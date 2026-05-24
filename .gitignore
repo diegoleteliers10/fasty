@@ -1,0 +1,7 @@
+#Cargo lock file
+Cargo.lock
+
+#target directory
+target/
+
+
