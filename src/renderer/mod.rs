@@ -145,6 +145,11 @@ impl<'a> Renderer<'a> {
         hover_max: bool,
         hover_min: bool,
         hover_settings: bool,
+        last_activity_time_secs: f32,
+        current_time: f32,
+        selection: Option<Selection>,
+        hovered_url: Option<HoveredUrl>,
+        toast: Option<(&str, std::time::Instant)>,
     ) {
         if !self.dirty {
             tracing::debug!("Renderer::render early exit - dirty=false");
@@ -198,6 +203,11 @@ impl<'a> Renderer<'a> {
                 hover_max,
                 hover_min,
                 hover_settings,
+                last_activity_time_secs,
+                current_time,
+                selection,
+                hovered_url,
+                toast,
                 &self.device,
                 &self.queue,
             );
@@ -284,4 +294,17 @@ impl<'a> Renderer<'a> {
         frame.present();
         self.dirty = false;
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub start: alacritty_terminal::index::Point,
+    pub end: alacritty_terminal::index::Point,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HoveredUrl {
+    pub line: i32,
+    pub start_col: usize,
+    pub end_col: usize,
 }

@@ -93,7 +93,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if (input.is_color > 0.5) {
         return tex_color;
     } else {
-        return vec4<f32>(input.fg_color.rgb, tex_color.r);
+        return vec4<f32>(input.fg_color.rgb, tex_color.r * input.fg_color.a);
     }
 }
 "#;
@@ -335,6 +335,11 @@ impl Pipeline {
         hover_max: bool,
         hover_min: bool,
         hover_settings: bool,
+        last_activity_time_secs: f32,
+        current_time: f32,
+        selection: Option<crate::renderer::Selection>,
+        hovered_url: Option<crate::renderer::HoveredUrl>,
+        toast: Option<(&str, std::time::Instant)>,
         device: &Device,
         queue: &wgpu::Queue,
     ) {
@@ -352,7 +357,7 @@ impl Pipeline {
             [8.0 / 255.0, 8.0 / 255.0, 10.0 / 255.0, 1.0],
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
-            12.0, // radius of 12
+            8.0, // radius of 8
         );
         bg_instances.push(window_bg);
 
@@ -363,14 +368,14 @@ impl Pipeline {
             [18.0 / 255.0, 18.0 / 255.0, 22.0 / 255.0, 1.0],
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
-            12.0, // radius of 12 at top
+            8.0, // radius of 8 at top
         );
         bg_instances.push(topbar_bg);
 
         // 2. Draw square block to cover bottom rounded corners of the topbar
         let topbar_bottom_fill = CellInstance::new(
-            0.0, 24.0,
-            viewport_width, 12.0,
+            0.0, 28.0,
+            viewport_width, 8.0,
             [18.0 / 255.0, 18.0 / 255.0, 22.0 / 255.0, 1.0],
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 0.0, 0.0,
@@ -404,7 +409,20 @@ impl Pipeline {
             let cell_x = (col as f32 * cell_width).round() + Self::PADDING_LEFT;
             let cell_y = ((row as f32 + scroll_fraction) * cell_height).round() + Self::PADDING_TOP;
 
-            // 1. Draw solid background if not default
+            // 1. Draw solid background if not default or if selected
+            let is_selected = if let Some(sel) = selection {
+                let (min_p, max_p) = if sel.start <= sel.end { (sel.start, sel.end) } else { (sel.end, sel.start) };
+                point >= min_p && point <= max_p
+            } else {
+                false
+            };
+
+            let is_hovered_url = if let Some(url) = hovered_url {
+                point.line.0 == url.line && col >= url.start_col && col <= url.end_col
+            } else {
+                false
+            };
+
             if !is_default_bg {
                 let is_wide = cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR);
                 let char_width = if is_wide { 2 } else { 1 };
@@ -417,6 +435,32 @@ impl Pipeline {
                     cell_x, cell_y,
                     cell_w, cell_height,
                     bg,
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                );
+                bg_instances.push(bg_instance);
+            }
+
+            if is_selected {
+                let sel_color = [66.0 / 255.0, 135.0 / 255.0, 245.0 / 255.0, 0.3];
+                let bg_instance = CellInstance::new(
+                    cell_x, cell_y,
+                    cell_width, cell_height,
+                    sel_color,
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                );
+                bg_instances.push(bg_instance);
+            }
+
+            if is_hovered_url {
+                let underline_color = [66.0 / 255.0, 135.0 / 255.0, 245.0 / 255.0, 0.8];
+                let bg_instance = CellInstance::new(
+                    cell_x, cell_y + cell_height - 2.0,
+                    cell_width, 1.0,
+                    underline_color,
                     [0.0, 0.0, 0.0, 0.0],
                     0.0, 0.0, 0.0, 0.0,
                     0.0,
@@ -537,21 +581,66 @@ impl Pipeline {
         instances.extend(bg_instances);
         instances.extend(fg_instances);
 
-        if scrollbar_alpha > 0.001 {
-            let track_width = 8.0f32;
-            let track_margin = 2.0f32;
-            let track_x = viewport_width - track_width - track_margin;
-            let track_y = 36.0f32;
-            let track_h = viewport_height - 36.0f32;
+        // Draw cursor
+        let cursor_row = content.cursor.point.line.0 + content.display_offset as i32;
+        if cursor_row >= 0 && cursor_row < visible_rows as i32 {
+            let cursor_x = (content.cursor.point.column.0 as f32 * cell_width).round() + Self::PADDING_LEFT;
+            let cursor_y = ((cursor_row as f32 + scroll_fraction) * cell_height).round() + Self::PADDING_TOP;
 
-            // Draw track (semi-transparent gray/white, noticeable but subtle)
+            // Match shape to determine cursor size, offsets, and base opacity
+            let (c_w, c_h, c_ox, c_oy, c_alpha) = match content.cursor.shape {
+                alacritty_terminal::vte::ansi::CursorShape::Block => (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32),
+                alacritty_terminal::vte::ansi::CursorShape::Underline => (cell_width, 1.0f32, 0.0f32, cell_height - 1.0f32, 0.9f32),
+                alacritty_terminal::vte::ansi::CursorShape::Beam => (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32),
+                alacritty_terminal::vte::ansi::CursorShape::Hidden => (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32),
+                _ => (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32),
+            };
+
+            if c_w > 0.0 && c_h > 0.0 {
+                let cursor_is_active = (current_time - last_activity_time_secs) < 0.5f32;
+                // Apply pulsing animation if cursor is idle (quieto)
+                let final_alpha = if cursor_is_active {
+                    c_alpha
+                } else {
+                    // Start pulsing animation smoothly from c_alpha by basing phase on the time since the activity period ended (500ms after last activity)
+                    let activity_end_time = last_activity_time_secs + 0.5f32;
+                    let idle_time = (current_time - activity_end_time).max(0.0f32);
+                    // Use a cosine wave so it starts at its maximum value (cos(0) = 1.0) and starts fading down smoothly.
+                    // Frequency of 0.8 Hz means 0.8 cycles per second (1.25s per full cycle).
+                    let pulse = 0.5f32 + 0.5f32 * (idle_time * std::f32::consts::PI * 2.0f32 * 0.8f32).cos();
+                    c_alpha * pulse
+                };
+
+                let cursor_color = [1.0, 1.0, 1.0, final_alpha];
+                let cursor_instance = CellInstance::new(
+                    cursor_x + c_ox,
+                    cursor_y + c_oy,
+                    c_w,
+                    c_h,
+                    cursor_color,
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                );
+                instances.push(cursor_instance);
+            }
+        }
+
+        if scrollbar_alpha > 0.001 {
+            const SCROLLBAR_TOP_MARGIN: f32 = 36.0; // px — clears the custom title bar height
+            let track_width = 6.0f32;
+            let track_x = viewport_width - track_width - 2.0f32; // 2px from right edge
+            let track_y = SCROLLBAR_TOP_MARGIN;
+            let track_h = viewport_height - SCROLLBAR_TOP_MARGIN - 4.0f32; // 4px bottom margin
+
+            // Draw track (rgba(255,255,255,0.08))
             let track_instance = CellInstance::new(
                 track_x, track_y,
                 track_width, track_h,
-                [1.0, 1.0, 1.0, 0.15 * scrollbar_alpha],
+                [1.0, 1.0, 1.0, 0.08 * scrollbar_alpha],
                 [0.0, 0.0, 0.0, 0.0],
                 0.0, 0.0, 1.0, 1.0,
-                2.0,
+                3.0, // corner radius of 3px (half of 6px width for perfect pill shape)
             );
             instances.push(track_instance);
 
@@ -559,7 +648,7 @@ impl Pipeline {
             let total_lines = visible_rows + history_size;
             if total_lines > 0.0 {
                 let ratio = visible_rows / total_lines;
-                let thumb_h = (track_h * ratio).max(30.0).min(track_h);
+                let thumb_h = (track_h * ratio).max(20.0).min(track_h);
 
                 let scroll_ratio = if history_size > 0.0 {
                     scroll_current / history_size
@@ -569,16 +658,100 @@ impl Pipeline {
 
                 let thumb_y = track_y + (1.0 - scroll_ratio) * (track_h - thumb_h);
 
-                // Draw thumb (noticeable gray but not too bright)
+                // Draw thumb (rgba(255,255,255,0.3))
                 let thumb_instance = CellInstance::new(
                     track_x, thumb_y,
                     track_width, thumb_h,
-                    [0.6, 0.6, 0.6, 0.60 * scrollbar_alpha],
+                    [1.0, 1.0, 1.0, 0.3 * scrollbar_alpha],
                     [0.0, 0.0, 0.0, 0.0],
                     0.0, 0.0, 1.0, 1.0,
-                    2.0,
+                    3.0, // corner radius of 3px
                 );
                 instances.push(thumb_instance);
+            }
+        }
+
+        // Draw Toast Popup if any
+        if let Some((msg, start_time)) = toast {
+            let elapsed_ms = start_time.elapsed().as_millis();
+            let alpha = match elapsed_ms {
+                t if t < 120 => t as f32 / 120.0,
+                t if t < 1620 => 1.0,
+                t if t < 1920 => 1.0 - (t - 1620) as f32 / 300.0,
+                _ => 0.0,
+            };
+
+            if alpha > 0.0 {
+                let scale = 13.0 / 16.0;
+                let mut text_w = 0.0f32;
+                for c in msg.chars() {
+                    if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                        if entry.width > 0.0 {
+                            text_w += (entry.width + 1.0) * scale;
+                        } else if c == ' ' {
+                            text_w += 8.0 * scale;
+                        }
+                    }
+                }
+
+                let toast_w = text_w + 28.0;
+                let text_h = cell_height * scale;
+                let toast_h = text_h + 16.0;
+
+                let toast_x = (viewport_width - toast_w) / 2.0;
+                let toast_y = viewport_height - toast_h - 24.0;
+
+                // Outer border
+                let border_color = [1.0, 1.0, 1.0, 0.12 * alpha];
+                instances.push(CellInstance::new(
+                    toast_x, toast_y,
+                    toast_w, toast_h,
+                    border_color,
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, 1.0,
+                    8.0,
+                ));
+
+                // Inner background
+                let bg_color = [40.0 / 255.0, 42.0 / 255.0, 46.0 / 255.0, 0.95 * alpha];
+                instances.push(CellInstance::new(
+                    toast_x + 1.0, toast_y + 1.0,
+                    toast_w - 2.0, toast_h - 2.0,
+                    bg_color,
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, 1.0,
+                    7.0,
+                ));
+
+                // Text characters
+                let mut tx = toast_x + 14.0;
+                let baseline_y = toast_y + 8.0 + atlas.ascent() * scale;
+                for c in msg.chars() {
+                    if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                        if entry.width > 0.0 {
+                            let glyph_w = entry.width * scale;
+                            let glyph_h = entry.height * scale;
+                            let glyph_x = tx + entry.left * scale;
+                            let glyph_y = baseline_y + entry.top * scale;
+                            let (aw, ah) = atlas.atlas_size();
+                            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                            let uv_w = uv_end_x - uv_x;
+                            let uv_h = uv_end_y - uv_y;
+
+                            instances.push(CellInstance::new(
+                                glyph_x, glyph_y,
+                                glyph_w, glyph_h,
+                                [1.0, 1.0, 1.0, 0.9 * alpha],
+                                [0.0, 0.0, 0.0, 0.0],
+                                uv_x, uv_y, uv_w, uv_h,
+                                0.0,
+                            ));
+                            tx += (entry.width + 1.0) * scale;
+                        } else if c == ' ' {
+                            tx += 8.0 * scale;
+                        }
+                    }
+                }
             }
         }
         
@@ -639,7 +812,7 @@ impl Pipeline {
             [8.0 / 255.0, 8.0 / 255.0, 10.0 / 255.0, 1.0],
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
-            12.0,
+            8.0,
         ));
 
         // 1. Draw topbar background
@@ -649,11 +822,11 @@ impl Pipeline {
             [18.0 / 255.0, 18.0 / 255.0, 22.0 / 255.0, 1.0],
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
-            12.0,
+            8.0,
         ));
         bg_instances.push(CellInstance::new(
-            0.0, 24.0,
-            viewport_width, 12.0,
+            0.0, 28.0,
+            viewport_width, 8.0,
             [18.0 / 255.0, 18.0 / 255.0, 22.0 / 255.0, 1.0],
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 0.0, 0.0,

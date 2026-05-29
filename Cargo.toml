@@ -32,6 +32,7 @@ raw-window-handle = "0.6"
 unicode-width = "0.1"
 fontconfig = "0.5"
 image = "0.25"
+arboard = { version = "3", features = ["wayland-data-control"] }
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"
