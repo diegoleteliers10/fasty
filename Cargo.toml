@@ -13,29 +13,30 @@ path = "src/main.rs"
 required-features = []
 
 [dependencies]
-gpui = "0.2.2"
+winit = "0.30"
+wgpu = { version = "22", features = ["wgsl"] }
+alacritty_terminal = "0.24"
 portable-pty = "0.8"
-alacritty_terminal = { git = "https://github.com/alacritty/alacritty", package = "alacritty_terminal" }
-unicode-width = "0.1"
-flume = "0.11"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.3"
+log = "0.4"
+env_logger = "0.11"
+freetype-rs = "0.37"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-bitflags = "2"
-futures = "0.3"
 anyhow = "1"
-thiserror = "1"
 parking_lot = "0.12"
-gpui-component = "0.5.1"
+raw-window-handle = "0.6"
+unicode-width = "0.1"
+fontconfig = "0.5"
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"
 
-[features]
-default = []
-wayland = ["gpui/wayland"]
-x11 = ["gpui/x11"]
+[target.'cfg(all(target_os = "linux", not(windows)))'.dependencies]
+x11 = { version = "2.21", features = ["xlib", "xfixes"] }
 
 [profile.release]
 opt-level = 3

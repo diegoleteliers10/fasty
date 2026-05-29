@@ -28,6 +28,14 @@ impl PtyWriter {
         w.write_all(bytes)
             .map_err(|e| anyhow::anyhow!("PTY write error: {}", e))
     }
+
+    pub fn inner_arc(&self) -> Arc<Mutex<Box<dyn IoWrite + Send>>> {
+        Arc::clone(&self.inner)
+    }
+
+    pub fn from_writer_arc(writer_arc: Arc<Mutex<Box<dyn IoWrite + Send>>>) -> Self {
+        Self { inner: writer_arc }
+    }
 }
 
 impl Clone for PtyWriter {
@@ -43,6 +51,9 @@ pub struct PtyWorker {
     pub writer: PtyWriter,
     shutdown_flag: Arc<AtomicBool>,
 }
+
+unsafe impl Send for PtyWorker {}
+unsafe impl Sync for PtyWorker {}
 
 impl PtyWorker {
     pub fn spawn(

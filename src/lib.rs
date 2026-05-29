@@ -1,9 +1,7 @@
-//! fasty library: exposes terminal, parser, pty, and input modules for testing.
+//! fasty library - winit/wgpu terminal emulator
 
-pub mod app;
 pub mod config;
-pub mod input;
-pub mod parser;
+pub mod event_listener;
 pub mod pty;
-pub mod settings;
-pub mod terminal;
+pub mod renderer;
+pub mod terminal_state;

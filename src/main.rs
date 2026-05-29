@@ -1,26 +1,21 @@
-//! Biovity Terminal -- GPU-native terminal emulator powered by GPUI
-
-mod app;
 mod config;
-mod input;
-mod parser;
+mod event_listener;
 mod pty;
-mod settings;
-mod terminal;
+mod renderer;
+mod terminal_state;
 
-use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::Config as AlacrittyConfig;
-use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
-use app::AppView;
-use flume;
-use gpui::{
-    px, App, AppContext, Entity, Styled, Window, WindowBounds, WindowDecorations, WindowOptions,
-};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::sync::Mutex;
-use terminal::{Terminal, TerminalView};
+
+use config::Config;
+use renderer::Renderer;
+use terminal_state::TerminalState;
+use tracing_subscriber::util::SubscriberInitExt;
+use winit::{
+    event::{ElementState, WindowEvent},
+    event_loop::EventLoop,
+    keyboard::Key,
+};
 
 fn get_login_shell() -> String {
     if let Ok(content) = std::fs::read_to_string("/etc/passwd") {
@@ -40,101 +35,12 @@ fn get_login_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
 }
 
-struct PreSpawnedPty {
-    term: Arc<Mutex<alacritty_terminal::term::Term<VoidListener>>>,
-    render_generation: Arc<AtomicU64>,
-    pty_writer: pty::PtyWriter,
-    grid_wake_rx: flume::Receiver<()>,
-}
-
-fn pre_spawn_pty(shell: &str, scrollback: usize) -> PreSpawnedPty {
-    let cols = 80;
-    let rows = 24;
-
-    let mut config = AlacrittyConfig::default();
-    config.scrolling_history = scrollback;
-    let size = TermSize::new(cols, rows);
-    let term = Arc::new(Mutex::new(alacritty_terminal::term::Term::new(
-        config,
-        &size,
-        VoidListener,
-    )));
-    let render_generation = Arc::new(AtomicU64::new(0));
-    let render_generation_worker = Arc::clone(&render_generation);
-    let (grid_wake_tx, grid_wake_rx) = flume::unbounded::<()>();
-
-    let term_clone = Arc::clone(&term);
-    let pty_worker = pty::PtyWorker::spawn(&[shell.to_string()], cols, rows, move |chunk| {
-        if chunk.is_empty() {
-            return;
-        }
-        let mut term_locked = match term_clone.lock() {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-        let mut parser: Processor<StdSyncHandler> = Processor::new();
-        parser.advance(&mut *term_locked, &chunk);
-        render_generation_worker.fetch_add(1, Ordering::Relaxed);
-        drop(term_locked);
-        let _ = grid_wake_tx.send(());
-    });
-
-    let pty_writer = pty_worker.writer.clone();
-
-    PreSpawnedPty {
-        term,
-        render_generation,
-        pty_writer,
-        grid_wake_rx,
-    }
-}
-
-fn spawn_pty(shell: &str, scrollback: usize) -> PreSpawnedPty {
-    let cols = 80;
-    let rows = 24;
-
-    let mut config = AlacrittyConfig::default();
-    config.scrolling_history = scrollback;
-    let size = TermSize::new(cols, rows);
-    let term = Arc::new(Mutex::new(alacritty_terminal::term::Term::new(
-        config,
-        &size,
-        VoidListener,
-    )));
-    let render_generation = Arc::new(AtomicU64::new(0));
-    let render_generation_worker = Arc::clone(&render_generation);
-    let (grid_wake_tx, grid_wake_rx) = flume::unbounded::<()>();
-
-    let term_clone = Arc::clone(&term);
-    let pty_worker = pty::PtyWorker::spawn(&[shell.to_string()], cols, rows, move |chunk| {
-        if chunk.is_empty() {
-            return;
-        }
-        let mut term_locked = match term_clone.lock() {
-            Ok(t) => t,
-            Err(_) => return,
-        };
-        let mut parser: Processor<StdSyncHandler> = Processor::new();
-        parser.advance(&mut *term_locked, &chunk);
-        render_generation_worker.fetch_add(1, Ordering::Relaxed);
-        drop(term_locked);
-        let _ = grid_wake_tx.send(());
-    });
-
-    let pty_writer = pty_worker.writer.clone();
-
-    PreSpawnedPty {
-        term,
-        render_generation,
-        pty_writer,
-        grid_wake_rx,
-    }
-}
-
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .init();
 
-    let config = config::Config::load()?;
+    let config = Config::load()?;
     tracing::info!(
         "fasty: starting, shell={}",
         config.shell.as_deref().unwrap_or("default")
@@ -146,86 +52,141 @@ fn main() -> anyhow::Result<()> {
         get_login_shell()
     };
 
-    let pre_spawned = pre_spawn_pty(&shell, config.scrollback);
-    tracing::info!("fasty: PTY pre-spawned successfully");
+    let event_loop = EventLoop::new()?;
+    let window = event_loop.create_window(winit::window::WindowAttributes::default()
+        .with_title("fasty")
+        .with_inner_size(winit::dpi::LogicalSize::new(1200.0, 800.0)))?;
 
-    let app_config = config.clone();
-    let app = gpui::Application::new();
+    let window_arc = Arc::new(window);
+    let window_for_renderer = window_arc.as_ref();
+    let renderer = pollster::block_on(Renderer::new(window_for_renderer))?;
+    let cell_width = renderer.cell_width();
+    let cell_height = renderer.cell_height();
 
-    app.run(move |cx: &mut App| {
-        let PreSpawnedPty {
-            term,
-            render_generation,
-            pty_writer,
-            grid_wake_rx,
-        } = pre_spawned;
 
-        let font_config = config.font.clone();
+    let viewport_width = renderer.config.width as f32;
+    const PADDING_LEFT: f32 = 10.0;
+    const PADDING_TOP: f32 = 10.0;
 
-        let window_bounds = gpui::Bounds::new(
-            gpui::point(px(0.0), px(0.0)),
-            gpui::size(px(1200.0), px(800.0)),
-        );
+    let viewport_height = renderer.config.height as f32;
+    let shell_cols = ((viewport_width - PADDING_LEFT * 2.0) / cell_width).floor().max(1.0) as usize;
+    let shell_rows = ((viewport_height - PADDING_TOP * 2.0) / cell_height).floor().max(1.0) as usize;
+    let terminal_state = TerminalState::new(&shell, config.scrollback, config.font.clone(), cell_width, cell_height, shell_cols.max(80) as f32 * cell_width, shell_rows.max(24) as f32 * cell_height)?;
+    let terminal_state = Arc::new(parking_lot::Mutex::new(terminal_state));
+    let renderer = Arc::new(parking_lot::Mutex::new(renderer));
+    let mut modifiers = winit::keyboard::ModifiersState::default();
+    let render_generation = Arc::new(AtomicU64::new(0));
+    let rg = Arc::clone(&render_generation);
 
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(window_bounds)),
-                window_decorations: Some(WindowDecorations::Client),
-                titlebar: None,
-                is_resizable: true,
-                ..Default::default()
-            },
-            move |window, cx| {
-                let terminal = cx.new(|cx| {
-                    Terminal::from_pre_spawned(
-                        cx,
-                        pty_writer,
-                        term,
-                        render_generation,
-                        grid_wake_rx,
-                        font_config,
-                    )
-                });
-                let terminal_view = cx.new(|cx| TerminalView::new(window, cx, terminal));
-                let config = app_config.clone();
+    let window_for_redraw = window_arc.clone();
 
-                let app_view = cx.new(|cx| AppView::new(cx, terminal_view, config, None));
+    event_loop.run(move |event, target| {
+        match event {
+            winit::event::Event::WindowEvent { window_id: _, event } => {
+                match event {
+                    WindowEvent::CloseRequested => {
+                        target.exit();
+                    }
+                    WindowEvent::Resized(_size) => {
+                        let physical_size = window_for_redraw.inner_size();
+                        let cols = (((physical_size.width as f32 - PADDING_LEFT * 2.0) / cell_width).floor().max(1.0)) as usize;
+                        let rows = (((physical_size.height as f32 - PADDING_TOP * 2.0) / cell_height).floor().max(1.0)) as usize;
 
-                let shell_clone = shell.clone();
-                let config_for_spawn = app_config.clone();
-                let app_view_clone = app_view.clone();
-                let new_tab_cb: Option<
-                    Box<dyn Fn(&mut Window, &mut gpui::Context<AppView>) + 'static>,
-                > = Some(Box::new(move |window, cx| {
-                    let spawned = spawn_pty(&shell_clone, config_for_spawn.scrollback);
-                    let term = spawned.term;
-                    let render_gen = spawned.render_generation;
-                    let pty_writer = spawned.pty_writer;
-                    let grid_rx = spawned.grid_wake_rx;
-                    let font_cfg = config_for_spawn.font.clone();
+                        let mut r = renderer.lock();
+                        r.resize(physical_size.width, physical_size.height);
+                        drop(r);
+                        terminal_state.lock().resize(cols, rows);
+                        renderer.lock().set_dirty(true);
+                    }
+                    WindowEvent::ModifiersChanged(modified) => {
+                        modifiers = modified.state();
+                    }
+                    WindowEvent::KeyboardInput { event, .. } => {
+                        let pressed = event.state == ElementState::Pressed;
+                        if !pressed {
+                            return;
+                        }
 
-                    let terminal: Entity<Terminal> = cx.new(|cx| {
-                        Terminal::from_pre_spawned(
-                            cx, pty_writer, term, render_gen, grid_rx, font_cfg,
-                        )
-                    });
-                    let terminal_view: Entity<TerminalView> =
-                        cx.new(|cx| TerminalView::new(window, cx, terminal));
+                        let key_str = match &event.logical_key {
+                            Key::Character(s) => s.to_string(),
+                            Key::Named(n) => format!("{:?}", n),
+                            _ => String::new(),
+                        };
 
-                    app_view_clone.update(cx, |app, _| {
-                        app.add_terminal_view(terminal_view);
-                    });
-                }));
+                        if modifiers.control_key() {
+                            match key_str.as_str() {
+                                "c" => { terminal_state.lock().write_to_pty(&[0x03]); return; }
+                                "d" => { terminal_state.lock().write_to_pty(&[0x04]); return; }
+                                "z" => { terminal_state.lock().write_to_pty(&[0x1A]); return; }
+                                "l" => { terminal_state.lock().write_to_pty(&[0x0C]); return; }
+                                _ => {}
+                            }
+                        }
 
-                app_view.update(cx, |app, _| {
-                    app.set_new_tab_cb(new_tab_cb);
-                });
-
-                app_view
-            },
-        )
-        .expect("Failed to open window");
-    });
+                        let bytes = key_to_bytes(&event.logical_key, &modifiers);
+                        if !bytes.is_empty() {
+                            terminal_state.lock().write_to_pty(&bytes);
+                        }
+                    }
+                    WindowEvent::MouseWheel { delta, .. } => {
+                        let lines = match delta {
+                            winit::event::MouseScrollDelta::LineDelta(_, y) => y as isize,
+                            winit::event::MouseScrollDelta::PixelDelta(_) => 0,
+                        };
+                        if lines != 0 {
+                            terminal_state.lock().scroll(lines);
+                            renderer.lock().set_dirty(true);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            winit::event::Event::AboutToWait => {
+                window_for_redraw.request_redraw();
+                let term = terminal_state.lock();
+                term.update_render_generation(&rg);
+                term.mark_dirty();
+                renderer.lock().set_dirty(true);
+                let term_ref: &TerminalState = &*term;
+                renderer.lock().render(term_ref);
+            }
+            _ => {}
+        }
+    })?;
 
     Ok(())
+}
+
+fn key_to_bytes(key: &Key, modifiers: &winit::keyboard::ModifiersState) -> Vec<u8> {
+    match key {
+        Key::Character(s) if !s.is_empty() => s.as_bytes().to_vec(),
+        Key::Named(n) => {
+            let name = format!("{:?}", n);
+            match name.as_str() {
+                "Enter" => vec![b'\r'],
+                "Space" => vec![b' '],
+                "Backspace" => vec![0x7F],
+                "Tab" => vec![0x09],
+                "Escape" => vec![0x1B],
+                "ArrowUp" => {
+                    if modifiers.alt_key() {
+                        vec![0x1B, 0x5B, 0x41]
+                    } else {
+                        vec![0x1B, 0x5B, 0x41]
+                    }
+                }
+                "ArrowDown" => vec![0x1B, 0x5B, 0x42],
+                "ArrowRight" => vec![0x1B, 0x5B, 0x43],
+                "ArrowLeft" => vec![0x1B, 0x5B, 0x44],
+                "Home" => vec![0x1B, 0x5B, 0x48],
+                "End" => vec![0x1B, 0x5B, 0x46],
+                "PageUp" => vec![0x1B, 0x5B, 0x35, 0x7E],
+                "PageDown" => vec![0x1B, 0x5B, 0x36, 0x7E],
+                "Insert" => vec![0x1B, 0x5B, 0x32, 0x7E],
+                "Delete" => vec![0x1B, 0x5B, 0x33, 0x7E],
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    }
 }
