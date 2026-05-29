@@ -12,10 +12,10 @@ pub use cell::CellInstance;
 pub use pipeline::Pipeline;
 
 const CLEAR_COLOR: wgpu::Color = wgpu::Color {
-    r: 8.0 / 255.0,
-    g: 8.0 / 255.0,
-    b: 10.0 / 255.0,
-    a: 1.0,
+    r: 0.0,
+    g: 0.0,
+    b: 0.0,
+    a: 0.0,
 };
 
 pub struct Renderer<'a> {
@@ -68,6 +68,17 @@ impl<'a> Renderer<'a> {
             .copied()
             .unwrap_or(wgpu::TextureFormat::Bgra8Unorm);
 
+        let caps = surface.get_capabilities(&adapter);
+        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+            wgpu::CompositeAlphaMode::PreMultiplied
+        } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+            wgpu::CompositeAlphaMode::PostMultiplied
+        } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Inherit) {
+            wgpu::CompositeAlphaMode::Inherit
+        } else {
+            wgpu::CompositeAlphaMode::Opaque
+        };
+
         let size = window.inner_size();
         let config = SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -76,7 +87,7 @@ impl<'a> Renderer<'a> {
             height: size.height,
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 1,
-            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            alpha_mode,
             view_formats: vec![],
         };
         surface.configure(&device, &config);
@@ -130,6 +141,10 @@ impl<'a> Renderer<'a> {
         scroll_current: f32,
         history_size: f32,
         visible_rows: f32,
+        hover_close: bool,
+        hover_max: bool,
+        hover_min: bool,
+        hover_settings: bool,
     ) {
         if !self.dirty {
             tracing::debug!("Renderer::render early exit - dirty=false");
@@ -179,6 +194,86 @@ impl<'a> Renderer<'a> {
                 scroll_current,
                 history_size,
                 visible_rows,
+                hover_close,
+                hover_max,
+                hover_min,
+                hover_settings,
+                &self.device,
+                &self.queue,
+            );
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+        frame.present();
+        self.dirty = false;
+    }
+
+    pub fn render_settings(
+        &mut self,
+        font_family: &str,
+        font_size: f32,
+        scrollback: usize,
+        active_field: usize,
+        hover_close: bool,
+        hover_font_family: bool,
+        hover_size_minus: bool,
+        hover_size_plus: bool,
+        hover_scroll_minus: bool,
+        hover_scroll_plus: bool,
+        hover_save: bool,
+        hover_cancel: bool,
+    ) {
+        if !self.dirty {
+            return;
+        }
+
+        let frame = match self.surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(e) => {
+                tracing::error!("Failed to get current texture: {}", e);
+                return;
+            }
+        };
+
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("settings-render-encoder"),
+        });
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("settings-render-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+
+            self.pipeline.render_settings(
+                &mut render_pass,
+                &mut self.atlas,
+                self.config.width as f32,
+                self.config.height as f32,
+                font_family,
+                font_size,
+                scrollback,
+                active_field,
+                hover_close,
+                hover_font_family,
+                hover_size_minus,
+                hover_size_plus,
+                hover_scroll_minus,
+                hover_scroll_plus,
+                hover_save,
+                hover_cancel,
                 &self.device,
                 &self.queue,
             );

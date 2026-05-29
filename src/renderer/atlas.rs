@@ -89,6 +89,7 @@ pub struct Atlas {
     atlas_height: u32,
     font_size: f32,
     scale_factor: f32,
+    pub app_icon: Option<AtlasEntry>,
 }
 
 impl Atlas {
@@ -178,12 +179,24 @@ impl Atlas {
             atlas_height: height,
             font_size,
             scale_factor,
+            app_icon: None,
         };
 
         atlas.rasterize_basic_glyphs(device, queue)?;
 
         if let Some(space) = atlas.entries.get(&' ') {
             atlas.fallback_glyph = Some(*space);
+        }
+
+        // Try to load the app icon
+        match atlas.load_custom_image("assets/fastySmallIcon.png", 24, queue) {
+            Ok(entry) => {
+                atlas.app_icon = Some(entry);
+                tracing::info!("Successfully loaded app icon into atlas");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load app icon: {:?}", e);
+            }
         }
 
         tracing::info!(
@@ -561,6 +574,61 @@ impl Atlas {
 
     pub fn texture(&self) -> &wgpu::Texture {
         &self.texture
+    }
+
+    pub fn load_custom_image(
+        &mut self,
+        path: &str,
+        target_size: u32,
+        queue: &Queue,
+    ) -> anyhow::Result<AtlasEntry> {
+        let img = image::open(path).context("Failed to open image file")?;
+        let scaled = img.resize(target_size, target_size, image::imageops::FilterType::Lanczos3);
+        let rgba = scaled.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        
+        let padding = 1;
+        let alloc_w = w + padding * 2;
+        let alloc_h = h + padding * 2;
+        
+        if let Some(pos) = self.packer.alloc(alloc_w, alloc_h) {
+            let entry = AtlasEntry {
+                x: (pos.0 + padding) as f32,
+                y: (pos.1 + padding) as f32,
+                width: w as f32,
+                height: h as f32,
+                left: 0.0,
+                top: 0.0,
+                is_color: true,
+            };
+            
+            queue.write_texture(
+                wgpu::ImageCopyTextureBase {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: pos.0 + padding,
+                        y: pos.1 + padding,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &rgba,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            Ok(entry)
+        } else {
+            anyhow::bail!("Failed to allocate space in atlas for custom image")
+        }
     }
 }
 

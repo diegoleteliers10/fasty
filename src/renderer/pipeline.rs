@@ -80,8 +80,7 @@ fn vertex_main(
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if (input.is_color > 1.5) {
-        // Corner radius of 4.0 pixels (since track width is 8.0, 4.0 radius forms a perfect pill shape)
-        let r = 4.0;
+        let r = input.is_color;
         let p = (input.uv - vec2<f32>(0.5)) * input.size;
         let b = input.size / 2.0;
         let q = abs(p) - b + vec2<f32>(r);
@@ -317,7 +316,7 @@ impl Pipeline {
     }
 
     const PADDING_LEFT: f32 = 10.0;
-    const PADDING_TOP: f32 = 10.0;
+    const PADDING_TOP: f32 = 46.0;
 
     pub fn render(
         &self,
@@ -332,6 +331,10 @@ impl Pipeline {
         scroll_current: f32,
         history_size: f32,
         visible_rows: f32,
+        hover_close: bool,
+        hover_max: bool,
+        hover_min: bool,
+        hover_settings: bool,
         device: &Device,
         queue: &wgpu::Queue,
     ) {
@@ -341,6 +344,50 @@ impl Pipeline {
 
         let mut bg_instances = Vec::new();
         let mut fg_instances = Vec::new();
+
+        // 0. Draw window background (slate dark)
+        let window_bg = CellInstance::new(
+            0.0, 0.0,
+            viewport_width, viewport_height,
+            [8.0 / 255.0, 8.0 / 255.0, 10.0 / 255.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            12.0, // radius of 12
+        );
+        bg_instances.push(window_bg);
+
+        // 1. Draw topbar background (slightly lighter dark)
+        let topbar_bg = CellInstance::new(
+            0.0, 0.0,
+            viewport_width, 36.0,
+            [18.0 / 255.0, 18.0 / 255.0, 22.0 / 255.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            12.0, // radius of 12 at top
+        );
+        bg_instances.push(topbar_bg);
+
+        // 2. Draw square block to cover bottom rounded corners of the topbar
+        let topbar_bottom_fill = CellInstance::new(
+            0.0, 24.0,
+            viewport_width, 12.0,
+            [18.0 / 255.0, 18.0 / 255.0, 22.0 / 255.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 0.0, 0.0,
+            0.0, // radius 0 (square)
+        );
+        bg_instances.push(topbar_bottom_fill);
+
+        // 3. Draw a subtle bottom border/divider line for the topbar
+        let topbar_border = CellInstance::new(
+            0.0, 36.0,
+            viewport_width, 1.0,
+            [35.0 / 255.0, 35.0 / 255.0, 45.0 / 255.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 0.0, 0.0,
+            0.0,
+        );
+        bg_instances.push(topbar_border);
 
         let scroll_fraction = scroll_current - content.display_offset as f32;
 
@@ -405,10 +452,88 @@ impl Pipeline {
             }
         }
 
+        // Draw app icon in the topbar
+        if let Some(entry) = atlas.app_icon {
+            let (aw, ah) = atlas.atlas_size();
+            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+            let uv_w = uv_end_x - uv_x;
+            let uv_h = uv_end_y - uv_y;
+            
+            fg_instances.push(CellInstance::new(
+                10.0, 6.0,
+                24.0, 24.0,
+                [1.0, 1.0, 1.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0],
+                uv_x, uv_y, uv_w, uv_h,
+                1.0, // is_color = 1.0 (rgba from texture)
+            ));
+        }
+
+        // Draw title text "fasty"
+        let title = "fasty";
+        let mut title_x = 42.0;
+        for c in title.chars() {
+            if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                let glyph_x = title_x + entry.left;
+                let glyph_y = 6.0 + atlas.ascent() + entry.top;
+                let (aw, ah) = atlas.atlas_size();
+                let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                let uv_w = uv_end_x - uv_x;
+                let uv_h = uv_end_y - uv_y;
+
+                fg_instances.push(CellInstance::new(
+                    glyph_x, glyph_y,
+                    entry.width, entry.height,
+                    [0.85, 0.85, 0.90, 1.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                    uv_x, uv_y, uv_w, uv_h,
+                    0.0,
+                ));
+                title_x += entry.width + 2.0;
+            }
+        }
+
+        // Draw control buttons (Settings, Minimize, Maximize, Close)
+        let buttons = [
+            ('\u{2699}', viewport_width - 128.0, hover_settings, [0.7, 0.7, 0.75, 1.0], [1.0, 1.0, 1.0, 0.15]),
+            ('\u{2500}', viewport_width - 96.0, hover_min, [0.8, 0.8, 0.85, 1.0], [1.0, 1.0, 1.0, 0.15]),
+            ('\u{25A2}', viewport_width - 64.0, hover_max, [0.8, 0.8, 0.85, 1.0], [1.0, 1.0, 1.0, 0.15]),
+            ('\u{2715}', viewport_width - 32.0, hover_close, [0.8, 0.8, 0.85, 1.0], [0.85, 0.25, 0.25, 0.9]),
+        ];
+        for (c, bx, is_hovered, fg_color, bg_color) in buttons {
+            if is_hovered {
+                bg_instances.push(CellInstance::new(
+                    bx, 4.0,
+                    28.0, 28.0,
+                    bg_color,
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, 1.0,
+                    6.0, // corner radius of 6.0
+                ));
+            }
+            if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                let glyph_x = bx + (28.0 - entry.width) / 2.0;
+                let glyph_y = 4.0 + (28.0 - entry.height) / 2.0;
+                let (aw, ah) = atlas.atlas_size();
+                let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                let uv_w = uv_end_x - uv_x;
+                let uv_h = uv_end_y - uv_y;
+
+                fg_instances.push(CellInstance::new(
+                    glyph_x, glyph_y,
+                    entry.width, entry.height,
+                    fg_color,
+                    [0.0, 0.0, 0.0, 0.0],
+                    uv_x, uv_y, uv_w, uv_h,
+                    0.0,
+                ));
+            }
+        }
+
         let bg_count = bg_instances.len();
         let fg_count = fg_instances.len();
 
-        let mut instances = Vec::with_capacity(bg_count + fg_count + 2);
+        let mut instances = Vec::with_capacity(bg_count + fg_count + 10);
         instances.extend(bg_instances);
         instances.extend(fg_instances);
 
@@ -416,8 +541,8 @@ impl Pipeline {
             let track_width = 8.0f32;
             let track_margin = 2.0f32;
             let track_x = viewport_width - track_width - track_margin;
-            let track_y = 0.0f32;
-            let track_h = viewport_height;
+            let track_y = 36.0f32;
+            let track_h = viewport_height - 36.0f32;
 
             // Draw track (semi-transparent gray/white, noticeable but subtle)
             let track_instance = CellInstance::new(
@@ -442,7 +567,7 @@ impl Pipeline {
                     0.0
                 };
 
-                let thumb_y = (1.0 - scroll_ratio) * (track_h - thumb_h);
+                let thumb_y = track_y + (1.0 - scroll_ratio) * (track_h - thumb_h);
 
                 // Draw thumb (noticeable gray but not too bright)
                 let thumb_instance = CellInstance::new(
@@ -478,6 +603,264 @@ impl Pipeline {
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
         
+        if instance_count > 0 {
+            render_pass.draw(0..6, 0..instance_count as u32);
+        }
+    }
+
+    pub fn render_settings(
+        &self,
+        render_pass: &mut wgpu::RenderPass,
+        atlas: &mut crate::renderer::Atlas,
+        viewport_width: f32,
+        viewport_height: f32,
+        font_family: &str,
+        font_size: f32,
+        scrollback: usize,
+        active_field: usize,
+        hover_close: bool,
+        hover_font_family: bool,
+        hover_size_minus: bool,
+        hover_size_plus: bool,
+        hover_scroll_minus: bool,
+        hover_scroll_plus: bool,
+        hover_save: bool,
+        hover_cancel: bool,
+        device: &Device,
+        queue: &wgpu::Queue,
+    ) {
+        let mut bg_instances = Vec::new();
+        let mut fg_instances = Vec::new();
+
+        // 0. Draw window background (slate dark)
+        bg_instances.push(CellInstance::new(
+            0.0, 0.0,
+            viewport_width, viewport_height,
+            [8.0 / 255.0, 8.0 / 255.0, 10.0 / 255.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            12.0,
+        ));
+
+        // 1. Draw topbar background
+        bg_instances.push(CellInstance::new(
+            0.0, 0.0,
+            viewport_width, 36.0,
+            [18.0 / 255.0, 18.0 / 255.0, 22.0 / 255.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            12.0,
+        ));
+        bg_instances.push(CellInstance::new(
+            0.0, 24.0,
+            viewport_width, 12.0,
+            [18.0 / 255.0, 18.0 / 255.0, 22.0 / 255.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 0.0, 0.0,
+            0.0,
+        ));
+        bg_instances.push(CellInstance::new(
+            0.0, 36.0,
+            viewport_width, 1.0,
+            [35.0 / 255.0, 35.0 / 255.0, 45.0 / 255.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 0.0, 0.0,
+            0.0,
+        ));
+
+        // Helper to draw text helper
+        let draw_text = |atlas: &mut crate::renderer::Atlas, text: &str, start_x: f32, start_y: f32, color: [f32; 4], fg_list: &mut Vec<CellInstance>| {
+            let mut x = start_x;
+            for c in text.chars() {
+                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                    if entry.width > 0.0 {
+                        let glyph_x = x + entry.left;
+                        let glyph_y = start_y + atlas.ascent() + entry.top;
+                        let (aw, ah) = atlas.atlas_size();
+                        let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                        fg_list.push(CellInstance::new(
+                            glyph_x, glyph_y,
+                            entry.width, entry.height,
+                            color,
+                            [0.0, 0.0, 0.0, 0.0],
+                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                            0.0,
+                        ));
+                        x += entry.width + 2.0;
+                    } else if c == ' ' {
+                        x += 8.0;
+                    }
+                }
+            }
+        };
+
+        // Draw title
+        draw_text(atlas, "Settings", 12.0, 6.0, [0.85, 0.85, 0.90, 1.0], &mut fg_instances);
+
+        // Draw topbar close button
+        if hover_close {
+            bg_instances.push(CellInstance::new(
+                viewport_width - 32.0, 4.0,
+                28.0, 28.0,
+                [0.85, 0.25, 0.25, 0.9],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                6.0,
+            ));
+        }
+        if let Some(entry) = atlas.get_or_rasterize('\u{2715}', device, queue) {
+            let glyph_x = (viewport_width - 32.0) + (28.0 - entry.width) / 2.0;
+            let glyph_y = 4.0 + (28.0 - entry.height) / 2.0;
+            let (aw, ah) = atlas.atlas_size();
+            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+            fg_instances.push(CellInstance::new(
+                glyph_x, glyph_y,
+                entry.width, entry.height,
+                [0.8, 0.8, 0.85, 1.0],
+                [0.0, 0.0, 0.0, 0.0],
+                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                0.0,
+            ));
+        }
+
+        // Draw labels
+        draw_text(atlas, "Font Family:", 20.0, 56.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
+        draw_text(atlas, "Font Size:", 20.0, 96.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
+        draw_text(atlas, "Scrollback:", 20.0, 136.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
+
+        // Draw inputs
+        // 1. Font Family input box
+        let family_bg = if active_field == 1 {
+            [25.0 / 255.0, 25.0 / 255.0, 32.0 / 255.0, 1.0]
+        } else if hover_font_family {
+            [22.0 / 255.0, 22.0 / 255.0, 28.0 / 255.0, 1.0]
+        } else {
+            [16.0 / 255.0, 16.0 / 255.0, 20.0 / 255.0, 1.0]
+        };
+        bg_instances.push(CellInstance::new(
+            140.0, 52.0,
+            240.0, 26.0,
+            family_bg,
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            6.0,
+        ));
+        
+        let display_family = if active_field == 1 {
+            format!("{}|", font_family)
+        } else {
+            font_family.to_string()
+        };
+        draw_text(atlas, &display_family, 146.0, 56.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+
+        // 2. Font Size controls
+        let size_minus_bg = if hover_size_minus { [1.0, 1.0, 1.0, 0.15] } else { [1.0, 1.0, 1.0, 0.05] };
+        bg_instances.push(CellInstance::new(
+            140.0, 92.0,
+            28.0, 26.0,
+            size_minus_bg,
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            6.0,
+        ));
+        draw_text(atlas, "-", 150.0, 96.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+
+        draw_text(atlas, &format!("{:.1}", font_size), 180.0, 96.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+
+        let size_plus_bg = if hover_size_plus { [1.0, 1.0, 1.0, 0.15] } else { [1.0, 1.0, 1.0, 0.05] };
+        bg_instances.push(CellInstance::new(
+            220.0, 92.0,
+            28.0, 26.0,
+            size_plus_bg,
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            6.0,
+        ));
+        draw_text(atlas, "+", 230.0, 96.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+
+        // 3. Scrollback controls
+        let scroll_minus_bg = if hover_scroll_minus { [1.0, 1.0, 1.0, 0.15] } else { [1.0, 1.0, 1.0, 0.05] };
+        bg_instances.push(CellInstance::new(
+            140.0, 132.0,
+            28.0, 26.0,
+            scroll_minus_bg,
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            6.0,
+        ));
+        draw_text(atlas, "-", 150.0, 136.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+
+        draw_text(atlas, &format!("{}", scrollback), 180.0, 136.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+
+        let scroll_plus_bg = if hover_scroll_plus { [1.0, 1.0, 1.0, 0.15] } else { [1.0, 1.0, 1.0, 0.05] };
+        bg_instances.push(CellInstance::new(
+            240.0, 132.0,
+            28.0, 26.0,
+            scroll_plus_bg,
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            6.0,
+        ));
+        draw_text(atlas, "+", 250.0, 136.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+
+        // Save & Cancel buttons
+        let save_bg = if hover_save {
+            [40.0 / 255.0, 120.0 / 255.0, 60.0 / 255.0, 1.0]
+        } else {
+            [30.0 / 255.0, 90.0 / 255.0, 45.0 / 255.0, 1.0]
+        };
+        bg_instances.push(CellInstance::new(
+            90.0, 220.0,
+            100.0, 32.0,
+            save_bg,
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            6.0,
+        ));
+        draw_text(atlas, "Save", 125.0, 226.0, [1.0, 1.0, 1.0, 1.0], &mut fg_instances);
+
+        let cancel_bg = if hover_cancel {
+            [80.0 / 255.0, 80.0 / 255.0, 90.0 / 255.0, 1.0]
+        } else {
+            [60.0 / 255.0, 60.0 / 255.0, 70.0 / 255.0, 1.0]
+        };
+        bg_instances.push(CellInstance::new(
+            210.0, 220.0,
+            100.0, 32.0,
+            cancel_bg,
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            6.0,
+        ));
+        draw_text(atlas, "Cancel", 235.0, 226.0, [1.0, 1.0, 1.0, 1.0], &mut fg_instances);
+
+        // Write buffer and draw
+        let bg_count = bg_instances.len();
+        let fg_count = fg_instances.len();
+        let mut instances = Vec::with_capacity(bg_count + fg_count);
+        instances.extend(bg_instances);
+        instances.extend(fg_instances);
+
+        let instance_count = instances.len().min(self.max_instances);
+        if instance_count > 0 {
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                cast_slice(&instances[..instance_count]),
+            );
+        }
+
+        queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            cast_slice(&[viewport_width, viewport_height]),
+        );
+
+        render_pass.set_pipeline(&self.pipeline);
+        render_pass.set_bind_group(0, &self.bind_group, &[]);
+        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+
         if instance_count > 0 {
             render_pass.draw(0..6, 0..instance_count as u32);
         }
