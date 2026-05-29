@@ -44,6 +44,7 @@ struct VertexOutput {
     @location(1) bg_color: vec4<f32>,
     @location(2) fg_color: vec4<f32>,
     @location(3) is_color: f32,
+    @location(4) size: vec2<f32>,
 }
 
 @vertex
@@ -71,12 +72,24 @@ fn vertex_main(
     output.bg_color = cell_bg;
     output.fg_color = cell_fg;
     output.is_color = cell_is_color;
+    output.size = cell_size;
 
     return output;
 }
 
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    if (input.is_color > 1.5) {
+        // Corner radius of 4.0 pixels (since track width is 8.0, 4.0 radius forms a perfect pill shape)
+        let r = 4.0;
+        let p = (input.uv - vec2<f32>(0.5)) * input.size;
+        let b = input.size / 2.0;
+        let q = abs(p) - b + vec2<f32>(r);
+        let dist = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+        let alpha = 1.0 - smoothstep(-0.5, 0.5, dist);
+        return vec4<f32>(input.fg_color.rgb, input.fg_color.a * alpha);
+    }
+
     let tex_color = textureSample(atlas, atlas_sampler, input.uv);
     if (input.is_color > 0.5) {
         return tex_color;
@@ -315,6 +328,10 @@ impl Pipeline {
         cell_height: f32,
         viewport_width: f32,
         viewport_height: f32,
+        scrollbar_alpha: f32,
+        scroll_current: f32,
+        history_size: f32,
+        visible_rows: f32,
         device: &Device,
         queue: &wgpu::Queue,
     ) {
@@ -324,6 +341,8 @@ impl Pipeline {
 
         let mut bg_instances = Vec::new();
         let mut fg_instances = Vec::new();
+
+        let scroll_fraction = scroll_current - content.display_offset as f32;
 
         for Indexed { cell, point } in content.display_iter {
             let col = point.column.0 as usize;
@@ -336,7 +355,7 @@ impl Pipeline {
             );
 
             let cell_x = (col as f32 * cell_width).round() + Self::PADDING_LEFT;
-            let cell_y = (row as f32 * cell_height).round() + Self::PADDING_TOP;
+            let cell_y = ((row as f32 + scroll_fraction) * cell_height).round() + Self::PADDING_TOP;
 
             // 1. Draw solid background if not default
             if !is_default_bg {
@@ -386,9 +405,57 @@ impl Pipeline {
             }
         }
 
-        let mut instances = Vec::with_capacity(bg_instances.len() + fg_instances.len());
+        let bg_count = bg_instances.len();
+        let fg_count = fg_instances.len();
+
+        let mut instances = Vec::with_capacity(bg_count + fg_count + 2);
         instances.extend(bg_instances);
         instances.extend(fg_instances);
+
+        if scrollbar_alpha > 0.001 {
+            let track_width = 8.0f32;
+            let track_margin = 2.0f32;
+            let track_x = viewport_width - track_width - track_margin;
+            let track_y = 0.0f32;
+            let track_h = viewport_height;
+
+            // Draw track (semi-transparent gray/white, noticeable but subtle)
+            let track_instance = CellInstance::new(
+                track_x, track_y,
+                track_width, track_h,
+                [1.0, 1.0, 1.0, 0.15 * scrollbar_alpha],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                2.0,
+            );
+            instances.push(track_instance);
+
+            // Draw thumb
+            let total_lines = visible_rows + history_size;
+            if total_lines > 0.0 {
+                let ratio = visible_rows / total_lines;
+                let thumb_h = (track_h * ratio).max(30.0).min(track_h);
+
+                let scroll_ratio = if history_size > 0.0 {
+                    scroll_current / history_size
+                } else {
+                    0.0
+                };
+
+                let thumb_y = (1.0 - scroll_ratio) * (track_h - thumb_h);
+
+                // Draw thumb (noticeable gray but not too bright)
+                let thumb_instance = CellInstance::new(
+                    track_x, thumb_y,
+                    track_width, thumb_h,
+                    [0.6, 0.6, 0.6, 0.60 * scrollbar_alpha],
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, 1.0,
+                    2.0,
+                );
+                instances.push(thumb_instance);
+            }
+        }
         
         let instance_count = instances.len().min(self.max_instances);
         

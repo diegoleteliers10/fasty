@@ -24,7 +24,16 @@ pub struct TerminalState {
 }
 
 impl TerminalState {
-    pub fn new(shell: &str, scrollback: usize, _font_config: FontConfig, cell_width: f32, cell_height: f32, viewport_width: f32, viewport_height: f32) -> anyhow::Result<Self> {
+    pub fn new(
+        shell: &str,
+        scrollback: usize,
+        _font_config: FontConfig,
+        cell_width: f32,
+        cell_height: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+        proxy: winit::event_loop::EventLoopProxy<()>,
+    ) -> anyhow::Result<Self> {
         let cols = ((viewport_width as usize) / (cell_width as usize)).max(80);
         let rows = ((viewport_height as usize) / (cell_height as usize)).max(24);
 
@@ -102,6 +111,7 @@ impl TerminalState {
                         let data = &buf[..n];
                         tracing::info!("PTY read {} bytes", n);
                         Self::process_chunk(&term_clone, &mut parser, &render_gen_clone, data);
+                        let _ = proxy.send_event(());
                     }
                     Err(e) => {
                         tracing::error!("PTY read error: {}", e);
@@ -172,6 +182,17 @@ impl TerminalState {
         let mut term = self.term.lock();
         use alacritty_terminal::grid::Scroll;
         term.scroll_display(Scroll::Delta(delta as i32));
+    }
+
+    pub fn display_offset(&self) -> usize {
+        let term = self.term.lock();
+        term.grid().display_offset()
+    }
+
+    pub fn history_size(&self) -> usize {
+        use alacritty_terminal::grid::Dimensions;
+        let term = self.term.lock();
+        term.history_size()
     }
 
     pub fn update_render_generation(&self, rg: &Arc<AtomicU64>) {

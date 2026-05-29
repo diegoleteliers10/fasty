@@ -123,7 +123,14 @@ impl<'a> Renderer<'a> {
         self.dirty = dirty;
     }
 
-    pub fn render(&mut self, terminal: &crate::terminal_state::TerminalState) {
+    pub fn render(
+        &mut self,
+        terminal: &crate::terminal_state::TerminalState,
+        scrollbar_alpha: f32,
+        scroll_current: f32,
+        history_size: f32,
+        visible_rows: f32,
+    ) {
         if !self.dirty {
             tracing::debug!("Renderer::render early exit - dirty=false");
             return;
@@ -138,17 +145,13 @@ impl<'a> Renderer<'a> {
             }
         };
 
-
-
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("fasty-render-encoder"),
         });
 
-
-{
+        {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("fasty-render-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -164,15 +167,26 @@ impl<'a> Renderer<'a> {
                 timestamp_writes: None,
             });
 
-            self.pipeline
-                .render(&mut render_pass, terminal, &mut self.atlas, self.cell_width, self.cell_height, self.config.width as f32, self.config.height as f32, &self.device, &self.queue);
+            self.pipeline.render(
+                &mut render_pass,
+                terminal,
+                &mut self.atlas,
+                self.cell_width,
+                self.cell_height,
+                self.config.width as f32,
+                self.config.height as f32,
+                scrollbar_alpha,
+                scroll_current,
+                history_size,
+                visible_rows,
+                &self.device,
+                &self.queue,
+            );
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         self.device.poll(wgpu::Maintain::Wait);
         frame.present();
         self.dirty = false;
-
-        return;
     }
 }
