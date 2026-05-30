@@ -9,6 +9,8 @@ use wgpu::{Device, Queue, TextureDescriptor, TextureDimension, TextureFormat, Te
 use freetype::Library;
 use freetype::face::LoadFlag;
 
+use usvg::Tree;
+
 thread_local! {
     static FT_LIB: Library = Library::init().expect("Failed to initialize FreeType");
 }
@@ -90,6 +92,14 @@ pub struct Atlas {
     font_size: f32,
     scale_factor: f32,
     pub app_icon: Option<AtlasEntry>,
+    pub icon_add: Option<AtlasEntry>,
+    pub icon_close: Option<AtlasEntry>,
+    pub icon_copy: Option<AtlasEntry>,
+    pub icon_paste: Option<AtlasEntry>,
+    pub icon_settings: Option<AtlasEntry>,
+    pub icon_text_font: Option<AtlasEntry>,
+    pub icon_less: Option<AtlasEntry>,
+    pub icon_maximize: Option<AtlasEntry>,
 }
 
 impl Atlas {
@@ -210,6 +220,14 @@ impl Atlas {
             font_size,
             scale_factor,
             app_icon: None,
+            icon_add: None,
+            icon_close: None,
+            icon_copy: None,
+            icon_paste: None,
+            icon_settings: None,
+            icon_text_font: None,
+            icon_less: None,
+            icon_maximize: None,
         };
 
         atlas.rasterize_basic_glyphs(device, queue)?;
@@ -227,6 +245,40 @@ impl Atlas {
             Err(e) => {
                 tracing::warn!("Failed to load app icon: {:?}", e);
             }
+        }
+
+        // Try to load custom SVG icons
+        match atlas.load_svg_icon("assets/icons/add.svg", 64, queue) {
+            Ok(entry) => { atlas.icon_add = Some(entry); tracing::info!("Successfully loaded add.svg icon into atlas"); }
+            Err(e) => tracing::warn!("Failed to load add.svg icon: {:?}", e),
+        }
+        match atlas.load_svg_icon("assets/icons/close.svg", 64, queue) {
+            Ok(entry) => { atlas.icon_close = Some(entry); tracing::info!("Successfully loaded close.svg icon into atlas"); }
+            Err(e) => tracing::warn!("Failed to load close.svg icon: {:?}", e),
+        }
+        match atlas.load_svg_icon("assets/icons/copy.svg", 64, queue) {
+            Ok(entry) => { atlas.icon_copy = Some(entry); tracing::info!("Successfully loaded copy.svg icon into atlas"); }
+            Err(e) => tracing::warn!("Failed to load copy.svg icon: {:?}", e),
+        }
+        match atlas.load_svg_icon("assets/icons/paste.svg", 64, queue) {
+            Ok(entry) => { atlas.icon_paste = Some(entry); tracing::info!("Successfully loaded paste.svg icon into atlas"); }
+            Err(e) => tracing::warn!("Failed to load paste.svg icon: {:?}", e),
+        }
+        match atlas.load_svg_icon("assets/icons/settings.svg", 64, queue) {
+            Ok(entry) => { atlas.icon_settings = Some(entry); tracing::info!("Successfully loaded settings.svg icon into atlas"); }
+            Err(e) => tracing::warn!("Failed to load settings.svg icon: {:?}", e),
+        }
+        match atlas.load_svg_icon("assets/icons/text-font.svg", 64, queue) {
+            Ok(entry) => { atlas.icon_text_font = Some(entry); tracing::info!("Successfully loaded text-font.svg icon into atlas"); }
+            Err(e) => tracing::warn!("Failed to load text-font.svg icon: {:?}", e),
+        }
+        match atlas.load_svg_icon("assets/icons/less.svg", 64, queue) {
+            Ok(entry) => { atlas.icon_less = Some(entry); tracing::info!("Successfully loaded less.svg icon into atlas"); }
+            Err(e) => tracing::warn!("Failed to load less.svg icon: {:?}", e),
+        }
+        match atlas.load_svg_icon("assets/icons/maximize.svg", 64, queue) {
+            Ok(entry) => { atlas.icon_maximize = Some(entry); tracing::info!("Successfully loaded maximize.svg icon into atlas"); }
+            Err(e) => tracing::warn!("Failed to load maximize.svg icon: {:?}", e),
         }
 
         tracing::info!(
@@ -666,6 +718,85 @@ impl Atlas {
             Ok(entry)
         } else {
             anyhow::bail!("Failed to allocate space in atlas for custom image")
+        }
+    }
+
+    pub fn load_svg_icon(
+        &mut self,
+        path: &str,
+        target_size: u32,
+        queue: &Queue,
+    ) -> anyhow::Result<AtlasEntry> {
+        let svg_data = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read SVG file at {:?}", path))?;
+        
+        // Convert currentColor to white for stencil rendering
+        let svg_data = svg_data.replace("currentColor", "white");
+
+        let opt = usvg::Options::default();
+        let tree = Tree::from_str(&svg_data, &opt)
+            .context("Failed to parse SVG data")?;
+
+        let mut pixmap = tiny_skia::Pixmap::new(target_size, target_size)
+            .context("Failed to create tiny-skia pixmap")?;
+
+        // Fill with transparent
+        pixmap.fill(tiny_skia::Color::TRANSPARENT);
+
+        let size = tree.size();
+        let scale_x = target_size as f32 / size.width();
+        let scale_y = target_size as f32 / size.height();
+        let scale = scale_x.min(scale_y);
+        
+        let transform = tiny_skia::Transform::from_scale(scale, scale);
+
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+        let rgba = pixmap.data();
+        let w = target_size;
+        let h = target_size;
+
+        let padding = 1;
+        let alloc_w = w + padding * 2;
+        let alloc_h = h + padding * 2;
+
+        if let Some(pos) = self.packer.alloc(alloc_w, alloc_h) {
+            let entry = AtlasEntry {
+                x: (pos.0 + padding) as f32,
+                y: (pos.1 + padding) as f32,
+                width: w as f32,
+                height: h as f32,
+                left: 0.0,
+                top: 0.0,
+                is_color: false, // We use it as stencil (is_color = false)
+            };
+
+            queue.write_texture(
+                wgpu::ImageCopyTextureBase {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: pos.0 + padding,
+                        y: pos.1 + padding,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                rgba,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            Ok(entry)
+        } else {
+            anyhow::bail!("Failed to allocate space in atlas for SVG icon")
         }
     }
 }

@@ -11,6 +11,12 @@ pub use atlas::Atlas;
 pub use cell::CellInstance;
 pub use pipeline::Pipeline;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderReason {
+    CursorBlink,
+    GridChanged,
+}
+
 const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     r: 0.0,
     g: 0.0,
@@ -25,9 +31,12 @@ pub struct Renderer<'a> {
     pub config: SurfaceConfiguration,
     pipeline: Pipeline,
     atlas: Atlas,
+    pub ui_atlas: Atlas,
     cell_width: f32,
     cell_height: f32,
     pub dirty: bool,
+    pub grid_dirty: bool,
+    pub cached_grid_instances: Vec<CellInstance>,
 }
 
 impl<'a> Renderer<'a> {
@@ -98,9 +107,10 @@ impl<'a> Renderer<'a> {
 
         let scale_factor = window.scale_factor() as f32;
         let atlas = Atlas::new(&device, &queue, 2048, 2048, font_family, font_size, scale_factor)?;
+        let ui_atlas = Atlas::new(&device, &queue, 2048, 2048, font_family, 13.0, scale_factor)?;
         let (cell_width, cell_height) = atlas.cell_size();
         tracing::info!("Atlas created with {} entries, cell_size: {}x{}", atlas.entries_len(), cell_width, cell_height);
-        let pipeline = Pipeline::new(&device, &atlas, format);
+        let pipeline = Pipeline::new(&device, &atlas, &ui_atlas, format);
 
         Ok(Self {
             surface,
@@ -109,9 +119,12 @@ impl<'a> Renderer<'a> {
             config,
             pipeline,
             atlas,
+            ui_atlas,
             cell_width,
             cell_height,
             dirty: true,
+            grid_dirty: true,
+            cached_grid_instances: Vec::new(),
         })
     }
 
@@ -123,6 +136,7 @@ impl<'a> Renderer<'a> {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.dirty = true;
+        self.grid_dirty = true;
     }
 
     pub fn update_font(&mut self, font_family: &str, font_size: f32) -> anyhow::Result<()> {
@@ -136,13 +150,24 @@ impl<'a> Renderer<'a> {
             font_size,
             scale_factor,
         )?;
-        let pipeline = Pipeline::new(&self.device, &new_atlas, self.config.format);
+        let new_ui_atlas = Atlas::new(
+            &self.device,
+            &self.queue,
+            2048,
+            2048,
+            font_family,
+            13.0,
+            scale_factor,
+        )?;
+        let pipeline = Pipeline::new(&self.device, &new_atlas, &new_ui_atlas, self.config.format);
         self.atlas = new_atlas;
+        self.ui_atlas = new_ui_atlas;
         self.pipeline = pipeline;
         let (cell_width, cell_height) = self.atlas.cell_size();
         self.cell_width = cell_width;
         self.cell_height = cell_height;
         self.dirty = true;
+        self.grid_dirty = true;
         Ok(())
     }
 
@@ -160,7 +185,9 @@ impl<'a> Renderer<'a> {
 
     pub fn render(
         &mut self,
+        reason: RenderReason,
         terminal: &crate::terminal_state::TerminalState,
+        cursor_visible: bool,
         scrollbar_alpha: f32,
         scroll_current: f32,
         history_size: f32,
@@ -223,9 +250,12 @@ impl<'a> Renderer<'a> {
             });
 
             self.pipeline.render(
+                reason,
                 &mut render_pass,
                 terminal,
+                cursor_visible,
                 &mut self.atlas,
+                &mut self.ui_atlas,
                 self.cell_width,
                 self.cell_height,
                 self.config.width as f32,
@@ -254,6 +284,8 @@ impl<'a> Renderer<'a> {
                 hovered_tab_index,
                 hovered_close_tab_index,
                 hover_new_tab,
+                &mut self.cached_grid_instances,
+                &mut self.grid_dirty,
                 &self.device,
                 &self.queue,
             );

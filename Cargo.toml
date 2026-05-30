@@ -33,6 +33,9 @@ unicode-width = "0.1"
 fontconfig = "0.5"
 image = "0.25"
 arboard = { version = "3", features = ["wayland-data-control"] }
+resvg = "0.47.0"
+usvg = "0.47.0"
+tiny-skia = "0.12.0"
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"

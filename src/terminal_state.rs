@@ -14,7 +14,6 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use crate::config::FontConfig;
 use crate::event_listener::EventListenerProxy;
 
-const PTY_READ_BUF_SIZE: usize = 65536;
 
 pub struct TerminalState {
     term: Arc<ParkingMutex<alacritty_terminal::term::Term<EventListenerProxy>>>,
@@ -97,13 +96,12 @@ impl TerminalState {
         let render_generation = Arc::new(AtomicU64::new(0));
         let render_gen_clone = Arc::clone(&render_generation);
         let term_clone = Arc::clone(&term);
-
         thread::spawn(move || {
             use std::io::Read;
             tracing::info!("PTY reader thread started");
 
             let mut buf = [0u8; 8192];
-            let mut parser = Processor::new();
+            let mut parser: Processor<StdSyncHandler> = Processor::new();
             loop {
                 tracing::debug!("Calling read()...");
                 match reader.read(&mut buf) {
@@ -112,10 +110,17 @@ impl TerminalState {
                         break;
                     }
                     Ok(n) => {
-                        let data = &buf[..n];
-                        tracing::info!("PTY read {} bytes", n);
-                        Self::process_chunk(&term_clone, &mut parser, &render_gen_clone, data);
+                        let mut term_locked = term_clone.lock();
+                        for byte in &buf[..n] {
+                            parser.advance(&mut *term_locked, *byte);
+                        }
+                        drop(term_locked);
+
+                        render_gen_clone.fetch_add(1, Ordering::Relaxed);
                         let _ = proxy.send_event(());
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        continue;
                     }
                     Err(e) => {
                         tracing::error!("PTY read error: {}", e);
@@ -139,26 +144,7 @@ impl TerminalState {
         self.shell_pid
     }
 
-    fn process_chunk(
-        term: &Arc<ParkingMutex<alacritty_terminal::term::Term<EventListenerProxy>>>,
-        parser: &mut Processor<StdSyncHandler>,
-        render_generation: &AtomicU64,
-        chunk: &[u8],
-    ) {
-        if chunk.is_empty() {
-            return;
-        }
-
-        let mut term_locked = term.lock();
-        for byte in chunk {
-            parser.advance(&mut *term_locked, *byte);
-        }
-
-        drop(term_locked);
-        render_generation.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn write_to_pty(&mut self, bytes: &[u8]) {
+    pub fn write_to_pty(&self, bytes: &[u8]) {
         let mut w = self.writer.lock();
         let _ = w.write_all(bytes);
         let _ = w.flush();

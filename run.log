@@ -1,0 +1,67 @@
+build: RELEASE
+[2m2026-05-30T23:16:59.339284Z[0m [32m INFO[0m [2mfasty::config[0m[2m:[0m fasty: loaded config from /home/diegoleteliers/.config/fasty/config.json
+[2m2026-05-30T23:16:59.343162Z[0m [32m INFO[0m [2mfasty[0m[2m:[0m fasty: starting, shell=default
+[2m2026-05-30T23:16:59.343301Z[0m [32m INFO[0m [2mfasty[0m[2m:[0m Initializing EventLoop and Window...
+[2m2026-05-30T23:16:59.416302Z[0m [33m WARN[0m [2msctk_adwaita::buttons[0m[2m:[0m Ignoring unknown button type: icon
+[2m2026-05-30T23:16:59.416681Z[0m [32m INFO[0m [2mfasty[0m[2m:[0m Window created successfully!
+[2m2026-05-30T23:16:59.470932Z[0m [32m INFO[0m [2mfasty[0m[2m:[0m Creating Renderer...
+[2m2026-05-30T23:16:59.501206Z[0m [33m WARN[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m InstanceFlags::VALIDATION requested, but unable to find layer: VK_LAYER_KHRONOS_validation
+[2m2026-05-30T23:16:59.513439Z[0m [32m INFO[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m Debug utils not enabled: debug_utils_user_data not passed to Instance::from_raw
+[2m2026-05-30T23:16:59.522800Z[0m [32m INFO[0m [2mwgpu_hal::gles::egl[0m[2m:[0m Using Wayland platform
+[2m2026-05-30T23:16:59.569865Z[0m [33m WARN[0m [2mwgpu_hal::gles::egl[0m[2m:[0m Re-initializing Gles context due to Wayland window
+[2m2026-05-30T23:16:59.614982Z[0m [32m INFO[0m [2mwgpu_core::instance[0m[2m:[0m Adapter Vulkan AdapterInfo { name: "AMD Radeon Vega 8 Graphics (RADV RAVEN)", vendor: 4098, device: 5592, device_type: IntegratedGpu, driver: "radv", driver_info: "Mesa 26.1.1-arch2.1", backend: Vulkan }
+[2m2026-05-30T23:16:59.621655Z[0m [32m INFO[0m [2mwgpu_core::device::resource[0m[2m:[0m Device::maintain: waiting for submission index 0
+[2m2026-05-30T23:17:00.011078Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded app icon into atlas
+[2m2026-05-30T23:17:00.011969Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded add.svg icon into atlas
+[2m2026-05-30T23:17:00.012204Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded close.svg icon into atlas
+[2m2026-05-30T23:17:00.012539Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded copy.svg icon into atlas
+[2m2026-05-30T23:17:00.012833Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded paste.svg icon into atlas
+[2m2026-05-30T23:17:00.013356Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded settings.svg icon into atlas
+[2m2026-05-30T23:17:00.013628Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded text-font.svg icon into atlas
+[2m2026-05-30T23:17:00.013730Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded less.svg icon into atlas
+[2m2026-05-30T23:17:00.013927Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded maximize.svg icon into atlas
+[2m2026-05-30T23:17:00.013943Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m ATLAS: cell=6.0x13.0, entries=223, atlas=2048x2048
+[2m2026-05-30T23:17:00.356296Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded app icon into atlas
+[2m2026-05-30T23:17:00.356552Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded add.svg icon into atlas
+[2m2026-05-30T23:17:00.356737Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded close.svg icon into atlas
+[2m2026-05-30T23:17:00.357087Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded copy.svg icon into atlas
+[2m2026-05-30T23:17:00.357422Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded paste.svg icon into atlas
+[2m2026-05-30T23:17:00.357865Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded settings.svg icon into atlas
+[2m2026-05-30T23:17:00.358175Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded text-font.svg icon into atlas
+[2m2026-05-30T23:17:00.358301Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded less.svg icon into atlas
+[2m2026-05-30T23:17:00.358487Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m Successfully loaded maximize.svg icon into atlas
+[2m2026-05-30T23:17:00.358517Z[0m [32m INFO[0m [2mfasty::renderer::atlas[0m[2m:[0m ATLAS: cell=8.0x16.0, entries=223, atlas=2048x2048
+[2m2026-05-30T23:17:00.358535Z[0m [32m INFO[0m [2mfasty::renderer[0m[2m:[0m Atlas created with 223 entries, cell_size: 6x13
+[2m2026-05-30T23:17:00.360174Z[0m [32m INFO[0m [2mfasty[0m[2m:[0m Renderer created successfully!
+[2m2026-05-30T23:17:00.364132Z[0m [32m INFO[0m [2mfasty::terminal_state[0m[2m:[0m Cloned PTY reader
+[2m2026-05-30T23:17:00.364191Z[0m [32m INFO[0m [2mfasty::terminal_state[0m[2m:[0m Took PTY writer
+[2m2026-05-30T23:17:00.365105Z[0m [32m INFO[0m [2mfasty[0m[2m:[0m Entering event loop run...
+[2m2026-05-30T23:17:00.365148Z[0m [32m INFO[0m [2mfasty::terminal_state[0m[2m:[0m PTY reader thread started
+[2m2026-05-30T23:17:00.367506Z[0m [32m INFO[0m [2mwgpu_core::device::resource[0m[2m:[0m Device::maintain: waiting for submission index 0
+[2m2026-05-30T23:17:00.368422Z[0m [32m INFO[0m [2mfasty::renderer[0m[2m:[0m Renderer::render executing
+[2m2026-05-30T23:17:00.370925Z[0m [32m INFO[0m [2mwgpu_core::device::resource[0m[2m:[0m Device::maintain: waiting for submission index 0
+render #1 at 5.980886ms
+[2m2026-05-30T23:17:00.387279Z[0m [32m INFO[0m [2mfasty::renderer[0m[2m:[0m Renderer::render executing
+[2m2026-05-30T23:17:00.389818Z[0m [32m INFO[0m [2mwgpu_core::device::resource[0m[2m:[0m Device::maintain: waiting for submission index 1
+render #2 at 19.045171ms
+[2m2026-05-30T23:17:00.533515Z[0m [32m INFO[0m [2mfasty::renderer[0m[2m:[0m Renderer::render executing
+[2m2026-05-30T23:17:00.535565Z[0m [32m INFO[0m [2mwgpu_core::device::resource[0m[2m:[0m Device::maintain: waiting for submission index 2
+render #3 at 145.434731ms
+[2m2026-05-30T23:17:00.551817Z[0m [32m INFO[0m [2mfasty::renderer[0m[2m:[0m Renderer::render executing
+[2m2026-05-30T23:17:00.552794Z[0m [32m INFO[0m [2mwgpu_core::device::resource[0m[2m:[0m Device::maintain: waiting for submission index 3
+render #4 at 17.150251ms
+[2m2026-05-30T23:17:00.569020Z[0m [32m INFO[0m [2mfasty::renderer[0m[2m:[0m Renderer::render executing
+[2m2026-05-30T23:17:00.569813Z[0m [32m INFO[0m [2mwgpu_core::device::resource[0m[2m:[0m Device::maintain: waiting for submission index 4
+render #5 at 16.965377ms
+[2m2026-05-30T23:17:00.586038Z[0m [32m INFO[0m [2mfasty::renderer[0m[2m:[0m Renderer::render executing
+[2m2026-05-30T23:17:00.587026Z[0m [32m INFO[0m [2mwgpu_core::device::resource[0m[2m:[0m Device::maintain: waiting for submission index 5
+render #6 at 17.234642ms
+[2m2026-05-30T23:17:00.603347Z[0m [32m INFO[0m [2mfasty::renderer[0m[2m:[0m Renderer::render executing
+[2m2026-05-30T23:17:00.612410Z[0m [32m INFO[0m [2mwgpu_core::device::resource[0m[2m:[0m Device::maintain: waiting for submission index 6
+render #7 at 25.306132ms
+[2m2026-05-30T23:17:01.588457Z[0m [32m INFO[0m [2mfasty::renderer[0m[2m:[0m Renderer::render executing
+[2m2026-05-30T23:17:01.588967Z[0m [32m INFO[0m [2mwgpu_core::device::resource[0m[2m:[0m Device::maintain: waiting for submission index 7
+render #8 at 976.554086ms
+[2m2026-05-30T23:17:02.088483Z[0m [32m INFO[0m [2mfasty::renderer[0m[2m:[0m Renderer::render executing
+[2m2026-05-30T23:17:02.089144Z[0m [32m INFO[0m [2mwgpu_core::device::resource[0m[2m:[0m Device::maintain: waiting for submission index 8
+render #9 at 500.0681ms

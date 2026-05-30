@@ -8,8 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use config::Config;
-use renderer::Renderer;
-use renderer::Selection;
+use renderer::{Renderer, Selection, RenderReason};
 use terminal_state::TerminalState;
 use tracing_subscriber::util::SubscriberInitExt;
 use alacritty_terminal::grid::Dimensions;
@@ -49,6 +48,7 @@ struct Tab {
     last_activity_time: std::time::Instant,
     last_actual_offset: usize,
     last_scroll_diff: isize,
+    cursor_visible: bool,
 }
 
 fn create_new_tab(
@@ -83,6 +83,7 @@ fn create_new_tab(
         last_activity_time: std::time::Instant::now(),
         last_actual_offset: 0,
         last_scroll_diff: 0,
+        cursor_visible: true,
     })
 }
 
@@ -139,6 +140,12 @@ fn get_last_path_component(path_str: &str) -> String {
 }
 
 fn main() -> anyhow::Result<()> {
+    eprintln!("build: {}", if cfg!(debug_assertions) { "DEBUG" } else { "RELEASE" });
+    std::env::set_var("TERM", "xterm-256color");
+    std::env::set_var("COLORTERM", "truecolor");
+    std::env::set_var("TERM_PROGRAM", "fasty");
+    std::env::set_var("TERM_PROGRAM_VERSION", "0.1.0");
+
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .init();
@@ -161,7 +168,7 @@ fn main() -> anyhow::Result<()> {
         .with_title("fasty")
         .with_decorations(false)
         .with_transparent(true)
-        .with_inner_size(winit::dpi::LogicalSize::new(1200.0, 800.0)))?;
+        .with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0)))?;
     tracing::info!("Window created successfully!");
 
     // Load and set the window icon at runtime for the taskbar/desktop bar
@@ -232,6 +239,7 @@ fn main() -> anyhow::Result<()> {
     let mut context_menu_open_time: Option<std::time::Instant> = None;
     let mut context_menu_open_time_secs: Option<f32> = None;
     let mut last_scroll_event_time: Option<std::time::Instant> = None;
+    let mut mouse_down_button: Option<winit::event::MouseButton> = None;
 
     // Hover states for main window topbar buttons
     let mut hover_close = false;
@@ -265,12 +273,19 @@ fn main() -> anyhow::Result<()> {
     let mut s_mouse_x = 0.0f64;
     let mut s_mouse_y = 0.0f64;
     let mut first_frame_rendered = false;
+    let mut app_dirty = true;
+    let mut last_render_time = std::time::Instant::now();
+    let mut frame_count = 0;
+    let mut last_blink_index = 0;
+    let mut next_render_reason = RenderReason::GridChanged;
+
     tracing::info!("Entering event loop run...");
+    event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     event_loop.run(move |event, target| {
         match event {
             winit::event::Event::UserEvent(()) => {
-                renderer.lock().set_dirty(true);
-                window_for_redraw.request_redraw();
+                app_dirty = true;
+                renderer.lock().grid_dirty = true;
             }
             winit::event::Event::WindowEvent { window_id, event } => {
                 if window_id == window_for_redraw.id() {
@@ -289,8 +304,7 @@ fn main() -> anyhow::Result<()> {
                             let mut r = renderer.lock();
                             r.resize(physical_size.width, physical_size.height);
                             drop(r);
-                            renderer.lock().set_dirty(true);
-                            window_for_redraw.request_redraw();
+                            app_dirty = true;
                         }
                         WindowEvent::RedrawRequested => {
                             first_frame_rendered = true;
@@ -328,8 +342,12 @@ fn main() -> anyhow::Result<()> {
                             let last_activity_time_secs = active_tab.last_activity_time.saturating_duration_since(start_time).as_secs_f32();
                             let current_time = start_time.elapsed().as_secs_f32();
 
-                            renderer.lock().render(
+                            let mut r = renderer.lock();
+                            r.set_dirty(true);
+                            r.render(
+                                next_render_reason,
                                 term_ref,
+                                active_tab.cursor_visible,
                                 scrollbar_alpha,
                                 active_tab.scroll_current,
                                 max_history,
@@ -355,6 +373,11 @@ fn main() -> anyhow::Result<()> {
                                 hovered_close_tab_index,
                                 hover_new_tab,
                             );
+                            drop(r);
+
+                            frame_count += 1;
+                            eprintln!("render #{} at {:?}", frame_count, last_render_time.elapsed());
+                            last_render_time = std::time::Instant::now();
                         }
                         WindowEvent::ModifiersChanged(modified) => {
                             modifiers = modified.state();
@@ -373,8 +396,10 @@ fn main() -> anyhow::Result<()> {
                             );
                             if tabs[active_tab_index].hovered_url != new_hover {
                                 tabs[active_tab_index].hovered_url = new_hover;
-                                renderer.lock().set_dirty(true);
-                                window_for_redraw.request_redraw();
+                                let mut r = renderer.lock();
+                                r.set_dirty(true);
+                                r.grid_dirty = true;
+                                app_dirty = true;
                             }
                         }
                         WindowEvent::KeyboardInput { event, .. } => {
@@ -402,6 +427,7 @@ fn main() -> anyhow::Result<()> {
                             let alt_active = modifiers.alt_key() || alt_held;
 
                             tabs[active_tab_index].last_activity_time = std::time::Instant::now();
+                            tabs[active_tab_index].cursor_visible = true;
 
                             let padding_top = get_padding_top(tabs.len());
 
@@ -419,8 +445,10 @@ fn main() -> anyhow::Result<()> {
                             );
                             if tabs[active_tab_index].hovered_url != new_hover {
                                 tabs[active_tab_index].hovered_url = new_hover;
-                                renderer.lock().set_dirty(true);
-                                window_for_redraw.request_redraw();
+                                let mut r = renderer.lock();
+                                r.set_dirty(true);
+                                r.grid_dirty = true;
+                                app_dirty = true;
                             }
 
                             if !pressed {
@@ -462,9 +490,10 @@ fn main() -> anyhow::Result<()> {
                                         let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
                                         shell_cols = cols;
                                         shell_rows = rows;
-                                        
-                                        renderer.lock().set_dirty(true);
-                                        window_for_redraw.request_redraw();
+                                        let mut r = renderer.lock();
+                                        r.set_dirty(true);
+                                        r.grid_dirty = true;
+                                        app_dirty = true;
                                     }
                                     Err(e) => {
                                         tracing::error!("Failed to create new tab: {:?}", e);
@@ -491,8 +520,10 @@ fn main() -> anyhow::Result<()> {
                                     shell_cols = cols;
                                     shell_rows = rows;
                                     
-                                    renderer.lock().set_dirty(true);
-                                    window_for_redraw.request_redraw();
+                                    let mut r = renderer.lock();
+                                    r.set_dirty(true);
+                                    r.grid_dirty = true;
+                                    app_dirty = true;
                                 }
                                 return;
                             }
@@ -509,8 +540,10 @@ fn main() -> anyhow::Result<()> {
                             if ctrl_active && !shift_active && (is_tab_key || is_page_down_key) {
                                 if tabs.len() > 1 {
                                     active_tab_index = (active_tab_index + 1) % tabs.len();
-                                    renderer.lock().set_dirty(true);
-                                    window_for_redraw.request_redraw();
+                                    let mut r = renderer.lock();
+                                    r.set_dirty(true);
+                                    r.grid_dirty = true;
+                                    app_dirty = true;
                                 }
                                 return;
                             }
@@ -527,8 +560,10 @@ fn main() -> anyhow::Result<()> {
                                     } else {
                                         active_tab_index -= 1;
                                     }
-                                    renderer.lock().set_dirty(true);
-                                    window_for_redraw.request_redraw();
+                                    let mut r = renderer.lock();
+                                    r.set_dirty(true);
+                                    r.grid_dirty = true;
+                                    app_dirty = true;
                                 }
                                 return;
                             }
@@ -537,11 +572,13 @@ fn main() -> anyhow::Result<()> {
                             if alt_active && !ctrl_active && !shift_active {
                                 if let Some(digit_char) = key_str.chars().next() {
                                     if digit_char.is_ascii_digit() && digit_char != '0' {
-                                        let target_idx = (digit_char as usize - '1' as usize);
+                                        let target_idx = digit_char as usize - '1' as usize;
                                         if target_idx < tabs.len() {
                                             active_tab_index = target_idx;
-                                            renderer.lock().set_dirty(true);
-                                            window_for_redraw.request_redraw();
+                                            let mut r = renderer.lock();
+                                            r.set_dirty(true);
+                                            r.grid_dirty = true;
+                                            app_dirty = true;
                                             return;
                                         }
                                     }
@@ -621,6 +658,7 @@ fn main() -> anyhow::Result<()> {
                         WindowEvent::MouseInput { state, button, .. } => {
                             let padding_top = get_padding_top(tabs.len());
                             tabs[active_tab_index].last_activity_time = std::time::Instant::now();
+                            tabs[active_tab_index].cursor_visible = true;
 
                             if context_menu_visible {
                                 let pressed = state == ElementState::Pressed;
@@ -753,7 +791,7 @@ fn main() -> anyhow::Result<()> {
                                             
                                             context_menu_hovered_idx = None;
                                             renderer.lock().set_dirty(true);
-                                            window_for_redraw.request_redraw();
+                                            app_dirty = true;
                                             return;
                                         }
                                     }
@@ -761,10 +799,50 @@ fn main() -> anyhow::Result<()> {
                                     context_menu_open_time = None;
                                     context_menu_open_time_secs = None;
                                     context_menu_hovered_idx = None;
-                                    renderer.lock().set_dirty(true);
-                                    window_for_redraw.request_redraw();
+                                    let mut r = renderer.lock();
+                                    r.set_dirty(true);
+                                    r.grid_dirty = true;
+                                    app_dirty = true;
                                 }
                                 return;
+                            }
+
+                            if state == ElementState::Pressed {
+                                mouse_down_button = Some(button);
+                            } else {
+                                mouse_down_button = None;
+                            }
+
+                            let r = renderer.lock();
+                            let v_width = r.config.width as f64;
+                            drop(r);
+                            let padding_top = get_padding_top(tabs.len());
+                            let is_in_terminal_area = current_mouse_y > padding_top as f64 && current_mouse_x <= (v_width - 20.0);
+
+                            if is_in_terminal_area {
+                                let term_guard = tabs[active_tab_index].terminal_state.lock();
+                                let mode = *term_guard.term().lock().mode();
+                                let tui_owns_mouse = mode.intersects(
+                                    alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
+                                    | alacritty_terminal::term::TermMode::MOUSE_MOTION  
+                                    | alacritty_terminal::term::TermMode::SGR_MOUSE
+                                    | alacritty_terminal::term::TermMode::MOUSE_DRAG
+                                );
+                                drop(term_guard);
+
+                                let shift_active = modifiers.shift_key() || shift_held;
+
+                                if tui_owns_mouse && !shift_active {
+                                    let col = (((current_mouse_x as f32 - 10.0) / cell_width).floor() as i32)
+                                        .clamp(0, shell_cols as i32 - 1) as usize;
+                                    let row = (((current_mouse_y as f32 - padding_top) / cell_height).floor() as i32)
+                                        .clamp(0, shell_rows as i32 - 1) as usize;
+                                    let term_state = tabs[active_tab_index].terminal_state.lock();
+                                    let mode = *term_state.term().lock().mode();
+                                    send_mouse_event_to_pty(&term_state, button, state, col, row, mode);
+                                    drop(term_state);
+                                    return;
+                                }
                             }
 
                             if button == MouseButton::Left {
@@ -812,7 +890,7 @@ fn main() -> anyhow::Result<()> {
                                                      let sw_arc = Arc::new(sw);
                                                      let sw_ref: &winit::window::Window = &*sw_arc;
                                                      let sw_static: &'static winit::window::Window = unsafe { std::mem::transmute(sw_ref) };
-                                                     if let Ok(sr) = pollster::block_on(Renderer::new(sw_static, &settings_family, settings_size)) {
+                                                     if let Ok(sr) = pollster::block_on(Renderer::new(sw_static, &settings_family, 13.0)) {
                                                          settings_renderer = Some(sr);
                                                      }
                                                      settings_window = Some(sw_arc);
@@ -821,7 +899,7 @@ fn main() -> anyhow::Result<()> {
                                                  settings_window = None;
                                                  settings_renderer = None;
                                              }
-                                             window_for_redraw.request_redraw();
+                                             app_dirty = true;
                                              return;
                                          }
 
@@ -866,8 +944,10 @@ fn main() -> anyhow::Result<()> {
                                                  } else {
                                                      active_tab_index = clicked_tab_idx;
                                                  }
-                                                 renderer.lock().set_dirty(true);
-                                                 window_for_redraw.request_redraw();
+                                                 let mut r = renderer.lock();
+                                                 r.set_dirty(true);
+                                                 r.grid_dirty = true;
+                                                 app_dirty = true;
                                              }
                                              return;
                                          }
@@ -903,8 +983,10 @@ fn main() -> anyhow::Result<()> {
                                                      tracing::error!("Failed to create new tab: {:?}", e);
                                                  }
                                              }
-                                             renderer.lock().set_dirty(true);
-                                             window_for_redraw.request_redraw();
+                                             let mut r = renderer.lock();
+                                             r.set_dirty(true);
+                                             r.grid_dirty = true;
+                                             app_dirty = true;
                                              return;
                                          }
 
@@ -930,7 +1012,20 @@ fn main() -> anyhow::Result<()> {
                                      }
 
                                     let scrollbar_top_margin = padding_top - 10.0;
-                                    let is_hovering_scrollbar = current_mouse_y > scrollbar_top_margin as f64 && current_mouse_x > (v_width - 20.0);
+                                    let show_scrollbar = {
+                                        let term_guard = tabs[active_tab_index].terminal_state.lock();
+                                        let mode = *term_guard.term().lock().mode();
+                                        drop(term_guard);
+                                        let tui_owns_mouse = mode.intersects(
+                                            alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
+                                            | alacritty_terminal::term::TermMode::MOUSE_MOTION
+                                            | alacritty_terminal::term::TermMode::SGR_MOUSE
+                                            | alacritty_terminal::term::TermMode::MOUSE_DRAG
+                                        );
+                                        let alt_screen_active = mode.contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
+                                        !tui_owns_mouse && !alt_screen_active
+                                    };
+                                    let is_hovering_scrollbar = show_scrollbar && current_mouse_y > scrollbar_top_margin as f64 && current_mouse_x > (v_width - 20.0);
                                     if is_hovering_scrollbar {
                                         let term = tabs[active_tab_index].terminal_state.lock();
                                         let history_size = term.history_size() as f32;
@@ -962,7 +1057,7 @@ fn main() -> anyhow::Result<()> {
 
                                                 is_dragging_scrollbar = true;
                                                 scrollbar_drag_offset_y = thumb_h / 2.0;
-                                                window_for_redraw.request_redraw();
+                                                app_dirty = true;
                                             }
                                         }
                                     } else if modifiers.control_key() || ctrl_held {
@@ -1042,13 +1137,15 @@ fn main() -> anyhow::Result<()> {
                                                 std::time::Instant::now(),
                                             ));
                                             renderer.lock().set_dirty(true);
-                                            window_for_redraw.request_redraw();
+                                            app_dirty = true;
                                         }
                                     } else if tabs[active_tab_index].selection_start_pos.is_some() {
                                         // Simple click release (no drag occurred): clear selection
                                         tabs[active_tab_index].selection = None;
-                                        renderer.lock().set_dirty(true);
-                                        window_for_redraw.request_redraw();
+                                        let mut r = renderer.lock();
+                                        r.set_dirty(true);
+                                        r.grid_dirty = true;
+                                        app_dirty = true;
                                     }
                                     tabs[active_tab_index].selection_start_pos = None;
                                 }
@@ -1081,7 +1178,7 @@ fn main() -> anyhow::Result<()> {
                                         context_menu_visible = true;
                                         context_menu_hovered_idx = None;
                                         renderer.lock().set_dirty(true);
-                                        window_for_redraw.request_redraw();
+                                        app_dirty = true;
                                     }
                                 }
                             }
@@ -1103,7 +1200,7 @@ fn main() -> anyhow::Result<()> {
                                     context_menu_hovered_idx = None;
                                 }
                                 renderer.lock().set_dirty(true);
-                                window_for_redraw.request_redraw();
+                                app_dirty = true;
                             }
 
                             let r = renderer.lock();
@@ -1113,6 +1210,38 @@ fn main() -> anyhow::Result<()> {
 
                             let padding_top = get_padding_top(tabs.len());
                             let is_in_terminal_area = current_mouse_y > padding_top as f64 && current_mouse_x <= (v_width - 20.0);
+
+                            let (tui_owns_mouse, shift_active, term_mode) = if is_in_terminal_area {
+                                let term_guard = tabs[active_tab_index].terminal_state.lock();
+                                let mode = *term_guard.term().lock().mode();
+                                let tui_owns = mode.intersects(
+                                    alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
+                                    | alacritty_terminal::term::TermMode::MOUSE_MOTION  
+                                    | alacritty_terminal::term::TermMode::SGR_MOUSE
+                                    | alacritty_terminal::term::TermMode::MOUSE_DRAG
+                                );
+                                drop(term_guard);
+                                let shift = modifiers.shift_key() || shift_held;
+                                (tui_owns, shift, Some(mode))
+                            } else {
+                                (false, false, None)
+                            };
+
+                            if is_in_terminal_area && tui_owns_mouse && !shift_active {
+                                if let Some(mode) = term_mode {
+                                    let col = (((current_mouse_x as f32 - 10.0) / cell_width).floor() as i32)
+                                        .clamp(0, shell_cols as i32 - 1) as usize;
+                                    let row = (((current_mouse_y as f32 - padding_top) / cell_height).floor() as i32)
+                                        .clamp(0, shell_rows as i32 - 1) as usize;
+                                    
+                                    let term_state = tabs[active_tab_index].terminal_state.lock();
+                                    send_drag_event_to_pty(&term_state, mouse_down_button, col, row, mode);
+                                    drop(term_state);
+                                }
+                                window_for_redraw.set_cursor(winit::window::CursorIcon::Default);
+                                return;
+                            }
+
                             let is_dragging_anything = tabs[active_tab_index].is_dragging || is_dragging_scrollbar || tabs[active_tab_index].selection_start_pos.is_some();
                             const RESIZE_BORDER_WIDTH: f64 = 8.0;
                              
@@ -1196,7 +1325,7 @@ fn main() -> anyhow::Result<()> {
                                 || hover_new_tab != old_hover_new
                             {
                                 renderer.lock().set_dirty(true);
-                                window_for_redraw.request_redraw();
+                                app_dirty = true;
                             }
 
                             if is_dragging_scrollbar {
@@ -1219,7 +1348,7 @@ fn main() -> anyhow::Result<()> {
                                         tabs[active_tab_index].scroll_target = scroll_ratio * history_size;
                                     }
                                 }
-                                window_for_redraw.request_redraw();
+                                app_dirty = true;
                             } else if let Some((sx, sy)) = tabs[active_tab_index].selection_start_pos {
                                 if !tabs[active_tab_index].is_selecting_text {
                                     let dist = ((current_mouse_x - sx).powi(2) + (current_mouse_y - sy).powi(2)).sqrt();
@@ -1253,8 +1382,10 @@ fn main() -> anyhow::Result<()> {
                                             padding_top,
                                         );
                                         tabs[active_tab_index].selection = Some(Selection { start: start_point, end: current_point });
-                                        renderer.lock().set_dirty(true);
-                                        window_for_redraw.request_redraw();
+                                        let mut r = renderer.lock();
+                                        r.set_dirty(true);
+                                        r.grid_dirty = true;
+                                        app_dirty = true;
                                     }
                                 } else {
                                     let term = tabs[active_tab_index].terminal_state.lock();
@@ -1276,8 +1407,10 @@ fn main() -> anyhow::Result<()> {
                                     if let Some(ref mut sel) = tabs[active_tab_index].selection {
                                         if sel.end != current_point {
                                             sel.end = current_point;
-                                            renderer.lock().set_dirty(true);
-                                            window_for_redraw.request_redraw();
+                                            let mut r = renderer.lock();
+                                            r.set_dirty(true);
+                                            r.grid_dirty = true;
+                                            app_dirty = true;
                                         }
                                     }
                                 }
@@ -1286,7 +1419,7 @@ fn main() -> anyhow::Result<()> {
                                 let delta_lines = (delta_y as f32 / cell_height) * drag_speed;
                                 let max_history = tabs[active_tab_index].terminal_state.lock().history_size() as f32;
                                 tabs[active_tab_index].scroll_target = (tabs[active_tab_index].scroll_target + delta_lines).clamp(0.0, max_history);
-                                window_for_redraw.request_redraw();
+                                app_dirty = true;
                             }
 
                             let new_hover = detect_hovered_url(
@@ -1303,8 +1436,10 @@ fn main() -> anyhow::Result<()> {
                             );
                             if tabs[active_tab_index].hovered_url != new_hover {
                                 tabs[active_tab_index].hovered_url = new_hover;
-                                renderer.lock().set_dirty(true);
-                                window_for_redraw.request_redraw();
+                                let mut r = renderer.lock();
+                                r.set_dirty(true);
+                                r.grid_dirty = true;
+                                app_dirty = true;
                             }
                         }
                         WindowEvent::MouseWheel { delta, .. } => {
@@ -1326,8 +1461,53 @@ fn main() -> anyhow::Result<()> {
                                 MouseScrollDelta::PixelDelta(_) => lines,
                             };
 
-                            tabs[active_tab_index].scroll_target = (tabs[active_tab_index].scroll_target + delta_scroll).clamp(0.0, max_history);
-                            window_for_redraw.request_redraw();
+                            let r = renderer.lock();
+                            let v_width = r.config.width as f64;
+                            drop(r);
+                            let padding_top = get_padding_top(tabs.len());
+                            let is_in_term = current_mouse_y > padding_top as f64 && current_mouse_x <= (v_width - 20.0);
+
+                            let shift_active = modifiers.shift_key() || shift_held;
+
+                            if lines != 0.0 && !shift_active {
+                                let term_state = tabs[active_tab_index].terminal_state.lock();
+                                let (has_sgr, has_click) = {
+                                    let term_locked = term_state.term().lock();
+                                    let mode = term_locked.mode();
+                                    (
+                                        mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE),
+                                        mode.contains(alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK),
+                                    )
+                                };
+
+                                if is_in_term && (has_sgr || has_click) {
+                                    let padding_top = get_padding_top(tabs.len());
+                                    let col = (((current_mouse_x as f32 - 10.0) / cell_width).floor() as i32)
+                                        .clamp(0, shell_cols as i32 - 1) + 1;
+                                    let row = (((current_mouse_y as f32 - padding_top) / cell_height).floor() as i32)
+                                        .clamp(0, shell_rows as i32 - 1) + 1;
+
+                                    if has_sgr {
+                                        let seq = if lines > 0.0 {
+                                            format!("\x1b[<64;{};{}M", col, row)
+                                        } else {
+                                            format!("\x1b[<65;{};{}M", col, row)
+                                        };
+                                        term_state.write_to_pty(seq.as_bytes());
+                                    } else {
+                                        let btn = if lines > 0.0 { 96 } else { 97 };
+                                        let col_byte = (col.clamp(1, 223) as u8) + 32;
+                                        let row_byte = (row.clamp(1, 223) as u8) + 32;
+                                        term_state.write_to_pty(&[0x1b, b'[', b'M', btn, col_byte, row_byte]);
+                                    }
+                                } else {
+                                    drop(term_state);
+                                    tabs[active_tab_index].scroll_target = (tabs[active_tab_index].scroll_target + delta_scroll).clamp(0.0, max_history);
+                                }
+                            } else {
+                                tabs[active_tab_index].scroll_target = (tabs[active_tab_index].scroll_target + delta_scroll).clamp(0.0, max_history);
+                            }
+                            app_dirty = true;
                         }
                         WindowEvent::CursorLeft { .. } => {
                             window_for_redraw.set_cursor(winit::window::CursorIcon::Default);
@@ -1347,7 +1527,7 @@ fn main() -> anyhow::Result<()> {
 
                             if old_hover_close || old_hover_max || old_hover_min || old_hover_settings || url_changed {
                                 renderer.lock().set_dirty(true);
-                                window_for_redraw.request_redraw();
+                                app_dirty = true;
                             }
                         }
                         WindowEvent::Focused(focused) => {
@@ -1366,7 +1546,7 @@ fn main() -> anyhow::Result<()> {
 
                                 if old_hover_close || old_hover_max || old_hover_min || old_hover_settings {
                                     renderer.lock().set_dirty(true);
-                                    window_for_redraw.request_redraw();
+                                    app_dirty = true;
                                 }
                             }
                         }
@@ -1389,6 +1569,11 @@ fn main() -> anyhow::Result<()> {
                                 if let Err(e) = renderer.lock().update_font(&config.font.family, config.font.size) {
                                     tracing::error!("Failed to update renderer font: {:?}", e);
                                 }
+                                
+                                // Apply font family update to the settings renderer as well, but at fixed font size 13.0
+                                if let Some(ref mut sr) = settings_renderer {
+                                    let _ = sr.update_font(&settings_family, 13.0);
+                                }
 
                                 // Apply new scrollback limit to all existing terminal state instances!
                                 for tab in &tabs {
@@ -1405,7 +1590,7 @@ fn main() -> anyhow::Result<()> {
                                 cell_width = cell_w;
                                 cell_height = cell_h;
 
-                                window_for_redraw.request_redraw();
+                                app_dirty = true;
                             }
                         }
 
@@ -1413,7 +1598,7 @@ fn main() -> anyhow::Result<()> {
                             WindowEvent::CloseRequested => {
                                 settings_window = None;
                                 settings_renderer = None;
-                                window_for_redraw.request_redraw();
+                                app_dirty = true;
                             }
                             WindowEvent::Resized(size) => {
                                 if let Some(ref mut r) = settings_renderer {
@@ -1499,7 +1684,7 @@ fn main() -> anyhow::Result<()> {
                                     if s_hover_close || s_hover_cancel {
                                         settings_window = None;
                                         settings_renderer = None;
-                                        window_for_redraw.request_redraw();
+                                        app_dirty = true;
                                     } else if s_mouse_y <= 36.0 {
                                         let _ = sw.drag_window();
                                     } else if s_hover_family {
@@ -1536,7 +1721,7 @@ fn main() -> anyhow::Result<()> {
                                     } else if s_hover_save {
                                         settings_window = None;
                                         settings_renderer = None;
-                                        window_for_redraw.request_redraw();
+                                        app_dirty = true;
                                     } else {
                                         settings_active_field = 0;
                                     }
@@ -1626,6 +1811,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             winit::event::Event::AboutToWait => {
+                let now = std::time::Instant::now();
                 if !first_frame_rendered {
                     first_frame_rendered = true;
                     // Force render the first frame directly to commit the Wayland buffer and map the window!
@@ -1662,9 +1848,12 @@ fn main() -> anyhow::Result<()> {
                     let last_activity_time_secs = active_tab.last_activity_time.saturating_duration_since(start_time).as_secs_f32();
                     let current_time = start_time.elapsed().as_secs_f32();
 
-                    renderer.lock().set_dirty(true);
-                    renderer.lock().render(
+                    let mut r = renderer.lock();
+                    r.set_dirty(true);
+                    r.render(
+                        next_render_reason,
                         term_ref,
+                        active_tab.cursor_visible,
                         scrollbar_alpha,
                         active_tab.scroll_current,
                         max_history,
@@ -1690,9 +1879,12 @@ fn main() -> anyhow::Result<()> {
                         hovered_close_tab_index,
                         hover_new_tab,
                     );
+                    drop(r);
+                    last_render_time = now;
+                    app_dirty = false;
                 }
 
-                let mut needs_redraw = false;
+                let mut animating = false;
 
                 for (idx, tab) in tabs.iter_mut().enumerate() {
                     let term = tab.terminal_state.lock();
@@ -1706,7 +1898,8 @@ fn main() -> anyhow::Result<()> {
                             tab.scroll_target += pty_change;
                             tab.scroll_current += pty_change;
                             if idx == active_tab_index {
-                                needs_redraw = true;
+                                app_dirty = true;
+                                renderer.lock().grid_dirty = true;
                             }
                         }
                     }
@@ -1726,11 +1919,17 @@ fn main() -> anyhow::Result<()> {
                             current_scroll_diff = scroll_diff;
                         }
                         if idx == active_tab_index {
-                            renderer.lock().set_dirty(true);
-                            needs_redraw = true;
+                            animating = true;
+                            renderer.lock().grid_dirty = true;
                         }
                     } else {
-                        tab.scroll_current = tab.scroll_target;
+                        if tab.scroll_current != tab.scroll_target {
+                            tab.scroll_current = tab.scroll_target;
+                            if idx == active_tab_index {
+                                renderer.lock().grid_dirty = true;
+                                app_dirty = true;
+                            }
+                        }
                     }
 
                     tab.last_actual_offset = term.display_offset();
@@ -1742,9 +1941,10 @@ fn main() -> anyhow::Result<()> {
                     let current_rg = rg.load(Ordering::Relaxed);
                     if current_rg != last_rg {
                         tab.last_activity_time = std::time::Instant::now();
+                        tab.cursor_visible = true;
                         if idx == active_tab_index {
-                            renderer.lock().set_dirty(true);
-                            needs_redraw = true;
+                            app_dirty = true;
+                            renderer.lock().grid_dirty = true;
                         }
                     }
                 }
@@ -1754,26 +1954,33 @@ fn main() -> anyhow::Result<()> {
                 let padding_top = get_padding_top(tabs.len());
                 let scrollbar_top_margin = padding_top - 10.0;
                 
-                let now = std::time::Instant::now();
+                let show_scrollbar = {
+                    let term_guard = tabs[active_tab_index].terminal_state.lock();
+                    let mode = *term_guard.term().lock().mode();
+                    drop(term_guard);
+                    let tui_owns_mouse = mode.intersects(
+                        alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
+                        | alacritty_terminal::term::TermMode::MOUSE_MOTION
+                        | alacritty_terminal::term::TermMode::SGR_MOUSE
+                        | alacritty_terminal::term::TermMode::MOUSE_DRAG
+                    );
+                    let alt_screen_active = mode.contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
+                    !tui_owns_mouse && !alt_screen_active
+                };
+
                 let is_scrolling_recently = if let Some(scroll_time) = last_scroll_event_time {
-                    if now.duration_since(scroll_time) < std::time::Duration::from_millis(1500) {
-                        needs_redraw = true; // force redraw to check timer until it expires
-                        true
-                    } else {
-                        false
-                    }
+                    now.duration_since(scroll_time) < std::time::Duration::from_millis(1500)
                 } else {
                     false
                 };
 
-                let is_hovering = (current_mouse_y > scrollbar_top_margin as f64 && current_mouse_x > (v_width - 20.0)) || is_dragging_scrollbar;
-                let target_alpha = if is_hovering || is_scrolling_recently { 1.0 } else { 0.0 };
+                let is_hovering = show_scrollbar && ((current_mouse_y > scrollbar_top_margin as f64 && current_mouse_x > (v_width - 20.0)) || is_dragging_scrollbar);
+                let target_alpha = if show_scrollbar && (is_hovering || is_scrolling_recently) { 1.0 } else { 0.0 };
 
                 let alpha_diff = target_alpha - scrollbar_alpha;
                 if alpha_diff.abs() > 0.01 {
                     scrollbar_alpha += alpha_diff * 0.15;
-                    renderer.lock().set_dirty(true);
-                    needs_redraw = true;
+                    animating = true;
                 } else {
                     scrollbar_alpha = target_alpha;
                 }
@@ -1782,41 +1989,90 @@ fn main() -> anyhow::Result<()> {
                 if context_menu_visible {
                     if let Some(open_time) = context_menu_open_time {
                         if open_time.elapsed() < std::time::Duration::from_millis(80) {
-                            renderer.lock().set_dirty(true);
-                            needs_redraw = true;
+                            animating = true;
                         }
                     }
-                }
-
-                // If active tab cursor is idle, force redraw to animate its pulsing
-                let cursor_is_active = std::time::Instant::now().duration_since(tabs[active_tab_index].last_activity_time) < std::time::Duration::from_millis(500);
-                if !cursor_is_active {
-                    renderer.lock().set_dirty(true);
-                    needs_redraw = true;
                 }
 
                 // Toast auto-clear and redraw management
                 if let Some((_, start_time)) = toast {
                     if start_time.elapsed() < std::time::Duration::from_millis(1920) {
-                        renderer.lock().set_dirty(true);
-                        needs_redraw = true;
+                        animating = true;
                     } else {
                         toast = None;
-                        renderer.lock().set_dirty(true);
-                        needs_redraw = true;
+                        app_dirty = true;
                     }
                 }
 
-                if needs_redraw || renderer.lock().dirty {
-                    window_for_redraw.request_redraw();
+                if animating {
+                    app_dirty = true;
                 }
 
-                // Control flow adjustment
-                if needs_redraw {
-                    target.set_control_flow(winit::event_loop::ControlFlow::Poll);
-                } else if cursor_is_active {
-                    let wake_time = tabs[active_tab_index].last_activity_time + std::time::Duration::from_millis(500);
-                    target.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(wake_time));
+                let mut next_wakeup = None;
+                let frame_time = std::time::Duration::from_millis(16);
+
+                if app_dirty {
+                    let elapsed = last_render_time.elapsed();
+                    if elapsed >= frame_time {
+                        next_render_reason = RenderReason::GridChanged;
+                        window_for_redraw.request_redraw();
+                        app_dirty = false;
+                        if animating {
+                            next_wakeup = Some(now + frame_time);
+                        }
+                    } else {
+                        next_wakeup = Some(last_render_time + frame_time);
+                    }
+                }
+
+                if next_wakeup.is_none() {
+                    // Check cursor blink wakeup
+                    let activity_end_time = tabs[active_tab_index].last_activity_time + std::time::Duration::from_millis(500);
+                    if now >= activity_end_time {
+                        // Cursor is idle and blinking.
+                        let idle_time = now.duration_since(activity_end_time);
+                        let idle_ms = idle_time.as_millis();
+                        
+                        let current_blink_index = idle_ms / 500;
+                        if current_blink_index != last_blink_index {
+                            last_blink_index = current_blink_index;
+                            tabs[active_tab_index].cursor_visible = !tabs[active_tab_index].cursor_visible;
+                            next_render_reason = RenderReason::CursorBlink;
+                            window_for_redraw.request_redraw();
+                        }
+                        
+                        // Wake up at the next blink boundary
+                        let next_multiple_ms = (current_blink_index + 1) * 500;
+                        let next_blink_time = activity_end_time + std::time::Duration::from_millis(next_multiple_ms as u64);
+                        next_wakeup = Some(next_blink_time);
+                    } else {
+                        // Cursor is active (static). Wake up when it transitions to blinking.
+                        next_wakeup = Some(activity_end_time);
+                    }
+                    
+                    // Check scrollbar recent scroll fade-out wakeup
+                    if let Some(scroll_time) = last_scroll_event_time {
+                        let fade_start_time = scroll_time + std::time::Duration::from_millis(1500);
+                        if now < fade_start_time {
+                            if next_wakeup.is_none() || fade_start_time < next_wakeup.unwrap() {
+                                next_wakeup = Some(fade_start_time);
+                            }
+                        }
+                    }
+                    
+                    // Check toast auto-clear wakeup
+                    if let Some((_, toast_start)) = toast {
+                        let toast_expire_time = toast_start + std::time::Duration::from_millis(1920);
+                        if now < toast_expire_time {
+                            if next_wakeup.is_none() || toast_expire_time < next_wakeup.unwrap() {
+                                next_wakeup = Some(toast_expire_time);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(wakeup) = next_wakeup {
+                    target.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(wakeup));
                 } else {
                     target.set_control_flow(winit::event_loop::ControlFlow::Wait);
                 }
@@ -1956,6 +2212,84 @@ fn mouse_to_grid_point(
     let line = clamped_row - display_offset as i32;
     
     Point::new(Line(line), Column(col))
+}
+
+fn send_mouse_event_to_pty(
+    terminal: &crate::terminal_state::TerminalState,
+    button: winit::event::MouseButton,
+    state: winit::event::ElementState,
+    col: usize,
+    row: usize,
+    mode: alacritty_terminal::term::TermMode,
+) {
+    let is_press = state == winit::event::ElementState::Pressed;
+
+    if mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE) {
+        let btn = match button {
+            winit::event::MouseButton::Left => 0,
+            winit::event::MouseButton::Middle => 1,
+            winit::event::MouseButton::Right => 2,
+            _ => return,
+        };
+        let action = if is_press { 'M' } else { 'm' };
+        let seq = format!("\x1b[<{};{};{}{}", btn, col + 1, row + 1, action);
+        terminal.write_to_pty(seq.as_bytes());
+    } else if mode.contains(alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK) {
+        let btn_code = if is_press {
+            match button {
+                winit::event::MouseButton::Left => 0,
+                winit::event::MouseButton::Middle => 1,
+                winit::event::MouseButton::Right => 2,
+                _ => return,
+            }
+        } else {
+            3
+        };
+        let seq = [
+            0x1b, b'[', b'M',
+            btn_code as u8 + 32,
+            (col + 1 + 32) as u8,
+            (row + 1 + 32) as u8,
+        ];
+        terminal.write_to_pty(&seq);
+    }
+}
+
+fn send_drag_event_to_pty(
+    terminal: &crate::terminal_state::TerminalState,
+    button: Option<winit::event::MouseButton>,
+    col: usize,
+    row: usize,
+    mode: alacritty_terminal::term::TermMode,
+) {
+    let btn_code = match button {
+        Some(winit::event::MouseButton::Left) => 32,
+        Some(winit::event::MouseButton::Middle) => 33,
+        Some(winit::event::MouseButton::Right) => 34,
+        None => {
+            if mode.contains(alacritty_terminal::term::TermMode::MOUSE_MOTION) {
+                35
+            } else {
+                return;
+            }
+        }
+        _ => return,
+    };
+
+    if mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE) {
+        let seq = format!("\x1b[<{};{};{}M", btn_code, col + 1, row + 1);
+        terminal.write_to_pty(seq.as_bytes());
+    } else if mode.contains(alacritty_terminal::term::TermMode::MOUSE_DRAG)
+        || mode.contains(alacritty_terminal::term::TermMode::MOUSE_MOTION)
+    {
+        let seq = [
+            0x1b, b'[', b'M',
+            btn_code as u8 + 32,
+            (col + 1 + 32) as u8,
+            (row + 1 + 32) as u8,
+        ];
+        terminal.write_to_pty(&seq);
+    }
 }
 
 fn is_url(s: &str) -> bool {

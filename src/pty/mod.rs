@@ -80,6 +80,8 @@ impl PtyWorker {
 
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        cmd.env("TERM_PROGRAM", "fasty");
+        cmd.env("TERM_PROGRAM_VERSION", "0.1.0");
         if let Ok(lang) = std::env::var("LANG") {
             cmd.env("LANG", lang);
         }

@@ -6,7 +6,7 @@ use alacritty_terminal::grid::Indexed;
 use bytemuck::cast_slice;
 use wgpu::{Buffer, Device, RenderPipeline};
 
-use crate::renderer::CellInstance;
+use crate::renderer::{CellInstance, RenderReason};
 use crate::terminal_state::TerminalState;
 
 pub struct Pipeline {
@@ -15,7 +15,12 @@ pub struct Pipeline {
     vertex_buffer: Buffer,
     uniform_buffer: Buffer,
     bind_group: wgpu::BindGroup,
+    pub ui_bind_group: wgpu::BindGroup,
     max_instances: usize,
+    pub last_cursor_index: Option<usize>,
+    pub last_term_draw_count: usize,
+    pub last_ui_draw_count: usize,
+    pub cached_final_instances: Vec<CellInstance>,
 }
 
 const SHADER_SOURCE: &str = r#"
@@ -119,13 +124,22 @@ const VERTEX_BUFFER_DATA: &[f32] = &[
 ];
 
 impl Pipeline {
-    pub fn new(device: &Device, atlas: &crate::renderer::Atlas, format: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: &Device,
+        atlas: &crate::renderer::Atlas,
+        ui_atlas: &crate::renderer::Atlas,
+        format: wgpu::TextureFormat,
+    ) -> Self {
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cell-shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER_SOURCE.into()),
         });
 
         let atlas_view = atlas.texture().create_view(&wgpu::TextureViewDescriptor {
+            format: Some(wgpu::TextureFormat::Rgba8Unorm),
+            ..Default::default()
+        });
+        let ui_atlas_view = ui_atlas.texture().create_view(&wgpu::TextureViewDescriptor {
             format: Some(wgpu::TextureFormat::Rgba8Unorm),
             ..Default::default()
         });
@@ -316,23 +330,54 @@ impl Pipeline {
             ],
         });
 
+        let ui_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ui-atlas-bind-group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&ui_atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &uniform_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+            ],
+        });
+
         Self {
             pipeline,
             instance_buffer,
             vertex_buffer,
             uniform_buffer,
             bind_group,
+            ui_bind_group,
             max_instances,
+            last_cursor_index: None,
+            last_term_draw_count: 0,
+            last_ui_draw_count: 0,
+            cached_final_instances: Vec::new(),
         }
     }
 
     const PADDING_LEFT: f32 = 10.0;
 
     pub fn render(
-        &self,
+        &mut self,
+        reason: RenderReason,
         render_pass: &mut wgpu::RenderPass,
         terminal: &TerminalState,
+        cursor_visible: bool,
         atlas: &mut crate::renderer::Atlas,
+        ui_atlas: &mut crate::renderer::Atlas,
         cell_width: f32,
         cell_height: f32,
         viewport_width: f32,
@@ -345,7 +390,7 @@ impl Pipeline {
         hover_max: bool,
         hover_min: bool,
         hover_settings: bool,
-        last_activity_time_secs: f32,
+        _last_activity_time_secs: f32,
         current_time: f32,
         selection: Option<crate::renderer::Selection>,
         hovered_url: Option<crate::renderer::HoveredUrl>,
@@ -361,27 +406,72 @@ impl Pipeline {
         hovered_tab_index: Option<usize>,
         hovered_close_tab_index: Option<usize>,
         hover_new_tab: bool,
+        cached_grid_instances: &mut Vec<CellInstance>,
+        grid_dirty: &mut bool,
         device: &Device,
         queue: &wgpu::Queue,
     ) {
+        if reason == RenderReason::CursorBlink {
+            let term = terminal.term();
+            let term_guard = term.lock();
+            let content = term_guard.renderable_content();
+            
+            let (_c_w, _c_h, _c_ox, _c_oy, c_alpha) = match content.cursor.shape {
+                alacritty_terminal::vte::ansi::CursorShape::Block => (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32),
+                alacritty_terminal::vte::ansi::CursorShape::Underline => (cell_width, 1.0f32, 0.0f32, cell_height - 1.0f32, 0.9f32),
+                alacritty_terminal::vte::ansi::CursorShape::Beam => (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32),
+                alacritty_terminal::vte::ansi::CursorShape::Hidden => (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32),
+                _ => (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32),
+            };
+
+            let final_alpha = if cursor_visible {
+                c_alpha
+            } else {
+                0.0
+            };
+
+            if let Some(idx) = self.last_cursor_index {
+                if idx < self.cached_final_instances.len() {
+                    self.cached_final_instances[idx].fg_color[3] = final_alpha;
+                    let offset = (idx * mem::size_of::<CellInstance>()) as u64;
+                    queue.write_buffer(
+                        &self.instance_buffer,
+                        offset,
+                        cast_slice(&[self.cached_final_instances[idx]]),
+                    );
+                }
+            }
+
+            let term_draw_count = self.last_term_draw_count;
+            if term_draw_count > 0 {
+                render_pass.set_pipeline(&self.pipeline);
+                render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                render_pass.set_bind_group(0, &self.bind_group, &[]);
+                let end_offset = (term_draw_count * mem::size_of::<CellInstance>()) as u64;
+                render_pass.set_vertex_buffer(1, self.instance_buffer.slice(0..end_offset));
+                render_pass.draw(0..6, 0..term_draw_count as u32);
+            }
+            
+            let ui_draw_count = self.last_ui_draw_count;
+            if ui_draw_count > 0 {
+                render_pass.set_pipeline(&self.pipeline);
+                render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                render_pass.set_bind_group(0, &self.ui_bind_group, &[]);
+                let start_offset = (term_draw_count * mem::size_of::<CellInstance>()) as u64;
+                let end_offset = ((term_draw_count + ui_draw_count) * mem::size_of::<CellInstance>()) as u64;
+                render_pass.set_vertex_buffer(1, self.instance_buffer.slice(start_offset..end_offset));
+                render_pass.draw(0..6, 0..ui_draw_count as u32);
+            }
+            return;
+        }
         let padding_top = 48.0f32;
+        let orig_grid_dirty = *grid_dirty;
         let term = terminal.term();
         let term_guard = term.lock();
         let content = term_guard.renderable_content();
 
-        let mut bg_instances = Vec::new();
-        let mut fg_instances = Vec::new();
-
-        // 0. Draw window background (slate dark)
-        let window_bg = CellInstance::new(
-            0.0, 0.0,
-            viewport_width, viewport_height,
-            [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0], // Terminal bg color (#0c0c0c)
-            [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
-            8.0, // radius of 8
-        );
-        bg_instances.push(window_bg);
+        let mut ui_bg_instances = Vec::new();
+        let mut ui_fg_instances = Vec::new();
 
         // 1. Draw unified bar background (#0a0a0a)
         let bar_bg = CellInstance::new(
@@ -392,7 +482,7 @@ impl Pipeline {
             0.0, 0.0, 1.0, 1.0,
             8.0, // radius of 8 at top corners
         );
-        bg_instances.push(bar_bg);
+        ui_bg_instances.push(bar_bg);
 
         // 2. Draw square block to cover bottom rounded corners of the topbar
         let bar_bottom_fill = CellInstance::new(
@@ -403,29 +493,7 @@ impl Pipeline {
             0.0, 0.0, 0.0, 0.0,
             0.0, // square
         );
-        bg_instances.push(bar_bottom_fill);
-
-        // 3. Draw terminal background (#0c0c0c) below the unified topbar
-        let terminal_bg = CellInstance::new(
-            0.0, 40.0,
-            viewport_width, viewport_height - 40.0,
-            [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0],
-            [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
-            8.0, // bottom corners radius of 8
-        );
-        bg_instances.push(terminal_bg);
-
-        // 4. Draw square block to cover top rounded corners of the terminal bg
-        let terminal_top_fill = CellInstance::new(
-            0.0, 40.0,
-            viewport_width, 8.0,
-            [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0],
-            [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 0.0, 0.0,
-            0.0, // square
-        );
-        bg_instances.push(terminal_top_fill);
+        ui_bg_instances.push(bar_bottom_fill);
 
         // 5. Draw unified bar bottom border (1px solid rgba(255,255,255,0.06))
         let bar_border = CellInstance::new(
@@ -436,9 +504,49 @@ impl Pipeline {
             0.0, 0.0, 1.0, 1.0,
             0.0,
         );
-        bg_instances.push(bar_border);
+        ui_bg_instances.push(bar_border);
 
         let scroll_fraction = scroll_current - content.display_offset as f32;
+
+        let mut instances = if *grid_dirty {
+            let mut term_bg_instances = Vec::new();
+            let mut term_fg_instances = Vec::new();
+
+            // 0. Draw window background (slate dark)
+            let window_bg = CellInstance::new(
+                0.0, 0.0,
+                viewport_width, viewport_height,
+                [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0], // Terminal bg color (#0c0c0c)
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                8.0, // radius of 8
+            );
+            term_bg_instances.push(window_bg);
+
+            // 3. Draw terminal background (#0c0c0c) below the unified topbar
+            let terminal_bg = CellInstance::new(
+                0.0, 40.0,
+                viewport_width, viewport_height - 40.0,
+                [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                8.0, // bottom corners radius of 8
+            );
+            term_bg_instances.push(terminal_bg);
+
+            // 4. Draw square block to cover top rounded corners of the terminal bg
+            let terminal_top_fill = CellInstance::new(
+                0.0, 40.0,
+                viewport_width, 8.0,
+                [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 0.0, 0.0,
+                0.0, // square
+            );
+            term_bg_instances.push(terminal_top_fill);
+
+            let bg_instances = &mut term_bg_instances;
+            let fg_instances = &mut term_fg_instances;
 
         for Indexed { cell, point } in content.display_iter {
             let col = point.column.0 as usize;
@@ -540,6 +648,21 @@ impl Pipeline {
             }
         }
 
+            let mut term_instances_flat = Vec::with_capacity(term_bg_instances.len() + term_fg_instances.len() + 10);
+            term_instances_flat.extend(term_bg_instances);
+            term_instances_flat.extend(term_fg_instances);
+            *cached_grid_instances = term_instances_flat.clone();
+            *grid_dirty = false;
+            term_instances_flat
+        } else {
+            cached_grid_instances.clone()
+        };
+
+
+        let bg_instances = &mut ui_bg_instances;
+        let fg_instances = &mut ui_fg_instances;
+        let atlas = ui_atlas;
+
         // Draw unified topbar app icon or fallback lightning icon (⚡) U+26A1
         if let Some(entry) = &atlas.app_icon {
             let icon_scale = 16.0f32 / entry.height;
@@ -595,7 +718,7 @@ impl Pipeline {
             160.0f32
         };
 
-        let scale = 1.0f32; // Crisp 16px native size
+        let scale = 13.0f32 / atlas.font_size();
 
         for (i, title) in tab_titles.iter().enumerate() {
             let tab_x = tab_start_x + i as f32 * tab_width;
@@ -681,7 +804,8 @@ impl Pipeline {
                 [1.0, 1.0, 1.0, 0.40] // Inactive tab text
             };
 
-            let baseline_y = (40.0f32 - 16.0f32) / 2.0f32 + atlas.ascent();
+            let scaled_ascent = atlas.ascent() * scale;
+            let baseline_y = (40.0f32 - 13.0f32) / 2.0f32 + scaled_ascent;
 
             for c in truncated_title.chars() {
                 if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
@@ -722,8 +846,7 @@ impl Pipeline {
 
             // Tab Close Button U+00D7 (×) -> \u{2715} (✕)
             if is_close_visible {
-                let close_char = '\u{2715}';
-                if let Some(entry) = atlas.get_or_rasterize(close_char, device, queue) {
+                if let Some(entry) = &atlas.icon_close {
                     let close_x = tab_x + tab_width - 30.0f32;
                     let is_close_hovered = hovered_close_tab_index == Some(i);
 
@@ -739,8 +862,10 @@ impl Pipeline {
                         ));
                     }
 
-                    let cx = close_x + (16.0f32 - entry.width) / 2.0f32;
-                    let cy = (40.0f32 - entry.height) / 2.0f32;
+                    let entry_w = 12.0f32;
+                    let entry_h = 12.0f32;
+                    let cx = close_x + (16.0f32 - entry_w) / 2.0f32;
+                    let cy = (40.0f32 - entry_h) / 2.0f32;
                     let (aw, ah) = atlas.atlas_size();
                     let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                     let uv_w = uv_end_x - uv_x;
@@ -754,7 +879,7 @@ impl Pipeline {
 
                     fg_instances.push(CellInstance::new(
                         cx, cy,
-                        entry.width, entry.height,
+                        entry_w, entry_h,
                         close_color,
                         [0.0, 0.0, 0.0, 0.0],
                         uv_x, uv_y, uv_w, uv_h,
@@ -776,10 +901,11 @@ impl Pipeline {
                 0.0,
             ));
         }
-        let plus_char = '+';
-        if let Some(entry) = atlas.get_or_rasterize(plus_char, device, queue) {
-            let cx = new_tab_x + (32.0f32 - entry.width) / 2.0f32;
-            let cy = (40.0f32 - entry.height) / 2.0f32;
+        if let Some(entry) = &atlas.icon_add {
+            let entry_w = 16.0f32;
+            let entry_h = 16.0f32;
+            let cx = new_tab_x + (32.0f32 - entry_w) / 2.0f32;
+            let cy = (40.0f32 - entry_h) / 2.0f32;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             let uv_w = uv_end_x - uv_x;
@@ -793,7 +919,7 @@ impl Pipeline {
 
             fg_instances.push(CellInstance::new(
                 cx, cy,
-                entry.width, entry.height,
+                entry_w, entry_h,
                 icon_color,
                 [0.0, 0.0, 0.0, 0.0],
                 uv_x, uv_y, uv_w, uv_h,
@@ -803,23 +929,25 @@ impl Pipeline {
 
         // Draw centered path display
         let basename = active_tab_path.split(|c| c == '/' || c == '\\').last().unwrap_or("fasty");
+        let path_scale = 14.0f32 / atlas.font_size();
         let mut text_w = 0.0f32;
         for c in basename.chars() {
             if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
-                text_w += entry.width + 1.0;
+                text_w += (entry.width + 1.0) * path_scale;
             }
         }
 
         let mut tx = (viewport_width - text_w) / 2.0f32;
-        let path_baseline_y = (40.0f32 - 16.0f32) / 2.0f32 + atlas.ascent();
+        let scaled_ascent = atlas.ascent() * path_scale;
+        let path_baseline_y = (40.0f32 - 14.0f32) / 2.0f32 + scaled_ascent;
         
         for c in basename.chars() {
             if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                 if entry.width > 0.0 {
-                    let glyph_w = entry.width;
-                    let glyph_h = entry.height;
-                    let glyph_x = tx + entry.left;
-                    let glyph_y = path_baseline_y + entry.top;
+                    let glyph_w = entry.width * path_scale;
+                    let glyph_h = entry.height * path_scale;
+                    let glyph_x = tx + entry.left * path_scale;
+                    let glyph_y = path_baseline_y + entry.top * path_scale;
                     let (aw, ah) = atlas.atlas_size();
                     let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                     let uv_w = uv_end_x - uv_x;
@@ -833,15 +961,16 @@ impl Pipeline {
                         uv_x, uv_y, uv_w, uv_h,
                         0.0,
                     ));
-                    tx += entry.width + 1.0;
+                    tx += (entry.width + 1.0) * path_scale;
                 } else if c == ' ' {
-                    tx += 8.0;
+                    tx += 8.0 * path_scale;
                 }
             }
         }
 
         // Draw window controls (Settings, vertical line, Minimize, Maximize, Close)
         let controls_y = 6.0f32; // centered vertically: (40 - 28)/2
+        let _icon_scale = 15.0f32 / atlas.font_size();
 
         // 1. Settings button (⚙)
         let settings_x = viewport_width - 137.0f32;
@@ -855,10 +984,11 @@ impl Pipeline {
                 6.0,
             ));
         }
-        let settings_char = '\u{2699}';
-        if let Some(entry) = atlas.get_or_rasterize(settings_char, device, queue) {
-            let glyph_x = settings_x + (28.0f32 - entry.width) / 2.0f32;
-            let glyph_y = controls_y + (28.0f32 - entry.height) / 2.0f32;
+        if let Some(entry) = &atlas.icon_settings {
+            let entry_w = 16.0f32;
+            let entry_h = 16.0f32;
+            let glyph_x = settings_x + (28.0f32 - entry_w) / 2.0f32;
+            let glyph_y = controls_y + (28.0f32 - entry_h) / 2.0f32;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             let uv_w = uv_end_x - uv_x;
@@ -867,7 +997,7 @@ impl Pipeline {
             let fg_color = if hover_settings { [1.0, 1.0, 1.0, 1.0] } else { [0.7, 0.7, 0.75, 1.0] };
             fg_instances.push(CellInstance::new(
                 glyph_x, glyph_y,
-                entry.width, entry.height,
+                entry_w, entry_h,
                 fg_color,
                 [0.0, 0.0, 0.0, 0.0],
                 uv_x, uv_y, uv_w, uv_h,
@@ -897,10 +1027,11 @@ impl Pipeline {
                 6.0,
             ));
         }
-        let min_char = '\u{2500}';
-        if let Some(entry) = atlas.get_or_rasterize(min_char, device, queue) {
-            let glyph_x = min_x + (28.0f32 - entry.width) / 2.0f32;
-            let glyph_y = controls_y + (28.0f32 - entry.height) / 2.0f32;
+        if let Some(entry) = &atlas.icon_less {
+            let entry_w = 14.0f32;
+            let entry_h = 14.0f32;
+            let glyph_x = min_x + (28.0f32 - entry_w) / 2.0f32;
+            let glyph_y = controls_y + (28.0f32 - entry_h) / 2.0f32;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             let uv_w = uv_end_x - uv_x;
@@ -909,7 +1040,7 @@ impl Pipeline {
             let fg_color = if hover_min { [1.0, 1.0, 1.0, 1.0] } else { [0.8, 0.8, 0.85, 1.0] };
             fg_instances.push(CellInstance::new(
                 glyph_x, glyph_y,
-                entry.width, entry.height,
+                entry_w, entry_h,
                 fg_color,
                 [0.0, 0.0, 0.0, 0.0],
                 uv_x, uv_y, uv_w, uv_h,
@@ -929,10 +1060,11 @@ impl Pipeline {
                 6.0,
             ));
         }
-        let max_char = '\u{25A2}';
-        if let Some(entry) = atlas.get_or_rasterize(max_char, device, queue) {
-            let glyph_x = max_x + (28.0f32 - entry.width) / 2.0f32;
-            let glyph_y = controls_y + (28.0f32 - entry.height) / 2.0f32;
+        if let Some(entry) = &atlas.icon_maximize {
+            let entry_w = 14.0f32;
+            let entry_h = 14.0f32;
+            let glyph_x = max_x + (28.0f32 - entry_w) / 2.0f32;
+            let glyph_y = controls_y + (28.0f32 - entry_h) / 2.0f32;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             let uv_w = uv_end_x - uv_x;
@@ -941,7 +1073,7 @@ impl Pipeline {
             let fg_color = if hover_max { [1.0, 1.0, 1.0, 1.0] } else { [0.8, 0.8, 0.85, 1.0] };
             fg_instances.push(CellInstance::new(
                 glyph_x, glyph_y,
-                entry.width, entry.height,
+                entry_w, entry_h,
                 fg_color,
                 [0.0, 0.0, 0.0, 0.0],
                 uv_x, uv_y, uv_w, uv_h,
@@ -961,10 +1093,11 @@ impl Pipeline {
                 6.0,
             ));
         }
-        let close_char = '\u{2715}';
-        if let Some(entry) = atlas.get_or_rasterize(close_char, device, queue) {
-            let glyph_x = close_x + (28.0f32 - entry.width) / 2.0f32;
-            let glyph_y = controls_y + (28.0f32 - entry.height) / 2.0f32;
+        if let Some(entry) = &atlas.icon_close {
+            let entry_w = 14.0f32;
+            let entry_h = 14.0f32;
+            let glyph_x = close_x + (28.0f32 - entry_w) / 2.0f32;
+            let glyph_y = controls_y + (28.0f32 - entry_h) / 2.0f32;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             let uv_w = uv_end_x - uv_x;
@@ -973,7 +1106,7 @@ impl Pipeline {
             let fg_color = if hover_close { [1.0, 1.0, 1.0, 1.0] } else { [0.8, 0.8, 0.85, 1.0] };
             fg_instances.push(CellInstance::new(
                 glyph_x, glyph_y,
-                entry.width, entry.height,
+                entry_w, entry_h,
                 fg_color,
                 [0.0, 0.0, 0.0, 0.0],
                 uv_x, uv_y, uv_w, uv_h,
@@ -981,14 +1114,10 @@ impl Pipeline {
             ));
         }
 
-        let bg_count = bg_instances.len();
-        let fg_count = fg_instances.len();
 
-        let mut instances = Vec::with_capacity(bg_count + fg_count + 10);
-        instances.extend(bg_instances);
-        instances.extend(fg_instances);
 
         // Draw cursor
+        let mut cursor_index = None;
         let cursor_row = content.cursor.point.line.0 + content.display_offset as i32;
         if cursor_row >= 0 && cursor_row < visible_rows as i32 {
             let cursor_x = (content.cursor.point.column.0 as f32 * cell_width).round() + Self::PADDING_LEFT;
@@ -1004,18 +1133,10 @@ impl Pipeline {
             };
 
             if c_w > 0.0 && c_h > 0.0 {
-                let cursor_is_active = (current_time - last_activity_time_secs) < 0.5f32;
-                // Apply pulsing animation if cursor is idle (quieto)
-                let final_alpha = if cursor_is_active {
+                let final_alpha = if cursor_visible {
                     c_alpha
                 } else {
-                    // Start pulsing animation smoothly from c_alpha by basing phase on the time since the activity period ended (500ms after last activity)
-                    let activity_end_time = last_activity_time_secs + 0.5f32;
-                    let idle_time = (current_time - activity_end_time).max(0.0f32);
-                    // Use a cosine wave so it starts at its maximum value (cos(0) = 1.0) and starts fading down smoothly.
-                    // Frequency of 0.8 Hz means 0.8 cycles per second (1.25s per full cycle).
-                    let pulse = 0.5f32 + 0.5f32 * (idle_time * std::f32::consts::PI * 2.0f32 * 0.8f32).cos();
-                    c_alpha * pulse
+                    0.0
                 };
 
                 let cursor_color = [1.0, 1.0, 1.0, final_alpha];
@@ -1029,6 +1150,7 @@ impl Pipeline {
                     0.0, 0.0, 0.0, 0.0,
                     0.0,
                 );
+                cursor_index = Some(instances.len());
                 instances.push(cursor_instance);
             }
         }
@@ -1078,6 +1200,9 @@ impl Pipeline {
             }
         }
 
+        let term_instances_final = instances;
+        let mut instances = Vec::new();
+
         // Draw Toast Popup if any
         if let Some((msg, start_time)) = toast {
             let elapsed_ms = start_time.elapsed().as_millis();
@@ -1089,7 +1214,7 @@ impl Pipeline {
             };
 
             if alpha > 0.0 {
-                let scale = 13.0 / 16.0;
+                let scale = 13.0 / atlas.font_size();
                 let mut text_w = 0.0f32;
                 for c in msg.chars() {
                     if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
@@ -1102,7 +1227,8 @@ impl Pipeline {
                 }
 
                 let toast_w = text_w + 28.0;
-                let text_h = cell_height * scale;
+                let (_, ui_cell_height) = atlas.cell_size();
+                let text_h = ui_cell_height * scale;
                 let toast_h = text_h + 16.0;
 
                 let toast_x = (viewport_width - toast_w) / 2.0;
@@ -1258,7 +1384,7 @@ impl Pipeline {
             );
 
             // 3. Draw items
-            let base_scale = 1.0f32; // Crisp 16px native size
+            let base_scale = 13.0f32 / atlas.font_size();
             let mut current_y = context_menu_y + padding_y;
 
             for (idx, item) in menu_items.iter().enumerate() {
@@ -1302,7 +1428,7 @@ impl Pipeline {
                         }
 
                         // Determine text, icon, and optional shortcut
-                        let (icon, label, shortcut) = match item {
+                        let (_, label, shortcut) = match item {
                             crate::renderer::ContextMenuItem::Copy => ("📋", "Copiar", Some("⌘C")),
                             crate::renderer::ContextMenuItem::Paste => ("📋", "Pegar", Some("⌘V")),
                             crate::renderer::ContextMenuItem::NewTab => ("+", "Nueva pestaña", None),
@@ -1318,40 +1444,44 @@ impl Pipeline {
                         };
 
                         let item_center_y = current_y + item_h / 2.0;
-                        let mut icon_x = context_menu_x + 12.0;
-                        for c in icon.chars() {
-                            if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
-                                if entry.width > 0.0 {
-                                    let glyph_w = entry.width * base_scale;
-                                    let glyph_h = entry.height * base_scale;
-                                    let glyph_x = icon_x + entry.left * base_scale;
-                                    let glyph_y = item_center_y - glyph_h / 2.0;
+                        let icon_x = context_menu_x + 12.0;
+                        let icon_entry = match item {
+                            crate::renderer::ContextMenuItem::Copy => atlas.icon_copy.as_ref(),
+                            crate::renderer::ContextMenuItem::Paste => atlas.icon_paste.as_ref(),
+                            crate::renderer::ContextMenuItem::NewTab => atlas.icon_add.as_ref(),
+                            crate::renderer::ContextMenuItem::CloseTab => atlas.icon_close.as_ref(),
+                            _ => None,
+                        };
 
-                                    let (aw, ah) = atlas.atlas_size();
-                                    let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
-                                    let uv_w = uv_end_x - uv_x;
-                                    let uv_h = uv_end_y - uv_y;
+                        if let Some(entry) = icon_entry {
+                            let entry_w = 14.0f32;
+                            let entry_h = 14.0f32;
+                            let glyph_x = icon_x;
+                            let glyph_y = item_center_y - entry_h / 2.0;
 
-                                    anim_push(
-                                        glyph_x,
-                                        glyph_y,
-                                        glyph_w,
-                                        glyph_h,
-                                        text_color,
-                                        [0.0, 0.0, 0.0, 0.0],
-                                        uv_x,
-                                        uv_y,
-                                        uv_w,
-                                        uv_h,
-                                        0.0,
-                                    );
-                                    icon_x += (entry.width + 1.0) * base_scale;
-                                }
-                            }
+                            let (aw, ah) = atlas.atlas_size();
+                            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                            let uv_w = uv_end_x - uv_x;
+                            let uv_h = uv_end_y - uv_y;
+
+                            anim_push(
+                                glyph_x,
+                                glyph_y,
+                                entry_w,
+                                entry_h,
+                                text_color,
+                                [0.0, 0.0, 0.0, 0.0],
+                                uv_x,
+                                uv_y,
+                                uv_w,
+                                uv_h,
+                                0.0,
+                            );
                         }
 
                         // Render text label left-aligned at relative x=30px (context_menu_x + 30px)
-                        let text_baseline_y = item_center_y - cell_height / 2.0 + atlas.ascent();
+                        let (_, ui_cell_height) = atlas.cell_size();
+                        let text_baseline_y = item_center_y - (ui_cell_height * base_scale) / 2.0 + atlas.ascent() * base_scale;
                         let mut label_x = context_menu_x + 30.0;
                         for c in label.chars() {
                             if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
@@ -1434,13 +1564,25 @@ impl Pipeline {
             }
         }
         
-        let instance_count = instances.len().min(self.max_instances);
+        let ui_extra_instances_final = instances;
+
+        let term_count = term_instances_final.len();
+        let ui_count = ui_bg_instances.len() + ui_fg_instances.len() + ui_extra_instances_final.len();
+        tracing::debug!("Render stats: orig_grid_dirty={}, term_count={}, ui_bg={}, ui_fg={}, ui_extra={}", orig_grid_dirty, term_count, ui_bg_instances.len(), ui_fg_instances.len(), ui_extra_instances_final.len());
+
+        let mut final_instances = Vec::with_capacity(term_count + ui_count);
+        final_instances.extend(term_instances_final);
+        final_instances.extend(ui_bg_instances);
+        final_instances.extend(ui_fg_instances);
+        final_instances.extend(ui_extra_instances_final);
+
+        let instance_count = final_instances.len().min(self.max_instances);
         
         if instance_count > 0 {
             queue.write_buffer(
                 &self.instance_buffer,
                 0,
-                cast_slice(&instances[..instance_count]),
+                cast_slice(&final_instances[..instance_count]),
             );
         }
         
@@ -1451,13 +1593,29 @@ impl Pipeline {
         );
         
         render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_bind_group(0, &self.bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
         
-        if instance_count > 0 {
-            render_pass.draw(0..6, 0..instance_count as u32);
+        let term_draw_count = term_count.min(instance_count);
+        if term_draw_count > 0 {
+            render_pass.set_bind_group(0, &self.bind_group, &[]);
+            let end_offset = (term_draw_count * mem::size_of::<CellInstance>()) as u64;
+            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(0..end_offset));
+            render_pass.draw(0..6, 0..term_draw_count as u32);
         }
+
+        let ui_draw_count = ui_count.min(instance_count - term_draw_count);
+        if ui_draw_count > 0 {
+            render_pass.set_bind_group(0, &self.ui_bind_group, &[]);
+            let start_offset = (term_draw_count * mem::size_of::<CellInstance>()) as u64;
+            let end_offset = ((term_draw_count + ui_draw_count) * mem::size_of::<CellInstance>()) as u64;
+            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(start_offset..end_offset));
+            render_pass.draw(0..6, 0..ui_draw_count as u32);
+        }
+
+        self.last_cursor_index = cursor_index;
+        self.last_term_draw_count = term_draw_count;
+        self.last_ui_draw_count = ui_draw_count;
+        self.cached_final_instances = final_instances;
     }
 
     pub fn render_settings(
@@ -1563,14 +1721,16 @@ impl Pipeline {
                 6.0, // Rounded rectangle
             ));
         }
-        if let Some(entry) = atlas.get_or_rasterize('\u{2715}', device, queue) {
-            let glyph_x = (viewport_width - 32.0) + (28.0 - entry.width) / 2.0;
-            let glyph_y = 4.0 + (28.0 - entry.height) / 2.0;
+        if let Some(entry) = &atlas.icon_close {
+            let entry_w = 14.0f32;
+            let entry_h = 14.0f32;
+            let glyph_x = (viewport_width - 32.0) + (28.0 - entry_w) / 2.0;
+            let glyph_y = 4.0 + (28.0 - entry_h) / 2.0;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
                 glyph_x, glyph_y,
-                entry.width, entry.height,
+                entry_w, entry_h,
                 [0.8, 0.8, 0.85, 1.0],
                 [0.0, 0.0, 0.0, 0.0],
                 uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
@@ -1601,8 +1761,26 @@ impl Pipeline {
             6.0,
         ));
 
+        // Draw text-font SVG icon
+        if let Some(entry) = &atlas.icon_text_font {
+            let entry_w = 14.0f32;
+            let entry_h = 14.0f32;
+            let glyph_x = 148.0f32;
+            let glyph_y = 52.0f32 + (26.0f32 - entry_h) / 2.0f32;
+            let (aw, ah) = atlas.atlas_size();
+            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+            fg_instances.push(CellInstance::new(
+                glyph_x, glyph_y,
+                entry_w, entry_h,
+                [0.7, 0.7, 0.75, 1.0],
+                [0.0, 0.0, 0.0, 0.0],
+                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                0.0,
+            ));
+        }
+
         // Draw font family text name
-        draw_text(atlas, font_family, 146.0, 56.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+        draw_text(atlas, font_family, 168.0, 56.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
         // Draw dropdown arrow icon (▾)
         draw_text(atlas, "▾", 362.0, 56.0, [0.7, 0.7, 0.75, 1.0], &mut fg_instances);
 
@@ -1616,7 +1794,22 @@ impl Pipeline {
             0.0, 0.0, 1.0, 1.0,
             6.0,
         ));
-        draw_text(atlas, "-", 150.0, 96.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+        if let Some(entry) = &atlas.icon_less {
+            let entry_w = 14.0f32;
+            let entry_h = 14.0f32;
+            let glyph_x = 140.0f32 + (28.0f32 - entry_w) / 2.0f32;
+            let glyph_y = 92.0f32 + (26.0f32 - entry_h) / 2.0f32;
+            let (aw, ah) = atlas.atlas_size();
+            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+            fg_instances.push(CellInstance::new(
+                glyph_x, glyph_y,
+                entry_w, entry_h,
+                [0.9, 0.9, 0.95, 1.0],
+                [0.0, 0.0, 0.0, 0.0],
+                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                0.0,
+            ));
+        }
 
         draw_text(atlas, &format!("{:.1}", font_size), 180.0, 96.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
 
@@ -1629,7 +1822,22 @@ impl Pipeline {
             0.0, 0.0, 1.0, 1.0,
             6.0,
         ));
-        draw_text(atlas, "+", 230.0, 96.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+        if let Some(entry) = &atlas.icon_add {
+            let entry_w = 14.0f32;
+            let entry_h = 14.0f32;
+            let glyph_x = 220.0f32 + (28.0f32 - entry_w) / 2.0f32;
+            let glyph_y = 92.0f32 + (26.0f32 - entry_h) / 2.0f32;
+            let (aw, ah) = atlas.atlas_size();
+            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+            fg_instances.push(CellInstance::new(
+                glyph_x, glyph_y,
+                entry_w, entry_h,
+                [0.9, 0.9, 0.95, 1.0],
+                [0.0, 0.0, 0.0, 0.0],
+                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                0.0,
+            ));
+        }
 
         // 3. Scrollback controls
         let scroll_minus_bg = if hover_scroll_minus { [1.0, 1.0, 1.0, 0.15] } else { [1.0, 1.0, 1.0, 0.05] };
@@ -1641,7 +1849,22 @@ impl Pipeline {
             0.0, 0.0, 1.0, 1.0,
             6.0,
         ));
-        draw_text(atlas, "-", 150.0, 136.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+        if let Some(entry) = &atlas.icon_less {
+            let entry_w = 14.0f32;
+            let entry_h = 14.0f32;
+            let glyph_x = 140.0f32 + (28.0f32 - entry_w) / 2.0f32;
+            let glyph_y = 132.0f32 + (26.0f32 - entry_h) / 2.0f32;
+            let (aw, ah) = atlas.atlas_size();
+            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+            fg_instances.push(CellInstance::new(
+                glyph_x, glyph_y,
+                entry_w, entry_h,
+                [0.9, 0.9, 0.95, 1.0],
+                [0.0, 0.0, 0.0, 0.0],
+                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                0.0,
+            ));
+        }
 
         draw_text(atlas, &format!("{}", scrollback), 180.0, 136.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
 
@@ -1654,7 +1877,22 @@ impl Pipeline {
             0.0, 0.0, 1.0, 1.0,
             6.0,
         ));
-        draw_text(atlas, "+", 250.0, 136.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+        if let Some(entry) = &atlas.icon_add {
+            let entry_w = 14.0f32;
+            let entry_h = 14.0f32;
+            let glyph_x = 240.0f32 + (28.0f32 - entry_w) / 2.0f32;
+            let glyph_y = 132.0f32 + (26.0f32 - entry_h) / 2.0f32;
+            let (aw, ah) = atlas.atlas_size();
+            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+            fg_instances.push(CellInstance::new(
+                glyph_x, glyph_y,
+                entry_w, entry_h,
+                [0.9, 0.9, 0.95, 1.0],
+                [0.0, 0.0, 0.0, 0.0],
+                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                0.0,
+            ));
+        }
 
         // Save & Cancel buttons
         let save_bg = if hover_save {
