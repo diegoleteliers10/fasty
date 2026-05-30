@@ -21,6 +21,7 @@ pub struct TerminalState {
     render_generation: Arc<AtomicU64>,
     writer: Arc<ParkingMutex<Box<dyn Write + Send>>>,
     master: Arc<ParkingMutex<Box<dyn MasterPty + Send>>>,
+    shell_pid: Option<u32>,
 }
 
 impl TerminalState {
@@ -34,8 +35,10 @@ impl TerminalState {
         viewport_height: f32,
         proxy: winit::event_loop::EventLoopProxy<()>,
     ) -> anyhow::Result<Self> {
-        let cols = ((viewport_width as usize) / (cell_width as usize)).max(80);
-        let rows = ((viewport_height as usize) / (cell_height as usize)).max(24);
+        let cell_w = (cell_width as usize).max(1);
+        let cell_h = (cell_height as usize).max(1);
+        let cols = ((viewport_width as usize) / cell_w).max(80);
+        let rows = ((viewport_height as usize) / cell_h).max(24);
 
         let mut config = AlacrittyConfig::default();
         config.scrolling_history = scrollback;
@@ -61,7 +64,8 @@ impl TerminalState {
             cmd.env("PATH", path);
         }
 
-        let _child = pair.slave.spawn_command(cmd).expect("Failed to spawn shell");
+        let child = pair.slave.spawn_command(cmd).expect("Failed to spawn shell");
+        let shell_pid = child.process_id();
 
         drop(pair.slave);
 
@@ -127,7 +131,12 @@ impl TerminalState {
             render_generation,
             writer: writer_arc,
             master: master_arc,
+            shell_pid,
         })
+    }
+
+    pub fn shell_pid(&self) -> Option<u32> {
+        self.shell_pid
     }
 
     fn process_chunk(
@@ -157,6 +166,11 @@ impl TerminalState {
 
     pub fn mark_dirty(&self) {
         self.render_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn update_scrollback(&self, scrollback: usize) {
+        let mut term = self.term.lock();
+        term.grid_mut().update_history(scrollback);
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {

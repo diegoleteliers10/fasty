@@ -98,6 +98,7 @@ impl Atlas {
         queue: &Queue,
         width: u32,
         height: u32,
+        font_family: &str,
         font_size: f32,
         scale_factor: f32,
     ) -> anyhow::Result<Self> {
@@ -116,30 +117,59 @@ impl Atlas {
             view_formats: &[],
         });
 
-        let primary_path = Self::load_font_path()?;
-        let fallback_paths = Self::load_fallback_paths(&primary_path);
+        let primary_path_initial = Self::load_font_path(font_family).unwrap_or_else(|_| "monospace".to_string());
         let physical_size = font_size * scale_factor;
 
-        let (cell_width, cell_height, ascent) = FT_LIB.with(|lib| -> anyhow::Result<(f32, f32, f32)> {
-            let face = lib.new_face(&primary_path, 0).context("Failed to load primary face")?;
-            let _ = face.set_pixel_sizes(0, physical_size as u32);
-            
-            let metrics = face.size_metrics().context("Failed to get size metrics")?;
-            let cell_height = (metrics.height as f32 / 64.0).ceil();
-            
-            // Get advance of '0' for cell width
-            let zero_idx = face.get_char_index('0' as usize).unwrap_or(0);
-            let cell_width = if zero_idx != 0 {
-                let _ = face.load_glyph(zero_idx, LoadFlag::RENDER);
-                (face.glyph().advance().x as f32 / 64.0).round()
-            } else {
-                (physical_size * 0.6).round()
+        let (cell_width, cell_height, ascent, primary_path_resolved) = FT_LIB.with(|lib| -> anyhow::Result<(f32, f32, f32, String)> {
+            // Helper to get metrics from a face if they are valid for monospace rendering
+            let get_metrics = |face: &freetype::Face| -> Option<(f32, f32, f32)> {
+                let _ = face.set_pixel_sizes(0, physical_size as u32);
+                let metrics = face.size_metrics()?;
+                let cell_height = (metrics.height as f32 / 64.0).ceil();
+                
+                // Get advance of '0' for cell width
+                let zero_idx = face.get_char_index('0' as usize).unwrap_or(0);
+                let cell_width = if zero_idx != 0 {
+                    let _ = face.load_glyph(zero_idx, LoadFlag::RENDER).ok()?;
+                    (face.glyph().advance().x as f32 / 64.0).round()
+                } else {
+                    (physical_size * 0.6).round()
+                };
+                
+                let ascent = (metrics.ascender as f32 / 64.0).round();
+                
+                if cell_width >= 3.0 && cell_height >= 5.0 {
+                    Some((cell_width, cell_height, ascent))
+                } else {
+                    None
+                }
             };
-            
-            let ascent = (metrics.ascender as f32 / 64.0).round();
-            
-            Ok((cell_width, cell_height, ascent))
+
+            // 1. Try primary font path
+            if let Ok(face) = lib.new_face(&primary_path_initial, 0) {
+                if let Some((w, h, a)) = get_metrics(&face) {
+                    return Ok((w, h, a, primary_path_initial));
+                }
+            }
+
+            // 2. Try default fallback system monospace path
+            tracing::warn!("Font '{}' lacks valid monospace metrics. Falling back to default system monospace.", font_family);
+            let fallback_path = Self::load_font_path("monospace").unwrap_or_else(|_| "monospace".to_string());
+            if let Ok(face) = lib.new_face(&fallback_path, 0) {
+                if let Some((w, h, a)) = get_metrics(&face) {
+                    return Ok((w, h, a, fallback_path));
+                }
+            }
+
+            // 3. Absolute last resort hardcoded defaults
+            let cell_h = physical_size.ceil().max(12.0);
+            let cell_w = (physical_size * 0.6).round().max(7.0);
+            let ascent = (physical_size * 0.8).round().max(9.0);
+            Ok((cell_w, cell_h, ascent, fallback_path))
         })?;
+
+        let primary_path = primary_path_resolved;
+        let fallback_paths = Self::load_fallback_paths(&primary_path);
 
         let mut packer = ShelfPacker::new(width, height);
         packer.alloc(10, 10);
@@ -211,11 +241,11 @@ impl Atlas {
         Ok(atlas)
     }
 
-    fn load_font_path() -> anyhow::Result<String> {
+    fn load_font_path(family: &str) -> anyhow::Result<String> {
         let output = std::process::Command::new("fc-match")
             .arg("-f")
             .arg("%{file}")
-            .arg("monospace")
+            .arg(family)
             .output()
             .context("Failed to run fc-match")?;
 
@@ -568,8 +598,16 @@ impl Atlas {
         self.ascent
     }
 
+    pub fn scale_factor(&self) -> f32 {
+        self.scale_factor
+    }
+
     pub fn atlas_size(&self) -> (u32, u32) {
         (self.atlas_width, self.atlas_height)
+    }
+
+    pub fn font_size(&self) -> f32 {
+        self.font_size
     }
 
     pub fn texture(&self) -> &wgpu::Texture {

@@ -31,9 +31,13 @@ pub struct Renderer<'a> {
 }
 
 impl<'a> Renderer<'a> {
-    pub async fn new(window: &'a Window) -> anyhow::Result<Self> {
+    pub async fn new(
+        window: &'a Window,
+        font_family: &str,
+        font_size: f32,
+    ) -> anyhow::Result<Self> {
         let instance = Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::GL,
+            backends: wgpu::Backends::all(),
             flags: wgpu::InstanceFlags::VALIDATION,
             ..Default::default()
         });
@@ -92,9 +96,8 @@ impl<'a> Renderer<'a> {
         };
         surface.configure(&device, &config);
 
-        let font_size = 16.0;
         let scale_factor = window.scale_factor() as f32;
-        let atlas = Atlas::new(&device, &queue, 2048, 2048, font_size, scale_factor)?;
+        let atlas = Atlas::new(&device, &queue, 2048, 2048, font_family, font_size, scale_factor)?;
         let (cell_width, cell_height) = atlas.cell_size();
         tracing::info!("Atlas created with {} entries, cell_size: {}x{}", atlas.entries_len(), cell_width, cell_height);
         let pipeline = Pipeline::new(&device, &atlas, format);
@@ -120,6 +123,27 @@ impl<'a> Renderer<'a> {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.dirty = true;
+    }
+
+    pub fn update_font(&mut self, font_family: &str, font_size: f32) -> anyhow::Result<()> {
+        let scale_factor = self.atlas.scale_factor();
+        let new_atlas = Atlas::new(
+            &self.device,
+            &self.queue,
+            2048,
+            2048,
+            font_family,
+            font_size,
+            scale_factor,
+        )?;
+        let pipeline = Pipeline::new(&self.device, &new_atlas, self.config.format);
+        self.atlas = new_atlas;
+        self.pipeline = pipeline;
+        let (cell_width, cell_height) = self.atlas.cell_size();
+        self.cell_width = cell_width;
+        self.cell_height = cell_height;
+        self.dirty = true;
+        Ok(())
     }
 
     pub fn cell_width(&self) -> f32 {
@@ -150,6 +174,17 @@ impl<'a> Renderer<'a> {
         selection: Option<Selection>,
         hovered_url: Option<HoveredUrl>,
         toast: Option<(&str, std::time::Instant)>,
+        active_tab_index: usize,
+        tab_titles: &[String],
+        active_tab_path: &str,
+        context_menu_visible: bool,
+        context_menu_x: f32,
+        context_menu_y: f32,
+        context_menu_hovered_idx: Option<usize>,
+        context_menu_open_time_secs: Option<f32>,
+        hovered_tab_index: Option<usize>,
+        hovered_close_tab_index: Option<usize>,
+        hover_new_tab: bool,
     ) {
         if !self.dirty {
             tracing::debug!("Renderer::render early exit - dirty=false");
@@ -208,13 +243,23 @@ impl<'a> Renderer<'a> {
                 selection,
                 hovered_url,
                 toast,
+                active_tab_index,
+                tab_titles,
+                active_tab_path,
+                context_menu_visible,
+                context_menu_x,
+                context_menu_y,
+                context_menu_hovered_idx,
+                context_menu_open_time_secs,
+                hovered_tab_index,
+                hovered_close_tab_index,
+                hover_new_tab,
                 &self.device,
                 &self.queue,
             );
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        self.device.poll(wgpu::Maintain::Wait);
         frame.present();
         self.dirty = false;
     }
@@ -233,6 +278,9 @@ impl<'a> Renderer<'a> {
         hover_scroll_plus: bool,
         hover_save: bool,
         hover_cancel: bool,
+        system_fonts: &[String],
+        font_scroll_y: f32,
+        hovered_font_idx: Option<usize>,
     ) {
         if !self.dirty {
             return;
@@ -284,13 +332,15 @@ impl<'a> Renderer<'a> {
                 hover_scroll_plus,
                 hover_save,
                 hover_cancel,
+                system_fonts,
+                font_scroll_y,
+                hovered_font_idx,
                 &self.device,
                 &self.queue,
             );
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        self.device.poll(wgpu::Maintain::Wait);
         frame.present();
         self.dirty = false;
     }
@@ -307,4 +357,13 @@ pub struct HoveredUrl {
     pub line: i32,
     pub start_col: usize,
     pub end_col: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextMenuItem {
+    Copy,
+    Paste,
+    Separator,
+    NewTab,
+    CloseTab,
 }
