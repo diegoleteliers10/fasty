@@ -212,6 +212,7 @@ impl<'a> Renderer<'a> {
         tab_titles: &[String],
         active_tab_path: &str,
         context_menu_visible: bool,
+        context_menu_is_about: bool,
         context_menu_x: f32,
         context_menu_y: f32,
         context_menu_hovered_idx: Option<usize>,
@@ -282,6 +283,7 @@ impl<'a> Renderer<'a> {
                 tab_titles,
                 active_tab_path,
                 context_menu_visible,
+                context_menu_is_about,
                 context_menu_x,
                 context_menu_y,
                 context_menu_hovered_idx,
@@ -384,6 +386,61 @@ impl<'a> Renderer<'a> {
         frame.present();
         self.dirty = false;
     }
+
+    pub fn render_about(
+        &mut self,
+        version: &str,
+        hover_close: bool,
+    ) {
+        if !self.dirty {
+            return;
+        }
+
+        let frame = match self.surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(e) => {
+                tracing::error!("Failed to get current texture: {}", e);
+                return;
+            }
+        };
+
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("about-render-encoder"),
+        });
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("about-render-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+
+            self.pipeline.render_about(
+                &mut render_pass,
+                &mut self.ui_atlas,
+                self.config.width as f32,
+                self.config.height as f32,
+                version,
+                hover_close,
+                &self.device,
+                &self.queue,
+            );
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        frame.present();
+        self.dirty = false;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -406,4 +463,5 @@ pub enum ContextMenuItem {
     Separator,
     NewTab,
     CloseTab,
+    About,
 }

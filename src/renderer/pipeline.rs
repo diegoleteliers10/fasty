@@ -596,6 +596,7 @@ impl Pipeline {
         tab_titles: &[String],
         active_tab_path: &str,
         context_menu_visible: bool,
+        context_menu_is_about: bool,
         context_menu_x: f32,
         context_menu_y: f32,
         context_menu_hovered_idx: Option<usize>,
@@ -1232,22 +1233,38 @@ impl Pipeline {
             let update_x = settings_x - update_btn_w - 12.0;
             let update_y = controls_y + 4.0;
 
-            // Draw button background (rounded rect)
-            let btn_bg_color = if update_in_progress {
-                [0.4f32, 0.4f32, 0.4f32, 0.5f32] // Disabled grey if updating
-            } else if hover_update {
-                [5.0 / 255.0, 150.0 / 255.0, 105.0 / 255.0, 1.0] // Darker green on hover
+            // Draw button background (rounded rect with border)
+            let border_color = if hover_update {
+                [255.0 / 255.0, 255.0 / 255.0, 255.0 / 255.0, 0.20] // Lighter border on hover
             } else {
-                [16.0 / 255.0, 185.0 / 255.0, 129.0 / 255.0, 1.0] // Green #10B981
+                [255.0 / 255.0, 255.0 / 255.0, 255.0 / 255.0, 0.10] // Subtle border normally
+            };
+            let btn_bg_color = if update_in_progress {
+                [40.0 / 255.0, 40.0 / 255.0, 40.0 / 255.0, 1.0]
+            } else if hover_update {
+                [24.0 / 255.0, 24.0 / 255.0, 24.0 / 255.0, 1.0] // Slightly lighter grey on hover
+            } else {
+                [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0] // #0c0c0c
             };
 
+            // Outer border
             bg_instances.push(CellInstance::new(
                 update_x, update_y,
                 update_btn_w, update_btn_h,
-                btn_bg_color,
+                border_color,
                 [0.0, 0.0, 0.0, 0.0],
                 0.0, 0.0, 1.0, 1.0,
                 5.0, // 5px corner radius
+            ));
+
+            // Inner background
+            bg_instances.push(CellInstance::new(
+                update_x + 1.0, update_y + 1.0,
+                update_btn_w - 2.0, update_btn_h - 2.0,
+                btn_bg_color,
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                4.0, // 4px corner radius
             ));
 
             // Draw button text
@@ -1266,12 +1283,12 @@ impl Pipeline {
                 }
             }
 
-            let tx = update_x + (update_btn_w - text_w) / 2.0;
-            let ty = update_y + (update_btn_h - 11.0) / 2.0;
+            let tx = (update_x + (update_btn_w - text_w) / 2.0).round();
+            let ty = (update_y + (update_btn_h - 11.0) / 2.0).round();
 
             let mut curr_x = tx;
             let scaled_ascent = atlas.ascent() * text_scale;
-            let path_baseline_y = ty + scaled_ascent;
+            let path_baseline_y = (ty + scaled_ascent - 1.5).round();
             for c in text.chars() {
                 if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                     if entry.width > 0.0 {
@@ -1618,14 +1635,18 @@ impl Pipeline {
         // Draw Context Menu if visible
         if context_menu_visible {
             let mut menu_items = Vec::new();
-            if selection.is_some() {
-                menu_items.push(crate::renderer::ContextMenuItem::Copy);
-            }
-            menu_items.push(crate::renderer::ContextMenuItem::Paste);
-            menu_items.push(crate::renderer::ContextMenuItem::Separator);
-            menu_items.push(crate::renderer::ContextMenuItem::NewTab);
-            if tab_titles.len() > 1 {
-                menu_items.push(crate::renderer::ContextMenuItem::CloseTab);
+            if context_menu_is_about {
+                menu_items.push(crate::renderer::ContextMenuItem::About);
+            } else {
+                if selection.is_some() {
+                    menu_items.push(crate::renderer::ContextMenuItem::Copy);
+                }
+                menu_items.push(crate::renderer::ContextMenuItem::Paste);
+                menu_items.push(crate::renderer::ContextMenuItem::Separator);
+                menu_items.push(crate::renderer::ContextMenuItem::NewTab);
+                if tab_titles.len() > 1 {
+                    menu_items.push(crate::renderer::ContextMenuItem::CloseTab);
+                }
             }
 
             let menu_w = 180.0f32; // Target design: Min width 180px
@@ -1698,13 +1719,18 @@ impl Pipeline {
                 10.0, // 10px corner radius on all corners
             );
 
-            // 2. Inner background (rgba(36, 38, 42, 0.97))
+            // 2. Inner background (rgba(36, 38, 42, 0.97) or rgba(12, 12, 12, 1.0))
+            let inner_bg_color = if context_menu_is_about {
+                [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0]
+            } else {
+                [36.0 / 255.0, 38.0 / 255.0, 42.0 / 255.0, 0.97]
+            };
             anim_push(
                 context_menu_x + 1.0,
                 context_menu_y + 1.0,
                 menu_w - 2.0,
                 menu_h - 2.0,
-                [36.0 / 255.0, 38.0 / 255.0, 42.0 / 255.0, 0.97],
+                inner_bg_color,
                 [0.0, 0.0, 0.0, 0.0],
                 0.0, 0.0, 1.0, 1.0,
                 9.0, // Alignment inner radius
@@ -1760,6 +1786,7 @@ impl Pipeline {
                             crate::renderer::ContextMenuItem::Paste => ("📋", "Pegar", Some("⌘V")),
                             crate::renderer::ContextMenuItem::NewTab => ("+", "Nueva pestaña", None),
                             crate::renderer::ContextMenuItem::CloseTab => ("\u{2715}", "Cerrar pestaña", None),
+                            crate::renderer::ContextMenuItem::About => ("", "About", None),
                             _ => ("", "", None),
                         };
 
@@ -1777,6 +1804,7 @@ impl Pipeline {
                             crate::renderer::ContextMenuItem::Paste => atlas.icon_paste.as_ref(),
                             crate::renderer::ContextMenuItem::NewTab => atlas.icon_add.as_ref(),
                             crate::renderer::ContextMenuItem::CloseTab => atlas.icon_close.as_ref(),
+                            crate::renderer::ContextMenuItem::About => atlas.app_icon.as_ref(),
                             _ => None,
                         };
 
@@ -2259,7 +2287,7 @@ impl Pipeline {
             let drop_h = 180.0f32;
 
             // Draw dropdown background shadow
-            bg_instances.push(CellInstance::new(
+            fg_instances.push(CellInstance::new(
                 drop_x - 4.0, drop_y - 2.0,
                 drop_w + 8.0, drop_h + 8.0,
                 [0.0, 0.0, 0.0, 0.35],
@@ -2269,20 +2297,20 @@ impl Pipeline {
             ));
 
             // Draw dropdown border
-            bg_instances.push(CellInstance::new(
+            fg_instances.push(CellInstance::new(
                 drop_x, drop_y,
                 drop_w, drop_h,
-                [1.0, 1.0, 1.0, 0.08],
+                [1.0, 1.0, 1.0, 0.15],
                 [0.0, 0.0, 0.0, 0.0],
                 0.0, 0.0, 1.0, 1.0,
                 6.0,
             ));
 
-            // Draw dropdown background (#08080a) - 100% opaque alpha!
-            bg_instances.push(CellInstance::new(
+            // Draw dropdown background (#0c0c0c) - 100% opaque alpha!
+            fg_instances.push(CellInstance::new(
                 drop_x + 1.0, drop_y + 1.0,
                 drop_w - 2.0, drop_h - 2.0,
-                [8.0 / 255.0, 8.0 / 255.0, 10.0 / 255.0, 1.0],
+                [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0],
                 [0.0, 0.0, 0.0, 0.0],
                 0.0, 0.0, 1.0, 1.0,
                 5.0,
@@ -2303,7 +2331,7 @@ impl Pipeline {
 
                     // Draw item background on hover/selection
                     if is_hovered {
-                        bg_instances.push(CellInstance::new(
+                        fg_instances.push(CellInstance::new(
                             drop_x + 4.0, item_top_y + 1.0,
                             drop_w - 8.0, item_h - 2.0,
                             [1.0, 1.0, 1.0, 0.08],
@@ -2312,7 +2340,7 @@ impl Pipeline {
                             4.0,
                         ));
                     } else if is_selected {
-                        bg_instances.push(CellInstance::new(
+                        fg_instances.push(CellInstance::new(
                             drop_x + 4.0, item_top_y + 1.0,
                             drop_w - 8.0, item_h - 2.0,
                             [91.0 / 255.0, 138.0 / 255.0, 240.0 / 255.0, 0.15],
@@ -2383,7 +2411,7 @@ impl Pipeline {
                 let sbar_h = (drop_h / total_h) * drop_h;
                 let sbar_y = drop_y + (font_scroll_y / total_h) * drop_h;
 
-                bg_instances.push(CellInstance::new(
+                fg_instances.push(CellInstance::new(
                     sbar_x, sbar_y,
                     sbar_w, sbar_h,
                     [1.0, 1.0, 1.0, 0.25],
@@ -2393,6 +2421,196 @@ impl Pipeline {
                 ));
             }
         }
+
+        // Write buffer and draw
+        let bg_count = bg_instances.len();
+        let fg_count = fg_instances.len();
+        let mut instances = Vec::with_capacity(bg_count + fg_count);
+        instances.extend(bg_instances);
+        instances.extend(fg_instances);
+
+        let instance_count = instances.len().min(self.max_instances);
+        if instance_count > 0 {
+            queue.write_buffer(
+                &self.instance_buffer,
+                0,
+                cast_slice(&instances[..instance_count]),
+            );
+        }
+
+        queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            cast_slice(&[viewport_width, viewport_height]),
+        );
+
+        render_pass.set_pipeline(&self.pipeline);
+        render_pass.set_bind_group(0, &self.bind_group, &[]);
+        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+
+        if instance_count > 0 {
+            render_pass.draw(0..6, 0..instance_count as u32);
+        }
+    }
+
+    pub fn render_about(
+        &self,
+        render_pass: &mut wgpu::RenderPass,
+        atlas: &mut crate::renderer::Atlas,
+        viewport_width: f32,
+        viewport_height: f32,
+        version: &str,
+        hover_close: bool,
+        device: &Device,
+        queue: &wgpu::Queue,
+    ) {
+        let mut bg_instances = Vec::new();
+        let mut fg_instances = Vec::new();
+
+        // 0. Draw window background (slate dark)
+        bg_instances.push(CellInstance::new(
+            0.0, 0.0,
+            viewport_width, viewport_height,
+            [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0], // About bg (#0c0c0c)
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            8.0,
+        ));
+
+        // 1. Draw topbar background (#0a0a0a)
+        bg_instances.push(CellInstance::new(
+            0.0, 0.0,
+            viewport_width, 36.0,
+            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            8.0,
+        ));
+        bg_instances.push(CellInstance::new(
+            0.0, 28.0,
+            viewport_width, 8.0,
+            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 0.0, 0.0,
+            0.0,
+        ));
+        bg_instances.push(CellInstance::new(
+            0.0, 36.0,
+            viewport_width, 1.0,
+            [1.0, 1.0, 1.0, 0.06], // Divider line
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 0.0, 0.0,
+            0.0,
+        ));
+
+        // Helper to draw text
+        let draw_text = |atlas: &mut crate::renderer::Atlas, text: &str, start_x: f32, start_y: f32, color: [f32; 4], fg_list: &mut Vec<CellInstance>| {
+            let mut x = start_x;
+            for c in text.chars() {
+                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                    if entry.width > 0.0 {
+                        let glyph_x = (x + entry.left).round();
+                        let glyph_y = (start_y + atlas.ascent() + entry.top).round();
+                        let (aw, ah) = atlas.atlas_size();
+                        let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                        fg_list.push(CellInstance::new(
+                            glyph_x, glyph_y,
+                            entry.width, entry.height,
+                            color,
+                            [0.0, 0.0, 0.0, 0.0],
+                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                            0.0,
+                        ));
+                        x += entry.width + 2.0;
+                    } else if c == ' ' {
+                        x += 8.0;
+                    }
+                }
+            }
+        };
+
+        let get_text_width = |atlas: &mut crate::renderer::Atlas, text: &str| -> f32 {
+            let mut w = 0.0f32;
+            for c in text.chars() {
+                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                    if entry.width > 0.0 {
+                        w += entry.width + 2.0;
+                    } else if c == ' ' {
+                        w += 8.0;
+                    }
+                }
+            }
+            w
+        };
+
+        // Draw title
+        draw_text(atlas, "About Fasty", 12.0, 6.0, [0.85, 0.85, 0.90, 1.0], &mut fg_instances);
+
+        // Draw topbar close button
+        if hover_close {
+            bg_instances.push(CellInstance::new(
+                viewport_width - 32.0, 4.0,
+                28.0, 28.0,
+                [0.85, 0.25, 0.25, 0.9],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                6.0,
+            ));
+        }
+        if let Some(entry) = &atlas.icon_close {
+            let entry_w = 14.0f32;
+            let entry_h = 14.0f32;
+            let glyph_x = (viewport_width - 32.0) + (28.0 - entry_w) / 2.0;
+            let glyph_y = 4.0 + (28.0 - entry_h) / 2.0;
+            let (aw, ah) = atlas.atlas_size();
+            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+            fg_instances.push(CellInstance::new(
+                glyph_x, glyph_y,
+                entry_w, entry_h,
+                [0.8, 0.8, 0.85, 1.0],
+                [0.0, 0.0, 0.0, 0.0],
+                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                0.0,
+            ));
+        }
+
+        // Draw Fasty App Icon in the center
+        if let Some(entry) = &atlas.app_icon {
+            let logo_w = 48.0f32;
+            let logo_h = 48.0f32;
+            let logo_x = (viewport_width - logo_w) / 2.0;
+            let logo_y = 52.0f32;
+            let (aw, ah) = atlas.atlas_size();
+            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+            fg_instances.push(CellInstance::new(
+                logo_x, logo_y,
+                logo_w, logo_h,
+                [1.0, 1.0, 1.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0],
+                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                1.0,
+            ));
+        }
+
+        // Draw App Name: Fasty
+        let name_str = "Fasty";
+        let name_w = get_text_width(atlas, name_str);
+        let name_x = (viewport_width - name_w) / 2.0;
+        draw_text(atlas, name_str, name_x, 110.0, [1.0, 1.0, 1.0, 1.0], &mut fg_instances);
+
+        // Draw Version: e.g. Version 0.1.3
+        let ver_clean = version.trim_start_matches('v');
+        let ver_str = format!("Version {}", ver_clean);
+        let ver_w = get_text_width(atlas, &ver_str);
+        let ver_x = (viewport_width - ver_w) / 2.0;
+        draw_text(atlas, &ver_str, ver_x, 134.0, [0.6, 0.6, 0.65, 1.0], &mut fg_instances);
+
+        // Draw description
+        let desc_str = "GPU-accelerated Terminal Emulator";
+        let desc_w = get_text_width(atlas, desc_str);
+        let desc_x = (viewport_width - desc_w) / 2.0;
+        draw_text(atlas, desc_str, desc_x, 158.0, [0.45, 0.45, 0.5, 1.0], &mut fg_instances);
 
         // Write buffer and draw
         let bg_count = bg_instances.len();

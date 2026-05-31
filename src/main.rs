@@ -138,11 +138,17 @@ fn get_last_path_component(path_str: &str) -> String {
     }
 }
 
+fn get_current_version() -> String {
+    format!("v{}", env!("CARGO_PKG_VERSION"))
+}
+
+
 fn main() -> anyhow::Result<()> {
     std::env::set_var("TERM", "xterm-256color");
     std::env::set_var("COLORTERM", "truecolor");
     std::env::set_var("TERM_PROGRAM", "fasty");
-    std::env::set_var("TERM_PROGRAM_VERSION", "0.1.0");
+    let app_version = get_current_version();
+    std::env::set_var("TERM_PROGRAM_VERSION", app_version.trim_start_matches('v'));
 
     tracing_subscriber::fmt()
         .with_env_filter("warn,fasty=info")
@@ -223,6 +229,7 @@ fn main() -> anyhow::Result<()> {
     let start_time = std::time::Instant::now();
     let mut clipboard: Option<arboard::Clipboard> = None;
     let mut context_menu_visible = false;
+    let mut context_menu_is_about = false;
     let mut context_menu_x = 0.0f64;
     let mut context_menu_y = 0.0f64;
     let mut context_menu_hovered_idx: Option<usize> = None;
@@ -263,6 +270,13 @@ fn main() -> anyhow::Result<()> {
     let mut system_fonts = Vec::<String>::new();
     let mut s_mouse_x = 0.0f64;
     let mut s_mouse_y = 0.0f64;
+
+    // Secondary about window state
+    let mut about_window: Option<Arc<winit::window::Window>> = None;
+    let mut about_renderer: Option<Renderer<'static>> = None;
+    let mut about_hover_close = false;
+    let mut about_mouse_y = 0.0f64;
+
     let mut first_frame_rendered = false;
     let mut app_dirty = true;
     let mut last_render_time = std::time::Instant::now();
@@ -295,9 +309,10 @@ fn main() -> anyhow::Result<()> {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
                         if let Some(tag_name) = json.get("tag_name").and_then(|v| v.as_str()) {
-                            let clean_tag = tag_name.trim_start_matches('v');
-                            let current_version = env!("CARGO_PKG_VERSION");
-                            if clean_tag != current_version {
+                            let clean_tag = tag_name.trim_start_matches('v').trim();
+                            let current_version = get_current_version();
+                            let clean_current = current_version.trim_start_matches('v').trim();
+                            if clean_tag != clean_current {
                                 tracing::info!("Update available: {} (current: {})", tag_name, current_version);
                                 *update_available.lock() = Some(tag_name.to_string());
                                 let _ = proxy.send_event(());
@@ -383,7 +398,7 @@ fn main() -> anyhow::Result<()> {
                                     toast = Some((
                                         format!("Update Available ({}) [Update Now]", ver_str),
                                         std::time::Instant::now(),
-                                        8000,
+                                        2000,
                                     ));
                                     app_dirty = true;
                                 }
@@ -398,7 +413,7 @@ fn main() -> anyhow::Result<()> {
                                 toast = Some((
                                     "✓  Update success! Please restart Fasty.".to_string(),
                                     std::time::Instant::now(),
-                                    8000,
+                                    2000,
                                 ));
                                 *update_available.lock() = None; // Hide button
                                 has_shown_update_toast = true; // Prevent re-showing update toast
@@ -409,15 +424,10 @@ fn main() -> anyhow::Result<()> {
                             let is_in_progress = *update_in_progress.lock();
 
                             let mut r = renderer.lock();
-                            if r.update_available != is_available
-                                || r.update_in_progress != is_in_progress
-                                || r.hover_update != hover_update
-                            {
-                                r.update_available = is_available;
-                                r.update_in_progress = is_in_progress;
-                                r.hover_update = hover_update;
-                                r.set_dirty(true);
-                            }
+                            r.update_available = is_available;
+                            r.update_in_progress = is_in_progress;
+                            r.hover_update = hover_update;
+                            r.set_dirty(true);
                             r.render(
                                 next_render_reason,
                                 term_ref,
@@ -439,6 +449,7 @@ fn main() -> anyhow::Result<()> {
                                 &tab_titles,
                                 &active_tab_path,
                                 context_menu_visible,
+                                context_menu_is_about,
                                 context_menu_x as f32,
                                 context_menu_y as f32,
                                 context_menu_hovered_idx,
@@ -537,7 +548,24 @@ fn main() -> anyhow::Result<()> {
                                 winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyT) => true,
                                 _ => key_str.eq_ignore_ascii_case("t")
                             };
+                            let is_w_key = match event.physical_key {
+                                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyW) => true,
+                                _ => key_str.eq_ignore_ascii_case("w")
+                            };
+                            let is_n_key = match event.physical_key {
+                                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyN) => true,
+                                _ => key_str.eq_ignore_ascii_case("n")
+                            };
+                            let is_c_key = match event.physical_key {
+                                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyC) => true,
+                                _ => key_str.eq_ignore_ascii_case("c")
+                            };
+                            let is_v_key = match event.physical_key {
+                                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV) => true,
+                                _ => key_str.eq_ignore_ascii_case("v") || key_str == "\u{16}"
+                            };
 
+                            // Ctrl+Shift+T -> new tab
                             if ctrl_active && shift_active && is_t_key {
                                 let new_tab_count = tabs.len() + 1;
                                 let padding_top = get_padding_top(new_tab_count);
@@ -574,10 +602,7 @@ fn main() -> anyhow::Result<()> {
                                 return;
                             }
 
-                            let is_w_key = match event.physical_key {
-                                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyW) => true,
-                                _ => key_str.eq_ignore_ascii_case("w")
-                            };
+                            // Ctrl+Shift+W -> close tab
                             if ctrl_active && shift_active && is_w_key {
                                 if tabs.len() <= 1 {
                                     target.exit();
@@ -592,6 +617,125 @@ fn main() -> anyhow::Result<()> {
                                     shell_cols = cols;
                                     shell_rows = rows;
                                     
+                                    let mut r = renderer.lock();
+                                    r.set_dirty(true);
+                                    r.grid_dirty = true;
+                                    app_dirty = true;
+                                }
+                                return;
+                            }
+
+                            // Ctrl+Shift+N -> new window
+                            if ctrl_active && shift_active && is_n_key {
+                                if let Ok(exe) = std::env::current_exe() {
+                                    let _ = std::process::Command::new(exe).spawn();
+                                }
+                                return;
+                            }
+
+                            // Ctrl+Shift+C -> copy selection to clipboard
+                            if ctrl_active && shift_active && is_c_key {
+                                if let Some(sel) = tabs[active_tab_index].selection {
+                                    copy_selection_to_clipboard(&tabs[active_tab_index].terminal_state, sel, shell_cols, shell_rows, &mut clipboard);
+                                    toast = Some((
+                                        "✓  Text copied".to_string(),
+                                        std::time::Instant::now(),
+                                        1920,
+                                    ));
+                                    let mut r = renderer.lock();
+                                    r.set_dirty(true);
+                                    r.grid_dirty = true;
+                                    app_dirty = true;
+                                }
+                                return;
+                            }
+
+                            // Ctrl+Shift+V -> paste from clipboard
+                            if ctrl_active && shift_active && is_v_key {
+                                let mut ctx_opt = if clipboard.is_none() {
+                                    match arboard::Clipboard::new() {
+                                        Ok(ctx) => {
+                                            clipboard = Some(ctx);
+                                            clipboard.as_mut()
+                                        }
+                                        Err(_e) => {
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    clipboard.as_mut()
+                                };
+
+                                if let Some(ref mut ctx) = ctx_opt {
+                                    match ctx.get_text() {
+                                        Ok(text) => {
+                                            if !text.is_empty() {
+                                                let term = tabs[active_tab_index].terminal_state.lock();
+                                                let term_guard = term.term().lock();
+                                                let mode = term_guard.mode();
+                                                let bracketed = mode.contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+                                                drop(term_guard);
+                                                drop(term);
+
+                                                let mut paste_bytes = Vec::new();
+                                                if bracketed {
+                                                    paste_bytes.extend_from_slice(b"\x1b[200~");
+                                                    paste_bytes.extend_from_slice(text.as_bytes());
+                                                    paste_bytes.extend_from_slice(b"\x1b[201~");
+                                                } else {
+                                                    paste_bytes.extend_from_slice(text.as_bytes());
+                                                }
+                                                tabs[active_tab_index].scroll_target = 0.0;
+                                                tabs[active_tab_index].terminal_state.lock().write_to_pty(&paste_bytes);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("fasty clipboard get_text failed: {:?}", e);
+                                        }
+                                    }
+                                } else {
+                                    eprintln!("fasty clipboard not available");
+                                }
+                                return;
+                            }
+
+                            // Ctrl+Shift+Equal / Ctrl+Plus -> increase font size
+                            // Ctrl+Minus -> decrease font size
+                            // Ctrl+Shift+0 -> reset font size
+                            let is_increase = (ctrl_active && shift_active && (key_str == "=" || key_str == "+"))
+                                || (ctrl_active && !shift_active && key_str == "+");
+                            let is_decrease = ctrl_active && !shift_active && key_str == "-";
+                            let is_reset = ctrl_active && shift_active && key_str == "0";
+
+                            if is_increase || is_decrease || is_reset {
+                                let mut current_config = Config::load().unwrap_or_default();
+                                let mut new_size = current_config.font.size;
+                                if is_increase {
+                                    new_size = (new_size + 0.5).min(72.0);
+                                } else if is_decrease {
+                                    new_size = (new_size - 0.5).max(6.0);
+                                } else if is_reset {
+                                    new_size = 13.0;
+                                }
+
+                                if new_size != current_config.font.size {
+                                    current_config.font.size = new_size;
+                                    let _ = current_config.save(&Config::config_path());
+                                    config = current_config;
+
+                                    if let Err(e) = renderer.lock().update_font(&config.font.family, config.font.size) {
+                                        tracing::error!("Failed to update renderer font: {:?}", e);
+                                    }
+
+                                    let cell_w = renderer.lock().cell_width();
+                                    let cell_h = renderer.lock().cell_height();
+                                    let physical_size = window_for_redraw.inner_size();
+                                    let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_w, cell_h);
+                                    shell_cols = cols;
+                                    shell_rows = rows;
+                                    cell_width = cell_w;
+                                    cell_height = cell_h;
+
                                     let mut r = renderer.lock();
                                     r.set_dirty(true);
                                     r.grid_dirty = true;
@@ -657,66 +801,17 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
 
-                            if ctrl_active {
-                                 let is_v_key = match event.physical_key {
-                                     winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV) => true,
-                                     _ => key_str.eq_ignore_ascii_case("v") || key_str == "\u{16}"
-                                 };
-
-                                 if shift_active && is_v_key {
-                                     let mut ctx_opt = if clipboard.is_none() {
-                                         match arboard::Clipboard::new() {
-                                             Ok(ctx) => {
-                                                 clipboard = Some(ctx);
-                                                 clipboard.as_mut()
-                                             }
-                                             Err(_e) => {
-                                                 None
-                                             }
-                                         }
-                                     } else {
-                                         clipboard.as_mut()
-                                     };
-
-                                     if let Some(ref mut ctx) = ctx_opt {
-                                         match ctx.get_text() {
-                                             Ok(text) => {
-                                                 if !text.is_empty() {
-                                                     let term = tabs[active_tab_index].terminal_state.lock();
-                                                     let term_guard = term.term().lock();
-                                                     let mode = term_guard.mode();
-                                                     let bracketed = mode.contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
-                                                     drop(term_guard);
-                                                     drop(term);
-
-                                                     let mut paste_bytes = Vec::new();
-                                                     if bracketed {
-                                                         paste_bytes.extend_from_slice(b"\x1b[200~");
-                                                         paste_bytes.extend_from_slice(text.as_bytes());
-                                                         paste_bytes.extend_from_slice(b"\x1b[201~");
-                                                     } else {
-                                                         paste_bytes.extend_from_slice(text.as_bytes());
-                                                     }
-                                                     tabs[active_tab_index].scroll_target = 0.0;
-                                                     tabs[active_tab_index].terminal_state.lock().write_to_pty(&paste_bytes);
-                                                 }
-                                             }
-                                             Err(e) => {
-                                                 eprintln!("fasty clipboard get_text failed: {:?}", e);
-                                             }
-                                         }
-                                     } else {
-                                         eprintln!("fasty clipboard not available");
-                                     }
-                                     return;
-                                 }
-
-                                match key_str.as_str() {
-                                    "c" => { tabs[active_tab_index].scroll_target = 0.0; tabs[active_tab_index].terminal_state.lock().write_to_pty(&[0x03]); return; }
-                                    "d" => { tabs[active_tab_index].scroll_target = 0.0; tabs[active_tab_index].terminal_state.lock().write_to_pty(&[0x04]); return; }
-                                    "z" => { tabs[active_tab_index].scroll_target = 0.0; tabs[active_tab_index].terminal_state.lock().write_to_pty(&[0x1A]); return; }
-                                    "l" => { tabs[active_tab_index].scroll_target = 0.0; tabs[active_tab_index].terminal_state.lock().write_to_pty(&[0x0C]); return; }
-                                    _ => {}
+                            // Plain Ctrl+letter always goes to the PTY without interception
+                            if ctrl_active && !shift_active && !alt_active {
+                                if let winit::keyboard::Key::Character(ref s) = event.logical_key {
+                                    if let Some(ch) = s.chars().next() {
+                                        if ch.is_ascii_alphabetic() || ['[', '\\', ']', '^', '_'].contains(&ch) {
+                                            let b = (ch.to_ascii_uppercase() as u8) & 0x1F;
+                                            tabs[active_tab_index].scroll_target = 0.0;
+                                            tabs[active_tab_index].terminal_state.lock().write_to_pty(&[b]);
+                                            return;
+                                        }
+                                    }
                                 }
                             }
 
@@ -726,7 +821,7 @@ fn main() -> anyhow::Result<()> {
                                 *term_guard.mode()
                             };
 
-                            let bytes = key_to_bytes(&event.logical_key, shift_active, mode);
+                            let bytes = key_to_bytes(&event.logical_key, shift_active, ctrl_active, alt_active, mode);
                             if !bytes.is_empty() {
                                 tabs[active_tab_index].scroll_target = 0.0;
                                 tabs[active_tab_index].terminal_state.lock().write_to_pty(&bytes);
@@ -742,10 +837,36 @@ fn main() -> anyhow::Result<()> {
                                 if pressed {
                                     if button == MouseButton::Left {
                                         if let Some(hovered_idx) = context_menu_hovered_idx {
-                                            let menu_items = get_context_menu_items(&tabs, active_tab_index);
+                                            let menu_items = get_context_menu_items(&tabs, active_tab_index, context_menu_is_about);
                                             if hovered_idx < menu_items.len() {
                                                 let item = menu_items[hovered_idx];
                                                 match item {
+                                                    crate::renderer::ContextMenuItem::About => {
+                                                        if about_window.is_none() {
+                                                            if let Ok(aw) = target.create_window(winit::window::WindowAttributes::default()
+                                                                .with_title("About Fasty")
+                                                                .with_decorations(false)
+                                                                .with_transparent(true)
+                                                                .with_inner_size(winit::dpi::LogicalSize::new(300.0, 200.0))) {
+                                                                let aw_arc = Arc::new(aw);
+                                                                let aw_ref: &winit::window::Window = &*aw_arc;
+                                                                let aw_static: &'static winit::window::Window = unsafe { std::mem::transmute(aw_ref) };
+                                                                if let Ok(ar) = pollster::block_on(Renderer::new(aw_static, "Inter", 13.0)) {
+                                                                    about_renderer = Some(ar);
+                                                                }
+                                                                about_window = Some(aw_arc);
+                                                                about_hover_close = false;
+                                                            }
+                                                        }
+                                                        context_menu_visible = false;
+                                                        context_menu_open_time = None;
+                                                        context_menu_open_time_secs = None;
+                                                        context_menu_hovered_idx = None;
+                                                        let mut r = renderer.lock();
+                                                        r.set_dirty(true);
+                                                        r.grid_dirty = true;
+                                                        app_dirty = true;
+                                                    }
                                                     crate::renderer::ContextMenuItem::Copy => {
                                                         if let Some(sel) = tabs[active_tab_index].selection {
                                                             copy_selection_to_clipboard(&tabs[active_tab_index].terminal_state, sel, shell_cols, shell_rows, &mut clipboard);
@@ -847,13 +968,22 @@ fn main() -> anyhow::Result<()> {
                                         }
                                     } else if button == MouseButton::Right {
                                         // Reposition menu
-                                        let menu_items = get_context_menu_items(&tabs, active_tab_index);
+                                        let menu_items = get_context_menu_items(&tabs, active_tab_index, context_menu_is_about);
                                         let (menu_w, menu_h) = get_context_menu_size(&menu_items);
                                         let r = renderer.lock();
                                         let v_width = r.config.width as f64;
                                         drop(r);
                                         
-                                        if current_mouse_y >= padding_top as f64 && current_mouse_x <= (v_width - 20.0) {
+                                        if context_menu_is_about {
+                                            context_menu_x = 8.0;
+                                            context_menu_y = 40.0;
+                                            context_menu_open_time = Some(std::time::Instant::now());
+                                            context_menu_open_time_secs = Some(start_time.elapsed().as_secs_f32());
+                                            context_menu_hovered_idx = None;
+                                            renderer.lock().set_dirty(true);
+                                            app_dirty = true;
+                                            return;
+                                        } else if current_mouse_y >= padding_top as f64 && current_mouse_x <= (v_width - 20.0) {
                                             context_menu_x = current_mouse_x;
                                             context_menu_y = current_mouse_y;
                                             context_menu_open_time = Some(std::time::Instant::now());
@@ -1252,8 +1382,20 @@ fn main() -> anyhow::Result<()> {
                                     let v_width = r.config.width as f64;
                                     drop(r);
                                     
-                                    if current_mouse_y >= padding_top as f64 && current_mouse_x <= (v_width - 20.0) {
-                                        let menu_items = get_context_menu_items(&tabs, active_tab_index);
+                                    if current_mouse_y < padding_top as f64 && current_mouse_x <= 36.0 {
+                                        // Right-click on Fasty icon in topbar
+                                        context_menu_x = 8.0;
+                                        context_menu_y = 40.0;
+                                        context_menu_is_about = true;
+                                        context_menu_open_time = Some(std::time::Instant::now());
+                                        context_menu_open_time_secs = Some(start_time.elapsed().as_secs_f32());
+                                        context_menu_visible = true;
+                                        context_menu_hovered_idx = None;
+                                        renderer.lock().set_dirty(true);
+                                        app_dirty = true;
+                                    } else if current_mouse_y >= padding_top as f64 && current_mouse_x <= (v_width - 20.0) {
+                                        context_menu_is_about = false;
+                                        let menu_items = get_context_menu_items(&tabs, active_tab_index, false);
                                         let (menu_w, menu_h) = get_context_menu_size(&menu_items);
                                         
                                         context_menu_x = current_mouse_x;
@@ -1286,7 +1428,7 @@ fn main() -> anyhow::Result<()> {
                             current_mouse_y = position.y;
 
                             if context_menu_visible {
-                                let menu_items = get_context_menu_items(&tabs, active_tab_index);
+                                let menu_items = get_context_menu_items(&tabs, active_tab_index, context_menu_is_about);
                                 let (menu_w, menu_h) = get_context_menu_size(&menu_items);
                                 if current_mouse_x >= context_menu_x && current_mouse_x <= context_menu_x + menu_w
                                    && current_mouse_y >= context_menu_y && current_mouse_y <= context_menu_y + menu_h {
@@ -1927,6 +2069,72 @@ fn main() -> anyhow::Result<()> {
                             _ => {}
                         }
                     }
+                } else if let Some(ref aw) = about_window {
+                    if window_id == aw.id() {
+                        // --- About Window Event Handler ---
+                        match event {
+                            WindowEvent::CloseRequested => {
+                                about_window = None;
+                                about_renderer = None;
+                                app_dirty = true;
+                            }
+                            WindowEvent::Resized(size) => {
+                                if let Some(ref mut r) = about_renderer {
+                                    r.resize(size.width, size.height);
+                                }
+                            }
+                            WindowEvent::RedrawRequested => {
+                                if let Some(ref mut r) = about_renderer {
+                                    r.set_dirty(true);
+                                    r.render_about(&get_current_version(), about_hover_close);
+                                }
+                            }
+                            WindowEvent::CursorMoved { position, .. } => {
+                                let scale_factor = aw.scale_factor();
+                                let m_x = position.x / scale_factor;
+                                let m_y = position.y / scale_factor;
+                                about_mouse_y = m_y;
+
+                                let old_hover_close = about_hover_close;
+                                about_hover_close = m_y >= 4.0 && m_y <= 32.0 && m_x >= (300.0 - 32.0) && m_x < (300.0 - 4.0);
+
+                                if about_hover_close != old_hover_close {
+                                    if let Some(ref mut r) = about_renderer {
+                                        r.set_dirty(true);
+                                    }
+                                    aw.request_redraw();
+                                }
+                            }
+                            WindowEvent::MouseInput { state, button, .. } => {
+                                if button == MouseButton::Left && state == ElementState::Pressed {
+                                    if about_hover_close {
+                                        about_window = None;
+                                        about_renderer = None;
+                                        app_dirty = true;
+                                    } else if about_mouse_y <= 36.0 {
+                                        let _ = aw.drag_window();
+                                    }
+                                }
+                            }
+                            WindowEvent::CursorLeft { .. } => {
+                                about_hover_close = false;
+                                if let Some(ref mut r) = about_renderer {
+                                    r.set_dirty(true);
+                                }
+                                aw.request_redraw();
+                            }
+                            WindowEvent::Focused(focused) => {
+                                if !focused {
+                                    about_hover_close = false;
+                                    if let Some(ref mut r) = about_renderer {
+                                        r.set_dirty(true);
+                                    }
+                                    aw.request_redraw();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             winit::event::Event::AboutToWait => {
@@ -1990,6 +2198,7 @@ fn main() -> anyhow::Result<()> {
                         &tab_titles,
                         &active_tab_path,
                         context_menu_visible,
+                        context_menu_is_about,
                         context_menu_x as f32,
                         context_menu_y as f32,
                         context_menu_hovered_idx,
@@ -2115,8 +2324,13 @@ fn main() -> anyhow::Result<()> {
 
                 // Toast auto-clear and redraw management
                 if let Some((_, start_time, duration_ms)) = toast {
-                    if start_time.elapsed() < std::time::Duration::from_millis(duration_ms) {
-                        animating = true;
+                    let elapsed_ms = start_time.elapsed().as_millis() as u64;
+                    if elapsed_ms < duration_ms {
+                        // Toast is only animating (fading in/out) during the first 120ms and last 300ms.
+                        // During the static phase (in-between), we do not set animating = true to save CPU/GPU.
+                        if elapsed_ms < 120 || elapsed_ms >= duration_ms.saturating_sub(300) {
+                            animating = true;
+                        }
                     } else {
                         toast = None;
                         app_dirty = true;
@@ -2179,10 +2393,21 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     
-                    // Check toast auto-clear wakeup
+                    // Check toast auto-clear and fade-out transition wakeup
                     if let Some((_, toast_start, duration_ms)) = toast {
-                        let toast_expire_time = toast_start + std::time::Duration::from_millis(duration_ms);
-                        if now < toast_expire_time {
+                        let elapsed_ms = now.duration_since(toast_start).as_millis() as u64;
+                        if elapsed_ms < duration_ms {
+                            // Wake up when the fade-out starts so we resume drawing at 60 FPS
+                            let fade_out_start_ms = duration_ms.saturating_sub(300);
+                            if elapsed_ms < fade_out_start_ms {
+                                let fade_out_time = toast_start + std::time::Duration::from_millis(fade_out_start_ms);
+                                if next_wakeup.is_none() || fade_out_time < next_wakeup.unwrap() {
+                                    next_wakeup = Some(fade_out_time);
+                                }
+                            }
+                            
+                            // Also wake up when it completely expires to clear the toast
+                            let toast_expire_time = toast_start + std::time::Duration::from_millis(duration_ms);
                             if next_wakeup.is_none() || toast_expire_time < next_wakeup.unwrap() {
                                 next_wakeup = Some(toast_expire_time);
                             }
@@ -2203,13 +2428,28 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn key_to_bytes(key: &Key, shift_active: bool, mode: alacritty_terminal::term::TermMode) -> Vec<u8> {
+fn key_to_bytes(
+    key: &Key,
+    shift_active: bool,
+    ctrl_active: bool,
+    alt_active: bool,
+    mode: alacritty_terminal::term::TermMode,
+) -> Vec<u8> {
     match key {
-        Key::Character(s) if !s.is_empty() => s.as_bytes().to_vec(),
+        Key::Character(s) if !s.is_empty() => {
+            if alt_active && !ctrl_active {
+                // Alt + key (Meta key — prefix with Escape)
+                let mut bytes = vec![0x1B];
+                bytes.extend_from_slice(s.as_bytes());
+                bytes
+            } else {
+                s.as_bytes().to_vec()
+            }
+        }
         Key::Named(n) => {
-            let name = format!("{:?}", n);
-            match name.as_str() {
-                "Enter" => {
+            use winit::keyboard::NamedKey;
+            match n {
+                NamedKey::Enter => {
                     if shift_active {
                         let has_kbd_proto = mode.intersects(
                             alacritty_terminal::term::TermMode::DISAMBIGUATE_ESC_CODES
@@ -2227,20 +2467,81 @@ fn key_to_bytes(key: &Key, shift_active: bool, mode: alacritty_terminal::term::T
                         vec![b'\r']
                     }
                 }
-                "Space" => vec![b' '],
-                "Backspace" => vec![0x7F],
-                "Tab" => vec![0x09],
-                "Escape" => vec![0x1B],
-                "ArrowUp" => vec![0x1B, 0x5B, 0x41],
-                "ArrowDown" => vec![0x1B, 0x5B, 0x42],
-                "ArrowRight" => vec![0x1B, 0x5B, 0x43],
-                "ArrowLeft" => vec![0x1B, 0x5B, 0x44],
-                "Home" => vec![0x1B, 0x5B, 0x48],
-                "End" => vec![0x1B, 0x5B, 0x46],
-                "PageUp" => vec![0x1B, 0x5B, 0x35, 0x7E],
-                "PageDown" => vec![0x1B, 0x5B, 0x36, 0x7E],
-                "Insert" => vec![0x1B, 0x5B, 0x32, 0x7E],
-                "Delete" => vec![0x1B, 0x5B, 0x33, 0x7E],
+                NamedKey::Space => vec![b' '],
+                NamedKey::Backspace => vec![0x7F],
+                NamedKey::Tab => {
+                    if shift_active {
+                        vec![0x1B, 0x5B, 0x5A] // \x1b[Z
+                    } else {
+                        vec![0x09] // \t
+                    }
+                }
+                NamedKey::Escape => vec![0x1B],
+
+                // Arrow keys
+                NamedKey::ArrowUp => {
+                    if ctrl_active {
+                        vec![0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x41] // \x1b[1;5A
+                    } else {
+                        vec![0x1B, 0x5B, 0x41] // \x1b[A
+                    }
+                }
+                NamedKey::ArrowDown => {
+                    if ctrl_active {
+                        vec![0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x42] // \x1b[1;5B
+                    } else {
+                        vec![0x1B, 0x5B, 0x42] // \x1b[B
+                    }
+                }
+                NamedKey::ArrowRight => {
+                    if ctrl_active {
+                        vec![0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x43] // \x1b[1;5C
+                    } else {
+                        vec![0x1B, 0x5B, 0x43] // \x1b[C
+                    }
+                }
+                NamedKey::ArrowLeft => {
+                    if ctrl_active {
+                        vec![0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x44] // \x1b[1;5D
+                    } else {
+                        vec![0x1B, 0x5B, 0x44] // \x1b[D
+                    }
+                }
+
+                // Navigation
+                NamedKey::Home => {
+                    if shift_active {
+                        vec![0x1B, 0x5B, 0x31, 0x3B, 0x32, 0x48] // \x1b[1;2H
+                    } else {
+                        vec![0x1B, 0x5B, 0x48] // \x1b[H
+                    }
+                }
+                NamedKey::End => {
+                    if shift_active {
+                        vec![0x1B, 0x5B, 0x31, 0x3B, 0x32, 0x46] // \x1b[1;2F
+                    } else {
+                        vec![0x1B, 0x5B, 0x46] // \x1b[F
+                    }
+                }
+                NamedKey::PageUp => vec![0x1B, 0x5B, 0x35, 0x7E],   // \x1b[5~
+                NamedKey::PageDown => vec![0x1B, 0x5B, 0x36, 0x7E], // \x1b[6~
+                NamedKey::Insert => vec![0x1B, 0x5B, 0x32, 0x7E],   // \x1b[2~
+                NamedKey::Delete => vec![0x1B, 0x5B, 0x33, 0x7E],   // \x1b[3~
+
+                // Function keys
+                NamedKey::F1 => vec![0x1B, 0x4F, 0x50],  // \x1bOP
+                NamedKey::F2 => vec![0x1B, 0x4F, 0x51],  // \x1bOQ
+                NamedKey::F3 => vec![0x1B, 0x4F, 0x52],  // \x1bOR
+                NamedKey::F4 => vec![0x1B, 0x4F, 0x53],  // \x1bOS
+                NamedKey::F5 => vec![0x1B, 0x5B, 0x31, 0x35, 0x7E], // \x1b[15~
+                NamedKey::F6 => vec![0x1B, 0x5B, 0x31, 0x37, 0x7E], // \x1b[17~
+                NamedKey::F7 => vec![0x1B, 0x5B, 0x31, 0x38, 0x7E], // \x1b[18~
+                NamedKey::F8 => vec![0x1B, 0x5B, 0x31, 0x39, 0x7E], // \x1b[19~
+                NamedKey::F9 => vec![0x1B, 0x5B, 0x32, 0x30, 0x7E], // \x1b[20~
+                NamedKey::F10 => vec![0x1B, 0x5B, 0x32, 0x31, 0x7E], // \x1b[21~
+                NamedKey::F11 => vec![0x1B, 0x5B, 0x32, 0x33, 0x7E], // \x1b[23~
+                NamedKey::F12 => vec![0x1B, 0x5B, 0x32, 0x34, 0x7E], // \x1b[24~
+
                 _ => Vec::new(),
             }
         }
@@ -2591,18 +2892,22 @@ fn resize_direction_to_cursor(dir: winit::window::ResizeDirection) -> winit::win
     }
 }
 
-fn get_context_menu_items(tabs: &[Tab], active_idx: usize) -> Vec<crate::renderer::ContextMenuItem> {
-    let mut items = Vec::new();
-    if tabs[active_idx].selection.is_some() {
-        items.push(crate::renderer::ContextMenuItem::Copy);
+fn get_context_menu_items(tabs: &[Tab], active_idx: usize, is_about: bool) -> Vec<crate::renderer::ContextMenuItem> {
+    if is_about {
+        vec![crate::renderer::ContextMenuItem::About]
+    } else {
+        let mut items = Vec::new();
+        if tabs[active_idx].selection.is_some() {
+            items.push(crate::renderer::ContextMenuItem::Copy);
+        }
+        items.push(crate::renderer::ContextMenuItem::Paste);
+        items.push(crate::renderer::ContextMenuItem::Separator);
+        items.push(crate::renderer::ContextMenuItem::NewTab);
+        if tabs.len() > 1 {
+            items.push(crate::renderer::ContextMenuItem::CloseTab);
+        }
+        items
     }
-    items.push(crate::renderer::ContextMenuItem::Paste);
-    items.push(crate::renderer::ContextMenuItem::Separator);
-    items.push(crate::renderer::ContextMenuItem::NewTab);
-    if tabs.len() > 1 {
-        items.push(crate::renderer::ContextMenuItem::CloseTab);
-    }
-    items
 }
 
 fn get_context_menu_size(menu_items: &[crate::renderer::ContextMenuItem]) -> (f64, f64) {
