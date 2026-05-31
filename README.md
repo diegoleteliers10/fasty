@@ -81,9 +81,65 @@ src/
 
 ---
 
-## 🛠️ Build & Setup
+## 📦 Installation & Setup
 
-### 1. Install System Dependencies
+### 1. Automatic Installation via Scripts
+
+#### 🐧 Linux & 🍎 macOS
+You can install Fasty automatically by running the installer script:
+```bash
+curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash
+```
+
+#### 🪟 Windows
+Run the PowerShell installer script (no administrator privileges required):
+```powershell
+irm https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.ps1 | iex
+```
+
+---
+
+### 2. Manual Installation from Release Archives
+
+If you prefer to install Fasty manually, download the correct bundle for your platform from the [Releases page](https://github.com/diegoleteliers10/fasty/releases).
+
+#### 🐧 Linux & 🍎 macOS (`.tar.gz`)
+1. Download the archive for your architecture:
+   - Linux: `fasty-x86_64-unknown-linux-gnu.tar.gz`
+   - macOS (Intel): `fasty-x86_64-apple-darwin.tar.gz`
+   - macOS (Apple Silicon): `fasty-aarch64-apple-darwin.tar.gz`
+2. Extract the archive:
+   ```bash
+   tar -xzf fasty-*.tar.gz
+   ```
+3. Move the binary/app bundle to your installation directory:
+   - On **Linux**:
+     ```bash
+     mkdir -p ~/.local/bin
+     mv fasty ~/.local/bin/
+     ```
+   - On **macOS**:
+     ```bash
+     mv Fasty.app /Applications/
+     ln -s /Applications/Fasty.app/Contents/MacOS/fasty /usr/local/bin/fasty
+     ```
+
+#### 🪟 Windows (`.zip`)
+1. Download `fasty-x86_64-pc-windows-msvc.zip`.
+2. Extract the `.zip` archive.
+3. Move the extracted folder or copy `fasty.exe` to a folder in your path, for example:
+   ```powershell
+   Move-Item -Path .\fasty.exe -Destination "$env:USERPROFILE\.local\bin\fasty.exe" -Force
+   ```
+4. Ensure `$env:USERPROFILE\.local\bin` is added to your environment `PATH` variable.
+
+---
+
+### 3. Build & Setup from Source
+
+If you want to compile Fasty from source:
+
+#### Install System Dependencies
 
 * **macOS**:
   ```bash
@@ -100,7 +156,7 @@ src/
 * **Windows**:
   Install the [Vulkan SDK](https://vulkan.lunarg.com/).
 
-### 2. Build
+#### Build Fasty
 
 ```bash
 # Debug profile
@@ -114,10 +170,43 @@ cargo build --features wayland
 cargo build --features x11
 ```
 
-### 3. Run
+---
+
+## 💻 Command Line Interface (CLI)
+
+Fasty can be launched with several command-line flags to customize its startup behavior.
+
+### CLI Options
+
+| Option | Alias | Description |
+| :--- | :--- | :--- |
+| `-e` | `--command` | Spawns a specific command directly and auto-closes the window once it exits. |
+| `-d` | `--working-dir` | Overrides the PTY startup working directory (e.g. `-d ~/projects`). |
+| | `--title` | Sets a custom window title. |
+
+### Usage Examples
 
 ```bash
-cargo run
+# Open fasty with the default user shell
+fasty
+
+# Open htop directly, closing the window automatically when htop exits
+fasty -e htop
+
+# Open a specific file inside neovim
+fasty -e nvim src/main.rs
+
+# Start an ssh session
+fasty -e ssh user@server
+
+# Run a development server in a specific working directory
+fasty -d ~/my-project -e bun run dev
+
+# Open terminal in a specific directory with a custom window title
+fasty --title "Dev Server" -d ~/my-project -e bun run dev
+
+# Run compound command inside bash
+fasty -e bash -c "cargo build && cargo test"
 ```
 
 ---
