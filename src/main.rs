@@ -219,7 +219,7 @@ fn main() -> anyhow::Result<()> {
     let mut current_mouse_x = 0.0f64;
     let mut current_mouse_y = 0.0f64;
     let mut last_click_time: Option<std::time::Instant> = None;
-    let mut toast: Option<(String, std::time::Instant)> = None;
+    let mut toast: Option<(String, std::time::Instant, u64)> = None;
     let start_time = std::time::Instant::now();
     let mut clipboard: Option<arboard::Clipboard> = None;
     let mut context_menu_visible = false;
@@ -236,6 +236,7 @@ fn main() -> anyhow::Result<()> {
     let mut hover_max = false;
     let mut hover_min = false;
     let mut hover_settings = false;
+    let mut hover_update = false;
     let mut hovered_tab_index: Option<usize> = None;
     let mut hovered_close_tab_index: Option<usize> = None;
     let mut hover_new_tab = false;
@@ -267,6 +268,47 @@ fn main() -> anyhow::Result<()> {
     let mut last_render_time = std::time::Instant::now();
     let mut last_blink_index = 0;
     let mut next_render_reason = RenderReason::GridChanged;
+
+    let update_available = Arc::new(parking_lot::Mutex::new(None::<String>));
+    let update_in_progress = Arc::new(parking_lot::Mutex::new(false));
+    let update_completed = Arc::new(parking_lot::Mutex::new(false));
+    let mut has_shown_update_toast = false;
+    let mut has_shown_success_toast = false;
+
+    // Spawn a background thread to check for updates at startup
+    {
+        let update_available = Arc::clone(&update_available);
+        let proxy = proxy.clone();
+        std::thread::spawn(move || {
+            // Wait 2 seconds before checking to let the terminal boot up smoothly
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            
+            let cmd = std::process::Command::new("curl")
+                .arg("-s")
+                .arg("-H")
+                .arg("User-Agent: fasty")
+                .arg("https://api.github.com/repos/diegoleteliers10/fasty/releases/latest")
+                .output();
+
+            if let Ok(output) = cmd {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                        if let Some(tag_name) = json.get("tag_name").and_then(|v| v.as_str()) {
+                            let clean_tag = tag_name.trim_start_matches('v');
+                            let current_version = env!("CARGO_PKG_VERSION");
+                            if clean_tag != current_version {
+                                tracing::info!("Update available: {} (current: {})", tag_name, current_version);
+                                *update_available.lock() = Some(tag_name.to_string());
+                                let _ = proxy.send_event(());
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     event_loop.run(move |event, target| {
         match event {
@@ -329,8 +371,53 @@ fn main() -> anyhow::Result<()> {
                             let last_activity_time_secs = active_tab.last_activity_time.saturating_duration_since(start_time).as_secs_f32();
                             let current_time = start_time.elapsed().as_secs_f32();
 
+                            // Update checker and notifier state integration
+                            let latest_ver = {
+                                let guard = update_available.lock();
+                                guard.clone()
+                            };
+                            if let Some(ver) = latest_ver {
+                                if !has_shown_update_toast {
+                                    has_shown_update_toast = true;
+                                    let ver_str = if ver.starts_with('v') { ver.clone() } else { format!("v{}", ver) };
+                                    toast = Some((
+                                        format!("Update Available ({}) [Update Now]", ver_str),
+                                        std::time::Instant::now(),
+                                        8000,
+                                    ));
+                                    app_dirty = true;
+                                }
+                            }
+
+                            let completed = {
+                                let guard = update_completed.lock();
+                                *guard
+                            };
+                            if completed && !has_shown_success_toast {
+                                has_shown_success_toast = true;
+                                toast = Some((
+                                    "✓  Update success! Please restart Fasty.".to_string(),
+                                    std::time::Instant::now(),
+                                    8000,
+                                ));
+                                *update_available.lock() = None; // Hide button
+                                has_shown_update_toast = true; // Prevent re-showing update toast
+                                app_dirty = true;
+                            }
+
+                            let is_available = update_available.lock().is_some();
+                            let is_in_progress = *update_in_progress.lock();
+
                             let mut r = renderer.lock();
-                            r.set_dirty(true);
+                            if r.update_available != is_available
+                                || r.update_in_progress != is_in_progress
+                                || r.hover_update != hover_update
+                            {
+                                r.update_available = is_available;
+                                r.update_in_progress = is_in_progress;
+                                r.hover_update = hover_update;
+                                r.set_dirty(true);
+                            }
                             r.render(
                                 next_render_reason,
                                 term_ref,
@@ -347,7 +434,7 @@ fn main() -> anyhow::Result<()> {
                                 current_time,
                                 active_tab.selection,
                                 active_tab.hovered_url,
-                                toast.as_ref().map(|(msg, t)| (msg.as_str(), *t)),
+                                toast.as_ref().map(|(msg, t, d)| (msg.as_str(), *t, *d)),
                                 active_tab_index,
                                 &tab_titles,
                                 &active_tab_path,
@@ -610,6 +697,7 @@ fn main() -> anyhow::Result<()> {
                                                      } else {
                                                          paste_bytes.extend_from_slice(text.as_bytes());
                                                      }
+                                                     tabs[active_tab_index].scroll_target = 0.0;
                                                      tabs[active_tab_index].terminal_state.lock().write_to_pty(&paste_bytes);
                                                  }
                                              }
@@ -624,16 +712,23 @@ fn main() -> anyhow::Result<()> {
                                  }
 
                                 match key_str.as_str() {
-                                    "c" => { tabs[active_tab_index].terminal_state.lock().write_to_pty(&[0x03]); return; }
-                                    "d" => { tabs[active_tab_index].terminal_state.lock().write_to_pty(&[0x04]); return; }
-                                    "z" => { tabs[active_tab_index].terminal_state.lock().write_to_pty(&[0x1A]); return; }
-                                    "l" => { tabs[active_tab_index].terminal_state.lock().write_to_pty(&[0x0C]); return; }
+                                    "c" => { tabs[active_tab_index].scroll_target = 0.0; tabs[active_tab_index].terminal_state.lock().write_to_pty(&[0x03]); return; }
+                                    "d" => { tabs[active_tab_index].scroll_target = 0.0; tabs[active_tab_index].terminal_state.lock().write_to_pty(&[0x04]); return; }
+                                    "z" => { tabs[active_tab_index].scroll_target = 0.0; tabs[active_tab_index].terminal_state.lock().write_to_pty(&[0x1A]); return; }
+                                    "l" => { tabs[active_tab_index].scroll_target = 0.0; tabs[active_tab_index].terminal_state.lock().write_to_pty(&[0x0C]); return; }
                                     _ => {}
                                 }
                             }
 
-                            let bytes = key_to_bytes(&event.logical_key, &modifiers);
+                            let mode = {
+                                let term = tabs[active_tab_index].terminal_state.lock();
+                                let term_guard = term.term().lock();
+                                *term_guard.mode()
+                            };
+
+                            let bytes = key_to_bytes(&event.logical_key, shift_active, mode);
                             if !bytes.is_empty() {
+                                tabs[active_tab_index].scroll_target = 0.0;
                                 tabs[active_tab_index].terminal_state.lock().write_to_pty(&bytes);
                             }
                         }
@@ -657,6 +752,7 @@ fn main() -> anyhow::Result<()> {
                                                             toast = Some((
                                                                 "✓  Text copied".to_string(),
                                                                 std::time::Instant::now(),
+                                                                1920,
                                                             ));
                                                         }
                                                     }
@@ -695,6 +791,7 @@ fn main() -> anyhow::Result<()> {
                                                                         } else {
                                                                             paste_bytes.extend_from_slice(text.as_bytes());
                                                                         }
+                                                                        tabs[active_tab_index].scroll_target = 0.0;
                                                                         tabs[active_tab_index].terminal_state.lock().write_to_pty(&paste_bytes);
                                                                     }
                                                                 }
@@ -847,6 +944,22 @@ fn main() -> anyhow::Result<()> {
                                          let is_hovering_max = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 68.0) && current_mouse_x < (v_width - 40.0);
                                          let is_hovering_min = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 100.0) && current_mouse_x < (v_width - 72.0);
                                          let is_hovering_settings = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 137.0) && current_mouse_x < (v_width - 109.0);
+
+                                         let is_update_available = update_available.lock().is_some();
+                                         if is_update_available {
+                                             let is_hovering_update = current_mouse_y >= 10.0 && current_mouse_y <= 30.0
+                                                 && current_mouse_x >= (v_width - 219.0) && current_mouse_x < (v_width - 149.0);
+                                             if is_hovering_update {
+                                                 trigger_update(
+                                                     &update_available,
+                                                     &update_in_progress,
+                                                     &update_completed,
+                                                     &window_for_redraw,
+                                                     proxy.clone(),
+                                                 );
+                                                 return;
+                                             }
+                                         }
 
                                          if is_hovering_close {
                                              target.exit();
@@ -1117,6 +1230,7 @@ fn main() -> anyhow::Result<()> {
                                             toast = Some((
                                                 "✓  Text copied".to_string(),
                                                 std::time::Instant::now(),
+                                                1920,
                                             ));
                                             renderer.lock().set_dirty(true);
                                             app_dirty = true;
@@ -1247,6 +1361,7 @@ fn main() -> anyhow::Result<()> {
                             let old_hover_max = hover_max;
                             let old_hover_min = hover_min;
                             let old_hover_settings = hover_settings;
+                            let old_hover_update = hover_update;
                             let old_hovered_tab = hovered_tab_index;
                             let old_hovered_close = hovered_close_tab_index;
                             let old_hover_new = hover_new_tab;
@@ -1255,6 +1370,14 @@ fn main() -> anyhow::Result<()> {
                             hover_max = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 68.0) && current_mouse_x < (v_width - 40.0);
                             hover_min = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 100.0) && current_mouse_x < (v_width - 72.0);
                             hover_settings = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 137.0) && current_mouse_x < (v_width - 109.0);
+
+                            let is_update_available = update_available.lock().is_some();
+                            if is_update_available {
+                                hover_update = current_mouse_y >= 10.0 && current_mouse_y <= 30.0
+                                    && current_mouse_x >= (v_width - 219.0) && current_mouse_x < (v_width - 149.0);
+                            } else {
+                                hover_update = false;
+                            }
 
                             hovered_tab_index = None;
                             hovered_close_tab_index = None;
@@ -1302,6 +1425,7 @@ fn main() -> anyhow::Result<()> {
                                 || hover_max != old_hover_max
                                 || hover_min != old_hover_min
                                 || hover_settings != old_hover_settings
+                                || hover_update != old_hover_update
                                 || hovered_tab_index != old_hovered_tab
                                 || hovered_close_tab_index != old_hovered_close
                                 || hover_new_tab != old_hover_new
@@ -1498,17 +1622,21 @@ fn main() -> anyhow::Result<()> {
                             let old_hover_max = hover_max;
                             let old_hover_min = hover_min;
                             let old_hover_settings = hover_settings;
+                            let old_hover_update = hover_update;
 
                             hover_close = false;
                             hover_max = false;
                             hover_min = false;
                             hover_settings = false;
+                            hover_update = false;
 
                             let url_changed = tabs[active_tab_index].hovered_url.is_some();
                             tabs[active_tab_index].hovered_url = None;
 
-                            if old_hover_close || old_hover_max || old_hover_min || old_hover_settings || url_changed {
-                                renderer.lock().set_dirty(true);
+                            if old_hover_close || old_hover_max || old_hover_min || old_hover_settings || old_hover_update || url_changed {
+                                let mut r = renderer.lock();
+                                r.hover_update = false;
+                                r.set_dirty(true);
                                 app_dirty = true;
                             }
                         }
@@ -1518,16 +1646,25 @@ fn main() -> anyhow::Result<()> {
                                 let old_hover_max = hover_max;
                                 let old_hover_min = hover_min;
                                 let old_hover_settings = hover_settings;
+                                let old_hover_update = hover_update;
 
                                 hover_close = false;
                                 hover_max = false;
                                 hover_min = false;
                                 hover_settings = false;
+                                hover_update = false;
                                 tabs[active_tab_index].is_dragging = false;
                                 is_dragging_scrollbar = false;
 
-                                if old_hover_close || old_hover_max || old_hover_min || old_hover_settings {
-                                    renderer.lock().set_dirty(true);
+                                ctrl_held = false;
+                                shift_held = false;
+                                alt_held = false;
+                                modifiers = winit::keyboard::ModifiersState::default();
+
+                                if old_hover_close || old_hover_max || old_hover_min || old_hover_settings || old_hover_update {
+                                    let mut r = renderer.lock();
+                                    r.hover_update = false;
+                                    r.set_dirty(true);
                                     app_dirty = true;
                                 }
                             }
@@ -1848,7 +1985,7 @@ fn main() -> anyhow::Result<()> {
                         current_time,
                         active_tab.selection,
                         active_tab.hovered_url,
-                        toast.as_ref().map(|(msg, t)| (msg.as_str(), *t)),
+                        toast.as_ref().map(|(msg, t, d)| (msg.as_str(), *t, *d)),
                         active_tab_index,
                         &tab_titles,
                         &active_tab_path,
@@ -1977,8 +2114,8 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 // Toast auto-clear and redraw management
-                if let Some((_, start_time)) = toast {
-                    if start_time.elapsed() < std::time::Duration::from_millis(1920) {
+                if let Some((_, start_time, duration_ms)) = toast {
+                    if start_time.elapsed() < std::time::Duration::from_millis(duration_ms) {
                         animating = true;
                     } else {
                         toast = None;
@@ -2043,8 +2180,8 @@ fn main() -> anyhow::Result<()> {
                     }
                     
                     // Check toast auto-clear wakeup
-                    if let Some((_, toast_start)) = toast {
-                        let toast_expire_time = toast_start + std::time::Duration::from_millis(1920);
+                    if let Some((_, toast_start, duration_ms)) = toast {
+                        let toast_expire_time = toast_start + std::time::Duration::from_millis(duration_ms);
                         if now < toast_expire_time {
                             if next_wakeup.is_none() || toast_expire_time < next_wakeup.unwrap() {
                                 next_wakeup = Some(toast_expire_time);
@@ -2066,24 +2203,35 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn key_to_bytes(key: &Key, modifiers: &winit::keyboard::ModifiersState) -> Vec<u8> {
+fn key_to_bytes(key: &Key, shift_active: bool, mode: alacritty_terminal::term::TermMode) -> Vec<u8> {
     match key {
         Key::Character(s) if !s.is_empty() => s.as_bytes().to_vec(),
         Key::Named(n) => {
             let name = format!("{:?}", n);
             match name.as_str() {
-                "Enter" => vec![b'\r'],
+                "Enter" => {
+                    if shift_active {
+                        let has_kbd_proto = mode.intersects(
+                            alacritty_terminal::term::TermMode::DISAMBIGUATE_ESC_CODES
+                            | alacritty_terminal::term::TermMode::REPORT_EVENT_TYPES
+                            | alacritty_terminal::term::TermMode::REPORT_ALTERNATE_KEYS
+                            | alacritty_terminal::term::TermMode::REPORT_ALL_KEYS_AS_ESC
+                            | alacritty_terminal::term::TermMode::REPORT_ASSOCIATED_TEXT
+                        );
+                        if has_kbd_proto {
+                            vec![0x1B, 0x5B, 0x31, 0x33, 0x3B, 0x32, 0x75] // \x1b[13;2u
+                        } else {
+                            vec![0x1B, 0x0D] // \x1b\r (Esc + Enter / Alt+Enter)
+                        }
+                    } else {
+                        vec![b'\r']
+                    }
+                }
                 "Space" => vec![b' '],
                 "Backspace" => vec![0x7F],
                 "Tab" => vec![0x09],
                 "Escape" => vec![0x1B],
-                "ArrowUp" => {
-                    if modifiers.alt_key() {
-                        vec![0x1B, 0x5B, 0x41]
-                    } else {
-                        vec![0x1B, 0x5B, 0x41]
-                    }
-                }
+                "ArrowUp" => vec![0x1B, 0x5B, 0x41],
                 "ArrowDown" => vec![0x1B, 0x5B, 0x42],
                 "ArrowRight" => vec![0x1B, 0x5B, 0x43],
                 "ArrowLeft" => vec![0x1B, 0x5B, 0x44],
@@ -2514,4 +2662,116 @@ fn get_system_fonts() -> Vec<String> {
         fonts.insert("Fira Code".to_string());
     }
     fonts.into_iter().collect()
+}
+
+fn trigger_update(
+    update_available: &Arc<parking_lot::Mutex<Option<String>>>,
+    update_in_progress: &Arc<parking_lot::Mutex<bool>>,
+    update_completed: &Arc<parking_lot::Mutex<bool>>,
+    window: &Arc<winit::window::Window>,
+    proxy: winit::event_loop::EventLoopProxy<()>,
+) {
+    let mut in_progress = update_in_progress.lock();
+    if *in_progress {
+        return;
+    }
+    *in_progress = true;
+    let _ = proxy.send_event(());
+
+    let _update_available = Arc::clone(update_available);
+    let update_in_progress = Arc::clone(update_in_progress);
+    let update_completed = Arc::clone(update_completed);
+    let window = Arc::clone(window);
+
+    std::thread::spawn(move || {
+        // Query asset download url
+        let cmd = std::process::Command::new("curl")
+            .arg("-s")
+            .arg("-H")
+            .arg("User-Agent: fasty")
+            .arg("https://api.github.com/repos/diegoleteliers10/fasty/releases/latest")
+            .output();
+
+        let mut download_url = None;
+        if let Ok(output) = cmd {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                    if let Some(assets) = json.get("assets").and_then(|v| v.as_array()) {
+                        for asset in assets {
+                            if let Some(name) = asset.get("name").and_then(|v| v.as_str()) {
+                                if name == "fasty-x86_64-unknown-linux-gnu.tar.gz" {
+                                    if let Some(url) = asset.get("browser_download_url").and_then(|v| v.as_str()) {
+                                        download_url = Some(url.to_string());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(url) = download_url {
+            // Download the tarball
+            let tmp_tar = "/tmp/fasty-update.tar.gz";
+            let download_cmd = std::process::Command::new("curl")
+                .arg("-L")
+                .arg("-s")
+                .arg("-o")
+                .arg(tmp_tar)
+                .arg(&url)
+                .status();
+
+            if let Ok(status) = download_cmd {
+                if status.success() {
+                    // Extract using tar
+                    let extract_cmd = std::process::Command::new("tar")
+                        .arg("-xzf")
+                        .arg(tmp_tar)
+                        .arg("-C")
+                        .arg("/tmp")
+                        .status();
+
+                    if let Ok(ext_status) = extract_cmd {
+                        if ext_status.success() {
+                            // Perform self-replace
+                            if let Ok(current_exe) = std::env::current_exe() {
+                                let old_exe = current_exe.with_extension("old");
+                                let _ = std::fs::remove_file(&old_exe);
+                                
+                                if std::fs::rename(&current_exe, &old_exe).is_ok() {
+                                    if std::fs::rename("/tmp/fasty", &current_exe).is_ok()
+                                        || std::fs::copy("/tmp/fasty", &current_exe).is_ok()
+                                    {
+                                        #[cfg(unix)]
+                                        {
+                                            use std::os::unix::fs::PermissionsExt;
+                                            let _ = std::fs::set_permissions(&current_exe, std::fs::Permissions::from_mode(0o755));
+                                        }
+
+                                        let _ = std::fs::remove_file(&old_exe);
+                                        let _ = std::fs::remove_file(tmp_tar);
+                                        let _ = std::fs::remove_file("/tmp/fasty");
+                                        
+                                        *update_completed.lock() = true;
+                                        *update_in_progress.lock() = false;
+                                        let _ = proxy.send_event(());
+                                        window.request_redraw();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If something failed
+        *update_in_progress.lock() = false;
+        let _ = proxy.send_event(());
+        window.request_redraw();
+    });
 }

@@ -52,6 +52,184 @@ struct VertexOutput {
     @location(4) size: vec2<f32>,
 }
 
+fn sd_segment(p: vec2<f32>, p1: vec2<f32>, p2: vec2<f32>) -> f32 {
+    let pa = p - p1;
+    let ba = p2 - p1;
+    let h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return length(pa - ba * h);
+}
+
+fn sd_connection(p: vec2<f32>, center: vec2<f32>, size: vec2<f32>, dir: u32, style: u32, light: f32, heavy: f32, space: f32) -> f32 {
+    if (style == 0u) { return 1e6; }
+    
+    var p1 = center;
+    var p2 = center;
+    if (dir == 0u) { // Left
+        p1 = vec2<f32>(0.0, center.y);
+    } else if (dir == 1u) { // Right
+        p1 = vec2<f32>(size.x, center.y);
+    } else if (dir == 2u) { // Top
+        p1 = vec2<f32>(center.x, 0.0);
+    } else { // Bottom
+        p1 = vec2<f32>(center.x, size.y);
+    }
+    
+    if (style == 1u) {
+        return sd_segment(p, p1, p2) - light / 2.0;
+    } else if (style == 2u) {
+        return sd_segment(p, p1, p2) - heavy / 2.0;
+    } else if (style == 3u) {
+        // Double lines
+        var d1 = 1e6;
+        var d2 = 1e6;
+        if (dir == 0u || dir == 1u) { // Horizontal
+            d1 = sd_segment(p, p1 - vec2<f32>(0.0, space), p2 - vec2<f32>(0.0, space));
+            d2 = sd_segment(p, p1 + vec2<f32>(0.0, space), p2 + vec2<f32>(0.0, space));
+        } else { // Vertical
+            d1 = sd_segment(p, p1 - vec2<f32>(space, 0.0), p2 - vec2<f32>(space, 0.0));
+            d2 = sd_segment(p, p1 + vec2<f32>(space, 0.0), p2 + vec2<f32>(space, 0.0));
+        }
+        return min(d1, d2) - light / 2.0;
+    }
+    return 1e6;
+}
+
+fn draw_block_or_box(code: u32, kind: u32, left_style: u32, right_style: u32, top_style: u32, bottom_style: u32, uv: vec2<f32>, size: vec2<f32>, frag_pos: vec2<f32>) -> f32 {
+    let p = uv * size;
+    let center = size / 2.0;
+    
+    if (code >= 0x2580u && code <= 0x259Fu) {
+        // Block Elements
+        if (code == 0x2588u) { return 1.0; } // Full block
+        if (code == 0x2580u) { return f32(uv.y <= 0.5); } // Upper half
+        if (code == 0x2584u) { return f32(uv.y >= 0.5); } // Lower half
+        if (code == 0x258Cu) { return f32(uv.x <= 0.5); } // Left half
+        if (code == 0x2590u) { return f32(uv.x >= 0.5); } // Right half
+        
+        // Lower levels
+        if (code == 0x2581u) { return f32(uv.y >= 0.875); }
+        if (code == 0x2582u) { return f32(uv.y >= 0.75); }
+        if (code == 0x2583u) { return f32(uv.y >= 0.625); }
+        if (code == 0x2585u) { return f32(uv.y >= 0.375); }
+        if (code == 0x2586u) { return f32(uv.y >= 0.25); }
+        if (code == 0x2587u) { return f32(uv.y >= 0.125); }
+        
+        // Left levels
+        if (code == 0x2589u) { return f32(uv.x <= 0.875); }
+        if (code == 0x258Au) { return f32(uv.x <= 0.75); }
+        if (code == 0x258Bu) { return f32(uv.x <= 0.625); }
+        if (code == 0x258Du) { return f32(uv.x <= 0.375); }
+        if (code == 0x258Eu) { return f32(uv.x <= 0.25); }
+        if (code == 0x258Fu) { return f32(uv.x <= 0.125); }
+        
+        // Right and Upper levels
+        if (code == 0x2594u) { return f32(uv.y <= 0.125); }
+        if (code == 0x2595u) { return f32(uv.x >= 0.875); }
+        
+        // Quadrants
+        if (code == 0x2596u) { return f32(uv.x <= 0.5 && uv.y >= 0.5); }
+        if (code == 0x2597u) { return f32(uv.x >= 0.5 && uv.y >= 0.5); }
+        if (code == 0x2598u) { return f32(uv.x <= 0.5 && uv.y <= 0.5); }
+        if (code == 0x259Du) { return f32(uv.x >= 0.5 && uv.y <= 0.5); }
+        
+        if (code == 0x2599u) { return f32(!(uv.x >= 0.5 && uv.y <= 0.5)); }
+        if (code == 0x259Au) { return f32((uv.x <= 0.5 && uv.y <= 0.5) || (uv.x >= 0.5 && uv.y >= 0.5)); }
+        if (code == 0x259Bu) { return f32(!(uv.x >= 0.5 && uv.y >= 0.5)); }
+        if (code == 0x259Cu) { return f32(!(uv.x <= 0.5 && uv.y >= 0.5)); }
+        if (code == 0x259Eu) { return f32((uv.x >= 0.5 && uv.y <= 0.5) || (uv.x <= 0.5 && uv.y >= 0.5)); }
+        if (code == 0x259Fu) { return f32(!(uv.x <= 0.5 && uv.y <= 0.5)); }
+
+        // Shades (25%, 50%, 75%) using screen coordinates for stipple pattern
+        let px = u32(frag_pos.x);
+        let py = u32(frag_pos.y);
+        if (code == 0x2591u) { // 25% light shade
+            return f32((px % 2u == 0u) && (py % 2u == 0u));
+        }
+        if (code == 0x2592u) { // 50% medium shade
+            return f32((px + py) % 2u == 0u);
+        }
+        if (code == 0x2593u) { // 75% dark shade
+            return f32(!((px % 2u == 0u) && (py % 2u == 0u)));
+        }
+    } else if (code >= 0x2500u && code <= 0x257Fu) {
+        // Box Drawing
+        let light = max(1.0, size.x * 0.08);
+        let heavy = light * 2.2;
+        let space = light * 1.5;
+        
+        if (kind == 1u) {
+            // Round corners
+            let radius = min(center.x, center.y);
+            var c = center;
+            var is_active_corner = false;
+            if (right_style > 0u && bottom_style > 0u) { // ╭
+                c = center + vec2<f32>(radius, radius);
+                is_active_corner = p.x < c.x && p.y < c.y;
+            } else if (left_style > 0u && bottom_style > 0u) { // ╮
+                c = center + vec2<f32>(-radius, radius);
+                is_active_corner = p.x > c.x && p.y < c.y;
+            } else if (left_style > 0u && top_style > 0u) { // ╯
+                c = center + vec2<f32>(-radius, -radius);
+                is_active_corner = p.x > c.x && p.y > c.y;
+            } else if (right_style > 0u && top_style > 0u) { // ╰
+                c = center + vec2<f32>(radius, -radius);
+                is_active_corner = p.x < c.x && p.y > c.y;
+            }
+            
+            if (is_active_corner) {
+                let dist = abs(length(p - c) - radius) - light / 2.0;
+                return 1.0 - smoothstep(-0.75, 0.75, dist);
+            }
+            return 0.0;
+        } else if (kind == 2u) {
+            // Diagonals
+            var dist = 1e6;
+            if (code == 0x2571u) {
+                dist = sd_segment(p, vec2<f32>(0.0, size.y), vec2<f32>(size.x, 0.0)) - light / 2.0;
+            } else if (code == 0x2572u) {
+                dist = sd_segment(p, vec2<f32>(0.0, 0.0), vec2<f32>(size.x, size.y)) - light / 2.0;
+            } else if (code == 0x2573u) {
+                dist = min(
+                    sd_segment(p, vec2<f32>(0.0, size.y), vec2<f32>(size.x, 0.0)),
+                    sd_segment(p, vec2<f32>(0.0, 0.0), vec2<f32>(size.x, size.y))
+                ) - light / 2.0;
+            }
+            return 1.0 - smoothstep(-0.75, 0.75, dist);
+        } else {
+            // Normal & Dashed Lines
+            var d_left = sd_connection(p, center, size, 0u, left_style, light, heavy, space);
+            var d_right = sd_connection(p, center, size, 1u, right_style, light, heavy, space);
+            var d_top = sd_connection(p, center, size, 2u, top_style, light, heavy, space);
+            var d_bottom = sd_connection(p, center, size, 3u, bottom_style, light, heavy, space);
+            
+            // If dashed, mask it out
+            if (kind == 3u) {
+                let dash_len = light * 4.0;
+                if (left_style > 0u && p.x < center.x) {
+                    let dash = u32(p.x / dash_len) % 2u;
+                    if (dash == 1u) { d_left = 1e6; }
+                }
+                if (right_style > 0u && p.x > center.x) {
+                    let dash = u32((p.x - center.x) / dash_len) % 2u;
+                    if (dash == 1u) { d_right = 1e6; }
+                }
+                if (top_style > 0u && p.y < center.y) {
+                    let dash = u32(p.y / dash_len) % 2u;
+                    if (dash == 1u) { d_top = 1e6; }
+                }
+                if (bottom_style > 0u && p.y > center.y) {
+                    let dash = u32((p.y - center.y) / dash_len) % 2u;
+                    if (dash == 1u) { d_bottom = 1e6; }
+                }
+            }
+            
+            let min_d = min(min(d_left, d_right), min(d_top, d_bottom));
+            return 1.0 - smoothstep(-0.75, 0.75, min_d);
+        }
+    }
+    return 0.0;
+}
+
 @vertex
 fn vertex_main(
     @location(0) vertex_pos: vec2<f32>,
@@ -84,6 +262,25 @@ fn vertex_main(
 
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    if (input.is_color < -0.5) {
+        let abs_val = -input.is_color;
+        let code = u32(abs_val);
+        let kind = u32(round((abs_val - f32(code)) * 10.0));
+        
+        let left_style = u32(round(input.bg_color.r));
+        let right_style = u32(round(input.bg_color.g));
+        let top_style = u32(round(input.bg_color.b));
+        let bottom_style = u32(round(input.bg_color.a));
+        
+        let alpha = draw_block_or_box(
+            code, kind,
+            left_style, right_style, top_style, bottom_style,
+            input.uv, input.size, input.position.xy
+        );
+        
+        return vec4<f32>(input.fg_color.rgb, input.fg_color.a * alpha);
+    }
+
     if (input.is_color > 1.5) {
         let r = input.is_color;
         let p = (input.uv - vec2<f32>(0.5)) * input.size;
@@ -111,7 +308,7 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     } else {
         return vec4<f32>(input.fg_color.rgb, tex_color.r * input.fg_color.a);
     }
-}
+};
 "#;
 
 const VERTEX_BUFFER_DATA: &[f32] = &[
@@ -148,9 +345,9 @@ impl Pipeline {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
@@ -394,7 +591,7 @@ impl Pipeline {
         current_time: f32,
         selection: Option<crate::renderer::Selection>,
         hovered_url: Option<crate::renderer::HoveredUrl>,
-        toast: Option<(&str, std::time::Instant)>,
+        toast: Option<(&str, std::time::Instant, u64)>,
         active_tab_index: usize,
         tab_titles: &[String],
         active_tab_path: &str,
@@ -406,6 +603,9 @@ impl Pipeline {
         hovered_tab_index: Option<usize>,
         hovered_close_tab_index: Option<usize>,
         hover_new_tab: bool,
+        update_available: bool,
+        update_in_progress: bool,
+        hover_update: bool,
         cached_grid_instances: &mut Vec<CellInstance>,
         grid_dirty: &mut bool,
         device: &Device,
@@ -558,7 +758,12 @@ impl Pipeline {
             );
 
             let cell_x = (col as f32 * cell_width).round() + Self::PADDING_LEFT;
+            let next_cell_x = ((col + 1) as f32 * cell_width).round() + Self::PADDING_LEFT;
+            let actual_cell_width = next_cell_x - cell_x;
+
             let cell_y = ((row as f32 + scroll_fraction) * cell_height).round() + padding_top;
+            let next_cell_y = (((row + 1) as f32 + scroll_fraction) * cell_height).round() + padding_top;
+            let actual_cell_height = next_cell_y - cell_y;
 
             // 1. Draw solid background if not default or if selected
             let is_selected = if let Some(sel) = selection {
@@ -576,15 +781,19 @@ impl Pipeline {
 
             if !is_default_bg {
                 let is_wide = cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR);
-                let char_width = if is_wide { 2 } else { 1 };
-                let cell_w = cell_width * char_width as f32;
+                let cell_w = if is_wide {
+                    let end_x = ((col + 2) as f32 * cell_width).round() + Self::PADDING_LEFT;
+                    end_x - cell_x
+                } else {
+                    actual_cell_width
+                };
 
                 let bg = cell_bg_to_f32(cell.bg);
 
                 // Push solid background instance sampling white pixel at (0, 0)
                 let bg_instance = CellInstance::new(
                     cell_x, cell_y,
-                    cell_w, cell_height,
+                    cell_w, actual_cell_height,
                     bg,
                     [0.0, 0.0, 0.0, 0.0],
                     0.0, 0.0, 0.0, 0.0,
@@ -597,7 +806,7 @@ impl Pipeline {
                 let sel_color = [66.0 / 255.0, 135.0 / 255.0, 245.0 / 255.0, 0.3];
                 let bg_instance = CellInstance::new(
                     cell_x, cell_y,
-                    cell_width, cell_height,
+                    actual_cell_width, actual_cell_height,
                     sel_color,
                     [0.0, 0.0, 0.0, 0.0],
                     0.0, 0.0, 0.0, 0.0,
@@ -609,8 +818,8 @@ impl Pipeline {
             if is_hovered_url {
                 let underline_color = [66.0 / 255.0, 135.0 / 255.0, 245.0 / 255.0, 0.8];
                 let bg_instance = CellInstance::new(
-                    cell_x, cell_y + cell_height - 2.0,
-                    cell_width, 1.0,
+                    cell_x, cell_y + actual_cell_height - 2.0,
+                    actual_cell_width, 1.0,
                     underline_color,
                     [0.0, 0.0, 0.0, 0.0],
                     0.0, 0.0, 0.0, 0.0,
@@ -621,26 +830,70 @@ impl Pipeline {
 
             // 2. Draw glyph if non-space/non-null
             if cell.c != ' ' && cell.c != '\0' {
-                if let Some(entry) = atlas.get_or_rasterize(cell.c, device, queue) {
+                if is_custom_block_drawing(cell.c) {
+                    let fg = cell_fg_to_f32(cell.fg, cell.flags);
+                    let mut left = 0.0;
+                    let mut right = 0.0;
+                    let mut top = 0.0;
+                    let mut bottom = 0.0;
+                    let mut kind = 0.0;
+                    
+                    if let Some((l, r, t, b, k)) = decode_box_drawing(cell.c) {
+                        left = l as f32;
+                        right = r as f32;
+                        top = t as f32;
+                        bottom = b as f32;
+                        kind = k as f32;
+                    }
+                    
+                    let code = cell.c as u32 as f32;
+                    let is_color_val = -(code + kind / 10.0);
+                    
+                    let block_instance = CellInstance::new(
+                        cell_x,
+                        cell_y,
+                        actual_cell_width,
+                        actual_cell_height,
+                        fg,
+                        [left, right, top, bottom],
+                        0.0, 0.0, 1.0, 1.0,
+                        is_color_val,
+                    );
+                    fg_instances.push(block_instance);
+                } else if let Some(entry) = atlas.get_or_rasterize(cell.c, device, queue) {
                     if entry.width > 0.0 && entry.height > 0.0 {
                         let fg = cell_fg_to_f32(cell.fg, cell.flags);
-                        let glyph_x = cell_x + entry.left;
-                        let glyph_y = cell_y + atlas.ascent() + entry.top;
-
                         let (aw, ah) = atlas.atlas_size();
                         let raw_uv = entry.uv_coords(aw, ah);
                         let [uv_x, uv_y, uv_end_x, uv_end_y] = raw_uv;
                         let uv_w = uv_end_x - uv_x;
                         let uv_h = uv_end_y - uv_y;
 
-                        let text_instance = CellInstance::new(
-                            glyph_x, glyph_y,
-                            entry.width, entry.height,
-                            fg,
-                            [0.0, 0.0, 0.0, 0.0],
-                            uv_x, uv_y, uv_w, uv_h,
-                            if entry.is_color { 1.0 } else { 0.0 },
-                        );
+                        let text_instance = if crate::renderer::is_block_element(cell.c) {
+                            CellInstance::new(
+                                cell_x,
+                                cell_y,
+                                actual_cell_width,
+                                actual_cell_height,
+                                fg,
+                                [0.0, 0.0, 0.0, 0.0],
+                                uv_x, uv_y, uv_w, uv_h,
+                                if entry.is_color { 1.0 } else { 0.0 },
+                            )
+                        } else {
+                            let glyph_x = (cell_x + entry.left).round();
+                            let glyph_y = (cell_y + atlas.ascent() + entry.top).round();
+                            CellInstance::new(
+                                glyph_x,
+                                glyph_y,
+                                entry.width,
+                                entry.height,
+                                fg,
+                                [0.0, 0.0, 0.0, 0.0],
+                                uv_x, uv_y, uv_w, uv_h,
+                                if entry.is_color { 1.0 } else { 0.0 },
+                            )
+                        };
                         fg_instances.push(text_instance);
                     }
                 }
@@ -688,8 +941,8 @@ impl Pipeline {
                 let icon_scale = 16.0f32 / atlas.font_size();
                 let glyph_w = entry.width * icon_scale;
                 let glyph_h = entry.height * icon_scale;
-                let glyph_x = 8.0f32 + (16.0f32 - glyph_w) / 2.0f32;
-                let glyph_y = 12.0f32 + (16.0f32 - glyph_h) / 2.0f32;
+                let glyph_x = (8.0f32 + (16.0f32 - glyph_w) / 2.0f32).round();
+                let glyph_y = (12.0f32 + (16.0f32 - glyph_h) / 2.0f32).round();
                 let (aw, ah) = atlas.atlas_size();
                 let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                 let uv_w = uv_end_x - uv_x;
@@ -945,8 +1198,8 @@ impl Pipeline {
                 if entry.width > 0.0 {
                     let glyph_w = entry.width * path_scale;
                     let glyph_h = entry.height * path_scale;
-                    let glyph_x = tx + entry.left * path_scale;
-                    let glyph_y = path_baseline_y + entry.top * path_scale;
+                    let glyph_x = (tx + entry.left * path_scale).round();
+                    let glyph_y = (path_baseline_y + entry.top * path_scale).round();
                     let (aw, ah) = atlas.atlas_size();
                     let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                     let uv_w = uv_end_x - uv_x;
@@ -971,8 +1224,83 @@ impl Pipeline {
         let controls_y = 6.0f32; // centered vertically: (40 - 28)/2
         let _icon_scale = 15.0f32 / atlas.font_size();
 
-        // 1. Settings button (⚙)
+        // 0. Update button (if update is available)
         let settings_x = viewport_width - 137.0f32;
+        if update_available {
+            let update_btn_w = 70.0f32;
+            let update_btn_h = 20.0f32;
+            let update_x = settings_x - update_btn_w - 12.0;
+            let update_y = controls_y + 4.0;
+
+            // Draw button background (rounded rect)
+            let btn_bg_color = if update_in_progress {
+                [0.4f32, 0.4f32, 0.4f32, 0.5f32] // Disabled grey if updating
+            } else if hover_update {
+                [5.0 / 255.0, 150.0 / 255.0, 105.0 / 255.0, 1.0] // Darker green on hover
+            } else {
+                [16.0 / 255.0, 185.0 / 255.0, 129.0 / 255.0, 1.0] // Green #10B981
+            };
+
+            bg_instances.push(CellInstance::new(
+                update_x, update_y,
+                update_btn_w, update_btn_h,
+                btn_bg_color,
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                5.0, // 5px corner radius
+            ));
+
+            // Draw button text
+            let text = if update_in_progress { "Updating" } else { "Update" };
+            let text_scale = 11.0f32 / atlas.font_size();
+
+            // Measure text to center it inside the button
+            let mut text_w = 0.0f32;
+            for c in text.chars() {
+                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                    if entry.width > 0.0 {
+                        text_w += (entry.width + 1.0) * text_scale;
+                    } else if c == ' ' {
+                        text_w += 6.0 * text_scale;
+                    }
+                }
+            }
+
+            let tx = update_x + (update_btn_w - text_w) / 2.0;
+            let ty = update_y + (update_btn_h - 11.0) / 2.0;
+
+            let mut curr_x = tx;
+            let scaled_ascent = atlas.ascent() * text_scale;
+            let path_baseline_y = ty + scaled_ascent;
+            for c in text.chars() {
+                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                    if entry.width > 0.0 {
+                        let glyph_w = entry.width * text_scale;
+                        let glyph_h = entry.height * text_scale;
+                        let glyph_x = (curr_x + entry.left * text_scale).round();
+                        let glyph_y = (path_baseline_y + entry.top * text_scale).round();
+                        let (aw, ah) = atlas.atlas_size();
+                        let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                        let uv_w = uv_end_x - uv_x;
+                        let uv_h = uv_end_y - uv_y;
+
+                        fg_instances.push(CellInstance::new(
+                            glyph_x, glyph_y,
+                            glyph_w, glyph_h,
+                            [1.0, 1.0, 1.0, 1.0], // White text
+                            [0.0, 0.0, 0.0, 0.0],
+                            uv_x, uv_y, uv_w, uv_h,
+                            0.0,
+                        ));
+                        curr_x += (entry.width + 1.0) * text_scale;
+                    } else if c == ' ' {
+                        curr_x += 6.0 * text_scale;
+                    }
+                }
+            }
+        }
+
+        // 1. Settings button (⚙)
         if hover_settings {
             bg_instances.push(CellInstance::new(
                 settings_x, controls_y,
@@ -1203,12 +1531,12 @@ impl Pipeline {
         let mut instances = Vec::new();
 
         // Draw Toast Popup if any
-        if let Some((msg, start_time)) = toast {
-            let elapsed_ms = start_time.elapsed().as_millis();
+        if let Some((msg, start_time, duration_ms)) = toast {
+            let elapsed_ms = start_time.elapsed().as_millis() as u64;
             let alpha = match elapsed_ms {
                 t if t < 120 => t as f32 / 120.0,
-                t if t < 1620 => 1.0,
-                t if t < 1920 => 1.0 - (t - 1620) as f32 / 300.0,
+                t if t < duration_ms - 300 => 1.0,
+                t if t < duration_ms => 1.0 - (t - (duration_ms - 300)) as f32 / 300.0,
                 _ => 0.0,
             };
 
@@ -1230,7 +1558,7 @@ impl Pipeline {
                 let text_h = ui_cell_height * scale;
                 let toast_h = text_h + 16.0;
 
-                let toast_x = (viewport_width - toast_w) / 2.0;
+                let toast_x = viewport_width - toast_w - 24.0;
                 let toast_y = viewport_height - toast_h - 24.0;
 
                 // Outer border
@@ -1263,8 +1591,8 @@ impl Pipeline {
                         if entry.width > 0.0 {
                             let glyph_w = entry.width * scale;
                             let glyph_h = entry.height * scale;
-                            let glyph_x = tx + entry.left * scale;
-                            let glyph_y = baseline_y + entry.top * scale;
+                            let glyph_x = (tx + entry.left * scale).round();
+                            let glyph_y = (baseline_y + entry.top * scale).round();
                             let (aw, ah) = atlas.atlas_size();
                             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                             let uv_w = uv_end_x - uv_x;
@@ -1487,8 +1815,8 @@ impl Pipeline {
                                 if entry.width > 0.0 {
                                     let glyph_w = entry.width * base_scale;
                                     let glyph_h = entry.height * base_scale;
-                                    let glyph_x = label_x + entry.left * base_scale;
-                                    let glyph_y = text_baseline_y + entry.top * base_scale;
+                                    let glyph_x = (label_x + entry.left * base_scale).round();
+                                    let glyph_y = (text_baseline_y + entry.top * base_scale).round();
 
                                     let (aw, ah) = atlas.atlas_size();
                                     let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
@@ -1530,8 +1858,8 @@ impl Pipeline {
                                     if entry.width > 0.0 {
                                         let glyph_w = entry.width * base_scale;
                                         let glyph_h = entry.height * base_scale;
-                                        let glyph_x = sh_x + entry.left * base_scale;
-                                        let glyph_y = item_center_y - glyph_h / 2.0;
+                                        let glyph_x = (sh_x + entry.left * base_scale).round();
+                                        let glyph_y = (item_center_y - glyph_h / 2.0).round();
 
                                         let (aw, ah) = atlas.atlas_size();
                                         let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
@@ -1685,8 +2013,8 @@ impl Pipeline {
             for c in text.chars() {
                 if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                     if entry.width > 0.0 {
-                        let glyph_x = x + entry.left;
-                        let glyph_y = start_y + atlas.ascent() + entry.top;
+                        let glyph_x = (x + entry.left).round();
+                        let glyph_y = (start_y + atlas.ascent() + entry.top).round();
                         let (aw, ah) = atlas.atlas_size();
                         let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                         fg_list.push(CellInstance::new(
@@ -2020,8 +2348,8 @@ impl Pipeline {
                                     break;
                                 }
                                 
-                                let glyph_x = tx + entry.left;
-                                let glyph_y = text_y + atlas.ascent() + entry.top;
+                                let glyph_x = (tx + entry.left).round();
+                                let glyph_y = (text_y + atlas.ascent() + entry.top).round();
 
                                 // Clip glyph vertically to dropdown client area
                                 if glyph_y + glyph_h <= drop_y + drop_h - 2.0 && glyph_y >= drop_y + 2.0 {
@@ -2190,4 +2518,182 @@ fn index_to_ansi_color(idx: usize) -> (u8, u8, u8) {
         let v = (((idx - 232) * 10 + 8) as u8).min(255);
         (v, v, v)
     }
+}
+
+pub fn is_custom_block_drawing(ch: char) -> bool {
+    matches!(ch as u32, 0x2500..=0x259F)
+}
+
+pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
+    let code = ch as u32;
+    if !(0x2500..=0x257F).contains(&code) {
+        return None;
+    }
+    
+    // Returns (left, right, top, bottom, kind)
+    // Styles: 0: none, 1: light, 2: heavy, 3: double
+    // Kinds: 0: normal, 1: round corner, 2: diagonal, 3: dashed
+    Some(match code {
+        // Horizontal / Vertical lines
+        0x2500 => (1, 1, 0, 0, 0), // ─
+        0x2501 => (2, 2, 0, 0, 0), // ━
+        0x2502 => (0, 0, 1, 1, 0), // │
+        0x2503 => (0, 0, 2, 2, 0), // ┃
+        
+        // Dashed lines
+        0x2504 => (1, 1, 0, 0, 3), // ┄
+        0x2505 => (2, 2, 0, 0, 3), // ┅
+        0x2506 => (0, 0, 1, 1, 3), // ┆
+        0x2507 => (0, 0, 2, 2, 3), // ┇
+        0x2508 => (1, 1, 0, 0, 3), // ┈
+        0x2509 => (2, 2, 0, 0, 3), // ┉
+        0x250A => (0, 0, 1, 1, 3), // ┊
+        0x250B => (0, 0, 2, 2, 3), // ┋
+        
+        // Corners: Down and Right
+        0x250C => (0, 1, 0, 1, 0), // ┌
+        0x250D => (0, 2, 0, 1, 0), // ┍
+        0x250E => (0, 1, 0, 2, 0), // ┎
+        0x250F => (0, 2, 0, 2, 0), // ┏
+        
+        // Corners: Down and Left
+        0x2510 => (1, 0, 0, 1, 0), // ┐
+        0x2511 => (2, 0, 0, 1, 0), // ┑
+        0x2512 => (1, 0, 0, 2, 0), // ┒
+        0x2513 => (2, 0, 0, 2, 0), // ┓
+        
+        // Corners: Up and Right
+        0x2514 => (0, 1, 1, 0, 0), // └
+        0x2515 => (0, 2, 1, 0, 0), // ┕
+        0x2516 => (0, 1, 2, 0, 0), // ┚ (Actually ┖)
+        0x2517 => (0, 2, 2, 0, 0), // ┗
+        
+        // Corners: Up and Left
+        0x2518 => (1, 0, 1, 0, 0), // ┘
+        0x2519 => (2, 0, 1, 0, 0), // ┙
+        0x251A => (1, 0, 2, 0, 0), // ┚
+        0x251B => (2, 0, 2, 0, 0), // ┛
+        
+        // Tees: Vertical and Right
+        0x251C => (0, 1, 1, 1, 0), // ├
+        0x251D => (0, 2, 1, 1, 0), // ┝
+        0x251E => (0, 1, 2, 1, 0), // ┞
+        0x251F => (0, 1, 1, 2, 0), // ┟
+        0x2520 => (0, 1, 2, 2, 0), // ┠
+        0x2521 => (0, 2, 2, 1, 0), // ┡
+        0x2522 => (0, 2, 1, 2, 0), // ┢
+        0x2523 => (0, 2, 2, 2, 0), // ┣
+        
+        // Tees: Vertical and Left
+        0x2524 => (1, 0, 1, 1, 0), // ┤
+        0x2525 => (2, 0, 1, 1, 0), // ┥
+        0x2526 => (1, 0, 2, 1, 0), // ┦
+        0x2527 => (1, 0, 1, 2, 0), // ┧
+        0x2528 => (1, 0, 2, 2, 0), // ┨
+        0x2529 => (2, 0, 2, 1, 0), // ┩
+        0x252A => (2, 0, 1, 2, 0), // ┪
+        0x252B => (2, 0, 2, 2, 0), // ┫
+        
+        // Tees: Down and Horizontal
+        0x252C => (1, 1, 0, 1, 0), // ┬
+        0x252D => (2, 1, 0, 1, 0), // ┭
+        0x252E => (1, 2, 0, 1, 0), // ┮
+        0x252F => (2, 2, 0, 1, 0), // ┯
+        0x2530 => (1, 1, 0, 2, 0), // ┰
+        0x2531 => (2, 1, 0, 2, 0), // ┱
+        0x2532 => (1, 2, 0, 2, 0), // ┲
+        0x2533 => (2, 2, 0, 2, 0), // ┳
+        
+        // Tees: Up and Horizontal
+        0x2534 => (1, 1, 1, 0, 0), // ┴
+        0x2535 => (2, 1, 1, 0, 0), // ┵
+        0x2536 => (1, 2, 1, 0, 0), // ┶
+        0x2537 => (2, 2, 1, 0, 0), // ┷
+        0x2538 => (1, 1, 2, 0, 0), // ┸
+        0x2539 => (2, 1, 2, 0, 0), // ┹
+        0x253A => (1, 2, 2, 0, 0), // ┺
+        0x253B => (2, 2, 2, 0, 0), // ┻
+        
+        // Crossings
+        0x253C => (1, 1, 1, 1, 0), // ┼
+        0x253D => (2, 1, 1, 1, 0), // ┽
+        0x253E => (1, 2, 1, 1, 0), // ┾
+        0x253F => (2, 2, 1, 1, 0), // ┿
+        0x2540 => (1, 1, 2, 1, 0), // ╀
+        0x2541 => (1, 1, 1, 2, 0), // ╁
+        0x2542 => (1, 1, 2, 2, 0), // ╂
+        0x2543 => (2, 1, 2, 1, 0), // ╃
+        0x2544 => (1, 2, 2, 1, 0), // ╄
+        0x2545 => (2, 2, 2, 1, 0), // ╅
+        0x2546 => (2, 1, 1, 2, 0), // ╆
+        0x2547 => (1, 2, 1, 2, 0), // ╇
+        0x2548 => (2, 2, 1, 2, 0), // ╈
+        0x2549 => (2, 1, 2, 2, 0), // ╉
+        0x254A => (1, 2, 2, 2, 0), // ╊
+        0x254B => (2, 2, 2, 2, 0), // ╋
+        
+        // Double dashed
+        0x254C => (1, 1, 0, 0, 3), // ╌
+        0x254D => (2, 2, 0, 0, 3), // ╍
+        0x254E => (0, 0, 1, 1, 3), // ╎
+        0x254F => (0, 0, 2, 2, 3), // ╏
+        
+        // Double Lines
+        0x2550 => (3, 3, 0, 0, 0), // ═
+        0x2551 => (0, 0, 3, 3, 0), // ║
+        0x2552 => (0, 3, 0, 1, 0), // ╒
+        0x2553 => (0, 1, 0, 3, 0), // ╓
+        0x2554 => (0, 3, 0, 3, 0), // ╔
+        0x2555 => (3, 0, 0, 1, 0), // ╕
+        0x2556 => (1, 0, 0, 3, 0), // ╖
+        0x2557 => (3, 0, 0, 3, 0), // ╗
+        0x2558 => (0, 3, 1, 0, 0), // ╘
+        0x2559 => (0, 1, 3, 0, 0), // ╙
+        0x255A => (0, 3, 3, 0, 0), // ╚
+        0x255B => (3, 0, 1, 0, 0), // ╛
+        0x255C => (1, 0, 3, 0, 0), // ╜
+        0x255D => (3, 0, 3, 0, 0), // ╝
+        0x255E => (0, 3, 1, 1, 0), // ╞
+        0x255F => (0, 1, 3, 3, 0), // ╟
+        0x2560 => (0, 3, 3, 3, 0), // ╠
+        0x2561 => (3, 0, 1, 1, 0), // ╡
+        0x2562 => (1, 0, 3, 3, 0), // ╢
+        0x2563 => (3, 0, 3, 3, 0), // ╣
+        0x2564 => (3, 3, 0, 1, 0), // ╤
+        0x2565 => (1, 1, 0, 3, 0), // ╥
+        0x2566 => (3, 3, 0, 3, 0), // ╦
+        0x2567 => (3, 3, 1, 0, 0), // ╧
+        0x2568 => (1, 1, 3, 0, 0), // ╨
+        0x2569 => (3, 3, 3, 0, 0), // ╩
+        0x256A => (3, 3, 1, 1, 0), // ╪
+        0x256B => (1, 1, 3, 3, 0), // ╫
+        0x256C => (3, 3, 3, 3, 0), // ╬
+        
+        // Round corners
+        0x256D => (0, 1, 0, 1, 1), // ╭
+        0x256E => (1, 0, 0, 1, 1), // ╮
+        0x256F => (1, 0, 1, 0, 1), // ╯
+        0x2570 => (0, 1, 1, 0, 1), // ╰
+        
+        // Diagonals
+        0x2571 => (0, 0, 0, 0, 2), // ╱
+        0x2572 => (0, 0, 0, 0, 2), // ╲
+        0x2573 => (0, 0, 0, 0, 2), // ╳
+        
+        // Light / Heavy half lines
+        0x2574 => (1, 0, 0, 0, 0), // ╴
+        0x2575 => (0, 0, 1, 0, 0), // ╵
+        0x2576 => (0, 1, 0, 0, 0), // ╶
+        0x2577 => (0, 0, 0, 1, 0), // ╷
+        0x2578 => (2, 0, 0, 0, 0), // ╸
+        0x2579 => (0, 0, 2, 0, 0), // ╹
+        0x257A => (0, 2, 0, 0, 0), // ╺
+        0x257B => (0, 0, 0, 2, 0), // ╻
+        0x257C => (1, 2, 0, 0, 0), // ╼
+        0x257D => (0, 0, 1, 2, 0), // ╽
+        0x257E => (2, 1, 0, 0, 0), // ╾
+        0x257F => (0, 0, 2, 1, 0), // ╿
+        
+        _ => (0, 0, 0, 0, 0),
+    })
 }

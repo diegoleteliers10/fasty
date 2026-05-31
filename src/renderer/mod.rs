@@ -8,6 +8,7 @@ use wgpu::{Device, DeviceDescriptor, Features, Instance, Queue, Surface, Surface
 use winit::window::Window;
 
 pub use atlas::Atlas;
+pub use atlas::is_block_element;
 pub use cell::CellInstance;
 pub use pipeline::Pipeline;
 
@@ -37,6 +38,9 @@ pub struct Renderer<'a> {
     pub dirty: bool,
     pub grid_dirty: bool,
     pub cached_grid_instances: Vec<CellInstance>,
+    pub update_available: bool,
+    pub update_in_progress: bool,
+    pub hover_update: bool,
 }
 
 impl<'a> Renderer<'a> {
@@ -125,6 +129,9 @@ impl<'a> Renderer<'a> {
             dirty: true,
             grid_dirty: true,
             cached_grid_instances: Vec::new(),
+            update_available: false,
+            update_in_progress: false,
+            hover_update: false,
         })
     }
 
@@ -200,7 +207,7 @@ impl<'a> Renderer<'a> {
         current_time: f32,
         selection: Option<Selection>,
         hovered_url: Option<HoveredUrl>,
-        toast: Option<(&str, std::time::Instant)>,
+        toast: Option<(&str, std::time::Instant, u64)>,
         active_tab_index: usize,
         tab_titles: &[String],
         active_tab_path: &str,
@@ -282,6 +289,9 @@ impl<'a> Renderer<'a> {
                 hovered_tab_index,
                 hovered_close_tab_index,
                 hover_new_tab,
+                self.update_available,
+                self.update_in_progress,
+                self.hover_update,
                 &mut self.cached_grid_instances,
                 &mut self.grid_dirty,
                 &self.device,

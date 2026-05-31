@@ -24,16 +24,30 @@ pub struct AtlasEntry {
     pub left: f32,
     pub top: f32,
     pub is_color: bool,
+    pub is_block: bool,
 }
 
 impl AtlasEntry {
     pub fn uv_coords(&self, atlas_width: u32, atlas_height: u32) -> [f32; 4] {
-        [
-            self.x / atlas_width as f32,
-            self.y / atlas_height as f32,
-            (self.x + self.width) / atlas_width as f32,
-            (self.y + self.height) / atlas_height as f32,
-        ]
+        if self.is_block {
+            // Inset by 0.5 pixels to sample exactly from the center of the edge texels.
+            // Under Linear filtering, this prevents color bleeding/gaps at the cell boundaries.
+            let inset_x = 0.5;
+            let inset_y = 0.5;
+            [
+                (self.x + inset_x) / atlas_width as f32,
+                (self.y + inset_y) / atlas_height as f32,
+                (self.x + self.width - inset_x) / atlas_width as f32,
+                (self.y + self.height - inset_y) / atlas_height as f32,
+            ]
+        } else {
+            [
+                self.x / atlas_width as f32,
+                self.y / atlas_height as f32,
+                (self.x + self.width) / atlas_width as f32,
+                (self.y + self.height) / atlas_height as f32,
+            ]
+        }
     }
 }
 
@@ -416,6 +430,7 @@ impl Atlas {
                 left: 0.0,
                 top: 0.0,
                 is_color,
+                is_block: is_block_element(c),
             };
             self.entries.insert(c, entry);
             return Ok(());
@@ -474,16 +489,31 @@ impl Atlas {
             }
         }
 
-        // 2. Scale down if taller than cell_height
-        let (final_rgba, final_w, final_h, scale) = if h > self.cell_height.round() as u32 {
-            let scale = self.cell_height / h as f32;
-            let new_w = (w as f32 * scale).round() as u32;
-            let new_h = self.cell_height.round() as u32;
-            let scaled = scale_rgba_bitmap(&rgba_data, w as usize, h as usize, new_w as usize, new_h as usize);
-            (scaled, new_w, new_h, scale)
+        // 2. Scale block elements to cell dimensions; keep other glyphs at their native FreeType size
+        let (mut final_rgba, final_w, final_h, scale) = if is_block_element(c) {
+            let target_w = self.cell_width.round() as u32;
+            let target_h = self.cell_height.round() as u32;
+            let scaled = scale_rgba_bitmap(&rgba_data, w as usize, h as usize, target_w as usize, target_h as usize);
+            (scaled, target_w, target_h, 1.0)
         } else {
             (rgba_data, w, h, 1.0)
         };
+
+        if is_block_element(c) {
+            for pixel_chunk in final_rgba.chunks_mut(4) {
+                if pixel_chunk[3] > 0 || pixel_chunk[0] > 0 {
+                    pixel_chunk[0] = 255;
+                    pixel_chunk[1] = 255;
+                    pixel_chunk[2] = 255;
+                    pixel_chunk[3] = 255;
+                } else {
+                    pixel_chunk[0] = 0;
+                    pixel_chunk[1] = 0;
+                    pixel_chunk[2] = 0;
+                    pixel_chunk[3] = 0;
+                }
+            }
+        }
 
         // 3. Allocate and upload
         let padding = 1u32;
@@ -496,9 +526,18 @@ impl Atlas {
                 y: (pos.1 + padding) as f32,
                 width: final_w as f32,
                 height: final_h as f32,
-                left: (glyph.bitmap_left() as f32 * scale).round(),
-                top: (-glyph.bitmap_top() as f32 * scale).round(),
+                left: if is_block_element(c) {
+                    0.0
+                } else {
+                    (glyph.bitmap_left() as f32 * scale).round()
+                },
+                top: if is_block_element(c) {
+                    -self.ascent
+                } else {
+                    (-glyph.bitmap_top() as f32 * scale).round()
+                },
                 is_color,
+                is_block: is_block_element(c),
             };
 
             self.entries.insert(c, entry);
@@ -618,6 +657,7 @@ impl Atlas {
                 left: 0.0,
                 top: 0.0,
                 is_color: false,
+                is_block: is_block_element(c),
             };
             self.entries.insert(c, dummy);
             Some(dummy)
@@ -676,6 +716,7 @@ impl Atlas {
                 left: 0.0,
                 top: 0.0,
                 is_color: true,
+                is_block: false,
             };
             
             queue.write_texture(
@@ -755,6 +796,7 @@ impl Atlas {
                 left: 0.0,
                 top: 0.0,
                 is_color: false, // We use it as stencil (is_color = false)
+                is_block: false,
             };
 
             queue.write_texture(
@@ -810,6 +852,7 @@ impl Atlas {
                 left: 0.0,
                 top: 0.0,
                 is_color: true,
+                is_block: false,
             };
             
             queue.write_texture(
@@ -884,6 +927,7 @@ impl Atlas {
                 left: 0.0,
                 top: 0.0,
                 is_color: false,
+                is_block: false,
             };
 
             queue.write_texture(
@@ -931,4 +975,10 @@ fn scale_rgba_bitmap(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> 
         }
     }
     dst
+}
+
+pub fn is_block_element(ch: char) -> bool {
+    matches!(ch as u32,
+        0x2580..=0x259F  // Block Elements: ▀▁▂▃▄▅▆▇█▉▊▋▌▍▎▏▐░▒▓
+    )
 }
