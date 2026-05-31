@@ -881,8 +881,31 @@ impl Pipeline {
                                 uv_x, uv_y, uv_w, uv_h,
                                 if entry.is_color { 1.0 } else { 0.0 },
                             )
+                        } else if entry.is_color {
+                            let char_width = if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR) { 2.0 } else { 1.0 };
+                            let scale = actual_cell_height / entry.height;
+                            let emoji_render_width = entry.width * scale;
+                            let emoji_render_height = actual_cell_height;
+                            let x_offset = ((actual_cell_width * char_width) - emoji_render_width) / 2.0;
+                            let glyph_x = (cell_x + x_offset.max(0.0)).round();
+                            let glyph_y = cell_y.round();
+                            CellInstance::new(
+                                glyph_x,
+                                glyph_y,
+                                emoji_render_width,
+                                emoji_render_height,
+                                fg,
+                                [0.0, 0.0, 0.0, 0.0],
+                                uv_x, uv_y, uv_w, uv_h,
+                                1.0,
+                            )
                         } else {
-                            let glyph_x = (cell_x + entry.left).round();
+                            let glyph_x = if is_arrow_symbol(cell.c) {
+                                let x_offset = (actual_cell_width - entry.width) / 2.0;
+                                (cell_x + x_offset).round()
+                            } else {
+                                (cell_x + entry.left).round()
+                            };
                             let glyph_y = (cell_y + atlas.ascent() + entry.top).round();
                             CellInstance::new(
                                 glyph_x,
@@ -892,7 +915,7 @@ impl Pipeline {
                                 fg,
                                 [0.0, 0.0, 0.0, 0.0],
                                 uv_x, uv_y, uv_w, uv_h,
-                                if entry.is_color { 1.0 } else { 0.0 },
+                                0.0,
                             )
                         };
                         fg_instances.push(text_instance);
@@ -2914,4 +2937,8 @@ pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
         
         _ => (0, 0, 0, 0, 0),
     })
+}
+
+fn is_arrow_symbol(ch: char) -> bool {
+    matches!(ch as u32, 0x2190..=0x21FF | 0x2B00..=0x2BFF)
 }

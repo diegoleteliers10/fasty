@@ -421,6 +421,9 @@ impl Atlas {
         let w = bitmap.width() as u32;
         let h = bitmap.rows() as u32;
 
+        let pixel_mode = bitmap.pixel_mode().unwrap_or(freetype::bitmap::PixelMode::Gray);
+        let actual_is_color = is_color || pixel_mode == freetype::bitmap::PixelMode::Bgra || is_emoji(c);
+
         if w == 0 || h == 0 {
             let entry = AtlasEntry {
                 x: 0.0,
@@ -429,7 +432,7 @@ impl Atlas {
                 height: 0.0,
                 left: 0.0,
                 top: 0.0,
-                is_color,
+                is_color: actual_is_color,
                 is_block: is_block_element(c),
             };
             self.entries.insert(c, entry);
@@ -441,7 +444,6 @@ impl Atlas {
         let buffer = bitmap.buffer();
         let pitch = bitmap.pitch() as usize;
 
-        let pixel_mode = bitmap.pixel_mode().unwrap_or(freetype::bitmap::PixelMode::Gray);
         match pixel_mode {
             freetype::bitmap::PixelMode::Gray => {
                 for y in 0..h as usize {
@@ -536,7 +538,7 @@ impl Atlas {
                 } else {
                     (-glyph.bitmap_top() as f32 * scale).round()
                 },
-                is_color,
+                is_color: actual_is_color,
                 is_block: is_block_element(c),
             };
 
@@ -582,7 +584,7 @@ impl Atlas {
                 let _ = face.set_pixel_sizes(0, physical_size as u32);
                 if let Some(idx) = face.get_char_index(c as usize) {
                     if idx != 0 {
-                        let is_color = face.has_fixed_sizes();
+                        let is_color = face.has_fixed_sizes() || is_emoji(c);
                         let load_flags = if is_color {
                             LoadFlag::RENDER | LoadFlag::COLOR
                         } else {
@@ -601,7 +603,7 @@ impl Atlas {
             for path in &self.fallback_paths {
                 if let Ok(face) = lib.new_face(path, 0) {
                     let physical_size = self.font_size * self.scale_factor;
-                    let is_color = face.has_fixed_sizes();
+                    let is_color = face.has_fixed_sizes() || is_emoji(c);
 
                     if is_color {
                         let num_fixed_sizes = face.raw().num_fixed_sizes;
@@ -980,5 +982,16 @@ fn scale_rgba_bitmap(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> 
 pub fn is_block_element(ch: char) -> bool {
     matches!(ch as u32,
         0x2580..=0x259F  // Block Elements: ▀▁▂▃▄▅▆▇█▉▊▋▌▍▎▏▐░▒▓
+    )
+}
+
+pub fn is_emoji(ch: char) -> bool {
+    matches!(ch as u32,
+        0x1F300..=0x1F9FF |  // Misc symbols and pictographs
+        0x1F000..=0x1F02F |  // Mahjong tiles
+        0x1F0A0..=0x1F0FF |  // Playing cards
+        0x1FA00..=0x1FA6F |  // Chess, other symbols
+        0x2600..=0x26FF   |  // Misc symbols
+        0x2700..=0x27BF      // Dingbats
     )
 }
