@@ -18,6 +18,7 @@ use crate::event_listener::EventListenerProxy;
 pub enum AppEvent {
     Wakeup,
     Exit,
+    ForceExit,
 }
 
 

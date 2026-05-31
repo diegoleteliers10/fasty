@@ -429,6 +429,9 @@ fn main() -> anyhow::Result<()> {
                             target.exit();
                         }
                     }
+                    AppEvent::ForceExit => {
+                        target.exit();
+                    }
                 }
             }
             winit::event::Event::WindowEvent { window_id, event } => {
@@ -3076,10 +3079,10 @@ fn get_system_fonts() -> Vec<String> {
 }
 
 fn trigger_update(
-    update_available: &Arc<parking_lot::Mutex<Option<String>>>,
+    _update_available: &Arc<parking_lot::Mutex<Option<String>>>,
     update_in_progress: &Arc<parking_lot::Mutex<bool>>,
-    update_completed: &Arc<parking_lot::Mutex<bool>>,
-    window: &Arc<winit::window::Window>,
+    _update_completed: &Arc<parking_lot::Mutex<bool>>,
+    _window: &Arc<winit::window::Window>,
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
 ) {
     let mut in_progress = update_in_progress.lock();
@@ -3087,104 +3090,68 @@ fn trigger_update(
         return;
     }
     *in_progress = true;
-    let _ = proxy.send_event(AppEvent::Wakeup);
 
-    let _update_available = Arc::clone(update_available);
-    let update_in_progress = Arc::clone(update_in_progress);
-    let update_completed = Arc::clone(update_completed);
-    let window = Arc::clone(window);
+    let current_pid = std::process::id();
 
-    std::thread::spawn(move || {
-        // Query asset download url
-        let cmd = std::process::Command::new("curl")
-            .arg("-s")
-            .arg("-H")
-            .arg("User-Agent: fasty")
-            .arg("https://api.github.com/repos/diegoleteliers10/fasty/releases/latest")
-            .output();
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 
-        let mut download_url = None;
-        if let Ok(output) = cmd {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                    if let Some(assets) = json.get("assets").and_then(|v| v.as_array()) {
-                        for asset in assets {
-                            if let Some(name) = asset.get("name").and_then(|v| v.as_str()) {
-                                if name == "fasty-x86_64-unknown-linux-gnu.tar.gz" {
-                                    if let Some(url) = asset.get("browser_download_url").and_then(|v| v.as_str()) {
-                                        download_url = Some(url.to_string());
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let cmd_str = format!(
+            "while (Get-Process -Id {} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 200 }}; \
+             irm https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.ps1 | iex; \
+             Start-Process \"$env:USERPROFILE\\.local\\bin\\fasty.exe\"",
+            current_pid
+        );
 
-        if let Some(url) = download_url {
-            // Download the tarball
-            let tmp_tar = "/tmp/fasty-update.tar.gz";
-            let download_cmd = std::process::Command::new("curl")
-                .arg("-L")
-                .arg("-s")
-                .arg("-o")
-                .arg(tmp_tar)
-                .arg(&url)
-                .status();
+        let _ = std::process::Command::new("powershell")
+            .arg("-Command")
+            .arg(&cmd_str)
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+            .spawn();
+    }
 
-            if let Ok(status) = download_cmd {
-                if status.success() {
-                    // Extract using tar
-                    let extract_cmd = std::process::Command::new("tar")
-                        .arg("-xzf")
-                        .arg(tmp_tar)
-                        .arg("-C")
-                        .arg("/tmp")
-                        .status();
+    #[cfg(target_os = "macos")]
+    {
+        let cmd_str = format!(
+            "while kill -0 {} 2>/dev/null; do sleep 0.2; done; \
+             curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash && \
+             open -a Fasty",
+            current_pid
+        );
 
-                    if let Ok(ext_status) = extract_cmd {
-                        if ext_status.success() {
-                            // Perform self-replace
-                            if let Ok(current_exe) = std::env::current_exe() {
-                                let old_exe = current_exe.with_extension("old");
-                                let _ = std::fs::remove_file(&old_exe);
-                                
-                                if std::fs::rename(&current_exe, &old_exe).is_ok() {
-                                    if std::fs::rename("/tmp/fasty", &current_exe).is_ok()
-                                        || std::fs::copy("/tmp/fasty", &current_exe).is_ok()
-                                    {
-                                        #[cfg(unix)]
-                                        {
-                                            use std::os::unix::fs::PermissionsExt;
-                                            let _ = std::fs::set_permissions(&current_exe, std::fs::Permissions::from_mode(0o755));
-                                        }
+        let _ = std::process::Command::new("nohup")
+            .arg("sh")
+            .arg("-c")
+            .arg(&cmd_str)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
 
-                                        let _ = std::fs::remove_file(&old_exe);
-                                        let _ = std::fs::remove_file(tmp_tar);
-                                        let _ = std::fs::remove_file("/tmp/fasty");
-                                        
-                                        *update_completed.lock() = true;
-                                        *update_in_progress.lock() = false;
-                                        let _ = proxy.send_event(AppEvent::Wakeup);
-                                        window.request_redraw();
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        // Linux (and other unix systems)
+        let cmd_str = format!(
+            "while kill -0 {} 2>/dev/null; do sleep 0.2; done; \
+             curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash && \
+             /usr/local/bin/fasty &",
+            current_pid
+        );
 
-        // If something failed
-        *update_in_progress.lock() = false;
-        let _ = proxy.send_event(AppEvent::Wakeup);
-        window.request_redraw();
-    });
+        let _ = std::process::Command::new("nohup")
+            .arg("sh")
+            .arg("-c")
+            .arg(&cmd_str)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
+    // Unconditionally force exit the application
+    let _ = proxy.send_event(AppEvent::ForceExit);
 }
 
 #[cfg(test)]
