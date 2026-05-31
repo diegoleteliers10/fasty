@@ -30,7 +30,7 @@ anyhow = "1"
 parking_lot = "0.12"
 raw-window-handle = "0.6"
 unicode-width = "0.1"
-fontconfig = "0.5"
+rustix = { version = "0.38", features = ["std"] }
 image = "0.25"
 arboard = { version = "3", features = ["wayland-data-control"] }
 resvg = "0.47.0"
