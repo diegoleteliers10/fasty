@@ -863,7 +863,13 @@ impl Pipeline {
                     fg_instances.push(block_instance);
                 } else if let Some(entry) = atlas.get_or_rasterize(cell.c, device, queue) {
                     if entry.width > 0.0 && entry.height > 0.0 {
-                        let fg = cell_fg_to_f32(cell.fg, cell.flags);
+                        let mut fg = cell_fg_to_f32(cell.fg, cell.flags);
+                        if cell.c == '>' {
+                            let is_default_or_white = (fg[0] - 0.77).abs() < 0.05 || (fg[0] - 1.0).abs() < 0.05;
+                            if is_default_or_white {
+                                fg = [0.35, 0.75, 0.35, 1.0];
+                            }
+                        }
                         let (aw, ah) = atlas.atlas_size();
                         let raw_uv = entry.uv_coords(aw, ah);
                         let [uv_x, uv_y, uv_end_x, uv_end_y] = raw_uv;
