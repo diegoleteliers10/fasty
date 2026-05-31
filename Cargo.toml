@@ -21,7 +21,6 @@ bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.3"
 log = "0.4"
 env_logger = "0.11"
-freetype-rs = { version = "0.37" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
@@ -45,6 +44,12 @@ libc = "0.2"
 
 [target.'cfg(all(target_os = "linux", not(windows)))'.dependencies]
 x11 = { version = "2.21", features = ["xlib", "xfixes"] }
+
+[target.'cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
+freetype-rs = { version = "0.37" }
+
+[target.'cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))'.dependencies]
+freetype-rs = { version = "0.37", features = ["bundled"] }
 
 [profile.release]
 opt-level = 3
