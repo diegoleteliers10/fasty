@@ -214,11 +214,9 @@ impl<'a> Renderer<'a> {
         hover_new_tab: bool,
     ) {
         if !self.dirty {
-            tracing::debug!("Renderer::render early exit - dirty=false");
             return;
         }
 
-        tracing::info!("Renderer::render executing");
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(e) => {

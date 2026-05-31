@@ -465,7 +465,6 @@ impl Pipeline {
             return;
         }
         let padding_top = 48.0f32;
-        let orig_grid_dirty = *grid_dirty;
         let term = terminal.term();
         let term_guard = term.lock();
         let content = term_guard.renderable_content();
@@ -1568,7 +1567,6 @@ impl Pipeline {
 
         let term_count = term_instances_final.len();
         let ui_count = ui_bg_instances.len() + ui_fg_instances.len() + ui_extra_instances_final.len();
-        tracing::debug!("Render stats: orig_grid_dirty={}, term_count={}, ui_bg={}, ui_fg={}, ui_extra={}", orig_grid_dirty, term_count, ui_bg_instances.len(), ui_fg_instances.len(), ui_extra_instances_final.len());
 
         let mut final_instances = Vec::with_capacity(term_count + ui_count);
         final_instances.extend(term_instances_final);

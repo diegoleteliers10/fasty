@@ -29,12 +29,8 @@ impl EventListener for EventListenerProxy {
     fn send_event(&self, event: Event) {
         if let Event::PtyWrite(response) = event {
             let mut w = self.writer.lock();
-            if let Err(e) = w.write_all(response.as_bytes()) {
-                tracing::warn!("Failed to write PTY response: {}", e);
-                return;
-            }
-            if let Err(e) = w.flush() {
-                tracing::warn!("Failed to flush PTY response: {}", e);
+            if w.write_all(response.as_bytes()).is_ok() {
+                let _ = w.flush();
             }
         }
     }

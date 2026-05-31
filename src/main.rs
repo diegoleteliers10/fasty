@@ -10,7 +10,6 @@ use std::sync::Arc;
 use config::Config;
 use renderer::{Renderer, Selection, RenderReason};
 use terminal_state::TerminalState;
-use tracing_subscriber::util::SubscriberInitExt;
 use alacritty_terminal::grid::Dimensions;
 use winit::{
     event::{ElementState, WindowEvent, MouseButton, MouseScrollDelta},
@@ -140,21 +139,16 @@ fn get_last_path_component(path_str: &str) -> String {
 }
 
 fn main() -> anyhow::Result<()> {
-    eprintln!("build: {}", if cfg!(debug_assertions) { "DEBUG" } else { "RELEASE" });
     std::env::set_var("TERM", "xterm-256color");
     std::env::set_var("COLORTERM", "truecolor");
     std::env::set_var("TERM_PROGRAM", "fasty");
     std::env::set_var("TERM_PROGRAM_VERSION", "0.1.0");
 
     tracing_subscriber::fmt()
-        .with_env_filter("info")
+        .with_env_filter("warn,fasty=info")
         .init();
 
     let mut config = Config::load()?;
-    tracing::info!(
-        "fasty: starting, shell={}",
-        config.shell.as_deref().unwrap_or("default")
-    );
 
     let shell = if let Some(ref s) = config.shell {
         s.clone()
@@ -162,17 +156,15 @@ fn main() -> anyhow::Result<()> {
         get_login_shell()
     };
 
-    tracing::info!("Initializing EventLoop and Window...");
     let event_loop = EventLoop::new()?;
     let window = event_loop.create_window(winit::window::WindowAttributes::default()
         .with_title("fasty")
         .with_decorations(false)
         .with_transparent(true)
         .with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0)))?;
-    tracing::info!("Window created successfully!");
 
     // Load and set the window icon at runtime for the taskbar/desktop bar
-    if let Ok(icon_image) = image::open("assets/fastyIcon.png") {
+    if let Ok(icon_image) = image::load_from_memory(include_bytes!("../assets/fastyIcon.png")) {
         let icon_image = icon_image.into_rgba8();
         let (width, height) = icon_image.dimensions();
         let rgba = icon_image.into_raw();
@@ -183,9 +175,7 @@ fn main() -> anyhow::Result<()> {
 
     let window_arc = Arc::new(window);
     let window_for_renderer = window_arc.as_ref();
-    tracing::info!("Creating Renderer...");
     let renderer = pollster::block_on(Renderer::new(window_for_renderer, &config.font.family, config.font.size))?;
-    tracing::info!("Renderer created successfully!");
     let mut cell_width = renderer.cell_width();
     let mut cell_height = renderer.cell_height();
 
@@ -275,11 +265,8 @@ fn main() -> anyhow::Result<()> {
     let mut first_frame_rendered = false;
     let mut app_dirty = true;
     let mut last_render_time = std::time::Instant::now();
-    let mut frame_count = 0;
     let mut last_blink_index = 0;
     let mut next_render_reason = RenderReason::GridChanged;
-
-    tracing::info!("Entering event loop run...");
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     event_loop.run(move |event, target| {
         match event {
@@ -375,8 +362,6 @@ fn main() -> anyhow::Result<()> {
                             );
                             drop(r);
 
-                            frame_count += 1;
-                            eprintln!("render #{} at {:?}", frame_count, last_render_time.elapsed());
                             last_render_time = std::time::Instant::now();
                         }
                         WindowEvent::ModifiersChanged(modified) => {
@@ -592,15 +577,13 @@ fn main() -> anyhow::Result<()> {
                                  };
 
                                  if shift_active && is_v_key {
-                                     tracing::info!("Ctrl+Shift+V paste shortcut detected!");
                                      let mut ctx_opt = if clipboard.is_none() {
                                          match arboard::Clipboard::new() {
                                              Ok(ctx) => {
                                                  clipboard = Some(ctx);
                                                  clipboard.as_mut()
                                              }
-                                             Err(e) => {
-                                                 eprintln!("fasty clipboard initialization failed: {:?}", e);
+                                             Err(_e) => {
                                                  None
                                              }
                                          }
@@ -611,7 +594,6 @@ fn main() -> anyhow::Result<()> {
                                      if let Some(ref mut ctx) = ctx_opt {
                                          match ctx.get_text() {
                                              Ok(text) => {
-                                                 tracing::info!("Pasting {} characters from clipboard", text.len());
                                                  if !text.is_empty() {
                                                      let term = tabs[active_tab_index].terminal_state.lock();
                                                      let term_guard = term.term().lock();
@@ -685,8 +667,8 @@ fn main() -> anyhow::Result<()> {
                                                                     clipboard = Some(ctx);
                                                                     clipboard.as_mut()
                                                                 }
-                                                                Err(e) => {
-                                                                    eprintln!("fasty clipboard initialization failed: {:?}", e);
+                                                                Err(_e) => {
+                                                                    eprintln!("fasty clipboard initialization failed: {:?}", _e);
                                                                     None
                                                                 }
                                                             }
@@ -2160,8 +2142,6 @@ fn copy_selection_to_clipboard(
         }
     }
 
-    tracing::info!("Extracted selected text ({} chars): {:?}", text.len(), text);
-
     if !text.is_empty() {
         let ctx_opt = if clipboard.is_none() {
             match arboard::Clipboard::new() {
@@ -2180,8 +2160,6 @@ fn copy_selection_to_clipboard(
         if let Some(ctx) = ctx_opt {
             if let Err(e) = ctx.set_text(text) {
                 eprintln!("fasty clipboard copy set_text failed: {:?}", e);
-            } else {
-                tracing::info!("Successfully copied selection to clipboard!");
             }
         } else {
             eprintln!("fasty clipboard copy not available");
@@ -2303,8 +2281,6 @@ fn open_url(url: &str) {
         url.to_string()
     };
 
-    tracing::info!("Opening URL: {}", target_url);
-
     #[cfg(target_os = "macos")]
     let cmd = "open";
     #[cfg(target_os = "windows")]
@@ -2323,7 +2299,7 @@ fn open_url(url: &str) {
         .spawn();
 
     match res {
-        Ok(_) => tracing::info!("Successfully opened URL: {}", target_url),
+        Ok(_) => {}
         Err(e) => tracing::error!("Failed to open URL: {:?}", e),
     }
 }

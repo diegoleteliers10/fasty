@@ -23,7 +23,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             font: FontConfig {
-                family: "JetBrains Mono".to_string(),
+                family: "monospace".to_string(),
                 size: 14.0,
                 weight: 400.0,
                 ligatures: true,
@@ -37,7 +37,7 @@ impl Default for Config {
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            family: "JetBrains Mono".to_string(),
+            family: "monospace".to_string(),
             size: 14.0,
             weight: 400.0,
             ligatures: true,
@@ -59,12 +59,10 @@ impl Config {
             if p.exists() {
                 let content = std::fs::read_to_string(path)?;
                 let config: Config = serde_json::from_str(&content)?;
-                tracing::info!("fasty: loaded config from {}", path.display());
                 return Ok(config);
             }
         }
 
-        tracing::info!("fasty: no config file found, using defaults");
         Ok(Config::default())
     }
 
@@ -74,7 +72,6 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, content)?;
-        tracing::info!("fasty: saved config to {}", path.display());
         Ok(())
     }
 

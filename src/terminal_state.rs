@@ -75,9 +75,7 @@ impl TerminalState {
             .lock()
             .try_clone_reader()
             .expect("Failed to clone reader");
-        tracing::info!("Cloned PTY reader");
         let writer = master_arc.lock().take_writer().expect("Failed to take writer");
-        tracing::info!("Took PTY writer");
 
         let writer_boxed: Box<dyn Write + Send> = Box::new(writer);
         let writer_arc: Arc<ParkingMutex<Box<dyn Write + Send>>> =
@@ -98,15 +96,12 @@ impl TerminalState {
         let term_clone = Arc::clone(&term);
         thread::spawn(move || {
             use std::io::Read;
-            tracing::info!("PTY reader thread started");
 
             let mut buf = [0u8; 8192];
             let mut parser: Processor<StdSyncHandler> = Processor::new();
             loop {
-                tracing::debug!("Calling read()...");
                 match reader.read(&mut buf) {
                     Ok(0) => {
-                        tracing::info!("PTY read returned 0 (EOF)");
                         break;
                     }
                     Ok(n) => {
@@ -122,13 +117,11 @@ impl TerminalState {
                     Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
                         continue;
                     }
-                    Err(e) => {
-                        tracing::error!("PTY read error: {}", e);
+                    Err(_) => {
                         break;
                     }
                 }
             }
-            tracing::info!("PTY reader thread exiting");
         });
 
         Ok(Self {

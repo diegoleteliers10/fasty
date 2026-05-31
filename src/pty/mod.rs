@@ -114,7 +114,6 @@ impl PtyWorker {
         };
 
         let _shutdown_read = Arc::clone(&shutdown_flag);
-        tracing::debug!("PTY: starting reader thread");
         thread::spawn(move || {
             let mut buf = [0u8; PTY_READ_BUF_SIZE];
             let mut batch = Vec::with_capacity(PTY_READ_BUF_SIZE * 2);
@@ -127,12 +126,10 @@ impl PtyWorker {
                             on_chunk(&batch);
                             batch.clear();
                         }
-                        tracing::debug!("PTY: reader returned 0 (EOF)");
                         return;
                     }
                     Ok(n) => n,
-                    Err(e) => {
-                        tracing::error!("PTY read error: {}", e);
+                    Err(_) => {
                         if !batch.is_empty() {
                             on_chunk(&batch);
                             batch.clear();
