@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use config::Config;
 use renderer::{Renderer, Selection, RenderReason};
-use terminal_state::TerminalState;
+use terminal_state::{TerminalState, AppEvent};
 use alacritty_terminal::grid::Dimensions;
 use winit::{
     event::{ElementState, WindowEvent, MouseButton, MouseScrollDelta},
@@ -51,17 +51,21 @@ struct Tab {
 }
 
 fn create_new_tab(
-    shell: &str,
+    executable: &str,
+    exec_args: &[String],
+    cwd: Option<&str>,
     scrollback: usize,
     font: config::FontConfig,
     cell_width: f32,
     cell_height: f32,
     cols: usize,
     rows: usize,
-    proxy: winit::event_loop::EventLoopProxy<()>,
+    proxy: winit::event_loop::EventLoopProxy<AppEvent>,
 ) -> anyhow::Result<Tab> {
     let terminal_state = TerminalState::new(
-        shell,
+        executable,
+        exec_args,
+        cwd,
         scrollback,
         font,
         cell_width,
@@ -143,6 +147,54 @@ fn get_current_version() -> String {
 }
 
 
+#[derive(Debug)]
+struct FastyArgs {
+    command: Option<Vec<String>>,   // -e cmd arg1 arg2...
+    working_dir: Option<String>,    // -d /path/to/dir
+    title: Option<String>,          // --title "My Window"
+}
+
+impl FastyArgs {
+    fn parse() -> Self {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        Self::parse_from(args)
+    }
+
+    fn parse_from(args: Vec<String>) -> Self {
+        let mut result = Self {
+            command: None,
+            working_dir: None,
+            title: None,
+        };
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-e" | "--command" => {
+                    // Everything after -e is the command + its args
+                    if i + 1 < args.len() {
+                        result.command = Some(args[i+1..].to_vec());
+                    }
+                    break; // -e consumes the rest
+                }
+                "-d" | "--working-dir" => {
+                    if i + 1 < args.len() {
+                        result.working_dir = Some(args[i+1].clone());
+                        i += 2;
+                    }
+                }
+                "--title" => {
+                    if i + 1 < args.len() {
+                        result.title = Some(args[i+1].clone());
+                        i += 2;
+                    }
+                }
+                _ => { i += 1; }
+            }
+        }
+        result
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     std::env::set_var("TERM", "xterm-256color");
     std::env::set_var("COLORTERM", "truecolor");
@@ -156,15 +208,52 @@ fn main() -> anyhow::Result<()> {
 
     let mut config = Config::load()?;
 
+    let fasty_args = FastyArgs::parse();
+
+    // Resolve what to spawn
+    let (executable, exec_args) = match &fasty_args.command {
+        Some(cmd) => {
+            // -e was passed — spawn command directly
+            let exe = cmd[0].clone();
+            let args = cmd[1..].to_vec();
+            (exe, args)
+        }
+        None => {
+            // No -e — spawn default shell
+            let shell = if let Some(ref s) = config.shell {
+                s.clone()
+            } else {
+                get_login_shell()
+            };
+            (shell, vec![])
+        }
+    };
+
+    // Resolve working directory
+    let cwd = fasty_args.working_dir.clone();
+
+    // Window title
+    let window_title = fasty_args.title
+        .clone()
+        .unwrap_or_else(|| {
+            match &fasty_args.command {
+                Some(cmd) => cmd[0].clone(),  // "arch-update", "htop", etc
+                None => "fasty".to_string(),
+            }
+        });
+
+    let auto_close = fasty_args.command.is_some();
+
+    // Resolve default shell for subsequent tabs
     let shell = if let Some(ref s) = config.shell {
         s.clone()
     } else {
         get_login_shell()
     };
 
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let window = event_loop.create_window(winit::window::WindowAttributes::default()
-        .with_title("fasty")
+        .with_title(&window_title)
         .with_decorations(false)
         .with_transparent(true)
         .with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0)))?;
@@ -195,7 +284,9 @@ fn main() -> anyhow::Result<()> {
     let mut shell_rows = ((viewport_height - (get_padding_top(1) + PADDING_BOTTOM)) / cell_height).floor().max(1.0) as usize;
     let proxy = event_loop.create_proxy();
     let initial_tab = create_new_tab(
-        &shell,
+        &executable,
+        &exec_args,
+        cwd.as_deref(),
         config.scrollback,
         config.font.clone(),
         cell_width,
@@ -315,7 +406,7 @@ fn main() -> anyhow::Result<()> {
                             if clean_tag != clean_current {
                                 tracing::info!("Update available: {} (current: {})", tag_name, current_version);
                                 *update_available.lock() = Some(tag_name.to_string());
-                                let _ = proxy.send_event(());
+                                let _ = proxy.send_event(AppEvent::Wakeup);
                             }
                         }
                     }
@@ -327,9 +418,18 @@ fn main() -> anyhow::Result<()> {
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     event_loop.run(move |event, target| {
         match event {
-            winit::event::Event::UserEvent(()) => {
-                app_dirty = true;
-                renderer.lock().grid_dirty = true;
+            winit::event::Event::UserEvent(app_event) => {
+                match app_event {
+                    AppEvent::Wakeup => {
+                        app_dirty = true;
+                        renderer.lock().grid_dirty = true;
+                    }
+                    AppEvent::Exit => {
+                        if auto_close {
+                            target.exit();
+                        }
+                    }
+                }
             }
             winit::event::Event::WindowEvent { window_id, event } => {
                 if window_id == window_for_redraw.id() {
@@ -575,6 +675,8 @@ fn main() -> anyhow::Result<()> {
                                 
                                 match create_new_tab(
                                     &shell,
+                                    &[],
+                                    None,
                                     config.scrollback,
                                     config.font.clone(),
                                     cell_width,
@@ -931,6 +1033,8 @@ fn main() -> anyhow::Result<()> {
                                                         
                                                         match create_new_tab(
                                                             &shell,
+                                                            &[],
+                                                            None,
                                                             config.scrollback,
                                                             config.font.clone(),
                                                             cell_width,
@@ -1188,6 +1292,8 @@ fn main() -> anyhow::Result<()> {
                                              
                                              match create_new_tab(
                                                  &shell,
+                                                 &[],
+                                                 None,
                                                  config.scrollback,
                                                  config.font.clone(),
                                                  cell_width,
@@ -2974,14 +3080,14 @@ fn trigger_update(
     update_in_progress: &Arc<parking_lot::Mutex<bool>>,
     update_completed: &Arc<parking_lot::Mutex<bool>>,
     window: &Arc<winit::window::Window>,
-    proxy: winit::event_loop::EventLoopProxy<()>,
+    proxy: winit::event_loop::EventLoopProxy<AppEvent>,
 ) {
     let mut in_progress = update_in_progress.lock();
     if *in_progress {
         return;
     }
     *in_progress = true;
-    let _ = proxy.send_event(());
+    let _ = proxy.send_event(AppEvent::Wakeup);
 
     let _update_available = Arc::clone(update_available);
     let update_in_progress = Arc::clone(update_in_progress);
@@ -3062,7 +3168,7 @@ fn trigger_update(
                                         
                                         *update_completed.lock() = true;
                                         *update_in_progress.lock() = false;
-                                        let _ = proxy.send_event(());
+                                        let _ = proxy.send_event(AppEvent::Wakeup);
                                         window.request_redraw();
                                         return;
                                     }
@@ -3076,7 +3182,63 @@ fn trigger_update(
 
         // If something failed
         *update_in_progress.lock() = false;
-        let _ = proxy.send_event(());
+        let _ = proxy.send_event(AppEvent::Wakeup);
         window.request_redraw();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fasty_args_parsing() {
+        // Test no args
+        let args = FastyArgs::parse_from(vec![]);
+        assert!(args.command.is_none());
+        assert!(args.working_dir.is_none());
+        assert!(args.title.is_none());
+
+        // Test title and directory
+        let args = FastyArgs::parse_from(vec![
+            "--title".to_string(),
+            "My Terminal".to_string(),
+            "-d".to_string(),
+            "/home/user/project".to_string(),
+        ]);
+        assert!(args.command.is_none());
+        assert_eq!(args.working_dir.as_deref(), Some("/home/user/project"));
+        assert_eq!(args.title.as_deref(), Some("My Terminal"));
+
+        // Test command with multiple args
+        let args = FastyArgs::parse_from(vec![
+            "-e".to_string(),
+            "nvim".to_string(),
+            "src/main.rs".to_string(),
+        ]);
+        assert_eq!(
+            args.command,
+            Some(vec!["nvim".to_string(), "src/main.rs".to_string()])
+        );
+        assert!(args.working_dir.is_none());
+        assert!(args.title.is_none());
+
+        // Test command mixed with other options (command consumes the rest)
+        let args = FastyArgs::parse_from(vec![
+            "--title".to_string(),
+            "My Dev Window".to_string(),
+            "-d".to_string(),
+            "/path/to/dir".to_string(),
+            "-e".to_string(),
+            "bun".to_string(),
+            "run".to_string(),
+            "dev".to_string(),
+        ]);
+        assert_eq!(args.title.as_deref(), Some("My Dev Window"));
+        assert_eq!(args.working_dir.as_deref(), Some("/path/to/dir"));
+        assert_eq!(
+            args.command,
+            Some(vec!["bun".to_string(), "run".to_string(), "dev".to_string()])
+        );
+    }
 }

@@ -14,6 +14,13 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use crate::config::FontConfig;
 use crate::event_listener::EventListenerProxy;
 
+#[derive(Debug, Clone, Copy)]
+pub enum AppEvent {
+    Wakeup,
+    Exit,
+}
+
+
 
 pub struct TerminalState {
     term: Arc<ParkingMutex<alacritty_terminal::term::Term<EventListenerProxy>>>,
@@ -25,14 +32,16 @@ pub struct TerminalState {
 
 impl TerminalState {
     pub fn new(
-        shell: &str,
+        executable: &str,
+        exec_args: &[String],
+        cwd: Option<&str>,
         scrollback: usize,
         _font_config: FontConfig,
         cell_width: f32,
         cell_height: f32,
         viewport_width: f32,
         viewport_height: f32,
-        proxy: winit::event_loop::EventLoopProxy<()>,
+        proxy: winit::event_loop::EventLoopProxy<AppEvent>,
     ) -> anyhow::Result<Self> {
         let cell_w = (cell_width as usize).max(1);
         let cell_h = (cell_height as usize).max(1);
@@ -53,9 +62,14 @@ impl TerminalState {
             })
             .expect("Failed to open PTY");
 
-        let mut cmd = CommandBuilder::new(shell);
+        let mut cmd = CommandBuilder::new(executable);
+        cmd.args(exec_args);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        cmd.env("TERM_PROGRAM", "fasty");
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
+        }
         if let Ok(lang) = std::env::var("LANG") {
             cmd.env("LANG", lang);
         }
@@ -63,7 +77,7 @@ impl TerminalState {
             cmd.env("PATH", path);
         }
 
-        let child = pair.slave.spawn_command(cmd).expect("Failed to spawn shell");
+        let child = pair.slave.spawn_command(cmd).expect("Failed to spawn command");
         let shell_pid = child.process_id();
 
         drop(pair.slave);
@@ -94,6 +108,7 @@ impl TerminalState {
         let render_generation = Arc::new(AtomicU64::new(0));
         let render_gen_clone = Arc::clone(&render_generation);
         let term_clone = Arc::clone(&term);
+        let proxy_clone = proxy.clone();
         thread::spawn(move || {
             use std::io::Read;
 
@@ -102,6 +117,7 @@ impl TerminalState {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
+                        let _ = proxy_clone.send_event(AppEvent::Exit);
                         break;
                     }
                     Ok(n) => {
@@ -112,12 +128,13 @@ impl TerminalState {
                         drop(term_locked);
 
                         render_gen_clone.fetch_add(1, Ordering::Relaxed);
-                        let _ = proxy.send_event(());
+                        let _ = proxy_clone.send_event(AppEvent::Wakeup);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
                         continue;
                     }
                     Err(_) => {
+                        let _ = proxy_clone.send_event(AppEvent::Exit);
                         break;
                     }
                 }
