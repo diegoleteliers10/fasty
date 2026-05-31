@@ -21,7 +21,7 @@ bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.3"
 log = "0.4"
 env_logger = "0.11"
-freetype-rs = { version = "0.37", features = ["bundled"] }
+freetype-rs = { version = "0.37" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
