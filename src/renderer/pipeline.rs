@@ -864,9 +864,9 @@ impl Pipeline {
                 } else if let Some(entry) = atlas.get_or_rasterize(cell.c, device, queue) {
                     if entry.width > 0.0 && entry.height > 0.0 {
                         let mut fg = cell_fg_to_f32(cell.fg, cell.flags);
-                        if cell.c == '>' {
-                            let is_default_or_white = (fg[0] - 0.77).abs() < 0.05 || (fg[0] - 1.0).abs() < 0.05;
-                            if is_default_or_white {
+                        if cell.c == '>' || cell.c == '❯' {
+                            let is_grayscale = (fg[0] - fg[1]).abs() < 0.02 && (fg[1] - fg[2]).abs() < 0.02;
+                            if is_grayscale {
                                 fg = [0.35, 0.75, 0.35, 1.0];
                             }
                         }
