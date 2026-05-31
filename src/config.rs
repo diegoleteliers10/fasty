@@ -79,4 +79,21 @@ impl Config {
         std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
             .join(".config/fasty/config.json")
     }
+
+    pub fn get_active_config_path() -> std::path::PathBuf {
+        let config_paths: Vec<std::path::PathBuf> = vec![
+            std::path::PathBuf::from("config.json"),
+            std::path::PathBuf::from("/etc/fasty/config.json"),
+            std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+                .join(".config/fasty/config.json"),
+        ];
+
+        for path in &config_paths {
+            if path.exists() {
+                return path.clone();
+            }
+        }
+
+        Self::config_path()
+    }
 }

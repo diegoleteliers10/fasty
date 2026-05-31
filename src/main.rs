@@ -353,6 +353,7 @@ fn main() -> anyhow::Result<()> {
     let mut s_hover_size_plus = false;
     let mut s_hover_scroll_minus = false;
     let mut s_hover_scroll_plus = false;
+    let mut s_hover_open_config = false;
     let mut s_hover_save = false;
     let mut s_hover_cancel = false;
     
@@ -535,6 +536,7 @@ fn main() -> anyhow::Result<()> {
                                 next_render_reason,
                                 term_ref,
                                 active_tab.cursor_visible,
+                                config.font.ligatures,
                                 scrollbar_alpha,
                                 active_tab.scroll_current,
                                 max_history,
@@ -1345,7 +1347,8 @@ fn main() -> anyhow::Result<()> {
                                          return;
                                      }
 
-                                    let scrollbar_top_margin = padding_top - 10.0;
+                                    const TOPBAR_HEIGHT: f32 = 40.0;
+                                    let scrollbar_top_margin = TOPBAR_HEIGHT;
                                     let show_scrollbar = {
                                         let term_guard = tabs[active_tab_index].terminal_state.lock();
                                         let mode = *term_guard.term().lock().mode();
@@ -1694,7 +1697,8 @@ fn main() -> anyhow::Result<()> {
                                 let total_lines = visible_rows + history_size;
                                 if total_lines > 0.0 {
                                     let ratio = visible_rows / total_lines;
-                                    let scrollbar_top_margin = padding_top - 10.0;
+                                    const TOPBAR_HEIGHT: f32 = 40.0;
+                                    let scrollbar_top_margin = TOPBAR_HEIGHT;
                                     let track_h = v_height - scrollbar_top_margin - 4.0;
                                     let thumb_h = (track_h * ratio).max(20.0).min(track_h);
                                     let track_center = track_h - thumb_h;
@@ -1988,6 +1992,7 @@ fn main() -> anyhow::Result<()> {
                                         s_hover_size_plus,
                                         s_hover_scroll_minus,
                                         s_hover_scroll_plus,
+                                        s_hover_open_config,
                                         s_hover_save,
                                         s_hover_cancel,
                                         &system_fonts,
@@ -2007,6 +2012,7 @@ fn main() -> anyhow::Result<()> {
                                 let old_hover_size_plus = s_hover_size_plus;
                                 let old_hover_scroll_minus = s_hover_scroll_minus;
                                 let old_hover_scroll_plus = s_hover_scroll_plus;
+                                let old_hover_open_config = s_hover_open_config;
                                 let old_hover_save = s_hover_save;
                                 let old_hover_cancel = s_hover_cancel;
                                 let old_hovered_font_idx = settings_hovered_font_idx;
@@ -2019,6 +2025,8 @@ fn main() -> anyhow::Result<()> {
 
                                 s_hover_scroll_minus = s_mouse_y >= 132.0 && s_mouse_y <= 158.0 && s_mouse_x >= 140.0 && s_mouse_x < 168.0;
                                 s_hover_scroll_plus = s_mouse_y >= 132.0 && s_mouse_y <= 158.0 && s_mouse_x >= 240.0 && s_mouse_x < 268.0;
+
+                                s_hover_open_config = s_mouse_y >= 172.0 && s_mouse_y <= 198.0 && s_mouse_x >= 140.0 && s_mouse_x < 380.0;
 
                                 s_hover_save = s_mouse_y >= 220.0 && s_mouse_y <= 252.0 && s_mouse_x >= 90.0 && s_mouse_x < 190.0;
                                 s_hover_cancel = s_mouse_y >= 220.0 && s_mouse_y <= 252.0 && s_mouse_x >= 210.0 && s_mouse_x < 310.0;
@@ -2038,6 +2046,7 @@ fn main() -> anyhow::Result<()> {
                                     || s_hover_size_plus != old_hover_size_plus
                                     || s_hover_scroll_minus != old_hover_scroll_minus
                                     || s_hover_scroll_plus != old_hover_scroll_plus
+                                    || s_hover_open_config != old_hover_open_config
                                     || s_hover_save != old_hover_save
                                     || s_hover_cancel != old_hover_cancel
                                     || settings_hovered_font_idx != old_hovered_font_idx;
@@ -2088,6 +2097,14 @@ fn main() -> anyhow::Result<()> {
                                     } else if s_hover_scroll_plus {
                                         settings_scrollback = settings_scrollback.saturating_add(1000).min(1000000);
                                         apply_settings!();
+                                    } else if s_hover_open_config {
+                                        let mut current_config = Config::load().unwrap_or_default();
+                                        current_config.font.family = settings_family.clone();
+                                        current_config.font.size = settings_size;
+                                        current_config.scrollback = settings_scrollback;
+                                        let path = Config::get_active_config_path();
+                                        let _ = current_config.save(&path);
+                                        let _ = open_file_in_editor(&path);
                                     } else if s_hover_save {
                                         settings_window = None;
                                         settings_renderer = None;
@@ -2152,6 +2169,7 @@ fn main() -> anyhow::Result<()> {
                                 s_hover_size_plus = false;
                                 s_hover_scroll_minus = false;
                                 s_hover_scroll_plus = false;
+                                s_hover_open_config = false;
                                 s_hover_save = false;
                                 s_hover_cancel = false;
                                 if let Some(ref mut r) = settings_renderer {
@@ -2167,6 +2185,7 @@ fn main() -> anyhow::Result<()> {
                                     s_hover_size_plus = false;
                                     s_hover_scroll_minus = false;
                                     s_hover_scroll_plus = false;
+                                    s_hover_open_config = false;
                                     s_hover_save = false;
                                     s_hover_cancel = false;
                                     if let Some(ref mut r) = settings_renderer {
@@ -2290,6 +2309,7 @@ fn main() -> anyhow::Result<()> {
                         next_render_reason,
                         term_ref,
                         active_tab.cursor_visible,
+                        config.font.ligatures,
                         scrollbar_alpha,
                         active_tab.scroll_current,
                         max_history,
@@ -2388,8 +2408,8 @@ fn main() -> anyhow::Result<()> {
 
                 // Opacity animation of the scrollbar (uses active tab details)
                 let v_width = renderer.lock().config.width as f64;
-                let padding_top = get_padding_top(tabs.len());
-                let scrollbar_top_margin = padding_top - 10.0;
+                const TOPBAR_HEIGHT: f32 = 40.0;
+                let scrollbar_top_margin = TOPBAR_HEIGHT;
                 
                 let show_scrollbar = {
                     let term_guard = tabs[active_tab_index].terminal_state.lock();
@@ -3152,6 +3172,32 @@ fn trigger_update(
 
     // Unconditionally force exit the application
     let _ = proxy.send_event(AppEvent::ForceExit);
+}
+
+fn open_file_in_editor(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(&["/C", "start", "", path.to_str().unwrap_or_default()])
+            .spawn()?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()?;
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

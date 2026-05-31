@@ -8,7 +8,9 @@ use wgpu::{Device, DeviceDescriptor, Features, Instance, Queue, Surface, Surface
 use winit::window::Window;
 
 pub use atlas::Atlas;
+pub use atlas::RowShapingResult;
 pub use atlas::is_block_element;
+pub use atlas::is_emoji;
 pub use cell::CellInstance;
 pub use pipeline::Pipeline;
 
@@ -195,6 +197,7 @@ impl<'a> Renderer<'a> {
         reason: RenderReason,
         terminal: &crate::terminal_state::TerminalState,
         cursor_visible: bool,
+        ligatures: bool,
         scrollbar_alpha: f32,
         scroll_current: f32,
         history_size: f32,
@@ -260,6 +263,7 @@ impl<'a> Renderer<'a> {
                 &mut render_pass,
                 terminal,
                 cursor_visible,
+                ligatures,
                 &mut self.atlas,
                 &mut self.ui_atlas,
                 self.cell_width,
@@ -318,6 +322,7 @@ impl<'a> Renderer<'a> {
         hover_size_plus: bool,
         hover_scroll_minus: bool,
         hover_scroll_plus: bool,
+        hover_open_config: bool,
         hover_save: bool,
         hover_cancel: bool,
         system_fonts: &[String],
@@ -372,6 +377,7 @@ impl<'a> Renderer<'a> {
                 hover_size_plus,
                 hover_scroll_minus,
                 hover_scroll_plus,
+                hover_open_config,
                 hover_save,
                 hover_cancel,
                 system_fonts,

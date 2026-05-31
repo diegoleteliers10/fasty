@@ -6,7 +6,7 @@ use alacritty_terminal::grid::Indexed;
 use bytemuck::cast_slice;
 use wgpu::{Buffer, Device, RenderPipeline};
 
-use crate::renderer::{CellInstance, RenderReason};
+use crate::renderer::{CellInstance, RenderReason, RowShapingResult};
 use crate::terminal_state::TerminalState;
 
 pub struct Pipeline {
@@ -573,6 +573,7 @@ impl Pipeline {
         render_pass: &mut wgpu::RenderPass,
         terminal: &TerminalState,
         cursor_visible: bool,
+        ligatures: bool,
         atlas: &mut crate::renderer::Atlas,
         ui_atlas: &mut crate::renderer::Atlas,
         cell_width: f32,
@@ -748,187 +749,255 @@ impl Pipeline {
             let bg_instances = &mut term_bg_instances;
             let fg_instances = &mut term_fg_instances;
 
-        for Indexed { cell, point } in content.display_iter {
-            let col = point.column.0 as usize;
-            let row = (point.line.0 + content.display_offset as i32) as usize;
+            let visible_rows_count = visible_rows.round() as usize;
+            let mut row_cells: Vec<Vec<&alacritty_terminal::term::cell::Cell>> = vec![Vec::new(); visible_rows_count];
+            let mut row_points: Vec<Vec<alacritty_terminal::index::Point>> = vec![Vec::new(); visible_rows_count];
 
-            let is_default_bg = matches!(cell.bg,
-                alacritty_terminal::vte::ansi::Color::Named(
-                    alacritty_terminal::vte::ansi::NamedColor::Background
-                )
-            );
+            // 1. Draw solid background, selection, and underline, and collect cells for layout
+            for Indexed { cell, point } in content.display_iter {
+                let col = point.column.0 as usize;
+                let row = (point.line.0 + content.display_offset as i32) as usize;
 
-            let cell_x = (col as f32 * cell_width).round() + Self::PADDING_LEFT;
-            let next_cell_x = ((col + 1) as f32 * cell_width).round() + Self::PADDING_LEFT;
-            let actual_cell_width = next_cell_x - cell_x;
+                if row < visible_rows_count {
+                    row_cells[row].push(cell);
+                    row_points[row].push(point);
+                }
 
-            let cell_y = ((row as f32 + scroll_fraction) * cell_height).round() + padding_top;
-            let next_cell_y = (((row + 1) as f32 + scroll_fraction) * cell_height).round() + padding_top;
-            let actual_cell_height = next_cell_y - cell_y;
+                let is_default_bg = matches!(cell.bg,
+                    alacritty_terminal::vte::ansi::Color::Named(
+                        alacritty_terminal::vte::ansi::NamedColor::Background
+                    )
+                );
 
-            // 1. Draw solid background if not default or if selected
-            let is_selected = if let Some(sel) = selection {
-                let (min_p, max_p) = if sel.start <= sel.end { (sel.start, sel.end) } else { (sel.end, sel.start) };
-                point >= min_p && point <= max_p
-            } else {
-                false
-            };
+                let cell_x = (col as f32 * cell_width).round() + Self::PADDING_LEFT;
+                let next_cell_x = ((col + 1) as f32 * cell_width).round() + Self::PADDING_LEFT;
+                let actual_cell_width = next_cell_x - cell_x;
 
-            let is_hovered_url = if let Some(url) = hovered_url {
-                point.line.0 == url.line && col >= url.start_col && col <= url.end_col
-            } else {
-                false
-            };
+                let cell_y = ((row as f32 + scroll_fraction) * cell_height).round() + padding_top;
+                let next_cell_y = (((row + 1) as f32 + scroll_fraction) * cell_height).round() + padding_top;
+                let actual_cell_height = next_cell_y - cell_y;
 
-            if !is_default_bg {
-                let is_wide = cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR);
-                let cell_w = if is_wide {
-                    let end_x = ((col + 2) as f32 * cell_width).round() + Self::PADDING_LEFT;
-                    end_x - cell_x
+                // Selection check
+                let is_selected = if let Some(sel) = selection {
+                    let (min_p, max_p) = if sel.start <= sel.end { (sel.start, sel.end) } else { (sel.end, sel.start) };
+                    point >= min_p && point <= max_p
                 } else {
-                    actual_cell_width
+                    false
                 };
 
-                let bg = cell_bg_to_f32(cell.bg);
+                let is_hovered_url = if let Some(url) = hovered_url {
+                    point.line.0 == url.line && col >= url.start_col && col <= url.end_col
+                } else {
+                    false
+                };
 
-                // Push solid background instance sampling white pixel at (0, 0)
-                let bg_instance = CellInstance::new(
-                    cell_x, cell_y,
-                    cell_w, actual_cell_height,
-                    bg,
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 0.0, 0.0,
-                    0.0,
-                );
-                bg_instances.push(bg_instance);
-            }
+                if !is_default_bg {
+                    let is_wide = cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR);
+                    let cell_w = if is_wide {
+                        let end_x = ((col + 2) as f32 * cell_width).round() + Self::PADDING_LEFT;
+                        end_x - cell_x
+                    } else {
+                        actual_cell_width
+                    };
 
-            if is_selected {
-                let sel_color = [66.0 / 255.0, 135.0 / 255.0, 245.0 / 255.0, 0.3];
-                let bg_instance = CellInstance::new(
-                    cell_x, cell_y,
-                    actual_cell_width, actual_cell_height,
-                    sel_color,
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 0.0, 0.0,
-                    0.0,
-                );
-                bg_instances.push(bg_instance);
-            }
-
-            if is_hovered_url {
-                let underline_color = [66.0 / 255.0, 135.0 / 255.0, 245.0 / 255.0, 0.8];
-                let bg_instance = CellInstance::new(
-                    cell_x, cell_y + actual_cell_height - 2.0,
-                    actual_cell_width, 1.0,
-                    underline_color,
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 0.0, 0.0,
-                    0.0,
-                );
-                bg_instances.push(bg_instance);
-            }
-
-            // 2. Draw glyph if non-space/non-null
-            if cell.c != ' ' && cell.c != '\0' {
-                if is_custom_block_drawing(cell.c) {
-                    let fg = cell_fg_to_f32(cell.fg, cell.flags);
-                    let mut left = 0.0;
-                    let mut right = 0.0;
-                    let mut top = 0.0;
-                    let mut bottom = 0.0;
-                    let mut kind = 0.0;
-                    
-                    if let Some((l, r, t, b, k)) = decode_box_drawing(cell.c) {
-                        left = l as f32;
-                        right = r as f32;
-                        top = t as f32;
-                        bottom = b as f32;
-                        kind = k as f32;
-                    }
-                    
-                    let code = cell.c as u32 as f32;
-                    let is_color_val = -(code + kind / 10.0);
-                    
-                    let block_instance = CellInstance::new(
-                        cell_x,
-                        cell_y,
-                        actual_cell_width,
-                        actual_cell_height,
-                        fg,
-                        [left, right, top, bottom],
-                        0.0, 0.0, 1.0, 1.0,
-                        is_color_val,
+                    let bg = cell_bg_to_f32(cell.bg);
+                    let bg_instance = CellInstance::new(
+                        cell_x, cell_y,
+                        cell_w, actual_cell_height,
+                        bg,
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0, 0.0, 0.0, 0.0,
+                        0.0,
                     );
-                    fg_instances.push(block_instance);
-                } else if let Some(entry) = atlas.get_or_rasterize(cell.c, device, queue) {
-                    if entry.width > 0.0 && entry.height > 0.0 {
-                        let mut fg = cell_fg_to_f32(cell.fg, cell.flags);
-                        if cell.c == '>' || cell.c == '❯' {
-                            let is_grayscale = (fg[0] - fg[1]).abs() < 0.02 && (fg[1] - fg[2]).abs() < 0.02;
-                            if is_grayscale {
-                                fg = [0.35, 0.75, 0.35, 1.0];
-                            }
-                        }
-                        let (aw, ah) = atlas.atlas_size();
-                        let raw_uv = entry.uv_coords(aw, ah);
-                        let [uv_x, uv_y, uv_end_x, uv_end_y] = raw_uv;
-                        let uv_w = uv_end_x - uv_x;
-                        let uv_h = uv_end_y - uv_y;
+                    bg_instances.push(bg_instance);
+                }
 
-                        let text_instance = if crate::renderer::is_block_element(cell.c) {
-                            CellInstance::new(
-                                cell_x,
-                                cell_y,
-                                actual_cell_width,
-                                actual_cell_height,
-                                fg,
-                                [0.0, 0.0, 0.0, 0.0],
-                                uv_x, uv_y, uv_w, uv_h,
-                                if entry.is_color { 1.0 } else { 0.0 },
-                            )
-                        } else if entry.is_color {
-                            let char_width = if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR) { 2.0 } else { 1.0 };
-                            let scale = actual_cell_height / entry.height;
-                            let emoji_render_width = entry.width * scale;
-                            let emoji_render_height = actual_cell_height;
-                            let x_offset = ((actual_cell_width * char_width) - emoji_render_width) / 2.0;
-                            let glyph_x = (cell_x + x_offset.max(0.0)).round();
-                            let glyph_y = cell_y.round();
-                            CellInstance::new(
-                                glyph_x,
-                                glyph_y,
-                                emoji_render_width,
-                                emoji_render_height,
-                                fg,
-                                [0.0, 0.0, 0.0, 0.0],
-                                uv_x, uv_y, uv_w, uv_h,
-                                1.0,
-                            )
-                        } else {
-                            let glyph_x = if is_arrow_symbol(cell.c) {
-                                let x_offset = (actual_cell_width - entry.width) / 2.0;
-                                (cell_x + x_offset).round()
-                            } else {
-                                (cell_x + entry.left).round()
+                if is_selected {
+                    let sel_color = [66.0 / 255.0, 135.0 / 255.0, 245.0 / 255.0, 0.3];
+                    let bg_instance = CellInstance::new(
+                        cell_x, cell_y,
+                        actual_cell_width, actual_cell_height,
+                        sel_color,
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0, 0.0, 0.0, 0.0,
+                        0.0,
+                    );
+                    bg_instances.push(bg_instance);
+                }
+
+                if is_hovered_url {
+                    let underline_color = [66.0 / 255.0, 135.0 / 255.0, 245.0 / 255.0, 0.8];
+                    let bg_instance = CellInstance::new(
+                        cell_x, cell_y + actual_cell_height - 2.0,
+                        actual_cell_width, 1.0,
+                        underline_color,
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0, 0.0, 0.0, 0.0,
+                        0.0,
+                    );
+                    bg_instances.push(bg_instance);
+                }
+            }
+
+            // 2. Render text / glyph foreground (either shaped or cell-by-cell)
+            let use_ligatures = ligatures && atlas.hb_face().is_some();
+            let mut row_shaping = vec![None; visible_rows_count];
+
+            if use_ligatures {
+                for row in 0..visible_rows_count {
+                    let cells = &row_cells[row];
+                    if cells.is_empty() { continue; }
+
+                    // 1. Build row text
+                    let mut row_text = String::new();
+                    for cell in cells.iter() {
+                        row_text.push(cell.c);
+                    }
+
+                    // 2. Check cache
+                    if let Some(cached) = atlas.shaping_cache.get(&row_text) {
+                        row_shaping[row] = Some(cached.clone());
+                        continue;
+                    }
+
+                    // 3. Cache miss: construct col_map and shape
+                    let mut col_map = Vec::new();
+                    for (idx, cell) in cells.iter().enumerate() {
+                        let char_len = cell.c.len_utf8();
+                        for _ in 0..char_len {
+                            col_map.push(idx);
+                        }
+                    }
+                    col_map.push(cells.len());
+
+                    if let Some(hb_face) = atlas.hb_face() {
+                        let mut buffer = rustybuzz::UnicodeBuffer::new();
+                        buffer.push_str(&row_text);
+                        buffer.set_direction(rustybuzz::Direction::LeftToRight);
+                        let shaped = rustybuzz::shape(hb_face, &[], buffer);
+                        let glyph_infos = shaped.glyph_infos().to_vec();
+
+                        if !glyph_infos.is_empty() {
+                            let result = RowShapingResult {
+                                glyph_infos,
+                                col_map,
                             };
-                            let glyph_y = (cell_y + atlas.ascent() + entry.top).round();
-                            CellInstance::new(
-                                glyph_x,
-                                glyph_y,
-                                entry.width,
-                                entry.height,
-                                fg,
-                                [0.0, 0.0, 0.0, 0.0],
-                                uv_x, uv_y, uv_w, uv_h,
-                                0.0,
-                            )
-                        };
-                        fg_instances.push(text_instance);
+                            if atlas.shaping_cache.len() >= 500 {
+                                atlas.shaping_cache.clear();
+                            }
+                            atlas.shaping_cache.insert(row_text.clone(), result.clone());
+                            row_shaping[row] = Some(result);
+                        }
                     }
                 }
             }
-        }
+
+            for row in 0..visible_rows_count {
+                let cells = &row_cells[row];
+                if cells.is_empty() { continue; }
+
+                if let Some(shaping_result) = &row_shaping[row] {
+                    let col_map = &shaping_result.col_map;
+                    let glyph_infos = &shaping_result.glyph_infos;
+
+                    for (g_idx, info) in glyph_infos.iter().enumerate() {
+                        let cluster = info.cluster as usize;
+                        if cluster >= col_map.len() { continue; }
+                        let start_col = col_map[cluster];
+                        let end_col = if g_idx + 1 < glyph_infos.len() {
+                            let next_cluster = glyph_infos[g_idx + 1].cluster as usize;
+                            if next_cluster < col_map.len() {
+                                col_map[next_cluster]
+                            } else {
+                                cells.len()
+                            }
+                        } else {
+                            cells.len()
+                        };
+
+                        if end_col <= start_col { continue; }
+                        let cell = &cells[start_col];
+
+                        if cell.c != ' ' && cell.c != '\0' {
+                            let is_emoji_or_block_or_wide = crate::renderer::is_emoji(cell.c)
+                                || is_custom_block_drawing(cell.c)
+                                || crate::renderer::is_block_element(cell.c)
+                                || cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR);
+
+                            let cell_x = (start_col as f32 * cell_width).round() + Self::PADDING_LEFT;
+                            let cell_y = ((row as f32 + scroll_fraction) * cell_height).round() + padding_top;
+                            let next_cell_y = (((row + 1) as f32 + scroll_fraction) * cell_height).round() + padding_top;
+                            let actual_cell_height = next_cell_y - cell_y;
+
+                            if !is_emoji_or_block_or_wide {
+                                if let Some(entry) = atlas.get_or_rasterize_glyph(info.glyph_id, device, queue) {
+                                    if entry.width > 0.0 && entry.height > 0.0 {
+                                        let mut fg = cell_fg_to_f32(cell.fg, cell.flags);
+                                        if cell.c == '>' || cell.c == '❯' {
+                                            let is_grayscale = (fg[0] - fg[1]).abs() < 0.02 && (fg[1] - fg[2]).abs() < 0.02;
+                                            if is_grayscale {
+                                                fg = [0.35, 0.75, 0.35, 1.0];
+                                            }
+                                        }
+                                        let (aw, ah) = atlas.atlas_size();
+                                        let raw_uv = entry.uv_coords(aw, ah);
+                                        let [uv_x, uv_y, uv_end_x, uv_end_y] = raw_uv;
+                                        let uv_w = uv_end_x - uv_x;
+                                        let uv_h = uv_end_y - uv_y;
+
+                                        let glyph_x = (cell_x + entry.left).round();
+                                        let glyph_y = (cell_y + atlas.ascent() + entry.top).round();
+
+                                        let text_instance = CellInstance::new(
+                                            glyph_x,
+                                            glyph_y,
+                                            entry.width,
+                                            entry.height,
+                                            fg,
+                                            [0.0, 0.0, 0.0, 0.0],
+                                            uv_x, uv_y, uv_w, uv_h,
+                                            0.0,
+                                        );
+                                        fg_instances.push(text_instance);
+                                    }
+                                }
+                            } else {
+                                for sub_col in start_col..end_col {
+                                    let sub_cell = &cells[sub_col];
+                                    if sub_cell.c != ' ' && sub_cell.c != '\0' {
+                                        let sub_x = (sub_col as f32 * cell_width).round() + Self::PADDING_LEFT;
+                                        let next_sub_x = ((sub_col + 1) as f32 * cell_width).round() + Self::PADDING_LEFT;
+                                        let sub_w = next_sub_x - sub_x;
+
+                                        render_single_char(
+                                            sub_cell, sub_x, cell_y, sub_w, actual_cell_height,
+                                            atlas, fg_instances, device, queue
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Ligature fallback: render cell-by-cell
+                for (col_idx, cell) in cells.iter().enumerate() {
+                    if cell.c != ' ' && cell.c != '\0' {
+                        let cell_x = (col_idx as f32 * cell_width).round() + Self::PADDING_LEFT;
+                        let next_cell_x = ((col_idx + 1) as f32 * cell_width).round() + Self::PADDING_LEFT;
+                        let actual_cell_width = next_cell_x - cell_x;
+                        let cell_y = ((row as f32 + scroll_fraction) * cell_height).round() + padding_top;
+                        let next_cell_y = (((row + 1) as f32 + scroll_fraction) * cell_height).round() + padding_top;
+                        let actual_cell_height = next_cell_y - cell_y;
+
+                        render_single_char(
+                            cell, cell_x, cell_y, actual_cell_width, actual_cell_height,
+                            atlas, fg_instances, device, queue
+                        );
+                    }
+                }
+            }
 
             let mut term_instances_flat = Vec::with_capacity(term_bg_instances.len() + term_fg_instances.len() + 10);
             term_instances_flat.extend(term_bg_instances);
@@ -1529,16 +1598,17 @@ impl Pipeline {
         }
 
         if scrollbar_alpha > 0.001 {
-            let scrollbar_top_margin = padding_top - 10.0f32; // clears the custom title bar and tab bar height
+            const TOPBAR_HEIGHT: f32 = 40.0;
+            let track_top = TOPBAR_HEIGHT;
             let track_width = 6.0f32;
             let track_x = viewport_width - track_width - 2.0f32; // 2px from right edge
-            let track_y = scrollbar_top_margin;
-            let track_h = viewport_height - scrollbar_top_margin - 4.0f32; // 4px bottom margin
+            let track_bottom = viewport_height - 4.0f32;
+            let track_height = track_bottom - track_top;
 
             // Draw track (rgba(255,255,255,0.08))
             let track_instance = CellInstance::new(
-                track_x, track_y,
-                track_width, track_h,
+                track_x, track_top,
+                track_width, track_height,
                 [1.0, 1.0, 1.0, 0.08 * scrollbar_alpha],
                 [0.0, 0.0, 0.0, 0.0],
                 0.0, 0.0, 1.0, 1.0,
@@ -1550,7 +1620,7 @@ impl Pipeline {
             let total_lines = visible_rows + history_size;
             if total_lines > 0.0 {
                 let ratio = visible_rows / total_lines;
-                let thumb_h = (track_h * ratio).max(20.0).min(track_h);
+                let thumb_h = (track_height * ratio).max(20.0).min(track_height);
 
                 let scroll_ratio = if history_size > 0.0 {
                     scroll_current / history_size
@@ -1558,7 +1628,8 @@ impl Pipeline {
                     0.0
                 };
 
-                let thumb_y = track_y + (1.0 - scroll_ratio) * (track_h - thumb_h);
+                let thumb_y = track_top + (1.0 - scroll_ratio) * (track_height - thumb_h);
+                let thumb_y = thumb_y.clamp(track_top, track_bottom - thumb_h);
 
                 // Draw thumb (rgba(255,255,255,0.3))
                 let thumb_instance = CellInstance::new(
@@ -2017,6 +2088,7 @@ impl Pipeline {
         hover_size_plus: bool,
         hover_scroll_minus: bool,
         hover_scroll_plus: bool,
+        hover_open_config: bool,
         hover_save: bool,
         hover_cancel: bool,
         system_fonts: &[String],
@@ -2276,6 +2348,43 @@ impl Pipeline {
                 0.0,
             ));
         }
+
+        // 4. Config File option
+        draw_text(atlas, "Config File:", 20.0, 176.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
+
+        let config_bg = if hover_open_config {
+            [25.0 / 255.0, 25.0 / 255.0, 32.0 / 255.0, 1.0]
+        } else {
+            [16.0 / 255.0, 16.0 / 255.0, 20.0 / 255.0, 1.0]
+        };
+        bg_instances.push(CellInstance::new(
+            140.0, 172.0,
+            240.0, 26.0,
+            config_bg,
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            6.0,
+        ));
+
+        // Draw settings SVG icon for Config
+        if let Some(entry) = &atlas.icon_settings {
+            let entry_w = 14.0f32;
+            let entry_h = 14.0f32;
+            let glyph_x = 148.0f32;
+            let glyph_y = 172.0f32 + (26.0f32 - entry_h) / 2.0f32;
+            let (aw, ah) = atlas.atlas_size();
+            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+            fg_instances.push(CellInstance::new(
+                glyph_x, glyph_y,
+                entry_w, entry_h,
+                [0.7, 0.7, 0.75, 1.0],
+                [0.0, 0.0, 0.0, 0.0],
+                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                0.0,
+            ));
+        }
+
+        draw_text(atlas, "Open config.json", 168.0, 176.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
 
         // Save & Cancel buttons
         let save_bg = if hover_save {
@@ -2715,7 +2824,7 @@ fn named_color_rgb(named: alacritty_terminal::vte::ansi::NamedColor) -> (u8, u8,
         alacritty_terminal::vte::ansi::NamedColor::Background => (0x1D, 0x1F, 0x21),
         alacritty_terminal::vte::ansi::NamedColor::Black => (0x1D, 0x1F, 0x21),
         alacritty_terminal::vte::ansi::NamedColor::Red => (0xCC, 0x66, 0x66),
-        alacritty_terminal::vte::ansi::NamedColor::Green => (0xB5, 0xBD, 0x68),
+        alacritty_terminal::vte::ansi::NamedColor::Green => (0x50, 0xFA, 0x7B),
         alacritty_terminal::vte::ansi::NamedColor::Yellow => (0xF0, 0xC6, 0x74),
         alacritty_terminal::vte::ansi::NamedColor::Blue => (0x81, 0xA2, 0xBE),
         alacritty_terminal::vte::ansi::NamedColor::Magenta => (0xB2, 0x94, 0xBB),
@@ -2723,7 +2832,7 @@ fn named_color_rgb(named: alacritty_terminal::vte::ansi::NamedColor) -> (u8, u8,
         alacritty_terminal::vte::ansi::NamedColor::White => (0xC5, 0xC8, 0xC6),
         alacritty_terminal::vte::ansi::NamedColor::BrightBlack => (0x66, 0x66, 0x66),
         alacritty_terminal::vte::ansi::NamedColor::BrightRed => (0xFF, 0x33, 0x34),
-        alacritty_terminal::vte::ansi::NamedColor::BrightGreen => (0x9E, 0xC4, 0x00),
+        alacritty_terminal::vte::ansi::NamedColor::BrightGreen => (0x69, 0xDB, 0x7C),
         alacritty_terminal::vte::ansi::NamedColor::BrightYellow => (0xF0, 0xC6, 0x74),
         alacritty_terminal::vte::ansi::NamedColor::BrightBlue => (0x81, 0xA2, 0xBE),
         alacritty_terminal::vte::ansi::NamedColor::BrightMagenta => (0xB7, 0x7E, 0xE0),
@@ -2738,7 +2847,7 @@ fn index_to_ansi_color(idx: usize) -> (u8, u8, u8) {
         const ANSI_COLORS: [(u8, u8, u8); 16] = [
             (0x1D, 0x1F, 0x21),
             (0xCC, 0x66, 0x66),
-            (0xB5, 0xBD, 0x68),
+            (0x50, 0xFA, 0x7B),
             (0xF0, 0xC6, 0x74),
             (0x81, 0xA2, 0xBE),
             (0xB2, 0x94, 0xBB),
@@ -2746,7 +2855,7 @@ fn index_to_ansi_color(idx: usize) -> (u8, u8, u8) {
             (0xC5, 0xC8, 0xC6),
             (0x66, 0x66, 0x66),
             (0xFF, 0x33, 0x34),
-            (0x9E, 0xC4, 0x00),
+            (0x69, 0xDB, 0x7C),
             (0xF0, 0xC6, 0x74),
             (0x81, 0xA2, 0xBE),
             (0xB7, 0x7E, 0xE0),
@@ -2947,4 +3056,115 @@ pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
 
 fn is_arrow_symbol(ch: char) -> bool {
     matches!(ch as u32, 0x2190..=0x21FF | 0x2B00..=0x2BFF)
+}
+
+fn render_single_char(
+    cell: &alacritty_terminal::term::cell::Cell,
+    cell_x: f32,
+    cell_y: f32,
+    actual_cell_width: f32,
+    actual_cell_height: f32,
+    atlas: &mut crate::renderer::Atlas,
+    fg_instances: &mut Vec<CellInstance>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) {
+    if cell.c != ' ' && cell.c != '\0' {
+        if is_custom_block_drawing(cell.c) {
+            let fg = cell_fg_to_f32(cell.fg, cell.flags);
+            let mut left = 0.0;
+            let mut right = 0.0;
+            let mut top = 0.0;
+            let mut bottom = 0.0;
+            let mut kind = 0.0;
+
+            if let Some((l, r, t, b, k)) = decode_box_drawing(cell.c) {
+                left = l as f32;
+                right = r as f32;
+                top = t as f32;
+                bottom = b as f32;
+                kind = k as f32;
+            }
+
+            let code = cell.c as u32 as f32;
+            let is_color_val = -(code + kind / 10.0);
+
+            let block_instance = CellInstance::new(
+                cell_x,
+                cell_y,
+                actual_cell_width,
+                actual_cell_height,
+                fg,
+                [left, right, top, bottom],
+                0.0, 0.0, 1.0, 1.0,
+                is_color_val,
+            );
+            fg_instances.push(block_instance);
+        } else if let Some(entry) = atlas.get_or_rasterize(cell.c, device, queue) {
+            if entry.width > 0.0 && entry.height > 0.0 {
+                let mut fg = cell_fg_to_f32(cell.fg, cell.flags);
+                if cell.c == '>' || cell.c == '❯' {
+                    let is_grayscale = (fg[0] - fg[1]).abs() < 0.02 && (fg[1] - fg[2]).abs() < 0.02;
+                    if is_grayscale {
+                        fg = [0.35, 0.75, 0.35, 1.0];
+                    }
+                }
+                let (aw, ah) = atlas.atlas_size();
+                let raw_uv = entry.uv_coords(aw, ah);
+                let [uv_x, uv_y, uv_end_x, uv_end_y] = raw_uv;
+                let uv_w = uv_end_x - uv_x;
+                let uv_h = uv_end_y - uv_y;
+
+                let text_instance = if crate::renderer::is_block_element(cell.c) {
+                    CellInstance::new(
+                        cell_x,
+                        cell_y,
+                        actual_cell_width,
+                        actual_cell_height,
+                        fg,
+                        [0.0, 0.0, 0.0, 0.0],
+                        uv_x, uv_y, uv_w, uv_h,
+                        if entry.is_color { 1.0 } else { 0.0 },
+                    )
+                } else if entry.is_color {
+                    let char_width = if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR) { 2.0 } else { 1.0 };
+                    let scale = actual_cell_height / entry.height;
+                    let emoji_render_width = entry.width * scale;
+                    let emoji_render_height = actual_cell_height;
+                    let x_offset = ((actual_cell_width * char_width) - emoji_render_width) / 2.0;
+                    let glyph_x = (cell_x + x_offset.max(0.0)).round();
+                    let glyph_y = cell_y.round();
+                    CellInstance::new(
+                        glyph_x,
+                        glyph_y,
+                        emoji_render_width,
+                        emoji_render_height,
+                        fg,
+                        [0.0, 0.0, 0.0, 0.0],
+                        uv_x, uv_y, uv_w, uv_h,
+                        1.0,
+                    )
+                } else {
+                    let glyph_x = if is_arrow_symbol(cell.c) {
+                        let x_offset = (actual_cell_width - entry.width) / 2.0;
+                        (cell_x + x_offset).round()
+                    } else {
+                        (cell_x + entry.left).round()
+                    };
+                    let glyph_y = (cell_y + atlas.ascent() + entry.top).round();
+                    CellInstance::new(
+                        glyph_x,
+                        glyph_y,
+                        entry.width,
+                        entry.height,
+                        fg,
+                        [0.0, 0.0, 0.0, 0.0],
+                        uv_x, uv_y, uv_w, uv_h,
+                        0.0,
+                    )
+                };
+                fg_instances.push(text_instance);
+            }
+        }
+    }
 }

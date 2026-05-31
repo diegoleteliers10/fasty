@@ -1,6 +1,6 @@
 [package]
 name = "fasty"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 
 [lib]
@@ -35,6 +35,7 @@ arboard = { version = "3", features = ["wayland-data-control"] }
 resvg = "0.47.0"
 usvg = "0.47.0"
 tiny-skia = "0.12.0"
+rustybuzz = "0.12.1"
 
 [build-dependencies]
 winres = "0.1"

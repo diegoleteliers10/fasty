@@ -91,11 +91,26 @@ impl ShelfPacker {
     }
 }
 
+#[derive(Clone)]
+pub struct RowShapingResult {
+    pub glyph_infos: Vec<rustybuzz::GlyphInfo>,
+    pub col_map: Vec<usize>,
+}
+
+#[derive(Hash, Eq, PartialEq, Debug, Clone, Copy)]
+pub enum GlyphKey {
+    Char(char),
+    GlyphId(u32),
+}
+
 pub struct Atlas {
     texture: wgpu::Texture,
-    entries: HashMap<char, AtlasEntry>,
+    entries: HashMap<GlyphKey, AtlasEntry>,
     packer: ShelfPacker,
     primary_path: String,
+    primary_font_bytes: Option<Vec<u8>>,
+    hb_face: Option<rustybuzz::Face<'static>>,
+    pub shaping_cache: HashMap<String, RowShapingResult>,
     fallback_paths: Vec<String>,
     fallback_glyph: Option<AtlasEntry>,
     cell_width: f32,
@@ -219,11 +234,25 @@ impl Atlas {
             },
         );
 
+        let primary_font_bytes = std::fs::read(&primary_path).ok();
+
+        let mut hb_face = None;
+        if let Some(bytes) = &primary_font_bytes {
+            if let Some(face) = rustybuzz::Face::from_slice(bytes, 0) {
+                unsafe {
+                    hb_face = Some(std::mem::transmute::<rustybuzz::Face<'_>, rustybuzz::Face<'static>>(face));
+                }
+            }
+        }
+
         let mut atlas = Self {
             texture,
             entries: HashMap::new(),
             packer,
             primary_path,
+            primary_font_bytes,
+            hb_face,
+            shaping_cache: HashMap::new(),
             fallback_paths,
             fallback_glyph: None,
             cell_width,
@@ -246,7 +275,7 @@ impl Atlas {
 
         atlas.rasterize_basic_glyphs(device, queue)?;
 
-        if let Some(space) = atlas.entries.get(&' ') {
+        if let Some(space) = atlas.entries.get(&GlyphKey::Char(' ')) {
             atlas.fallback_glyph = Some(*space);
         }
 
@@ -398,7 +427,7 @@ impl Atlas {
                                 LoadFlag::RENDER
                             };
                             if face.load_glyph(idx, load_flags).is_ok() {
-                                let _ = self.rasterize_freetype_glyph(device, queue, c, &face.glyph(), is_color);
+                                let _ = self.rasterize_freetype_glyph_key(device, queue, GlyphKey::Char(c), &face.glyph(), is_color);
                             }
                         }
                     }
@@ -409,11 +438,11 @@ impl Atlas {
         Ok(())
     }
 
-    fn rasterize_freetype_glyph(
+    fn rasterize_freetype_glyph_key(
         &mut self,
         _device: &Device,
         queue: &Queue,
-        c: char,
+        key: GlyphKey,
         glyph: &freetype::GlyphSlot,
         is_color: bool,
     ) -> anyhow::Result<()> {
@@ -422,7 +451,15 @@ impl Atlas {
         let h = bitmap.rows() as u32;
 
         let pixel_mode = bitmap.pixel_mode().unwrap_or(freetype::bitmap::PixelMode::Gray);
-        let actual_is_color = is_color || pixel_mode == freetype::bitmap::PixelMode::Bgra || is_emoji(c);
+        let is_emoji_char = match key {
+            GlyphKey::Char(ch) => is_emoji(ch),
+            GlyphKey::GlyphId(_) => false,
+        };
+        let is_block_char = match key {
+            GlyphKey::Char(ch) => is_block_element(ch),
+            GlyphKey::GlyphId(_) => false,
+        };
+        let actual_is_color = is_color || pixel_mode == freetype::bitmap::PixelMode::Bgra || is_emoji_char;
 
         if w == 0 || h == 0 {
             let entry = AtlasEntry {
@@ -433,9 +470,9 @@ impl Atlas {
                 left: 0.0,
                 top: 0.0,
                 is_color: actual_is_color,
-                is_block: is_block_element(c),
+                is_block: is_block_char,
             };
-            self.entries.insert(c, entry);
+            self.entries.insert(key, entry);
             return Ok(());
         }
 
@@ -492,7 +529,7 @@ impl Atlas {
         }
 
         // 2. Scale block elements to cell dimensions; keep other glyphs at their native FreeType size
-        let (mut final_rgba, final_w, final_h, scale) = if is_block_element(c) {
+        let (mut final_rgba, final_w, final_h, scale) = if is_block_char {
             let target_w = self.cell_width.round() as u32;
             let target_h = self.cell_height.round() as u32;
             let scaled = scale_rgba_bitmap(&rgba_data, w as usize, h as usize, target_w as usize, target_h as usize);
@@ -501,7 +538,7 @@ impl Atlas {
             (rgba_data, w, h, 1.0)
         };
 
-        if is_block_element(c) {
+        if is_block_char {
             for pixel_chunk in final_rgba.chunks_mut(4) {
                 if pixel_chunk[3] > 0 || pixel_chunk[0] > 0 {
                     pixel_chunk[0] = 255;
@@ -528,21 +565,21 @@ impl Atlas {
                 y: (pos.1 + padding) as f32,
                 width: final_w as f32,
                 height: final_h as f32,
-                left: if is_block_element(c) {
+                left: if is_block_char {
                     0.0
                 } else {
                     (glyph.bitmap_left() as f32 * scale).round()
                 },
-                top: if is_block_element(c) {
+                top: if is_block_char {
                     -self.ascent
                 } else {
                     (-glyph.bitmap_top() as f32 * scale).round()
                 },
                 is_color: actual_is_color,
-                is_block: is_block_element(c),
+                is_block: is_block_char,
             };
 
-            self.entries.insert(c, entry);
+            self.entries.insert(key, entry);
 
             queue.write_texture(
                 wgpu::ImageCopyTextureBase {
@@ -573,7 +610,7 @@ impl Atlas {
     }
 
     pub fn get_or_rasterize(&mut self, c: char, device: &Device, queue: &Queue) -> Option<AtlasEntry> {
-        if let Some(entry) = self.entries.get(&c) {
+        if let Some(entry) = self.entries.get(&GlyphKey::Char(c)) {
             return Some(*entry);
         }
 
@@ -592,8 +629,8 @@ impl Atlas {
                         };
 
                         if face.load_glyph(idx, load_flags).is_ok() {
-                            let _ = self.rasterize_freetype_glyph(device, queue, c, &face.glyph(), is_color);
-                            return self.entries.get(&c).copied();
+                            let _ = self.rasterize_freetype_glyph_key(device, queue, GlyphKey::Char(c), &face.glyph(), is_color);
+                            return self.entries.get(&GlyphKey::Char(c)).copied();
                         }
                     }
                 }
@@ -637,8 +674,8 @@ impl Atlas {
                                 LoadFlag::RENDER
                             };
                             if face.load_glyph(idx, load_flags).is_ok() {
-                                let _ = self.rasterize_freetype_glyph(device, queue, c, &face.glyph(), is_color);
-                                return self.entries.get(&c).copied();
+                                let _ = self.rasterize_freetype_glyph_key(device, queue, GlyphKey::Char(c), &face.glyph(), is_color);
+                                return self.entries.get(&GlyphKey::Char(c)).copied();
                             }
                         }
                     }
@@ -661,10 +698,53 @@ impl Atlas {
                 is_color: false,
                 is_block: is_block_element(c),
             };
-            self.entries.insert(c, dummy);
+            self.entries.insert(GlyphKey::Char(c), dummy);
             Some(dummy)
         }
     }
+
+    pub fn get_or_rasterize_glyph(
+        &mut self,
+        glyph_id: u32,
+        device: &Device,
+        queue: &Queue,
+    ) -> Option<AtlasEntry> {
+        if let Some(entry) = self.entries.get(&GlyphKey::GlyphId(glyph_id)) {
+            return Some(*entry);
+        }
+
+        FT_LIB.with(|lib| {
+            if let Ok(face) = lib.new_face(&self.primary_path, 0) {
+                let physical_size = self.font_size * self.scale_factor;
+                let _ = face.set_pixel_sizes(0, physical_size as u32);
+                let is_color = face.has_fixed_sizes();
+                let load_flags = if is_color {
+                    LoadFlag::RENDER | LoadFlag::COLOR
+                } else {
+                    LoadFlag::RENDER
+                };
+
+                if face.load_glyph(glyph_id, load_flags).is_ok() {
+                    let _ = self.rasterize_freetype_glyph_key(device, queue, GlyphKey::GlyphId(glyph_id), &face.glyph(), is_color);
+                    return self.entries.get(&GlyphKey::GlyphId(glyph_id)).copied();
+                }
+            }
+            None
+        })
+    }
+
+    pub fn primary_path(&self) -> &str {
+        &self.primary_path
+    }
+
+    pub fn primary_font_bytes(&self) -> Option<&[u8]> {
+        self.primary_font_bytes.as_deref()
+    }
+
+    pub fn hb_face(&self) -> Option<&rustybuzz::Face<'static>> {
+        self.hb_face.as_ref()
+    }
+
 
     pub fn entries_len(&self) -> usize {
         self.entries.len()
