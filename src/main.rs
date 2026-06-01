@@ -1487,6 +1487,57 @@ fn main() -> anyhow::Result<()> {
                                         r.set_dirty(true);
                                         r.grid_dirty = true;
                                         app_dirty = true;
+
+                                        // Click-to-cursor-position in normal shell mode (no TUI app owns mouse):
+                                        let padding_top = get_padding_top(tabs.len());
+                                        let is_in_terminal_area = current_mouse_y > padding_top as f64 && current_mouse_x <= (v_width - 20.0);
+                                        if is_in_terminal_area {
+                                            let term_state = tabs[active_tab_index].terminal_state.lock();
+                                            let mode = *term_state.term().lock().mode();
+                                            let tui_owns_mouse = mode.intersects(
+                                                alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
+                                                | alacritty_terminal::term::TermMode::MOUSE_MOTION  
+                                                | alacritty_terminal::term::TermMode::SGR_MOUSE
+                                                | alacritty_terminal::term::TermMode::MOUSE_DRAG
+                                            );
+                                            if !tui_owns_mouse {
+                                                let scroll_fraction = tabs[active_tab_index].scroll_current - term_state.display_offset() as f32;
+                                                let display_offset = term_state.display_offset();
+                                                let click_point = mouse_to_grid_point(
+                                                    current_mouse_x,
+                                                    current_mouse_y,
+                                                    cell_width,
+                                                    cell_height,
+                                                    scroll_fraction,
+                                                    display_offset,
+                                                    shell_cols,
+                                                    shell_rows,
+                                                    padding_top,
+                                                );
+
+                                                let click_col = click_point.column.0 as i32;
+                                                let click_row = click_point.line.0;
+                                                
+                                                let term_guard = term_state.term().lock();
+                                                let cursor_col = term_guard.grid().cursor.point.column.0 as i32;
+                                                let cursor_row = term_guard.grid().cursor.point.line.0;
+
+                                                if click_row == cursor_row {
+                                                    let delta = click_col - cursor_col;
+                                                    if delta > 0 {
+                                                        // Click is to the RIGHT of cursor — send → arrows
+                                                        for _ in 0..delta {
+                                                            term_state.write_to_pty(b"\x1b[C");  // cursor forward
+                                                        }
+                                                    } else if delta < 0 {
+                                                        // Click is to the LEFT of cursor — send ← arrows
+                                                        for _ in 0..delta.abs() {
+                                                            term_state.write_to_pty(b"\x1b[D");  // cursor backward
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                     tabs[active_tab_index].selection_start_pos = None;
                                 }
@@ -1715,8 +1766,7 @@ fn main() -> anyhow::Result<()> {
                                 app_dirty = true;
                             } else if let Some((sx, sy)) = tabs[active_tab_index].selection_start_pos {
                                 if !tabs[active_tab_index].is_selecting_text {
-                                    let dist = ((current_mouse_x - sx).powi(2) + (current_mouse_y - sy).powi(2)).sqrt();
-                                    if dist > 5.0 {
+                                    if (current_mouse_x - sx).abs() > 2.0 || (current_mouse_y - sy).abs() > 2.0 {
                                         tabs[active_tab_index].is_selecting_text = true;
                                         let term = tabs[active_tab_index].terminal_state.lock();
                                         let scroll_fraction = tabs[active_tab_index].scroll_current - term.display_offset() as f32;

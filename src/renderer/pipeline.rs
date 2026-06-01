@@ -696,16 +696,7 @@ impl Pipeline {
         );
         ui_bg_instances.push(bar_bottom_fill);
 
-        // 5. Draw unified bar bottom border (1px solid rgba(255,255,255,0.06))
-        let bar_border = CellInstance::new(
-            0.0, 39.0,
-            viewport_width, 1.0,
-            [1.0, 1.0, 1.0, 0.06],
-            [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
-            0.0,
-        );
-        ui_bg_instances.push(bar_border);
+        // (Unified bar bottom border is now drawn segmented below in the tabs rendering logic to bypass the active tab)
 
         let scroll_fraction = scroll_current - content.display_offset as f32;
 
@@ -1066,6 +1057,46 @@ impl Pipeline {
             160.0f32
         };
 
+        // Draw segmented bottom border (1px solid rgba(255,255,255,0.06)) to separate topbar from terminal
+        // active tab has NO bottom border, allowing it to merge seamlessly.
+        if active_tab_index < tab_titles.len() {
+            let active_tab_x = tab_start_x + active_tab_index as f32 * tab_width;
+            
+            // Left segment
+            if active_tab_x > 0.0 {
+                bg_instances.push(CellInstance::new(
+                    0.0, 39.0,
+                    active_tab_x, 1.0,
+                    [1.0, 1.0, 1.0, 0.06],
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                ));
+            }
+            
+            // Right segment
+            let right_start = active_tab_x + tab_width;
+            if right_start < viewport_width {
+                bg_instances.push(CellInstance::new(
+                    right_start, 39.0,
+                    viewport_width - right_start, 1.0,
+                    [1.0, 1.0, 1.0, 0.06],
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                ));
+            }
+        } else {
+            bg_instances.push(CellInstance::new(
+                0.0, 39.0,
+                viewport_width, 1.0,
+                [1.0, 1.0, 1.0, 0.06],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 0.0, 0.0,
+                0.0,
+            ));
+        }
+
         let scale = 13.0f32 / atlas.font_size();
 
         for (i, title) in tab_titles.iter().enumerate() {
@@ -1073,45 +1104,46 @@ impl Pipeline {
             let is_active = i == active_tab_index;
             let is_hovered = hovered_tab_index == Some(i);
 
-            // Active tab bg (#1e2024), Inactive tab bg (transparent or hover rgba(255,255,255,0.05))
+            // Active tab bg (#0c0c0c), Inactive tab bg is transparent (no fill)
             if is_active {
-                // Background fills up to 40.0 to merge visually with terminal
+                // Background fills up to 40.0 to merge visually with terminal background
                 bg_instances.push(CellInstance::new(
                     tab_x, 0.0,
                     tab_width, 40.0,
                     [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0], // Terminal bg color (#0c0c0c)
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
+                    0.0, 0.0, 0.0, 0.0,
                     0.0,
                 ));
-                // Top accent edge (2px solid #5b8af0)
+
+                // Left border of active tab (subtle 1px vertical line)
                 bg_instances.push(CellInstance::new(
                     tab_x, 0.0,
-                    tab_width, 2.0,
-                    [91.0 / 255.0, 138.0 / 255.0, 240.0 / 255.0, 1.0], // Blue accent
+                    1.0, 40.0,
+                    [1.0, 1.0, 1.0, 0.12],
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
+                    0.0, 0.0, 0.0, 0.0,
                     0.0,
                 ));
-            } else if is_hovered {
+                // Right border of active tab (subtle 1px vertical line)
                 bg_instances.push(CellInstance::new(
-                    tab_x, 0.0,
-                    tab_width, 40.0,
-                    [1.0, 1.0, 1.0, 0.05], // Hover bg
+                    tab_x + tab_width, 0.0,
+                    1.0, 40.0,
+                    [1.0, 1.0, 1.0, 0.12],
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
+                    0.0, 0.0, 0.0, 0.0,
                     0.0,
                 ));
             }
 
-            // Draw vertical separator (1px vertical line) between tabs
-            if i + 1 < tab_titles.len() {
+            // Draw vertical separator (1px vertical line) between inactive tabs only (active tab is separated by its own borders)
+            if i + 1 < tab_titles.len() && i != active_tab_index && i + 1 != active_tab_index {
                 bg_instances.push(CellInstance::new(
                     tab_x + tab_width, 12.0,
                     1.0, 16.0,
-                    [1.0, 1.0, 1.0, 0.07], // Separator
+                    [1.0, 1.0, 1.0, 0.05], // Very subtle separator
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
+                    0.0, 0.0, 0.0, 0.0,
                     0.0,
                 ));
             }
@@ -1145,11 +1177,11 @@ impl Pipeline {
 
             let mut char_x = tab_x + 14.0f32;
             let fg_color = if is_active {
-                [1.0, 1.0, 1.0, 0.90] // Active tab text
+                [1.0, 1.0, 1.0, 1.0] // Active tab text (full opacity)
             } else if is_hovered {
-                [1.0, 1.0, 1.0, 0.70] // Hover tab text
+                [1.0, 1.0, 1.0, 0.70] // Hover tab text (slightly increased opacity)
             } else {
-                [1.0, 1.0, 1.0, 0.40] // Inactive tab text
+                [1.0, 1.0, 1.0, 0.30] // Inactive tab text (low opacity)
             };
 
             let scaled_ascent = atlas.ascent() * scale;
@@ -1243,7 +1275,7 @@ impl Pipeline {
             bg_instances.push(CellInstance::new(
                 new_tab_x, 0.0,
                 32.0, 40.0,
-                [1.0, 1.0, 1.0, 0.08], // Hover background
+                [1.0, 1.0, 1.0, 0.04], // Extremely subtle hover feedback
                 [0.0, 0.0, 0.0, 0.0],
                 0.0, 0.0, 1.0, 1.0,
                 0.0,
@@ -1260,9 +1292,9 @@ impl Pipeline {
             let uv_h = uv_end_y - uv_y;
 
             let icon_color = if hover_new_tab {
-                [1.0, 1.0, 1.0, 0.80]
+                [1.0, 1.0, 1.0, 0.70] // Consistent with hover tab text
             } else {
-                [1.0, 1.0, 1.0, 0.35]
+                [1.0, 1.0, 1.0, 0.35] // Consistent with inactive tab text
             };
 
             fg_instances.push(CellInstance::new(
