@@ -1071,7 +1071,6 @@ pub fn is_emoji(ch: char) -> bool {
         0x1F000..=0x1F02F |  // Mahjong tiles
         0x1F0A0..=0x1F0FF |  // Playing cards
         0x1FA00..=0x1FA6F |  // Chess, other symbols
-        0x2600..=0x26FF   |  // Misc symbols
-        0x2700..=0x27BF      // Dingbats
+        0x2600..=0x26FF      // Misc symbols
     )
 }

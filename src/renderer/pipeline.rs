@@ -933,11 +933,8 @@ impl Pipeline {
                                 if let Some(entry) = atlas.get_or_rasterize_glyph(info.glyph_id, device, queue) {
                                     if entry.width > 0.0 && entry.height > 0.0 {
                                         let mut fg = cell_fg_to_f32(cell.fg, cell.flags);
-                                        if cell.c == '>' || cell.c == '❯' {
-                                            let is_grayscale = (fg[0] - fg[1]).abs() < 0.02 && (fg[1] - fg[2]).abs() < 0.02;
-                                            if is_grayscale {
-                                                fg = [0.35, 0.75, 0.35, 1.0];
-                                            }
+                                        if cell.c == '❯' {
+                                            fg = [0.35, 0.75, 0.35, 1.0];
                                         }
                                         let (aw, ah) = atlas.atlas_size();
                                         let raw_uv = entry.uv_coords(aw, ah);
@@ -1366,7 +1363,7 @@ impl Pipeline {
             ));
 
             // Draw button text
-            let text = if update_in_progress { "Updating" } else { "Update" };
+            let text = if update_in_progress { "Updating..." } else { "Update" };
             let text_scale = 11.0f32 / atlas.font_size();
 
             // Measure text to center it inside the button
@@ -3103,11 +3100,8 @@ fn render_single_char(
         } else if let Some(entry) = atlas.get_or_rasterize(cell.c, device, queue) {
             if entry.width > 0.0 && entry.height > 0.0 {
                 let mut fg = cell_fg_to_f32(cell.fg, cell.flags);
-                if cell.c == '>' || cell.c == '❯' {
-                    let is_grayscale = (fg[0] - fg[1]).abs() < 0.02 && (fg[1] - fg[2]).abs() < 0.02;
-                    if is_grayscale {
-                        fg = [0.35, 0.75, 0.35, 1.0];
-                    }
+                if cell.c == '❯' {
+                    fg = [0.35, 0.75, 0.35, 1.0];
                 }
                 let (aw, ah) = atlas.atlas_size();
                 let raw_uv = entry.uv_coords(aw, ah);

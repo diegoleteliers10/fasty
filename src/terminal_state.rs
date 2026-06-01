@@ -50,7 +50,7 @@ impl TerminalState {
         let rows = ((viewport_height as usize) / cell_h).max(24);
 
         let mut config = AlacrittyConfig::default();
-        config.scrolling_history = scrollback;
+        config.scrolling_history = scrollback.min(3000);
         let size = TermSize::new(cols, rows);
 
         let pty_system = native_pty_system();
@@ -167,7 +167,7 @@ impl TerminalState {
 
     pub fn update_scrollback(&self, scrollback: usize) {
         let mut term = self.term.lock();
-        term.grid_mut().update_history(scrollback);
+        term.grid_mut().update_history(scrollback.min(3000));
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {

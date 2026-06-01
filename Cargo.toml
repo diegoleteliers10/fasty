@@ -19,8 +19,6 @@ alacritty_terminal = "0.24"
 portable-pty = "0.8"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.3"
-log = "0.4"
-env_logger = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
@@ -56,3 +54,5 @@ freetype-rs = { version = "0.37", features = ["bundled"] }
 opt-level = 3
 lto = true
 codegen-units = 1
+strip = true       # strips debug symbols — reduces binary size
+panic = "abort"    # removes stack unwinding code

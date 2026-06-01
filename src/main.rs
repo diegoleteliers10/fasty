@@ -202,9 +202,12 @@ fn main() -> anyhow::Result<()> {
     let app_version = get_current_version();
     std::env::set_var("TERM_PROGRAM_VERSION", app_version.trim_start_matches('v'));
 
-    tracing_subscriber::fmt()
-        .with_env_filter("warn,fasty=info")
-        .init();
+    #[cfg(debug_assertions)]
+    {
+        tracing_subscriber::fmt()
+            .with_env_filter("warn,fasty=info")
+            .init();
+    }
 
     let mut config = Config::load()?;
 
@@ -344,7 +347,7 @@ fn main() -> anyhow::Result<()> {
     let mut settings_renderer: Option<Renderer<'static>> = None;
     let mut settings_family = String::new();
     let mut settings_size = 14.0f32;
-    let mut settings_scrollback = 10000usize;
+    let mut settings_scrollback = 3000usize;
     let mut settings_active_field = 0usize; // 0 = none, 1 = font family select dropdown
     
     let mut s_hover_close = false;
@@ -1214,7 +1217,7 @@ fn main() -> anyhow::Result<()> {
                                              if settings_window.is_none() {
                                                   settings_family = config.font.family.clone();
                                                   settings_size = config.font.size;
-                                                  settings_scrollback = config.scrollback;
+                                                   settings_scrollback = config.scrollback.min(3000);
                                                   settings_active_field = 0;
                                                  if let Ok(sw) = target.create_window(winit::window::WindowAttributes::default()
                                                      .with_title("fasty Settings")
@@ -2095,7 +2098,7 @@ fn main() -> anyhow::Result<()> {
                                         settings_scrollback = settings_scrollback.saturating_sub(1000).max(1000);
                                         apply_settings!();
                                     } else if s_hover_scroll_plus {
-                                        settings_scrollback = settings_scrollback.saturating_add(1000).min(1000000);
+                                        settings_scrollback = settings_scrollback.saturating_add(1000).min(3000);
                                         apply_settings!();
                                     } else if s_hover_open_config {
                                         let mut current_config = Config::load().unwrap_or_default();
@@ -3102,7 +3105,7 @@ fn trigger_update(
     _update_available: &Arc<parking_lot::Mutex<Option<String>>>,
     update_in_progress: &Arc<parking_lot::Mutex<bool>>,
     _update_completed: &Arc<parking_lot::Mutex<bool>>,
-    _window: &Arc<winit::window::Window>,
+    window: &Arc<winit::window::Window>,
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
 ) {
     let mut in_progress = update_in_progress.lock();
@@ -3111,67 +3114,87 @@ fn trigger_update(
     }
     *in_progress = true;
 
-    let current_pid = std::process::id();
+    // Redraw window so the text switches to "Updating..." immediately
+    window.request_redraw();
 
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+    let update_in_progress_clone = Arc::clone(update_in_progress);
+    let window_clone = Arc::clone(window);
 
-        let cmd_str = format!(
-            "while (Get-Process -Id {} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 200 }}; \
-             irm https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.ps1 | iex; \
-             Start-Process \"$env:USERPROFILE\\.local\\bin\\fasty.exe\"",
-            current_pid
-        );
+    std::thread::spawn(move || {
+        let mut success = false;
 
-        let _ = std::process::Command::new("powershell")
-            .arg("-Command")
-            .arg(&cmd_str)
-            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-            .spawn();
-    }
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(mut child) = std::process::Command::new("powershell")
+                .arg("-Command")
+                .arg("irm https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.ps1 | iex")
+                .spawn() {
+                if let Ok(status) = child.wait() {
+                    success = status.success();
+                }
+            }
+        }
 
-    #[cfg(target_os = "macos")]
-    {
-        let cmd_str = format!(
-            "while kill -0 {} 2>/dev/null; do sleep 0.2; done; \
-             curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash && \
-             open -a Fasty",
-            current_pid
-        );
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(mut child) = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash")
+                .spawn() {
+                if let Ok(status) = child.wait() {
+                    success = status.success();
+                }
+            }
+        }
 
-        let _ = std::process::Command::new("nohup")
-            .arg("sh")
-            .arg("-c")
-            .arg(&cmd_str)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            // Linux and others
+            if let Ok(mut child) = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash")
+                .spawn() {
+                if let Ok(status) = child.wait() {
+                    success = status.success();
+                }
+            }
+        }
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        // Linux (and other unix systems)
-        let cmd_str = format!(
-            "while kill -0 {} 2>/dev/null; do sleep 0.2; done; \
-             curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash && \
-             /usr/local/bin/fasty &",
-            current_pid
-        );
+        if success {
+            // Spawn the newly updated fasty binary in the background!
+            #[cfg(target_os = "windows")]
+            {
+                let home = std::env::var("USERPROFILE").unwrap_or_default();
+                let fasty_path = std::path::Path::new(&home)
+                    .join(".local")
+                    .join("bin")
+                    .join("fasty.exe");
+                let _ = std::process::Command::new(fasty_path).spawn();
+            }
 
-        let _ = std::process::Command::new("nohup")
-            .arg("sh")
-            .arg("-c")
-            .arg(&cmd_str)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open")
+                    .arg("-a")
+                    .arg("Fasty")
+                    .spawn();
+            }
 
-    // Unconditionally force exit the application
-    let _ = proxy.send_event(AppEvent::ForceExit);
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            {
+                // Linux
+                let _ = std::process::Command::new("/usr/local/bin/fasty").spawn();
+            }
+
+            // Close the current window/application
+            let _ = proxy.send_event(AppEvent::ForceExit);
+        } else {
+            // Re-enable the update button on failure
+            let mut in_progress = update_in_progress_clone.lock();
+            *in_progress = false;
+            window_clone.request_redraw();
+        }
+    });
 }
 
 fn open_file_in_editor(path: &std::path::Path) -> std::io::Result<()> {

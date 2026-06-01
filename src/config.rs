@@ -29,7 +29,7 @@ impl Default for Config {
                 ligatures: true,
             },
             shell: None,
-            scrollback: 10000,
+            scrollback: 3000,
         }
     }
 }
@@ -58,7 +58,8 @@ impl Config {
             let p: &std::path::Path = path.as_ref();
             if p.exists() {
                 let content = std::fs::read_to_string(path)?;
-                let config: Config = serde_json::from_str(&content)?;
+                let mut config: Config = serde_json::from_str(&content)?;
+                config.scrollback = config.scrollback.min(3000);
                 return Ok(config);
             }
         }
