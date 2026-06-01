@@ -42,6 +42,7 @@ pub struct Renderer<'a> {
     pub cached_grid_instances: Vec<CellInstance>,
     pub update_available: bool,
     pub update_in_progress: bool,
+    pub update_completed: bool,
     pub hover_update: bool,
 }
 
@@ -133,6 +134,7 @@ impl<'a> Renderer<'a> {
             cached_grid_instances: Vec::new(),
             update_available: false,
             update_in_progress: false,
+            update_completed: false,
             hover_update: false,
         })
     }
@@ -297,6 +299,7 @@ impl<'a> Renderer<'a> {
                 hover_new_tab,
                 self.update_available,
                 self.update_in_progress,
+                self.update_completed,
                 self.hover_update,
                 &mut self.cached_grid_instances,
                 &mut self.grid_dirty,

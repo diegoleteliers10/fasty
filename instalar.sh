@@ -8,6 +8,21 @@
 
 set -euo pipefail
 
+# Procesar argumentos y variables de entorno
+USE_USER_DIR=false
+if [ "${FASTY_USER_INSTALL:-0}" = "1" ]; then
+    USE_USER_DIR=true
+fi
+
+for arg in "$@"; do
+    case $arg in
+        --user)
+            USE_USER_DIR=true
+            shift
+            ;;
+    esac
+done
+
 # CONFIGURACIÓN
 GITHUB_USER="diegoleteliers10"
 GITHUB_REPO="fasty"
@@ -76,7 +91,15 @@ tar -xzf "$TEMP_DIR/$ASSET_NAME" -C "$TEMP_DIR"
 # 5. Instalación específica por Sistema Operativo
 if [ "$OS" = "darwin" ]; then
     # --- macOS: Instalación en /Applications con soporte de Launcher/Launchpad ---
-    INSTALL_DIR="/Applications"
+    if [ "$USE_USER_DIR" = true ]; then
+        INSTALL_DIR="$HOME/Applications"
+        BIN_DIR="$HOME/.local/bin"
+        mkdir -p "$INSTALL_DIR"
+        mkdir -p "$BIN_DIR"
+    else
+        INSTALL_DIR="/Applications"
+        BIN_DIR="/usr/local/bin"
+    fi
     echo "🚀 Copiando Fasty.app a $INSTALL_DIR..."
     
     if [ -w "$INSTALL_DIR" ]; then
@@ -88,10 +111,9 @@ if [ "$OS" = "darwin" ]; then
         sudo mv "$TEMP_DIR/Fasty.app" "$INSTALL_DIR/"
     fi
 
-    # Crear enlace simbólico en /usr/local/bin para poder ejecutar 'fasty' desde terminal
-    BIN_DIR="/usr/local/bin"
+    # Crear enlace simbólico en BIN_DIR para poder ejecutar 'fasty' desde terminal
     if [ ! -d "$BIN_DIR" ]; then
-        if [ -w "/usr/local" ]; then
+        if [ -w "$(dirname "$BIN_DIR")" ]; then
             mkdir -p "$BIN_DIR"
         else
             sudo mkdir -p "$BIN_DIR"
@@ -112,11 +134,22 @@ if [ "$OS" = "darwin" ]; then
 
 elif [ "$OS" = "linux" ]; then
     # --- Linux: Mover binario y configurar lanzador de escritorio .desktop ---
-    BIN_DIR="/usr/local/bin"
+    if [ "$USE_USER_DIR" = true ]; then
+        BIN_DIR="$HOME/.local/bin"
+        ICON_DIR="$HOME/.local/share/pixmaps"
+        DESKTOP_DIR="$HOME/.local/share/applications"
+        mkdir -p "$BIN_DIR"
+        mkdir -p "$ICON_DIR"
+        mkdir -p "$DESKTOP_DIR"
+    else
+        BIN_DIR="/usr/local/bin"
+        ICON_DIR="/usr/local/share/pixmaps"
+        DESKTOP_DIR="/usr/local/share/applications"
+    fi
     
     if [ ! -d "$BIN_DIR" ]; then
         echo "📂 Creando el directorio $BIN_DIR..."
-        if [ -w "/usr/local" ]; then
+        if [ -w "$(dirname "$BIN_DIR")" ]; then
             mkdir -p "$BIN_DIR"
         else
             sudo mkdir -p "$BIN_DIR"
@@ -135,8 +168,6 @@ elif [ "$OS" = "linux" ]; then
 
     # Configuración de icono PNG y archivo .desktop para menús del sistema
     echo "🎨 Configurando icono y acceso directo de escritorio para Linux..."
-    ICON_DIR="/usr/local/share/pixmaps"
-    DESKTOP_DIR="/usr/local/share/applications"
     RAW_ICON_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/main/assets/fastyIcon.png"
 
     # Descargar el icono PNG

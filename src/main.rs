@@ -518,12 +518,10 @@ fn main() -> anyhow::Result<()> {
                             if completed && !has_shown_success_toast {
                                 has_shown_success_toast = true;
                                 toast = Some((
-                                    "✓  Update success! Please restart Fasty.".to_string(),
+                                    "✓  Update success! Click 'Reiniciar' to restart.".to_string(),
                                     std::time::Instant::now(),
-                                    2000,
+                                    3000,
                                 ));
-                                *update_available.lock() = None; // Hide button
-                                has_shown_update_toast = true; // Prevent re-showing update toast
                                 app_dirty = true;
                             }
 
@@ -533,6 +531,7 @@ fn main() -> anyhow::Result<()> {
                             let mut r = renderer.lock();
                             r.update_available = is_available;
                             r.update_in_progress = is_in_progress;
+                            r.update_completed = completed;
                             r.hover_update = hover_update;
                             r.set_dirty(true);
                             r.render(
@@ -3154,10 +3153,53 @@ fn get_system_fonts() -> Vec<String> {
 fn trigger_update(
     _update_available: &Arc<parking_lot::Mutex<Option<String>>>,
     update_in_progress: &Arc<parking_lot::Mutex<bool>>,
-    _update_completed: &Arc<parking_lot::Mutex<bool>>,
+    update_completed: &Arc<parking_lot::Mutex<bool>>,
     window: &Arc<winit::window::Window>,
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
 ) {
+    let completed = *update_completed.lock();
+    if completed {
+        // Spawn the newly updated fasty binary in the background!
+        #[cfg(target_os = "windows")]
+        {
+            let home = std::env::var("USERPROFILE").unwrap_or_default();
+            let fasty_path = std::path::Path::new(&home)
+                .join(".local")
+                .join("bin")
+                .join("fasty.exe");
+            let _ = std::process::Command::new(fasty_path).spawn();
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open")
+                .arg("-a")
+                .arg("Fasty")
+                .spawn();
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            // Linux
+            let binary_path = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin/fasty"));
+            let home = std::env::var("HOME").unwrap_or_default();
+            let local_path = std::path::Path::new(&home)
+                .join(".local")
+                .join("bin")
+                .join("fasty");
+            let spawn_path = if local_path.exists() {
+                local_path
+            } else {
+                binary_path
+            };
+            let _ = std::process::Command::new(spawn_path).spawn();
+        }
+
+        // Close the current window/application
+        let _ = proxy.send_event(AppEvent::ForceExit);
+        return;
+    }
+
     let mut in_progress = update_in_progress.lock();
     if *in_progress {
         return;
@@ -3168,6 +3210,7 @@ fn trigger_update(
     window.request_redraw();
 
     let update_in_progress_clone = Arc::clone(update_in_progress);
+    let update_completed_clone = Arc::clone(update_completed);
     let window_clone = Arc::clone(window);
 
     std::thread::spawn(move || {
@@ -3190,6 +3233,7 @@ fn trigger_update(
             if let Ok(mut child) = std::process::Command::new("sh")
                 .arg("-c")
                 .arg("curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash")
+                .env("FASTY_USER_INSTALL", "1")
                 .spawn() {
                 if let Ok(status) = child.wait() {
                     success = status.success();
@@ -3203,6 +3247,7 @@ fn trigger_update(
             if let Ok(mut child) = std::process::Command::new("sh")
                 .arg("-c")
                 .arg("curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash")
+                .env("FASTY_USER_INSTALL", "1")
                 .spawn() {
                 if let Ok(status) = child.wait() {
                     success = status.success();
@@ -3210,40 +3255,15 @@ fn trigger_update(
             }
         }
 
+        let mut in_progress = update_in_progress_clone.lock();
+        *in_progress = false;
+
         if success {
-            // Spawn the newly updated fasty binary in the background!
-            #[cfg(target_os = "windows")]
-            {
-                let home = std::env::var("USERPROFILE").unwrap_or_default();
-                let fasty_path = std::path::Path::new(&home)
-                    .join(".local")
-                    .join("bin")
-                    .join("fasty.exe");
-                let _ = std::process::Command::new(fasty_path).spawn();
-            }
-
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::process::Command::new("open")
-                    .arg("-a")
-                    .arg("Fasty")
-                    .spawn();
-            }
-
-            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            {
-                // Linux
-                let _ = std::process::Command::new("/usr/local/bin/fasty").spawn();
-            }
-
-            // Close the current window/application
-            let _ = proxy.send_event(AppEvent::ForceExit);
-        } else {
-            // Re-enable the update button on failure
-            let mut in_progress = update_in_progress_clone.lock();
-            *in_progress = false;
-            window_clone.request_redraw();
+            let mut completed = update_completed_clone.lock();
+            *completed = true;
         }
+
+        window_clone.request_redraw();
     });
 }
 

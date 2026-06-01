@@ -607,6 +607,7 @@ impl Pipeline {
         hover_new_tab: bool,
         update_available: bool,
         update_in_progress: bool,
+        update_completed: bool,
         hover_update: bool,
         cached_grid_instances: &mut Vec<CellInstance>,
         grid_dirty: &mut bool,
@@ -1395,7 +1396,7 @@ impl Pipeline {
             ));
 
             // Draw button text
-            let text = if update_in_progress { "Updating..." } else { "Update" };
+            let text = if update_completed { "Reiniciar" } else if update_in_progress { "Updating..." } else { "Update" };
             let text_scale = 11.0f32 / atlas.font_size();
 
             // Measure text to center it inside the button
