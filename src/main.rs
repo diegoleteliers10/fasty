@@ -18,21 +18,28 @@ use winit::{
 };
 
 fn get_login_shell() -> String {
-    if let Ok(content) = std::fs::read_to_string("/etc/passwd") {
-        let current_user = std::env::var("USER").unwrap_or_else(|_| "diegoleteliers".to_string());
-        for line in content.lines() {
-            if let Some(username) = line.split(':').next() {
-                if username == current_user {
-                    if let Some(shell) = line.split(':').last() {
-                        if !shell.is_empty() {
-                            return shell.trim().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(content) = std::fs::read_to_string("/etc/passwd") {
+            let current_user = std::env::var("USER").unwrap_or_else(|_| "diegoleteliers".to_string());
+            for line in content.lines() {
+                if let Some(username) = line.split(':').next() {
+                    if username == current_user {
+                        if let Some(shell) = line.split(':').last() {
+                            if !shell.is_empty() {
+                                return shell.trim().to_string();
+                            }
                         }
                     }
                 }
             }
         }
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
     }
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
 }
 
 struct Tab {
@@ -276,6 +283,8 @@ fn main() -> anyhow::Result<()> {
     let renderer = pollster::block_on(Renderer::new(window_for_renderer, &config.font.family, config.font.size))?;
     let mut cell_width = renderer.cell_width();
     let mut cell_height = renderer.cell_height();
+
+
 
 
     let viewport_width = renderer.config.width as f32;
@@ -951,31 +960,49 @@ fn main() -> anyhow::Result<()> {
                                                 let item = menu_items[hovered_idx];
                                                 match item {
                                                     crate::renderer::ContextMenuItem::About => {
-                                                        if about_window.is_none() {
-                                                            if let Ok(aw) = target.create_window(winit::window::WindowAttributes::default()
-                                                                .with_title("About Fasty")
-                                                                .with_decorations(false)
-                                                                .with_transparent(true)
-                                                                .with_inner_size(winit::dpi::LogicalSize::new(300.0, 200.0))) {
-                                                                let aw_arc = Arc::new(aw);
-                                                                let aw_ref: &winit::window::Window = &*aw_arc;
-                                                                let aw_static: &'static winit::window::Window = unsafe { std::mem::transmute(aw_ref) };
-                                                                if let Ok(ar) = pollster::block_on(Renderer::new(aw_static, "Inter", 13.0)) {
-                                                                    about_renderer = Some(ar);
-                                                                }
-                                                                about_window = Some(aw_arc);
-                                                                about_hover_close = false;
-                                                            }
-                                                        }
-                                                        context_menu_visible = false;
-                                                        context_menu_open_time = None;
-                                                        context_menu_open_time_secs = None;
-                                                        context_menu_hovered_idx = None;
-                                                        let mut r = renderer.lock();
-                                                        r.set_dirty(true);
-                                                        r.grid_dirty = true;
-                                                        app_dirty = true;
-                                                    }
+                                                          if about_window.is_none() {
+                                                              match target.create_window(winit::window::WindowAttributes::default()
+                                                                  .with_title("About Fasty")
+                                                                  .with_decorations(false)
+                                                                  .with_transparent(true)
+                                                                  .with_visible(true)
+                                                                  .with_inner_size(winit::dpi::LogicalSize::new(300.0, 200.0)))
+                                                              {
+                                                                  Ok(window) => {
+                                                                      let about_window_arc = Arc::new(window);
+                                                                      let aw_ref: &winit::window::Window = &*about_window_arc;
+                                                                      let aw_static: &'static winit::window::Window = unsafe { std::mem::transmute(aw_ref) };
+                                                                      let (shared_instance, shared_device, shared_queue, format, alpha_mode) = {
+                                                                          let r = renderer.lock();
+                                                                          (r.instance.clone(), r.device.clone(), r.queue.clone(), r.config.format, r.config.alpha_mode)
+                                                                      };
+                                                                      match Renderer::new_shared(aw_static, "Inter", 13.0, shared_instance, shared_device, shared_queue, format, alpha_mode) {
+                                                                          Ok(renderer_obj) => {
+                                                                              about_window = Some(about_window_arc);
+                                                                              about_renderer = Some(renderer_obj);
+                                                                          }
+                                                                          Err(e) => {
+                                                                              tracing::error!("Failed to create about renderer: {:?}", e);
+                                                                          }
+                                                                      }
+                                                                  }
+                                                                  Err(e) => {
+                                                                      tracing::error!("Failed to create about window: {:?}", e);
+                                                                  }
+                                                              }
+                                                          } else {
+                                                              about_window = None;
+                                                              about_renderer = None;
+                                                          }
+                                                         context_menu_visible = false;
+                                                         context_menu_open_time = None;
+                                                         context_menu_open_time_secs = None;
+                                                         context_menu_hovered_idx = None;
+                                                         let mut r = renderer.lock();
+                                                         r.set_dirty(true);
+                                                         r.grid_dirty = true;
+                                                         app_dirty = true;
+                                                     }
                                                     crate::renderer::ContextMenuItem::Copy => {
                                                         if let Some(sel) = tabs[active_tab_index].selection {
                                                             copy_selection_to_clipboard(&tabs[active_tab_index].terminal_state, sel, shell_cols, shell_rows, &mut clipboard);
@@ -1213,31 +1240,47 @@ fn main() -> anyhow::Result<()> {
                                              window_for_redraw.set_minimized(true);
                                              return;
                                          } else if is_hovering_settings {
-                                             if settings_window.is_none() {
+                                              if settings_window.is_none() {
                                                   settings_family = config.font.family.clone();
                                                   settings_size = config.font.size;
-                                                   settings_scrollback = config.scrollback.min(3000);
+                                                  settings_scrollback = config.scrollback.min(3000);
                                                   settings_active_field = 0;
-                                                 if let Ok(sw) = target.create_window(winit::window::WindowAttributes::default()
-                                                     .with_title("fasty Settings")
-                                                     .with_decorations(false)
-                                                     .with_transparent(true)
-                                                     .with_inner_size(winit::dpi::LogicalSize::new(400.0, 300.0))) {
-                                                     let sw_arc = Arc::new(sw);
-                                                     let sw_ref: &winit::window::Window = &*sw_arc;
-                                                     let sw_static: &'static winit::window::Window = unsafe { std::mem::transmute(sw_ref) };
-                                                     if let Ok(sr) = pollster::block_on(Renderer::new(sw_static, &settings_family, 13.0)) {
-                                                         settings_renderer = Some(sr);
-                                                     }
-                                                     settings_window = Some(sw_arc);
-                                                 }
-                                             } else {
-                                                 settings_window = None;
-                                                 settings_renderer = None;
-                                             }
-                                             app_dirty = true;
-                                             return;
-                                         }
+                                                  match target.create_window(winit::window::WindowAttributes::default()
+                                                      .with_title("fasty Settings")
+                                                      .with_decorations(false)
+                                                      .with_transparent(true)
+                                                      .with_visible(true)
+                                                      .with_inner_size(winit::dpi::LogicalSize::new(400.0, 300.0)))
+                                                  {
+                                                      Ok(window) => {
+                                                          let settings_window_arc = Arc::new(window);
+                                                          let sw_ref: &winit::window::Window = &*settings_window_arc;
+                                                          let sw_static: &'static winit::window::Window = unsafe { std::mem::transmute(sw_ref) };
+                                                          let (shared_instance, shared_device, shared_queue, format, alpha_mode) = {
+                                                              let r = renderer.lock();
+                                                              (r.instance.clone(), r.device.clone(), r.queue.clone(), r.config.format, r.config.alpha_mode)
+                                                          };
+                                                          match Renderer::new_shared(sw_static, &config.font.family, 13.0, shared_instance, shared_device, shared_queue, format, alpha_mode) {
+                                                              Ok(renderer_obj) => {
+                                                                  settings_window = Some(settings_window_arc);
+                                                                  settings_renderer = Some(renderer_obj);
+                                                              }
+                                                              Err(e) => {
+                                                                  tracing::error!("Failed to create settings renderer: {:?}", e);
+                                                              }
+                                                          }
+                                                      }
+                                                      Err(e) => {
+                                                          tracing::error!("Failed to create settings window: {:?}", e);
+                                                      }
+                                                  }
+                                              } else {
+                                                  settings_window = None;
+                                                  settings_renderer = None;
+                                              }
+                                              app_dirty = true;
+                                              return;
+                                          }
 
                                          // 2. Check tab clicks & close tab clicks & new tab click
                                          let tab_start_x = 36.0;
@@ -1978,8 +2021,8 @@ fn main() -> anyhow::Result<()> {
                         }
                         _ => {}
                     }
-                } else if let Some(ref sw) = settings_window {
-                    if window_id == sw.id() {
+                } else if settings_window.as_ref().map_or(false, |sw| window_id == sw.id()) {
+                    if let Some(ref sw) = settings_window {
                         // --- Settings Window Event Handler ---
                         macro_rules! apply_settings {
                             () => {
@@ -2069,7 +2112,8 @@ fn main() -> anyhow::Result<()> {
                                 let old_hover_cancel = s_hover_cancel;
                                 let old_hovered_font_idx = settings_hovered_font_idx;
 
-                                s_hover_close = s_mouse_y >= 4.0 && s_mouse_y <= 32.0 && s_mouse_x >= (400.0 - 32.0) && s_mouse_x < (400.0 - 4.0);
+                                let sw_width = sw.inner_size().width as f64 / scale_factor;
+                                s_hover_close = s_mouse_y >= 4.0 && s_mouse_y <= 32.0 && s_mouse_x >= (sw_width - 32.0) && s_mouse_x < (sw_width - 4.0);
                                 s_hover_family = s_mouse_y >= 52.0 && s_mouse_y <= 78.0 && s_mouse_x >= 140.0 && s_mouse_x < 380.0;
 
                                 s_hover_size_minus = s_mouse_y >= 92.0 && s_mouse_y <= 118.0 && s_mouse_x >= 140.0 && s_mouse_x < 168.0;
@@ -2249,8 +2293,8 @@ fn main() -> anyhow::Result<()> {
                             _ => {}
                         }
                     }
-                } else if let Some(ref aw) = about_window {
-                    if window_id == aw.id() {
+                } else if about_window.as_ref().map_or(false, |aw| window_id == aw.id()) {
+                    if let Some(ref aw) = about_window {
                         // --- About Window Event Handler ---
                         match event {
                             WindowEvent::CloseRequested => {
@@ -2276,7 +2320,8 @@ fn main() -> anyhow::Result<()> {
                                 about_mouse_y = m_y;
 
                                 let old_hover_close = about_hover_close;
-                                about_hover_close = m_y >= 4.0 && m_y <= 32.0 && m_x >= (300.0 - 32.0) && m_x < (300.0 - 4.0);
+                                let aw_width = aw.inner_size().width as f64 / scale_factor;
+                                about_hover_close = m_y >= 4.0 && m_y <= 32.0 && m_x >= (aw_width - 32.0) && m_x < (aw_width - 4.0);
 
                                 if about_hover_close != old_hover_close {
                                     if let Some(ref mut r) = about_renderer {

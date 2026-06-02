@@ -78,7 +78,7 @@ impl TerminalState {
             cmd.env("PATH", path);
         }
 
-        let child = pair.slave.spawn_command(cmd).expect("Failed to spawn command");
+        let child = pair.slave.spawn_command(cmd)?;
         let shell_pid = child.process_id();
 
         drop(pair.slave);

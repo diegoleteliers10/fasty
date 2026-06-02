@@ -29,8 +29,9 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
 
 pub struct Renderer<'a> {
     surface: Surface<'a>,
-    device: Device,
-    queue: Queue,
+    pub instance: std::sync::Arc<Instance>,
+    pub device: std::sync::Arc<Device>,
+    pub queue: std::sync::Arc<Queue>,
     pub config: SurfaceConfiguration,
     pipeline: Pipeline,
     atlas: Atlas,
@@ -57,6 +58,7 @@ impl<'a> Renderer<'a> {
             flags: wgpu::InstanceFlags::VALIDATION,
             ..Default::default()
         });
+        let instance = std::sync::Arc::new(instance);
 
         let surface = instance.create_surface(window)?;
 
@@ -80,6 +82,8 @@ impl<'a> Renderer<'a> {
                 None,
             )
             .await?;
+        let device = std::sync::Arc::new(device);
+        let queue = std::sync::Arc::new(queue);
 
         let format = surface
             .get_capabilities(&adapter)
@@ -121,6 +125,60 @@ impl<'a> Renderer<'a> {
 
         Ok(Self {
             surface,
+            instance,
+            device,
+            queue,
+            config,
+            pipeline,
+            atlas,
+            ui_atlas,
+            cell_width,
+            cell_height,
+            dirty: true,
+            grid_dirty: true,
+            cached_grid_instances: Vec::new(),
+            update_available: false,
+            update_in_progress: false,
+            update_completed: false,
+            hover_update: false,
+        })
+    }
+
+    pub fn new_shared(
+        window: &'a Window,
+        font_family: &str,
+        font_size: f32,
+        instance: std::sync::Arc<Instance>,
+        device: std::sync::Arc<Device>,
+        queue: std::sync::Arc<Queue>,
+        format: wgpu::TextureFormat,
+        alpha_mode: wgpu::CompositeAlphaMode,
+    ) -> anyhow::Result<Self> {
+        let surface = instance.create_surface(window)?;
+
+        let size = window.inner_size();
+        let config = SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width,
+            height: size.height,
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 1,
+            alpha_mode,
+            view_formats: vec![],
+        };
+        surface.configure(&device, &config);
+
+        let scale_factor = window.scale_factor() as f32;
+        let atlas = Atlas::new(&device, &queue, 1536, 1536, font_family, font_size, scale_factor)?;
+        let ui_atlas = Atlas::new(&device, &queue, 1536, 1536, font_family, 13.0, scale_factor)?;
+        let (cell_width, cell_height) = atlas.cell_size();
+        tracing::info!("Atlas created with {} entries, cell_size: {}x{}", atlas.entries_len(), cell_width, cell_height);
+        let pipeline = Pipeline::new(&device, &atlas, &ui_atlas, format);
+
+        Ok(Self {
+            surface,
+            instance,
             device,
             queue,
             config,
@@ -152,6 +210,15 @@ impl<'a> Renderer<'a> {
 
     pub fn update_font(&mut self, font_family: &str, font_size: f32) -> anyhow::Result<()> {
         let scale_factor = self.atlas.scale_factor();
+        let new_primary_path = Atlas::load_font_path(font_family).unwrap_or_else(|_| "monospace".to_string());
+        
+        let font_family_changed = new_primary_path != self.atlas.primary_path();
+        let font_size_changed = font_size != self.atlas.font_size();
+        
+        if !font_family_changed && !font_size_changed {
+            return Ok(());
+        }
+
         let new_atlas = Atlas::new(
             &self.device,
             &self.queue,
@@ -161,19 +228,28 @@ impl<'a> Renderer<'a> {
             font_size,
             scale_factor,
         )?;
-        let new_ui_atlas = Atlas::new(
-            &self.device,
-            &self.queue,
-            1536,
-            1536,
-            font_family,
-            13.0,
-            scale_factor,
-        )?;
-        let pipeline = Pipeline::new(&self.device, &new_atlas, &new_ui_atlas, self.config.format);
-        self.atlas = new_atlas;
-        self.ui_atlas = new_ui_atlas;
-        self.pipeline = pipeline;
+
+        if font_family_changed {
+            let new_ui_atlas = Atlas::new(
+                &self.device,
+                &self.queue,
+                1536,
+                1536,
+                font_family,
+                13.0,
+                scale_factor,
+            )?;
+            let pipeline = Pipeline::new(&self.device, &new_atlas, &new_ui_atlas, self.config.format);
+            self.atlas = new_atlas;
+            self.ui_atlas = new_ui_atlas;
+            self.pipeline = pipeline;
+        } else {
+            // Re-use the existing ui_atlas
+            let pipeline = Pipeline::new(&self.device, &new_atlas, &self.ui_atlas, self.config.format);
+            self.atlas = new_atlas;
+            self.pipeline = pipeline;
+        }
+
         let (cell_width, cell_height) = self.atlas.cell_size();
         self.cell_width = cell_width;
         self.cell_height = cell_height;

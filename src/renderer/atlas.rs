@@ -131,6 +131,72 @@ pub struct Atlas {
     pub icon_maximize: Option<AtlasEntry>,
 }
 
+struct CachedIcon {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+struct CachedIcons {
+    app_icon: CachedIcon,
+    icon_add: CachedIcon,
+    icon_close: CachedIcon,
+    icon_copy: CachedIcon,
+    icon_paste: CachedIcon,
+    icon_settings: CachedIcon,
+    icon_text_font: CachedIcon,
+    icon_less: CachedIcon,
+    icon_maximize: CachedIcon,
+}
+
+fn get_cached_icons() -> &'static CachedIcons {
+    static CACHE: std::sync::OnceLock<CachedIcons> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let app_icon = {
+            let img = image::load_from_memory(include_bytes!("../../assets/fastySmallIcon.png")).unwrap();
+            let scaled = img.resize(24, 24, image::imageops::FilterType::Lanczos3);
+            let rgba = scaled.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            CachedIcon {
+                rgba: rgba.into_raw(),
+                width: w,
+                height: h,
+            }
+        };
+        
+        let render_svg = |svg_data: &str, target_size: u32| -> CachedIcon {
+            let svg_data = svg_data.replace("currentColor", "white");
+            let opt = usvg::Options::default();
+            let tree = Tree::from_str(&svg_data, &opt).unwrap();
+            let mut pixmap = tiny_skia::Pixmap::new(target_size, target_size).unwrap();
+            pixmap.fill(tiny_skia::Color::TRANSPARENT);
+            let size = tree.size();
+            let scale_x = target_size as f32 / size.width();
+            let scale_y = target_size as f32 / size.height();
+            let scale = scale_x.min(scale_y);
+            let transform = tiny_skia::Transform::from_scale(scale, scale);
+            resvg::render(&tree, transform, &mut pixmap.as_mut());
+            CachedIcon {
+                rgba: pixmap.data().to_vec(),
+                width: target_size,
+                height: target_size,
+            }
+        };
+
+        CachedIcons {
+            app_icon,
+            icon_add: render_svg(include_str!("../../assets/icons/add.svg"), 64),
+            icon_close: render_svg(include_str!("../../assets/icons/close.svg"), 64),
+            icon_copy: render_svg(include_str!("../../assets/icons/copy.svg"), 64),
+            icon_paste: render_svg(include_str!("../../assets/icons/paste.svg"), 64),
+            icon_settings: render_svg(include_str!("../../assets/icons/settings.svg"), 64),
+            icon_text_font: render_svg(include_str!("../../assets/icons/text-font.svg"), 64),
+            icon_less: render_svg(include_str!("../../assets/icons/less.svg"), 64),
+            icon_maximize: render_svg(include_str!("../../assets/icons/maximize.svg"), 64),
+        }
+    })
+}
+
 impl Atlas {
     pub fn new(
         device: &Device,
@@ -279,34 +345,33 @@ impl Atlas {
             atlas.fallback_glyph = Some(*space);
         }
 
-        // Try to load the app icon
-        if let Ok(entry) = atlas.load_custom_image_from_memory(include_bytes!("../../assets/fastySmallIcon.png"), 24, queue) {
+        // Try to load the app icon and custom SVG icons using the pre-rasterized cache
+        let cached = get_cached_icons();
+        if let Ok(entry) = atlas.load_raw_rgba_image(&cached.app_icon.rgba, cached.app_icon.width, cached.app_icon.height, true, queue) {
             atlas.app_icon = Some(entry);
         }
-
-        // Try to load custom SVG icons
-        if let Ok(entry) = atlas.load_svg_icon_from_memory(include_str!("../../assets/icons/add.svg"), 64, queue) {
+        if let Ok(entry) = atlas.load_raw_rgba_image(&cached.icon_add.rgba, cached.icon_add.width, cached.icon_add.height, false, queue) {
             atlas.icon_add = Some(entry);
         }
-        if let Ok(entry) = atlas.load_svg_icon_from_memory(include_str!("../../assets/icons/close.svg"), 64, queue) {
+        if let Ok(entry) = atlas.load_raw_rgba_image(&cached.icon_close.rgba, cached.icon_close.width, cached.icon_close.height, false, queue) {
             atlas.icon_close = Some(entry);
         }
-        if let Ok(entry) = atlas.load_svg_icon_from_memory(include_str!("../../assets/icons/copy.svg"), 64, queue) {
+        if let Ok(entry) = atlas.load_raw_rgba_image(&cached.icon_copy.rgba, cached.icon_copy.width, cached.icon_copy.height, false, queue) {
             atlas.icon_copy = Some(entry);
         }
-        if let Ok(entry) = atlas.load_svg_icon_from_memory(include_str!("../../assets/icons/paste.svg"), 64, queue) {
+        if let Ok(entry) = atlas.load_raw_rgba_image(&cached.icon_paste.rgba, cached.icon_paste.width, cached.icon_paste.height, false, queue) {
             atlas.icon_paste = Some(entry);
         }
-        if let Ok(entry) = atlas.load_svg_icon_from_memory(include_str!("../../assets/icons/settings.svg"), 64, queue) {
+        if let Ok(entry) = atlas.load_raw_rgba_image(&cached.icon_settings.rgba, cached.icon_settings.width, cached.icon_settings.height, false, queue) {
             atlas.icon_settings = Some(entry);
         }
-        if let Ok(entry) = atlas.load_svg_icon_from_memory(include_str!("../../assets/icons/text-font.svg"), 64, queue) {
+        if let Ok(entry) = atlas.load_raw_rgba_image(&cached.icon_text_font.rgba, cached.icon_text_font.width, cached.icon_text_font.height, false, queue) {
             atlas.icon_text_font = Some(entry);
         }
-        if let Ok(entry) = atlas.load_svg_icon_from_memory(include_str!("../../assets/icons/less.svg"), 64, queue) {
+        if let Ok(entry) = atlas.load_raw_rgba_image(&cached.icon_less.rgba, cached.icon_less.width, cached.icon_less.height, false, queue) {
             atlas.icon_less = Some(entry);
         }
-        if let Ok(entry) = atlas.load_svg_icon_from_memory(include_str!("../../assets/icons/maximize.svg"), 64, queue) {
+        if let Ok(entry) = atlas.load_raw_rgba_image(&cached.icon_maximize.rgba, cached.icon_maximize.width, cached.icon_maximize.height, false, queue) {
             atlas.icon_maximize = Some(entry);
         }
 
@@ -322,7 +387,7 @@ impl Atlas {
         Ok(atlas)
     }
 
-    fn load_font_path(family: &str) -> anyhow::Result<String> {
+    pub fn load_font_path(family: &str) -> anyhow::Result<String> {
         let output = std::process::Command::new("fc-match")
             .arg("-f")
             .arg("%{file}")
@@ -344,66 +409,74 @@ impl Atlas {
     }
 
     fn load_fallback_paths(primary_path: &str) -> Vec<String> {
-        let mut names: Vec<String> = vec![
-            "Symbols Nerd Font".to_string(),
-            "DejaVu Sans".to_string(),
-            "Noto Sans Symbols".to_string(),
-            "Noto Color Emoji".to_string(),
-            "FreeMono".to_string(),
-        ];
+        static FALLBACK_PATHS_CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        let paths = FALLBACK_PATHS_CACHE.get_or_init(|| {
+            let mut names: Vec<String> = vec![
+                "Symbols Nerd Font".to_string(),
+                "DejaVu Sans".to_string(),
+                "Noto Sans Symbols".to_string(),
+                "Noto Color Emoji".to_string(),
+                "FreeMono".to_string(),
+            ];
 
-        // Try to find installed Nerd Fonts dynamically from fontconfig
-        if let Ok(output) = std::process::Command::new("fc-list")
-            .arg(":")
-            .arg("family")
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let mut nerd_families = std::collections::HashSet::new();
-                for line in stdout.lines() {
-                    for family in line.split(',') {
-                        let family = family.trim();
-                        if family.to_lowercase().contains("nerd font") {
-                            if !family.contains("Mono") && !family.contains("Propo") {
-                                nerd_families.insert(family.to_string());
-                            } else if nerd_families.is_empty() {
-                                nerd_families.insert(family.to_string());
-                            }
-                        }
-                    }
-                    if nerd_families.len() >= 5 {
-                        break;
-                    }
-                }
-                for fam in nerd_families {
-                    names.insert(0, fam);
-                }
-            }
-        }
-
-        let mut fallback_paths = Vec::new();
-        use std::collections::HashSet;
-        let mut loaded_paths = HashSet::new();
-        loaded_paths.insert(primary_path.to_string());
-
-        for name in names {
-            if let Ok(output) = std::process::Command::new("fc-match")
-                .arg("-f")
-                .arg("%{file}")
-                .arg(&name)
+            // Try to find installed Nerd Fonts dynamically from fontconfig
+            if let Ok(output) = std::process::Command::new("fc-list")
+                .arg(":")
+                .arg("family")
                 .output()
             {
                 if output.status.success() {
-                    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if !path.is_empty() && !loaded_paths.contains(&path) {
-                        loaded_paths.insert(path.clone());
-                        fallback_paths.push(path);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let mut nerd_families = std::collections::HashSet::new();
+                    for line in stdout.lines() {
+                        for family in line.split(',') {
+                            let family = family.trim();
+                            if family.to_lowercase().contains("nerd font") {
+                                if !family.contains("Mono") && !family.contains("Propo") {
+                                    nerd_families.insert(family.to_string());
+                                } else if nerd_families.is_empty() {
+                                    nerd_families.insert(family.to_string());
+                                }
+                            }
+                        }
+                        if nerd_families.len() >= 5 {
+                            break;
+                        }
+                    }
+                    for fam in nerd_families {
+                        names.insert(0, fam);
                     }
                 }
             }
-        }
-        fallback_paths
+
+            let mut fallback_paths = Vec::new();
+            use std::collections::HashSet;
+            let mut loaded_paths = HashSet::new();
+
+            for name in names {
+                if let Ok(output) = std::process::Command::new("fc-match")
+                    .arg("-f")
+                    .arg("%{file}")
+                    .arg(&name)
+                    .output()
+                {
+                    if output.status.success() {
+                        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if !path.is_empty() && !loaded_paths.contains(&path) {
+                            loaded_paths.insert(path.clone());
+                            fallback_paths.push(path);
+                        }
+                    }
+                }
+            }
+            fallback_paths
+        });
+
+        // Filter out primary_path dynamically
+        paths.iter()
+            .filter(|p| *p != primary_path)
+            .cloned()
+            .collect()
     }
 
     fn rasterize_basic_glyphs(&mut self, device: &Device, queue: &Queue) -> anyhow::Result<()> {
@@ -949,6 +1022,59 @@ impl Atlas {
                     aspect: wgpu::TextureAspect::All,
                 },
                 &rgba,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            Ok(entry)
+        } else {
+            anyhow::bail!("Failed to allocate space in atlas for custom image")
+        }
+    }
+
+    pub fn load_raw_rgba_image(
+        &mut self,
+        rgba: &[u8],
+        w: u32,
+        h: u32,
+        is_color: bool,
+        queue: &Queue,
+    ) -> anyhow::Result<AtlasEntry> {
+        let padding = 1;
+        let alloc_w = w + padding * 2;
+        let alloc_h = h + padding * 2;
+        
+        if let Some(pos) = self.packer.alloc(alloc_w, alloc_h) {
+            let entry = AtlasEntry {
+                x: (pos.0 + padding) as f32,
+                y: (pos.1 + padding) as f32,
+                width: w as f32,
+                height: h as f32,
+                left: 0.0,
+                top: 0.0,
+                is_color,
+                is_block: false,
+            };
+            
+            queue.write_texture(
+                wgpu::ImageCopyTextureBase {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: pos.0 + padding,
+                        y: pos.1 + padding,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                rgba,
                 wgpu::ImageDataLayout {
                     offset: 0,
                     bytes_per_row: Some(w * 4),

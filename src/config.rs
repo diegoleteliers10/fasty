@@ -47,10 +47,11 @@ impl Default for FontConfig {
 
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
+        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
         let config_paths: Vec<std::path::PathBuf> = vec![
             std::path::PathBuf::from("config.json"),
             std::path::PathBuf::from("/etc/fasty/config.json"),
-            std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+            std::path::Path::new(&home)
                 .join(".config/fasty/config.json"),
         ];
 
@@ -77,15 +78,17 @@ impl Config {
     }
 
     pub fn config_path() -> std::path::PathBuf {
-        std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
+        std::path::Path::new(&home)
             .join(".config/fasty/config.json")
     }
 
     pub fn get_active_config_path() -> std::path::PathBuf {
+        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
         let config_paths: Vec<std::path::PathBuf> = vec![
             std::path::PathBuf::from("config.json"),
             std::path::PathBuf::from("/etc/fasty/config.json"),
-            std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+            std::path::Path::new(&home)
                 .join(".config/fasty/config.json"),
         ];
 
