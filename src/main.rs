@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 mod config;
 mod event_listener;
 mod pty;
@@ -262,6 +267,15 @@ fn main() -> anyhow::Result<()> {
     };
 
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
+    #[cfg(target_os = "windows")]
+    let window = event_loop.create_window(winit::window::WindowAttributes::default()
+        .with_title(&window_title)
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_visible(false)
+        .with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0)))?;
+
+    #[cfg(not(target_os = "windows"))]
     let window = event_loop.create_window(winit::window::WindowAttributes::default()
         .with_title(&window_title)
         .with_decorations(false)
@@ -467,6 +481,8 @@ fn main() -> anyhow::Result<()> {
                             app_dirty = true;
                         }
                         WindowEvent::RedrawRequested => {
+                            #[cfg(target_os = "windows")]
+                            let was_rendered = first_frame_rendered;
                             first_frame_rendered = true;
 
                             let mut tab_titles = Vec::new();
@@ -575,6 +591,13 @@ fn main() -> anyhow::Result<()> {
                                 hover_new_tab,
                             );
                             drop(r);
+
+                            #[cfg(target_os = "windows")]
+                            {
+                                if !was_rendered {
+                                    window_for_redraw.set_visible(true);
+                                }
+                            }
 
                             last_render_time = std::time::Instant::now();
                         }
@@ -2434,6 +2457,10 @@ fn main() -> anyhow::Result<()> {
                         hover_new_tab,
                     );
                     drop(r);
+                    #[cfg(target_os = "windows")]
+                    {
+                        window_for_redraw.set_visible(true);
+                    }
                     last_render_time = now;
                     app_dirty = false;
                 }

@@ -1,6 +1,6 @@
 [package]
 name = "fasty"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 
 [lib]
@@ -11,6 +11,9 @@ path = "src/lib.rs"
 name = "fasty"
 path = "src/main.rs"
 required-features = []
+
+[package.metadata.winres]
+# Use the windows subsystem to hide console window
 
 [dependencies]
 winit = "0.30"
@@ -49,6 +52,9 @@ freetype-rs = { version = "0.37" }
 
 [target.'cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))'.dependencies]
 freetype-rs = { version = "0.37", features = ["bundled"] }
+
+[target.'cfg(windows)'.dependencies]
+winres = "0.1"
 
 [profile.release]
 opt-level = 3

@@ -2127,6 +2127,12 @@ impl Pipeline {
         device: &Device,
         queue: &wgpu::Queue,
     ) {
+        let scale = if cfg!(target_os = "windows") {
+            viewport_width / 400.0
+        } else {
+            1.0
+        };
+
         let mut bg_instances = Vec::new();
         let mut fg_instances = Vec::new();
 
@@ -2137,29 +2143,29 @@ impl Pipeline {
             [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0], // Settings bg (#0c0c0c)
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
-            8.0,
+            8.0 * scale,
         ));
 
         // 1. Draw topbar background (#0a0a0a)
         bg_instances.push(CellInstance::new(
             0.0, 0.0,
-            viewport_width, 36.0,
+            viewport_width, 36.0 * scale,
             [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0],
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
-            8.0,
+            8.0 * scale,
         ));
         bg_instances.push(CellInstance::new(
-            0.0, 28.0,
-            viewport_width, 8.0,
+            0.0, 28.0 * scale,
+            viewport_width, 8.0 * scale,
             [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0],
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 0.0, 0.0,
             0.0,
         ));
         bg_instances.push(CellInstance::new(
-            0.0, 36.0,
-            viewport_width, 1.0,
+            0.0, 36.0 * scale,
+            viewport_width, 1.0 * scale,
             [1.0, 1.0, 1.0, 0.06], // Consistent with main topbar border
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 0.0, 0.0,
@@ -2168,12 +2174,12 @@ impl Pipeline {
 
         // Helper to draw text helper
         let draw_text = |atlas: &mut crate::renderer::Atlas, text: &str, start_x: f32, start_y: f32, color: [f32; 4], fg_list: &mut Vec<CellInstance>| {
-            let mut x = start_x;
+            let mut x = start_x * scale;
             for c in text.chars() {
                 if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                     if entry.width > 0.0 {
                         let glyph_x = (x + entry.left).round();
-                        let glyph_y = (start_y + atlas.ascent() + entry.top).round();
+                        let glyph_y = (start_y * scale + atlas.ascent() + entry.top).round();
                         let (aw, ah) = atlas.atlas_size();
                         let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                         fg_list.push(CellInstance::new(
@@ -2184,9 +2190,9 @@ impl Pipeline {
                             uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
                             0.0,
                         ));
-                        x += entry.width + 2.0;
+                        x += entry.width + 2.0 * scale;
                     } else if c == ' ' {
-                        x += 8.0;
+                        x += 8.0 * scale;
                     }
                 }
             }
@@ -2196,21 +2202,23 @@ impl Pipeline {
         draw_text(atlas, "Settings", 12.0, 6.0, [0.85, 0.85, 0.90, 1.0], &mut fg_instances);
 
         // Draw topbar close button
+        let close_x = viewport_width - 32.0 * scale;
+        let close_y = 4.0 * scale;
         if hover_close {
             bg_instances.push(CellInstance::new(
-                viewport_width - 32.0, 4.0,
-                28.0, 28.0,
+                close_x, close_y,
+                28.0 * scale, 28.0 * scale,
                 [0.85, 0.25, 0.25, 0.9],
                 [0.0, 0.0, 0.0, 0.0],
                 0.0, 0.0, 1.0, 1.0,
-                6.0, // Rounded rectangle
+                6.0 * scale, // Rounded rectangle
             ));
         }
         if let Some(entry) = &atlas.icon_close {
-            let entry_w = 14.0f32;
-            let entry_h = 14.0f32;
-            let glyph_x = (viewport_width - 32.0) + (28.0 - entry_w) / 2.0;
-            let glyph_y = 4.0 + (28.0 - entry_h) / 2.0;
+            let entry_w = 14.0f32 * scale;
+            let entry_h = 14.0f32 * scale;
+            let glyph_x = close_x + (28.0f32 * scale - entry_w) / 2.0;
+            let glyph_y = close_y + (28.0f32 * scale - entry_h) / 2.0;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
@@ -2238,20 +2246,20 @@ impl Pipeline {
             [16.0 / 255.0, 16.0 / 255.0, 20.0 / 255.0, 1.0]
         };
         bg_instances.push(CellInstance::new(
-            140.0, 52.0,
-            240.0, 26.0,
+            140.0 * scale, 52.0 * scale,
+            240.0 * scale, 26.0 * scale,
             family_bg,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
-            6.0,
+            6.0 * scale,
         ));
 
         // Draw text-font SVG icon
         if let Some(entry) = &atlas.icon_text_font {
-            let entry_w = 14.0f32;
-            let entry_h = 14.0f32;
-            let glyph_x = 148.0f32;
-            let glyph_y = 52.0f32 + (26.0f32 - entry_h) / 2.0f32;
+            let entry_w = 14.0f32 * scale;
+            let entry_h = 14.0f32 * scale;
+            let glyph_x = 148.0f32 * scale;
+            let glyph_y = 52.0f32 * scale + (26.0f32 * scale - entry_h) / 2.0f32;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
@@ -2272,18 +2280,18 @@ impl Pipeline {
         // 2. Font Size controls
         let size_minus_bg = if hover_size_minus { [1.0, 1.0, 1.0, 0.15] } else { [1.0, 1.0, 1.0, 0.05] };
         bg_instances.push(CellInstance::new(
-            140.0, 92.0,
-            28.0, 26.0,
+            140.0 * scale, 92.0 * scale,
+            28.0 * scale, 26.0 * scale,
             size_minus_bg,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
-            6.0,
+            6.0 * scale,
         ));
         if let Some(entry) = &atlas.icon_less {
-            let entry_w = 14.0f32;
-            let entry_h = 14.0f32;
-            let glyph_x = 140.0f32 + (28.0f32 - entry_w) / 2.0f32;
-            let glyph_y = 92.0f32 + (26.0f32 - entry_h) / 2.0f32;
+            let entry_w = 14.0f32 * scale;
+            let entry_h = 14.0f32 * scale;
+            let glyph_x = 140.0f32 * scale + (28.0f32 * scale - entry_w) / 2.0f32;
+            let glyph_y = 92.0f32 * scale + (26.0f32 * scale - entry_h) / 2.0f32;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
@@ -2300,18 +2308,18 @@ impl Pipeline {
 
         let size_plus_bg = if hover_size_plus { [1.0, 1.0, 1.0, 0.15] } else { [1.0, 1.0, 1.0, 0.05] };
         bg_instances.push(CellInstance::new(
-            220.0, 92.0,
-            28.0, 26.0,
+            220.0 * scale, 92.0 * scale,
+            28.0 * scale, 26.0 * scale,
             size_plus_bg,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
-            6.0,
+            6.0 * scale,
         ));
         if let Some(entry) = &atlas.icon_add {
-            let entry_w = 14.0f32;
-            let entry_h = 14.0f32;
-            let glyph_x = 220.0f32 + (28.0f32 - entry_w) / 2.0f32;
-            let glyph_y = 92.0f32 + (26.0f32 - entry_h) / 2.0f32;
+            let entry_w = 14.0f32 * scale;
+            let entry_h = 14.0f32 * scale;
+            let glyph_x = 220.0f32 * scale + (28.0f32 * scale - entry_w) / 2.0f32;
+            let glyph_y = 92.0f32 * scale + (26.0f32 * scale - entry_h) / 2.0f32;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
@@ -2327,18 +2335,18 @@ impl Pipeline {
         // 3. Scrollback controls
         let scroll_minus_bg = if hover_scroll_minus { [1.0, 1.0, 1.0, 0.15] } else { [1.0, 1.0, 1.0, 0.05] };
         bg_instances.push(CellInstance::new(
-            140.0, 132.0,
-            28.0, 26.0,
+            140.0 * scale, 132.0 * scale,
+            28.0 * scale, 26.0 * scale,
             scroll_minus_bg,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
-            6.0,
+            6.0 * scale,
         ));
         if let Some(entry) = &atlas.icon_less {
-            let entry_w = 14.0f32;
-            let entry_h = 14.0f32;
-            let glyph_x = 140.0f32 + (28.0f32 - entry_w) / 2.0f32;
-            let glyph_y = 132.0f32 + (26.0f32 - entry_h) / 2.0f32;
+            let entry_w = 14.0f32 * scale;
+            let entry_h = 14.0f32 * scale;
+            let glyph_x = 140.0f32 * scale + (28.0f32 * scale - entry_w) / 2.0f32;
+            let glyph_y = 132.0f32 * scale + (26.0f32 * scale - entry_h) / 2.0f32;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
@@ -2355,18 +2363,18 @@ impl Pipeline {
 
         let scroll_plus_bg = if hover_scroll_plus { [1.0, 1.0, 1.0, 0.15] } else { [1.0, 1.0, 1.0, 0.05] };
         bg_instances.push(CellInstance::new(
-            240.0, 132.0,
-            28.0, 26.0,
+            240.0 * scale, 132.0 * scale,
+            28.0 * scale, 26.0 * scale,
             scroll_plus_bg,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
-            6.0,
+            6.0 * scale,
         ));
         if let Some(entry) = &atlas.icon_add {
-            let entry_w = 14.0f32;
-            let entry_h = 14.0f32;
-            let glyph_x = 240.0f32 + (28.0f32 - entry_w) / 2.0f32;
-            let glyph_y = 132.0f32 + (26.0f32 - entry_h) / 2.0f32;
+            let entry_w = 14.0f32 * scale;
+            let entry_h = 14.0f32 * scale;
+            let glyph_x = 240.0f32 * scale + (28.0f32 * scale - entry_w) / 2.0f32;
+            let glyph_y = 132.0f32 * scale + (26.0f32 * scale - entry_h) / 2.0f32;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
@@ -2388,20 +2396,20 @@ impl Pipeline {
             [16.0 / 255.0, 16.0 / 255.0, 20.0 / 255.0, 1.0]
         };
         bg_instances.push(CellInstance::new(
-            140.0, 172.0,
-            240.0, 26.0,
+            140.0 * scale, 172.0 * scale,
+            240.0 * scale, 26.0 * scale,
             config_bg,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
-            6.0,
+            6.0 * scale,
         ));
 
         // Draw settings SVG icon for Config
         if let Some(entry) = &atlas.icon_settings {
-            let entry_w = 14.0f32;
-            let entry_h = 14.0f32;
-            let glyph_x = 148.0f32;
-            let glyph_y = 172.0f32 + (26.0f32 - entry_h) / 2.0f32;
+            let entry_w = 14.0f32 * scale;
+            let entry_h = 14.0f32 * scale;
+            let glyph_x = 148.0f32 * scale;
+            let glyph_y = 172.0f32 * scale + (26.0f32 * scale - entry_h) / 2.0f32;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
@@ -2423,12 +2431,12 @@ impl Pipeline {
             [30.0 / 255.0, 90.0 / 255.0, 45.0 / 255.0, 1.0]
         };
         bg_instances.push(CellInstance::new(
-            90.0, 220.0,
-            100.0, 32.0,
+            90.0 * scale, 220.0 * scale,
+            100.0 * scale, 32.0 * scale,
             save_bg,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
-            6.0,
+            6.0 * scale,
         ));
         draw_text(atlas, "Save", 125.0, 226.0, [1.0, 1.0, 1.0, 1.0], &mut fg_instances);
 
@@ -2438,30 +2446,30 @@ impl Pipeline {
             [60.0 / 255.0, 60.0 / 255.0, 70.0 / 255.0, 1.0]
         };
         bg_instances.push(CellInstance::new(
-            210.0, 220.0,
-            100.0, 32.0,
+            210.0 * scale, 220.0 * scale,
+            100.0 * scale, 32.0 * scale,
             cancel_bg,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
-            6.0,
+            6.0 * scale,
         ));
         draw_text(atlas, "Cancel", 235.0, 226.0, [1.0, 1.0, 1.0, 1.0], &mut fg_instances);
 
         // Draw scrollable dropdown list if active_field == 1
         if active_field == 1 {
-            let drop_x = 140.0f32;
-            let drop_y = 78.0f32; // 52.0 + 26.0
-            let drop_w = 240.0f32;
-            let drop_h = 180.0f32;
+            let drop_x = 140.0f32 * scale;
+            let drop_y = 78.0f32 * scale; // 52.0 + 26.0
+            let drop_w = 240.0f32 * scale;
+            let drop_h = 180.0f32 * scale;
 
             // Draw dropdown background shadow
             fg_instances.push(CellInstance::new(
-                drop_x - 4.0, drop_y - 2.0,
-                drop_w + 8.0, drop_h + 8.0,
+                drop_x - 4.0 * scale, drop_y - 2.0 * scale,
+                drop_w + 8.0 * scale, drop_h + 8.0 * scale,
                 [0.0, 0.0, 0.0, 0.35],
-                [4.0, 4.0, 4.0, 0.0],
+                [4.0 * scale, 4.0 * scale, 4.0 * scale, 0.0],
                 0.0, 0.0, 1.0, 1.0,
-                6.0,
+                6.0 * scale,
             ));
 
             // Draw dropdown border
@@ -2471,25 +2479,25 @@ impl Pipeline {
                 [1.0, 1.0, 1.0, 0.15],
                 [0.0, 0.0, 0.0, 0.0],
                 0.0, 0.0, 1.0, 1.0,
-                6.0,
+                6.0 * scale,
             ));
 
             // Draw dropdown background (#0c0c0c) - 100% opaque alpha!
             fg_instances.push(CellInstance::new(
-                drop_x + 1.0, drop_y + 1.0,
-                drop_w - 2.0, drop_h - 2.0,
+                drop_x + 1.0 * scale, drop_y + 1.0 * scale,
+                drop_w - 2.0 * scale, drop_h - 2.0 * scale,
                 [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0],
                 [0.0, 0.0, 0.0, 0.0],
                 0.0, 0.0, 1.0, 1.0,
-                5.0,
+                5.0 * scale,
             ));
 
             // Draw scrollable items
-            let item_h = 22.0f32;
-            let padding_x = 8.0f32;
+            let item_h = 22.0f32 * scale;
+            let padding_x = 8.0f32 * scale;
 
             for (i, font) in system_fonts.iter().enumerate() {
-                let item_top_y = drop_y + i as f32 * item_h - font_scroll_y;
+                let item_top_y = drop_y + i as f32 * item_h - font_scroll_y * scale;
                 let item_bottom_y = item_top_y + item_h;
 
                 // Simple clipping check: only render if inside the dropdown height
@@ -2500,21 +2508,21 @@ impl Pipeline {
                     // Draw item background on hover/selection
                     if is_hovered {
                         fg_instances.push(CellInstance::new(
-                            drop_x + 4.0, item_top_y + 1.0,
-                            drop_w - 8.0, item_h - 2.0,
+                            drop_x + 4.0 * scale, item_top_y + 1.0 * scale,
+                            drop_w - 8.0 * scale, item_h - 2.0 * scale,
                             [1.0, 1.0, 1.0, 0.08],
                             [0.0, 0.0, 0.0, 0.0],
                             0.0, 0.0, 1.0, 1.0,
-                            4.0,
+                            4.0 * scale,
                         ));
                     } else if is_selected {
                         fg_instances.push(CellInstance::new(
-                            drop_x + 4.0, item_top_y + 1.0,
-                            drop_w - 8.0, item_h - 2.0,
+                            drop_x + 4.0 * scale, item_top_y + 1.0 * scale,
+                            drop_w - 8.0 * scale, item_h - 2.0 * scale,
                             [91.0 / 255.0, 138.0 / 255.0, 240.0 / 255.0, 0.15],
                             [0.0, 0.0, 0.0, 0.0],
                             0.0, 0.0, 1.0, 1.0,
-                            4.0,
+                            4.0 * scale,
                         ));
                     }
 
@@ -2532,7 +2540,7 @@ impl Pipeline {
                     let mut tx = drop_x + padding_x;
                     
                     // Simple text clipping: truncate if too long
-                    let max_text_w = drop_w - padding_x * 2.0 - 10.0; 
+                    let max_text_w = drop_w - padding_x * 2.0 - 10.0 * scale; 
                     let mut current_w = 0.0f32;
 
                     for c in font.chars() {
@@ -2548,7 +2556,7 @@ impl Pipeline {
                                 let glyph_y = (text_y + atlas.ascent() + entry.top).round();
 
                                 // Clip glyph vertically to dropdown client area
-                                if glyph_y + glyph_h <= drop_y + drop_h - 2.0 && glyph_y >= drop_y + 2.0 {
+                                if glyph_y + glyph_h <= drop_y + drop_h - 2.0 * scale && glyph_y >= drop_y + 2.0 * scale {
                                     let (aw, ah) = atlas.atlas_size();
                                     let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                                     fg_instances.push(CellInstance::new(
@@ -2560,11 +2568,11 @@ impl Pipeline {
                                         0.0,
                                     ));
                                 }
-                                tx += entry.width + 1.0;
-                                current_w += entry.width + 1.0;
+                                tx += entry.width + 1.0 * scale;
+                                current_w += entry.width + 1.0 * scale;
                             } else if c == ' ' {
-                                tx += 8.0;
-                                current_w += 8.0;
+                                tx += 8.0 * scale;
+                                current_w += 8.0 * scale;
                             }
                         }
                     }
@@ -2572,12 +2580,12 @@ impl Pipeline {
             }
 
             // Draw scrollbar if necessary
-            let total_h = system_fonts.len() as f32 * item_h;
+            let total_h = system_fonts.iter().enumerate().count() as f32 * item_h;
             if total_h > drop_h {
-                let sbar_w = 4.0f32;
-                let sbar_x = drop_x + drop_w - sbar_w - 2.0;
+                let sbar_w = 4.0f32 * scale;
+                let sbar_x = drop_x + drop_w - sbar_w - 2.0 * scale;
                 let sbar_h = (drop_h / total_h) * drop_h;
-                let sbar_y = drop_y + (font_scroll_y / total_h) * drop_h;
+                let sbar_y = drop_y + ((font_scroll_y * scale) / total_h) * drop_h;
 
                 fg_instances.push(CellInstance::new(
                     sbar_x, sbar_y,
@@ -2585,7 +2593,7 @@ impl Pipeline {
                     [1.0, 1.0, 1.0, 0.25],
                     [0.0, 0.0, 0.0, 0.0],
                     0.0, 0.0, 1.0, 1.0,
-                    2.0,
+                    2.0 * scale,
                 ));
             }
         }
