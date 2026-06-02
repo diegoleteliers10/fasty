@@ -27,6 +27,8 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     a: 0.0,
 };
 
+const ATLAS_SIZE: u32 = if cfg!(target_os = "windows") { 1024 } else { 1536 };
+
 pub struct Renderer<'a> {
     surface: Surface<'a>,
     pub instance: std::sync::Arc<Instance>,
@@ -55,7 +57,7 @@ impl<'a> Renderer<'a> {
     ) -> anyhow::Result<Self> {
         let instance = Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            flags: wgpu::InstanceFlags::VALIDATION,
+            flags: wgpu::InstanceFlags::from_build_config(),
             ..Default::default()
         });
         let instance = std::sync::Arc::new(instance);
@@ -77,7 +79,11 @@ impl<'a> Renderer<'a> {
                     label: Some("fasty-renderer"),
                     required_features: Features::empty(),
                     required_limits: wgpu::Limits::default(),
-                    memory_hints: wgpu::MemoryHints::Performance,
+                    memory_hints: if cfg!(target_os = "windows") {
+                        wgpu::MemoryHints::MemoryUsage
+                    } else {
+                        wgpu::MemoryHints::Performance
+                    },
                 },
                 None,
             )
@@ -117,8 +123,8 @@ impl<'a> Renderer<'a> {
         surface.configure(&device, &config);
 
         let scale_factor = window.scale_factor() as f32;
-        let atlas = Atlas::new(&device, &queue, 1536, 1536, font_family, font_size, scale_factor)?;
-        let ui_atlas = Atlas::new(&device, &queue, 1536, 1536, font_family, 13.0, scale_factor)?;
+        let atlas = Atlas::new(&device, &queue, ATLAS_SIZE, ATLAS_SIZE, font_family, font_size, scale_factor)?;
+        let ui_atlas = Atlas::new(&device, &queue, ATLAS_SIZE, ATLAS_SIZE, font_family, 13.0, scale_factor)?;
         let (cell_width, cell_height) = atlas.cell_size();
         tracing::info!("Atlas created with {} entries, cell_size: {}x{}", atlas.entries_len(), cell_width, cell_height);
         let pipeline = Pipeline::new(&device, &atlas, &ui_atlas, format);
@@ -170,8 +176,8 @@ impl<'a> Renderer<'a> {
         surface.configure(&device, &config);
 
         let scale_factor = window.scale_factor() as f32;
-        let atlas = Atlas::new(&device, &queue, 1536, 1536, font_family, font_size, scale_factor)?;
-        let ui_atlas = Atlas::new(&device, &queue, 1536, 1536, font_family, 13.0, scale_factor)?;
+        let atlas = Atlas::new(&device, &queue, ATLAS_SIZE, ATLAS_SIZE, font_family, font_size, scale_factor)?;
+        let ui_atlas = Atlas::new(&device, &queue, ATLAS_SIZE, ATLAS_SIZE, font_family, 13.0, scale_factor)?;
         let (cell_width, cell_height) = atlas.cell_size();
         tracing::info!("Atlas created with {} entries, cell_size: {}x{}", atlas.entries_len(), cell_width, cell_height);
         let pipeline = Pipeline::new(&device, &atlas, &ui_atlas, format);
@@ -222,8 +228,8 @@ impl<'a> Renderer<'a> {
         let new_atlas = Atlas::new(
             &self.device,
             &self.queue,
-            1536,
-            1536,
+            ATLAS_SIZE,
+            ATLAS_SIZE,
             font_family,
             font_size,
             scale_factor,
@@ -233,8 +239,8 @@ impl<'a> Renderer<'a> {
             let new_ui_atlas = Atlas::new(
                 &self.device,
                 &self.queue,
-                1536,
-                1536,
+                ATLAS_SIZE,
+                ATLAS_SIZE,
                 font_family,
                 13.0,
                 scale_factor,

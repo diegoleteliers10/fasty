@@ -9,7 +9,7 @@ fn main() {
 <assemblyIdentity
     type="win32"
     name="fasty"
-    version="0.2.4.0"
+    version="0.2.5.0"
     processorArchitecture="*"
 />
 <application xmlns="urn:schemas-microsoft-com:asm.v3">

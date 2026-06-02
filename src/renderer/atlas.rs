@@ -397,7 +397,9 @@ impl Atlas {
         };
 
         let query_reg = |key: &str| -> Option<String> {
+            use std::os::windows::process::CommandExt;
             let output = std::process::Command::new("reg")
+                .creation_flags(0x08000000)
                 .args(&["query", key])
                 .output()
                 .ok()?;

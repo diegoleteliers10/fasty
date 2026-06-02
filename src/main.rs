@@ -47,6 +47,14 @@ fn get_login_shell() -> String {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn no_window_cmd(program: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut c = std::process::Command::new(program);
+    c.creation_flags(0x08000000);
+    c
+}
+
 struct Tab {
     terminal_state: Arc<parking_lot::Mutex<TerminalState>>,
     scroll_current: f32,
@@ -415,14 +423,20 @@ fn main() -> anyhow::Result<()> {
             // Wait 2 seconds before checking to let the terminal boot up smoothly
             std::thread::sleep(std::time::Duration::from_secs(2));
             
-            let cmd = std::process::Command::new("curl")
+            let mut cmd = std::process::Command::new("curl");
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000);
+            }
+            let cmd_res = cmd
                 .arg("-s")
                 .arg("-H")
                 .arg("User-Agent: fasty")
                 .arg("https://api.github.com/repos/diegoleteliers10/fasty/releases/latest")
                 .output();
 
-            if let Ok(output) = cmd {
+            if let Ok(output) = cmd_res {
                 if output.status.success() {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
@@ -769,6 +783,9 @@ fn main() -> anyhow::Result<()> {
                             // Ctrl+Shift+N -> new window
                             if ctrl_active && shift_active && is_n_key {
                                 if let Ok(exe) = std::env::current_exe() {
+                                    #[cfg(target_os = "windows")]
+                                    let _ = no_window_cmd(&exe.to_string_lossy()).spawn();
+                                    #[cfg(not(target_os = "windows"))]
                                     let _ = std::process::Command::new(exe).spawn();
                                 }
                                 return;
@@ -984,11 +1001,12 @@ fn main() -> anyhow::Result<()> {
                                                 match item {
                                                     crate::renderer::ContextMenuItem::About => {
                                                           if about_window.is_none() {
+                                                              let visible = !cfg!(target_os = "windows");
                                                               match target.create_window(winit::window::WindowAttributes::default()
                                                                   .with_title("About Fasty")
                                                                   .with_decorations(false)
                                                                   .with_transparent(true)
-                                                                  .with_visible(true)
+                                                                  .with_visible(visible)
                                                                   .with_inner_size(winit::dpi::LogicalSize::new(300.0, 200.0)))
                                                               {
                                                                   Ok(window) => {
@@ -1001,6 +1019,14 @@ fn main() -> anyhow::Result<()> {
                                                                       };
                                                                       match Renderer::new_shared(aw_static, "Inter", 13.0, shared_instance, shared_device, shared_queue, format, alpha_mode) {
                                                                           Ok(renderer_obj) => {
+                                                                              #[cfg(target_os = "windows")]
+                                                                              let mut renderer_obj = renderer_obj;
+                                                                              #[cfg(target_os = "windows")]
+                                                                              {
+                                                                                  renderer_obj.set_dirty(true);
+                                                                                  renderer_obj.render_about(&get_current_version(), false);
+                                                                                  about_window_arc.set_visible(true);
+                                                                              }
                                                                               about_window = Some(about_window_arc);
                                                                               about_renderer = Some(renderer_obj);
                                                                           }
@@ -1268,11 +1294,12 @@ fn main() -> anyhow::Result<()> {
                                                   settings_size = config.font.size;
                                                   settings_scrollback = config.scrollback.min(3000);
                                                   settings_active_field = 0;
+                                                  let visible = !cfg!(target_os = "windows");
                                                   match target.create_window(winit::window::WindowAttributes::default()
                                                       .with_title("fasty Settings")
                                                       .with_decorations(false)
                                                       .with_transparent(true)
-                                                      .with_visible(true)
+                                                      .with_visible(visible)
                                                       .with_inner_size(winit::dpi::LogicalSize::new(400.0, 300.0)))
                                                   {
                                                       Ok(window) => {
@@ -1285,6 +1312,23 @@ fn main() -> anyhow::Result<()> {
                                                           };
                                                           match Renderer::new_shared(sw_static, &config.font.family, 13.0, shared_instance, shared_device, shared_queue, format, alpha_mode) {
                                                               Ok(renderer_obj) => {
+                                                                  #[cfg(target_os = "windows")]
+                                                                  let mut renderer_obj = renderer_obj;
+                                                                  #[cfg(target_os = "windows")]
+                                                                  {
+                                                                      renderer_obj.set_dirty(true);
+                                                                      renderer_obj.render_settings(
+                                                                          &config.font.family,
+                                                                          config.font.size,
+                                                                          config.scrollback.min(3000),
+                                                                          0,
+                                                                          false, false, false, false, false, false, false, false, false,
+                                                                          &system_fonts,
+                                                                          0.0,
+                                                                          None,
+                                                                      );
+                                                                      settings_window_arc.set_visible(true);
+                                                                  }
                                                                   settings_window = Some(settings_window_arc);
                                                                   settings_renderer = Some(renderer_obj);
                                                               }
@@ -2117,6 +2161,10 @@ fn main() -> anyhow::Result<()> {
                                         settings_font_scroll_y,
                                         settings_hovered_font_idx,
                                     );
+                                }
+                                #[cfg(target_os = "windows")]
+                                {
+                                    sw.set_visible(true);
                                 }
                             }
                             WindowEvent::CursorMoved { position, .. } => {
@@ -2991,7 +3039,7 @@ fn open_url(url: &str) {
     let cmd = "xdg-open";
 
     #[cfg(target_os = "windows")]
-    let res = std::process::Command::new("cmd")
+    let res = no_window_cmd("cmd")
         .args(&["/C", "start", "", &target_url])
         .spawn();
 
@@ -3221,7 +3269,7 @@ fn get_system_fonts() -> Vec<String> {
 
     #[cfg(target_os = "windows")]
     {
-        if let Ok(output) = std::process::Command::new("reg")
+        if let Ok(output) = no_window_cmd("reg")
             .args(&["query", "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"])
             .output()
         {
@@ -3287,7 +3335,7 @@ fn trigger_update(
                 .join(".local")
                 .join("bin")
                 .join("fasty.exe");
-            let _ = std::process::Command::new(fasty_path).spawn();
+            let _ = no_window_cmd(&fasty_path.to_string_lossy()).spawn();
         }
 
         #[cfg(target_os = "macos")]
@@ -3338,7 +3386,7 @@ fn trigger_update(
 
         #[cfg(target_os = "windows")]
         {
-            if let Ok(mut child) = std::process::Command::new("powershell")
+            if let Ok(mut child) = no_window_cmd("powershell")
                 .arg("-Command")
                 .arg("irm https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.ps1 | iex")
                 .spawn() {
@@ -3390,7 +3438,7 @@ fn trigger_update(
 fn open_file_in_editor(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
+        no_window_cmd("cmd")
             .args(&["/C", "start", "", path.to_str().unwrap_or_default()])
             .spawn()?;
     }
