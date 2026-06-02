@@ -120,5 +120,23 @@ if (-not $IsInPath) {
     Write-Host "✅ El directorio $InstallDir ya se encuentra en tu PATH." -ForegroundColor Green
 }
 
+# 6. Crear un acceso directo en el Menú Inicio para que aparezca como aplicación del sistema
+Write-Host "🖥️ Creando acceso directo en el Menú de Inicio..." -ForegroundColor Cyan
+try {
+    $StartMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
+    $ShortcutPath = Join-Path $StartMenuDir "Fasty.lnk"
+    
+    $WshShell = New-Object -ComObject WScript.Shell
+    $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
+    $Shortcut.TargetPath = $ExeDestPath
+    $Shortcut.WorkingDirectory = $InstallDir
+    $Shortcut.Description = "Fasty Terminal Emulator"
+    $Shortcut.Save()
+    
+    Write-Host "✅ Acceso directo creado en el Menú Inicio con éxito." -ForegroundColor Green
+} catch {
+    Write-Host "⚠️ Advertencia: No se pudo crear el acceso directo en el Menú Inicio." -ForegroundColor Yellow
+}
+
 # Limpieza final del directorio temporal
 Remove-Item -Recurse -Force $TempDir -ErrorAction SilentlyContinue

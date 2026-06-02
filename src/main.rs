@@ -3170,23 +3170,71 @@ fn get_menu_item_at_y(menu_items: &[crate::renderer::ContextMenuItem], relative_
 
 fn get_system_fonts() -> Vec<String> {
     let mut fonts = std::collections::BTreeSet::new();
-    if let Ok(output) = std::process::Command::new("fc-list")
-        .arg(":")
-        .arg("family")
-        .output()
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                for family in line.split(',') {
-                    let family = family.trim();
-                    if !family.is_empty() && !family.starts_with('.') {
-                        fonts.insert(family.to_string());
+        if let Ok(output) = std::process::Command::new("fc-list")
+            .arg(":")
+            .arg("family")
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    for family in line.split(',') {
+                        let family = family.trim();
+                        if !family.is_empty() && !family.starts_with('.') {
+                            fonts.insert(family.to_string());
+                        }
                     }
                 }
             }
         }
     }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = std::process::Command::new("reg")
+            .args(&["query", "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"])
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    if let Some(pos) = line.find("REG_SZ") {
+                        let name_part = line[..pos].trim();
+                        let clean_name = if let Some(p) = name_part.find(" (") {
+                            &name_part[..p]
+                        } else {
+                            name_part
+                        };
+                        let lower = clean_name.to_lowercase();
+                        if lower.contains("consolas") 
+                            || lower.contains("courier") 
+                            || lower.contains("lucida console") 
+                            || lower.contains("cascadia")
+                            || lower.contains("mono") 
+                            || lower.contains("code") {
+                            fonts.insert(clean_name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        
+        fonts.insert("Consolas".to_string());
+        fonts.insert("Courier New".to_string());
+        fonts.insert("Lucida Console".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        fonts.insert("Menlo".to_string());
+        fonts.insert("Monaco".to_string());
+        fonts.insert("Courier".to_string());
+        fonts.insert("Courier New".to_string());
+    }
+
     if fonts.is_empty() {
         fonts.insert("monospace".to_string());
         fonts.insert("JetBrains Mono".to_string());

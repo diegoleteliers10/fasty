@@ -387,6 +387,124 @@ impl Atlas {
         Ok(atlas)
     }
 
+    #[cfg(target_os = "windows")]
+    pub fn load_font_path(family: &str) -> anyhow::Result<String> {
+        let family_lower = family.to_lowercase();
+        let target_family = if family_lower == "monospace" || family_lower == "sans-serif" || family_lower == "serif" {
+            "consolas"
+        } else {
+            &family_lower
+        };
+
+        let query_reg = |key: &str| -> Option<String> {
+            let output = std::process::Command::new("reg")
+                .args(&["query", key])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let line_lower = line.to_lowercase();
+                if line_lower.contains(target_family) {
+                    if let Some(pos) = line.find("REG_SZ") {
+                        let val = line[pos + 6..].trim();
+                        if !val.is_empty() {
+                            return Some(val.to_string());
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        let font_file = query_reg("HKCU\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts")
+            .or_else(|| query_reg("HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"));
+
+        if let Some(file) = font_file {
+            let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
+            let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
+            
+            let sys_path = std::path::Path::new(&windir).join("Fonts").join(&file);
+            if sys_path.exists() {
+                return Ok(sys_path.to_string_lossy().to_string());
+            }
+
+            if !localappdata.is_empty() {
+                let user_path = std::path::Path::new(&localappdata)
+                    .join("Microsoft\\Windows\\Fonts")
+                    .join(&file);
+                if user_path.exists() {
+                    return Ok(user_path.to_string_lossy().to_string());
+                }
+            }
+
+            let path = std::path::Path::new(&file);
+            if path.exists() {
+                return Ok(file);
+            }
+        }
+
+        let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let fonts_dir = std::path::Path::new(&windir).join("Fonts");
+        
+        let fallbacks = [
+            "consola.ttf",
+            "consolab.ttf",
+            "cour.ttf",
+            "lucon.ttf",
+        ];
+
+        for fallback in &fallbacks {
+            let path = fonts_dir.join(fallback);
+            if path.exists() {
+                return Ok(path.to_string_lossy().to_string());
+            }
+        }
+
+        anyhow::bail!("Could not find font on Windows")
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn load_font_path(family: &str) -> anyhow::Result<String> {
+        let family_lower = family.to_lowercase();
+        let target_family = if family_lower == "monospace" || family_lower == "sans-serif" || family_lower == "serif" {
+            "menlo"
+        } else {
+            &family_lower
+        };
+
+        let paths = [
+            "/System/Library/Fonts/Constants/Menlo.ttc",
+            "/System/Library/Fonts/Menlo.ttc",
+            "/System/Library/Fonts/Courier.dfont",
+            "/System/Library/Fonts/Supplemental/Courier New.ttf",
+            "/System/Library/Fonts/Supplemental/Courier New Bold.ttf",
+            "/System/Library/Fonts/Monaco.ttf",
+            "/Library/Fonts/Arial.ttf",
+        ];
+
+        for path in &paths {
+            let p = std::path::Path::new(path);
+            if p.exists() {
+                let name = p.file_stem().unwrap_or_default().to_string_lossy().to_lowercase();
+                if name.contains(target_family) {
+                    return Ok(path.to_string());
+                }
+            }
+        }
+
+        for path in &paths {
+            if std::path::Path::new(path).exists() {
+                return Ok(path.to_string());
+            }
+        }
+
+        anyhow::bail!("Could not find font on macOS")
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     pub fn load_font_path(family: &str) -> anyhow::Result<String> {
         let output = std::process::Command::new("fc-match")
             .arg("-f")
