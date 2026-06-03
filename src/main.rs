@@ -63,6 +63,9 @@ struct Tab {
     is_selecting_text: bool,
     selection_start_pos: Option<(f64, f64)>,
     hovered_url: Option<renderer::HoveredUrl>,
+    hovered_hyperlink: Option<String>,
+    pending_hyperlink_open: Option<String>,
+    hyperlink_press_pos: Option<(f64, f64)>,
     is_dragging: bool,
     last_activity_time: std::time::Instant,
     last_actual_offset: usize,
@@ -102,6 +105,9 @@ fn create_new_tab(
         is_selecting_text: false,
         selection_start_pos: None,
         hovered_url: None,
+        hovered_hyperlink: None,
+        pending_hyperlink_open: None,
+        hyperlink_press_pos: None,
         is_dragging: false,
         last_activity_time: std::time::Instant::now(),
         last_actual_offset: 0,
@@ -590,6 +596,7 @@ fn main() -> anyhow::Result<()> {
                                 current_time,
                                 active_tab.selection,
                                 active_tab.hovered_url,
+                                active_tab.hovered_hyperlink.as_deref(),
                                 toast.as_ref().map(|(msg, t, d)| (msg.as_str(), *t, *d)),
                                 active_tab_index,
                                 &tab_titles,
@@ -635,6 +642,18 @@ fn main() -> anyhow::Result<()> {
                                 let mut r = renderer.lock();
                                 r.set_dirty(true);
                                 r.grid_dirty = true;
+                                app_dirty = true;
+                            }
+                            let new_hyperlink = detect_hovered_hyperlink(
+                                current_mouse_x, current_mouse_y,
+                                &tabs[active_tab_index].terminal_state,
+                                tabs[active_tab_index].scroll_current,
+                                cell_width, cell_height, shell_cols, shell_rows, padding_top,
+                            );
+                            if tabs[active_tab_index].hovered_hyperlink != new_hyperlink {
+                                tabs[active_tab_index].hovered_hyperlink = new_hyperlink;
+                                let mut r = renderer.lock();
+                                r.set_dirty(true);
                                 app_dirty = true;
                             }
                         }
@@ -684,6 +703,18 @@ fn main() -> anyhow::Result<()> {
                                 let mut r = renderer.lock();
                                 r.set_dirty(true);
                                 r.grid_dirty = true;
+                                app_dirty = true;
+                            }
+                            let new_hyperlink = detect_hovered_hyperlink(
+                                current_mouse_x, current_mouse_y,
+                                &tabs[active_tab_index].terminal_state,
+                                tabs[active_tab_index].scroll_current,
+                                cell_width, cell_height, shell_cols, shell_rows, padding_top,
+                            );
+                            if tabs[active_tab_index].hovered_hyperlink != new_hyperlink {
+                                tabs[active_tab_index].hovered_hyperlink = new_hyperlink;
+                                let mut r = renderer.lock();
+                                r.set_dirty(true);
                                 app_dirty = true;
                             }
 
@@ -1509,13 +1540,22 @@ fn main() -> anyhow::Result<()> {
                                                 app_dirty = true;
                                             }
                                         }
+                                    } else if let Some(uri) = detect_hovered_hyperlink(
+                                        current_mouse_x, current_mouse_y,
+                                        &tabs[active_tab_index].terminal_state,
+                                        tabs[active_tab_index].scroll_current,
+                                        cell_width, cell_height, shell_cols, shell_rows, padding_top,
+                                    ) {
+                                        // OSC 8 hyperlink: open URL on plain click
+                                        tabs[active_tab_index].pending_hyperlink_open = Some(uri.clone());
+                                        tabs[active_tab_index].hyperlink_press_pos = Some((current_mouse_x, current_mouse_y));
                                     } else if modifiers.control_key() || ctrl_held {
                                         // Ctrl + Click: Try to detect and open URL
                                         let term = tabs[active_tab_index].terminal_state.lock();
                                         let scroll_fraction = tabs[active_tab_index].scroll_current - term.display_offset() as f32;
                                         let display_offset = term.display_offset();
                                         let history_size = term.history_size();
-                                        
+
                                         let click_point = mouse_to_grid_point(
                                             current_mouse_x,
                                             current_mouse_y,
@@ -1577,6 +1617,12 @@ fn main() -> anyhow::Result<()> {
                                 } else {
                                     tabs[active_tab_index].is_dragging = false;
                                     is_dragging_scrollbar = false;
+
+                                    if let Some(uri) = tabs[active_tab_index].pending_hyperlink_open.take() {
+                                        tabs[active_tab_index].hyperlink_press_pos = None;
+                                        open_url(&uri);
+                                    }
+
                                     if tabs[active_tab_index].is_selecting_text {
                                         tabs[active_tab_index].is_selecting_text = false;
                                         if let Some(sel) = tabs[active_tab_index].selection {
@@ -1701,6 +1747,15 @@ fn main() -> anyhow::Result<()> {
                             last_cursor_y = position.y;
                             current_mouse_x = position.x;
                             current_mouse_y = position.y;
+
+                            if let Some((px, py)) = tabs[active_tab_index].hyperlink_press_pos {
+                                let dx = current_mouse_x - px;
+                                let dy = current_mouse_y - py;
+                                if dx * dx + dy * dy > 25.0 {
+                                    tabs[active_tab_index].pending_hyperlink_open = None;
+                                    tabs[active_tab_index].hyperlink_press_pos = None;
+                                }
+                            }
 
                             if context_menu_visible {
                                 let menu_items = get_context_menu_items(&tabs, active_tab_index, context_menu_is_about);
@@ -1964,6 +2019,18 @@ fn main() -> anyhow::Result<()> {
                                 r.grid_dirty = true;
                                 app_dirty = true;
                             }
+                            let new_hyperlink = detect_hovered_hyperlink(
+                                current_mouse_x, current_mouse_y,
+                                &tabs[active_tab_index].terminal_state,
+                                tabs[active_tab_index].scroll_current,
+                                cell_width, cell_height, shell_cols, shell_rows, padding_top,
+                            );
+                            if tabs[active_tab_index].hovered_hyperlink != new_hyperlink {
+                                tabs[active_tab_index].hovered_hyperlink = new_hyperlink;
+                                let mut r = renderer.lock();
+                                r.set_dirty(true);
+                                app_dirty = true;
+                            }
                         }
                         WindowEvent::MouseWheel { delta, .. } => {
                             last_scroll_event_time = Some(std::time::Instant::now());
@@ -2049,8 +2116,10 @@ fn main() -> anyhow::Result<()> {
 
                             let url_changed = tabs[active_tab_index].hovered_url.is_some();
                             tabs[active_tab_index].hovered_url = None;
+                            let hyperlink_changed = tabs[active_tab_index].hovered_hyperlink.is_some();
+                            tabs[active_tab_index].hovered_hyperlink = None;
 
-                            if old_hover_close || old_hover_max || old_hover_min || old_hover_settings || old_hover_update || url_changed {
+                            if old_hover_close || old_hover_max || old_hover_min || old_hover_settings || old_hover_update || url_changed || hyperlink_changed {
                                 let mut r = renderer.lock();
                                 r.hover_update = false;
                                 r.set_dirty(true);
@@ -2490,6 +2559,7 @@ fn main() -> anyhow::Result<()> {
                         current_time,
                         active_tab.selection,
                         active_tab.hovered_url,
+                        active_tab.hovered_hyperlink.as_deref(),
                         toast.as_ref().map(|(msg, t, d)| (msg.as_str(), *t, *d)),
                         active_tab_index,
                         &tab_titles,
@@ -3052,6 +3122,53 @@ fn open_url(url: &str) {
         Ok(_) => {}
         Err(e) => tracing::error!("Failed to open URL: {:?}", e),
     }
+}
+
+fn detect_hovered_hyperlink(
+    current_mouse_x: f64,
+    current_mouse_y: f64,
+    terminal_state: &Arc<parking_lot::Mutex<TerminalState>>,
+    scroll_current: f32,
+    cell_width: f32,
+    cell_height: f32,
+    shell_cols: usize,
+    shell_rows: usize,
+    padding_top: f32,
+) -> Option<String> {
+    if current_mouse_y <= padding_top as f64 {
+        return None;
+    }
+
+    let term = terminal_state.lock();
+    let scroll_fraction = scroll_current - term.display_offset() as f32;
+    let display_offset = term.display_offset();
+    let history_size = term.history_size();
+
+    let hover_point = mouse_to_grid_point(
+        current_mouse_x,
+        current_mouse_y,
+        cell_width,
+        cell_height,
+        scroll_fraction,
+        display_offset,
+        shell_cols,
+        shell_rows,
+        padding_top,
+    );
+
+    if hover_point.line.0 < -(history_size as i32) || hover_point.line.0 >= shell_rows as i32 {
+        return None;
+    }
+
+    let term_guard = term.term().lock();
+    let grid = term_guard.grid();
+    let row = &grid[alacritty_terminal::index::Line(hover_point.line.0)];
+    let col_idx = hover_point.column.0;
+    if col_idx >= shell_cols {
+        return None;
+    }
+    let cell = &row[alacritty_terminal::index::Column(col_idx)];
+    cell.hyperlink().map(|h| h.uri().to_string())
 }
 
 fn detect_hovered_url(

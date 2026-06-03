@@ -592,6 +592,7 @@ impl Pipeline {
         current_time: f32,
         selection: Option<crate::renderer::Selection>,
         hovered_url: Option<crate::renderer::HoveredUrl>,
+        hovered_hyperlink: Option<&str>,
         toast: Option<(&str, std::time::Instant, u64)>,
         active_tab_index: usize,
         tab_titles: &[String],
@@ -744,6 +745,7 @@ impl Pipeline {
             let visible_rows_count = visible_rows.round() as usize;
             let mut row_cells: Vec<Vec<&alacritty_terminal::term::cell::Cell>> = vec![Vec::new(); visible_rows_count];
             let mut row_points: Vec<Vec<alacritty_terminal::index::Point>> = vec![Vec::new(); visible_rows_count];
+            let mut row_hyperlinks: Vec<Vec<Option<std::sync::Arc<str>>>> = vec![Vec::new(); visible_rows_count];
 
             // 1. Draw solid background, selection, and underline, and collect cells for layout
             for Indexed { cell, point } in content.display_iter {
@@ -753,6 +755,7 @@ impl Pipeline {
                 if row < visible_rows_count {
                     row_cells[row].push(cell);
                     row_points[row].push(point);
+                    row_hyperlinks[row].push(cell.hyperlink().map(|h| std::sync::Arc::from(h.uri())));
                 }
 
                 let is_default_bg = matches!(cell.bg,
@@ -828,6 +831,26 @@ impl Pipeline {
                         0.0,
                     );
                     bg_instances.push(bg_instance);
+                }
+
+                if !is_hovered_url {
+                    if let Some(Some(uri)) = row_hyperlinks.get(row).and_then(|r| r.get(col)) {
+                        let is_this_hovered = hovered_hyperlink == Some(uri.as_ref());
+                        let underline_color = if is_this_hovered {
+                            [66.0 / 255.0, 135.0 / 255.0, 245.0 / 255.0, 1.0]
+                        } else {
+                            [66.0 / 255.0, 135.0 / 255.0, 245.0 / 255.0, 0.55]
+                        };
+                        let bg_instance = CellInstance::new(
+                            cell_x, cell_y + actual_cell_height - 2.0,
+                            actual_cell_width, 1.0,
+                            underline_color,
+                            [0.0, 0.0, 0.0, 0.0],
+                            0.0, 0.0, 0.0, 0.0,
+                            0.0,
+                        );
+                        bg_instances.push(bg_instance);
+                    }
                 }
             }
 
