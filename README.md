@@ -48,12 +48,22 @@ Fasty integrates custom vector icons mapped into the GPU texture atlas as non-co
 
 ## ⚡ Performance & Memory Optimizations
 
-### Memory Footprint Reduction (30–50MB Footprint)
-Fasty has been optimized to run at a significantly lower memory footprint (reduced from ~90MB to 30–50MB):
+### Memory Footprint Reduction (30–50MB Linux, 50–70MB Windows)
+Fasty has been optimized to run at a significantly lower memory footprint across all platforms:
 1. **Scrollback Memory Cap**: The scrollback buffer is capped at a maximum of 3000 lines (down from 10,000), reducing allocations by ~37MB.
-2. **GPU Texture Atlas Scaling**: Main and UI texture atlases were downscaled from `2048x2048` to `1536x1536` pixels, freeing GPU and system memory.
+2. **GPU Texture Atlas Scaling**: Main and UI texture atlases are sized at `1536x1536` on Linux/macOS and `1024x1024` on Windows (down from `2048x2048`), freeing GPU and system memory.
 3. **Logging Overhead Elimination**: Removed duplicate logging crates (`log`, `env_logger`) in favor of standard `tracing`. Tracing output is conditionalized to initialize only in debug configurations.
 4. **Hardened Release Profile**: Recompiled with Link-Time Optimization (`lto = true`), unit splitting (`codegen-units = 1`), debug symbols stripping (`strip = true`), and panic unwinding disabled (`panic = "abort"`).
+
+### Windows Memory & UX Hardening (v0.2.5)
+v0.2.5 brings Windows to parity with the Linux/macOS footprint and eliminates two UX issues specific to the D3D12 backend:
+1. **D3D12 Debug Layer Disabled in Release**: `wgpu::InstanceFlags` is now set via `from_build_config()` so the validation layer (which loads `d3d12sdklayers.dll` and spawns 3 helper processes — the source of the visible console flashes at startup) only runs in debug builds. **Cuts ~70MB of D3D12 debug-layer shadow copies.**
+2. **Memory Hints on Windows**: `MemoryHints::MemoryUsage` (instead of `Performance`) is used on the D3D12 backend to prevent the driver from creating CPU-accessible staging copies of every GPU resource. **Cuts another ~20–50MB.**
+3. **Atlas Sizing on Windows**: Atlases are 1024×1024 on Windows (1024² = 1M cells is more than enough for the basic + box-drawing + emoji set used). **Cuts ~10MB per renderer × up to 3 renderers (main + settings + about).**
+4. **No-Console-Startup**: All Windows child process spawns (`curl` for update check, `reg` for font resolution, `cmd` for URL/file opening, `powershell` for update install, fasty relaunch on `Ctrl+Shift+N`) now set `creation_flags(0x08000000)` (`CREATE_NO_WINDOW`). The user no longer sees background terminal windows flash at startup or during user actions.
+5. **No Dialog White Flash**: Settings and About dialogs now commit their first swapchain frame (`frame.present()`) before being made visible. On Windows D3D12, invisible HWNDs never receive `WM_PAINT`, so the previous approach of `set_visible(true)` inside `RedrawRequested` was unreachable and resulted in a white backbuffer being shown on the first user interaction.
+
+**Result on Windows**: 200MB → **50–70MB** RAM, zero console flashes, zero dialog white flash.
 
 ### Micro-Optimized Cursor Blinking
 Instead of triggering a full layout and rebuilding cell instances across the grid when the cursor blinks (which consumed ~8% CPU), Fasty implements a fast-path renderer:
@@ -260,6 +270,77 @@ Fasty loads a file named `config.json` situated in the binary's execution direct
 | **`Ctrl + V`** / **`Ctrl + Shift + V`** | Paste clipboard contents to PTY |
 | **`Left Mouse Drag`** | Highlight text |
 | **`Ctrl + Left Click`** | Open highlighted URL in default browser |
+
+---
+
+## 🗺️ Roadmap
+
+Features under consideration for upcoming releases. Grouped by category and priority (**🔴 High** = high demand + low-medium effort, **🟡 Medium** = clear value but moderate effort, **🟢 Exploratory** = speculative, high effort or niche).
+
+### 🖼️ Graphics & Terminal Protocols
+| Priority | Feature | Notes |
+| :--- | :--- | :--- |
+| 🔴 | **OSC 8 Hyperlinks** | Make `\e]8;;url\e\\text\e]8;;\e\\` clickable inline (currently requires `Ctrl+hover`). Industry standard, used by `ls --color`, `gh`, modern CLI tools. |
+| 🔴 | **Inline Image Protocol (iTerm2/Kitty)** | Render PNG/JPEG inline via the Kitty graphics protocol. Useful for `chafa`, `viu`, image previews in `yazi`/`ranger`. |
+| 🟡 | **Sixel Graphics** | Legacy image protocol still used by some tools (`img2sixel`, `ls -6`). Optional, opt-in via config. |
+| 🟢 | **Unicode 16 + Complex Shaping** | Better emoji ZWJ sequences, RTL text, Indic scripts. Current FreeType pipeline handles most cases; gaps remain. |
+
+### ✂️ Productivity & Workflow
+| Priority | Feature | Notes |
+| :--- | :--- | :--- |
+| 🔴 | **In-Scrollback Search** | `Ctrl+Shift+F` opens a search bar that highlights matches in the live + scrollback buffer. Should be GPU-accelerated. |
+| 🔴 | **Command Palette** | `Ctrl+Shift+P` opens a fuzzy-search palette over settings, tab actions, themes. Inspired by VS Code/Sublime. |
+| 🔴 | **Session Restore** | Persist open tabs, working directories, and PWD on shutdown; restore on next launch. Optional via config. |
+| 🟡 | **Split Panes** | Horizontal/vertical splits per tab (like `tmux`/`Zellij`). Each split runs its own PTY. |
+| 🟡 | **Copy on Select** | Mouse selection auto-copies to clipboard, like `tmux`/`kitty` (with a config toggle for the current `Ctrl+Shift+C` flow). |
+| 🟡 | **Tab Reordering by Drag** | Currently read-only. Add drag-to-reorder + drag-to-detach (spawn new window). |
+| 🟢 | **Quake-Mode / Drop-Down Terminal** | Global hotkey toggles a top-anchored sliding window. Implementation: fullscreen transparent window + slide-in offset animation. |
+| 🟢 | **Shell Integration (Shell History, Last Command Markers)** | Mark command boundaries in scrollback, jump between them. Requires opt-in shell hooks (similar to `starship`/`fish`). |
+
+### 🎨 Customization & Configuration
+| Priority | Feature | Notes |
+| :--- | :--- | :--- |
+| 🔴 | **Themes (Color Schemes)** | First-class color palette support. Ship 4–6 built-in themes (Tomorrow Night, Solarized, One Dark, Catppuccin) + a `.theme.json` loader. |
+| 🔴 | **TOML Config + Live Reload** | Replace the single `config.json` with a typed `fasty.toml` (sections: `[font]`, `[colors]`, `[keybindings]`, `[shell]`) that re-applies on save. |
+| 🟡 | **Custom Keybindings** | User-rebindable shortcuts in `fasty.toml`. Required for split-pane UX. |
+| 🟡 | **Per-Override Settings UI** | A visual theme/font picker, replacing the current text-number fields. |
+| 🟢 | **Plugin System (Lua/WASM)** | Ghostty/WezTerm-style scripting. High effort, but unlocks third-party themes, status bars, integrations. |
+
+### 🤖 Modern Integrations
+| Priority | Feature | Notes |
+| :--- | :--- | :--- |
+| 🟡 | **AI Command Suggestions (opt-in)** | Local-only: pipe the last failed command to a small LLM (via Ollama / local API) for a fix suggestion. No telemetry. |
+| 🟡 | **Inline Git Status in Topbar** | Render the current tab's repo branch + dirty status in the topbar. Hooks `git status` lazily (cached, 1s debounce). |
+| 🟡 | **Built-in SSH Manager** | Quick `Ctrl+Shift+S` → "Connect to..." picker. Spawns `ssh user@host` inside a new tab. Replaces manual `fasty -e ssh user@host`. |
+| 🟢 | **Remote / `fasty://` URL Scheme** | Register a protocol so `fasty://new-tab?cwd=...` opens a new tab from a browser link. |
+| 🟢 | **Cloud Config Sync** | Optional encrypted sync of `fasty.toml` via a simple backend (or WebDAV). |
+
+### ♿ Accessibility & Inclusion
+| Priority | Feature | Notes |
+| :--- | :--- | :--- |
+| 🔴 | **Screen Reader Bridge (Windows UIA / Linux AT-SPI / macOS AX)** | Announce output to assistive tech. Biggest current gap. |
+| 🟡 | **High-Contrast Theme** | WCAG AAA-compliant palette for users with low vision. |
+| 🟡 | **Color-Blind Palettes** | Deuteranopia/protanopia-friendly variants. |
+| 🟡 | **DPI Override Per-Monitor** | Already PerMonitorV2-aware; needs verified behavior on mixed-DPI multi-monitor setups. |
+| 🟢 | **Touch / Gesture Input** | Long-press to select, two-finger scroll in scrollback. Targets 2-in-1 laptops. |
+
+### ⚙️ Performance & Reliability
+| Priority | Feature | Notes |
+| :--- | :--- | :--- |
+| 🔴 | **Scrollback-to-Disk** | Beyond 3000 lines, spill to a memory-mapped file. RAM-stays-low, infinite history. |
+| 🟡 | **GPU-Accelerated Search** | Run the in-scrollback search as a compute shader on the GPU-stored glyph index. Sub-millisecond on 100k lines. |
+| 🟡 | **Crash Reporting & Auto-Restart** | Optional opt-in crash dump upload (self-hosted) + automatic restart on panic. |
+| 🟢 | **Wide-Gamut (P3) and HDR Output** | Detect HDR displays, emit 10-bit color where supported. Currently 8-bit sRGB only. |
+
+### 🪟 Platform & Packaging
+| Priority | Feature | Notes |
+| :--- | :--- | :--- |
+| 🔴 | **Signed MSIX / `.msi` Installer for Windows** | Replace the PowerShell installer. Microsoft's `makeappx` + a self-signed cert. |
+| 🟡 | **Flatpak for Linux** | Sandbox-friendly distribution. |
+| 🟡 | **Homebrew Formula Maintenance** | Already installable via the script; a real tap is overdue. |
+| 🟢 | **Android (via `winit` + `wgpu` Mobile)** | The same codebase already builds for Android (the crates support it). Just need touch-friendly input and on-screen keyboard. |
+
+> **Have a feature request?** Open an issue on GitHub. Anything that fits the "minimal, fast, GPU-native terminal" philosophy is welcome.
 
 ---
 
