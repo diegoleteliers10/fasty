@@ -2719,7 +2719,7 @@ impl Pipeline {
             ));
         }
 
-        draw_text(atlas, "Open config.json", 168.0, 216.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+        draw_text(atlas, "Open fasty.toml", 168.0, 216.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
 
         // Save & Cancel buttons removed — settings apply live.
 

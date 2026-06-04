@@ -19,6 +19,7 @@ pub enum AppEvent {
     Wakeup,
     Exit,
     ForceExit,
+    ConfigChanged,
 }
 
 

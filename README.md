@@ -233,21 +233,35 @@ fasty -e bash -c "cargo build && cargo test"
 
 ## ⚙️ Configuration
 
-Fasty loads a file named `config.json` situated in the binary's execution directory. If not present, defaults are applied. On startup, Fasty initializes window dimensions at a default logical footprint of **`800 x 520`** pixels.
+Fasty reads `fasty.toml` from the first existing path in this order:
+
+1. `./fasty.toml` (current working directory — portable mode)
+2. `/etc/fasty/fasty.toml` (system-wide)
+3. `~/.config/fasty/fasty.toml` (user — default)
+
+If no file is found, defaults are applied. On startup, Fasty initializes window dimensions at a default logical footprint of **`800 x 520`** pixels.
+
+**Live reload (v0.2.8+):** edits to `fasty.toml` re-apply on save — no restart needed for `font.family`, `font.size`, `theme`, or `scrollback`. Settings changed via the Settings dialog also persist to this same file. Comments and formatting are preserved across Settings-dialog writes (via `toml_edit` round-tripping).
+
+**Live-reload exceptions:**
+- `font.ligatures`: requires restart (atlas-level cache rebuild).
+- `shell`: applies only to newly spawned tabs.
+
+**Migration from v0.2.7 or earlier:** on first launch v0.2.8 auto-converts `~/.config/fasty/config.json` into `~/.config/fasty/fasty.toml` and renames the original to `config.json.bak`. The other two paths (cwd, `/etc/fasty/`) are not touched — migrate manually if you use them.
 
 ### Configuration Template
-```json
-{
-  "font": {
-    "family": "JetBrains Mono",
-    "size": 14.0,
-    "weight": 400.0,
-    "ligatures": true
-  },
-  "shell": null,
-  "scrollback": 3000,
-  "theme": "default"
-}
+```toml
+shell = "/bin/bash"        # optional; omit to detect system default
+scrollback = 3000
+theme = "default"
+
+[font]
+family = "JetBrains Mono"
+size = 14.0
+weight = 400.0
+ligatures = true
+
+[keybindings]              # reserved for v0.2.9 — leave empty for now
 ```
 
 | Config Property | Type | Description |
@@ -255,10 +269,10 @@ Fasty loads a file named `config.json` situated in the binary's execution direct
 | `font.family` | `string` | Name of the font family loaded via FontConfig / FreeType |
 | `font.size` | `float` | Font size in logical points |
 | `font.weight` | `float` | Numeric font weight value (e.g. `400.0` for Regular) |
-| `font.ligatures` | `boolean` | Toggles rendering of font ligatures |
-| `shell` | `string?` | Custom shell path (set to `null` to detect default system shell) |
+| `font.ligatures` | `boolean` | Toggles rendering of font ligatures (restart required) |
+| `shell` | `string?` | Custom shell path; omit the key entirely to detect the default system shell |
 | `scrollback` | `integer` | Lines of scrollback buffer history retained in memory (default 3000, capped at a maximum of 3000 for RAM efficiency) |
-| `theme` | `string` | Color scheme name. One of `default` (Fasty), `catppuccin`, `one-dark`, `solarized-dark`. Selectable live from the Settings dialog. |
+| `theme` | `string` | Color scheme name. One of `default` (Fasty), `catppuccin`, `one-dark`, `solarized-dark`, or any custom theme name in `~/.config/fasty/themes/`. Selectable live from the Settings dialog. |
 
 ### 🎨 Built-in Themes
 
@@ -274,7 +288,7 @@ The theme is read on every cell render from a process-wide `RwLock<String>`, so 
 **Themed surfaces** (all re-render on theme change):
 
 - Main window bg, topbar (darkened variant), active tab fill, scrollback area
-- Settings dialog: window bg, topbar, dropdown bgs, hover/selected item highlights, the closed-box rest/hover/active states for font family + theme pickers, the "Open config.json" button
+- Settings dialog: window bg, topbar, dropdown bgs, hover/selected item highlights, the closed-box rest/hover/active states for font family + theme pickers, the "Open fasty.toml" button
 - About dialog: window bg and topbar
 - Context menu (right-click on the topbar icon) inner background
 
@@ -352,9 +366,9 @@ Features under consideration for upcoming releases. Grouped by category and prio
 - [x] 🟡 **URL Hover Detection** — `Ctrl+hover` highlights URLs in terminal output; `Ctrl+click` opens in default browser.
 
 ### 🎨 Customization & Configuration
-- [x] 🔴 **Themes (Color Schemes)** — Built-in `default` (Fasty), `catppuccin`, `one-dark`, `solarized-dark`. Selectable live from the Settings dialog; persisted to `config.json` under the `theme` key.
-- [ ] 🔴 **TOML Config + Live Reload** — Replace the single `config.json` with a typed `fasty.toml` (sections: `[font]`, `[colors]`, `[keybindings]`, `[shell]`) that re-applies on save.
-- [ ] 🟡 **Custom Keybindings** — User-rebindable shortcuts in `fasty.toml`. Required for split-pane UX.
+- [x] 🔴 **Themes (Color Schemes)** — Built-in `default` (Fasty), `catppuccin`, `one-dark`, `solarized-dark`. Selectable live from the Settings dialog; persisted to `fasty.toml` under the `theme` key.
+- [x] 🔴 **TOML Config + Live Reload (v0.2.8)** — `fasty.toml` (typed `[font]` + top-level `shell`/`scrollback`/`theme` + reserved `[keybindings]`) re-applies on save via a debounced file watcher. Round-tripped with `toml_edit` so comments/formatting survive Settings-dialog writes. Legacy `config.json` auto-migrates on first launch.
+- [ ] 🟡 **Custom Keybindings** — User-rebindable shortcuts in `fasty.toml` (`[keybindings]` section already reserved). Required for split-pane UX.
 - [ ] 🟡 **Visual Settings Picker** — Replace the current text-number fields with a visual theme/font picker.
 - [ ] 🟢 **Plugin System (Lua/WASM)** — Ghostty/WezTerm-style scripting. High effort, but unlocks third-party themes, status bars, integrations.
 

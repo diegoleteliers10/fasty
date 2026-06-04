@@ -243,7 +243,10 @@ fn main() -> anyhow::Result<()> {
             .init();
     }
 
-    let mut config = Config::load()?;
+    let mut config = Config::load().unwrap_or_else(|e| {
+        tracing::warn!("config: startup load failed, using defaults: {e}");
+        Config::default()
+    });
     config::load_custom_themes();
 
     let fasty_args = FastyArgs::parse();
@@ -332,6 +335,15 @@ fn main() -> anyhow::Result<()> {
     let mut shell_cols = ((viewport_width - PADDING_LEFT * 2.0) / cell_width).floor().max(1.0) as usize;
     let mut shell_rows = ((viewport_height - (get_padding_top(1) + PADDING_BOTTOM)) / cell_height).floor().max(1.0) as usize;
     let proxy = event_loop.create_proxy();
+    {
+        let watcher_proxy = proxy.clone();
+        let watch_path = Config::get_active_config_path();
+        if let Err(e) = config::start_config_watcher(watch_path, move || {
+            let _ = watcher_proxy.send_event(AppEvent::ConfigChanged);
+        }) {
+            tracing::warn!("config: file watcher unavailable, live-reload disabled: {e}");
+        }
+    }
     let initial_tab = create_new_tab(
         &executable,
         &exec_args,
@@ -490,6 +502,95 @@ fn main() -> anyhow::Result<()> {
                     }
                     AppEvent::ForceExit => {
                         target.exit();
+                    }
+                    AppEvent::ConfigChanged => {
+                        match Config::load() {
+                            Ok(new_config) => {
+                                let theme_changed = new_config.theme != config.theme;
+                                let font_changed = new_config.font.family != config.font.family
+                                    || (new_config.font.size - config.font.size).abs() > f32::EPSILON;
+                                let scrollback_changed = new_config.scrollback != config.scrollback;
+                                let ligatures_changed = new_config.font.ligatures != config.font.ligatures;
+                                let weight_changed = (new_config.font.weight - config.font.weight).abs() > f32::EPSILON;
+                                let shell_changed = new_config.shell != config.shell;
+
+                                if theme_changed || font_changed || scrollback_changed || ligatures_changed || weight_changed || shell_changed {
+                                    tracing::info!(
+                                        "config: live-reload theme={} font={} scrollback={} ligatures={} weight={} shell={}",
+                                        theme_changed, font_changed, scrollback_changed, ligatures_changed, weight_changed, shell_changed
+                                    );
+                                    config = new_config;
+
+                                    if theme_changed {
+                                        if let Some(t) = &config.theme {
+                                            config::set_active_theme(t);
+                                        }
+                                    }
+
+                                    if font_changed {
+                                        if let Err(e) = renderer.lock().update_font(&config.font.family, config.font.size) {
+                                            tracing::error!("config live-reload: font update failed: {e:?}");
+                                        }
+                                        if let Some(ref mut sr) = settings_renderer {
+                                            let _ = sr.update_font(&config.font.family, 13.0);
+                                        }
+                                        let cell_w = renderer.lock().cell_width();
+                                        let cell_h = renderer.lock().cell_height();
+                                        let physical_size = window_for_redraw.inner_size();
+                                        let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_w, cell_h);
+                                        shell_cols = cols;
+                                        shell_rows = rows;
+                                        cell_width = cell_w;
+                                        cell_height = cell_h;
+                                    }
+
+                                    if scrollback_changed {
+                                        for tab in &tabs {
+                                            tab.terminal_state.lock().update_scrollback(config.scrollback);
+                                        }
+                                    }
+
+                                    if ligatures_changed {
+                                        tracing::info!("config: font.ligatures changed; restart fasty to apply");
+                                    }
+
+                                    if weight_changed {
+                                        tracing::info!("config: font.weight changed; restart fasty to apply");
+                                    }
+
+                                    if shell_changed {
+                                        tracing::info!("config: shell changed; applies to newly spawned tabs only");
+                                    }
+
+                                    if settings_window.is_some() {
+                                        settings_family = config.font.family.clone();
+                                        settings_size = config.font.size;
+                                        settings_scrollback = config.scrollback.min(3000);
+                                        settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
+                                        if let Some(ref mut sr) = settings_renderer {
+                                            sr.set_dirty(true);
+                                        }
+                                    }
+
+                                    renderer.lock().grid_dirty = true;
+                                    app_dirty = true;
+                                    window_for_redraw.request_redraw();
+                                    if let Some(ref w) = settings_window {
+                                        w.request_redraw();
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("config: reload failed, keeping in-memory: {e}");
+                                toast = Some((
+                                    "⚠ Not a valid config".to_string(),
+                                    std::time::Instant::now(),
+                                    4000,
+                                ));
+                                app_dirty = true;
+                                window_for_redraw.request_redraw();
+                            }
+                        }
                     }
                 }
             }
@@ -993,7 +1094,9 @@ fn main() -> anyhow::Result<()> {
 
                                 if new_size != current_config.font.size {
                                     current_config.font.size = new_size;
-                                    let _ = current_config.save(&Config::config_path());
+                                    if let Err(e) = current_config.save(&Config::get_active_config_path()) {
+                                        tracing::warn!("config: save failed: {e}");
+                                    }
                                     config = current_config;
 
                                     if let Err(e) = renderer.lock().update_font(&config.font.family, config.font.size) {
@@ -1405,12 +1508,15 @@ fn main() -> anyhow::Result<()> {
                                          } else if is_hovering_min {
                                              window_for_redraw.set_minimized(true);
                                              return;
-                                         } else if is_hovering_settings {
-                                              if settings_window.is_none() {
-                                                  settings_family = config.font.family.clone();
-                                                  settings_size = config.font.size;
-                                                  settings_scrollback = config.scrollback.min(3000);
-                                                  settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
+                                          } else if is_hovering_settings {
+                                               if settings_window.is_none() {
+                                                   if let Ok(fresh) = Config::load() {
+                                                       config = fresh;
+                                                   }
+                                                   settings_family = config.font.family.clone();
+                                                   settings_size = config.font.size;
+                                                   settings_scrollback = config.scrollback.min(3000);
+                                                   settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                                   settings_active_field = 0;
                                                   let visible = !cfg!(target_os = "windows");
                                                   match target.create_window(winit::window::WindowAttributes::default()
@@ -2258,7 +2364,9 @@ fn main() -> anyhow::Result<()> {
                                 current_config.font.size = settings_size;
                                 current_config.scrollback = settings_scrollback;
                                 current_config.theme = Some(settings_theme.clone());
-                                let _ = current_config.save(&Config::config_path());
+                                if let Err(e) = current_config.save(&Config::get_active_config_path()) {
+                                    tracing::warn!("config: save failed: {e}");
+                                }
 
                                 tracing::info!("apply_settings: theme={:?} family={:?} size={} scrollback={}",
                                     settings_theme, settings_family, settings_size, settings_scrollback);
@@ -2465,7 +2573,9 @@ fn main() -> anyhow::Result<()> {
                                         current_config.scrollback = settings_scrollback;
                                         current_config.theme = Some(settings_theme.clone());
                                         let path = Config::get_active_config_path();
-                                        let _ = current_config.save(&path);
+                                        if let Err(e) = current_config.save(&path) {
+                                            tracing::warn!("config: save failed before opening editor: {e}");
+                                        }
                                         let _ = open_file_in_editor(&path);
                                     } else {
                                         settings_active_field = 0;
