@@ -280,6 +280,33 @@ The theme is read on every cell render from a process-wide `RwLock<String>`, so 
 
 The `theme_accent` (the theme's `BrightBlue`) is used for selected-item highlights and active selection text in dropdowns, and `theme_item_hover` (theme bg lifted by +22/255) is used for hover rows. Both look right on every theme without per-theme overrides.
 
+### 📁 Custom Themes
+
+Drop a `.json` file into `~/.config/fasty/themes/` (the filename minus `.json` becomes the theme name) and it'll show up in the settings dropdown next launch. All 18 fields are optional except `background` and `foreground`; missing ANSI colors fall back to `foreground`.
+
+```json
+{
+  "background": "#1a1b26",
+  "foreground": "#c0caf5",
+  "black":   "#15161e",
+  "red":     "#f7768e",
+  "green":   "#9ece6a",
+  "yellow":  "#e0af68",
+  "blue":    "#7aa2f7",
+  "magenta": "#bb9af7",
+  "cyan":    "#7dcfff",
+  "white":   "#a9b1d6",
+  "bright_black":   "#414868",
+  "bright_red":     "#f7768e",
+  "bright_green":   "#9ece6a",
+  "bright_yellow":  "#e0af68",
+  "bright_blue":    "#7aa2f7",
+  "bright_magenta": "#bb9af7",
+  "bright_cyan":    "#7dcfff",
+  "bright_white":   "#c0caf5"
+}
+```
+
 ---
 
 ## ⌨️ Keyboard Shortcuts
@@ -306,7 +333,7 @@ Features under consideration for upcoming releases. Grouped by category and prio
 `[x]` = already implemented · `[ ]` = planned
 
 ### 🖼️ Graphics & Terminal Protocols
-- [ ] 🔴 **OSC 8 Hyperlinks** — Make `\e]8;;url\e\\text\e]8;;\e\\` clickable inline (currently requires `Ctrl+hover`). Industry standard, used by `ls --color`, `gh`, modern CLI tools.
+- [x] 🔴 **OSC 8 Hyperlinks** — `\e]8;;url\e\\text\e]8;;\e\\` is clickable inline via plain click. Hover state shows underline + accent tint. Auto-detected plain URLs (no OSC 8) still open via `Ctrl+click`. Industry standard, used by `ls --color`, `gh`, modern CLI tools.
 - [ ] 🔴 **Inline Image Protocol (iTerm2/Kitty)** — Render PNG/JPEG inline via the Kitty graphics protocol. Useful for `chafa`, `viu`, image previews in `yazi`/`ranger`.
 - [ ] 🟡 **Sixel Graphics** — Legacy image protocol still used by some tools (`img2sixel`, `ls -6`). Optional, opt-in via config.
 - [ ] 🟢 **Unicode 16 + Complex Shaping** — Better emoji ZWJ sequences, RTL text, Indic scripts. Current FreeType pipeline handles most cases; gaps remain.

@@ -886,9 +886,9 @@ impl Pipeline {
 
                 if in_search_match {
                     let highlight_color = if is_current_search_match {
-                        [255.0 / 255.0, 165.0 / 255.0, 0.0, 0.75]
+                        [255.0 / 255.0, 140.0 / 255.0, 0.0, 0.90]
                     } else {
-                        [255.0 / 255.0, 255.0 / 255.0, 0.0, 0.45]
+                        [255.0 / 255.0, 220.0 / 255.0, 0.0, 0.75]
                     };
                     let bg_instance = CellInstance::new(
                         cell_x, cell_y,
@@ -3339,7 +3339,33 @@ struct Theme {
 
 fn get_active_theme() -> Theme {
     let theme_name = crate::config::ACTIVE_THEME.read().clone();
-    match theme_name.to_lowercase().as_str() {
+    let name_lower = theme_name.to_lowercase();
+    if let Some(slots) = crate::config::try_get_custom_theme_full(&theme_name) {
+        // slots: 0=bg, 1=fg, 2..17=ANSI[0..15]. Fall back to fg for any missing slot.
+        let fallback = slots[1].unwrap_or((0, 0, 0));
+        let get = |i: usize| slots.get(i).copied().flatten().unwrap_or(fallback);
+        return Theme {
+            foreground: slots[1].unwrap_or((0, 0, 0)),
+            background: slots[0].unwrap_or((0, 0, 0)),
+            black: get(2),
+            red: get(3),
+            green: get(4),
+            yellow: get(5),
+            blue: get(6),
+            magenta: get(7),
+            cyan: get(8),
+            white: get(9),
+            bright_black: get(10),
+            bright_red: get(11),
+            bright_green: get(12),
+            bright_yellow: get(13),
+            bright_blue: get(14),
+            bright_magenta: get(15),
+            bright_cyan: get(16),
+            bright_white: get(17),
+        };
+    }
+    match name_lower.as_str() {
         "catppuccin" => Theme {
             foreground: (0xCA, 0xD3, 0xF5),
             background: (0x24, 0x27, 0x3A),

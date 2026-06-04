@@ -244,6 +244,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let mut config = Config::load()?;
+    config::load_custom_themes();
 
     let fasty_args = FastyArgs::parse();
 
@@ -397,12 +398,7 @@ fn main() -> anyhow::Result<()> {
     let mut settings_theme = String::new();
     let mut s_hover_theme = false;
     let mut settings_hovered_theme_idx: Option<usize> = None;
-    let themes_list = vec![
-        "default".to_string(),
-        "catppuccin".to_string(),
-        "one-dark".to_string(),
-        "solarized-dark".to_string(),
-    ];
+    let mut themes_list = config::all_theme_names();
     
     let mut s_hover_close = false;
     let mut s_hover_family = false;
@@ -769,7 +765,10 @@ fn main() -> anyhow::Result<()> {
                                 winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV) => true,
                                 _ => key_str.eq_ignore_ascii_case("v") || key_str == "\u{16}"
                             };
-
+                            let is_f_key = match event.physical_key {
+                                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyF) => true,
+                                _ => key_str.eq_ignore_ascii_case("f")
+                            };
                             // Ctrl+Shift+T -> new tab
                             if ctrl_active && shift_active && is_t_key {
                                 let new_tab_count = tabs.len() + 1;
@@ -906,6 +905,70 @@ fn main() -> anyhow::Result<()> {
                                 } else {
                                     eprintln!("fasty clipboard not available");
                                 }
+                                return;
+                            }
+
+                            // Ctrl+Shift+F -> open in-scrollback search
+                            if ctrl_active && shift_active && is_f_key {
+                                let tab = &mut tabs[active_tab_index];
+                                tab.search_visible = true;
+                                tab.search_query.clear();
+                                tab.search_matches.clear();
+                                tab.search_current_idx = 0;
+                                renderer.lock().set_dirty(true);
+                                app_dirty = true;
+                                return;
+                            }
+
+                            // When search bar is visible, all keyboard input goes to it.
+                            if tabs[active_tab_index].search_visible {
+                                use winit::keyboard::NamedKey;
+                                let tab = &mut tabs[active_tab_index];
+                                match &event.logical_key {
+                                    Key::Named(NamedKey::Escape) => {
+                                        tab.search_visible = false;
+                                        tab.search_query.clear();
+                                        tab.search_matches.clear();
+                                        tab.search_current_idx = 0;
+                                    }
+                                    Key::Named(NamedKey::Backspace) => {
+                                        tab.search_query.pop();
+                                        tab.search_matches = compute_search_matches(&tab.terminal_state, &tab.search_query, shell_cols, shell_rows);
+                                        tab.search_current_idx = 0;
+                                    }
+                                    Key::Named(NamedKey::Enter) => {
+                                        if !tab.search_matches.is_empty() {
+                                            tab.search_current_idx = (tab.search_current_idx + 1) % tab.search_matches.len();
+                                            let m = tab.search_matches[tab.search_current_idx];
+                                            if m.line < 0 {
+                                                tab.scroll_target = (-m.line) as f32;
+                                            } else {
+                                                tab.scroll_target = 0.0;
+                                            }
+                                        }
+                                    }
+                                    Key::Character(s) => {
+                                        if !ctrl_active && !alt_active {
+                                            tab.search_query.push_str(s);
+                                            tab.search_matches = compute_search_matches(&tab.terminal_state, &tab.search_query, shell_cols, shell_rows);
+                                            tab.search_current_idx = 0;
+                                        } else {
+                                            return;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                // Force the grid to rebuild so the new
+                                // search_matches and search_current_idx are
+                                // baked into the cell instances; otherwise
+                                // the cached grid keeps the previous frame's
+                                // highlights and current-match color.
+                                {
+                                    let mut r = renderer.lock();
+                                    r.set_dirty(true);
+                                    r.grid_dirty = true;
+                                }
+                                app_dirty = true;
                                 return;
                             }
 
@@ -1325,6 +1388,8 @@ fn main() -> anyhow::Result<()> {
                                                      &update_completed,
                                                      &window_for_redraw,
                                                      proxy.clone(),
+                                                     &tabs,
+                                                     active_tab_index,
                                                  );
                                                  return;
                                              }
@@ -1375,13 +1440,14 @@ fn main() -> anyhow::Result<()> {
                                                                           config.font.size,
                                                                           config.scrollback.min(3000),
                                                                           0,
-                                                                          false, false, false, false, false, false, false, false, false, false,
+                                                                          false, false, false, false, false, false, false, false,
                                                                           &system_fonts,
                                                                           0.0,
                                                                           None,
                                                                           &settings_theme,
                                                                           &themes_list,
                                                                           None,
+                                                                          0.0,
                                                                       );
                                                                       settings_window_arc.set_visible(true);
                                                                   }
@@ -3192,6 +3258,55 @@ fn open_url(url: &str) {
     }
 }
 
+fn compute_search_matches(
+    terminal_state: &Arc<parking_lot::Mutex<TerminalState>>,
+    query: &str,
+    shell_cols: usize,
+    shell_rows: usize,
+) -> Vec<renderer::SearchMatch> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let state = terminal_state.lock();
+    let history_size = state.history_size();
+    let term_guard = state.term().lock();
+    let grid = term_guard.grid();
+
+    let query_lower: Vec<char> = query.to_lowercase().chars().collect();
+    let q_chars: Vec<char> = query.chars().collect();
+    let mut matches: Vec<renderer::SearchMatch> = Vec::new();
+    let min_line: i32 = -(history_size as i32);
+    let max_line: i32 = shell_rows as i32;
+
+    for line_idx in min_line..max_line {
+        let row = &grid[alacritty_terminal::index::Line(line_idx)];
+        let row_chars: Vec<char> = (0..shell_cols).map(|c| row[alacritty_terminal::index::Column(c)].c).collect();
+        for start in 0..row_chars.len() {
+            if start + q_chars.len() > row_chars.len() {
+                break;
+            }
+            let mut ok = true;
+            for i in 0..q_chars.len() {
+                let rc = row_chars[start + i];
+                if rc.to_lowercase().next().unwrap_or('\0') != query_lower[i] {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                matches.push(renderer::SearchMatch { line: line_idx, col: start, len: q_chars.len() });
+                if matches.len() >= 1000 {
+                    break;
+                }
+            }
+        }
+        if matches.len() >= 1000 {
+            break;
+        }
+    }
+    matches
+}
+
 fn detect_hovered_hyperlink(
     current_mouse_x: f64,
     current_mouse_y: f64,
@@ -3509,6 +3624,8 @@ fn trigger_update(
     update_completed: &Arc<parking_lot::Mutex<bool>>,
     window: &Arc<winit::window::Window>,
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+    tabs: &Vec<Tab>,
+    active_tab_index: usize,
 ) {
     let completed = *update_completed.lock();
     if completed {
@@ -3562,15 +3679,14 @@ fn trigger_update(
     // Redraw window so the text switches to "Updating..." immediately
     window.request_redraw();
 
-    let update_in_progress_clone = Arc::clone(update_in_progress);
-    let update_completed_clone = Arc::clone(update_completed);
-    let window_clone = Arc::clone(window);
+    #[cfg(target_os = "windows")]
+    {
+        let update_in_progress_clone = Arc::clone(update_in_progress);
+        let update_completed_clone = Arc::clone(update_completed);
+        let window_clone = Arc::clone(window);
 
-    std::thread::spawn(move || {
-        let mut success = false;
-
-        #[cfg(target_os = "windows")]
-        {
+        std::thread::spawn(move || {
+            let mut success = false;
             if let Ok(mut child) = no_window_cmd("powershell")
                 .arg("-Command")
                 .arg("irm https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.ps1 | iex")
@@ -3579,45 +3695,32 @@ fn trigger_update(
                     success = status.success();
                 }
             }
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            if let Ok(mut child) = std::process::Command::new("sh")
-                .arg("-c")
-                .arg("curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash")
-                .env("FASTY_USER_INSTALL", "1")
-                .spawn() {
-                if let Ok(status) = child.wait() {
-                    success = status.success();
-                }
+            let mut in_progress = update_in_progress_clone.lock();
+            *in_progress = false;
+            if success {
+                let mut completed = update_completed_clone.lock();
+                *completed = true;
             }
+            window_clone.request_redraw();
+        });
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // On Linux/mac, write curl|bash to the user's terminal so they
+        // can see the install progress and enter the sudo password
+        // interactively. The install script's tail schedules a kill
+        // +restart of fasty after the install completes.
+        if let Some(tab) = tabs.get(active_tab_index) {
+            // No FASTY_USER_INSTALL env var: install into the system path
+            // (/usr/local/bin) so the system launcher/.desktop file points
+            // at the new binary after restart. The user will see the sudo
+            // prompt in this same terminal.
+            let cmd = b"curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash\n";
+            tab.terminal_state.lock().write_to_pty(cmd);
         }
-
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        {
-            // Linux and others
-            if let Ok(mut child) = std::process::Command::new("sh")
-                .arg("-c")
-                .arg("curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash")
-                .env("FASTY_USER_INSTALL", "1")
-                .spawn() {
-                if let Ok(status) = child.wait() {
-                    success = status.success();
-                }
-            }
-        }
-
-        let mut in_progress = update_in_progress_clone.lock();
-        *in_progress = false;
-
-        if success {
-            let mut completed = update_completed_clone.lock();
-            *completed = true;
-        }
-
-        window_clone.request_redraw();
-    });
+        *update_completed.lock() = true;
+    }
 }
 
 fn open_file_in_editor(path: &std::path::Path) -> std::io::Result<()> {

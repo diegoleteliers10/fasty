@@ -198,4 +198,16 @@ Keywords=terminal;emulator;wgpu;"
 
     echo "🎉 ¡$APP_NAME instalado con éxito en $BIN_DIR/$APP_NAME!"
     echo "💡 Puedes ejecutarlo buscando '$APP_NAME' en tu menú o escribiéndolo en terminal."
+
+    # Schedule a self-restart: 3s after this script exits, kill the
+    # current fasty and relaunch it. The deferred subshell survives
+    # even when the parent pty (the shell that ran this script) is
+    # destroyed, so the new fasty comes up cleanly.
+    (
+        sleep 3
+        pkill -x fasty 2>/dev/null || true
+        nohup "$BIN_DIR/$APP_NAME" >/dev/null 2>&1 &
+        disown
+    ) &
+    disown
 fi
