@@ -14,7 +14,8 @@ Inspired by [Ghostty](https://github.com/ghostty-org/ghostty), Fasty leverages `
 - **Animated Scrollbar Fading**: Smoothly fades the scrollbar out (using dynamic alpha opacity lerping) when running a text user interface (TUI) that owns mouse reporting or active alternate screen buffers, fading it back in instantly upon exit.
 - **Seamless TUI Mouse Integration**: Perfect mouse clicks and drag selections passed directly to the terminal PTY (such as inside Claude Code, htop, or vim) without interfering with desktop text selection.
 - **Tabbed Layout**: Support for multiple independent tabs, each running a native shell process.
-- **Configurable Settings Panel**: Adjust font family, font size, and scrollback capacity on-the-fly.
+- **Live-Apply Settings**: Font family, size (1pt step), scrollback, and theme are applied instantly to the running terminal — no Save / Cancel buttons, the dialog is a pure live-apply surface.
+- **Built-in Color Themes**: `default` (Fasty), `catppuccin`, `one-dark`, `solarized-dark`. Switches apply live to the main window, settings, and about dialogs. Topbar darkens on the active theme (`bg * 0.83` for non-default, hand-tuned `#0a0a0a` for default).
 - **Asynchronous Background Updater**: A non-blocking, automatic updater accessible via the topbar "Update" button. Selecting "Update" runs the installation script (`instalar.sh`/`instalar.ps1`) in a background thread, displaying "Updating...", and automatically launching the updated Fasty window and closing the old one on success.
 - **About Context Menu**: Left-clicking the Fasty top-bar logo triggers the options context menu, providing quick access to the "About Fasty" panel.
 
@@ -244,7 +245,8 @@ Fasty loads a file named `config.json` situated in the binary's execution direct
     "ligatures": true
   },
   "shell": null,
-  "scrollback": 3000
+  "scrollback": 3000,
+  "theme": "default"
 }
 ```
 
@@ -256,6 +258,27 @@ Fasty loads a file named `config.json` situated in the binary's execution direct
 | `font.ligatures` | `boolean` | Toggles rendering of font ligatures |
 | `shell` | `string?` | Custom shell path (set to `null` to detect default system shell) |
 | `scrollback` | `integer` | Lines of scrollback buffer history retained in memory (default 3000, capped at a maximum of 3000 for RAM efficiency) |
+| `theme` | `string` | Color scheme name. One of `default` (Fasty), `catppuccin`, `one-dark`, `solarized-dark`. Selectable live from the Settings dialog. |
+
+### 🎨 Built-in Themes
+
+| Theme | Background | Foreground | Notes |
+| :--- | :--- | :--- | :--- |
+| `default` | `#0C0C0C` | `#C5C8C6` | Fasty — original `#0c0c0c` terminal bg, Tomorrow Night text palette |
+| `catppuccin` | `#24273A` | `#CAD3F5` | Soft pastel, easy on the eyes |
+| `one-dark` | `#282C34` | `#ABB2BF` | Atom One Dark |
+| `solarized-dark` | `#002B36` | `#839496` | Classic Solarized dark (Ethan Schoonover) |
+
+The theme is read on every cell render from a process-wide `RwLock<String>`, so changes in the Settings dialog take effect immediately on the live terminal — no restart required. Each cell instance looks up its named color (`Foreground`, `Background`, `Red`, …) and the indexed 16-color palette through `named_color_rgb()` / `index_to_ansi_color()` which both dispatch to the active theme.
+
+**Themed surfaces** (all re-render on theme change):
+
+- Main window bg, topbar (darkened variant), active tab fill, scrollback area
+- Settings dialog: window bg, topbar, dropdown bgs, hover/selected item highlights, the closed-box rest/hover/active states for font family + theme pickers, the "Open config.json" button
+- About dialog: window bg and topbar
+- Context menu (right-click on the topbar icon) inner background
+
+The `theme_accent` (the theme's `BrightBlue`) is used for selected-item highlights and active selection text in dropdowns, and `theme_item_hover` (theme bg lifted by +22/255) is used for hover rows. Both look right on every theme without per-theme overrides.
 
 ---
 
@@ -275,70 +298,70 @@ Fasty loads a file named `config.json` situated in the binary's execution direct
 
 ## 🗺️ Roadmap
 
-Features under consideration for upcoming releases. Grouped by category and priority (**🔴 High** = high demand + low-medium effort, **🟡 Medium** = clear value but moderate effort, **🟢 Exploratory** = speculative, high effort or niche).
+Features under consideration for upcoming releases. Grouped by category and priority:
+- **🔴 High** = high demand + low-medium effort
+- **🟡 Medium** = clear value but moderate effort
+- **🟢 Exploratory** = speculative, high effort or niche
+
+`[x]` = already implemented · `[ ]` = planned
 
 ### 🖼️ Graphics & Terminal Protocols
-| Priority | Feature | Notes |
-| :--- | :--- | :--- |
-| 🔴 | **OSC 8 Hyperlinks** | Make `\e]8;;url\e\\text\e]8;;\e\\` clickable inline (currently requires `Ctrl+hover`). Industry standard, used by `ls --color`, `gh`, modern CLI tools. |
-| 🔴 | **Inline Image Protocol (iTerm2/Kitty)** | Render PNG/JPEG inline via the Kitty graphics protocol. Useful for `chafa`, `viu`, image previews in `yazi`/`ranger`. |
-| 🟡 | **Sixel Graphics** | Legacy image protocol still used by some tools (`img2sixel`, `ls -6`). Optional, opt-in via config. |
-| 🟢 | **Unicode 16 + Complex Shaping** | Better emoji ZWJ sequences, RTL text, Indic scripts. Current FreeType pipeline handles most cases; gaps remain. |
+- [ ] 🔴 **OSC 8 Hyperlinks** — Make `\e]8;;url\e\\text\e]8;;\e\\` clickable inline (currently requires `Ctrl+hover`). Industry standard, used by `ls --color`, `gh`, modern CLI tools.
+- [ ] 🔴 **Inline Image Protocol (iTerm2/Kitty)** — Render PNG/JPEG inline via the Kitty graphics protocol. Useful for `chafa`, `viu`, image previews in `yazi`/`ranger`.
+- [ ] 🟡 **Sixel Graphics** — Legacy image protocol still used by some tools (`img2sixel`, `ls -6`). Optional, opt-in via config.
+- [ ] 🟢 **Unicode 16 + Complex Shaping** — Better emoji ZWJ sequences, RTL text, Indic scripts. Current FreeType pipeline handles most cases; gaps remain.
+- [x] 🟡 **OpenType Font Ligatures** — Configurable via `font.ligatures`; rendered via `rustybuzz` shaping with high-perf row cache.
 
 ### ✂️ Productivity & Workflow
-| Priority | Feature | Notes |
-| :--- | :--- | :--- |
-| 🔴 | **In-Scrollback Search** | `Ctrl+Shift+F` opens a search bar that highlights matches in the live + scrollback buffer. Should be GPU-accelerated. |
-| 🔴 | **Command Palette** | `Ctrl+Shift+P` opens a fuzzy-search palette over settings, tab actions, themes. Inspired by VS Code/Sublime. |
-| 🔴 | **Session Restore** | Persist open tabs, working directories, and PWD on shutdown; restore on next launch. Optional via config. |
-| 🟡 | **Split Panes** | Horizontal/vertical splits per tab (like `tmux`/`Zellij`). Each split runs its own PTY. |
-| 🟡 | **Copy on Select** | Mouse selection auto-copies to clipboard, like `tmux`/`kitty` (with a config toggle for the current `Ctrl+Shift+C` flow). |
-| 🟡 | **Tab Reordering by Drag** | Currently read-only. Add drag-to-reorder + drag-to-detach (spawn new window). |
-| 🟢 | **Quake-Mode / Drop-Down Terminal** | Global hotkey toggles a top-anchored sliding window. Implementation: fullscreen transparent window + slide-in offset animation. |
-| 🟢 | **Shell Integration (Shell History, Last Command Markers)** | Mark command boundaries in scrollback, jump between them. Requires opt-in shell hooks (similar to `starship`/`fish`). |
+- [ ] 🔴 **In-Scrollback Search** — `Ctrl+Shift+F` opens a search bar that highlights matches in the live + scrollback buffer. Should be GPU-accelerated.
+- [ ] 🔴 **Command Palette** — `Ctrl+Shift+P` opens a fuzzy-search palette over settings, tab actions, themes. Inspired by VS Code/Sublime.
+- [ ] 🔴 **Session Restore** — Persist open tabs, working directories, and PWD on shutdown; restore on next launch. Optional via config.
+- [ ] 🟡 **Split Panes** — Horizontal/vertical splits per tab (like `tmux`/`Zellij`). Each split runs its own PTY.
+- [x] 🟡 **Copy on Select** — Mouse selection auto-copies to clipboard on mouse release, with a "✓ Text copied" toast. Inspired by `tmux`/`kitty` behavior.
+- [ ] 🟡 **Tab Reordering by Drag** — Currently read-only. Add drag-to-reorder + drag-to-detach (spawn new window).
+- [ ] 🟢 **Quake-Mode / Drop-Down Terminal** — Global hotkey toggles a top-anchored sliding window. Implementation: fullscreen transparent window + slide-in offset animation.
+- [ ] 🟢 **Shell Integration (Command Markers)** — Mark command boundaries in scrollback, jump between them. Requires opt-in shell hooks (similar to `starship`/`fish`).
+- [x] 🟡 **Click-to-Cursor Prompt Positioning** — Click anywhere in the prompt area to move the cursor to that position (vim-style).
+- [x] 🟡 **URL Hover Detection** — `Ctrl+hover` highlights URLs in terminal output; `Ctrl+click` opens in default browser.
 
 ### 🎨 Customization & Configuration
-| Priority | Feature | Notes |
-| :--- | :--- | :--- |
-| 🔴 | **Themes (Color Schemes)** | First-class color palette support. Ship 4–6 built-in themes (Tomorrow Night, Solarized, One Dark, Catppuccin) + a `.theme.json` loader. |
-| 🔴 | **TOML Config + Live Reload** | Replace the single `config.json` with a typed `fasty.toml` (sections: `[font]`, `[colors]`, `[keybindings]`, `[shell]`) that re-applies on save. |
-| 🟡 | **Custom Keybindings** | User-rebindable shortcuts in `fasty.toml`. Required for split-pane UX. |
-| 🟡 | **Per-Override Settings UI** | A visual theme/font picker, replacing the current text-number fields. |
-| 🟢 | **Plugin System (Lua/WASM)** | Ghostty/WezTerm-style scripting. High effort, but unlocks third-party themes, status bars, integrations. |
+- [x] 🔴 **Themes (Color Schemes)** — Built-in `default` (Fasty), `catppuccin`, `one-dark`, `solarized-dark`. Selectable live from the Settings dialog; persisted to `config.json` under the `theme` key.
+- [ ] 🔴 **TOML Config + Live Reload** — Replace the single `config.json` with a typed `fasty.toml` (sections: `[font]`, `[colors]`, `[keybindings]`, `[shell]`) that re-applies on save.
+- [ ] 🟡 **Custom Keybindings** — User-rebindable shortcuts in `fasty.toml`. Required for split-pane UX.
+- [ ] 🟡 **Visual Settings Picker** — Replace the current text-number fields with a visual theme/font picker.
+- [ ] 🟢 **Plugin System (Lua/WASM)** — Ghostty/WezTerm-style scripting. High effort, but unlocks third-party themes, status bars, integrations.
 
 ### 🤖 Modern Integrations
-| Priority | Feature | Notes |
-| :--- | :--- | :--- |
-| 🟡 | **AI Command Suggestions (opt-in)** | Local-only: pipe the last failed command to a small LLM (via Ollama / local API) for a fix suggestion. No telemetry. |
-| 🟡 | **Inline Git Status in Topbar** | Render the current tab's repo branch + dirty status in the topbar. Hooks `git status` lazily (cached, 1s debounce). |
-| 🟡 | **Built-in SSH Manager** | Quick `Ctrl+Shift+S` → "Connect to..." picker. Spawns `ssh user@host` inside a new tab. Replaces manual `fasty -e ssh user@host`. |
-| 🟢 | **Remote / `fasty://` URL Scheme** | Register a protocol so `fasty://new-tab?cwd=...` opens a new tab from a browser link. |
-| 🟢 | **Cloud Config Sync** | Optional encrypted sync of `fasty.toml` via a simple backend (or WebDAV). |
+- [ ] 🟡 **AI Command Suggestions (opt-in)** — Local-only: pipe the last failed command to a small LLM (via Ollama / local API) for a fix suggestion. No telemetry.
+- [ ] 🟡 **Inline Git Status in Topbar** — Render the current tab's repo branch + dirty status in the topbar. Hooks `git status` lazily (cached, 1s debounce).
+- [ ] 🟡 **Built-in SSH Manager** — Quick `Ctrl+Shift+S` → "Connect to..." picker. Spawns `ssh user@host` inside a new tab. Replaces manual `fasty -e ssh user@host`.
+- [ ] 🟢 **Remote / `fasty://` URL Scheme** — Register a protocol so `fasty://new-tab?cwd=...` opens a new tab from a browser link.
+- [ ] 🟢 **Cloud Config Sync** — Optional encrypted sync of `fasty.toml` via a simple backend (or WebDAV).
+- [x] 🟡 **Background Auto-Updater** — Non-blocking update check on startup + one-click install from the topbar "Update" button. Restarts Fasty automatically on success.
 
 ### ♿ Accessibility & Inclusion
-| Priority | Feature | Notes |
-| :--- | :--- | :--- |
-| 🔴 | **Screen Reader Bridge (Windows UIA / Linux AT-SPI / macOS AX)** | Announce output to assistive tech. Biggest current gap. |
-| 🟡 | **High-Contrast Theme** | WCAG AAA-compliant palette for users with low vision. |
-| 🟡 | **Color-Blind Palettes** | Deuteranopia/protanopia-friendly variants. |
-| 🟡 | **DPI Override Per-Monitor** | Already PerMonitorV2-aware; needs verified behavior on mixed-DPI multi-monitor setups. |
-| 🟢 | **Touch / Gesture Input** | Long-press to select, two-finger scroll in scrollback. Targets 2-in-1 laptops. |
+- [ ] 🔴 **Screen Reader Bridge (Windows UIA / Linux AT-SPI / macOS AX)** — Announce output to assistive tech. Biggest current gap.
+- [ ] 🟡 **High-Contrast Theme** — WCAG AAA-compliant palette for users with low vision.
+- [ ] 🟡 **Color-Blind Palettes** — Deuteranopia/protanopia-friendly variants.
+- [ ] 🟡 **DPI Override Per-Monitor** — Already PerMonitorV2-aware; needs verified behavior on mixed-DPI multi-monitor setups.
+- [ ] 🟢 **Touch / Gesture Input** — Long-press to select, two-finger scroll in scrollback. Targets 2-in-1 laptops.
 
 ### ⚙️ Performance & Reliability
-| Priority | Feature | Notes |
-| :--- | :--- | :--- |
-| 🔴 | **Scrollback-to-Disk** | Beyond 3000 lines, spill to a memory-mapped file. RAM-stays-low, infinite history. |
-| 🟡 | **GPU-Accelerated Search** | Run the in-scrollback search as a compute shader on the GPU-stored glyph index. Sub-millisecond on 100k lines. |
-| 🟡 | **Crash Reporting & Auto-Restart** | Optional opt-in crash dump upload (self-hosted) + automatic restart on panic. |
-| 🟢 | **Wide-Gamut (P3) and HDR Output** | Detect HDR displays, emit 10-bit color where supported. Currently 8-bit sRGB only. |
+- [x] 🔴 **D3D12 Debug Layer Disabled in Release (v0.2.5)** — `wgpu::InstanceFlags::from_build_config()` skips the debug layer that loads `d3d12sdklayers.dll` and 3 helper processes (cause of the 3 startup terminal flashes on Windows).
+- [x] 🔴 **`MemoryHints::MemoryUsage` on Windows (v0.2.5)** — Prevents the D3D12 driver from creating CPU-accessible shadow copies of every GPU resource. Saved ~20–50MB.
+- [x] 🔴 **CREATE_NO_WINDOW on All Windows Spawns (v0.2.5)** — Helper `no_window_cmd()` applies `creation_flags(0x08000000)` to every `Command::new` on Windows (curl, reg, cmd, powershell, fasty relaunch).
+- [x] 🔴 **First-Frame Render Before Show on Dialogs (v0.2.5)** — Settings and About windows commit their first swapchain frame before `set_visible(true)`, eliminating the white backbuffer flash on Windows.
+- [ ] 🔴 **Scrollback-to-Disk** — Beyond 3000 lines, spill to a memory-mapped file. RAM-stays-low, infinite history.
+- [ ] 🟡 **GPU-Accelerated Search** — Run the in-scrollback search as a compute shader on the GPU-stored glyph index. Sub-millisecond on 100k lines.
+- [ ] 🟡 **Crash Reporting & Auto-Restart** — Optional opt-in crash dump upload (self-hosted) + automatic restart on panic.
+- [ ] 🟢 **Wide-Gamut (P3) and HDR Output** — Detect HDR displays, emit 10-bit color where supported. Currently 8-bit sRGB only.
 
 ### 🪟 Platform & Packaging
-| Priority | Feature | Notes |
-| :--- | :--- | :--- |
-| 🔴 | **Signed MSIX / `.msi` Installer for Windows** | Replace the PowerShell installer. Microsoft's `makeappx` + a self-signed cert. |
-| 🟡 | **Flatpak for Linux** | Sandbox-friendly distribution. |
-| 🟡 | **Homebrew Formula Maintenance** | Already installable via the script; a real tap is overdue. |
-| 🟢 | **Android (via `winit` + `wgpu` Mobile)** | The same codebase already builds for Android (the crates support it). Just need touch-friendly input and on-screen keyboard. |
+- [ ] 🔴 **Signed MSIX / `.msi` Installer for Windows** — Replace the PowerShell installer. Microsoft's `makeappx` + a self-signed cert.
+- [x] 🟡 **Start Menu Shortcut on Windows** — Auto-registered on first launch via the registry (no admin required).
+- [ ] 🟡 **Flatpak for Linux** — Sandbox-friendly distribution.
+- [ ] 🟡 **Homebrew Formula Maintenance** — Already installable via the script; a real tap is overdue.
+- [ ] 🟢 **Android (via `winit` + `wgpu` Mobile)** — The same codebase already builds for Android (the crates support it). Just need touch-friendly input and on-screen keyboard.
 
 > **Have a feature request?** Open an issue on GitHub. Anything that fits the "minimal, fast, GPU-native terminal" philosophy is welcome.
 

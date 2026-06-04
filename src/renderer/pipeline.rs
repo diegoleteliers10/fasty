@@ -593,10 +593,15 @@ impl Pipeline {
         selection: Option<crate::renderer::Selection>,
         hovered_url: Option<crate::renderer::HoveredUrl>,
         hovered_hyperlink: Option<&str>,
+        search_matches: &[crate::renderer::SearchMatch],
+        search_current_idx: usize,
+        search_visible: bool,
+        search_query_render: &str,
+        terminal_font_size: f32,
         toast: Option<(&str, std::time::Instant, u64)>,
         active_tab_index: usize,
         tab_titles: &[String],
-        active_tab_path: &str,
+        _active_tab_path: &str,
         context_menu_visible: bool,
         context_menu_is_about: bool,
         context_menu_x: f32,
@@ -676,11 +681,28 @@ impl Pipeline {
         let mut ui_bg_instances = Vec::new();
         let mut ui_fg_instances = Vec::new();
 
-        // 1. Draw unified bar background (#0a0a0a)
+        // Topbar color is a darker variant of the theme bg so it visually
+        // separates from the terminal area. The default theme keeps its
+        // hand-tuned #0a0a0a; other themes derive their topbar from bg * 0.83.
+        let (bg_r, bg_g, bg_b) = named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::Background);
+        let theme_bg = [bg_r as f32 / 255.0, bg_g as f32 / 255.0, bg_b as f32 / 255.0, 1.0];
+        let active_theme = crate::config::ACTIVE_THEME.read().to_lowercase();
+        let theme_topbar = if active_theme == "default" {
+            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0]
+        } else {
+            [
+                bg_r as f32 / 255.0 * 0.83,
+                bg_g as f32 / 255.0 * 0.83,
+                bg_b as f32 / 255.0 * 0.83,
+                1.0,
+            ]
+        };
+
+        // 1. Draw unified bar background (darker variant of theme bg)
         let bar_bg = CellInstance::new(
             0.0, 0.0,
             viewport_width, 40.0,
-            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0],
+            theme_topbar,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
             8.0, // radius of 8 at top corners
@@ -691,7 +713,7 @@ impl Pipeline {
         let bar_bottom_fill = CellInstance::new(
             0.0, 32.0,
             viewport_width, 8.0,
-            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0],
+            theme_topbar,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 0.0, 0.0,
             0.0, // square
@@ -710,18 +732,18 @@ impl Pipeline {
             let window_bg = CellInstance::new(
                 0.0, 0.0,
                 viewport_width, viewport_height,
-                [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0], // Terminal bg color (#0c0c0c)
+                theme_bg, // Terminal bg color
                 [0.0, 0.0, 0.0, 0.0],
                 0.0, 0.0, 1.0, 1.0,
                 8.0, // radius of 8
             );
             term_bg_instances.push(window_bg);
 
-            // 3. Draw terminal background (#0c0c0c) below the unified topbar
+            // 3. Draw terminal background below the unified topbar
             let terminal_bg = CellInstance::new(
                 0.0, 40.0,
                 viewport_width, viewport_height - 40.0,
-                [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0],
+                theme_bg,
                 [0.0, 0.0, 0.0, 0.0],
                 0.0, 0.0, 1.0, 1.0,
                 8.0, // bottom corners radius of 8
@@ -732,7 +754,7 @@ impl Pipeline {
             let terminal_top_fill = CellInstance::new(
                 0.0, 40.0,
                 viewport_width, 8.0,
-                [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0],
+                theme_bg,
                 [0.0, 0.0, 0.0, 0.0],
                 0.0, 0.0, 0.0, 0.0,
                 0.0, // square
@@ -763,6 +785,15 @@ impl Pipeline {
                         alacritty_terminal::vte::ansi::NamedColor::Background
                     )
                 );
+
+                let in_search_match = search_matches.iter().any(|m| {
+                    m.line == point.line.0
+                        && col >= m.col && col < m.col + m.len
+                });
+                let is_current_search_match = search_matches.get(search_current_idx)
+                    .map(|m| m.line == point.line.0
+                        && col >= m.col && col < m.col + m.len)
+                    .unwrap_or(false);
 
                 let cell_x = (col as f32 * cell_width).round() + Self::PADDING_LEFT;
                 let next_cell_x = ((col + 1) as f32 * cell_width).round() + Self::PADDING_LEFT;
@@ -851,6 +882,23 @@ impl Pipeline {
                         );
                         bg_instances.push(bg_instance);
                     }
+                }
+
+                if in_search_match {
+                    let highlight_color = if is_current_search_match {
+                        [255.0 / 255.0, 165.0 / 255.0, 0.0, 0.75]
+                    } else {
+                        [255.0 / 255.0, 255.0 / 255.0, 0.0, 0.45]
+                    };
+                    let bg_instance = CellInstance::new(
+                        cell_x, cell_y,
+                        actual_cell_width, actual_cell_height,
+                        highlight_color,
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0, 0.0, 0.0, 0.0,
+                        0.0,
+                    );
+                    bg_instances.push(bg_instance);
                 }
             }
 
@@ -1026,6 +1074,157 @@ impl Pipeline {
         let fg_instances = &mut ui_fg_instances;
         let atlas = ui_atlas;
 
+        // In-scrollback search bar (Ctrl+Shift+F) — floating block in the
+        // top-right corner, just below the topbar with an 8px top margin.
+        if search_visible {
+            let bar_w = (viewport_width * 0.32).clamp(280.0, 480.0);
+            let bar_h = 52.0f32;
+            let bar_x = viewport_width - bar_w - 16.0;
+            let bar_y = 40.0f32 + 8.0f32;
+            let bar_radius = 8.0f32;
+
+            // Floating block background with rounded corners
+            let bar_bg = CellInstance::new(
+                bar_x, bar_y,
+                bar_w, bar_h,
+                [18.0 / 255.0, 18.0 / 255.0, 22.0 / 255.0, 0.98],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                bar_radius,
+            );
+            bg_instances.push(bar_bg);
+
+            // Subtle 1px border to define the block against the terminal
+            let border = CellInstance::new(
+                bar_x + 0.5, bar_y + 0.5,
+                bar_w - 1.0, bar_h - 1.0,
+                [1.0, 1.0, 1.0, 0.10],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                bar_radius,
+            );
+            bg_instances.push(border);
+
+            // True monospace cell: every char occupies a fixed-width slot
+            // and the glyph is centered inside it. Same pattern as the
+            // terminal text rendering (cell_x = col * cell_width), so the
+            // visible spacing between letters is consistent and the cursor
+            // can sit exactly on a cell boundary.
+            //
+            // The ui_atlas is rasterized at (font_size * scale_factor)
+            // physical pixels, so we scale the bitmap by cell_h / physical
+            // to render it inside our cell. Without that denominator, on
+            // HiDPI displays the bitmap is drawn 2x too big and gets
+            // clipped by the bar.
+            let cell_w = 9.0f32;
+            let cell_h = 14.0f32;
+            let physical_font_size = atlas.font_size() * atlas.scale_factor();
+            let scale = cell_h / physical_font_size;
+            let ascent_phys = atlas.ascent();
+            let ascent = ascent_phys * scale;
+            // Descent is roughly 25% of ascent for typical monospace fonts.
+            // Including it in the centered text block keeps descenders
+            // ('p', 'g', 'q', 'y') inside the bar.
+            let descent_approx = ascent * 0.3;
+            let total_text_h = ascent + descent_approx;
+            let baseline_y = bar_y + (bar_h - total_text_h) * 0.5 + ascent;
+
+            let mut cx = bar_x + 14.0f32;
+            let text_right_edge = bar_x + bar_w - 70.0f32;
+
+            for c in search_query_render.chars() {
+                if c == '\0' { continue; }
+                if cx > text_right_edge { break; }
+                if c == ' ' {
+                    cx += cell_w;
+                    continue;
+                }
+                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                    if entry.width <= 0.0 || entry.height <= 0.0 {
+                        cx += cell_w;
+                        continue;
+                    }
+                    let gw = entry.width * scale;
+                    let gh = entry.height * scale;
+                    let (aw, ah) = atlas.atlas_size();
+                    let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                    let uv_w = uv_end_x - uv_x;
+                    let uv_h = uv_end_y - uv_y;
+                    let glyph_y = baseline_y + entry.top * scale;
+                    // Center glyph horizontally in its fixed cell so the
+                    // inter-letter gap is uniform regardless of glyph shape.
+                    let glyph_x = cx + (cell_w - gw) * 0.5;
+                    fg_instances.push(CellInstance::new(
+                        glyph_x, glyph_y,
+                        gw, gh,
+                        [1.0, 1.0, 1.0, 1.0],
+                        [0.0, 0.0, 0.0, 0.0],
+                        uv_x, uv_y, uv_w, uv_h,
+                        0.0,
+                    ));
+                    cx += cell_w;
+                }
+            }
+
+            let cursor_visible = ((current_time * 2.0).sin() as f32).abs() > 0.1;
+            if cursor_visible && cx <= text_right_edge {
+                // Cursor spans the cap-height (from top of cap to baseline),
+                // matching the actual text metrics so it lines up with the
+                // rendered letters.
+                let cursor_top = baseline_y - ascent;
+                fg_instances.push(CellInstance::new(
+                    cx, cursor_top,
+                    1.5, ascent,
+                    [1.0, 1.0, 1.0, 0.85],
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                ));
+            }
+
+            // Count "X / Y" on the right (same monospace cells, right-aligned)
+            let total = search_matches.len();
+            let current = if total > 0 { search_current_idx + 1 } else { 0 };
+            let count_str = format!("{} / {}", current, total);
+            let count_color = if total == 0 {
+                [0.6, 0.6, 0.6, 1.0]
+            } else {
+                [1.0, 0.85, 0.30, 1.0]
+            };
+            let count_len = count_str.chars().count();
+            let count_total_w = count_len as f32 * cell_w;
+            let mut count_x = bar_x + bar_w - count_total_w - 14.0;
+            for c in count_str.chars() {
+                if c == ' ' {
+                    count_x += cell_w;
+                    continue;
+                }
+                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                    if entry.width <= 0.0 || entry.height <= 0.0 {
+                        count_x += cell_w;
+                        continue;
+                    }
+                    let gw = entry.width * scale;
+                    let gh = entry.height * scale;
+                    let (aw, ah) = atlas.atlas_size();
+                    let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                    let uv_w = uv_end_x - uv_x;
+                    let uv_h = uv_end_y - uv_y;
+                    let glyph_y = baseline_y + entry.top * scale;
+                    let glyph_x = count_x + (cell_w - gw) * 0.5;
+                    fg_instances.push(CellInstance::new(
+                        glyph_x, glyph_y,
+                        gw, gh,
+                        count_color,
+                        [0.0, 0.0, 0.0, 0.0],
+                        uv_x, uv_y, uv_w, uv_h,
+                        0.0,
+                    ));
+                    count_x += cell_w;
+                }
+            }
+        }
+
         // Draw unified topbar app icon or fallback lightning icon (⚡) U+26A1
         if let Some(entry) = &atlas.app_icon {
             let icon_scale = 16.0f32 / entry.height;
@@ -1128,13 +1327,13 @@ impl Pipeline {
             let is_active = i == active_tab_index;
             let is_hovered = hovered_tab_index == Some(i);
 
-            // Active tab bg (#0c0c0c), Inactive tab bg is transparent (no fill)
+            // Active tab bg matches theme terminal bg so the tab merges seamlessly
+            // with the terminal area below. Inactive tab bg is transparent.
             if is_active {
-                // Background fills up to 40.0 to merge visually with terminal background
                 bg_instances.push(CellInstance::new(
                     tab_x, 0.0,
                     tab_width, 40.0,
-                    [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0], // Terminal bg color (#0c0c0c)
+                    theme_bg,
                     [0.0, 0.0, 0.0, 0.0],
                     0.0, 0.0, 0.0, 0.0,
                     0.0,
@@ -1331,46 +1530,7 @@ impl Pipeline {
             ));
         }
 
-        // Draw centered path display
-        let basename = active_tab_path.split(|c| c == '/' || c == '\\').last().unwrap_or("fasty");
-        let path_scale = 14.0f32 / atlas.font_size();
-        let mut text_w = 0.0f32;
-        for c in basename.chars() {
-            if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
-                text_w += (entry.width + 1.0) * path_scale;
-            }
-        }
-
-        let mut tx = (viewport_width - text_w) / 2.0f32;
-        let scaled_ascent = atlas.ascent() * path_scale;
-        let path_baseline_y = (40.0f32 - 14.0f32) / 2.0f32 + scaled_ascent;
-        
-        for c in basename.chars() {
-            if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
-                if entry.width > 0.0 {
-                    let glyph_w = entry.width * path_scale;
-                    let glyph_h = entry.height * path_scale;
-                    let glyph_x = (tx + entry.left * path_scale).round();
-                    let glyph_y = (path_baseline_y + entry.top * path_scale).round();
-                    let (aw, ah) = atlas.atlas_size();
-                    let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
-                    let uv_w = uv_end_x - uv_x;
-                    let uv_h = uv_end_y - uv_y;
-
-                    fg_instances.push(CellInstance::new(
-                        glyph_x, glyph_y,
-                        glyph_w, glyph_h,
-                        [1.0, 1.0, 1.0, 0.30], // rgba(255,255,255,0.30)
-                        [0.0, 0.0, 0.0, 0.0],
-                        uv_x, uv_y, uv_w, uv_h,
-                        0.0,
-                    ));
-                    tx += (entry.width + 1.0) * path_scale;
-                } else if c == ' ' {
-                    tx += 8.0 * path_scale;
-                }
-            }
-        }
+        // Centered path display removed — the active tab already shows its name.
 
         // Draw window controls (Settings, vertical line, Minimize, Maximize, Close)
         let controls_y = 6.0f32; // centered vertically: (40 - 28)/2
@@ -1421,15 +1581,18 @@ impl Pipeline {
             // Draw button text
             let text = if update_completed { "Reiniciar" } else if update_in_progress { "Updating..." } else { "Update" };
             let text_scale = 11.0f32 / atlas.font_size();
+            let text_cell_w = atlas.cell_size().0 * text_scale;
 
             // Measure text to center it inside the button
             let mut text_w = 0.0f32;
             for c in text.chars() {
+                if c == ' ' {
+                    text_w += text_cell_w;
+                    continue;
+                }
                 if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                     if entry.width > 0.0 {
                         text_w += (entry.width + 1.0) * text_scale;
-                    } else if c == ' ' {
-                        text_w += 6.0 * text_scale;
                     }
                 }
             }
@@ -1441,6 +1604,10 @@ impl Pipeline {
             let scaled_ascent = atlas.ascent() * text_scale;
             let path_baseline_y = (ty + scaled_ascent - 1.5).round();
             for c in text.chars() {
+                if c == ' ' {
+                    curr_x += text_cell_w;
+                    continue;
+                }
                 if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                     if entry.width > 0.0 {
                         let glyph_w = entry.width * text_scale;
@@ -1461,8 +1628,6 @@ impl Pipeline {
                             0.0,
                         ));
                         curr_x += (entry.width + 1.0) * text_scale;
-                    } else if c == ' ' {
-                        curr_x += 6.0 * text_scale;
                     }
                 }
             }
@@ -1712,13 +1877,16 @@ impl Pipeline {
 
             if alpha > 0.0 {
                 let scale = 13.0 / atlas.font_size();
+                let toast_cell_w = atlas.cell_size().0 * scale;
                 let mut text_w = 0.0f32;
                 for c in msg.chars() {
+                    if c == ' ' {
+                        text_w += toast_cell_w;
+                        continue;
+                    }
                     if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                         if entry.width > 0.0 {
                             text_w += (entry.width + 1.0) * scale;
-                        } else if c == ' ' {
-                            text_w += 8.0 * scale;
                         }
                     }
                 }
@@ -1757,6 +1925,10 @@ impl Pipeline {
                 let mut tx = toast_x + 14.0;
                 let baseline_y = toast_y + 8.0 + atlas.ascent() * scale;
                 for c in msg.chars() {
+                    if c == ' ' {
+                        tx += toast_cell_w;
+                        continue;
+                    }
                     if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                         if entry.width > 0.0 {
                             let glyph_w = entry.width * scale;
@@ -1777,8 +1949,6 @@ impl Pipeline {
                                 0.0,
                             ));
                             tx += (entry.width + 1.0) * scale;
-                        } else if c == ' ' {
-                            tx += 8.0 * scale;
                         }
                     }
                 }
@@ -1872,11 +2042,18 @@ impl Pipeline {
                 10.0, // 10px corner radius on all corners
             );
 
-            // 2. Inner background (rgba(36, 38, 42, 0.97) or rgba(12, 12, 12, 1.0))
+            // 2. Inner background — theme_bg for the about variant, a
+            // slightly lifted theme_bg for the regular menu (matches the
+            // rgba(36,38,42,0.97) lift from default #0c0c0c by +14 per channel).
             let inner_bg_color = if context_menu_is_about {
-                [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0]
+                [theme_bg[0], theme_bg[1], theme_bg[2], 1.0]
             } else {
-                [36.0 / 255.0, 38.0 / 255.0, 42.0 / 255.0, 0.97]
+                [
+                    (theme_bg[0] + 14.0 / 255.0).min(1.0),
+                    (theme_bg[1] + 14.0 / 255.0).min(1.0),
+                    (theme_bg[2] + 14.0 / 255.0).min(1.0),
+                    0.97,
+                ]
             };
             anim_push(
                 context_menu_x + 1.0,
@@ -1990,8 +2167,13 @@ impl Pipeline {
                         // Render text label left-aligned at relative x=30px (context_menu_x + 30px)
                         let (_, ui_cell_height) = atlas.cell_size();
                         let text_baseline_y = item_center_y - (ui_cell_height * base_scale) / 2.0 + atlas.ascent() * base_scale;
+                        let ctx_cell_w = atlas.cell_size().0 * base_scale;
                         let mut label_x = context_menu_x + 30.0;
                         for c in label.chars() {
+                            if c == ' ' {
+                                label_x += ctx_cell_w;
+                                continue;
+                            }
                             if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                                 if entry.width > 0.0 {
                                     let glyph_w = entry.width * base_scale;
@@ -2018,8 +2200,6 @@ impl Pipeline {
                                         0.0,
                                     );
                                     label_x += (entry.width + 1.0) * base_scale;
-                                } else if c == ' ' {
-                                    label_x += 8.0 * base_scale;
                                 }
                             }
                         }
@@ -2141,12 +2321,15 @@ impl Pipeline {
         hover_size_plus: bool,
         hover_scroll_minus: bool,
         hover_scroll_plus: bool,
+        hover_theme: bool,
         hover_open_config: bool,
-        hover_save: bool,
-        hover_cancel: bool,
         system_fonts: &[String],
         font_scroll_y: f32,
         hovered_font_idx: Option<usize>,
+        theme: &str,
+        themes: &[String],
+        hovered_theme_idx: Option<usize>,
+        theme_scroll_y: f32,
         device: &Device,
         queue: &wgpu::Queue,
     ) {
@@ -2159,21 +2342,60 @@ impl Pipeline {
         let mut bg_instances = Vec::new();
         let mut fg_instances = Vec::new();
 
-        // 0. Draw window background (slate dark)
+        // Same theme_bg / theme_topbar as the main window so the dialogs
+        // match the active terminal palette. Default keeps #0a0a0a; others
+        // derive from bg * 0.83. Also pull the theme's bright blue for
+        // selected-item highlights so the active dropdown row reads as
+        // "selected" across every theme.
+        let (bg_r, bg_g, bg_b) = named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::Background);
+        let theme_bg = [bg_r as f32 / 255.0, bg_g as f32 / 255.0, bg_b as f32 / 255.0, 1.0];
+        let (bb_r, bb_g, bb_b) = named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::BrightBlue);
+        let theme_accent = [bb_r as f32 / 255.0, bb_g as f32 / 255.0, bb_b as f32 / 255.0, 1.0];
+        let active_theme = crate::config::ACTIVE_THEME.read().to_lowercase();
+        let theme_topbar = if active_theme == "default" {
+            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0]
+        } else {
+            [
+                bg_r as f32 / 255.0 * 0.83,
+                bg_g as f32 / 255.0 * 0.83,
+                bg_b as f32 / 255.0 * 0.83,
+                1.0,
+            ]
+        };
+        // Lifted theme_bg variants for the closed-box rest/hover/active
+        // states. Default ratios: rest = #101014, hover = #16161C, active = #191920.
+        let lift = |offset: f32| -> [f32; 4] {
+            [
+                (bg_r as f32 / 255.0 + offset / 255.0).min(1.0),
+                (bg_g as f32 / 255.0 + offset / 255.0).min(1.0),
+                (bg_b as f32 / 255.0 + offset / 255.0).min(1.0),
+                1.0,
+            ]
+        };
+        let theme_lift_rest = lift(4.0);
+        let theme_lift_box_hover = lift(6.0);
+        let theme_lift_box_active = lift(9.0);
+        let theme_lift_hover = lift(13.0);
+        // Item hover uses a stronger theme-bg lift so the row stands out
+        // against the dropdown bg without resorting to a hardcoded white
+        // overlay that fights light themes.
+        let theme_item_hover = lift(22.0);
+
+        // 0. Draw window background (theme bg)
         bg_instances.push(CellInstance::new(
             0.0, 0.0,
             viewport_width, viewport_height,
-            [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0], // Settings bg (#0c0c0c)
+            theme_bg,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
             8.0 * scale,
         ));
 
-        // 1. Draw topbar background (#0a0a0a)
+        // 1. Draw topbar background (darker variant of theme bg)
         bg_instances.push(CellInstance::new(
             0.0, 0.0,
             viewport_width, 36.0 * scale,
-            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0],
+            theme_topbar,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
             8.0 * scale,
@@ -2181,7 +2403,7 @@ impl Pipeline {
         bg_instances.push(CellInstance::new(
             0.0, 28.0 * scale,
             viewport_width, 8.0 * scale,
-            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0],
+            theme_topbar,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 0.0, 0.0,
             0.0,
@@ -2195,10 +2417,19 @@ impl Pipeline {
             0.0,
         ));
 
-        // Helper to draw text helper
+        // Helper to draw text. Spaces must be handled BEFORE the get_or_rasterize
+        // call (a space can return None or a 0-width entry) and must advance by
+        // the actual cell width — a hardcoded 8px is too narrow compared to
+        // letter advances (~entry.width + 2), which is why "Zed Mono Extended"
+        // was rendering as "ZedMonoExtended".
+        let cell_w = atlas.cell_size().0 * scale;
         let draw_text = |atlas: &mut crate::renderer::Atlas, text: &str, start_x: f32, start_y: f32, color: [f32; 4], fg_list: &mut Vec<CellInstance>| {
             let mut x = start_x * scale;
             for c in text.chars() {
+                if c == ' ' {
+                    x += cell_w;
+                    continue;
+                }
                 if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                     if entry.width > 0.0 {
                         let glyph_x = (x + entry.left).round();
@@ -2214,8 +2445,6 @@ impl Pipeline {
                             0.0,
                         ));
                         x += entry.width + 2.0 * scale;
-                    } else if c == ' ' {
-                        x += 8.0 * scale;
                     }
                 }
             }
@@ -2258,15 +2487,16 @@ impl Pipeline {
         draw_text(atlas, "Font Family:", 20.0, 56.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
         draw_text(atlas, "Font Size:", 20.0, 96.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
         draw_text(atlas, "Scrollback:", 20.0, 136.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
+        draw_text(atlas, "Theme:", 20.0, 176.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
 
         // Draw inputs
         // 1. Font Family select box
         let family_bg = if active_field == 1 {
-            [25.0 / 255.0, 25.0 / 255.0, 32.0 / 255.0, 1.0]
+            theme_lift_box_active
         } else if hover_font_family {
-            [22.0 / 255.0, 22.0 / 255.0, 28.0 / 255.0, 1.0]
+            theme_lift_box_hover
         } else {
-            [16.0 / 255.0, 16.0 / 255.0, 20.0 / 255.0, 1.0]
+            theme_lift_rest
         };
         bg_instances.push(CellInstance::new(
             140.0 * scale, 52.0 * scale,
@@ -2410,16 +2640,60 @@ impl Pipeline {
             ));
         }
 
-        // 4. Config File option
-        draw_text(atlas, "Config File:", 20.0, 176.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
-
-        let config_bg = if hover_open_config {
-            [25.0 / 255.0, 25.0 / 255.0, 32.0 / 255.0, 1.0]
+        // 4. Theme picker
+        let theme_bg = if active_field == 2 {
+            theme_lift_box_active
+        } else if hover_theme {
+            theme_lift_box_hover
         } else {
-            [16.0 / 255.0, 16.0 / 255.0, 20.0 / 255.0, 1.0]
+            theme_lift_rest
         };
         bg_instances.push(CellInstance::new(
             140.0 * scale, 172.0 * scale,
+            240.0 * scale, 26.0 * scale,
+            theme_bg,
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            6.0 * scale,
+        ));
+
+        // Color swatch for the active theme (left side, 4 small color dots)
+        let swatch_x = 148.0f32 * scale;
+        let swatch_y = 172.0f32 * scale + (26.0f32 * scale - 12.0f32 * scale) / 2.0f32;
+        let theme_colors = named_color_rgb_for_theme(theme);
+        let swatch_colors: [(u8, u8, u8); 4] = [
+            theme_colors.0, // foreground
+            theme_colors.1, // red
+            theme_colors.2, // green
+            theme_colors.3, // blue
+        ];
+        for (i, (r, g, b)) in swatch_colors.iter().enumerate() {
+            let cx = swatch_x + i as f32 * 4.0f32 * scale;
+            fg_instances.push(CellInstance::new(
+                cx, swatch_y,
+                3.0f32 * scale, 12.0f32 * scale,
+                [*r as f32 / 255.0, *g as f32 / 255.0, *b as f32 / 255.0, 1.0],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 0.0, 0.0,
+                1.0f32 * scale,
+            ));
+        }
+
+        // Theme name text
+        draw_text(atlas, theme, 172.0, 176.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+        // Dropdown arrow
+        draw_text(atlas, "▾", 362.0, 176.0, [0.7, 0.7, 0.75, 1.0], &mut fg_instances);
+
+        // 5. Config File option
+        draw_text(atlas, "Config File:", 20.0, 216.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
+
+        let config_bg = if hover_open_config {
+            theme_lift_hover
+        } else {
+            theme_lift_rest
+        };
+        bg_instances.push(CellInstance::new(
+            140.0 * scale, 212.0 * scale,
             240.0 * scale, 26.0 * scale,
             config_bg,
             [0.0, 0.0, 0.0, 0.0],
@@ -2432,7 +2706,7 @@ impl Pipeline {
             let entry_w = 14.0f32 * scale;
             let entry_h = 14.0f32 * scale;
             let glyph_x = 148.0f32 * scale;
-            let glyph_y = 172.0f32 * scale + (26.0f32 * scale - entry_h) / 2.0f32;
+            let glyph_y = 212.0f32 * scale + (26.0f32 * scale - entry_h) / 2.0f32;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
@@ -2445,38 +2719,9 @@ impl Pipeline {
             ));
         }
 
-        draw_text(atlas, "Open config.json", 168.0, 176.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+        draw_text(atlas, "Open config.json", 168.0, 216.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
 
-        // Save & Cancel buttons
-        let save_bg = if hover_save {
-            [40.0 / 255.0, 120.0 / 255.0, 60.0 / 255.0, 1.0]
-        } else {
-            [30.0 / 255.0, 90.0 / 255.0, 45.0 / 255.0, 1.0]
-        };
-        bg_instances.push(CellInstance::new(
-            90.0 * scale, 220.0 * scale,
-            100.0 * scale, 32.0 * scale,
-            save_bg,
-            [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
-            6.0 * scale,
-        ));
-        draw_text(atlas, "Save", 125.0, 226.0, [1.0, 1.0, 1.0, 1.0], &mut fg_instances);
-
-        let cancel_bg = if hover_cancel {
-            [80.0 / 255.0, 80.0 / 255.0, 90.0 / 255.0, 1.0]
-        } else {
-            [60.0 / 255.0, 60.0 / 255.0, 70.0 / 255.0, 1.0]
-        };
-        bg_instances.push(CellInstance::new(
-            210.0 * scale, 220.0 * scale,
-            100.0 * scale, 32.0 * scale,
-            cancel_bg,
-            [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
-            6.0 * scale,
-        ));
-        draw_text(atlas, "Cancel", 235.0, 226.0, [1.0, 1.0, 1.0, 1.0], &mut fg_instances);
+        // Save & Cancel buttons removed — settings apply live.
 
         // Draw scrollable dropdown list if active_field == 1
         if active_field == 1 {
@@ -2505,11 +2750,11 @@ impl Pipeline {
                 6.0 * scale,
             ));
 
-            // Draw dropdown background (#0c0c0c) - 100% opaque alpha!
+            // Draw dropdown background (theme bg) - 100% opaque alpha!
             fg_instances.push(CellInstance::new(
                 drop_x + 1.0 * scale, drop_y + 1.0 * scale,
                 drop_w - 2.0 * scale, drop_h - 2.0 * scale,
-                [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0],
+                theme_bg,
                 [0.0, 0.0, 0.0, 0.0],
                 0.0, 0.0, 1.0, 1.0,
                 5.0 * scale,
@@ -2528,12 +2773,12 @@ impl Pipeline {
                     let is_selected = font == font_family;
                     let is_hovered = hovered_font_idx == Some(i);
 
-                    // Draw item background on hover/selection
+                    // Draw item background on hover/selection (themed)
                     if is_hovered {
                         fg_instances.push(CellInstance::new(
                             drop_x + 4.0 * scale, item_top_y + 1.0 * scale,
                             drop_w - 8.0 * scale, item_h - 2.0 * scale,
-                            [1.0, 1.0, 1.0, 0.08],
+                            theme_item_hover,
                             [0.0, 0.0, 0.0, 0.0],
                             0.0, 0.0, 1.0, 1.0,
                             4.0 * scale,
@@ -2542,7 +2787,7 @@ impl Pipeline {
                         fg_instances.push(CellInstance::new(
                             drop_x + 4.0 * scale, item_top_y + 1.0 * scale,
                             drop_w - 8.0 * scale, item_h - 2.0 * scale,
-                            [91.0 / 255.0, 138.0 / 255.0, 240.0 / 255.0, 0.15],
+                            [theme_accent[0], theme_accent[1], theme_accent[2], 0.20],
                             [0.0, 0.0, 0.0, 0.0],
                             0.0, 0.0, 1.0, 1.0,
                             4.0 * scale,
@@ -2551,7 +2796,7 @@ impl Pipeline {
 
                     // Render item text
                     let text_color = if is_selected {
-                        [91.0 / 255.0, 138.0 / 255.0, 240.0 / 255.0, 1.0] // Blue text for active selection
+                        theme_accent
                     } else if is_hovered {
                         [1.0, 1.0, 1.0, 1.0]
                     } else {
@@ -2566,7 +2811,16 @@ impl Pipeline {
                     let max_text_w = drop_w - padding_x * 2.0 - 10.0 * scale; 
                     let mut current_w = 0.0f32;
 
+                    // Space must be handled BEFORE the rasterize call so a
+                    // cached-missing space still advances. Advance by the
+                    // cell width so spaces look like spaces, not squashed.
+                    let item_cell_w = atlas.cell_size().0 * scale;
                     for c in font.chars() {
+                        if c == ' ' {
+                            tx += item_cell_w;
+                            current_w += item_cell_w;
+                            continue;
+                        }
                         if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                             if entry.width > 0.0 {
                                 let glyph_w = entry.width;
@@ -2574,7 +2828,7 @@ impl Pipeline {
                                 if current_w + glyph_w > max_text_w {
                                     break;
                                 }
-                                
+
                                 let glyph_x = (tx + entry.left).round();
                                 let glyph_y = (text_y + atlas.ascent() + entry.top).round();
 
@@ -2593,9 +2847,6 @@ impl Pipeline {
                                 }
                                 tx += entry.width + 1.0 * scale;
                                 current_w += entry.width + 1.0 * scale;
-                            } else if c == ' ' {
-                                tx += 8.0 * scale;
-                                current_w += 8.0 * scale;
                             }
                         }
                     }
@@ -2609,6 +2860,170 @@ impl Pipeline {
                 let sbar_x = drop_x + drop_w - sbar_w - 2.0 * scale;
                 let sbar_h = (drop_h / total_h) * drop_h;
                 let sbar_y = drop_y + ((font_scroll_y * scale) / total_h) * drop_h;
+
+                fg_instances.push(CellInstance::new(
+                    sbar_x, sbar_y,
+                    sbar_w, sbar_h,
+                    [1.0, 1.0, 1.0, 0.25],
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, 1.0,
+                    2.0 * scale,
+                ));
+            }
+        }
+
+        // Draw theme dropdown list if active_field == 2
+        if active_field == 2 {
+            let drop_x = 140.0f32 * scale;
+            let drop_y = 198.0f32 * scale; // 172.0 + 26.0
+            let drop_w = 240.0f32 * scale;
+            let item_h = 22.0f32 * scale;
+            let max_items = (viewport_height - drop_y - 8.0 * scale) / item_h;
+            let visible_h = max_items.max(1.0) * item_h;
+            let total_h = themes.len() as f32 * item_h;
+            let drop_h = total_h.min(visible_h).max(item_h);
+
+            // Draw dropdown background shadow
+            fg_instances.push(CellInstance::new(
+                drop_x - 4.0 * scale, drop_y - 2.0 * scale,
+                drop_w + 8.0 * scale, drop_h + 8.0 * scale,
+                [0.0, 0.0, 0.0, 0.35],
+                [4.0 * scale, 4.0 * scale, 4.0 * scale, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                6.0 * scale,
+            ));
+
+            // Draw dropdown border
+            fg_instances.push(CellInstance::new(
+                drop_x, drop_y,
+                drop_w, drop_h,
+                [1.0, 1.0, 1.0, 0.15],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                6.0 * scale,
+            ));
+
+            // Draw dropdown background (theme bg)
+            fg_instances.push(CellInstance::new(
+                drop_x + 1.0 * scale, drop_y + 1.0 * scale,
+                drop_w - 2.0 * scale, drop_h - 2.0 * scale,
+                theme_bg,
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                5.0 * scale,
+            ));
+
+            let padding_x = 8.0f32 * scale;
+            for (i, theme_name) in themes.iter().enumerate() {
+                let item_top_y = drop_y + i as f32 * item_h - theme_scroll_y * scale;
+                let item_bottom_y = item_top_y + item_h;
+
+                if item_bottom_y > drop_y + drop_h || item_top_y < drop_y {
+                    continue;
+                }
+
+                let is_selected = theme_name == theme;
+                let is_hovered = hovered_theme_idx == Some(i);
+
+                if is_hovered {
+                    fg_instances.push(CellInstance::new(
+                        drop_x + 4.0 * scale, item_top_y + 1.0 * scale,
+                        drop_w - 8.0 * scale, item_h - 2.0 * scale,
+                        theme_item_hover,
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0, 0.0, 1.0, 1.0,
+                        4.0 * scale,
+                    ));
+                } else if is_selected {
+                    fg_instances.push(CellInstance::new(
+                        drop_x + 4.0 * scale, item_top_y + 1.0 * scale,
+                        drop_w - 8.0 * scale, item_h - 2.0 * scale,
+                        [theme_accent[0], theme_accent[1], theme_accent[2], 0.20],
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0, 0.0, 1.0, 1.0,
+                        4.0 * scale,
+                    ));
+                }
+
+                // Color swatch dots for the theme
+                let swatch_colors = named_color_rgb_for_theme(theme_name);
+                let swatch_colors_arr: [(u8, u8, u8); 4] = [
+                    swatch_colors.0,
+                    swatch_colors.1,
+                    swatch_colors.2,
+                    swatch_colors.3,
+                ];
+                let swatch_x = drop_x + padding_x;
+                let swatch_y = item_top_y + (item_h - 10.0f32 * scale) / 2.0;
+                for (j, (r, g, b)) in swatch_colors_arr.iter().enumerate() {
+                    let cx = swatch_x + j as f32 * 4.0f32 * scale;
+                    fg_instances.push(CellInstance::new(
+                        cx, swatch_y,
+                        3.0f32 * scale, 10.0f32 * scale,
+                        [*r as f32 / 255.0, *g as f32 / 255.0, *b as f32 / 255.0, 1.0],
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0, 0.0, 0.0, 0.0,
+                        1.0f32 * scale,
+                    ));
+                }
+
+                let text_color = if is_selected {
+                    theme_accent
+                } else if is_hovered {
+                    [1.0, 1.0, 1.0, 1.0]
+                } else {
+                    [0.85, 0.85, 0.90, 1.0]
+                };
+
+                let text_y = item_top_y + (item_h - atlas.cell_size().1) / 2.0;
+                let mut tx = drop_x + padding_x + 4.0 * 4.0 * scale + 4.0 * scale;
+
+                let max_text_w = drop_w - (tx - drop_x) - padding_x;
+                let mut current_w = 0.0f32;
+
+                // Space handled first; advance by cell width so spaces look right.
+                let item_cell_w = atlas.cell_size().0 * scale;
+                for c in theme_name.chars() {
+                    if c == ' ' {
+                        tx += item_cell_w;
+                        current_w += item_cell_w;
+                        continue;
+                    }
+                    if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                        if entry.width > 0.0 {
+                            let glyph_w = entry.width;
+                            let glyph_h = entry.height;
+                            if current_w + glyph_w > max_text_w {
+                                break;
+                            }
+                            let glyph_x = (tx + entry.left).round();
+                            let glyph_y = (text_y + atlas.ascent() + entry.top).round();
+
+                            if glyph_y + glyph_h <= drop_y + drop_h - 2.0 * scale && glyph_y >= drop_y + 2.0 * scale {
+                                let (aw, ah) = atlas.atlas_size();
+                                let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                                fg_instances.push(CellInstance::new(
+                                    glyph_x, glyph_y,
+                                    glyph_w, glyph_h,
+                                    text_color,
+                                    [0.0, 0.0, 0.0, 0.0],
+                                    uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                                    0.0,
+                                ));
+                            }
+                            tx += entry.width + 1.0 * scale;
+                            current_w += entry.width + 1.0 * scale;
+                        }
+                    }
+                }
+            }
+
+            // Draw scrollbar if necessary
+            if total_h > drop_h {
+                let sbar_w = 4.0f32 * scale;
+                let sbar_x = drop_x + drop_w - sbar_w - 2.0 * scale;
+                let sbar_h = (drop_h / total_h) * drop_h;
+                let sbar_y = drop_y + ((theme_scroll_y * scale) / total_h) * drop_h;
 
                 fg_instances.push(CellInstance::new(
                     sbar_x, sbar_y,
@@ -2667,21 +3082,36 @@ impl Pipeline {
         let mut bg_instances = Vec::new();
         let mut fg_instances = Vec::new();
 
-        // 0. Draw window background (slate dark)
+        // Theme-aware bg / topbar, same convention as the main window.
+        let (bg_r, bg_g, bg_b) = named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::Background);
+        let theme_bg = [bg_r as f32 / 255.0, bg_g as f32 / 255.0, bg_b as f32 / 255.0, 1.0];
+        let active_theme = crate::config::ACTIVE_THEME.read().to_lowercase();
+        let theme_topbar = if active_theme == "default" {
+            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0]
+        } else {
+            [
+                bg_r as f32 / 255.0 * 0.83,
+                bg_g as f32 / 255.0 * 0.83,
+                bg_b as f32 / 255.0 * 0.83,
+                1.0,
+            ]
+        };
+
+        // 0. Draw window background (theme bg)
         bg_instances.push(CellInstance::new(
             0.0, 0.0,
             viewport_width, viewport_height,
-            [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0], // About bg (#0c0c0c)
+            theme_bg,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
             8.0,
         ));
 
-        // 1. Draw topbar background (#0a0a0a)
+        // 1. Draw topbar background (darker variant of theme bg)
         bg_instances.push(CellInstance::new(
             0.0, 0.0,
             viewport_width, 36.0,
-            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0],
+            theme_topbar,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 1.0, 1.0,
             8.0,
@@ -2689,7 +3119,7 @@ impl Pipeline {
         bg_instances.push(CellInstance::new(
             0.0, 28.0,
             viewport_width, 8.0,
-            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0],
+            theme_topbar,
             [0.0, 0.0, 0.0, 0.0],
             0.0, 0.0, 0.0, 0.0,
             0.0,
@@ -2703,10 +3133,17 @@ impl Pipeline {
             0.0,
         ));
 
-        // Helper to draw text
+        // Helper to draw text. Spaces must be handled BEFORE the get_or_rasterize
+        // call (a space can return None or a 0-width entry) and must advance by
+        // the actual cell width so spaces look like spaces.
+        let about_cell_w = atlas.cell_size().0;
         let draw_text = |atlas: &mut crate::renderer::Atlas, text: &str, start_x: f32, start_y: f32, color: [f32; 4], fg_list: &mut Vec<CellInstance>| {
             let mut x = start_x;
             for c in text.chars() {
+                if c == ' ' {
+                    x += about_cell_w;
+                    continue;
+                }
                 if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                     if entry.width > 0.0 {
                         let glyph_x = (x + entry.left).round();
@@ -2722,8 +3159,6 @@ impl Pipeline {
                             0.0,
                         ));
                         x += entry.width + 2.0;
-                    } else if c == ' ' {
-                        x += 8.0;
                     }
                 }
             }
@@ -2732,11 +3167,13 @@ impl Pipeline {
         let get_text_width = |atlas: &mut crate::renderer::Atlas, text: &str| -> f32 {
             let mut w = 0.0f32;
             for c in text.chars() {
+                if c == ' ' {
+                    w += about_cell_w;
+                    continue;
+                }
                 if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                     if entry.width > 0.0 {
                         w += entry.width + 2.0;
-                    } else if c == ' ' {
-                        w += 8.0;
                     }
                 }
             }
@@ -2879,51 +3316,169 @@ fn cell_bg_to_f32(color: alacritty_terminal::vte::ansi::Color) -> [f32; 4] {
     }
 }
 
+struct Theme {
+    foreground: (u8, u8, u8),
+    background: (u8, u8, u8),
+    black: (u8, u8, u8),
+    red: (u8, u8, u8),
+    green: (u8, u8, u8),
+    yellow: (u8, u8, u8),
+    blue: (u8, u8, u8),
+    magenta: (u8, u8, u8),
+    cyan: (u8, u8, u8),
+    white: (u8, u8, u8),
+    bright_black: (u8, u8, u8),
+    bright_red: (u8, u8, u8),
+    bright_green: (u8, u8, u8),
+    bright_yellow: (u8, u8, u8),
+    bright_blue: (u8, u8, u8),
+    bright_magenta: (u8, u8, u8),
+    bright_cyan: (u8, u8, u8),
+    bright_white: (u8, u8, u8),
+}
+
+fn get_active_theme() -> Theme {
+    let theme_name = crate::config::ACTIVE_THEME.read().clone();
+    match theme_name.to_lowercase().as_str() {
+        "catppuccin" => Theme {
+            foreground: (0xCA, 0xD3, 0xF5),
+            background: (0x24, 0x27, 0x3A),
+            black: (0x49, 0x4D, 0x64),
+            red: (0xED, 0x87, 0x96),
+            green: (0xA6, 0xDA, 0x95),
+            yellow: (0xEE, 0xDD, 0xB2),
+            blue: (0x8A, 0xAD, 0xF4),
+            magenta: (0xF5, 0xB8, 0x95),
+            cyan: (0x91, 0xD7, 0xE3),
+            white: (0xB8, 0xC0, 0xE0),
+            bright_black: (0x5B, 0x60, 0x78),
+            bright_red: (0xED, 0x87, 0x96),
+            bright_green: (0xA6, 0xDA, 0x95),
+            bright_yellow: (0xEE, 0xDD, 0xB2),
+            bright_blue: (0x8A, 0xAD, 0xF4),
+            bright_magenta: (0xF4, 0xBD, 0xD8),
+            bright_cyan: (0x91, 0xD7, 0xE3),
+            bright_white: (0xA5, 0xAD, 0xCB),
+        },
+        "one-dark" | "onedark" => Theme {
+            foreground: (0xAB, 0xB2, 0xBF),
+            background: (0x28, 0x2C, 0x34),
+            black: (0x28, 0x2C, 0x34),
+            red: (0xE0, 0x6C, 0x75),
+            green: (0x98, 0xC3, 0x79),
+            yellow: (0xD1, 0x9A, 0x66),
+            blue: (0x61, 0xAF, 0xEF),
+            magenta: (0xC6, 0x78, 0xDD),
+            cyan: (0x56, 0xB6, 0xC2),
+            white: (0xAB, 0xB2, 0xBF),
+            bright_black: (0x5C, 0x63, 0x70),
+            bright_red: (0xE0, 0x6C, 0x75),
+            bright_green: (0x98, 0xC3, 0x79),
+            bright_yellow: (0xD1, 0x9A, 0x66),
+            bright_blue: (0x61, 0xAF, 0xEF),
+            bright_magenta: (0xC6, 0x78, 0xDD),
+            bright_cyan: (0x56, 0xB6, 0xC2),
+            bright_white: (0xFF, 0xFF, 0xFF),
+        },
+        "solarized-dark" | "solarized" => Theme {
+            foreground: (0x83, 0x94, 0x96),
+            background: (0x00, 0x2B, 0x36),
+            black: (0x07, 0x36, 0x42),
+            red: (0xDC, 0x32, 0x2F),
+            green: (0x85, 0x99, 0x00),
+            yellow: (0xB5, 0x89, 0x00),
+            blue: (0x26, 0x8B, 0xD2),
+            magenta: (0xD3, 0x36, 0x82),
+            cyan: (0x2A, 0xA1, 0x98),
+            white: (0xEE, 0xE8, 0xD5),
+            bright_black: (0x58, 0x6E, 0x75),
+            bright_red: (0xCB, 0x4B, 0x16),
+            bright_green: (0x58, 0x6E, 0x75),
+            bright_yellow: (0x65, 0x7B, 0x83),
+            bright_blue: (0x83, 0x94, 0x96),
+            bright_magenta: (0x6C, 0x71, 0xC4),
+            bright_cyan: (0x93, 0xA1, 0xA1),
+            bright_white: (0xFD, 0xF6, 0xE3),
+        },
+        _ => Theme { // Fasty (Default)
+            foreground: (0xC5, 0xC8, 0xC6),
+            background: (0x0C, 0x0C, 0x0C),
+            black: (0x1D, 0x1F, 0x21),
+            red: (0xCC, 0x66, 0x66),
+            green: (0xB5, 0xBD, 0x68),
+            yellow: (0xF0, 0xC6, 0x74),
+            blue: (0x81, 0xA2, 0xBE),
+            magenta: (0xB2, 0x94, 0xBB),
+            cyan: (0x8A, 0xBE, 0xB7),
+            white: (0xC5, 0xC8, 0xC6),
+            bright_black: (0x66, 0x66, 0x66),
+            bright_red: (0xCC, 0x66, 0x66),
+            bright_green: (0xB5, 0xBD, 0x68),
+            bright_yellow: (0xF0, 0xC6, 0x74),
+            bright_blue: (0x81, 0xA2, 0xBE),
+            bright_magenta: (0xB2, 0x94, 0xBB),
+            bright_cyan: (0x8A, 0xBE, 0xB7),
+            bright_white: (0xFF, 0xFF, 0xFF),
+        }
+    }
+}
+
+fn named_color_rgb_for_theme(theme_name: &str) -> ((u8, u8, u8), (u8, u8, u8), (u8, u8, u8), (u8, u8, u8)) {
+    let previous = crate::config::ACTIVE_THEME.read().clone();
+    crate::config::set_active_theme(theme_name);
+    let t = get_active_theme();
+    let result = (t.foreground, t.red, t.green, t.blue);
+    crate::config::set_active_theme(&previous);
+    result
+}
+
 fn named_color_rgb(named: alacritty_terminal::vte::ansi::NamedColor) -> (u8, u8, u8) {
+    let theme = get_active_theme();
     match named {
-        alacritty_terminal::vte::ansi::NamedColor::Foreground => (0xC5, 0xC8, 0xC6),
-        alacritty_terminal::vte::ansi::NamedColor::Background => (0x1D, 0x1F, 0x21),
-        alacritty_terminal::vte::ansi::NamedColor::Black => (0x1D, 0x1F, 0x21),
-        alacritty_terminal::vte::ansi::NamedColor::Red => (0xCC, 0x66, 0x66),
-        alacritty_terminal::vte::ansi::NamedColor::Green => (0x50, 0xFA, 0x7B),
-        alacritty_terminal::vte::ansi::NamedColor::Yellow => (0xF0, 0xC6, 0x74),
-        alacritty_terminal::vte::ansi::NamedColor::Blue => (0x81, 0xA2, 0xBE),
-        alacritty_terminal::vte::ansi::NamedColor::Magenta => (0xB2, 0x94, 0xBB),
-        alacritty_terminal::vte::ansi::NamedColor::Cyan => (0x8A, 0xBE, 0xB7),
-        alacritty_terminal::vte::ansi::NamedColor::White => (0xC5, 0xC8, 0xC6),
-        alacritty_terminal::vte::ansi::NamedColor::BrightBlack => (0x66, 0x66, 0x66),
-        alacritty_terminal::vte::ansi::NamedColor::BrightRed => (0xFF, 0x33, 0x34),
-        alacritty_terminal::vte::ansi::NamedColor::BrightGreen => (0x69, 0xDB, 0x7C),
-        alacritty_terminal::vte::ansi::NamedColor::BrightYellow => (0xF0, 0xC6, 0x74),
-        alacritty_terminal::vte::ansi::NamedColor::BrightBlue => (0x81, 0xA2, 0xBE),
-        alacritty_terminal::vte::ansi::NamedColor::BrightMagenta => (0xB7, 0x7E, 0xE0),
-        alacritty_terminal::vte::ansi::NamedColor::BrightCyan => (0x54, 0xCE, 0xD6),
-        alacritty_terminal::vte::ansi::NamedColor::BrightWhite => (0xFF, 0xFF, 0xFF),
-        _ => (0xC5, 0xC8, 0xC6),
+        alacritty_terminal::vte::ansi::NamedColor::Foreground => theme.foreground,
+        alacritty_terminal::vte::ansi::NamedColor::Background => theme.background,
+        alacritty_terminal::vte::ansi::NamedColor::Black => theme.black,
+        alacritty_terminal::vte::ansi::NamedColor::Red => theme.red,
+        alacritty_terminal::vte::ansi::NamedColor::Green => theme.green,
+        alacritty_terminal::vte::ansi::NamedColor::Yellow => theme.yellow,
+        alacritty_terminal::vte::ansi::NamedColor::Blue => theme.blue,
+        alacritty_terminal::vte::ansi::NamedColor::Magenta => theme.magenta,
+        alacritty_terminal::vte::ansi::NamedColor::Cyan => theme.cyan,
+        alacritty_terminal::vte::ansi::NamedColor::White => theme.white,
+        alacritty_terminal::vte::ansi::NamedColor::BrightBlack => theme.bright_black,
+        alacritty_terminal::vte::ansi::NamedColor::BrightRed => theme.bright_red,
+        alacritty_terminal::vte::ansi::NamedColor::BrightGreen => theme.bright_green,
+        alacritty_terminal::vte::ansi::NamedColor::BrightYellow => theme.bright_yellow,
+        alacritty_terminal::vte::ansi::NamedColor::BrightBlue => theme.bright_blue,
+        alacritty_terminal::vte::ansi::NamedColor::BrightMagenta => theme.bright_magenta,
+        alacritty_terminal::vte::ansi::NamedColor::BrightCyan => theme.bright_cyan,
+        alacritty_terminal::vte::ansi::NamedColor::BrightWhite => theme.bright_white,
+        _ => theme.foreground,
     }
 }
 
 fn index_to_ansi_color(idx: usize) -> (u8, u8, u8) {
     if idx < 16 {
-        const ANSI_COLORS: [(u8, u8, u8); 16] = [
-            (0x1D, 0x1F, 0x21),
-            (0xCC, 0x66, 0x66),
-            (0x50, 0xFA, 0x7B),
-            (0xF0, 0xC6, 0x74),
-            (0x81, 0xA2, 0xBE),
-            (0xB2, 0x94, 0xBB),
-            (0x8A, 0xBE, 0xB7),
-            (0xC5, 0xC8, 0xC6),
-            (0x66, 0x66, 0x66),
-            (0xFF, 0x33, 0x34),
-            (0x69, 0xDB, 0x7C),
-            (0xF0, 0xC6, 0x74),
-            (0x81, 0xA2, 0xBE),
-            (0xB7, 0x7E, 0xE0),
-            (0x54, 0xCE, 0xD6),
-            (0xFF, 0xFF, 0xFF),
-        ];
-        ANSI_COLORS[idx]
+        let theme = get_active_theme();
+        match idx {
+            0 => theme.black,
+            1 => theme.red,
+            2 => theme.green,
+            3 => theme.yellow,
+            4 => theme.blue,
+            5 => theme.magenta,
+            6 => theme.cyan,
+            7 => theme.white,
+            8 => theme.bright_black,
+            9 => theme.bright_red,
+            10 => theme.bright_green,
+            11 => theme.bright_yellow,
+            12 => theme.bright_blue,
+            13 => theme.bright_magenta,
+            14 => theme.bright_cyan,
+            15 => theme.bright_white,
+            _ => theme.white,
+        }
     } else if idx < 232 {
         let idx = idx - 16;
         (

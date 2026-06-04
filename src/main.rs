@@ -71,6 +71,10 @@ struct Tab {
     last_actual_offset: usize,
     last_scroll_diff: isize,
     cursor_visible: bool,
+    search_matches: Vec<renderer::SearchMatch>,
+    search_query: String,
+    search_visible: bool,
+    search_current_idx: usize,
 }
 
 fn create_new_tab(
@@ -113,6 +117,10 @@ fn create_new_tab(
         last_actual_offset: 0,
         last_scroll_diff: 0,
         cursor_visible: true,
+        search_matches: Vec::new(),
+        search_query: String::new(),
+        search_visible: false,
+        search_current_idx: 0,
     })
 }
 
@@ -385,7 +393,16 @@ fn main() -> anyhow::Result<()> {
     let mut settings_family = String::new();
     let mut settings_size = 14.0f32;
     let mut settings_scrollback = 3000usize;
-    let mut settings_active_field = 0usize; // 0 = none, 1 = font family select dropdown
+    let mut settings_active_field = 0usize; // 0 = none, 1 = font family select dropdown, 2 = theme select dropdown
+    let mut settings_theme = String::new();
+    let mut s_hover_theme = false;
+    let mut settings_hovered_theme_idx: Option<usize> = None;
+    let themes_list = vec![
+        "default".to_string(),
+        "catppuccin".to_string(),
+        "one-dark".to_string(),
+        "solarized-dark".to_string(),
+    ];
     
     let mut s_hover_close = false;
     let mut s_hover_family = false;
@@ -394,10 +411,9 @@ fn main() -> anyhow::Result<()> {
     let mut s_hover_scroll_minus = false;
     let mut s_hover_scroll_plus = false;
     let mut s_hover_open_config = false;
-    let mut s_hover_save = false;
-    let mut s_hover_cancel = false;
     
     let mut settings_font_scroll_y = 0.0f32;
+    let mut settings_theme_scroll_y = 0.0f32;
     let mut settings_hovered_font_idx: Option<usize> = None;
     let mut system_fonts = Vec::<String>::new();
     let mut s_mouse_x = 0.0f64;
@@ -597,6 +613,11 @@ fn main() -> anyhow::Result<()> {
                                 active_tab.selection,
                                 active_tab.hovered_url,
                                 active_tab.hovered_hyperlink.as_deref(),
+                                &active_tab.search_matches,
+                                active_tab.search_current_idx,
+                                active_tab.search_visible,
+                                &active_tab.search_query,
+                                config.font.size,
                                 toast.as_ref().map(|(msg, t, d)| (msg.as_str(), *t, *d)),
                                 active_tab_index,
                                 &tab_titles,
@@ -1324,6 +1345,7 @@ fn main() -> anyhow::Result<()> {
                                                   settings_family = config.font.family.clone();
                                                   settings_size = config.font.size;
                                                   settings_scrollback = config.scrollback.min(3000);
+                                                  settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                                   settings_active_field = 0;
                                                   let visible = !cfg!(target_os = "windows");
                                                   match target.create_window(winit::window::WindowAttributes::default()
@@ -1331,7 +1353,7 @@ fn main() -> anyhow::Result<()> {
                                                       .with_decorations(false)
                                                       .with_transparent(true)
                                                       .with_visible(visible)
-                                                      .with_inner_size(winit::dpi::LogicalSize::new(400.0, 300.0)))
+                                                      .with_inner_size(winit::dpi::LogicalSize::new(400.0, 260.0)))
                                                   {
                                                       Ok(window) => {
                                                           let settings_window_arc = Arc::new(window);
@@ -1353,9 +1375,12 @@ fn main() -> anyhow::Result<()> {
                                                                           config.font.size,
                                                                           config.scrollback.min(3000),
                                                                           0,
-                                                                          false, false, false, false, false, false, false, false, false,
+                                                                          false, false, false, false, false, false, false, false, false, false,
                                                                           &system_fonts,
                                                                           0.0,
+                                                                          None,
+                                                                          &settings_theme,
+                                                                          &themes_list,
                                                                           None,
                                                                       );
                                                                       settings_window_arc.set_visible(true);
@@ -2166,15 +2191,21 @@ fn main() -> anyhow::Result<()> {
                                 current_config.font.family = settings_family.clone();
                                 current_config.font.size = settings_size;
                                 current_config.scrollback = settings_scrollback;
+                                current_config.theme = Some(settings_theme.clone());
                                 let _ = current_config.save(&Config::config_path());
 
+                                tracing::info!("apply_settings: theme={:?} family={:?} size={} scrollback={}",
+                                    settings_theme, settings_family, settings_size, settings_scrollback);
+
                                 config = current_config;
+                                config::set_active_theme(&settings_theme);
+                                config.theme = Some(settings_theme.clone());
 
                                 // Apply the new font family and size dynamically to the renderer!
                                 if let Err(e) = renderer.lock().update_font(&config.font.family, config.font.size) {
                                     tracing::error!("Failed to update renderer font: {:?}", e);
                                 }
-                                
+
                                 // Apply font family update to the settings renderer as well, but at fixed font size 13.0
                                 if let Some(ref mut sr) = settings_renderer {
                                     let _ = sr.update_font(&settings_family, 13.0);
@@ -2195,6 +2226,8 @@ fn main() -> anyhow::Result<()> {
                                 cell_width = cell_w;
                                 cell_height = cell_h;
 
+                                // Theme change requires rebuilding cell instances so colors reflect live.
+                                renderer.lock().grid_dirty = true;
                                 app_dirty = true;
                             }
                         }
@@ -2223,12 +2256,15 @@ fn main() -> anyhow::Result<()> {
                                         s_hover_size_plus,
                                         s_hover_scroll_minus,
                                         s_hover_scroll_plus,
+                                        s_hover_theme,
                                         s_hover_open_config,
-                                        s_hover_save,
-                                        s_hover_cancel,
                                         &system_fonts,
                                         settings_font_scroll_y,
                                         settings_hovered_font_idx,
+                                        &settings_theme,
+                                        &themes_list,
+                                        settings_hovered_theme_idx,
+                                        settings_theme_scroll_y,
                                     );
                                 }
                                 #[cfg(target_os = "windows")]
@@ -2247,10 +2283,10 @@ fn main() -> anyhow::Result<()> {
                                 let old_hover_size_plus = s_hover_size_plus;
                                 let old_hover_scroll_minus = s_hover_scroll_minus;
                                 let old_hover_scroll_plus = s_hover_scroll_plus;
+                                let old_hover_theme = s_hover_theme;
                                 let old_hover_open_config = s_hover_open_config;
-                                let old_hover_save = s_hover_save;
-                                let old_hover_cancel = s_hover_cancel;
                                 let old_hovered_font_idx = settings_hovered_font_idx;
+                                let old_hovered_theme_idx = settings_hovered_theme_idx;
 
                                 let sw_width = sw.inner_size().width as f64 / scale_factor;
                                 s_hover_close = s_mouse_y >= 4.0 && s_mouse_y <= 32.0 && s_mouse_x >= (sw_width - 32.0) && s_mouse_x < (sw_width - 4.0);
@@ -2262,10 +2298,9 @@ fn main() -> anyhow::Result<()> {
                                 s_hover_scroll_minus = s_mouse_y >= 132.0 && s_mouse_y <= 158.0 && s_mouse_x >= 140.0 && s_mouse_x < 168.0;
                                 s_hover_scroll_plus = s_mouse_y >= 132.0 && s_mouse_y <= 158.0 && s_mouse_x >= 240.0 && s_mouse_x < 268.0;
 
-                                s_hover_open_config = s_mouse_y >= 172.0 && s_mouse_y <= 198.0 && s_mouse_x >= 140.0 && s_mouse_x < 380.0;
+                                s_hover_theme = s_mouse_y >= 172.0 && s_mouse_y <= 198.0 && s_mouse_x >= 140.0 && s_mouse_x < 380.0;
 
-                                s_hover_save = s_mouse_y >= 220.0 && s_mouse_y <= 252.0 && s_mouse_x >= 90.0 && s_mouse_x < 190.0;
-                                s_hover_cancel = s_mouse_y >= 220.0 && s_mouse_y <= 252.0 && s_mouse_x >= 210.0 && s_mouse_x < 310.0;
+                                s_hover_open_config = s_mouse_y >= 212.0 && s_mouse_y <= 238.0 && s_mouse_x >= 140.0 && s_mouse_x < 380.0;
 
                                 let mut hovered_font_idx = None;
                                 if settings_active_field == 1 && s_mouse_x >= 140.0 && s_mouse_x < 380.0 && s_mouse_y >= 78.0 && s_mouse_y < 258.0 {
@@ -2276,16 +2311,25 @@ fn main() -> anyhow::Result<()> {
                                 }
                                 settings_hovered_font_idx = hovered_font_idx;
 
+                                let mut hovered_theme_idx = None;
+                                if settings_active_field == 2 && s_mouse_x >= 140.0 && s_mouse_x < 380.0 && s_mouse_y >= 198.0 && s_mouse_y < 198.0 + themes_list.len() as f64 * 22.0 {
+                                    let idx = (((s_mouse_y - 198.0) + settings_theme_scroll_y as f64) / 22.0) as usize;
+                                    if idx < themes_list.len() {
+                                        hovered_theme_idx = Some(idx);
+                                    }
+                                }
+                                settings_hovered_theme_idx = hovered_theme_idx;
+
                                 let any_changed = s_hover_close != old_hover_close
                                     || s_hover_family != old_hover_family
                                     || s_hover_size_minus != old_hover_size_minus
                                     || s_hover_size_plus != old_hover_size_plus
                                     || s_hover_scroll_minus != old_hover_scroll_minus
                                     || s_hover_scroll_plus != old_hover_scroll_plus
+                                    || s_hover_theme != old_hover_theme
                                     || s_hover_open_config != old_hover_open_config
-                                    || s_hover_save != old_hover_save
-                                    || s_hover_cancel != old_hover_cancel
-                                    || settings_hovered_font_idx != old_hovered_font_idx;
+                                    || settings_hovered_font_idx != old_hovered_font_idx
+                                    || settings_hovered_theme_idx != old_hovered_theme_idx;
 
                                 if any_changed {
                                     if let Some(ref mut r) = settings_renderer {
@@ -2296,7 +2340,7 @@ fn main() -> anyhow::Result<()> {
                             }
                             WindowEvent::MouseInput { state, button, .. } => {
                                 if button == MouseButton::Left && state == ElementState::Pressed {
-                                    if s_hover_close || s_hover_cancel {
+                                    if s_hover_close {
                                         settings_window = None;
                                         settings_renderer = None;
                                         app_dirty = true;
@@ -2314,6 +2358,14 @@ fn main() -> anyhow::Result<()> {
                                         }
                                         settings_active_field = 1;
                                         settings_font_scroll_y = 0.0;
+                                    } else if s_hover_theme {
+                                        // Box clicks MUST take priority over dropdown-item checks,
+                                        // because the theme box (y 172-198) sits inside the font
+                                        // dropdown's y range (78-258). Without this, clicking the
+                                        // theme box while the font dropdown is open gets consumed
+                                        // as a font item selection.
+                                        settings_active_field = 2;
+                                        settings_theme_scroll_y = 0.0;
                                     } else if settings_active_field == 1 && s_mouse_x >= 140.0 && s_mouse_x < 380.0 && s_mouse_y >= 78.0 && s_mouse_y < 258.0 {
                                         let idx = (((s_mouse_y - 78.0) + settings_font_scroll_y as f64) / 22.0) as usize;
                                         if idx < system_fonts.len() {
@@ -2321,11 +2373,18 @@ fn main() -> anyhow::Result<()> {
                                             settings_active_field = 0;
                                             apply_settings!();
                                         }
+                                    } else if settings_active_field == 2 && s_mouse_x >= 140.0 && s_mouse_x < 380.0 && s_mouse_y >= 198.0 && s_mouse_y < 198.0 + themes_list.len() as f64 * 22.0 {
+                                        let idx = (((s_mouse_y - 198.0) + settings_theme_scroll_y as f64) / 22.0) as usize;
+                                        if idx < themes_list.len() {
+                                            settings_theme = themes_list[idx].clone();
+                                            settings_active_field = 0;
+                                            apply_settings!();
+                                        }
                                     } else if s_hover_size_minus {
-                                        settings_size = (settings_size - 0.5).max(6.0);
+                                        settings_size = (settings_size - 1.0).max(6.0);
                                         apply_settings!();
                                     } else if s_hover_size_plus {
-                                        settings_size = (settings_size + 0.5).min(72.0);
+                                        settings_size = (settings_size + 1.0).min(72.0);
                                         apply_settings!();
                                     } else if s_hover_scroll_minus {
                                         settings_scrollback = settings_scrollback.saturating_sub(1000).max(1000);
@@ -2338,13 +2397,10 @@ fn main() -> anyhow::Result<()> {
                                         current_config.font.family = settings_family.clone();
                                         current_config.font.size = settings_size;
                                         current_config.scrollback = settings_scrollback;
+                                        current_config.theme = Some(settings_theme.clone());
                                         let path = Config::get_active_config_path();
                                         let _ = current_config.save(&path);
                                         let _ = open_file_in_editor(&path);
-                                    } else if s_hover_save {
-                                        settings_window = None;
-                                        settings_renderer = None;
-                                        app_dirty = true;
                                     } else {
                                         settings_active_field = 0;
                                     }
@@ -2357,17 +2413,26 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
                             WindowEvent::MouseWheel { delta, .. } => {
+                                let lines = match delta {
+                                    MouseScrollDelta::LineDelta(_, y) => y,
+                                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 22.0,
+                                };
+                                let item_h = 22.0f32;
+                                let mut handled = false;
                                 if settings_active_field == 1 {
-                                    let lines = match delta {
-                                        MouseScrollDelta::LineDelta(_, y) => y,
-                                        MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 22.0,
-                                    };
-                                    let item_h = 22.0f32;
                                     let visible_h = 180.0f32;
                                     let total_h = system_fonts.len() as f32 * item_h;
                                     let max_scroll = (total_h - visible_h).max(0.0);
                                     settings_font_scroll_y = (settings_font_scroll_y - lines * item_h).clamp(0.0, max_scroll);
-                                    
+                                    handled = true;
+                                } else if settings_active_field == 2 {
+                                    let visible_h = ((260.0_f32 - 198.0 - 8.0) as f32).max(item_h);
+                                    let total_h = themes_list.len() as f32 * item_h;
+                                    let max_scroll = (total_h - visible_h).max(0.0);
+                                    settings_theme_scroll_y = (settings_theme_scroll_y - lines * item_h).clamp(0.0, max_scroll);
+                                    handled = true;
+                                }
+                                if handled {
                                     if let Some(ref mut r) = settings_renderer {
                                         r.set_dirty(true);
                                     }
@@ -2405,9 +2470,8 @@ fn main() -> anyhow::Result<()> {
                                 s_hover_size_plus = false;
                                 s_hover_scroll_minus = false;
                                 s_hover_scroll_plus = false;
+                                s_hover_theme = false;
                                 s_hover_open_config = false;
-                                s_hover_save = false;
-                                s_hover_cancel = false;
                                 if let Some(ref mut r) = settings_renderer {
                                     r.set_dirty(true);
                                 }
@@ -2421,9 +2485,8 @@ fn main() -> anyhow::Result<()> {
                                     s_hover_size_plus = false;
                                     s_hover_scroll_minus = false;
                                     s_hover_scroll_plus = false;
+                                    s_hover_theme = false;
                                     s_hover_open_config = false;
-                                    s_hover_save = false;
-                                    s_hover_cancel = false;
                                     if let Some(ref mut r) = settings_renderer {
                                         r.set_dirty(true);
                                     }
@@ -2560,6 +2623,11 @@ fn main() -> anyhow::Result<()> {
                         active_tab.selection,
                         active_tab.hovered_url,
                         active_tab.hovered_hyperlink.as_deref(),
+                        &active_tab.search_matches,
+                        active_tab.search_current_idx,
+                        active_tab.search_visible,
+                        &active_tab.search_query,
+                        config.font.size,
                         toast.as_ref().map(|(msg, t, d)| (msg.as_str(), *t, *d)),
                         active_tab_index,
                         &tab_titles,

@@ -531,15 +531,21 @@ impl Atlas {
     fn load_fallback_paths(primary_path: &str) -> Vec<String> {
         static FALLBACK_PATHS_CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
         let paths = FALLBACK_PATHS_CACHE.get_or_init(|| {
+            use std::path::Path;
+
             let mut names: Vec<String> = vec![
-                "Symbols Nerd Font".to_string(),
-                "DejaVu Sans".to_string(),
+                "Noto Sans Symbols 2".to_string(),
                 "Noto Sans Symbols".to_string(),
+                "Noto Sans".to_string(),
+                "DejaVu Sans".to_string(),
+                "Noto Sans CJK SC".to_string(),
+                "Noto Sans CJK".to_string(),
+                "Symbols Nerd Font".to_string(),
+                "JetBrainsMono Nerd Font".to_string(),
                 "Noto Color Emoji".to_string(),
                 "FreeMono".to_string(),
             ];
 
-            // Try to find installed Nerd Fonts dynamically from fontconfig
             if let Ok(output) = std::process::Command::new("fc-list")
                 .arg(":")
                 .arg("family")
@@ -552,16 +558,10 @@ impl Atlas {
                         for family in line.split(',') {
                             let family = family.trim();
                             if family.to_lowercase().contains("nerd font") {
-                                if !family.contains("Mono") && !family.contains("Propo") {
-                                    nerd_families.insert(family.to_string());
-                                } else if nerd_families.is_empty() {
-                                    nerd_families.insert(family.to_string());
-                                }
+                                nerd_families.insert(family.to_string());
                             }
                         }
-                        if nerd_families.len() >= 5 {
-                            break;
-                        }
+                        if nerd_families.len() >= 8 { break; }
                     }
                     for fam in nerd_families {
                         names.insert(0, fam);
@@ -573,26 +573,103 @@ impl Atlas {
             use std::collections::HashSet;
             let mut loaded_paths = HashSet::new();
 
-            for name in names {
+            for name in &names {
                 if let Ok(output) = std::process::Command::new("fc-match")
                     .arg("-f")
                     .arg("%{file}")
-                    .arg(&name)
+                    .arg(name)
                     .output()
                 {
                     if output.status.success() {
                         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        if !path.is_empty() && !loaded_paths.contains(&path) {
+                        if !path.is_empty()
+                            && !loaded_paths.contains(&path)
+                            && Path::new(&path).exists()
+                        {
                             loaded_paths.insert(path.clone());
                             fallback_paths.push(path);
                         }
                     }
                 }
             }
+
+            // Direct filesystem probes (used when fontconfig is unavailable,
+            // or as a hard guarantee for glyph coverage on each platform).
+            #[cfg(target_os = "linux")]
+            let extra_paths: Vec<String> = vec![
+                "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf".to_string(),
+                "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf".to_string(),
+                "/usr/share/fonts/noto/NotoSans-Regular.ttf".to_string(),
+                "/usr/share/fonts/TTF/DejaVuSans.ttf".to_string(),
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".to_string(),
+                "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc".to_string(),
+                "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc".to_string(),
+                "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf".to_string(),
+                "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf".to_string(),
+                "/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf".to_string(),
+                "/usr/share/fonts/gnu-free/FreeMono.ttf".to_string(),
+                "/usr/share/fonts/100dpi/charM08.ttf".to_string(),
+            ];
+
+            #[cfg(target_os = "macos")]
+            let extra_paths: Vec<String> = {
+                let mut v = vec![
+                    // System-bundled fonts that cover Dingbats + Symbols
+                    "/System/Library/Fonts/AppleSymbols.ttf".to_string(),
+                    "/System/Library/Fonts/SFNS.ttf".to_string(),
+                    "/System/Library/Fonts/Helvetica.ttc".to_string(),
+                    "/System/Library/Fonts/HelveticaNeue.ttc".to_string(),
+                    "/System/Library/Fonts/ArialHB.ttc".to_string(),
+                    "/System/Library/Fonts/Arial Unicode.ttf".to_string(),
+                    "/Library/Fonts/Arial.ttf".to_string(),
+                    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf".to_string(),
+                    "/System/Library/Fonts/Supplemental/AppleGothic.ttf".to_string(),
+                    "/System/Library/Fonts/Supplemental/DejaVuSans.ttf".to_string(),
+                    "/System/Library/Fonts/Supplemental/NotoSansSymbols-Regular.ttf".to_string(),
+                    "/System/Library/Fonts/Supplemental/NotoSansSymbols2-Regular.ttf".to_string(),
+                    "/System/Library/Fonts/Supplemental/NotoColorEmoji.ttf".to_string(),
+                ];
+                // User-installed fonts
+                if let Ok(home) = std::env::var("HOME") {
+                    v.push(format!("{}/Library/Fonts/NotoSansSymbols2-Regular.ttf", home));
+                    v.push(format!("{}/Library/Fonts/NotoSans-Regular.ttf", home));
+                    v.push(format!("{}/Library/Fonts/JetBrainsMonoNerdFont-Regular.ttf", home));
+                }
+                v
+            };
+
+            #[cfg(target_os = "windows")]
+            let extra_paths: Vec<String> = {
+                let mut v = Vec::new();
+                if let Ok(windir) = std::env::var("WINDIR") {
+                    // Dingbats (U+2700-U+27BF), Symbols, Arrows
+                    v.push(format!("{}\\Fonts\\seguisym.ttf", windir));
+                    // Emoji + Symbol coverage
+                    v.push(format!("{}\\Fonts\\seguiemj.ttf", windir));
+                    // Standard fallbacks
+                    v.push(format!("{}\\Fonts\\seguibl.ttf", windir));
+                    v.push(format!("{}\\Fonts\\segoeui.ttf", windir));
+                    v.push(format!("{}\\Fonts\\seguisb.ttf", windir));
+                    v.push(format!("{}\\Fonts\\arial.ttf", windir));
+                    v.push(format!("{}\\Fonts\\consola.ttf", windir));
+                    v.push(format!("{}\\Fonts\\segmdl2.ttf", windir)); // Segoe MDL2 Assets (icons)
+                }
+                if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                    v.push(format!("{}\\Microsoft\\Windows\\Fonts\\seguiemj.ttf", local));
+                }
+                v
+            };
+
+            for path in extra_paths {
+                if !loaded_paths.contains(&path) && Path::new(&path).exists() {
+                    loaded_paths.insert(path.clone());
+                    fallback_paths.push(path);
+                }
+            }
+
             fallback_paths
         });
 
-        // Filter out primary_path dynamically
         paths.iter()
             .filter(|p| *p != primary_path)
             .cloned()
@@ -804,7 +881,10 @@ impl Atlas {
 
     pub fn get_or_rasterize(&mut self, c: char, device: &Device, queue: &Queue) -> Option<AtlasEntry> {
         if let Some(entry) = self.entries.get(&GlyphKey::Char(c)) {
-            return Some(*entry);
+            if entry.width > 0.0 || entry.height > 0.0 {
+                return Some(*entry);
+            }
+            return None;
         }
 
         let entry = FT_LIB.with(|lib| {
@@ -829,7 +909,7 @@ impl Atlas {
                 }
             }
 
-            // 2. Try fallbacks
+            // 2. Try fallbacks (full font chain)
             for path in &self.fallback_paths {
                 if let Ok(face) = lib.new_face(path, 0) {
                     let physical_size = self.font_size * self.scale_factor;
@@ -879,8 +959,13 @@ impl Atlas {
         });
 
         if let Some(entry) = entry {
+            // Cache the entry so we don't re-rasterize
+            self.entries.insert(GlyphKey::Char(c), entry);
             Some(entry)
         } else {
+            // Cache a zero-sized entry to remember this glyph is missing.
+            // Callers must check width/height before drawing — returns None
+            // here so future lookups also skip without re-rasterizing.
             let dummy = AtlasEntry {
                 x: 0.0,
                 y: 0.0,
@@ -889,10 +974,10 @@ impl Atlas {
                 left: 0.0,
                 top: 0.0,
                 is_color: false,
-                is_block: is_block_element(c),
+                is_block: false,
             };
             self.entries.insert(GlyphKey::Char(c), dummy);
-            Some(dummy)
+            None
         }
     }
 

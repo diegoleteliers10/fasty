@@ -3,12 +3,27 @@
 //! Loads from config.json in the same directory as the binary.
 
 use serde::{Deserialize, Serialize};
+use parking_lot::RwLock;
+
+pub static ACTIVE_THEME: RwLock<String> = RwLock::new(String::new());
+
+pub fn set_active_theme(theme: &str) {
+    *ACTIVE_THEME.write() = theme.to_string();
+}
+
+pub const BUILTIN_THEMES: &[&str] = &[
+    "default",
+    "catppuccin",
+    "one-dark",
+    "solarized-dark",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub font: FontConfig,
     pub shell: Option<String>,
     pub scrollback: usize,
+    pub theme: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +45,7 @@ impl Default for Config {
             },
             shell: None,
             scrollback: 3000,
+            theme: Some("default".to_string()),
         }
     }
 }
@@ -61,11 +77,14 @@ impl Config {
                 let content = std::fs::read_to_string(path)?;
                 let mut config: Config = serde_json::from_str(&content)?;
                 config.scrollback = config.scrollback.min(3000);
+                *ACTIVE_THEME.write() = config.theme.clone().unwrap_or("default".to_string());
                 return Ok(config);
             }
         }
 
-        Ok(Config::default())
+        let def = Config::default();
+        *ACTIVE_THEME.write() = def.theme.clone().unwrap_or("default".to_string());
+        Ok(def)
     }
 
     pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {

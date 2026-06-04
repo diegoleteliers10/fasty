@@ -295,6 +295,11 @@ impl<'a> Renderer<'a> {
         selection: Option<Selection>,
         hovered_url: Option<HoveredUrl>,
         hovered_hyperlink: Option<&str>,
+        search_matches: &[crate::renderer::SearchMatch],
+        search_current_idx: usize,
+        search_visible: bool,
+        search_query_render: &str,
+        terminal_font_size: f32,
         toast: Option<(&str, std::time::Instant, u64)>,
         active_tab_index: usize,
         tab_titles: &[String],
@@ -368,6 +373,11 @@ impl<'a> Renderer<'a> {
                 selection,
                 hovered_url,
                 hovered_hyperlink,
+                search_matches,
+                search_current_idx,
+                search_visible,
+                search_query_render,
+                terminal_font_size,
                 toast,
                 active_tab_index,
                 tab_titles,
@@ -409,12 +419,15 @@ impl<'a> Renderer<'a> {
         hover_size_plus: bool,
         hover_scroll_minus: bool,
         hover_scroll_plus: bool,
+        hover_theme: bool,
         hover_open_config: bool,
-        hover_save: bool,
-        hover_cancel: bool,
         system_fonts: &[String],
         font_scroll_y: f32,
         hovered_font_idx: Option<usize>,
+        theme: &str,
+        themes: &[String],
+        hovered_theme_idx: Option<usize>,
+        theme_scroll_y: f32,
     ) {
         if !self.dirty {
             return;
@@ -464,12 +477,15 @@ impl<'a> Renderer<'a> {
                 hover_size_plus,
                 hover_scroll_minus,
                 hover_scroll_plus,
+                hover_theme,
                 hover_open_config,
-                hover_save,
-                hover_cancel,
                 system_fonts,
                 font_scroll_y,
                 hovered_font_idx,
+                theme,
+                themes,
+                hovered_theme_idx,
+                theme_scroll_y,
                 &self.device,
                 &self.queue,
             );
@@ -547,6 +563,13 @@ pub struct HoveredUrl {
     pub line: i32,
     pub start_col: usize,
     pub end_col: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub line: i32,
+    pub col: usize,
+    pub len: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
