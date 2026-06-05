@@ -317,6 +317,16 @@ impl<'a> Renderer<'a> {
         command_palette_query: &str,
         command_palette_selected: usize,
         command_palette_filtered: &[String],
+        dragging_tab: Option<usize>,
+        drag_current_x: f32,
+        drop_target_idx: Option<usize>,
+        tab_ctx_visible: bool,
+        tab_ctx_x: f32,
+        tab_ctx_y: f32,
+        tab_ctx_hovered: Option<usize>,
+        renaming_tab: Option<usize>,
+        rename_buffer: &str,
+        rename_cursor: usize,
     ) {
         if !self.dirty {
             return;
@@ -407,6 +417,16 @@ impl<'a> Renderer<'a> {
                 command_palette_query,
                 command_palette_selected,
                 command_palette_filtered,
+                dragging_tab,
+                drag_current_x,
+                drop_target_idx,
+                tab_ctx_visible,
+                tab_ctx_x,
+                tab_ctx_y,
+                tab_ctx_hovered,
+                renaming_tab,
+                rename_buffer,
+                rename_cursor,
             );
         }
 

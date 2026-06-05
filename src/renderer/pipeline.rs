@@ -623,6 +623,16 @@ impl Pipeline {
         command_palette_query: &str,
         command_palette_selected: usize,
         command_palette_filtered: &[String],
+        dragging_tab: Option<usize>,
+        drag_current_x: f32,
+        drop_target_idx: Option<usize>,
+        tab_ctx_visible: bool,
+        tab_ctx_x: f32,
+        tab_ctx_y: f32,
+        tab_ctx_hovered: Option<usize>,
+        renaming_tab: Option<usize>,
+        rename_buffer: &str,
+        rename_cursor: usize,
     ) {
         if reason == RenderReason::CursorBlink {
             let term = terminal.term();
@@ -1534,6 +1544,27 @@ impl Pipeline {
             ));
         }
 
+        // Tab drag reorder visual feedback
+        if dragging_tab.is_some() {
+            if let Some(target) = drop_target_idx {
+                let tab_start_x = 36.0f32;
+                let tab_w = if tab_titles.len() > 0 {
+                    (tab_area_width / tab_titles.len() as f32).clamp(80.0f32, 160.0f32)
+                } else {
+                    160.0f32
+                };
+                let indicator_x = tab_start_x + target as f32 * tab_w;
+                bg_instances.push(CellInstance::new(
+                    indicator_x - 1.0, 4.0,
+                    2.0, 32.0,
+                    [0.4, 0.6, 1.0, 0.8],
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                ));
+            }
+        }
+
         // Centered path display removed — the active tab already shows its name.
 
         // Draw window controls (Settings, vertical line, Minimize, Maximize, Close)
@@ -2253,6 +2284,150 @@ impl Pipeline {
                         current_y += item_h;
                     }
                 }
+            }
+        }
+
+        // Tab right-click context menu
+        if tab_ctx_visible {
+            let menu_w = 160.0f32;
+            let menu_h = 44.0f32;
+            let pad = 6.0f32;
+
+            let shadow_pad = 8.0f32;
+            instances.push(CellInstance::new(
+                tab_ctx_x as f32 - shadow_pad,
+                tab_ctx_y as f32 - shadow_pad + 4.0,
+                menu_w + 2.0 * shadow_pad,
+                menu_h + 2.0 * shadow_pad,
+                [0.0, 0.0, 0.0, 0.40],
+                [10.0, shadow_pad, shadow_pad, 0.0],
+                0.0, 0.0, 1.0, 1.0, 10.0,
+            ));
+            instances.push(CellInstance::new(
+                tab_ctx_x as f32, tab_ctx_y as f32, menu_w, menu_h,
+                [1.0, 1.0, 1.0, 0.10],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0, 10.0,
+            ));
+            instances.push(CellInstance::new(
+                tab_ctx_x as f32 + 1.0, tab_ctx_y as f32 + 1.0, menu_w - 2.0, menu_h - 2.0,
+                [
+                    (theme_bg[0] + 14.0 / 255.0).min(1.0),
+                    (theme_bg[1] + 14.0 / 255.0).min(1.0),
+                    (theme_bg[2] + 14.0 / 255.0).min(1.0),
+                    0.97,
+                ],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0, 9.0,
+            ));
+
+            let is_hover = tab_ctx_hovered == Some(0);
+            if is_hover {
+                instances.push(CellInstance::new(
+                    tab_ctx_x as f32 + 4.0, tab_ctx_y as f32 + pad,
+                    menu_w - 8.0, 32.0,
+                    [1.0, 1.0, 1.0, 0.08],
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, 1.0, 6.0,
+                ));
+            }
+
+            let base_scale = 13.0f32 / atlas.font_size();
+            let text_color = if is_hover {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                [220.0 / 255.0, 222.0 / 255.0, 226.0 / 255.0, 1.0]
+            };
+
+            let (_, ui_cell_height) = atlas.cell_size();
+            let text_baseline_y = tab_ctx_y as f32 + pad + 16.0 - (ui_cell_height * base_scale) / 2.0 + atlas.ascent() * base_scale;
+            let ctx_cell_w = atlas.cell_size().0 * base_scale;
+            let mut label_x = tab_ctx_x as f32 + 12.0;
+            for c in "Renombrar".chars() {
+                if c == ' ' { label_x += ctx_cell_w; continue; }
+                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                    if entry.width > 0.0 {
+                        let glyph_w = entry.width * base_scale;
+                        let glyph_h = entry.height * base_scale;
+                        let glyph_x = (label_x + entry.left * base_scale).round();
+                        let glyph_y = (text_baseline_y + entry.top * base_scale).round();
+                        let (aw, ah) = atlas.atlas_size();
+                        let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                        instances.push(CellInstance::new(
+                            glyph_x, glyph_y, glyph_w, glyph_h,
+                            text_color, [0.0, 0.0, 0.0, 0.0],
+                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y, 0.0,
+                        ));
+                        label_x += (entry.width + 1.0) * base_scale;
+                    }
+                }
+            }
+        }
+
+        // Rename input overlay on tab
+        if let Some(renaming_idx) = renaming_tab {
+            let tab_start_x = 36.0f32;
+            let tab_w = if tab_titles.len() > 0 {
+                (tab_area_width / tab_titles.len() as f32).clamp(80.0, 160.0)
+            } else { 160.0 };
+            let input_x = tab_start_x + renaming_idx as f32 * tab_w + 4.0;
+            let input_w = tab_w - 8.0;
+            let input_h = 24.0;
+            let input_y = (40.0 - input_h) / 2.0;
+
+            instances.push(CellInstance::new(
+                input_x - 1.0, input_y - 1.0, input_w + 2.0, input_h + 2.0,
+                [0.4, 0.6, 1.0, 0.8],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0, 6.0,
+            ));
+            instances.push(CellInstance::new(
+                input_x, input_y, input_w, input_h,
+                [theme_bg[0], theme_bg[1], theme_bg[2], 1.0],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0, 5.0,
+            ));
+
+            let base_scale = 11.0f32 / atlas.font_size();
+            let (_, ui_cell_height) = atlas.cell_size();
+            let text_baseline_y = input_y + input_h / 2.0 - (ui_cell_height * base_scale) / 2.0 + atlas.ascent() * base_scale;
+            let ctx_cell_w = atlas.cell_size().0 * base_scale;
+            let mut text_x = input_x + 6.0;
+
+            for (i, c) in rename_buffer.chars().enumerate() {
+                if i == rename_cursor {
+                    instances.push(CellInstance::new(
+                        text_x, input_y + 3.0, 2.0, input_h - 6.0,
+                        [0.4, 0.6, 1.0, 1.0],
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0, 0.0, 1.0, 1.0, 0.0,
+                    ));
+                }
+                if c == ' ' { text_x += ctx_cell_w; continue; }
+                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                    if entry.width > 0.0 {
+                        let glyph_w = entry.width * base_scale;
+                        let glyph_h = entry.height * base_scale;
+                        let glyph_x = (text_x + entry.left * base_scale).round();
+                        let glyph_y = (text_baseline_y + entry.top * base_scale).round();
+                        let (aw, ah) = atlas.atlas_size();
+                        let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                        instances.push(CellInstance::new(
+                            glyph_x, glyph_y, glyph_w, glyph_h,
+                            [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0],
+                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y, 0.0,
+                        ));
+                        text_x += (entry.width + 1.0) * base_scale;
+                    }
+                }
+            }
+            if rename_cursor >= rename_buffer.len() {
+                instances.push(CellInstance::new(
+                    text_x, input_y + 3.0, 2.0, input_h - 6.0,
+                    [0.4, 0.6, 1.0, 1.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, 1.0, 0.0,
+                ));
             }
         }
 
@@ -3552,6 +3727,26 @@ fn get_active_theme() -> Theme {
             bright_blue: (0x61, 0xAF, 0xEF),
             bright_magenta: (0xC6, 0x78, 0xDD),
             bright_cyan: (0x56, 0xB6, 0xC2),
+            bright_white: (0xFF, 0xFF, 0xFF),
+        },
+        "high-contrast" => Theme {
+            foreground: (0xFF, 0xFF, 0xFF),
+            background: (0x00, 0x00, 0x00),
+            black: (0x00, 0x00, 0x00),
+            red: (0xFF, 0x55, 0x55),
+            green: (0x50, 0xFA, 0x7B),
+            yellow: (0xFF, 0xF0, 0x5A),
+            blue: (0x62, 0xD6, 0xFF),
+            magenta: (0xFF, 0x79, 0xC6),
+            cyan: (0x8B, 0xEC, 0xFF),
+            white: (0xFF, 0xFF, 0xFF),
+            bright_black: (0x7F, 0x7F, 0x7F),
+            bright_red: (0xFF, 0x55, 0x55),
+            bright_green: (0x50, 0xFA, 0x7B),
+            bright_yellow: (0xFF, 0xF0, 0x5A),
+            bright_blue: (0x62, 0xD6, 0xFF),
+            bright_magenta: (0xFF, 0x79, 0xC6),
+            bright_cyan: (0x8B, 0xEC, 0xFF),
             bright_white: (0xFF, 0xFF, 0xFF),
         },
         "solarized-dark" | "solarized" => Theme {

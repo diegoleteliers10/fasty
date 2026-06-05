@@ -15,7 +15,7 @@ Inspired by [Ghostty](https://github.com/ghostty-org/ghostty), Fasty leverages `
 - **Seamless TUI Mouse Integration**: Perfect mouse clicks and drag selections passed directly to the PTY (htop, vim, Claude Code) without interfering with desktop text selection.
 - **Tabbed Layout**: Multiple independent tabs, each running a native shell process.
 - **Live-Apply Settings**: Font family, size (1pt step), scrollback, and theme applied instantly — no Save/Cancel buttons.
-- **Built-in Color Themes**: `default` (Fasty), `catppuccin`, `one-dark`, `solarized-dark`. Switches apply live across main window, settings, and about dialogs.
+- **Built-in Color Themes**: `default` (Fasty), `catppuccin`, `one-dark`, `solarized-dark`, `high-contrast`. Switches apply live across main window, settings, and about dialogs.
 - **Custom Keybindings**: User-rebindable shortcuts via `[keybindings]` in `fasty.toml`. 13 actions available; defaults preserved when omitted.
 - **Session Restore**: Saves open tab working directories on exit, restores to saved paths on next launch. Enabled by default; opt-out via `session_restore = false`.
 - **Command Palette**: `Ctrl+Shift+P` opens a fuzzy-search palette for quick access to settings, tab actions, themes, and font size controls.
@@ -237,7 +237,7 @@ ligatures = true
 | `font.ligatures` | `boolean` | Toggle font ligatures (restart required) |
 | `shell` | `string?` | Custom shell path; omit to detect system default |
 | `scrollback` | `integer` | Lines of scrollback buffer (default 3000, capped at 3000) |
-| `theme` | `string` | Color scheme: `default`, `catppuccin`, `one-dark`, `solarized-dark`, or custom name |
+| `theme` | `string` | Color scheme: `default`, `catppuccin`, `one-dark`, `solarized-dark`, `high-contrast`, or custom name |
 | `session_restore` | `boolean` | Restore previously open tabs on launch (default: `true`) |
 
 ### Keybindings
@@ -272,6 +272,7 @@ The `[keybindings]` section maps key combinations to actions. All bindings are o
 | `catppuccin` | `#24273A` | `#CAD3F5` | Soft pastel, easy on the eyes |
 | `one-dark` | `#282C34` | `#ABB2BF` | Atom One Dark |
 | `solarized-dark` | `#002B36` | `#839496` | Classic Solarized dark |
+| `high-contrast` | `#000000` | `#FFFFFF` | WCAG AAA, maximum contrast |
 
 Theme changes take effect immediately on the live terminal. Each cell instance looks up its named color through `named_color_rgb()` / `index_to_ansi_color()` which dispatch to the active theme.
 
@@ -366,7 +367,7 @@ Features under consideration for upcoming releases:
 
 ### Accessibility
 - [ ] **Screen Reader Bridge (Windows UIA / Linux AT-SPI / macOS AX)** -- Announce output to assistive tech.
-- [ ] **High-Contrast Theme** -- WCAG AAA-compliant palette.
+- [x] **High-Contrast Theme** -- WCAG AAA-compliant palette for low vision.
 - [ ] **Color-Blind Palettes** -- Deuteranopia/protanopia-friendly variants.
 - [ ] **DPI Override Per-Monitor** -- Verified behavior on mixed-DPI setups.
 - [ ] **Touch / Gesture Input** -- Long-press to select, two-finger scroll. Targets 2-in-1 laptops.

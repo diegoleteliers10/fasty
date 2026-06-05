@@ -78,6 +78,7 @@ struct Tab {
     search_query: String,
     search_visible: bool,
     search_current_idx: usize,
+    custom_name: Option<String>,
 }
 
 fn create_new_tab(
@@ -125,6 +126,7 @@ fn create_new_tab(
         search_query: String::new(),
         search_visible: false,
         search_current_idx: 0,
+        custom_name: None,
     })
 }
 
@@ -146,6 +148,7 @@ enum CommandAction {
     DecreaseFontSize,
     ResetFontSize,
     SnapToBottom,
+    RenameTab,
 }
 
 fn palette_label(action: CommandAction) -> &'static str {
@@ -162,6 +165,7 @@ fn palette_label(action: CommandAction) -> &'static str {
         CommandAction::DecreaseFontSize => "Decrease Font Size",
         CommandAction::ResetFontSize => "Reset Font Size",
         CommandAction::SnapToBottom => "Snap to Bottom",
+        CommandAction::RenameTab => "Rename Tab",
     }
 }
 
@@ -179,6 +183,7 @@ fn build_palette_commands() -> Vec<(&'static str, CommandAction)> {
         ("decrease font size", CommandAction::DecreaseFontSize),
         ("reset font size", CommandAction::ResetFontSize),
         ("snap to bottom", CommandAction::SnapToBottom),
+        ("rename tab", CommandAction::RenameTab),
     ]
 }
 
@@ -195,6 +200,26 @@ fn filter_palette(commands: &[(&'static str, CommandAction)], query: &str) -> Ve
 
 fn compute_palette_filtered(commands: &[(&'static str, CommandAction)], query: &str) -> Vec<String> {
     filter_palette(commands, query).into_iter().map(|i| commands[i].0.to_string()).collect()
+}
+
+fn compute_drop_target(
+    mouse_x: f64,
+    tab_start_x: f64,
+    tab_width: f64,
+    tabs_len: usize,
+) -> usize {
+    if tabs_len <= 1 {
+        return 0;
+    }
+    let remaining = tabs_len - 1;
+    let pos = mouse_x - tab_start_x;
+    for i in 0..remaining {
+        let midpoint = (i as f64 + 0.5) * tab_width;
+        if pos < midpoint {
+            return i;
+        }
+    }
+    remaining
 }
 
 macro_rules! dispatch_palette_action {
@@ -511,6 +536,23 @@ fn main() -> anyhow::Result<()> {
     let mut hovered_tab_index: Option<usize> = None;
     let mut hovered_close_tab_index: Option<usize> = None;
     let mut hover_new_tab = false;
+    let mut dragging_tab: Option<usize> = None;
+    let mut drag_start_x: f64 = 0.0;
+    let mut drag_tab_offset: f64 = 0.0;
+    let mut drag_current_x: f64 = 0.0;
+    let mut drag_threshold_passed = false;
+
+    // Tab rename state
+    let mut renaming_tab: Option<usize> = None;
+    let mut rename_buffer = String::new();
+    let mut rename_cursor: usize = 0;
+
+    // Tab right-click context menu state
+    let mut tab_ctx_visible = false;
+    let mut tab_ctx_x = 0.0f64;
+    let mut tab_ctx_y = 0.0f64;
+    let mut tab_ctx_tab_idx: usize = 0;
+    let mut tab_ctx_hovered: Option<usize> = None;
 
     // Secondary settings window state
     let mut settings_window: Option<Arc<winit::window::Window>> = None;
@@ -745,23 +787,35 @@ fn main() -> anyhow::Result<()> {
                             let mut tab_titles = Vec::new();
                             let mut active_tab_path = "fasty".to_string();
                             for (idx, tab) in tabs.iter().enumerate() {
-                                let path_str = if let Some(pid) = tab.terminal_state.lock().shell_pid() {
-                                    get_current_dir_shortened(pid)
+                                let title = if let Some(ref name) = tab.custom_name {
+                                    name.clone()
                                 } else {
-                                    None
-                                };
-                                
-                                let title = if let Some(ref path) = path_str {
-                                    get_last_path_component(path)
-                                } else {
-                                    "bash".to_string()
-                                };
-                                
-                                if idx == active_tab_index {
-                                    if let Some(ref path) = path_str {
-                                        active_tab_path = path.clone();
+                                    let path_str = if let Some(pid) = tab.terminal_state.lock().shell_pid() {
+                                        get_current_dir_shortened(pid)
                                     } else {
-                                        active_tab_path = "bash".to_string();
+                                        None
+                                    };
+                                    if let Some(ref path) = path_str {
+                                        get_last_path_component(path)
+                                    } else {
+                                        "bash".to_string()
+                                    }
+                                };
+
+                                if idx == active_tab_index {
+                                    if tab.custom_name.is_some() {
+                                        active_tab_path = title.clone();
+                                    } else {
+                                        let path_str = if let Some(pid) = tab.terminal_state.lock().shell_pid() {
+                                            get_current_dir_shortened(pid)
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(ref path) = path_str {
+                                            active_tab_path = path.clone();
+                                        } else {
+                                            active_tab_path = "bash".to_string();
+                                        }
                                     }
                                 }
                                 tab_titles.push(title);
@@ -810,6 +864,25 @@ fn main() -> anyhow::Result<()> {
                             let is_available = update_available.lock().is_some();
                             let is_in_progress = *update_in_progress.lock();
 
+                            let drop_target_idx = if drag_threshold_passed {
+                                dragging_tab.map(|_| {
+                                    let vw = { let rr = renderer.lock(); let w = rr.config.width as f64; drop(rr); w };
+                                    let tab_start_x = 36.0;
+                                    let path_center_x = vw / 2.0;
+                                    let tab_area_max_x = path_center_x - 40.0;
+                                    let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                                    let tabs_len = tabs.len();
+                                    let tab_width = if tabs_len > 0 {
+                                        (tab_area_width / tabs_len as f64).clamp(80.0, 160.0)
+                                    } else {
+                                        160.0
+                                    };
+                                    compute_drop_target(current_mouse_x, tab_start_x, tab_width, tabs_len)
+                                }).and_then(|t| if t < tabs.len() { Some(t) } else { None })
+                            } else {
+                                None
+                            };
+
                             let mut r = renderer.lock();
                             r.update_available = is_available;
                             r.update_in_progress = is_in_progress;
@@ -821,6 +894,7 @@ fn main() -> anyhow::Result<()> {
                             } else {
                                 Vec::new()
                             };
+
                             r.render(
                                 next_render_reason,
                                 term_ref,
@@ -861,6 +935,16 @@ fn main() -> anyhow::Result<()> {
                                 &command_palette_query,
                                 command_palette_selected,
                                 &palette_filtered,
+                                dragging_tab,
+                                drag_current_x as f32,
+                                drop_target_idx,
+                                tab_ctx_visible,
+                                tab_ctx_x as f32,
+                                tab_ctx_y as f32,
+                                tab_ctx_hovered,
+                                renaming_tab,
+                                &rename_buffer,
+                                rename_cursor,
                             );
                             drop(r);
 
@@ -971,6 +1055,104 @@ fn main() -> anyhow::Result<()> {
 
                             if !pressed {
                                 return;
+                            }
+
+                            if let Some(renaming_idx) = renaming_tab {
+                                use winit::keyboard::NamedKey;
+                                match &event.logical_key {
+                                    Key::Named(NamedKey::Enter) => {
+                                        let idx = renaming_tab.take().unwrap();
+                                        if rename_buffer.is_empty() {
+                                            tabs[idx].custom_name = None;
+                                        } else {
+                                            tabs[idx].custom_name = Some(rename_buffer.clone());
+                                        }
+                                        rename_buffer.clear();
+                                        renderer.lock().set_dirty(true);
+                                        app_dirty = true;
+                                    }
+                                    Key::Named(NamedKey::Escape) => {
+                                        renaming_tab = None;
+                                        rename_buffer.clear();
+                                        renderer.lock().set_dirty(true);
+                                        app_dirty = true;
+                                    }
+                                    Key::Named(NamedKey::Backspace) => {
+                                        if rename_cursor > 0 {
+                                            rename_cursor -= 1;
+                                            rename_buffer.remove(rename_cursor);
+                                            renderer.lock().set_dirty(true);
+                                            app_dirty = true;
+                                        }
+                                    }
+                                    Key::Named(NamedKey::Delete) => {
+                                        if rename_cursor < rename_buffer.len() {
+                                            rename_buffer.remove(rename_cursor);
+                                            renderer.lock().set_dirty(true);
+                                            app_dirty = true;
+                                        }
+                                    }
+                                    Key::Named(NamedKey::ArrowLeft) => {
+                                        if rename_cursor > 0 {
+                                            rename_cursor -= 1;
+                                            renderer.lock().set_dirty(true);
+                                            app_dirty = true;
+                                        }
+                                    }
+                                    Key::Named(NamedKey::ArrowRight) => {
+                                        if rename_cursor < rename_buffer.len() {
+                                            rename_cursor += 1;
+                                            renderer.lock().set_dirty(true);
+                                            app_dirty = true;
+                                        }
+                                    }
+                                    Key::Named(NamedKey::Home) => {
+                                        rename_cursor = 0;
+                                        renderer.lock().set_dirty(true);
+                                        app_dirty = true;
+                                    }
+                                    Key::Named(NamedKey::End) => {
+                                        rename_cursor = rename_buffer.len();
+                                        renderer.lock().set_dirty(true);
+                                        app_dirty = true;
+                                    }
+                                    Key::Character(s) => {
+                                        if !ctrl_active && !alt_active {
+                                            for ch in s.chars() {
+                                                rename_buffer.insert(rename_cursor, ch);
+                                                rename_cursor += 1;
+                                            }
+                                            renderer.lock().set_dirty(true);
+                                            app_dirty = true;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                window_for_redraw.request_redraw();
+                                return;
+                            }
+
+                            if tab_ctx_visible {
+                                if let Key::Named(winit::keyboard::NamedKey::Escape) = &event.logical_key {
+                                    tab_ctx_visible = false;
+                                    renderer.lock().set_dirty(true);
+                                    app_dirty = true;
+                                    window_for_redraw.request_redraw();
+                                    return;
+                                }
+                            }
+
+                            if context_menu_visible {
+                                if let Key::Named(winit::keyboard::NamedKey::Escape) = &event.logical_key {
+                                    context_menu_visible = false;
+                                    context_menu_open_time = None;
+                                    context_menu_open_time_secs = None;
+                                    context_menu_hovered_idx = None;
+                                    renderer.lock().set_dirty(true);
+                                    app_dirty = true;
+                                    window_for_redraw.request_redraw();
+                                    return;
+                                }
                             }
 
                             if command_palette_visible {
@@ -1178,6 +1360,18 @@ fn main() -> anyhow::Result<()> {
                                                 CommandAction::SnapToBottom => {
                                                     tabs[active_tab_index].scroll_target = 0.0;
                                                     app_dirty = true;
+                                                }
+                                                CommandAction::RenameTab => {
+                                                    let idx = active_tab_index;
+                                                    renaming_tab = Some(idx);
+                                                    rename_buffer = tabs[idx].custom_name.clone()
+                                                        .unwrap_or_else(|| {
+                                                            let path_str = if let Some(pid) = tabs[idx].terminal_state.lock().shell_pid() {
+                                                                get_current_dir_shortened(pid)
+                                                            } else { None };
+                                                            if let Some(ref p) = path_str { get_last_path_component(p) } else { "bash".to_string() }
+                                                        });
+                                                    rename_cursor = rename_buffer.len();
                                                 }
                                             }
                                         }
@@ -1619,6 +1813,55 @@ fn main() -> anyhow::Result<()> {
                             tabs[active_tab_index].last_activity_time = std::time::Instant::now();
                             tabs[active_tab_index].cursor_visible = true;
 
+                            if tab_ctx_visible {
+                                if state == ElementState::Pressed && button == MouseButton::Left {
+                                    let menu_h = 44.0f64;
+                                    let menu_w = 160.0f64;
+                                    if current_mouse_x >= tab_ctx_x && current_mouse_x < tab_ctx_x + menu_w
+                                        && current_mouse_y >= tab_ctx_y && current_mouse_y < tab_ctx_y + menu_h
+                                    {
+                                        let rel_y = current_mouse_y - tab_ctx_y;
+                                        if rel_y >= 6.0 && rel_y < 38.0 {
+                                            renaming_tab = Some(tab_ctx_tab_idx);
+                                            rename_buffer = tabs[tab_ctx_tab_idx].custom_name.clone()
+                                                .unwrap_or_else(|| {
+                                                    let path_str = if let Some(pid) = tabs[tab_ctx_tab_idx].terminal_state.lock().shell_pid() {
+                                                        get_current_dir_shortened(pid)
+                                                    } else { None };
+                                                    if let Some(ref p) = path_str { get_last_path_component(p) } else { "bash".to_string() }
+                                                });
+                                            rename_cursor = rename_buffer.len();
+                                        }
+                                    }
+                                    tab_ctx_visible = false;
+                                    renderer.lock().set_dirty(true);
+                                    app_dirty = true;
+                                    return;
+                                } else if state == ElementState::Pressed && button == MouseButton::Right {
+                                    tab_ctx_visible = false;
+                                    renderer.lock().set_dirty(true);
+                                    app_dirty = true;
+                                    return;
+                                }
+                            }
+
+                            if renaming_tab.is_some() {
+                                if state == ElementState::Pressed && button == MouseButton::Left {
+                                    if current_mouse_y >= padding_top as f64 {
+                                        let idx = renaming_tab.take().unwrap();
+                                        if rename_buffer.is_empty() {
+                                            tabs[idx].custom_name = None;
+                                        } else {
+                                            tabs[idx].custom_name = Some(rename_buffer.clone());
+                                        }
+                                        rename_buffer.clear();
+                                        renderer.lock().set_dirty(true);
+                                        app_dirty = true;
+                                    }
+                                }
+                                return;
+                            }
+
                             if context_menu_visible {
                                 let pressed = state == ElementState::Pressed;
                                 if pressed {
@@ -2012,6 +2255,8 @@ fn main() -> anyhow::Result<()> {
                                          if current_mouse_x >= tab_start_x && current_mouse_x < tab_start_x + tabs_total_width {
                                              let clicked_tab_idx = ((current_mouse_x - tab_start_x) / tab_width) as usize;
                                              if clicked_tab_idx < tabs_len {
+                                                 tab_ctx_visible = false;
+                                                 context_menu_visible = false;
                                                  let tab_x = tab_start_x + clicked_tab_idx as f64 * tab_width;
                                                  let close_x = tab_x + tab_width - 30.0;
                                                  let close_min_x = close_x - 4.0;
@@ -2035,7 +2280,10 @@ fn main() -> anyhow::Result<()> {
                                                      shell_cols = cols;
                                                      shell_rows = rows;
                                                  } else {
-                                                     active_tab_index = clicked_tab_idx;
+                                                     dragging_tab = Some(clicked_tab_idx);
+                                                     drag_start_x = current_mouse_x;
+                                                     drag_tab_offset = current_mouse_x - tab_x;
+                                                     drag_threshold_passed = false;
                                                  }
                                                  let mut r = renderer.lock();
                                                  r.set_dirty(true);
@@ -2234,6 +2482,43 @@ fn main() -> anyhow::Result<()> {
                                     tabs[active_tab_index].is_dragging = false;
                                     is_dragging_scrollbar = false;
 
+                                    if let Some(drag_idx) = dragging_tab {
+                                        if drag_threshold_passed {
+                                            let r = renderer.lock();
+                                            let v_width = r.config.width as f64;
+                                            drop(r);
+                                            let tab_start_x = 36.0;
+                                            let path_center_x = v_width / 2.0;
+                                            let tab_area_max_x = path_center_x - 40.0;
+                                            let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                                            let tabs_len = tabs.len();
+                                            let tab_width = if tabs_len > 0 {
+                                                (tab_area_width / tabs_len as f64).clamp(80.0, 160.0)
+                                            } else {
+                                                160.0
+                                            };
+                                            let target = compute_drop_target(current_mouse_x, tab_start_x, tab_width, tabs_len);
+                                            if target != drag_idx {
+                                                let tab = tabs.remove(drag_idx);
+                                                tabs.insert(target, tab);
+                                                active_tab_index = target;
+                                                let physical_size = window_for_redraw.inner_size();
+                                                let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                                                shell_cols = cols;
+                                                shell_rows = rows;
+                                            }
+                                        } else {
+                                            active_tab_index = drag_idx;
+                                        }
+                                        dragging_tab = None;
+                                        drag_threshold_passed = false;
+                                        let mut r = renderer.lock();
+                                        r.set_dirty(true);
+                                        r.grid_dirty = true;
+                                        app_dirty = true;
+                                        return;
+                                    }
+
                                     if let Some(uri) = tabs[active_tab_index].pending_hyperlink_open.take() {
                                         tabs[active_tab_index].hyperlink_press_pos = None;
                                         open_url(&uri);
@@ -2318,9 +2603,8 @@ fn main() -> anyhow::Result<()> {
                                     let r = renderer.lock();
                                     let v_width = r.config.width as f64;
                                     drop(r);
-                                    
+
                                     if current_mouse_y < padding_top as f64 && current_mouse_x <= 36.0 {
-                                        // Right-click on Fasty icon in topbar
                                         context_menu_x = 8.0;
                                         context_menu_y = 40.0;
                                         context_menu_is_about = true;
@@ -2330,26 +2614,47 @@ fn main() -> anyhow::Result<()> {
                                         context_menu_hovered_idx = None;
                                         renderer.lock().set_dirty(true);
                                         app_dirty = true;
+                                    } else if current_mouse_y < padding_top as f64 {
+                                        let path_center_x = v_width / 2.0;
+                                        let tab_area_max_x = path_center_x - 40.0;
+                                        let tab_area_width = tab_area_max_x - 36.0 - 32.0;
+                                        let tabs_len = tabs.len();
+                                        let tab_width = if tabs_len > 0 {
+                                            (tab_area_width / tabs_len as f64).clamp(80.0, 160.0)
+                                        } else { 160.0 };
+                                        let tabs_total_width = tabs_len as f64 * tab_width;
+                                        if current_mouse_x >= 36.0 && current_mouse_x < 36.0 + tabs_total_width {
+                                            let clicked_idx = ((current_mouse_x - 36.0) / tab_width) as usize;
+                                            if clicked_idx < tabs_len {
+                                                context_menu_visible = false;
+                                                tab_ctx_tab_idx = clicked_idx;
+                                                tab_ctx_x = current_mouse_x;
+                                                tab_ctx_y = current_mouse_y;
+                                                tab_ctx_visible = true;
+                                                tab_ctx_hovered = None;
+                                                renderer.lock().set_dirty(true);
+                                                app_dirty = true;
+                                            }
+                                        }
                                     } else if current_mouse_y >= padding_top as f64 && current_mouse_x <= (v_width - 20.0) {
                                         context_menu_is_about = false;
+                                        tab_ctx_visible = false;
                                         let menu_items = get_context_menu_items(&tabs, active_tab_index, false);
                                         let (menu_w, menu_h) = get_context_menu_size(&menu_items);
-                                        
+
                                         context_menu_x = current_mouse_x;
                                         context_menu_y = current_mouse_y;
                                         context_menu_open_time = Some(std::time::Instant::now());
                                         context_menu_open_time_secs = Some(start_time.elapsed().as_secs_f32());
-                                        
-                                        // Adjust X to stay within viewport
+
                                         let v_height = window_for_redraw.inner_size().height as f64;
                                         if context_menu_x + menu_w > v_width {
                                             context_menu_x = v_width - menu_w - 4.0;
                                         }
-                                        // Adjust Y to stay within viewport
                                         if context_menu_y + menu_h > v_height {
                                             context_menu_y = v_height - menu_h - 4.0;
                                         }
-                                        
+
                                         context_menu_visible = true;
                                         context_menu_hovered_idx = None;
                                         renderer.lock().set_dirty(true);
@@ -2382,6 +2687,21 @@ fn main() -> anyhow::Result<()> {
                                     context_menu_hovered_idx = get_menu_item_at_y(&menu_items, relative_y);
                                 } else {
                                     context_menu_hovered_idx = None;
+                                }
+                                renderer.lock().set_dirty(true);
+                                app_dirty = true;
+                            }
+
+                            if tab_ctx_visible {
+                                let menu_w = 160.0f64;
+                                let menu_h = 44.0f64;
+                                if current_mouse_x >= tab_ctx_x && current_mouse_x < tab_ctx_x + menu_w
+                                    && current_mouse_y >= tab_ctx_y && current_mouse_y < tab_ctx_y + menu_h
+                                {
+                                    let rel_y = current_mouse_y - tab_ctx_y;
+                                    tab_ctx_hovered = if rel_y >= 6.0 && rel_y < 38.0 { Some(0) } else { None };
+                                } else {
+                                    tab_ctx_hovered = None;
                                 }
                                 renderer.lock().set_dirty(true);
                                 app_dirty = true;
@@ -2520,6 +2840,17 @@ fn main() -> anyhow::Result<()> {
                             {
                                 renderer.lock().set_dirty(true);
                                 app_dirty = true;
+                            }
+
+                            if let Some(_drag_idx) = dragging_tab {
+                                if !drag_threshold_passed && (current_mouse_x - drag_start_x).abs() > 5.0 {
+                                    drag_threshold_passed = true;
+                                }
+                                if drag_threshold_passed {
+                                    drag_current_x = current_mouse_x;
+                                    renderer.lock().set_dirty(true);
+                                    app_dirty = true;
+                                }
                             }
 
                             if is_dragging_scrollbar {
@@ -3204,6 +3535,27 @@ fn main() -> anyhow::Result<()> {
                         Vec::new()
                     };
 
+                    let drop_target_idx = if drag_threshold_passed {
+                        dragging_tab.map(|_| {
+                            let r = renderer.lock();
+                            let vw = r.config.width as f64;
+                            drop(r);
+                            let tab_start_x = 36.0;
+                            let path_center_x = vw / 2.0;
+                            let tab_area_max_x = path_center_x - 40.0;
+                            let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                            let tabs_len = tabs.len();
+                            let tab_width = if tabs_len > 0 {
+                                (tab_area_width / tabs_len as f64).clamp(80.0, 160.0)
+                            } else {
+                                160.0
+                            };
+                            compute_drop_target(current_mouse_x, tab_start_x, tab_width, tabs_len)
+                        }).and_then(|t| if t < tabs.len() { Some(t) } else { None })
+                    } else {
+                        None
+                    };
+
                     let mut r = renderer.lock();
                     r.set_dirty(true);
                     r.render(
@@ -3246,6 +3598,16 @@ fn main() -> anyhow::Result<()> {
                         &command_palette_query,
                         command_palette_selected,
                         &palette_filtered,
+                        dragging_tab,
+                        drag_current_x as f32,
+                        drop_target_idx,
+                        tab_ctx_visible,
+                        tab_ctx_x as f32,
+                        tab_ctx_y as f32,
+                        tab_ctx_hovered,
+                        renaming_tab,
+                        &rename_buffer,
+                        rename_cursor,
                     );
                     drop(r);
                     #[cfg(target_os = "windows")]

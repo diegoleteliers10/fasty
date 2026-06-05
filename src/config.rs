@@ -43,6 +43,7 @@ pub const BUILTIN_THEMES: &[&str] = &[
     "catppuccin",
     "one-dark",
     "solarized-dark",
+    "high-contrast",
 ];
 
 /// In-memory cache of user-supplied themes, loaded once at startup.
