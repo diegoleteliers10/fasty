@@ -619,6 +619,10 @@ impl Pipeline {
         grid_dirty: &mut bool,
         device: &Device,
         queue: &wgpu::Queue,
+        command_palette_visible: bool,
+        command_palette_query: &str,
+        command_palette_selected: usize,
+        command_palette_filtered: &[String],
     ) {
         if reason == RenderReason::CursorBlink {
             let term = terminal.term();
@@ -2251,7 +2255,151 @@ impl Pipeline {
                 }
             }
         }
-        
+
+        if command_palette_visible {
+            let mut palette_w = 500.0f32;
+            let max_results = 8usize;
+            let item_h = 22.0f32;
+            let input_h = 28.0f32;
+            let n_shown = command_palette_filtered.len().min(max_results);
+            let palette_h = input_h + (n_shown as f32) * item_h + 16.0;
+            let palette_x = (viewport_width - palette_w) / 2.0;
+            let palette_y = 80.0;
+
+            instances.push(CellInstance::new(
+                palette_x - 1.0, palette_y - 1.0,
+                palette_w + 2.0, palette_h + 2.0,
+                [1.0, 1.0, 1.0, 0.18],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                8.0,
+            ));
+            instances.push(CellInstance::new(
+                palette_x, palette_y,
+                palette_w, palette_h,
+                [22.0 / 255.0, 24.0 / 255.0, 28.0 / 255.0, 0.96],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                7.0,
+            ));
+
+            let input_scale = 14.0 / atlas.font_size();
+            let prompt_str = "> ";
+            let input_baseline_y = palette_y + 6.0 + atlas.ascent() * input_scale;
+            let mut input_x = palette_x + 14.0;
+            let prompt_cell_w = atlas.cell_size().0 * input_scale;
+            for c in prompt_str.chars() {
+                if c == ' ' {
+                    input_x += prompt_cell_w;
+                    continue;
+                }
+                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                    if entry.width > 0.0 {
+                        let glyph_w = entry.width * input_scale;
+                        let glyph_h = entry.height * input_scale;
+                        let glyph_x = (input_x + entry.left * input_scale).round();
+                        let glyph_y = (input_baseline_y + entry.top * input_scale).round();
+                        let (aw, ah) = atlas.atlas_size();
+                        let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                        let uv_w = uv_end_x - uv_x;
+                        let uv_h = uv_end_y - uv_y;
+                        instances.push(CellInstance::new(
+                            glyph_x, glyph_y,
+                            glyph_w, glyph_h,
+                            [0.6, 0.85, 1.0, 0.95],
+                            [0.0, 0.0, 0.0, 0.0],
+                            uv_x, uv_y, uv_w, uv_h,
+                            0.0,
+                        ));
+                        input_x += (entry.width + 1.0) * input_scale;
+                    }
+                }
+            }
+                for c in command_palette_query.chars() {
+                    if c == ' ' {
+                        input_x += prompt_cell_w;
+                        continue;
+                    }
+                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                    if entry.width > 0.0 {
+                        let glyph_w = entry.width * input_scale;
+                        let glyph_h = entry.height * input_scale;
+                        let glyph_x = (input_x + entry.left * input_scale).round();
+                        let glyph_y = (input_baseline_y + entry.top * input_scale).round();
+                        let (aw, ah) = atlas.atlas_size();
+                        let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                        let uv_w = uv_end_x - uv_x;
+                        let uv_h = uv_end_y - uv_y;
+                        instances.push(CellInstance::new(
+                            glyph_x, glyph_y,
+                            glyph_w, glyph_h,
+                            [0.92, 0.94, 0.98, 1.0],
+                            [0.0, 0.0, 0.0, 0.0],
+                            uv_x, uv_y, uv_w, uv_h,
+                            0.0,
+                        ));
+                        input_x += (entry.width + 1.0) * input_scale;
+                    }
+                }
+            }
+            let cursor_x = input_x + 1.0;
+            let cursor_y = palette_y + 6.0;
+            instances.push(CellInstance::new(
+                cursor_x, cursor_y,
+                1.5, input_h - 12.0,
+                [0.6, 0.85, 1.0, 0.85],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                0.0,
+            ));
+
+            let result_scale = 12.0 / atlas.font_size();
+            let result_cell_w = atlas.cell_size().0 * result_scale;
+            let result_baseline_offset = atlas.ascent() * result_scale;
+            for (i, label) in command_palette_filtered.iter().take(max_results).enumerate() {
+                let item_y = palette_y + input_h + 8.0 + (i as f32) * item_h;
+                if i == command_palette_selected {
+                    instances.push(CellInstance::new(
+                        palette_x + 4.0, item_y,
+                        palette_w - 8.0, item_h - 2.0,
+                        [0.20, 0.45, 0.85, 0.35],
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0, 0.0, 1.0, 1.0,
+                        4.0,
+                    ));
+                }
+                let baseline_y = item_y + (item_h - atlas.cell_size().1 * result_scale) / 2.0 + result_baseline_offset;
+                let mut lx = palette_x + 14.0;
+                for c in label.chars() {
+                    if c == ' ' {
+                        lx += result_cell_w * 1.3;
+                        continue;
+                    }
+                    if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                        if entry.width > 0.0 {
+                            let glyph_w = entry.width * result_scale;
+                            let glyph_h = entry.height * result_scale;
+                            let glyph_x = (lx + entry.left * result_scale).round();
+                            let glyph_y = (baseline_y + entry.top * result_scale).round();
+                            let (aw, ah) = atlas.atlas_size();
+                            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                            let uv_w = uv_end_x - uv_x;
+                            let uv_h = uv_end_y - uv_y;
+                            instances.push(CellInstance::new(
+                                glyph_x, glyph_y,
+                                glyph_w, glyph_h,
+                                [0.92, 0.94, 0.98, 1.0],
+                                [0.0, 0.0, 0.0, 0.0],
+                                uv_x, uv_y, uv_w, uv_h,
+                                0.0,
+                            ));
+                            lx += (entry.width + 1.0) * result_scale;
+                        }
+                    }
+                }
+            }
+        }
+
         let ui_extra_instances_final = instances;
 
         let term_count = term_instances_final.len();

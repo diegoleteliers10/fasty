@@ -313,6 +313,10 @@ impl<'a> Renderer<'a> {
         hovered_tab_index: Option<usize>,
         hovered_close_tab_index: Option<usize>,
         hover_new_tab: bool,
+        command_palette_visible: bool,
+        command_palette_query: &str,
+        command_palette_selected: usize,
+        command_palette_filtered: &[String],
     ) {
         if !self.dirty {
             return;
@@ -399,6 +403,10 @@ impl<'a> Renderer<'a> {
                 &mut self.grid_dirty,
                 &self.device,
                 &self.queue,
+                command_palette_visible,
+                command_palette_query,
+                command_palette_selected,
+                command_palette_filtered,
             );
         }
 

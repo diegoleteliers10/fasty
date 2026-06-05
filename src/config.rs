@@ -191,6 +191,10 @@ pub struct Config {
     pub scrollback: usize,
     #[serde(default = "default_theme")]
     pub theme: Option<String>,
+    #[serde(default)]
+    pub keybindings: std::collections::HashMap<String, String>,
+    #[serde(default = "default_session_restore")]
+    pub session_restore: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +215,7 @@ fn default_font_family() -> String { "monospace".to_string() }
 fn default_font_size() -> f32 { 14.0 }
 fn default_font_weight() -> f32 { 400.0 }
 fn default_font_ligatures() -> bool { true }
+fn default_session_restore() -> bool { true }
 
 impl Default for Config {
     fn default() -> Self {
@@ -219,6 +224,8 @@ impl Default for Config {
             shell: None,
             scrollback: default_scrollback(),
             theme: default_theme(),
+            keybindings: std::collections::HashMap::new(),
+            session_restore: default_session_restore(),
         }
     }
 }
@@ -422,29 +429,18 @@ where
     if !parent.exists() {
         std::fs::create_dir_all(&parent)?;
     }
-
-    let watching_file_directly = file_path.exists();
-    if watching_file_directly {
-        tracing::info!("config-watch: watching file directly: {}", file_path.display());
-    } else {
-        tracing::info!("config-watch: watching parent dir: {} (waiting for file to be created)", parent.display());
-    }
+    tracing::info!("config-watch: watching dir {} (target: {})", parent.display(), file_path.display());
 
     let (tx, rx) = std::sync::mpsc::channel();
     let mut debouncer = new_debouncer(WATCH_DEBOUNCE, tx)?;
-    if watching_file_directly {
-        debouncer.watcher().watch(&file_path, RecursiveMode::NonRecursive)?;
-    } else {
-        debouncer.watcher().watch(&parent, RecursiveMode::NonRecursive)?;
-    }
+    debouncer.watcher().watch(&parent, RecursiveMode::NonRecursive)?;
 
     let watched_file = file_path.clone();
     let watched_name = watched_file.file_name().map(|n| n.to_owned());
     std::thread::Builder::new()
         .name("fasty-config-watch".into())
         .spawn(move || {
-            let mut _debouncer = debouncer;
-            let mut watching_file = watching_file_directly;
+            let _debouncer = debouncer;
             for batch in rx {
                 let events = match batch {
                     Ok(ev) => ev,
@@ -453,38 +449,20 @@ where
                         continue;
                     }
                 };
-                let touches_file = if watching_file {
-                    events.iter().any(|e| e.path == watched_file)
-                } else {
-                    events.iter().any(|e| e.path.file_name() == watched_name.as_deref())
-                };
+                let touches_file = events.iter().any(|e| {
+                    e.path.file_name() == watched_name.as_deref()
+                });
                 if !touches_file { continue; }
-                if !watched_file.exists() {
-                    if watching_file {
-                        let _ = _debouncer.watcher().unwatch(&watched_file);
-                        if let Err(e) = _debouncer.watcher().watch(&parent, RecursiveMode::NonRecursive) {
-                            tracing::warn!("config-watch: switch to parent dir failed: {e:?}");
-                        } else {
-                            watching_file = false;
-                            tracing::info!("config-watch: file deleted, switched to parent dir");
-                        }
-                    }
-                    continue;
-                } else if !watching_file && watched_file.exists() {
-                    let _ = _debouncer.watcher().unwatch(&parent);
-                    if let Err(e) = _debouncer.watcher().watch(&watched_file, RecursiveMode::NonRecursive) {
-                        tracing::warn!("config-watch: switch to direct file watch failed: {e:?}");
-                    } else {
-                        watching_file = true;
-                        tracing::info!("config-watch: file appeared, switched to direct watch");
-                    }
-                }
                 let content = match std::fs::read(&watched_file) {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
                 let h = content_hash(&content);
-                if h == last_applied_hash() { continue; }
+                if h == last_applied_hash() {
+                    tracing::debug!("config-watch: hash matches, skipping");
+                    continue;
+                }
+                tracing::info!("config-watch: change detected for {}", watched_file.display());
                 on_change();
             }
         })?;

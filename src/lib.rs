@@ -2,6 +2,8 @@
 
 pub mod config;
 pub mod event_listener;
+pub mod keybindings;
 pub mod pty;
 pub mod renderer;
+pub mod session;
 pub mod terminal_state;

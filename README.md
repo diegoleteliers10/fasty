@@ -6,24 +6,27 @@ Inspired by [Ghostty](https://github.com/ghostty-org/ghostty), Fasty leverages `
 
 ---
 
-## 🚀 Key Features
+## Key Features
 
-- **GPU-Accelerated Rendering**: Built on top of `wgpu` (targeting Vulkan, Metal, DX12, GLES) and WGSL shaders for low-latency cell grid updates.
-- **Modern SVG Vector Icons**: Replaced default unicode/font glyphs in context menus, topbar window controls, tabs, and settings panels with high-contrast vector icons loaded from `assets/icons/` via `resvg`, `usvg`, and `tiny-skia`.
-- **Ultra-Low CPU Idle Footprint**: Achieves `<1%` CPU consumption at idle by utilizing `winit`'s `ControlFlow::Wait` mode, employing a blocking PTY read loop, and implementing a micro-optimized cursor blink GPU fast-path.
-- **Animated Scrollbar Fading**: Smoothly fades the scrollbar out (using dynamic alpha opacity lerping) when running a text user interface (TUI) that owns mouse reporting or active alternate screen buffers, fading it back in instantly upon exit.
-- **Seamless TUI Mouse Integration**: Perfect mouse clicks and drag selections passed directly to the terminal PTY (such as inside Claude Code, htop, or vim) without interfering with desktop text selection.
-- **Tabbed Layout**: Support for multiple independent tabs, each running a native shell process.
-- **Live-Apply Settings**: Font family, size (1pt step), scrollback, and theme are applied instantly to the running terminal — no Save / Cancel buttons, the dialog is a pure live-apply surface.
-- **Built-in Color Themes**: `default` (Fasty), `catppuccin`, `one-dark`, `solarized-dark`. Switches apply live to the main window, settings, and about dialogs. Topbar darkens on the active theme (`bg * 0.83` for non-default, hand-tuned `#0a0a0a` for default).
-- **Asynchronous Background Updater**: A non-blocking, automatic updater accessible via the topbar "Update" button. Selecting "Update" runs the installation script (`instalar.sh`/`instalar.ps1`) in a background thread, displaying "Updating...", and automatically launching the updated Fasty window and closing the old one on success.
-- **About Context Menu**: Left-clicking the Fasty top-bar logo triggers the options context menu, providing quick access to the "About Fasty" panel.
+- **GPU-Accelerated Rendering**: Built on `wgpu` (Vulkan, Metal, DX12, GLES) and WGSL shaders for low-latency cell grid updates.
+- **Modern SVG Vector Icons**: High-contrast vector icons loaded from `assets/icons/` via `resvg`, `usvg`, and `tiny-skia` — replaces default unicode/font glyphs in context menus, topbar, tabs, and settings.
+- **Ultra-Low CPU Idle Footprint**: `<1%` CPU at idle via `winit`'s `ControlFlow::Wait`, blocking PTY read loop, and micro-optimized cursor blink GPU fast-path.
+- **Animated Scrollbar Fading**: Smoothly fades the scrollbar out during TUI mouse reporting or alternate screen buffers, fades back in instantly on exit.
+- **Seamless TUI Mouse Integration**: Perfect mouse clicks and drag selections passed directly to the PTY (htop, vim, Claude Code) without interfering with desktop text selection.
+- **Tabbed Layout**: Multiple independent tabs, each running a native shell process.
+- **Live-Apply Settings**: Font family, size (1pt step), scrollback, and theme applied instantly — no Save/Cancel buttons.
+- **Built-in Color Themes**: `default` (Fasty), `catppuccin`, `one-dark`, `solarized-dark`. Switches apply live across main window, settings, and about dialogs.
+- **Custom Keybindings**: User-rebindable shortcuts via `[keybindings]` in `fasty.toml`. 13 actions available; defaults preserved when omitted.
+- **Session Restore**: Saves open tab working directories on exit, restores to saved paths on next launch. Enabled by default; opt-out via `session_restore = false`.
+- **Command Palette**: `Ctrl+Shift+P` opens a fuzzy-search palette for quick access to settings, tab actions, themes, and font size controls.
+- **TOML Config + Live Reload**: `fasty.toml` edits re-apply on save — no restart needed. Comments and formatting preserved across Settings-dialog writes via `toml_edit` round-tripping.
+- **Asynchronous Background Updater**: Non-blocking update check on startup with one-click install from the topbar "Update" button. Restarts automatically on success.
 
 ---
 
-## 🎨 SVG Icon UI System
+## SVG Icon UI System
 
-Fasty integrates custom vector icons mapped into the GPU texture atlas as non-color stencils. This guarantees sharp rendering at all DPI scales without reliance on system-installed icon fonts.
+Fasty integrates custom vector icons mapped into the GPU texture atlas as non-color stencils. Sharp rendering at all DPI scales without system-installed icon fonts.
 
 | UI Component | Action / Function | SVG Icon Asset | Render Size |
 | :--- | :--- | :--- | :--- |
@@ -42,218 +45,173 @@ Fasty integrates custom vector icons mapped into the GPU texture atlas as non-co
 | | Open New Tab | `add.svg` | `14x14 px` |
 | | Close Tab | `close.svg` | `14x14 px` |
 
-> [!TIP]
 > Icons like `add.svg` and `less.svg` are custom-drawn with a stroke thickness of `2.5` to ensure subpixel visibility and high contrast at tiny render dimensions.
 
 ---
 
-## ⚡ Performance & Memory Optimizations
+## Performance & Memory Optimizations
 
-### Memory Footprint Reduction (30–50MB Linux, 50–70MB Windows)
-Fasty has been optimized to run at a significantly lower memory footprint across all platforms:
-1. **Scrollback Memory Cap**: The scrollback buffer is capped at a maximum of 3000 lines (down from 10,000), reducing allocations by ~37MB.
-2. **GPU Texture Atlas Scaling**: Main and UI texture atlases are sized at `1536x1536` on Linux/macOS and `1024x1024` on Windows (down from `2048x2048`), freeing GPU and system memory.
-3. **Logging Overhead Elimination**: Removed duplicate logging crates (`log`, `env_logger`) in favor of standard `tracing`. Tracing output is conditionalized to initialize only in debug configurations.
-4. **Hardened Release Profile**: Recompiled with Link-Time Optimization (`lto = true`), unit splitting (`codegen-units = 1`), debug symbols stripping (`strip = true`), and panic unwinding disabled (`panic = "abort"`).
+### Memory Footprint Reduction (30-50MB Linux, 50-70MB Windows)
+
+1. **Scrollback Memory Cap**: Capped at 3000 lines (down from 10,000), reducing allocations by ~37MB.
+2. **GPU Texture Atlas Scaling**: Main and UI texture atlases sized at `1536x1536` on Linux/macOS and `1024x1024` on Windows (down from `2048x2048`).
+3. **Logging Overhead Elimination**: Removed duplicate logging crates in favor of standard `tracing`. Output conditionalized to debug configurations only.
+4. **Hardened Release Profile**: LTO (`lto = true`), unit splitting (`codegen-units = 1`), debug symbols stripped (`strip = true`), panic unwinding disabled (`panic = "abort"`).
 
 ### Windows Memory & UX Hardening (v0.2.5)
-v0.2.5 brings Windows to parity with the Linux/macOS footprint and eliminates two UX issues specific to the D3D12 backend:
-1. **D3D12 Debug Layer Disabled in Release**: `wgpu::InstanceFlags` is now set via `from_build_config()` so the validation layer (which loads `d3d12sdklayers.dll` and spawns 3 helper processes — the source of the visible console flashes at startup) only runs in debug builds. **Cuts ~70MB of D3D12 debug-layer shadow copies.**
-2. **Memory Hints on Windows**: `MemoryHints::MemoryUsage` (instead of `Performance`) is used on the D3D12 backend to prevent the driver from creating CPU-accessible staging copies of every GPU resource. **Cuts another ~20–50MB.**
-3. **Atlas Sizing on Windows**: Atlases are 1024×1024 on Windows (1024² = 1M cells is more than enough for the basic + box-drawing + emoji set used). **Cuts ~10MB per renderer × up to 3 renderers (main + settings + about).**
-4. **No-Console-Startup**: All Windows child process spawns (`curl` for update check, `reg` for font resolution, `cmd` for URL/file opening, `powershell` for update install, fasty relaunch on `Ctrl+Shift+N`) now set `creation_flags(0x08000000)` (`CREATE_NO_WINDOW`). The user no longer sees background terminal windows flash at startup or during user actions.
-5. **No Dialog White Flash**: Settings and About dialogs now commit their first swapchain frame (`frame.present()`) before being made visible. On Windows D3D12, invisible HWNDs never receive `WM_PAINT`, so the previous approach of `set_visible(true)` inside `RedrawRequested` was unreachable and resulted in a white backbuffer being shown on the first user interaction.
 
-**Result on Windows**: 200MB → **50–70MB** RAM, zero console flashes, zero dialog white flash.
+1. **D3D12 Debug Layer Disabled in Release**: `wgpu::InstanceFlags::from_build_config()` skips the validation layer. Cuts ~70MB of D3D12 debug-layer shadow copies.
+2. **MemoryHints::MemoryUsage**: Prevents the D3D12 driver from creating CPU-accessible staging copies. Cuts ~20-50MB.
+3. **Atlas Sizing on Windows**: 1024x1024 atlases (sufficient for basic + box-drawing + emoji set). Cuts ~10MB per renderer.
+4. **No-Console-Startup**: All Windows child process spawns use `creation_flags(0x08000000)` (`CREATE_NO_WINDOW`). Zero console flashes.
+5. **No Dialog White Flash**: Settings and About dialogs commit first swapchain frame before `set_visible(true)`.
+
+**Result on Windows**: 200MB -> 50-70MB RAM, zero console flashes, zero dialog white flash.
 
 ### Micro-Optimized Cursor Blinking
-Instead of triggering a full layout and rebuilding cell instances across the grid when the cursor blinks (which consumed ~8% CPU), Fasty implements a fast-path renderer:
-1. An enum `RenderReason` defines the draw request:
-   ```rust
-   pub enum RenderReason {
-       CursorBlink, // Redraw only the cursor quad
-       GridChanged, // Rebuild and redraw the entire screen
-   }
-   ```
-2. When performing a `CursorBlink`, Fasty updates only the transparency byte of the cursor quad in `cached_final_instances`.
-3. It performs a single, minimal 48-byte buffer write (`queue.write_buffer`) directly to the GPU's instance buffer.
-4. It submits the command encoder immediately with cached draw count values, skipping cell iterations, Atlas dirty checks, and font rasterization.
+
+Instead of full layout rebuild on cursor blink (~8% CPU), Fasty implements a fast-path renderer:
+1. `RenderReason::CursorBlink` updates only the transparency byte of the cursor quad in `cached_final_instances`.
+2. Single 48-byte buffer write (`queue.write_buffer`) directly to GPU instance buffer.
+3. Command encoder submitted immediately with cached draw count values — skips cell iterations, atlas dirty checks, and font rasterization.
 
 ### OS-Level Sleeping
-- **Event Loop**: By default, the winit event loop rests in `Wait` state until a window event, keypress, or PTY output occurs.
-- **PTY Reader Thread**: The reader thread blocks at the OS kernel level on read calls from the PTY master, generating `0.0%` CPU wakeups when the shell is idle.
+
+- **Event Loop**: Rests in `Wait` state until window event, keypress, or PTY output.
+- **PTY Reader Thread**: Blocks at OS kernel level on read calls, generating `0.0%` CPU wakeups when idle.
 
 ---
 
-## 📂 Codebase Architecture
+## Codebase Architecture
 
 ```
 src/
 ├── main.rs            # Entry point, event loop, tab manager, UI state
 ├── terminal_state.rs  # PTY controller & alacritty_terminal parser wrapper
+├── keybindings.rs     # Key combo parser, action resolver, user overrides
+├── session.rs         # Tab cwd persistence (save/restore)
 ├── renderer/          # wgpu backend components
 │   ├── mod.rs         # Renderer definitions, render passes
 │   ├── pipeline.rs    # Cell instance drawing, UI layouts, cursor fast-path
 │   └── atlas.rs       # Dynamic Glyph and SVG Stencil GPU texture cache
-├── config.rs         # Config validation and local JSON reading
-└── event_listener.rs # PTY write proxy
+├── config.rs          # TOML config, live-reload watcher, atomic save
+└── event_listener.rs  # PTY write proxy
 ```
 
 ---
 
-## 📦 Installation & Setup
+## Installation & Setup
 
-### 1. Automatic Installation via Scripts
+### Automatic Installation via Scripts
 
-#### 🐧 Linux & 🍎 macOS
-You can install Fasty automatically by running the installer script:
+#### Linux & macOS
 ```bash
 curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash
 ```
 
-#### 🪟 Windows
-Run the PowerShell installer script (no administrator privileges required):
+#### Windows
 ```powershell
 irm https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.ps1 | iex
 ```
 
----
+### Manual Installation from Release Archives
 
-### 2. Manual Installation from Release Archives
+Download from the [Releases page](https://github.com/diegoleteliers10/fasty/releases).
 
-If you prefer to install Fasty manually, download the correct bundle for your platform from the [Releases page](https://github.com/diegoleteliers10/fasty/releases).
-
-#### 🐧 Linux & 🍎 macOS (`.tar.gz`)
+#### Linux & macOS (`.tar.gz`)
 1. Download the archive for your architecture:
    - Linux: `fasty-x86_64-unknown-linux-gnu.tar.gz`
    - macOS (Intel): `fasty-x86_64-apple-darwin.tar.gz`
    - macOS (Apple Silicon): `fasty-aarch64-apple-darwin.tar.gz`
-2. Extract the archive:
-   ```bash
-   tar -xzf fasty-*.tar.gz
-   ```
-3. Move the binary/app bundle to your installation directory:
-   - On **Linux**:
+2. Extract: `tar -xzf fasty-*.tar.gz`
+3. Install:
+   - **Linux**:
      ```bash
      mkdir -p ~/.local/bin
      mv fasty ~/.local/bin/
      ```
-   - On **macOS**:
+   - **macOS**:
      ```bash
      mv Fasty.app /Applications/
      ln -s /Applications/Fasty.app/Contents/MacOS/fasty /usr/local/bin/fasty
      ```
 
-#### 🪟 Windows (`.zip`)
+#### Windows (`.zip`)
 1. Download `fasty-x86_64-pc-windows-msvc.zip`.
-2. Extract the `.zip` archive.
-3. Move the extracted folder or copy `fasty.exe` to a folder in your path, for example:
+2. Extract the archive.
+3. Move `fasty.exe` to a folder in your path:
    ```powershell
    Move-Item -Path .\fasty.exe -Destination "$env:USERPROFILE\.local\bin\fasty.exe" -Force
    ```
-4. Ensure `$env:USERPROFILE\.local\bin` is added to your environment `PATH` variable.
+4. Ensure `$env:USERPROFILE\.local\bin` is in your `PATH`.
 
----
-
-### 3. Build & Setup from Source
-
-If you want to compile Fasty from source:
+### Build from Source
 
 #### Install System Dependencies
 
-* **macOS**:
-  ```bash
-  xcode-select --install
-  ```
-* **Linux (Wayland)**:
-  ```bash
-  sudo apt install libvulkan-dev libwayland-dev
-  ```
-* **Linux (X11)**:
-  ```bash
-  sudo apt install libvulkan-dev libx11-dev
-  ```
-* **Windows**:
-  Install the [Vulkan SDK](https://vulkan.lunarg.com/).
+- **macOS**: `xcode-select --install`
+- **Linux (Wayland)**: `sudo apt install libvulkan-dev libwayland-dev`
+- **Linux (X11)**: `sudo apt install libvulkan-dev libx11-dev`
+- **Windows**: Install the [Vulkan SDK](https://vulkan.lunarg.com/).
 
-#### Build Fasty
+#### Build
 
 ```bash
-# Debug profile
-cargo build
+cargo build              # Debug profile
+cargo build --release    # Release profile (LTO + optimizations)
 
-# Release profile (with LTO and optimizations)
-cargo build --release
-
-# Build specifying a specific backend (Linux only)
+# Linux backend selection
 cargo build --features wayland
 cargo build --features x11
 ```
 
 ---
 
-## 💻 Command Line Interface (CLI)
-
-Fasty can be launched with several command-line flags to customize its startup behavior.
-
-### CLI Options
+## Command Line Interface
 
 | Option | Alias | Description |
 | :--- | :--- | :--- |
-| `-e` | `--command` | Spawns a specific command directly and auto-closes the window once it exits. |
-| `-d` | `--working-dir` | Overrides the PTY startup working directory (e.g. `-d ~/projects`). |
-| | `--title` | Sets a custom window title. |
-
-### Usage Examples
+| `-e` | `--command` | Spawn a specific command and auto-close on exit |
+| `-d` | `--working-dir` | Override the PTY startup working directory |
+| | `--title` | Set a custom window title |
 
 ```bash
-# Open fasty with the default user shell
-fasty
-
-# Open htop directly, closing the window automatically when htop exits
-fasty -e htop
-
-# Open a specific file inside neovim
-fasty -e nvim src/main.rs
-
-# Start an ssh session
-fasty -e ssh user@server
-
-# Run a development server in a specific working directory
-fasty -d ~/my-project -e bun run dev
-
-# Open terminal in a specific directory with a custom window title
+fasty                                    # Default shell
+fasty -e htop                            # Run htop, auto-close on exit
+fasty -e nvim src/main.rs                # Open file in neovim
+fasty -e ssh user@server                 # SSH session
+fasty -d ~/my-project -e bun run dev    # Dev server in specific directory
 fasty --title "Dev Server" -d ~/my-project -e bun run dev
-
-# Run compound command inside bash
 fasty -e bash -c "cargo build && cargo test"
 ```
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
-Fasty reads `fasty.toml` from the first existing path in this order:
+Fasty reads `fasty.toml` from the first existing path:
 
-1. `./fasty.toml` (current working directory — portable mode)
+1. `./fasty.toml` (current working directory -- portable mode)
 2. `/etc/fasty/fasty.toml` (system-wide)
-3. `~/.config/fasty/fasty.toml` (user — default)
+3. `~/.config/fasty/fasty.toml` (user -- default)
 
-If no file is found, defaults are applied. On startup, Fasty initializes window dimensions at a default logical footprint of **`800 x 520`** pixels.
+If no file is found, defaults are applied. On startup, window dimensions default to **800 x 520** pixels.
 
-**Live reload (v0.2.8+):** edits to `fasty.toml` re-apply on save — no restart needed for `font.family`, `font.size`, `theme`, or `scrollback`. Settings changed via the Settings dialog also persist to this same file. Comments and formatting are preserved across Settings-dialog writes (via `toml_edit` round-tripping).
+**Live reload (v0.2.8+):** Edits to `fasty.toml` re-apply on save. Settings changed via the Settings dialog persist to this same file. Comments and formatting are preserved via `toml_edit` round-tripping.
 
 **Live-reload exceptions:**
 - `font.ligatures`: requires restart (atlas-level cache rebuild).
 - `shell`: applies only to newly spawned tabs.
 
-**Migration from v0.2.7 or earlier:** on first launch v0.2.8 auto-converts `~/.config/fasty/config.json` into `~/.config/fasty/fasty.toml` and renames the original to `config.json.bak`. The other two paths (cwd, `/etc/fasty/`) are not touched — migrate manually if you use them.
+**Migration from v0.2.7 or earlier:** On first launch, v0.2.8 auto-converts `~/.config/fasty/config.json` into `~/.config/fasty/fasty.toml` and renames the original to `config.json.bak`.
 
 ### Configuration Template
+
 ```toml
 shell = "/bin/bash"        # optional; omit to detect system default
 scrollback = 3000
 theme = "default"
+session_restore = true     # restore last tabs on launch
 
 [font]
 family = "JetBrains Mono"
@@ -261,42 +219,67 @@ size = 14.0
 weight = 400.0
 ligatures = true
 
-[keybindings]              # reserved for v0.2.9 — leave empty for now
+[keybindings]
+# All bindings are optional. Omitted keys use defaults.
+# Example overrides:
+# ctrl+shift+t = "new_tab"
+# ctrl+shift+w = "close_tab"
+# ctrl+shift+p = "command_palette"
 ```
 
-| Config Property | Type | Description |
-| :--- | :--- | :--- |
-| `font.family` | `string` | Name of the font family loaded via FontConfig / FreeType |
-| `font.size` | `float` | Font size in logical points |
-| `font.weight` | `float` | Numeric font weight value (e.g. `400.0` for Regular) |
-| `font.ligatures` | `boolean` | Toggles rendering of font ligatures (restart required) |
-| `shell` | `string?` | Custom shell path; omit the key entirely to detect the default system shell |
-| `scrollback` | `integer` | Lines of scrollback buffer history retained in memory (default 3000, capped at a maximum of 3000 for RAM efficiency) |
-| `theme` | `string` | Color scheme name. One of `default` (Fasty), `catppuccin`, `one-dark`, `solarized-dark`, or any custom theme name in `~/.config/fasty/themes/`. Selectable live from the Settings dialog. |
+### Config Properties
 
-### 🎨 Built-in Themes
+| Property | Type | Description |
+| :--- | :--- | :--- |
+| `font.family` | `string` | Font family name loaded via FontConfig / FreeType |
+| `font.size` | `float` | Font size in logical points |
+| `font.weight` | `float` | Numeric font weight (e.g. `400.0` for Regular) |
+| `font.ligatures` | `boolean` | Toggle font ligatures (restart required) |
+| `shell` | `string?` | Custom shell path; omit to detect system default |
+| `scrollback` | `integer` | Lines of scrollback buffer (default 3000, capped at 3000) |
+| `theme` | `string` | Color scheme: `default`, `catppuccin`, `one-dark`, `solarized-dark`, or custom name |
+| `session_restore` | `boolean` | Restore previously open tabs on launch (default: `true`) |
+
+### Keybindings
+
+The `[keybindings]` section maps key combinations to actions. All bindings are optional; omitted keys use defaults.
+
+**Available actions:**
+
+| Action | Default Binding | Description |
+| :--- | :--- | :--- |
+| `new_tab` | `ctrl+shift+t` | Open a new tab |
+| `close_tab` | `ctrl+shift+w` | Close current tab |
+| `new_window` | `ctrl+shift+n` | Open a new window |
+| `copy` | `ctrl+shift+c` | Copy selection to clipboard |
+| `paste` | `ctrl+shift+v` | Paste from clipboard |
+| `open_search` | `ctrl+shift+f` | Open search bar |
+| `open_settings` | `ctrl+shift+s` | Open settings dialog |
+| `reload_config` | `ctrl+shift+r` | Reload configuration |
+| `command_palette` | `ctrl+shift+p` | Open command palette |
+| `increase_font_size` | `ctrl+equal` / `ctrl+plus` | Increase font size |
+| `decrease_font_size` | `ctrl+minus` | Decrease font size |
+| `reset_font_size` | `ctrl+0` | Reset font size |
+| `next_tab` | `ctrl+tab` | Switch to next tab |
+| `prev_tab` | `ctrl+shift+tab` | Switch to previous tab |
+| `select_tab_N` | `alt+N` (1-9) | Switch to tab N |
+
+### Built-in Themes
 
 | Theme | Background | Foreground | Notes |
 | :--- | :--- | :--- | :--- |
-| `default` | `#0C0C0C` | `#C5C8C6` | Fasty — original `#0c0c0c` terminal bg, Tomorrow Night text palette |
+| `default` | `#0C0C0C` | `#C5C8C6` | Fasty -- original terminal bg, Tomorrow Night palette |
 | `catppuccin` | `#24273A` | `#CAD3F5` | Soft pastel, easy on the eyes |
 | `one-dark` | `#282C34` | `#ABB2BF` | Atom One Dark |
-| `solarized-dark` | `#002B36` | `#839496` | Classic Solarized dark (Ethan Schoonover) |
+| `solarized-dark` | `#002B36` | `#839496` | Classic Solarized dark |
 
-The theme is read on every cell render from a process-wide `RwLock<String>`, so changes in the Settings dialog take effect immediately on the live terminal — no restart required. Each cell instance looks up its named color (`Foreground`, `Background`, `Red`, …) and the indexed 16-color palette through `named_color_rgb()` / `index_to_ansi_color()` which both dispatch to the active theme.
+Theme changes take effect immediately on the live terminal. Each cell instance looks up its named color through `named_color_rgb()` / `index_to_ansi_color()` which dispatch to the active theme.
 
-**Themed surfaces** (all re-render on theme change):
+**Themed surfaces** (all re-render on theme change): main window bg, topbar, active tab fill, scrollback area, settings dialog, about dialog, context menu.
 
-- Main window bg, topbar (darkened variant), active tab fill, scrollback area
-- Settings dialog: window bg, topbar, dropdown bgs, hover/selected item highlights, the closed-box rest/hover/active states for font family + theme pickers, the "Open fasty.toml" button
-- About dialog: window bg and topbar
-- Context menu (right-click on the topbar icon) inner background
+### Custom Themes
 
-The `theme_accent` (the theme's `BrightBlue`) is used for selected-item highlights and active selection text in dropdowns, and `theme_item_hover` (theme bg lifted by +22/255) is used for hover rows. Both look right on every theme without per-theme overrides.
-
-### 📁 Custom Themes
-
-Drop a `.json` file into `~/.config/fasty/themes/` (the filename minus `.json` becomes the theme name) and it'll show up in the settings dropdown next launch. All 18 fields are optional except `background` and `foreground`; missing ANSI colors fall back to `foreground`.
+Drop a `.json` file into `~/.config/fasty/themes/` (filename minus `.json` becomes the theme name). All 18 fields are optional except `background` and `foreground`; missing ANSI colors fall back to `foreground`.
 
 ```json
 {
@@ -323,92 +306,93 @@ Drop a `.json` file into `~/.config/fasty/themes/` (the filename minus `.json` b
 
 ---
 
-## ⌨️ Keyboard Shortcuts
+## Keyboard Shortcuts
 
-| Shortcut Key | Action Performed |
+| Shortcut | Action |
 | :--- | :--- |
-| **`Ctrl + Shift + T`** | Open a new tab |
-| **`Ctrl + Shift + W`** | Close current tab |
-| **`Ctrl + Shift + L`** | Snap scroll position to the bottom of the buffer |
-| **`Ctrl + C`** / **`Ctrl + Shift + C`** | Copy current mouse text selection |
-| **`Ctrl + V`** / **`Ctrl + Shift + V`** | Paste clipboard contents to PTY |
-| **`Left Mouse Drag`** | Highlight text |
-| **`Ctrl + Left Click`** | Open highlighted URL in default browser |
+| `Ctrl + Shift + T` | Open a new tab |
+| `Ctrl + Shift + W` | Close current tab |
+| `Ctrl + Shift + P` | Open command palette |
+| `Ctrl + Shift + L` | Snap scroll to bottom |
+| `Ctrl + C` / `Ctrl + Shift + C` | Copy selection |
+| `Ctrl + V` / `Ctrl + Shift + V` | Paste clipboard |
+| `Ctrl + Left Click` | Open URL in browser |
+| `Left Mouse Drag` | Highlight text |
 
 ---
 
-## 🗺️ Roadmap
+## Roadmap
 
-Features under consideration for upcoming releases. Grouped by category and priority:
-- **🔴 High** = high demand + low-medium effort
-- **🟡 Medium** = clear value but moderate effort
-- **🟢 Exploratory** = speculative, high effort or niche
+Features under consideration for upcoming releases:
+- **High** = high demand + low-medium effort
+- **Medium** = clear value but moderate effort
+- **Exploratory** = speculative, high effort or niche
 
-`[x]` = already implemented · `[ ]` = planned
+`[x]` = implemented  |  `[ ]` = planned
 
-### 🖼️ Graphics & Terminal Protocols
-- [x] 🔴 **OSC 8 Hyperlinks** — `\e]8;;url\e\\text\e]8;;\e\\` is clickable inline via plain click. Hover state shows underline + accent tint. Auto-detected plain URLs (no OSC 8) still open via `Ctrl+click`. Industry standard, used by `ls --color`, `gh`, modern CLI tools.
-- [ ] 🔴 **Inline Image Protocol (iTerm2/Kitty)** — Render PNG/JPEG inline via the Kitty graphics protocol. Useful for `chafa`, `viu`, image previews in `yazi`/`ranger`.
-- [ ] 🟡 **Sixel Graphics** — Legacy image protocol still used by some tools (`img2sixel`, `ls -6`). Optional, opt-in via config.
-- [ ] 🟢 **Unicode 16 + Complex Shaping** — Better emoji ZWJ sequences, RTL text, Indic scripts. Current FreeType pipeline handles most cases; gaps remain.
-- [x] 🟡 **OpenType Font Ligatures** — Configurable via `font.ligatures`; rendered via `rustybuzz` shaping with high-perf row cache.
+### Graphics & Terminal Protocols
+- [x] **OSC 8 Hyperlinks** -- Clickable inline hyperlinks via OSC 8 escape sequences.
+- [ ] **Inline Image Protocol (iTerm2/Kitty)** -- Render PNG/JPEG inline via the Kitty graphics protocol.
+- [ ] **Sixel Graphics** -- Legacy image protocol for `img2sixel`, `ls -6`.
+- [ ] **Unicode 16 + Complex Shaping** -- Better emoji ZWJ sequences, RTL text, Indic scripts.
+- [x] **OpenType Font Ligatures** -- Configurable via `font.ligatures`; rendered via `rustybuzz` shaping.
 
-### ✂️ Productivity & Workflow
-- [ ] 🔴 **In-Scrollback Search** — `Ctrl+Shift+F` opens a search bar that highlights matches in the live + scrollback buffer. Should be GPU-accelerated.
-- [ ] 🔴 **Command Palette** — `Ctrl+Shift+P` opens a fuzzy-search palette over settings, tab actions, themes. Inspired by VS Code/Sublime.
-- [ ] 🔴 **Session Restore** — Persist open tabs, working directories, and PWD on shutdown; restore on next launch. Optional via config.
-- [ ] 🟡 **Split Panes** — Horizontal/vertical splits per tab (like `tmux`/`Zellij`). Each split runs its own PTY.
-- [x] 🟡 **Copy on Select** — Mouse selection auto-copies to clipboard on mouse release, with a "✓ Text copied" toast. Inspired by `tmux`/`kitty` behavior.
-- [ ] 🟡 **Tab Reordering by Drag** — Currently read-only. Add drag-to-reorder + drag-to-detach (spawn new window).
-- [ ] 🟢 **Quake-Mode / Drop-Down Terminal** — Global hotkey toggles a top-anchored sliding window. Implementation: fullscreen transparent window + slide-in offset animation.
-- [ ] 🟢 **Shell Integration (Command Markers)** — Mark command boundaries in scrollback, jump between them. Requires opt-in shell hooks (similar to `starship`/`fish`).
-- [x] 🟡 **Click-to-Cursor Prompt Positioning** — Click anywhere in the prompt area to move the cursor to that position (vim-style).
-- [x] 🟡 **URL Hover Detection** — `Ctrl+hover` highlights URLs in terminal output; `Ctrl+click` opens in default browser.
+### Productivity & Workflow
+- [ ] **In-Scrollback Search** -- `Ctrl+Shift+F` opens a search bar highlighting matches in live + scrollback buffer.
+- [x] **Command Palette** -- `Ctrl+Shift+P` opens a fuzzy-search palette over settings, tab actions, themes.
+- [x] **Session Restore** -- Persist open tab working directories on shutdown; restore on next launch.
+- [ ] **Split Panes** -- Horizontal/vertical splits per tab (like `tmux`/`Zellij`).
+- [x] **Copy on Select** -- Mouse selection auto-copies to clipboard on release.
+- [ ] **Tab Reordering by Drag** -- Drag-to-reorder + drag-to-detach.
+- [ ] **Quake-Mode / Drop-Down Terminal** -- Global hotkey toggles a top-anchored sliding window.
+- [ ] **Shell Integration (Command Markers)** -- Mark command boundaries in scrollback, jump between them.
+- [x] **Click-to-Cursor Prompt Positioning** -- Click in prompt area to move cursor.
+- [x] **URL Hover Detection** -- `Ctrl+hover` highlights URLs; `Ctrl+click` opens in browser.
 
-### 🎨 Customization & Configuration
-- [x] 🔴 **Themes (Color Schemes)** — Built-in `default` (Fasty), `catppuccin`, `one-dark`, `solarized-dark`. Selectable live from the Settings dialog; persisted to `fasty.toml` under the `theme` key.
-- [x] 🔴 **TOML Config + Live Reload (v0.2.8)** — `fasty.toml` (typed `[font]` + top-level `shell`/`scrollback`/`theme` + reserved `[keybindings]`) re-applies on save via a debounced file watcher. Round-tripped with `toml_edit` so comments/formatting survive Settings-dialog writes. Legacy `config.json` auto-migrates on first launch.
-- [ ] 🟡 **Custom Keybindings** — User-rebindable shortcuts in `fasty.toml` (`[keybindings]` section already reserved). Required for split-pane UX.
-- [ ] 🟡 **Visual Settings Picker** — Replace the current text-number fields with a visual theme/font picker.
-- [ ] 🟢 **Plugin System (Lua/WASM)** — Ghostty/WezTerm-style scripting. High effort, but unlocks third-party themes, status bars, integrations.
+### Customization & Configuration
+- [x] **Themes (Color Schemes)** -- Built-in `default`, `catppuccin`, `one-dark`, `solarized-dark`. Live switching.
+- [x] **TOML Config + Live Reload (v0.2.8)** -- `fasty.toml` re-applies on save. Round-tripped with `toml_edit`.
+- [x] **Custom Keybindings** -- User-rebindable shortcuts in `fasty.toml` `[keybindings]` section.
+- [ ] **Visual Settings Picker** -- Replace text-number fields with visual theme/font picker.
+- [ ] **Plugin System (Lua/WASM)** -- Ghostty/WezTerm-style scripting.
 
-### 🤖 Modern Integrations
-- [ ] 🟡 **AI Command Suggestions (opt-in)** — Local-only: pipe the last failed command to a small LLM (via Ollama / local API) for a fix suggestion. No telemetry.
-- [ ] 🟡 **Inline Git Status in Topbar** — Render the current tab's repo branch + dirty status in the topbar. Hooks `git status` lazily (cached, 1s debounce).
-- [ ] 🟡 **Built-in SSH Manager** — Quick `Ctrl+Shift+S` → "Connect to..." picker. Spawns `ssh user@host` inside a new tab. Replaces manual `fasty -e ssh user@host`.
-- [ ] 🟢 **Remote / `fasty://` URL Scheme** — Register a protocol so `fasty://new-tab?cwd=...` opens a new tab from a browser link.
-- [ ] 🟢 **Cloud Config Sync** — Optional encrypted sync of `fasty.toml` via a simple backend (or WebDAV).
-- [x] 🟡 **Background Auto-Updater** — Non-blocking update check on startup + one-click install from the topbar "Update" button. Restarts Fasty automatically on success.
+### Modern Integrations
+- [ ] **AI Command Suggestions (opt-in)** -- Local-only: pipe last failed command to a small LLM for fix suggestion.
+- [ ] **Inline Git Status in Topbar** -- Render current tab's repo branch + dirty status.
+- [ ] **Built-in SSH Manager** -- `Ctrl+Shift+S` -> "Connect to..." picker.
+- [ ] **Remote / `fasty://` URL Scheme** -- Register protocol for browser-to-terminal links.
+- [ ] **Cloud Config Sync** -- Optional encrypted sync of `fasty.toml`.
+- [x] **Background Auto-Updater** -- Non-blocking update check + one-click install from topbar.
 
-### ♿ Accessibility & Inclusion
-- [ ] 🔴 **Screen Reader Bridge (Windows UIA / Linux AT-SPI / macOS AX)** — Announce output to assistive tech. Biggest current gap.
-- [ ] 🟡 **High-Contrast Theme** — WCAG AAA-compliant palette for users with low vision.
-- [ ] 🟡 **Color-Blind Palettes** — Deuteranopia/protanopia-friendly variants.
-- [ ] 🟡 **DPI Override Per-Monitor** — Already PerMonitorV2-aware; needs verified behavior on mixed-DPI multi-monitor setups.
-- [ ] 🟢 **Touch / Gesture Input** — Long-press to select, two-finger scroll in scrollback. Targets 2-in-1 laptops.
+### Accessibility
+- [ ] **Screen Reader Bridge (Windows UIA / Linux AT-SPI / macOS AX)** -- Announce output to assistive tech.
+- [ ] **High-Contrast Theme** -- WCAG AAA-compliant palette.
+- [ ] **Color-Blind Palettes** -- Deuteranopia/protanopia-friendly variants.
+- [ ] **DPI Override Per-Monitor** -- Verified behavior on mixed-DPI setups.
+- [ ] **Touch / Gesture Input** -- Long-press to select, two-finger scroll. Targets 2-in-1 laptops.
 
-### ⚙️ Performance & Reliability
-- [x] 🔴 **D3D12 Debug Layer Disabled in Release (v0.2.5)** — `wgpu::InstanceFlags::from_build_config()` skips the debug layer that loads `d3d12sdklayers.dll` and 3 helper processes (cause of the 3 startup terminal flashes on Windows).
-- [x] 🔴 **`MemoryHints::MemoryUsage` on Windows (v0.2.5)** — Prevents the D3D12 driver from creating CPU-accessible shadow copies of every GPU resource. Saved ~20–50MB.
-- [x] 🔴 **CREATE_NO_WINDOW on All Windows Spawns (v0.2.5)** — Helper `no_window_cmd()` applies `creation_flags(0x08000000)` to every `Command::new` on Windows (curl, reg, cmd, powershell, fasty relaunch).
-- [x] 🔴 **First-Frame Render Before Show on Dialogs (v0.2.5)** — Settings and About windows commit their first swapchain frame before `set_visible(true)`, eliminating the white backbuffer flash on Windows.
-- [ ] 🔴 **Scrollback-to-Disk** — Beyond 3000 lines, spill to a memory-mapped file. RAM-stays-low, infinite history.
-- [ ] 🟡 **GPU-Accelerated Search** — Run the in-scrollback search as a compute shader on the GPU-stored glyph index. Sub-millisecond on 100k lines.
-- [ ] 🟡 **Crash Reporting & Auto-Restart** — Optional opt-in crash dump upload (self-hosted) + automatic restart on panic.
-- [ ] 🟢 **Wide-Gamut (P3) and HDR Output** — Detect HDR displays, emit 10-bit color where supported. Currently 8-bit sRGB only.
+### Performance & Reliability
+- [x] **D3D12 Debug Layer Disabled in Release (v0.2.5)** -- Skips validation layer.
+- [x] **MemoryHints::MemoryUsage on Windows (v0.2.5)** -- Prevents D3D12 shadow copies.
+- [x] **CREATE_NO_WINDOW on All Windows Spawns (v0.2.5)** -- Zero console flashes.
+- [x] **First-Frame Render Before Show on Dialogs (v0.2.5)** -- Eliminates white backbuffer flash.
+- [ ] **Scrollback-to-Disk** -- Spill to memory-mapped file beyond 3000 lines.
+- [ ] **GPU-Accelerated Search** -- In-scrollback search as compute shader.
+- [ ] **Crash Reporting & Auto-Restart** -- Opt-in crash dump + automatic restart on panic.
+- [ ] **Wide-Gamut (P3) and HDR Output** -- Detect HDR displays, emit 10-bit color.
 
-### 🪟 Platform & Packaging
-- [ ] 🔴 **Signed MSIX / `.msi` Installer for Windows** — Replace the PowerShell installer. Microsoft's `makeappx` + a self-signed cert.
-- [x] 🟡 **Start Menu Shortcut on Windows** — Auto-registered on first launch via the registry (no admin required).
-- [ ] 🟡 **Flatpak for Linux** — Sandbox-friendly distribution.
-- [ ] 🟡 **Homebrew Formula Maintenance** — Already installable via the script; a real tap is overdue.
-- [ ] 🟢 **Android (via `winit` + `wgpu` Mobile)** — The same codebase already builds for Android (the crates support it). Just need touch-friendly input and on-screen keyboard.
+### Platform & Packaging
+- [ ] **Signed MSIX / `.msi` Installer for Windows** -- Replace PowerShell installer.
+- [x] **Start Menu Shortcut on Windows** -- Auto-registered on first launch.
+- [ ] **Flatpak for Linux** -- Sandbox-friendly distribution.
+- [ ] **Homebrew Formula Maintenance** -- Real tap overdue.
+- [ ] **Android (via `winit` + `wgpu` Mobile)** -- Touch-friendly input and on-screen keyboard.
 
-> **Have a feature request?** Open an issue on GitHub. Anything that fits the "minimal, fast, GPU-native terminal" philosophy is welcome.
+> Have a feature request? Open an issue on GitHub. Anything that fits the "minimal, fast, GPU-native terminal" philosophy is welcome.
 
 ---
 
-## 📚 Acknowledgements & Resources
+## Acknowledgements & Resources
 
 - [wgpu](https://wgpu.rs) - Graphics framework for Rust.
 - [Ghostty](https://github.com/ghostty-org/ghostty) - Inspiration for modern GPU terminal features.

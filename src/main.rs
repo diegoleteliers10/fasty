@@ -5,8 +5,10 @@
 
 mod config;
 mod event_listener;
+mod keybindings;
 mod pty;
 mod renderer;
+mod session;
 mod terminal_state;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,6 +59,7 @@ fn no_window_cmd(program: &str) -> std::process::Command {
 
 struct Tab {
     terminal_state: Arc<parking_lot::Mutex<TerminalState>>,
+    cwd: Option<std::path::PathBuf>,
     scroll_current: f32,
     scroll_target: f32,
     selection: Option<Selection>,
@@ -103,6 +106,7 @@ fn create_new_tab(
     )?;
     Ok(Tab {
         terminal_state: Arc::new(parking_lot::Mutex::new(terminal_state)),
+        cwd: cwd.map(std::path::PathBuf::from),
         scroll_current: 0.0,
         scroll_target: 0.0,
         selection: None,
@@ -126,6 +130,77 @@ fn create_new_tab(
 
 fn get_padding_top(_tab_count: usize) -> f32 {
     48.0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandAction {
+    NewTab,
+    CloseTab,
+    NewWindow,
+    NextTab,
+    PrevTab,
+    OpenSettings,
+    OpenSearch,
+    ReloadConfig,
+    IncreaseFontSize,
+    DecreaseFontSize,
+    ResetFontSize,
+    SnapToBottom,
+}
+
+fn palette_label(action: CommandAction) -> &'static str {
+    match action {
+        CommandAction::NewTab => "New Tab",
+        CommandAction::CloseTab => "Close Tab",
+        CommandAction::NewWindow => "New Window",
+        CommandAction::NextTab => "Next Tab",
+        CommandAction::PrevTab => "Previous Tab",
+        CommandAction::OpenSettings => "Open Settings",
+        CommandAction::OpenSearch => "Open Search",
+        CommandAction::ReloadConfig => "Reload Config",
+        CommandAction::IncreaseFontSize => "Increase Font Size",
+        CommandAction::DecreaseFontSize => "Decrease Font Size",
+        CommandAction::ResetFontSize => "Reset Font Size",
+        CommandAction::SnapToBottom => "Snap to Bottom",
+    }
+}
+
+fn build_palette_commands() -> Vec<(&'static str, CommandAction)> {
+    vec![
+        ("new tab", CommandAction::NewTab),
+        ("close tab", CommandAction::CloseTab),
+        ("new window", CommandAction::NewWindow),
+        ("next tab", CommandAction::NextTab),
+        ("previous tab", CommandAction::PrevTab),
+        ("open settings", CommandAction::OpenSettings),
+        ("open search", CommandAction::OpenSearch),
+        ("reload config", CommandAction::ReloadConfig),
+        ("increase font size", CommandAction::IncreaseFontSize),
+        ("decrease font size", CommandAction::DecreaseFontSize),
+        ("reset font size", CommandAction::ResetFontSize),
+        ("snap to bottom", CommandAction::SnapToBottom),
+    ]
+}
+
+fn filter_palette(commands: &[(&'static str, CommandAction)], query: &str) -> Vec<usize> {
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        return (0..commands.len()).collect();
+    }
+    commands.iter().enumerate()
+        .filter(|(_, (label, _))| label.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn compute_palette_filtered(commands: &[(&'static str, CommandAction)], query: &str) -> Vec<String> {
+    filter_palette(commands, query).into_iter().map(|i| commands[i].0.to_string()).collect()
+}
+
+macro_rules! dispatch_palette_action {
+    ($self:ident, $a:expr) => {{
+        // Stub — actual dispatch happens inline below in the run() closure.
+    }};
 }
 
 fn resize_all_tabs(
@@ -163,6 +238,11 @@ fn get_current_dir_shortened(pid: u32) -> Option<String> {
         }
     }
     Some(path_str)
+}
+
+fn tab_live_cwd(tab: &Tab) -> Option<std::path::PathBuf> {
+    let pid = tab.terminal_state.lock().shell_pid()?;
+    std::fs::read_link(format!("/proc/{}/cwd", pid)).ok()
 }
 
 fn get_last_path_component(path_str: &str) -> String {
@@ -248,6 +328,7 @@ fn main() -> anyhow::Result<()> {
         Config::default()
     });
     config::load_custom_themes();
+    keybindings::init_resolver(config.keybindings.clone());
 
     let fasty_args = FastyArgs::parse();
 
@@ -357,8 +438,33 @@ fn main() -> anyhow::Result<()> {
         proxy.clone(),
     )?;
 
-    let mut tabs = vec![initial_tab];
     let mut active_tab_index = 0usize;
+    let mut tabs = if config.session_restore && fasty_args.command.is_none() {
+        match session::load() {
+            Some(s) if !s.tabs.is_empty() => {
+                let mut restored = Vec::new();
+                for tab_info in &s.tabs {
+                    let tab_cwd = tab_info.cwd.as_ref().and_then(|p| p.to_str());
+                    match create_new_tab(
+                        &shell, &[], tab_cwd, config.scrollback, config.font.clone(),
+                        cell_width, cell_height, shell_cols, shell_rows, proxy.clone(),
+                    ) {
+                        Ok(t) => restored.push(t),
+                        Err(e) => tracing::warn!("session: failed to restore tab: {e:?}"),
+                    }
+                }
+                if !restored.is_empty() {
+                    active_tab_index = s.active_tab.min(restored.len() - 1);
+                    restored
+                } else {
+                    vec![initial_tab]
+                }
+            }
+            _ => vec![initial_tab],
+        }
+    } else {
+        vec![initial_tab]
+    };
     let renderer = Arc::new(parking_lot::Mutex::new(renderer));
     let mut modifiers = winit::keyboard::ModifiersState::default();
     let mut ctrl_held = false;
@@ -378,6 +484,12 @@ fn main() -> anyhow::Result<()> {
     let mut current_mouse_y = 0.0f64;
     let mut last_click_time: Option<std::time::Instant> = None;
     let mut toast: Option<(String, std::time::Instant, u64)> = None;
+
+    let mut command_palette_visible = false;
+    let mut command_palette_query: String = String::new();
+    let mut command_palette_selected: usize = 0;
+    let mut command_palette_scroll: usize = 0;
+    let palette_commands: Vec<(&'static str, CommandAction)> = build_palette_commands();
     let start_time = std::time::Instant::now();
     let mut clipboard: Option<arboard::Clipboard> = None;
     let mut context_menu_visible = false;
@@ -489,6 +601,17 @@ fn main() -> anyhow::Result<()> {
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     event_loop.run(move |event, target| {
         match event {
+            winit::event::Event::LoopExiting => {
+                if config.session_restore {
+                    let saved: Vec<session::TabInfo> = tabs.iter().map(|t| {
+                        session::TabInfo { cwd: tab_live_cwd(t).or_else(|| t.cwd.clone()) }
+                    }).collect();
+                    let s = session::Session { tabs: saved, active_tab: active_tab_index };
+                    if let Err(e) = session::save(&s) {
+                        tracing::warn!("session: save failed: {e}");
+                    }
+                }
+            }
             winit::event::Event::UserEvent(app_event) => {
                 match app_event {
                     AppEvent::Wakeup => {
@@ -506,6 +629,7 @@ fn main() -> anyhow::Result<()> {
                     AppEvent::ConfigChanged => {
                         match Config::load() {
                             Ok(new_config) => {
+                                keybindings::init_resolver(new_config.keybindings.clone());
                                 let theme_changed = new_config.theme != config.theme;
                                 let font_changed = new_config.font.family != config.font.family
                                     || (new_config.font.size - config.font.size).abs() > f32::EPSILON;
@@ -692,6 +816,11 @@ fn main() -> anyhow::Result<()> {
                             r.update_completed = completed;
                             r.hover_update = hover_update;
                             r.set_dirty(true);
+                            let palette_filtered: Vec<String> = if command_palette_visible {
+                                compute_palette_filtered(&palette_commands, &command_palette_query)
+                            } else {
+                                Vec::new()
+                            };
                             r.render(
                                 next_render_reason,
                                 term_ref,
@@ -728,6 +857,10 @@ fn main() -> anyhow::Result<()> {
                                 hovered_tab_index,
                                 hovered_close_tab_index,
                                 hover_new_tab,
+                                command_palette_visible,
+                                &command_palette_query,
+                                command_palette_selected,
+                                &palette_filtered,
                             );
                             drop(r);
 
@@ -840,185 +973,574 @@ fn main() -> anyhow::Result<()> {
                                 return;
                             }
 
-                            let key_str = match &event.logical_key {
-                                Key::Character(s) => s.to_string(),
-                                Key::Named(n) => format!("{:?}", n),
-                                _ => String::new(),
-                            };
-
-                            let is_t_key = match event.physical_key {
-                                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyT) => true,
-                                _ => key_str.eq_ignore_ascii_case("t")
-                            };
-                            let is_w_key = match event.physical_key {
-                                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyW) => true,
-                                _ => key_str.eq_ignore_ascii_case("w")
-                            };
-                            let is_n_key = match event.physical_key {
-                                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyN) => true,
-                                _ => key_str.eq_ignore_ascii_case("n")
-                            };
-                            let is_c_key = match event.physical_key {
-                                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyC) => true,
-                                _ => key_str.eq_ignore_ascii_case("c")
-                            };
-                            let is_v_key = match event.physical_key {
-                                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyV) => true,
-                                _ => key_str.eq_ignore_ascii_case("v") || key_str == "\u{16}"
-                            };
-                            let is_f_key = match event.physical_key {
-                                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyF) => true,
-                                _ => key_str.eq_ignore_ascii_case("f")
-                            };
-                            // Ctrl+Shift+T -> new tab
-                            if ctrl_active && shift_active && is_t_key {
-                                let new_tab_count = tabs.len() + 1;
-                                let padding_top = get_padding_top(new_tab_count);
-                                let physical_size = window_for_redraw.inner_size();
-                                let new_cols = (((physical_size.width as f32 - PADDING_LEFT * 2.0) / cell_width).floor().max(1.0)) as usize;
-                                let new_rows = (((physical_size.height as f32 - (padding_top + PADDING_BOTTOM)) / cell_height).floor().max(1.0)) as usize;
-                                
-                                match create_new_tab(
-                                    &shell,
-                                    &[],
-                                    None,
-                                    config.scrollback,
-                                    config.font.clone(),
-                                    cell_width,
-                                    cell_height,
-                                    new_cols,
-                                    new_rows,
-                                    proxy.clone(),
-                                ) {
-                                    Ok(new_tab) => {
-                                        tabs.push(new_tab);
-                                        active_tab_index = tabs.len() - 1;
-                                        
-                                        let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
-                                        shell_cols = cols;
-                                        shell_rows = rows;
-                                        let mut r = renderer.lock();
-                                        r.set_dirty(true);
-                                        r.grid_dirty = true;
-                                        app_dirty = true;
+                            if command_palette_visible {
+                                use winit::keyboard::NamedKey;
+                                match &event.logical_key {
+                                    Key::Named(NamedKey::Escape) => {
+                                        command_palette_visible = false;
+                                        command_palette_query.clear();
+                                        command_palette_selected = 0;
+                                        command_palette_scroll = 0;
                                     }
-                                    Err(e) => {
-                                        tracing::error!("Failed to create new tab: {:?}", e);
-                                    }
-                                }
-                                return;
-                            }
-
-                            // Ctrl+Shift+W -> close tab
-                            if ctrl_active && shift_active && is_w_key {
-                                if tabs.len() <= 1 {
-                                    target.exit();
-                                    return;
-                                } else {
-                                    tabs.remove(active_tab_index);
-                                    if active_tab_index >= tabs.len() {
-                                        active_tab_index = tabs.len() - 1;
-                                    }
-                                    let physical_size = window_for_redraw.inner_size();
-                                    let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
-                                    shell_cols = cols;
-                                    shell_rows = rows;
-                                    
-                                    let mut r = renderer.lock();
-                                    r.set_dirty(true);
-                                    r.grid_dirty = true;
-                                    app_dirty = true;
-                                }
-                                return;
-                            }
-
-                            // Ctrl+Shift+N -> new window
-                            if ctrl_active && shift_active && is_n_key {
-                                if let Ok(exe) = std::env::current_exe() {
-                                    #[cfg(target_os = "windows")]
-                                    let _ = no_window_cmd(&exe.to_string_lossy()).spawn();
-                                    #[cfg(not(target_os = "windows"))]
-                                    let _ = std::process::Command::new(exe).spawn();
-                                }
-                                return;
-                            }
-
-                            // Ctrl+Shift+C -> copy selection to clipboard
-                            if ctrl_active && shift_active && is_c_key {
-                                if let Some(sel) = tabs[active_tab_index].selection {
-                                    copy_selection_to_clipboard(&tabs[active_tab_index].terminal_state, sel, shell_cols, shell_rows, &mut clipboard);
-                                    toast = Some((
-                                        "✓  Text copied".to_string(),
-                                        std::time::Instant::now(),
-                                        1920,
-                                    ));
-                                    let mut r = renderer.lock();
-                                    r.set_dirty(true);
-                                    r.grid_dirty = true;
-                                    app_dirty = true;
-                                }
-                                return;
-                            }
-
-                            // Ctrl+Shift+V -> paste from clipboard
-                            if ctrl_active && shift_active && is_v_key {
-                                let mut ctx_opt = if clipboard.is_none() {
-                                    match arboard::Clipboard::new() {
-                                        Ok(ctx) => {
-                                            clipboard = Some(ctx);
-                                            clipboard.as_mut()
-                                        }
-                                        Err(_e) => {
-                                            None
-                                        }
-                                    }
-                                } else {
-                                    clipboard.as_mut()
-                                };
-
-                                if let Some(ref mut ctx) = ctx_opt {
-                                    match ctx.get_text() {
-                                        Ok(text) => {
-                                            if !text.is_empty() {
-                                                let term = tabs[active_tab_index].terminal_state.lock();
-                                                let term_guard = term.term().lock();
-                                                let mode = term_guard.mode();
-                                                let bracketed = mode.contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
-                                                drop(term_guard);
-                                                drop(term);
-
-                                                let mut paste_bytes = Vec::new();
-                                                if bracketed {
-                                                    paste_bytes.extend_from_slice(b"\x1b[200~");
-                                                    paste_bytes.extend_from_slice(text.as_bytes());
-                                                    paste_bytes.extend_from_slice(b"\x1b[201~");
-                                                } else {
-                                                    paste_bytes.extend_from_slice(text.as_bytes());
+                                    Key::Named(NamedKey::Enter) => {
+                                        let filtered = filter_palette(&palette_commands, &command_palette_query);
+                                        if let Some(&idx) = filtered.get(command_palette_selected) {
+                                            let action = palette_commands[idx].1;
+                                            command_palette_visible = false;
+                                            command_palette_query.clear();
+                                            command_palette_selected = 0;
+                                            command_palette_scroll = 0;
+                                            match action {
+                                                CommandAction::NewTab => {
+                                                    let new_tab_count = tabs.len() + 1;
+                                                    let padding_top = get_padding_top(new_tab_count);
+                                                    let physical_size = window_for_redraw.inner_size();
+                                                    let new_cols = (((physical_size.width as f32 - PADDING_LEFT * 2.0) / cell_width).floor().max(1.0)) as usize;
+                                                    let new_rows = (((physical_size.height as f32 - (padding_top + PADDING_BOTTOM)) / cell_height).floor().max(1.0)) as usize;
+                                                    if let Ok(new_tab) = create_new_tab(
+                                                        &shell, &[], None, config.scrollback, config.font.clone(),
+                                                        cell_width, cell_height, new_cols, new_rows, proxy.clone(),
+                                                    ) {
+                                                        tabs.push(new_tab);
+                                                        active_tab_index = tabs.len() - 1;
+                                                        let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                                                        shell_cols = cols;
+                                                        shell_rows = rows;
+                                                        let mut r = renderer.lock();
+                                                        r.set_dirty(true);
+                                                        r.grid_dirty = true;
+                                                        app_dirty = true;
+                                                    }
                                                 }
-                                                tabs[active_tab_index].scroll_target = 0.0;
-                                                tabs[active_tab_index].terminal_state.lock().write_to_pty(&paste_bytes);
+                                                CommandAction::CloseTab => {
+                                                    if tabs.len() <= 1 {
+                                                        target.exit();
+                                                    } else {
+                                                        tabs.remove(active_tab_index);
+                                                        if active_tab_index >= tabs.len() {
+                                                            active_tab_index = tabs.len() - 1;
+                                                        }
+                                                        let physical_size = window_for_redraw.inner_size();
+                                                        let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                                                        shell_cols = cols;
+                                                        shell_rows = rows;
+                                                        let mut r = renderer.lock();
+                                                        r.set_dirty(true);
+                                                        r.grid_dirty = true;
+                                                        app_dirty = true;
+                                                    }
+                                                }
+                                                CommandAction::NextTab => {
+                                                    if tabs.len() > 1 {
+                                                        active_tab_index = (active_tab_index + 1) % tabs.len();
+                                                        let mut r = renderer.lock();
+                                                        r.set_dirty(true);
+                                                        r.grid_dirty = true;
+                                                        app_dirty = true;
+                                                    }
+                                                }
+                                                CommandAction::PrevTab => {
+                                                    if tabs.len() > 1 {
+                                                        if active_tab_index == 0 {
+                                                            active_tab_index = tabs.len() - 1;
+                                                        } else {
+                                                            active_tab_index -= 1;
+                                                        }
+                                                        let mut r = renderer.lock();
+                                                        r.set_dirty(true);
+                                                        r.grid_dirty = true;
+                                                        app_dirty = true;
+                                                    }
+                                                }
+                                                CommandAction::OpenSettings => {
+                                                    // Inlined open-settings logic; see Settings dialog topbar.
+                                                    if settings_window.is_none() {
+                                                        match Config::load() {
+                                                            Ok(fresh) => { config = fresh; }
+                                                            Err(e) => {
+                                                                tracing::warn!("config: settings-open reload failed: {e}");
+                                                                toast = Some(("⚠ Not a valid config".to_string(), std::time::Instant::now(), 4000));
+                                                            }
+                                                        }
+                                                        settings_family = config.font.family.clone();
+                                                        settings_size = config.font.size;
+                                                        settings_scrollback = config.scrollback.min(3000);
+                                                        settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
+                                                        settings_active_field = 0;
+                                                        let visible = !cfg!(target_os = "windows");
+                                                        if let Ok(window) = target.create_window(winit::window::WindowAttributes::default()
+                                                            .with_title("fasty Settings")
+                                                            .with_decorations(false)
+                                                            .with_transparent(true)
+                                                            .with_visible(visible)
+                                                            .with_inner_size(winit::dpi::LogicalSize::new(400.0, 260.0)))
+                                                        {
+                                                            let settings_window_arc = Arc::new(window);
+                                                            let sw_ref: &winit::window::Window = &*settings_window_arc;
+                                                            let sw_static: &'static winit::window::Window = unsafe { std::mem::transmute(sw_ref) };
+                                                            let (shared_instance, shared_device, shared_queue, format, alpha_mode) = {
+                                                                let r = renderer.lock();
+                                                                (r.instance.clone(), r.device.clone(), r.queue.clone(), r.config.format, r.config.alpha_mode)
+                                                            };
+                                                            if let Ok(renderer_obj) = Renderer::new_shared(sw_static, &config.font.family, 13.0, shared_instance, shared_device, shared_queue, format, alpha_mode) {
+                                                                settings_window = Some(settings_window_arc);
+                                                                settings_renderer = Some(renderer_obj);
+                                                            }
+                                                        }
+                                                    }
+                                                    app_dirty = true;
+                                                }
+                                                CommandAction::OpenSearch => {
+                                                    let tab = &mut tabs[active_tab_index];
+                                                    tab.search_visible = true;
+                                                    tab.search_query.clear();
+                                                    tab.search_matches.clear();
+                                                    tab.search_current_idx = 0;
+                                                    renderer.lock().set_dirty(true);
+                                                    app_dirty = true;
+                                                }
+                                                CommandAction::ReloadConfig => {
+                                                    let _ = proxy.send_event(AppEvent::ConfigChanged);
+                                                }
+                                                CommandAction::IncreaseFontSize => {
+                                                    let mut current_config = Config::load().unwrap_or_default();
+                                                    let new_size = (current_config.font.size + 0.5).min(72.0);
+                                                    if new_size != current_config.font.size {
+                                                        current_config.font.size = new_size;
+                                                        let _ = current_config.save(&Config::get_active_config_path());
+                                                        config = current_config;
+                                                        let _ = renderer.lock().update_font(&config.font.family, config.font.size);
+                                                        let cell_w = renderer.lock().cell_width();
+                                                        let cell_h = renderer.lock().cell_height();
+                                                        let physical_size = window_for_redraw.inner_size();
+                                                        let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_w, cell_h);
+                                                        shell_cols = cols;
+                                                        shell_rows = rows;
+                                                        cell_width = cell_w;
+                                                        cell_height = cell_h;
+                                                        let mut r = renderer.lock();
+                                                        r.set_dirty(true);
+                                                        r.grid_dirty = true;
+                                                        app_dirty = true;
+                                                    }
+                                                }
+                                                CommandAction::DecreaseFontSize => {
+                                                    let mut current_config = Config::load().unwrap_or_default();
+                                                    let new_size = (current_config.font.size - 0.5).max(6.0);
+                                                    if new_size != current_config.font.size {
+                                                        current_config.font.size = new_size;
+                                                        let _ = current_config.save(&Config::get_active_config_path());
+                                                        config = current_config;
+                                                        let _ = renderer.lock().update_font(&config.font.family, config.font.size);
+                                                        let cell_w = renderer.lock().cell_width();
+                                                        let cell_h = renderer.lock().cell_height();
+                                                        let physical_size = window_for_redraw.inner_size();
+                                                        let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_w, cell_h);
+                                                        shell_cols = cols;
+                                                        shell_rows = rows;
+                                                        cell_width = cell_w;
+                                                        cell_height = cell_h;
+                                                        let mut r = renderer.lock();
+                                                        r.set_dirty(true);
+                                                        r.grid_dirty = true;
+                                                        app_dirty = true;
+                                                    }
+                                                }
+                                                CommandAction::ResetFontSize => {
+                                                    let mut current_config = Config::load().unwrap_or_default();
+                                                    if current_config.font.size != 13.0 {
+                                                        current_config.font.size = 13.0;
+                                                        let _ = current_config.save(&Config::get_active_config_path());
+                                                        config = current_config;
+                                                        let _ = renderer.lock().update_font(&config.font.family, config.font.size);
+                                                        let cell_w = renderer.lock().cell_width();
+                                                        let cell_h = renderer.lock().cell_height();
+                                                        let physical_size = window_for_redraw.inner_size();
+                                                        let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_w, cell_h);
+                                                        shell_cols = cols;
+                                                        shell_rows = rows;
+                                                        cell_width = cell_w;
+                                                        cell_height = cell_h;
+                                                        let mut r = renderer.lock();
+                                                        r.set_dirty(true);
+                                                        r.grid_dirty = true;
+                                                        app_dirty = true;
+                                                    }
+                                                }
+                                                CommandAction::NewWindow => {
+                                                    if let Ok(exe) = std::env::current_exe() {
+                                                        #[cfg(target_os = "windows")]
+                                                        let _ = no_window_cmd(&exe.to_string_lossy()).spawn();
+                                                        #[cfg(not(target_os = "windows"))]
+                                                        let _ = std::process::Command::new(exe).spawn();
+                                                    }
+                                                }
+                                                CommandAction::SnapToBottom => {
+                                                    tabs[active_tab_index].scroll_target = 0.0;
+                                                    app_dirty = true;
+                                                }
                                             }
                                         }
-                                        Err(e) => {
-                                            eprintln!("fasty clipboard get_text failed: {:?}", e);
+                                    }
+                                    Key::Named(NamedKey::ArrowDown) => {
+                                        let n = filter_palette(&palette_commands, &command_palette_query).len();
+                                        if n > 0 {
+                                            command_palette_selected = (command_palette_selected + 1).min(n - 1);
                                         }
                                     }
-                                } else {
-                                    eprintln!("fasty clipboard not available");
+                                    Key::Named(NamedKey::ArrowUp) => {
+                                        command_palette_selected = command_palette_selected.saturating_sub(1);
+                                    }
+                                    Key::Named(NamedKey::Backspace) => {
+                                        command_palette_query.pop();
+                                        command_palette_selected = 0;
+                                        command_palette_scroll = 0;
+                                    }
+                                    Key::Named(NamedKey::Space) => {
+                                        if !ctrl_active && !alt_active {
+                                            command_palette_query.push(' ');
+                                            command_palette_selected = 0;
+                                            command_palette_scroll = 0;
+                                        }
+                                    }
+                                    Key::Character(s) => {
+                                        if !ctrl_active && !alt_active {
+                                            command_palette_query.push_str(s);
+                                            command_palette_selected = 0;
+                                            command_palette_scroll = 0;
+                                        }
+                                    }
+                                    _ => {}
                                 }
+                                let mut r = renderer.lock();
+                                r.set_dirty(true);
+                                r.grid_dirty = true;
+                                app_dirty = true;
+                                window_for_redraw.request_redraw();
                                 return;
                             }
 
-                            // Ctrl+Shift+F -> open in-scrollback search
-                            if ctrl_active && shift_active && is_f_key {
-                                let tab = &mut tabs[active_tab_index];
-                                tab.search_visible = true;
-                                tab.search_query.clear();
-                                tab.search_matches.clear();
-                                tab.search_current_idx = 0;
-                                renderer.lock().set_dirty(true);
-                                app_dirty = true;
-                                return;
+                            if let Some(combo) = keybindings::combo_from_event(&event, ctrl_active, shift_active, alt_active) {
+                                if let Some(action) = keybindings::RESOLVER.get_or_init(|| parking_lot::RwLock::new(keybindings::KeyBindingResolver::with_defaults())).read().resolve(&combo) {
+                                    match action {
+                                        keybindings::Action::NewTab => {
+                                            let new_tab_count = tabs.len() + 1;
+                                            let padding_top = get_padding_top(new_tab_count);
+                                            let physical_size = window_for_redraw.inner_size();
+                                            let new_cols = (((physical_size.width as f32 - PADDING_LEFT * 2.0) / cell_width).floor().max(1.0)) as usize;
+                                            let new_rows = (((physical_size.height as f32 - (padding_top + PADDING_BOTTOM)) / cell_height).floor().max(1.0)) as usize;
+                                            match create_new_tab(
+                                                &shell, &[], None, config.scrollback, config.font.clone(),
+                                                cell_width, cell_height, new_cols, new_rows, proxy.clone(),
+                                            ) {
+                                                Ok(new_tab) => {
+                                                    tabs.push(new_tab);
+                                                    active_tab_index = tabs.len() - 1;
+                                                    let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                                                    shell_cols = cols;
+                                                    shell_rows = rows;
+                                                    let mut r = renderer.lock();
+                                                    r.set_dirty(true);
+                                                    r.grid_dirty = true;
+                                                    app_dirty = true;
+                                                }
+                                                Err(e) => tracing::error!("Failed to create new tab: {:?}", e),
+                                            }
+                                            return;
+                                        }
+                                        keybindings::Action::CloseTab => {
+                                            if tabs.len() <= 1 {
+                                                target.exit();
+                                            } else {
+                                                tabs.remove(active_tab_index);
+                                                if active_tab_index >= tabs.len() {
+                                                    active_tab_index = tabs.len() - 1;
+                                                }
+                                                let physical_size = window_for_redraw.inner_size();
+                                                let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                                                shell_cols = cols;
+                                                shell_rows = rows;
+                                                let mut r = renderer.lock();
+                                                r.set_dirty(true);
+                                                r.grid_dirty = true;
+                                                app_dirty = true;
+                                            }
+                                            return;
+                                        }
+                                        keybindings::Action::NewWindow => {
+                                            if let Ok(exe) = std::env::current_exe() {
+                                                #[cfg(target_os = "windows")]
+                                                let _ = no_window_cmd(&exe.to_string_lossy()).spawn();
+                                                #[cfg(not(target_os = "windows"))]
+                                                let _ = std::process::Command::new(exe).spawn();
+                                            }
+                                            return;
+                                        }
+                                        keybindings::Action::Copy => {
+                                            if let Some(sel) = tabs[active_tab_index].selection {
+                                                copy_selection_to_clipboard(&tabs[active_tab_index].terminal_state, sel, shell_cols, shell_rows, &mut clipboard);
+                                                toast = Some((
+                                                    "✓  Text copied".to_string(),
+                                                    std::time::Instant::now(),
+                                                    1920,
+                                                ));
+                                                let mut r = renderer.lock();
+                                                r.set_dirty(true);
+                                                r.grid_dirty = true;
+                                                app_dirty = true;
+                                            }
+                                            return;
+                                        }
+                                        keybindings::Action::Paste => {
+                                            let mut ctx_opt = if clipboard.is_none() {
+                                                match arboard::Clipboard::new() {
+                                                    Ok(ctx) => {
+                                                        clipboard = Some(ctx);
+                                                        clipboard.as_mut()
+                                                    }
+                                                    Err(_) => None,
+                                                }
+                                            } else {
+                                                clipboard.as_mut()
+                                            };
+                                            if let Some(ref mut ctx) = ctx_opt {
+                                                if let Ok(text) = ctx.get_text() {
+                                                    if !text.is_empty() {
+                                                        let term = tabs[active_tab_index].terminal_state.lock();
+                                                        let term_guard = term.term().lock();
+                                                        let mode = term_guard.mode();
+                                                        let bracketed = mode.contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+                                                        drop(term_guard);
+                                                        drop(term);
+                                                        let mut paste_bytes = Vec::new();
+                                                        if bracketed {
+                                                            paste_bytes.extend_from_slice(b"\x1b[200~");
+                                                            paste_bytes.extend_from_slice(text.as_bytes());
+                                                            paste_bytes.extend_from_slice(b"\x1b[201~");
+                                                        } else {
+                                                            paste_bytes.extend_from_slice(text.as_bytes());
+                                                        }
+                                                        tabs[active_tab_index].scroll_target = 0.0;
+                                                        tabs[active_tab_index].terminal_state.lock().write_to_pty(&paste_bytes);
+                                                    }
+                                                }
+                                            }
+                                            return;
+                                        }
+                                        keybindings::Action::OpenSearch => {
+                                            let tab = &mut tabs[active_tab_index];
+                                            tab.search_visible = true;
+                                            tab.search_query.clear();
+                                            tab.search_matches.clear();
+                                            tab.search_current_idx = 0;
+                                            renderer.lock().set_dirty(true);
+                                            app_dirty = true;
+                                            return;
+                                        }
+                                        keybindings::Action::OpenSettings => {
+                                            if settings_window.is_none() {
+                                                match Config::load() {
+                                                    Ok(fresh) => { config = fresh; }
+                                                    Err(e) => {
+                                                        tracing::warn!("config: settings-open reload failed, keeping in-memory: {e}");
+                                                        toast = Some((
+                                                            "⚠ Not a valid config".to_string(),
+                                                            std::time::Instant::now(),
+                                                            4000,
+                                                        ));
+                                                    }
+                                                }
+                                                settings_family = config.font.family.clone();
+                                                settings_size = config.font.size;
+                                                settings_scrollback = config.scrollback.min(3000);
+                                                settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
+                                                settings_active_field = 0;
+                                                let visible = !cfg!(target_os = "windows");
+                                                match target.create_window(winit::window::WindowAttributes::default()
+                                                    .with_title("fasty Settings")
+                                                    .with_decorations(false)
+                                                    .with_transparent(true)
+                                                    .with_visible(visible)
+                                                    .with_inner_size(winit::dpi::LogicalSize::new(400.0, 260.0)))
+                                                {
+                                                    Ok(window) => {
+                                                        let settings_window_arc = Arc::new(window);
+                                                        let sw_ref: &winit::window::Window = &*settings_window_arc;
+                                                        let sw_static: &'static winit::window::Window = unsafe { std::mem::transmute(sw_ref) };
+                                                        let (shared_instance, shared_device, shared_queue, format, alpha_mode) = {
+                                                            let r = renderer.lock();
+                                                            (r.instance.clone(), r.device.clone(), r.queue.clone(), r.config.format, r.config.alpha_mode)
+                                                        };
+                                                        match Renderer::new_shared(sw_static, &config.font.family, 13.0, shared_instance, shared_device, shared_queue, format, alpha_mode) {
+                                                            Ok(renderer_obj) => {
+                                                                #[cfg(target_os = "windows")]
+                                                                let mut renderer_obj = renderer_obj;
+                                                                #[cfg(target_os = "windows")]
+                                                                {
+                                                                    renderer_obj.set_dirty(true);
+                                                                    renderer_obj.render_settings(
+                                                                        &config.font.family,
+                                                                        config.font.size,
+                                                                        config.scrollback.min(3000),
+                                                                        0,
+                                                                        false, false, false, false, false, false, false, false,
+                                                                        &system_fonts,
+                                                                        0.0,
+                                                                        None,
+                                                                        &settings_theme,
+                                                                        &themes_list,
+                                                                        None,
+                                                                        0.0,
+                                                                    );
+                                                                    settings_window_arc.set_visible(true);
+                                                                }
+                                                                settings_window = Some(settings_window_arc);
+                                                                settings_renderer = Some(renderer_obj);
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::error!("Failed to create settings renderer: {:?}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::error!("Failed to create settings window: {:?}", e);
+                                                    }
+                                                }
+                                            }
+                                            app_dirty = true;
+                                            return;
+                                        }
+                                        keybindings::Action::ReloadConfig => {
+                                            let _ = proxy.send_event(AppEvent::ConfigChanged);
+                                            return;
+                                        }
+                                        keybindings::Action::IncreaseFontSize => {
+                                            let mut current_config = Config::load().unwrap_or_default();
+                                            let new_size = (current_config.font.size + 0.5).min(72.0);
+                                            if new_size != current_config.font.size {
+                                                current_config.font.size = new_size;
+                                                if let Err(e) = current_config.save(&Config::get_active_config_path()) {
+                                                    tracing::warn!("config: save failed: {e}");
+                                                }
+                                                config = current_config;
+                                                if let Err(e) = renderer.lock().update_font(&config.font.family, config.font.size) {
+                                                    tracing::error!("Failed to update renderer font: {:?}", e);
+                                                }
+                                                let cell_w = renderer.lock().cell_width();
+                                                let cell_h = renderer.lock().cell_height();
+                                                let physical_size = window_for_redraw.inner_size();
+                                                let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_w, cell_h);
+                                                shell_cols = cols;
+                                                shell_rows = rows;
+                                                cell_width = cell_w;
+                                                cell_height = cell_h;
+                                                let mut r = renderer.lock();
+                                                r.set_dirty(true);
+                                                r.grid_dirty = true;
+                                                app_dirty = true;
+                                            }
+                                            return;
+                                        }
+                                        keybindings::Action::DecreaseFontSize => {
+                                            let mut current_config = Config::load().unwrap_or_default();
+                                            let new_size = (current_config.font.size - 0.5).max(6.0);
+                                            if new_size != current_config.font.size {
+                                                current_config.font.size = new_size;
+                                                if let Err(e) = current_config.save(&Config::get_active_config_path()) {
+                                                    tracing::warn!("config: save failed: {e}");
+                                                }
+                                                config = current_config;
+                                                if let Err(e) = renderer.lock().update_font(&config.font.family, config.font.size) {
+                                                    tracing::error!("Failed to update renderer font: {:?}", e);
+                                                }
+                                                let cell_w = renderer.lock().cell_width();
+                                                let cell_h = renderer.lock().cell_height();
+                                                let physical_size = window_for_redraw.inner_size();
+                                                let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_w, cell_h);
+                                                shell_cols = cols;
+                                                shell_rows = rows;
+                                                cell_width = cell_w;
+                                                cell_height = cell_h;
+                                                let mut r = renderer.lock();
+                                                r.set_dirty(true);
+                                                r.grid_dirty = true;
+                                                app_dirty = true;
+                                            }
+                                            return;
+                                        }
+                                        keybindings::Action::ResetFontSize => {
+                                            let mut current_config = Config::load().unwrap_or_default();
+                                            if current_config.font.size != 13.0 {
+                                                current_config.font.size = 13.0;
+                                                if let Err(e) = current_config.save(&Config::get_active_config_path()) {
+                                                    tracing::warn!("config: save failed: {e}");
+                                                }
+                                                config = current_config;
+                                                if let Err(e) = renderer.lock().update_font(&config.font.family, config.font.size) {
+                                                    tracing::error!("Failed to update renderer font: {:?}", e);
+                                                }
+                                                let cell_w = renderer.lock().cell_width();
+                                                let cell_h = renderer.lock().cell_height();
+                                                let physical_size = window_for_redraw.inner_size();
+                                                let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_w, cell_h);
+                                                shell_cols = cols;
+                                                shell_rows = rows;
+                                                cell_width = cell_w;
+                                                cell_height = cell_h;
+                                                let mut r = renderer.lock();
+                                                r.set_dirty(true);
+                                                r.grid_dirty = true;
+                                                app_dirty = true;
+                                            }
+                                            return;
+                                        }
+                                        keybindings::Action::NextTab => {
+                                            if tabs.len() > 1 {
+                                                active_tab_index = (active_tab_index + 1) % tabs.len();
+                                                let mut r = renderer.lock();
+                                                r.set_dirty(true);
+                                                r.grid_dirty = true;
+                                                app_dirty = true;
+                                            }
+                                            return;
+                                        }
+                                        keybindings::Action::PrevTab => {
+                                            if tabs.len() > 1 {
+                                                if active_tab_index == 0 {
+                                                    active_tab_index = tabs.len() - 1;
+                                                } else {
+                                                    active_tab_index -= 1;
+                                                }
+                                                let mut r = renderer.lock();
+                                                r.set_dirty(true);
+                                                r.grid_dirty = true;
+                                                app_dirty = true;
+                                            }
+                                            return;
+                                        }
+                                        keybindings::Action::SelectTab(n) => {
+                                            let target_idx = (n - 1) as usize;
+                                            if target_idx < tabs.len() {
+                                                active_tab_index = target_idx;
+                                                let mut r = renderer.lock();
+                                                r.set_dirty(true);
+                                                r.grid_dirty = true;
+                                                app_dirty = true;
+                                            }
+                                            return;
+                                        }
+                                        keybindings::Action::CommandPalette => {
+                                            command_palette_visible = !command_palette_visible;
+                                            command_palette_query.clear();
+                                            command_palette_selected = 0;
+                                            command_palette_scroll = 0;
+                                            let mut r = renderer.lock();
+                                            r.set_dirty(true);
+                                            app_dirty = true;
+                                            return;
+                                        }
+                                    }
+                                }
                             }
 
                             // When search bar is visible, all keyboard input goes to it.
@@ -1059,122 +1581,11 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     _ => {}
                                 }
-                                // Force the grid to rebuild so the new
-                                // search_matches and search_current_idx are
-                                // baked into the cell instances; otherwise
-                                // the cached grid keeps the previous frame's
-                                // highlights and current-match color.
-                                {
-                                    let mut r = renderer.lock();
-                                    r.set_dirty(true);
-                                    r.grid_dirty = true;
-                                }
+                                let mut r = renderer.lock();
+                                r.set_dirty(true);
+                                r.grid_dirty = true;
                                 app_dirty = true;
                                 return;
-                            }
-
-                            // Ctrl+Shift+Equal / Ctrl+Plus -> increase font size
-                            // Ctrl+Minus -> decrease font size
-                            // Ctrl+Shift+0 -> reset font size
-                            let is_increase = (ctrl_active && shift_active && (key_str == "=" || key_str == "+"))
-                                || (ctrl_active && !shift_active && key_str == "+");
-                            let is_decrease = ctrl_active && !shift_active && key_str == "-";
-                            let is_reset = ctrl_active && shift_active && key_str == "0";
-
-                            if is_increase || is_decrease || is_reset {
-                                let mut current_config = Config::load().unwrap_or_default();
-                                let mut new_size = current_config.font.size;
-                                if is_increase {
-                                    new_size = (new_size + 0.5).min(72.0);
-                                } else if is_decrease {
-                                    new_size = (new_size - 0.5).max(6.0);
-                                } else if is_reset {
-                                    new_size = 13.0;
-                                }
-
-                                if new_size != current_config.font.size {
-                                    current_config.font.size = new_size;
-                                    if let Err(e) = current_config.save(&Config::get_active_config_path()) {
-                                        tracing::warn!("config: save failed: {e}");
-                                    }
-                                    config = current_config;
-
-                                    if let Err(e) = renderer.lock().update_font(&config.font.family, config.font.size) {
-                                        tracing::error!("Failed to update renderer font: {:?}", e);
-                                    }
-
-                                    let cell_w = renderer.lock().cell_width();
-                                    let cell_h = renderer.lock().cell_height();
-                                    let physical_size = window_for_redraw.inner_size();
-                                    let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_w, cell_h);
-                                    shell_cols = cols;
-                                    shell_rows = rows;
-                                    cell_width = cell_w;
-                                    cell_height = cell_h;
-
-                                    let mut r = renderer.lock();
-                                    r.set_dirty(true);
-                                    r.grid_dirty = true;
-                                    app_dirty = true;
-                                }
-                                return;
-                            }
-
-                            // Ctrl+Tab / Ctrl+PageDown to switch to next tab
-                            let is_tab_key = match event.physical_key {
-                                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Tab) => true,
-                                _ => key_str == "Tab"
-                            };
-                            let is_page_down_key = match event.physical_key {
-                                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::PageDown) => true,
-                                _ => key_str == "PageDown"
-                            };
-                            if ctrl_active && !shift_active && (is_tab_key || is_page_down_key) {
-                                if tabs.len() > 1 {
-                                    active_tab_index = (active_tab_index + 1) % tabs.len();
-                                    let mut r = renderer.lock();
-                                    r.set_dirty(true);
-                                    r.grid_dirty = true;
-                                    app_dirty = true;
-                                }
-                                return;
-                            }
-
-                            // Ctrl+Shift+Tab / Ctrl+PageUp to switch to previous tab
-                            let is_page_up_key = match event.physical_key {
-                                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::PageUp) => true,
-                                _ => key_str == "PageUp"
-                            };
-                            if ctrl_active && shift_active && (is_tab_key || is_page_up_key) {
-                                if tabs.len() > 1 {
-                                    if active_tab_index == 0 {
-                                        active_tab_index = tabs.len() - 1;
-                                    } else {
-                                        active_tab_index -= 1;
-                                    }
-                                    let mut r = renderer.lock();
-                                    r.set_dirty(true);
-                                    r.grid_dirty = true;
-                                    app_dirty = true;
-                                }
-                                return;
-                            }
-
-                            // Alt+1 to Alt+9 to switch tabs
-                            if alt_active && !ctrl_active && !shift_active {
-                                if let Some(digit_char) = key_str.chars().next() {
-                                    if digit_char.is_ascii_digit() && digit_char != '0' {
-                                        let target_idx = digit_char as usize - '1' as usize;
-                                        if target_idx < tabs.len() {
-                                            active_tab_index = target_idx;
-                                            let mut r = renderer.lock();
-                                            r.set_dirty(true);
-                                            r.grid_dirty = true;
-                                            app_dirty = true;
-                                            return;
-                                        }
-                                    }
-                                }
                             }
 
                             // Plain Ctrl+letter always goes to the PTY without interception
@@ -1510,72 +1921,80 @@ fn main() -> anyhow::Result<()> {
                                              return;
                                           } else if is_hovering_settings {
                                                if settings_window.is_none() {
-                                                   if let Ok(fresh) = Config::load() {
-                                                       config = fresh;
+                                                    match Config::load() {
+                                                        Ok(fresh) => { config = fresh; }
+                                                        Err(e) => {
+                                                            tracing::warn!("config: settings-open reload failed, keeping in-memory: {e}");
+                                                            toast = Some((
+                                                                "⚠ Not a valid config".to_string(),
+                                                                std::time::Instant::now(),
+                                                                4000,
+                                                            ));
+                                                        }
+                                                    }
+                                                    settings_family = config.font.family.clone();
+                                                    settings_size = config.font.size;
+                                                    settings_scrollback = config.scrollback.min(3000);
+                                                    settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
+                                                   settings_active_field = 0;
+                                                   let visible = !cfg!(target_os = "windows");
+                                                   match target.create_window(winit::window::WindowAttributes::default()
+                                                       .with_title("fasty Settings")
+                                                       .with_decorations(false)
+                                                       .with_transparent(true)
+                                                       .with_visible(visible)
+                                                       .with_inner_size(winit::dpi::LogicalSize::new(400.0, 260.0)))
+                                                   {
+                                                       Ok(window) => {
+                                                           let settings_window_arc = Arc::new(window);
+                                                           let sw_ref: &winit::window::Window = &*settings_window_arc;
+                                                           let sw_static: &'static winit::window::Window = unsafe { std::mem::transmute(sw_ref) };
+                                                           let (shared_instance, shared_device, shared_queue, format, alpha_mode) = {
+                                                               let r = renderer.lock();
+                                                               (r.instance.clone(), r.device.clone(), r.queue.clone(), r.config.format, r.config.alpha_mode)
+                                                           };
+                                                           match Renderer::new_shared(sw_static, &config.font.family, 13.0, shared_instance, shared_device, shared_queue, format, alpha_mode) {
+                                                               Ok(renderer_obj) => {
+                                                                   #[cfg(target_os = "windows")]
+                                                                   let mut renderer_obj = renderer_obj;
+                                                                   #[cfg(target_os = "windows")]
+                                                                   {
+                                                                       renderer_obj.set_dirty(true);
+                                                                       renderer_obj.render_settings(
+                                                                           &config.font.family,
+                                                                           config.font.size,
+                                                                           config.scrollback.min(3000),
+                                                                           0,
+                                                                           false, false, false, false, false, false, false, false,
+                                                                           &system_fonts,
+                                                                           0.0,
+                                                                           None,
+                                                                           &settings_theme,
+                                                                           &themes_list,
+                                                                           None,
+                                                                           0.0,
+                                                                       );
+                                                                       settings_window_arc.set_visible(true);
+                                                                   }
+                                                                   settings_window = Some(settings_window_arc);
+                                                                   settings_renderer = Some(renderer_obj);
+                                                               }
+                                                               Err(e) => {
+                                                                   tracing::error!("Failed to create settings renderer: {:?}", e);
+                                                               }
+                                                           }
+                                                       }
+                                                       Err(e) => {
+                                                           tracing::error!("Failed to create settings window: {:?}", e);
+                                                       }
                                                    }
-                                                   settings_family = config.font.family.clone();
-                                                   settings_size = config.font.size;
-                                                   settings_scrollback = config.scrollback.min(3000);
-                                                   settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
-                                                  settings_active_field = 0;
-                                                  let visible = !cfg!(target_os = "windows");
-                                                  match target.create_window(winit::window::WindowAttributes::default()
-                                                      .with_title("fasty Settings")
-                                                      .with_decorations(false)
-                                                      .with_transparent(true)
-                                                      .with_visible(visible)
-                                                      .with_inner_size(winit::dpi::LogicalSize::new(400.0, 260.0)))
-                                                  {
-                                                      Ok(window) => {
-                                                          let settings_window_arc = Arc::new(window);
-                                                          let sw_ref: &winit::window::Window = &*settings_window_arc;
-                                                          let sw_static: &'static winit::window::Window = unsafe { std::mem::transmute(sw_ref) };
-                                                          let (shared_instance, shared_device, shared_queue, format, alpha_mode) = {
-                                                              let r = renderer.lock();
-                                                              (r.instance.clone(), r.device.clone(), r.queue.clone(), r.config.format, r.config.alpha_mode)
-                                                          };
-                                                          match Renderer::new_shared(sw_static, &config.font.family, 13.0, shared_instance, shared_device, shared_queue, format, alpha_mode) {
-                                                              Ok(renderer_obj) => {
-                                                                  #[cfg(target_os = "windows")]
-                                                                  let mut renderer_obj = renderer_obj;
-                                                                  #[cfg(target_os = "windows")]
-                                                                  {
-                                                                      renderer_obj.set_dirty(true);
-                                                                      renderer_obj.render_settings(
-                                                                          &config.font.family,
-                                                                          config.font.size,
-                                                                          config.scrollback.min(3000),
-                                                                          0,
-                                                                          false, false, false, false, false, false, false, false,
-                                                                          &system_fonts,
-                                                                          0.0,
-                                                                          None,
-                                                                          &settings_theme,
-                                                                          &themes_list,
-                                                                          None,
-                                                                          0.0,
-                                                                      );
-                                                                      settings_window_arc.set_visible(true);
-                                                                  }
-                                                                  settings_window = Some(settings_window_arc);
-                                                                  settings_renderer = Some(renderer_obj);
-                                                              }
-                                                              Err(e) => {
-                                                                  tracing::error!("Failed to create settings renderer: {:?}", e);
-                                                              }
-                                                          }
-                                                      }
-                                                      Err(e) => {
-                                                          tracing::error!("Failed to create settings window: {:?}", e);
-                                                      }
-                                                  }
-                                              } else {
-                                                  settings_window = None;
-                                                  settings_renderer = None;
-                                              }
-                                              app_dirty = true;
-                                              return;
-                                          }
+                                               } else {
+                                                   settings_window = None;
+                                                   settings_renderer = None;
+                                               }
+                                               app_dirty = true;
+                                               return;
+                                           }
 
                                          // 2. Check tab clicks & close tab clicks & new tab click
                                          let tab_start_x = 36.0;
@@ -2779,6 +3198,12 @@ fn main() -> anyhow::Result<()> {
                     let last_activity_time_secs = active_tab.last_activity_time.saturating_duration_since(start_time).as_secs_f32();
                     let current_time = start_time.elapsed().as_secs_f32();
 
+                    let palette_filtered: Vec<String> = if command_palette_visible {
+                        compute_palette_filtered(&palette_commands, &command_palette_query)
+                    } else {
+                        Vec::new()
+                    };
+
                     let mut r = renderer.lock();
                     r.set_dirty(true);
                     r.render(
@@ -2817,6 +3242,10 @@ fn main() -> anyhow::Result<()> {
                         hovered_tab_index,
                         hovered_close_tab_index,
                         hover_new_tab,
+                        command_palette_visible,
+                        &command_palette_query,
+                        command_palette_selected,
+                        &palette_filtered,
                     );
                     drop(r);
                     #[cfg(target_os = "windows")]
