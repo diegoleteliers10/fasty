@@ -338,7 +338,7 @@ Features under consideration for upcoming releases:
 - [x] **OpenType Font Ligatures** -- Configurable via `font.ligatures`; rendered via `rustybuzz` shaping.
 
 ### Productivity & Workflow
-- [ ] **In-Scrollback Search** -- `Ctrl+Shift+F` opens a search bar highlighting matches in live + scrollback buffer.
+- [x] **In-Scrollback Search** -- `Ctrl+Shift+F` opens a search bar highlighting matches in live + scrollback buffer.
 - [x] **Command Palette** -- `Ctrl+Shift+P` opens a fuzzy-search palette over settings, tab actions, themes.
 - [x] **Session Restore** -- Persist open tab working directories on shutdown; restore on next launch.
 - [ ] **Split Panes** -- Horizontal/vertical splits per tab (like `tmux`/`Zellij`).
