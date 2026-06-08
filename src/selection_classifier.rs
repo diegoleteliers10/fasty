@@ -107,14 +107,13 @@ pub fn classify_token(token: &str) -> Option<Classification> {
     Some(Classification::Word(token.to_string()))
 }
 
-#[allow(dead_code)]
 pub fn classify_at_point(
     grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
     point: Point,
     shell_cols: usize,
 ) -> Option<Classification> {
-    let _ = (grid, point, shell_cols);
-    todo!()
+    let (token, _, _) = extract_token(grid, point, shell_cols)?;
+    classify_token(&token)
 }
 
 #[allow(dead_code)]
@@ -290,5 +289,15 @@ mod tests {
         assert_eq!(tok, "foo");
         assert_eq!(start, 0);
         assert_eq!(end, 3);
+    }
+
+    #[test]
+    fn classify_at_point_returns_url() {
+        let (grid, cols) = grid_with_row("visit https://example.com today");
+        let p = Point::new(Line(0), Column(10));
+        match super::classify_at_point(&grid, p, cols) {
+            Some(Classification::Url(s)) => assert_eq!(s, "https://example.com"),
+            other => panic!("expected Url, got {:?}", other),
+        }
     }
 }
