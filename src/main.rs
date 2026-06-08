@@ -704,6 +704,8 @@ fn main() -> anyhow::Result<()> {
     let mut current_mouse_x = 0.0f64;
     let mut current_mouse_y = 0.0f64;
     let mut last_click_time: Option<std::time::Instant> = None;
+    let mut last_term_click_time: Option<std::time::Instant> = None;
+    let mut last_term_click_cell: Option<(i32, usize)> = None;
     let mut toast: Option<(String, std::time::Instant, u64)> = None;
 
     let mut command_palette_visible = false;
