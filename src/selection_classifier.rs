@@ -1,4 +1,10 @@
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Point;
+
+const DELIMITERS: &[char] = &[
+    ' ', '\0', '"', '\'', '`', '<', '>', '(', ')', '{', '}', '[', ']',
+];
+const TRAILING_PUNCT: &[char] = &[',', '.', ';', ':', '?', '!', ')', ']', '}'];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Classification {
@@ -117,8 +123,39 @@ pub fn extract_token(
     point: Point,
     shell_cols: usize,
 ) -> Option<(String, usize, usize)> {
-    let _ = (grid, point, shell_cols);
-    todo!()
+    let line_idx = point.line.0;
+    if line_idx < 0 {
+        return None;
+    }
+    let line_us = line_idx as usize;
+    if line_us >= grid.total_lines() {
+        return None;
+    }
+    let row = &grid[alacritty_terminal::index::Line(line_idx)];
+    let col = point.column.0.min(shell_cols.saturating_sub(1));
+
+    let line_str: String = (0..shell_cols)
+        .map(|i| row[alacritty_terminal::index::Column(i)].c)
+        .collect();
+
+    let bytes = line_str.as_bytes();
+    let mut start = col;
+    while start > 0 && !DELIMITERS.contains(&(bytes[start - 1] as char)) {
+        start -= 1;
+    }
+    let mut end = col;
+    while end < shell_cols && !DELIMITERS.contains(&(bytes[end] as char)) {
+        end += 1;
+    }
+    if end > start {
+        while end > start && TRAILING_PUNCT.contains(&(bytes[end - 1] as char)) {
+            end -= 1;
+        }
+    }
+    if start == end {
+        return None;
+    }
+    Some((line_str[start..end].to_string(), start, end))
 }
 
 #[cfg(test)]
@@ -191,5 +228,35 @@ mod tests {
             Some(Classification::Hex(_))
         ));
         assert!(matches!(classify_token("hello"), Some(Classification::Word(_))));
+    }
+
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line, Point};
+    use alacritty_terminal::term::{Config, Term};
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::term::cell::Cell;
+    use alacritty_terminal::vte::ansi::Handler;
+
+    fn grid_with_row(text: &str) -> (alacritty_terminal::grid::Grid<Cell>, usize) {
+        let cols: usize = 80;
+        let rows: usize = 1;
+        let size = TermSize::new(cols, rows);
+        let config = Config::default();
+        let mut term: Term<VoidListener> = Term::new(config, &size, VoidListener);
+        for &b in text.as_bytes() {
+            term.input(b as char);
+        }
+        (term.grid().clone(), cols)
+    }
+
+    #[test]
+    fn extract_token_picks_word_around_point() {
+        let (grid, cols) = grid_with_row("hello world foo");
+        let p = Point::new(Line(0), Column(8));
+        let (tok, start, end) = super::extract_token(&grid, p, cols).unwrap();
+        assert_eq!(tok, "world");
+        assert_eq!(start, 6);
+        assert_eq!(end, 11);
     }
 }
