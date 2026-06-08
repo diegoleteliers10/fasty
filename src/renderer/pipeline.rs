@@ -2308,7 +2308,7 @@ impl Pipeline {
                             crate::renderer::ContextMenuItem::CloseTab => ("\u{2715}", "Cerrar pestaña", None),
                             crate::renderer::ContextMenuItem::About => ("", "About", None),
                             crate::renderer::ContextMenuItem::OpenLink => ("🔗", "Open link", Some("⌘-click")),
-                            crate::renderer::ContextMenuItem::CopyWord => ("📋", "Copy word", None),
+                            crate::renderer::ContextMenuItem::CopyWord => ("📋", "Copy", None),
                             crate::renderer::ContextMenuItem::CopyLine => ("📋", "Copy line", None),
                             crate::renderer::ContextMenuItem::CdHere => ("📁", "Open path", None),
                             crate::renderer::ContextMenuItem::OpenInEditor => ("✏\u{FE0F}", "Open in editor", None),

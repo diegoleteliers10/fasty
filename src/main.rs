@@ -2184,7 +2184,11 @@ fn main() -> anyhow::Result<()> {
                                 if pressed {
                                     if button == MouseButton::Left {
                                         if let Some(hovered_idx) = context_menu_hovered_idx {
-                                            let menu_items = get_context_menu_items(&tabs, active_tab_index, context_menu_is_about);
+                                            let menu_items = if context_menu_is_about {
+                                                vec![crate::renderer::ContextMenuItem::About]
+                                            } else {
+                                                context_menu_items.clone()
+                                            };
                                             if hovered_idx < menu_items.len() {
                                                 let item = menu_items[hovered_idx];
                                                 match item {
@@ -3192,7 +3196,11 @@ fn main() -> anyhow::Result<()> {
                             }
 
                             if context_menu_visible {
-                                let menu_items = get_context_menu_items(&tabs, active_tab_index, context_menu_is_about);
+                                let menu_items = if context_menu_is_about {
+                                    vec![crate::renderer::ContextMenuItem::About]
+                                } else {
+                                    context_menu_items.clone()
+                                };
                                 let (menu_w, menu_h) = get_context_menu_size(&menu_items);
                                 if current_mouse_x >= context_menu_x && current_mouse_x <= context_menu_x + menu_w
                                    && current_mouse_y >= context_menu_y && current_mouse_y <= context_menu_y + menu_h {
