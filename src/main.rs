@@ -3103,6 +3103,7 @@ fn main() -> anyhow::Result<()> {
                                     } else if current_mouse_y >= padding_top as f64 && current_mouse_x <= (v_width - 20.0) {
                                         context_menu_is_about = false;
                                         tab_ctx_visible = false;
+                                        let cwd_resolvable = tab_live_cwd(&tabs[active_tab_index]).is_some();
                                         let (classification, menu_items) = {
                                             let term_state = tabs[active_tab_index].terminal_state.lock();
                                             let display_offset = term_state.display_offset();
@@ -3124,7 +3125,6 @@ fn main() -> anyhow::Result<()> {
                                                 let term_guard = term_state.term().lock();
                                                 selection_classifier::classify_at_point(term_guard.grid(), click_point, shell_cols)
                                             };
-                                            let cwd_resolvable = tab_live_cwd(&tabs[active_tab_index]).is_some();
                                             let items = build_smart_menu(
                                                 classification.as_ref(),
                                                 tabs[active_tab_index].selection.is_some(),
