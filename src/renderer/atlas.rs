@@ -535,6 +535,15 @@ impl Atlas {
         Ok(path)
     }
 
+    fn is_color_font_path(path: &str) -> bool {
+        let lower = path.to_lowercase();
+        lower.contains("coloremoji")
+            || lower.contains("color-emoji")
+            || lower.contains("notoemoji")
+            || lower.contains("applecoloremoji")
+            || lower.contains("twemoji")
+    }
+
     fn load_fallback_paths(primary_path: &str) -> Vec<String> {
         static FALLBACK_PATHS_CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
         let paths = FALLBACK_PATHS_CACHE.get_or_init(|| {
@@ -895,7 +904,12 @@ impl Atlas {
         }
 
         let entry = FT_LIB.with(|lib| {
-            // 1. Try primary font
+            let cp = c as u32;
+            let is_emoji_codepoint = cp >= 0x1F000 && cp <= 0x1FFFF;
+
+            // 1. Try primary font — only accept non-empty bitmaps.
+            //    Placeholder glyphs in text fonts return empty bitmaps for
+            //    color emoji codepoints; fall through to fallbacks.
             if let Ok(face) = lib.new_face(&self.primary_path, 0) {
                 let physical_size = self.font_size * self.scale_factor;
                 let _ = face.set_pixel_sizes(0, physical_size as u32);
@@ -910,14 +924,24 @@ impl Atlas {
 
                         if face.load_glyph(idx, load_flags).is_ok() {
                             let _ = self.rasterize_freetype_glyph_key(device, queue, GlyphKey::Char(c), &face.glyph(), is_color);
-                            return self.entries.get(&GlyphKey::Char(c)).copied();
+                            if let Some(entry) = self.entries.get(&GlyphKey::Char(c)) {
+                                if entry.width > 0.0 && entry.height > 0.0 {
+                                    return Some(*entry);
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            // 2. Try fallbacks (full font chain)
-            for path in &self.fallback_paths {
+            // 2. Try fallbacks. For emoji codepoints, prioritize color-capable
+            //    fonts (NotoColorEmoji and similar) so they are tried first.
+            let mut paths_to_try: Vec<String> = self.fallback_paths.clone();
+            if is_emoji_codepoint {
+                paths_to_try.sort_by_key(|p| !Self::is_color_font_path(p));
+            }
+
+            for path in &paths_to_try {
                 if let Ok(face) = lib.new_face(path, 0) {
                     let physical_size = self.font_size * self.scale_factor;
                     let is_color = face.has_fixed_sizes() || is_emoji(c);
@@ -955,7 +979,11 @@ impl Atlas {
                             };
                             if face.load_glyph(idx, load_flags).is_ok() {
                                 let _ = self.rasterize_freetype_glyph_key(device, queue, GlyphKey::Char(c), &face.glyph(), is_color);
-                                return self.entries.get(&GlyphKey::Char(c)).copied();
+                                if let Some(entry) = self.entries.get(&GlyphKey::Char(c)) {
+                                    if entry.width > 0.0 && entry.height > 0.0 {
+                                        return Some(*entry);
+                                    }
+                                }
                             }
                         }
                     }
