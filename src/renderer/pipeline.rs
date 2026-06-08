@@ -607,6 +607,7 @@ impl Pipeline {
         context_menu_x: f32,
         context_menu_y: f32,
         context_menu_hovered_idx: Option<usize>,
+        context_menu_items: &[crate::renderer::ContextMenuItem],
         context_menu_open_time_secs: Option<f32>,
         hovered_tab_index: Option<usize>,
         hovered_close_tab_index: Option<usize>,
@@ -2154,19 +2155,11 @@ impl Pipeline {
 
         // Draw Context Menu if visible
         if context_menu_visible {
-            let mut menu_items = Vec::new();
+            let mut menu_items: Vec<crate::renderer::ContextMenuItem> = Vec::new();
             if context_menu_is_about {
                 menu_items.push(crate::renderer::ContextMenuItem::About);
             } else {
-                if selection.is_some() {
-                    menu_items.push(crate::renderer::ContextMenuItem::Copy);
-                }
-                menu_items.push(crate::renderer::ContextMenuItem::Paste);
-                menu_items.push(crate::renderer::ContextMenuItem::Separator);
-                menu_items.push(crate::renderer::ContextMenuItem::NewTab);
-                if tab_titles.len() > 1 {
-                    menu_items.push(crate::renderer::ContextMenuItem::CloseTab);
-                }
+                menu_items.extend_from_slice(context_menu_items);
             }
 
             let menu_w = 180.0f32; // Target design: Min width 180px

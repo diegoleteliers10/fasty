@@ -729,6 +729,7 @@ fn main() -> anyhow::Result<()> {
     let mut context_menu_y = 0.0f64;
     let mut context_menu_hovered_idx: Option<usize> = None;
     let mut context_menu_classification: Option<selection_classifier::Classification> = None;
+    let mut context_menu_items: Vec<renderer::ContextMenuItem> = Vec::new();
     let mut context_menu_open_time: Option<std::time::Instant> = None;
     let mut context_menu_open_time_secs: Option<f32> = None;
     let mut last_scroll_event_time: Option<std::time::Instant> = None;
@@ -1147,6 +1148,7 @@ fn main() -> anyhow::Result<()> {
                                 context_menu_y as f32,
                                 context_menu_hovered_idx,
                                 context_menu_open_time_secs,
+                                &context_menu_items,
                                 hovered_tab_index,
                                 hovered_close_tab_index,
                                 hover_new_tab,
@@ -3134,7 +3136,8 @@ fn main() -> anyhow::Result<()> {
                                             (classification, items)
                                         };
                                         context_menu_classification = classification;
-                                        let (menu_w, menu_h) = get_context_menu_size(&menu_items);
+                                        context_menu_items = menu_items;
+                                        let (menu_w, menu_h) = get_context_menu_size(&context_menu_items);
 
                                         context_menu_x = current_mouse_x;
                                         context_menu_y = current_mouse_y;
@@ -4171,6 +4174,7 @@ fn main() -> anyhow::Result<()> {
                         context_menu_y as f32,
                         context_menu_hovered_idx,
                         context_menu_open_time_secs,
+                        &context_menu_items,
                         hovered_tab_index,
                         hovered_close_tab_index,
                         hover_new_tab,
