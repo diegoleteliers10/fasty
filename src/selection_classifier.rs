@@ -127,35 +127,37 @@ pub fn extract_token(
     if line_idx < 0 {
         return None;
     }
-    let line_us = line_idx as usize;
-    if line_us >= grid.total_lines() {
+    if line_idx as usize >= grid.total_lines() {
         return None;
     }
     let row = &grid[alacritty_terminal::index::Line(line_idx)];
-    let col = point.column.0.min(shell_cols.saturating_sub(1));
+    let shell_cols = shell_cols.min(grid.columns());
+    if shell_cols == 0 {
+        return None;
+    }
+    let col = point.column.0.min(shell_cols - 1);
 
-    let line_str: String = (0..shell_cols)
+    let chars: Vec<char> = (0..shell_cols)
         .map(|i| row[alacritty_terminal::index::Column(i)].c)
         .collect();
 
-    let bytes = line_str.as_bytes();
     let mut start = col;
-    while start > 0 && !DELIMITERS.contains(&(bytes[start - 1] as char)) {
+    while start > 0 && !DELIMITERS.contains(&chars[start - 1]) {
         start -= 1;
     }
     let mut end = col;
-    while end < shell_cols && !DELIMITERS.contains(&(bytes[end] as char)) {
+    while end < shell_cols && !DELIMITERS.contains(&chars[end]) {
         end += 1;
     }
     if end > start {
-        while end > start && TRAILING_PUNCT.contains(&(bytes[end - 1] as char)) {
+        while end > start && TRAILING_PUNCT.contains(&chars[end - 1]) {
             end -= 1;
         }
     }
     if start == end {
         return None;
     }
-    Some((line_str[start..end].to_string(), start, end))
+    Some((chars[start..end].iter().collect(), start, end))
 }
 
 #[cfg(test)]
@@ -244,8 +246,8 @@ mod tests {
         let size = TermSize::new(cols, rows);
         let config = Config::default();
         let mut term: Term<VoidListener> = Term::new(config, &size, VoidListener);
-        for &b in text.as_bytes() {
-            term.input(b as char);
+        for ch in text.chars() {
+            term.input(ch);
         }
         (term.grid().clone(), cols)
     }
@@ -258,5 +260,35 @@ mod tests {
         assert_eq!(tok, "world");
         assert_eq!(start, 6);
         assert_eq!(end, 11);
+    }
+
+    #[test]
+    fn extract_token_on_whitespace_returns_left_word() {
+        let (grid, cols) = grid_with_row("hello world foo");
+        let p = Point::new(Line(0), Column(5));
+        let (tok, start, end) = super::extract_token(&grid, p, cols).unwrap();
+        assert_eq!(tok, "hello");
+        assert_eq!(start, 0);
+        assert_eq!(end, 5);
+    }
+
+    #[test]
+    fn extract_token_handles_click_at_col_zero() {
+        let (grid, cols) = grid_with_row("hello world foo");
+        let p = Point::new(Line(0), Column(0));
+        let (tok, start, end) = super::extract_token(&grid, p, cols).unwrap();
+        assert_eq!(tok, "hello");
+        assert_eq!(start, 0);
+        assert_eq!(end, 5);
+    }
+
+    #[test]
+    fn extract_token_strips_trailing_punctuation() {
+        let (grid, cols) = grid_with_row("foo, bar;");
+        let p = Point::new(Line(0), Column(1));
+        let (tok, start, end) = super::extract_token(&grid, p, cols).unwrap();
+        assert_eq!(tok, "foo");
+        assert_eq!(start, 0);
+        assert_eq!(end, 3);
     }
 }
