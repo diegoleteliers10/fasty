@@ -728,6 +728,7 @@ fn main() -> anyhow::Result<()> {
     let mut context_menu_x = 0.0f64;
     let mut context_menu_y = 0.0f64;
     let mut context_menu_hovered_idx: Option<usize> = None;
+    let mut context_menu_classification: Option<selection_classifier::Classification> = None;
     let mut context_menu_open_time: Option<std::time::Instant> = None;
     let mut context_menu_open_time_secs: Option<f32> = None;
     let mut last_scroll_event_time: Option<std::time::Instant> = None;
@@ -3022,7 +3023,37 @@ fn main() -> anyhow::Result<()> {
                                     } else if current_mouse_y >= padding_top as f64 && current_mouse_x <= (v_width - 20.0) {
                                         context_menu_is_about = false;
                                         tab_ctx_visible = false;
-                                        let menu_items = get_context_menu_items(&tabs, active_tab_index, false);
+                                        let (classification, menu_items) = {
+                                            let term_state = tabs[active_tab_index].terminal_state.lock();
+                                            let display_offset = term_state.display_offset();
+                                            let click_point = mouse_to_grid_point(
+                                                current_mouse_x,
+                                                current_mouse_y,
+                                                cell_width,
+                                                cell_height,
+                                                tabs[active_tab_index].scroll_current,
+                                                display_offset,
+                                                shell_cols,
+                                                shell_rows,
+                                                padding_top,
+                                            );
+                                            let in_history = click_point.line.0 < -(term_state.history_size() as i32);
+                                            let classification = if in_history {
+                                                None
+                                            } else {
+                                                let term_guard = term_state.term().lock();
+                                                selection_classifier::classify_at_point(term_guard.grid(), click_point, shell_cols)
+                                            };
+                                            let cwd_resolvable = tab_live_cwd(&tabs[active_tab_index]).is_some();
+                                            let items = build_smart_menu(
+                                                classification.as_ref(),
+                                                tabs[active_tab_index].selection.is_some(),
+                                                tabs.len(),
+                                                cwd_resolvable,
+                                            );
+                                            (classification, items)
+                                        };
+                                        context_menu_classification = classification;
                                         let (menu_w, menu_h) = get_context_menu_size(&menu_items);
 
                                         context_menu_x = current_mouse_x;
@@ -4884,6 +4915,41 @@ fn get_context_menu_items(tabs: &[Tab], active_idx: usize, is_about: bool) -> Ve
         }
         items
     }
+}
+
+fn build_smart_menu(
+    classification: Option<&selection_classifier::Classification>,
+    has_selection: bool,
+    tabs_len: usize,
+    cwd_resolvable: bool,
+) -> Vec<renderer::ContextMenuItem> {
+    use renderer::ContextMenuItem::*;
+    use selection_classifier::Classification;
+    let mut items = Vec::new();
+    if has_selection {
+        items.push(Copy);
+    }
+    match classification {
+        Some(Classification::Url(_))   => items.push(OpenLink),
+        Some(Classification::Email(_)) => items.push(OpenEmail),
+        Some(Classification::Path(p))  => {
+            items.push(CopyWord);
+            if cwd_resolvable || p.starts_with('/') {
+                items.push(CdHere);
+            }
+            items.push(OpenInEditor);
+        }
+        Some(Classification::Hex(_))   => items.push(CopyHex),
+        Some(Classification::Word(_))  => items.push(CopyWord),
+        None => {}
+    }
+    items.push(Paste);
+    items.push(Separator);
+    items.push(NewTab);
+    if tabs_len > 1 {
+        items.push(CloseTab);
+    }
+    items
 }
 
 fn get_context_menu_size(menu_items: &[crate::renderer::ContextMenuItem]) -> (f64, f64) {
