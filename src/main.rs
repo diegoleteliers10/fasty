@@ -10,6 +10,7 @@ mod git;
 mod keybindings;
 mod pty;
 mod renderer;
+mod selection_classifier;
 mod session;
 mod ssh;
 mod terminal_state;
@@ -19,6 +20,7 @@ use std::sync::Arc;
 
 use config::Config;
 use renderer::{Renderer, Selection, RenderReason};
+use selection_classifier::extract_token;
 use terminal_state::{TerminalState, AppEvent};
 use alacritty_terminal::grid::Dimensions;
 use winit::{
@@ -2798,8 +2800,66 @@ fn main() -> anyhow::Result<()> {
                                             }
                                         }
                                     } else {
-                                        tabs[active_tab_index].selection_start_pos = Some((current_mouse_x, current_mouse_y));
-                                        tabs[active_tab_index].is_selecting_text = false;
+                                        let term_state = tabs[active_tab_index].terminal_state.lock();
+                                        let scroll_fraction = tabs[active_tab_index].scroll_current - term_state.display_offset() as f32;
+                                        let display_offset = term_state.display_offset();
+                                        let click_point = mouse_to_grid_point(
+                                            current_mouse_x,
+                                            current_mouse_y,
+                                            cell_width,
+                                            cell_height,
+                                            scroll_fraction,
+                                            display_offset,
+                                            shell_cols,
+                                            shell_rows,
+                                            padding_top,
+                                        );
+                                        let history_size = term_state.history_size();
+                                        let in_history = click_point.line.0 < -(history_size as i32);
+                                        drop(term_state);
+                                        let now = std::time::Instant::now();
+                                        let same_cell = last_term_click_cell == Some((click_point.line.0, click_point.column.0));
+                                        let is_double = same_cell
+                                            && last_term_click_time
+                                                .map(|t| now.duration_since(t) < std::time::Duration::from_millis(300))
+                                                .unwrap_or(false);
+                                        last_term_click_time = Some(now);
+                                        last_term_click_cell = Some((click_point.line.0, click_point.column.0));
+
+                                        if is_double && !in_history {
+                                            let token_info = {
+                                                let term = tabs[active_tab_index].terminal_state.lock();
+                                                let term_guard = term.term().lock();
+                                                extract_token(term_guard.grid(), click_point, shell_cols)
+                                            };
+                                            if let Some((_token, start_col, end_col)) = token_info {
+                                                let start = alacritty_terminal::index::Point::new(
+                                                    click_point.line,
+                                                    alacritty_terminal::index::Column(start_col),
+                                                );
+                                                let end = alacritty_terminal::index::Point::new(
+                                                    click_point.line,
+                                                    alacritty_terminal::index::Column(end_col),
+                                                );
+                                                tabs[active_tab_index].selection = Some(renderer::Selection { start, end });
+                                                let selection = tabs[active_tab_index].selection.unwrap();
+                                                copy_selection_to_clipboard(
+                                                    &tabs[active_tab_index].terminal_state,
+                                                    selection,
+                                                    shell_cols,
+                                                    shell_rows,
+                                                    &mut clipboard,
+                                                );
+                                                toast = Some((
+                                                    "\u{2713}  Text copied".to_string(),
+                                                    std::time::Instant::now(),
+                                                    1920,
+                                                ));
+                                            }
+                                        } else {
+                                            tabs[active_tab_index].selection_start_pos = Some((current_mouse_x, current_mouse_y));
+                                            tabs[active_tab_index].is_selecting_text = false;
+                                        }
                                     }
                                 } else {
                                     tabs[active_tab_index].is_dragging = false;
