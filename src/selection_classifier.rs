@@ -44,11 +44,7 @@ pub fn is_email(token: &str) -> bool {
     {
         return false;
     }
-    let dot = domain.find('.');
-    match dot {
-        Some(i) if i > 0 && i < domain.len() - 1 => true,
-        _ => false,
-    }
+    domain.find('.').is_some_and(|i| i > 0 && i < domain.len() - 1)
 }
 
 pub fn is_path(token: &str) -> bool {
@@ -68,10 +64,11 @@ pub fn is_path(token: &str) -> bool {
         return true;
     }
     if token.contains('.') && !token.starts_with('.') {
-        let last_dot = token.rfind('.').unwrap();
-        let ext = &token[last_dot + 1..];
-        if !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric()) && ext.len() <= 8 {
-            return true;
+        if let Some(last_dot) = token.rfind('.') {
+            let ext = &token[last_dot + 1..];
+            if !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric()) && ext.len() <= 8 {
+                return true;
+            }
         }
     }
     false
