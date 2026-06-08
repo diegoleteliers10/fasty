@@ -1017,18 +1017,47 @@ impl Pipeline {
                                         let uv_w = uv_end_x - uv_x;
                                         let uv_h = uv_end_y - uv_y;
 
-                                        let glyph_x = (cell_x + entry.left).round();
-                                        let glyph_y = (cell_y + atlas.ascent() + entry.top).round();
+                                        let (glyph_x, glyph_y, glyph_w, glyph_h, is_color_val) = if entry.is_color {
+                                            let char_width = if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR) { 2.0 } else { 1.0 };
+                                            let scale = actual_cell_height / entry.height;
+                                            let render_w = entry.width * scale;
+                                            let render_h = actual_cell_height;
+                                            let x_offset = ((cell_width * char_width) - render_w) / 2.0;
+                                            (
+                                                (cell_x + x_offset.max(0.0)).round(),
+                                                cell_y.round(),
+                                                render_w,
+                                                render_h,
+                                                1.0,
+                                            )
+                                        } else if is_arrow_symbol(cell.c) {
+                                            let x_offset = (cell_width - entry.width) / 2.0;
+                                            (
+                                                (cell_x + x_offset).round(),
+                                                (cell_y + atlas.ascent() + entry.top).round(),
+                                                entry.width,
+                                                entry.height,
+                                                0.0,
+                                            )
+                                        } else {
+                                            (
+                                                (cell_x + entry.left).round(),
+                                                (cell_y + atlas.ascent() + entry.top).round(),
+                                                entry.width,
+                                                entry.height,
+                                                0.0,
+                                            )
+                                        };
 
                                         let text_instance = CellInstance::new(
                                             glyph_x,
                                             glyph_y,
-                                            entry.width,
-                                            entry.height,
+                                            glyph_w,
+                                            glyph_h,
                                             fg,
                                             [0.0, 0.0, 0.0, 0.0],
                                             uv_x, uv_y, uv_w, uv_h,
-                                            0.0,
+                                            is_color_val,
                                         );
                                         fg_instances.push(text_instance);
                                     }
@@ -4474,7 +4503,7 @@ pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
 }
 
 fn is_arrow_symbol(ch: char) -> bool {
-    matches!(ch as u32, 0x2190..=0x21FF | 0x2B00..=0x2BFF)
+    matches!(ch as u32, 0x2190..=0x21FF | 0x27A0..=0x27BF | 0x2B00..=0x2BFF)
 }
 
 fn render_single_char(
