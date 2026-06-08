@@ -6,5 +6,6 @@ pub mod git;
 pub mod keybindings;
 pub mod pty;
 pub mod renderer;
+pub mod selection_classifier;
 pub mod session;
 pub mod terminal_state;
