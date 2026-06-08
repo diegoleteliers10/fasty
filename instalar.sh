@@ -166,6 +166,8 @@ elif [ "$OS" = "linux" ]; then
         sudo chmod +x "$BIN_DIR/$APP_NAME"
     fi
 
+    echo "$LATEST_TAG" > /tmp/fasty-update-done 2>/dev/null || true
+
     # Configuración de icono PNG y archivo .desktop para menús del sistema
     echo "🎨 Configurando icono y acceso directo de escritorio para Linux..."
     RAW_ICON_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/main/assets/fastyIcon.png"

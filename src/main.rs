@@ -537,6 +537,8 @@ fn main() -> anyhow::Result<()> {
     let app_version = get_current_version();
     std::env::set_var("TERM_PROGRAM_VERSION", app_version.trim_start_matches('v'));
 
+    let _ = std::fs::remove_file("/tmp/fasty-update-done");
+
     crash::install_hook();
 
     tracing_subscriber::fmt()
@@ -5011,19 +5013,29 @@ fn trigger_update(
 
     #[cfg(not(target_os = "windows"))]
     {
-        // On Linux/mac, write curl|bash to the user's terminal so they
-        // can see the install progress and enter the sudo password
-        // interactively. The install script's tail schedules a kill
-        // +restart of fasty after the install completes.
         if let Some(tab) = tabs.get(active_tab_index) {
-            // No FASTY_USER_INSTALL env var: install into the system path
-            // (/usr/local/bin) so the system launcher/.desktop file points
-            // at the new binary after restart. The user will see the sudo
-            // prompt in this same terminal.
             let cmd = b"curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash\n";
             tab.terminal_state.lock().write_to_pty(cmd);
         }
-        *update_completed.lock() = true;
+
+        let update_in_progress_clone = Arc::clone(update_in_progress);
+        let update_completed_clone = Arc::clone(update_completed);
+        let window_clone = Arc::clone(window);
+        std::thread::spawn(move || {
+            let marker = std::path::Path::new("/tmp/fasty-update-done");
+            for _ in 0..300u32 {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if marker.exists() {
+                    let _ = std::fs::remove_file(marker);
+                    *update_in_progress_clone.lock() = false;
+                    *update_completed_clone.lock() = true;
+                    window_clone.request_redraw();
+                    return;
+                }
+            }
+            *update_in_progress_clone.lock() = false;
+            window_clone.request_redraw();
+        });
     }
 }
 
