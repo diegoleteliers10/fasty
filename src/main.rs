@@ -2348,14 +2348,28 @@ fn main() -> anyhow::Result<()> {
                                                         context_menu_visible = false;
                                                     }
                                                     crate::renderer::ContextMenuItem::CopyWord | crate::renderer::ContextMenuItem::CopyHex => {
-                                                        if let Some(sel) = tabs[active_tab_index].selection {
-                                                            copy_selection_to_clipboard(
-                                                                &tabs[active_tab_index].terminal_state,
-                                                                sel,
-                                                                shell_cols,
-                                                                shell_rows,
-                                                                &mut clipboard,
-                                                            );
+                                                        let text = match context_menu_classification.as_ref() {
+                                                            Some(selection_classifier::Classification::Url(s))
+                                                            | Some(selection_classifier::Classification::Email(s))
+                                                            | Some(selection_classifier::Classification::Path(s))
+                                                            | Some(selection_classifier::Classification::Hex(s))
+                                                            | Some(selection_classifier::Classification::Word(s)) => Some(s.clone()),
+                                                            None => None,
+                                                        };
+                                                        if let Some(text) = text {
+                                                            if let Some(ref mut ctx) = clipboard.as_mut() {
+                                                                let _ = ctx.set_text(text.clone());
+                                                            } else {
+                                                                match arboard::Clipboard::new() {
+                                                                    Ok(mut ctx) => {
+                                                                        let _ = ctx.set_text(text.clone());
+                                                                        clipboard = Some(ctx);
+                                                                    }
+                                                                    Err(e) => {
+                                                                        eprintln!("fasty clipboard init failed: {:?}", e);
+                                                                    }
+                                                                }
+                                                            }
                                                             toast = Some((
                                                                 "\u{2713}  Text copied".to_string(),
                                                                 std::time::Instant::now(),
@@ -2409,7 +2423,9 @@ fn main() -> anyhow::Result<()> {
                                                             } else {
                                                                 p.clone()
                                                             };
-                                                            let _ = open_file_in_editor(std::path::Path::new(&resolved));
+                                                            if let Err(e) = open_file_in_editor(std::path::Path::new(&resolved)) {
+                                                                eprintln!("fasty open_file_in_editor failed for '{}': {:?}", resolved, e);
+                                                            }
                                                         }
                                                         context_menu_visible = false;
                                                     }
@@ -5018,7 +5034,7 @@ fn build_smart_menu(
         Some(Classification::Email(_)) => items.push(OpenEmail),
         Some(Classification::Path(p))  => {
             items.push(CopyWord);
-            if cwd_resolvable || p.starts_with('/') {
+            if cwd_resolvable || p.starts_with('/') || p.starts_with('~') || p.starts_with('.') {
                 items.push(CdHere);
             }
             items.push(OpenInEditor);
