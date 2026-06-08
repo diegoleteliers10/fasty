@@ -2332,6 +2332,13 @@ fn main() -> anyhow::Result<()> {
                                                         shell_rows = rows;
                                                     }
                                                     crate::renderer::ContextMenuItem::Separator => {}
+                                                    crate::renderer::ContextMenuItem::OpenLink => {}
+                                                    crate::renderer::ContextMenuItem::CopyWord => {}
+                                                    crate::renderer::ContextMenuItem::CopyLine => {}
+                                                    crate::renderer::ContextMenuItem::CdHere => {}
+                                                    crate::renderer::ContextMenuItem::OpenInEditor => {}
+                                                    crate::renderer::ContextMenuItem::OpenEmail => {}
+                                                    crate::renderer::ContextMenuItem::CopyHex => {}
                                                 }
                                             }
                                         }

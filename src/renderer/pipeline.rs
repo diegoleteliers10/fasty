@@ -2314,7 +2314,14 @@ impl Pipeline {
                             crate::renderer::ContextMenuItem::NewTab => ("+", "Nueva pestaña", None),
                             crate::renderer::ContextMenuItem::CloseTab => ("\u{2715}", "Cerrar pestaña", None),
                             crate::renderer::ContextMenuItem::About => ("", "About", None),
-                            _ => ("", "", None),
+                            crate::renderer::ContextMenuItem::OpenLink => ("🔗", "Open link", Some("⌘-click")),
+                            crate::renderer::ContextMenuItem::CopyWord => ("📋", "Copy word", None),
+                            crate::renderer::ContextMenuItem::CopyLine => ("📋", "Copy line", None),
+                            crate::renderer::ContextMenuItem::CdHere => ("📁", "cd here in new tab", None),
+                            crate::renderer::ContextMenuItem::OpenInEditor => ("✏\u{FE0F}", "Open in editor", None),
+                            crate::renderer::ContextMenuItem::OpenEmail => ("✉\u{FE0F}", "Compose email", None),
+                            crate::renderer::ContextMenuItem::CopyHex => ("#", "Copy hex", None),
+                            crate::renderer::ContextMenuItem::Separator => ("", "", None),
                         };
 
                         // Text color: hover = white, normal = rgba(220, 222, 226, 1.0)

@@ -626,4 +626,11 @@ pub enum ContextMenuItem {
     NewTab,
     CloseTab,
     About,
+    OpenLink,
+    CopyWord,
+    CopyLine,
+    CdHere,
+    OpenInEditor,
+    OpenEmail,
+    CopyHex,
 }
