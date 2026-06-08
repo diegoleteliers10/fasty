@@ -11,8 +11,8 @@ pub use atlas::Atlas;
 pub use atlas::RowShapingResult;
 pub use atlas::is_block_element;
 pub use atlas::is_emoji;
-pub use cell::CellInstance;
-pub use pipeline::Pipeline;
+ pub use cell::CellInstance;
+ pub use pipeline::Pipeline;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderReason {
@@ -327,6 +327,11 @@ impl<'a> Renderer<'a> {
         renaming_tab: Option<usize>,
         rename_buffer: &str,
         rename_cursor: usize,
+        git_status: Option<&crate::git::GitStatus>,
+        ssh_picker_visible: bool,
+        ssh_picker_query: &str,
+        ssh_picker_selected: usize,
+        ssh_filtered: &[String],
     ) {
         if !self.dirty {
             return;
@@ -427,6 +432,11 @@ impl<'a> Renderer<'a> {
                 renaming_tab,
                 rename_buffer,
                 rename_cursor,
+                git_status,
+                ssh_picker_visible,
+                ssh_picker_query,
+                ssh_picker_selected,
+                ssh_filtered,
             );
         }
 
@@ -456,6 +466,10 @@ impl<'a> Renderer<'a> {
         themes: &[String],
         hovered_theme_idx: Option<usize>,
         theme_scroll_y: f32,
+        visual_picker_active: bool,
+        hover_visual_toggle: bool,
+        hovered_card_idx: Option<usize>,
+        card_scroll_y: f32,
     ) {
         if !self.dirty {
             return;
@@ -514,6 +528,10 @@ impl<'a> Renderer<'a> {
                 themes,
                 hovered_theme_idx,
                 theme_scroll_y,
+                visual_picker_active,
+                hover_visual_toggle,
+                hovered_card_idx,
+                card_scroll_y,
                 &self.device,
                 &self.queue,
             );

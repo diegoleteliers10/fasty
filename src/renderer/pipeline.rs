@@ -633,6 +633,11 @@ impl Pipeline {
         renaming_tab: Option<usize>,
         rename_buffer: &str,
         rename_cursor: usize,
+        git_status: Option<&crate::git::GitStatus>,
+        ssh_picker_visible: bool,
+        ssh_picker_query: &str,
+        ssh_picker_selected: usize,
+        ssh_filtered: &[String],
     ) {
         if reason == RenderReason::CursorBlink {
             let term = terminal.term();
@@ -753,27 +758,19 @@ impl Pipeline {
             );
             term_bg_instances.push(window_bg);
 
-            // 3. Draw terminal background below the unified topbar
+            // 3. Draw terminal background below the unified topbar,
+            //    stopping before the bottombar area (15px).
             let terminal_bg = CellInstance::new(
                 0.0, 40.0,
-                viewport_width, viewport_height - 40.0,
+                viewport_width, viewport_height - 40.0 - 20.0,
                 theme_bg,
                 [0.0, 0.0, 0.0, 0.0],
                 0.0, 0.0, 1.0, 1.0,
-                8.0, // bottom corners radius of 8
+                0.0,
             );
             term_bg_instances.push(terminal_bg);
 
-            // 4. Draw square block to cover top rounded corners of the terminal bg
-            let terminal_top_fill = CellInstance::new(
-                0.0, 40.0,
-                viewport_width, 8.0,
-                theme_bg,
-                [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 0.0, 0.0,
-                0.0, // square
-            );
-            term_bg_instances.push(terminal_top_fill);
+            // 4. (removed: terminal bg no longer has rounded top corners)
 
             let bg_instances = &mut term_bg_instances;
             let fg_instances = &mut term_fg_instances;
@@ -1086,6 +1083,171 @@ impl Pipeline {
 
         let bg_instances = &mut ui_bg_instances;
         let fg_instances = &mut ui_fg_instances;
+
+        // Bottombar — always rendered (15px strip at the bottom).
+        // Git info is shown only when the active tab is in a git repo.
+        {
+            const BB_H: f32 = 20.0;
+            let bb_x = 0.0f32;
+            let bb_y = viewport_height - BB_H;
+            let bb_w = viewport_width;
+
+            let (bg_r, bg_g, bg_b) = named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::Background);
+            let theme_bg = [bg_r as f32 / 255.0, bg_g as f32 / 255.0, bg_b as f32 / 255.0, 1.0];
+
+            // Flat bottombar background — same color as terminal bg
+            bg_instances.push(CellInstance::new(
+                bb_x, bb_y,
+                bb_w, BB_H,
+                theme_bg,
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                0.0,
+            ));
+
+            // Git info — only when in a repo
+            if let Some(gs) = git_status {
+                let bb_font: f32 = 12.0;
+                let scale = bb_font / ui_atlas.font_size();
+                let cell_w = ui_atlas.cell_size().0 * scale;
+                let scaled_ascent = ui_atlas.ascent() * scale;
+                let descent = scaled_ascent * 0.3;
+                let text_block_h = scaled_ascent + descent;
+                let baseline_y = bb_y + (BB_H - text_block_h) / 2.0 + scaled_ascent;
+
+                macro_rules! bb_text {
+                    ($text:expr, $start_x:expr, $color:expr) => {{
+                        let mut x = $start_x;
+                        for c in $text.chars() {
+                            if c == ' ' { x += cell_w; continue; }
+                            if let Some(entry) = ui_atlas.get_or_rasterize(c, device, queue) {
+                                if entry.width > 0.0 {
+                                    let gw = entry.width * scale;
+                                    let glyph_x = (x + entry.left * scale).round();
+                                    let glyph_y = (baseline_y + entry.top * scale).round();
+                                    let (aw, ah) = ui_atlas.atlas_size();
+                                    let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                                    fg_instances.push(CellInstance::new(
+                                        glyph_x, glyph_y,
+                                        gw, entry.height * scale,
+                                        $color,
+                                        [0.0, 0.0, 0.0, 0.0],
+                                        uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                                        0.0,
+                                    ));
+                                    x += gw + 1.0;
+                                }
+                            }
+                        }
+                        x
+                    }};
+                }
+
+                let mut x = 8.0f32;
+
+                // Branch icon
+                if let Some(entry) = &ui_atlas.icon_branch {
+                    let icon_size = bb_font;
+                    let icon_y = bb_y + (BB_H - icon_size) / 2.0;
+                    let (aw, ah) = ui_atlas.atlas_size();
+                    let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                    fg_instances.push(CellInstance::new(
+                        x, icon_y,
+                        icon_size, icon_size,
+                        [0.75, 0.78, 0.85, 1.0],
+                        [0.0, 0.0, 0.0, 0.0],
+                        uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                        0.0,
+                    ));
+                    x += icon_size + 4.0;
+                }
+
+                // Branch name
+                let branch_color = [0.85, 0.88, 0.95, 1.0];
+                x = bb_text!(gs.branch.as_str(), x, branch_color);
+
+                // Dirty indicator dot
+                if !gs.is_clean() {
+                    x += 6.0;
+                    let dot_r = 2.5f32;
+                    let dot_y = bb_y + BB_H * 0.5;
+                    bg_instances.push(CellInstance::new(
+                        x - dot_r, dot_y - dot_r,
+                        dot_r * 2.0, dot_r * 2.0,
+                        [0.95, 0.80, 0.45, 1.0],
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0, 0.0, 0.0, 0.0,
+                        dot_r,
+                    ));
+                    x += dot_r * 2.0 + 6.0;
+                }
+
+                // Separator
+                x += 2.0;
+                let sep_color = [1.0, 1.0, 1.0, 0.08];
+                bg_instances.push(CellInstance::new(
+                    x, bb_y + 3.0,
+                    1.0, BB_H - 6.0,
+                    sep_color,
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                ));
+                x += 8.0;
+
+                // Ahead
+                if gs.ahead > 0 {
+                    let s = format!("\u{2191}{}", gs.ahead);
+                    x = bb_text!(s.as_str(), x, [0.45, 0.85, 0.55, 1.0]) + 6.0;
+                }
+
+                // Behind
+                if gs.behind > 0 {
+                    let s = format!("\u{2193}{}", gs.behind);
+                    x = bb_text!(s.as_str(), x, [0.90, 0.55, 0.40, 1.0]) + 6.0;
+                }
+
+                // Modified
+                if gs.modified > 0 {
+                    let s = format!("~{}", gs.modified);
+                    x = bb_text!(s.as_str(), x, [0.95, 0.80, 0.45, 1.0]) + 6.0;
+                }
+
+                // Staged
+                if gs.staged > 0 {
+                    let s = format!("+{}", gs.staged);
+                    x = bb_text!(s.as_str(), x, [0.50, 0.80, 0.95, 1.0]) + 6.0;
+                }
+
+                // Untracked
+                if gs.untracked > 0 {
+                    let s = format!("?{}", gs.untracked);
+                    x = bb_text!(s.as_str(), x, [0.65, 0.65, 0.75, 1.0]) + 6.0;
+                }
+
+                // Last commit summary — right-aligned, dimmed
+                if !gs.last_commit_summary.is_empty() {
+                    let summary_text = if gs.last_commit_summary.len() > 60 {
+                        format!("{}...", &gs.last_commit_summary[..57])
+                    } else {
+                        gs.last_commit_summary.clone()
+                    };
+                    // Measure text width to right-align
+                    let mut text_w = 0.0f32;
+                    for c in summary_text.chars() {
+                        if c == ' ' { text_w += cell_w; continue; }
+                        if let Some(entry) = ui_atlas.get_or_rasterize(c, device, queue) {
+                            text_w += entry.width * scale + 1.0;
+                        }
+                    }
+                    let right_x = viewport_width - text_w - 8.0;
+                    if right_x > x + 16.0 {
+                        let _ = bb_text!(summary_text.as_str(), right_x, [0.50, 0.50, 0.55, 0.6]);
+                    }
+                }
+            }
+        }
+
         let atlas = ui_atlas;
 
         // In-scrollback search bar (Ctrl+Shift+F) — floating block in the
@@ -2575,6 +2737,141 @@ impl Pipeline {
             }
         }
 
+        if ssh_picker_visible {
+            let picker_w = 500.0f32;
+            let max_results = 8usize;
+            let item_h = 22.0f32;
+            let input_h = 28.0f32;
+            let n_shown = ssh_filtered.len().min(max_results);
+            let picker_h = input_h + (n_shown as f32) * item_h + 16.0;
+            let picker_x = (viewport_width - picker_w) / 2.0;
+            let picker_y = 80.0;
+
+            instances.push(CellInstance::new(
+                picker_x - 1.0, picker_y - 1.0,
+                picker_w + 2.0, picker_h + 2.0,
+                [1.0, 1.0, 1.0, 0.18],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                8.0,
+            ));
+            instances.push(CellInstance::new(
+                picker_x, picker_y,
+                picker_w, picker_h,
+                [22.0 / 255.0, 24.0 / 255.0, 28.0 / 255.0, 0.96],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                7.0,
+            ));
+
+            let input_scale = 14.0 / atlas.font_size();
+            let prompt_str = "> ";
+            let input_baseline_y = picker_y + 6.0 + atlas.ascent() * input_scale;
+            let mut input_x = picker_x + 14.0;
+            let prompt_cell_w = atlas.cell_size().0 * input_scale;
+            for c in prompt_str.chars() {
+                if c == ' ' {
+                    input_x += prompt_cell_w;
+                    continue;
+                }
+                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                    if entry.width > 0.0 {
+                        let gw = entry.width * input_scale;
+                        let gh = entry.height * input_scale;
+                        let gx = (input_x + entry.left * input_scale).round();
+                        let gy = (input_baseline_y + entry.top * input_scale).round();
+                        let (aw, ah) = atlas.atlas_size();
+                        let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                        instances.push(CellInstance::new(
+                            gx, gy, gw, gh,
+                            [0.6, 0.85, 1.0, 0.95],
+                            [0.0, 0.0, 0.0, 0.0],
+                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                            0.0,
+                        ));
+                        input_x += (entry.width + 1.0) * input_scale;
+                    }
+                }
+            }
+            for c in ssh_picker_query.chars() {
+                if c == ' ' {
+                    input_x += prompt_cell_w;
+                    continue;
+                }
+                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                    if entry.width > 0.0 {
+                        let gw = entry.width * input_scale;
+                        let gh = entry.height * input_scale;
+                        let gx = (input_x + entry.left * input_scale).round();
+                        let gy = (input_baseline_y + entry.top * input_scale).round();
+                        let (aw, ah) = atlas.atlas_size();
+                        let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                        instances.push(CellInstance::new(
+                            gx, gy, gw, gh,
+                            [0.92, 0.94, 0.98, 1.0],
+                            [0.0, 0.0, 0.0, 0.0],
+                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                            0.0,
+                        ));
+                        input_x += (entry.width + 1.0) * input_scale;
+                    }
+                }
+            }
+            let cursor_x = input_x + 1.0;
+            let cursor_y = picker_y + 6.0;
+            instances.push(CellInstance::new(
+                cursor_x, cursor_y,
+                1.5, input_h - 12.0,
+                [0.6, 0.85, 1.0, 0.85],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0, 0.0, 1.0, 1.0,
+                0.0,
+            ));
+
+            let result_scale = 12.0 / atlas.font_size();
+            let result_cell_w = atlas.cell_size().0 * result_scale;
+            let result_baseline_offset = atlas.ascent() * result_scale;
+            for (i, label) in ssh_filtered.iter().take(max_results).enumerate() {
+                let item_y = picker_y + input_h + 8.0 + (i as f32) * item_h;
+                if i == ssh_picker_selected {
+                    instances.push(CellInstance::new(
+                        picker_x + 4.0, item_y,
+                        picker_w - 8.0, item_h - 2.0,
+                        [0.20, 0.45, 0.85, 0.35],
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0, 0.0, 1.0, 1.0,
+                        4.0,
+                    ));
+                }
+                let baseline_y = item_y + (item_h - atlas.cell_size().1 * result_scale) / 2.0 + result_baseline_offset;
+                let mut lx = picker_x + 14.0;
+                for c in label.chars() {
+                    if c == ' ' || c == '@' {
+                        lx += result_cell_w * 1.3;
+                        continue;
+                    }
+                    if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                        if entry.width > 0.0 {
+                            let gw = entry.width * result_scale;
+                            let gh = entry.height * result_scale;
+                            let gx = (lx + entry.left * result_scale).round();
+                            let gy = (baseline_y + entry.top * result_scale).round();
+                            let (aw, ah) = atlas.atlas_size();
+                            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                            instances.push(CellInstance::new(
+                                gx, gy, gw, gh,
+                                [0.92, 0.94, 0.98, 1.0],
+                                [0.0, 0.0, 0.0, 0.0],
+                                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                                0.0,
+                            ));
+                            lx += (entry.width + 1.0) * result_scale;
+                        }
+                    }
+                }
+            }
+        }
+
         let ui_extra_instances_final = instances;
 
         let term_count = term_instances_final.len();
@@ -2653,6 +2950,10 @@ impl Pipeline {
         themes: &[String],
         hovered_theme_idx: Option<usize>,
         theme_scroll_y: f32,
+        visual_picker_active: bool,
+        hover_visual_toggle: bool,
+        hovered_card_idx: Option<usize>,
+        card_scroll_y: f32,
         device: &Device,
         queue: &wgpu::Queue,
     ) {
@@ -2774,7 +3075,36 @@ impl Pipeline {
         };
 
         // Draw title
-        draw_text(atlas, "Settings", 12.0, 6.0, [0.85, 0.85, 0.90, 1.0], &mut fg_instances);
+        draw_text(atlas, "Settings", 12.0, 6.0, [0.85, 0.85, 0.85, 1.0], &mut fg_instances);
+
+        // Draw "Visual" toggle button in the topbar (between title and close)
+        let visual_btn_x = 80.0f32 * scale;
+        let visual_btn_w = 56.0f32 * scale;
+        let visual_btn_h = 24.0f32 * scale;
+        let visual_btn_y = 6.0f32 * scale;
+        let visual_btn_bg = if visual_picker_active {
+            theme_accent
+        } else if hover_visual_toggle {
+            theme_lift_hover
+        } else {
+            theme_lift_rest
+        };
+        bg_instances.push(CellInstance::new(
+            visual_btn_x, visual_btn_y,
+            visual_btn_w, visual_btn_h,
+            visual_btn_bg,
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            5.0 * scale,
+        ));
+        draw_text(
+            atlas,
+            "Visual",
+            visual_btn_x / scale + 8.0,
+            visual_btn_y / scale + 6.0,
+            if visual_picker_active { [0.05, 0.05, 0.05, 1.0] } else { [0.85, 0.85, 0.90, 1.0] },
+            &mut fg_instances,
+        );
 
         // Draw topbar close button
         let close_x = viewport_width - 32.0 * scale;
@@ -3357,6 +3687,110 @@ impl Pipeline {
                     2.0 * scale,
                 ));
             }
+        }
+
+        // Visual Picker — theme preview cards
+        if visual_picker_active {
+            let grid_x = 20.0f32 * scale;
+            let grid_y = 256.0f32 * scale;
+            let card_w = 170.0f32 * scale;
+            let card_h = 58.0f32 * scale;
+            let gap = 8.0f32 * scale;
+            let cols = 2;
+            let rows_visible = ((viewport_height - grid_y - 12.0 * scale) / (card_h + gap)).floor() as i32;
+            let rows_visible = rows_visible.max(1);
+            let total_rows = ((themes.len() as i32 + cols - 1) / cols).max(1);
+
+            draw_text(atlas, "Theme previews", grid_x / scale, grid_y / scale - 16.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
+
+            for (i, theme_name) in themes.iter().enumerate() {
+                let col = (i as i32) % cols;
+                let row = (i as i32) / cols;
+                let card_x = grid_x + col as f32 * (card_w + gap);
+                let card_y = grid_y + row as f32 * (card_h + gap) - card_scroll_y * scale;
+                let card_bottom = card_y + card_h;
+                if card_bottom < grid_y || card_y > viewport_height - 8.0 * scale {
+                    continue;
+                }
+
+                let swatch = named_color_rgb_for_theme(theme_name);
+                let (fg, accent_r, accent_g, _accent_b) = swatch;
+                let prev = crate::config::ACTIVE_THEME.read().clone();
+                crate::config::set_active_theme(theme_name);
+                let t = get_active_theme();
+                let (br, bgc, bb) = t.background;
+                crate::config::set_active_theme(&prev);
+
+                let card_bg = [br as f32 / 255.0, bgc as f32 / 255.0, bb as f32 / 255.0, 1.0];
+                let card_fg = [fg.0 as f32 / 255.0, fg.1 as f32 / 255.0, fg.2 as f32 / 255.0, 1.0];
+                let card_accent = [accent_r.0 as f32 / 255.0, accent_r.1 as f32 / 255.0, accent_r.2 as f32 / 255.0, 1.0];
+
+                let is_active = theme_name == theme;
+                let is_hovered = hovered_card_idx == Some(i);
+
+                let border_color = if is_active {
+                    card_accent
+                } else if is_hovered {
+                    [1.0, 1.0, 1.0, 0.30]
+                } else {
+                    [1.0, 1.0, 1.0, 0.12]
+                };
+
+                // Shadow
+                bg_instances.push(CellInstance::new(
+                    card_x + 2.0 * scale, card_y + 2.0 * scale,
+                    card_w, card_h,
+                    [0.0, 0.0, 0.0, 0.25],
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, 1.0,
+                    8.0 * scale,
+                ));
+                // Card background — uses the theme's actual bg color
+                bg_instances.push(CellInstance::new(
+                    card_x, card_y,
+                    card_w, card_h,
+                    card_bg,
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, 1.0,
+                    8.0 * scale,
+                ));
+                // Border ring
+                fg_instances.push(CellInstance::new(
+                    card_x, card_y,
+                    card_w, card_h,
+                    border_color,
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, 1.0,
+                    8.0 * scale,
+                ));
+
+                let sample_x = card_x + 8.0 * scale;
+                let sample_y = card_y + 6.0 * scale;
+                draw_text(atlas, "Aa Bb", sample_x / scale, sample_y / scale, card_fg, &mut fg_instances);
+                // Accent strip on the right (small bar using the theme's red/green accent)
+                fg_instances.push(CellInstance::new(
+                    card_x + card_w - 18.0 * scale, card_y + 8.0 * scale,
+                    10.0 * scale, 4.0 * scale,
+                    card_accent,
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, 1.0,
+                    2.0 * scale,
+                ));
+                fg_instances.push(CellInstance::new(
+                    card_x + card_w - 32.0 * scale, card_y + 8.0 * scale,
+                    10.0 * scale, 4.0 * scale,
+                    [accent_g.0 as f32 / 255.0, accent_g.1 as f32 / 255.0, accent_g.2 as f32 / 255.0, 1.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, 1.0,
+                    2.0 * scale,
+                ));
+
+                draw_text(atlas, theme_name, (card_x + 8.0 * scale) / scale, (card_y + 30.0 * scale) / scale, card_fg, &mut fg_instances);
+                if is_active {
+                    draw_text(atlas, "v", (card_x + card_w - 18.0 * scale) / scale, (card_y + 30.0 * scale) / scale, card_accent, &mut fg_instances);
+                }
+            }
+            let _ = (total_rows, rows_visible);
         }
 
         // Write buffer and draw

@@ -85,6 +85,7 @@ pub enum Action {
     PrevTab,
     SelectTab(u8),
     CommandPalette,
+    SshManager,
 }
 
 pub struct KeyBindingResolver {
@@ -108,6 +109,7 @@ impl KeyBindingResolver {
         insert("ctrl+shift+s", Action::OpenSettings);
         insert("ctrl+shift+r", Action::ReloadConfig);
         insert("ctrl+shift+p", Action::CommandPalette);
+        insert("ctrl+shift+o", Action::SshManager);
         insert("f5", Action::ReloadConfig);
         insert("f10", Action::ReloadConfig);
         insert("ctrl+equal", Action::IncreaseFontSize);
@@ -216,6 +218,7 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "open_settings" => Some(Action::OpenSettings),
         "reload_config" => Some(Action::ReloadConfig),
         "command_palette" => Some(Action::CommandPalette),
+        "ssh_manager" => Some(Action::SshManager),
         "increase_font_size" => Some(Action::IncreaseFontSize),
         "decrease_font_size" => Some(Action::DecreaseFontSize),
         "reset_font_size" => Some(Action::ResetFontSize),

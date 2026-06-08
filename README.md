@@ -13,12 +13,15 @@ Inspired by [Ghostty](https://github.com/ghostty-org/ghostty), Fasty leverages `
 - **Ultra-Low CPU Idle Footprint**: `<1%` CPU at idle via `winit`'s `ControlFlow::Wait`, blocking PTY read loop, and micro-optimized cursor blink GPU fast-path.
 - **Animated Scrollbar Fading**: Smoothly fades the scrollbar out during TUI mouse reporting or alternate screen buffers, fades back in instantly on exit.
 - **Seamless TUI Mouse Integration**: Perfect mouse clicks and drag selections passed directly to the PTY (htop, vim, Claude Code) without interfering with desktop text selection.
-- **Tabbed Layout**: Multiple independent tabs, each running a native shell process.
+- **Tabbed Layout**: Multiple independent tabs, each running a native shell process. Tabs support drag-to-reorder and right-click rename.
 - **Live-Apply Settings**: Font family, size (1pt step), scrollback, and theme applied instantly — no Save/Cancel buttons.
 - **Built-in Color Themes**: `default` (Fasty), `catppuccin`, `one-dark`, `solarized-dark`, `high-contrast`. Switches apply live across main window, settings, and about dialogs.
-- **Custom Keybindings**: User-rebindable shortcuts via `[keybindings]` in `fasty.toml`. 13 actions available; defaults preserved when omitted.
+- **Custom Keybindings**: User-rebindable shortcuts via `[keybindings]` in `fasty.toml`. 14 actions available; defaults preserved when omitted.
 - **Session Restore**: Saves open tab working directories on exit, restores to saved paths on next launch. Enabled by default; opt-out via `session_restore = false`.
 - **Command Palette**: `Ctrl+Shift+P` opens a fuzzy-search palette for quick access to settings, tab actions, themes, and font size controls.
+- **Git Status Bottombar**: Always-visible bottom bar showing branch, modified/staged/untracked counts, ahead/behind, and last commit summary when inside a git repo.
+- **Built-in SSH Manager**: `Ctrl+Shift+O` opens a fuzzy-search picker over `~/.ssh/config` hosts. Connects in a new tab with `StrictHostKeyChecking=accept-new`.
+- **Crash Reporting & Auto-Restart**: On panic, writes a timestamped crash dump with backtrace to `~/.config/fasty/crashes/` and auto-restarts the terminal.
 - **TOML Config + Live Reload**: `fasty.toml` edits re-apply on save — no restart needed. Comments and formatting preserved across Settings-dialog writes via `toml_edit` round-tripping.
 - **Asynchronous Background Updater**: Non-blocking update check on startup with one-click install from the topbar "Update" button. Restarts automatically on success.
 
@@ -56,7 +59,7 @@ Fasty integrates custom vector icons mapped into the GPU texture atlas as non-co
 1. **Scrollback Memory Cap**: Capped at 3000 lines (down from 10,000), reducing allocations by ~37MB.
 2. **GPU Texture Atlas Scaling**: Main and UI texture atlases sized at `1536x1536` on Linux/macOS and `1024x1024` on Windows (down from `2048x2048`).
 3. **Logging Overhead Elimination**: Removed duplicate logging crates in favor of standard `tracing`. Output conditionalized to debug configurations only.
-4. **Hardened Release Profile**: LTO (`lto = true`), unit splitting (`codegen-units = 1`), debug symbols stripped (`strip = true`), panic unwinding disabled (`panic = "abort"`).
+4. **Hardened Release Profile**: LTO (`lto = true`), unit splitting (`codegen-units = 1`), debug symbols stripped (`strip = true`), panic unwinding enabled (`panic = "unwind"`) for crash reporting support.
 
 ### Windows Memory & UX Hardening (v0.2.5)
 
@@ -90,6 +93,9 @@ src/
 ├── terminal_state.rs  # PTY controller & alacritty_terminal parser wrapper
 ├── keybindings.rs     # Key combo parser, action resolver, user overrides
 ├── session.rs         # Tab cwd persistence (save/restore)
+├── git.rs             # Background git status polling (branch, dirty, last commit)
+├── ssh.rs             # SSH config parser (~/.ssh/config) for built-in SSH manager
+├── crash.rs           # Panic hook, crash dump writer, auto-restart
 ├── renderer/          # wgpu backend components
 │   ├── mod.rs         # Renderer definitions, render passes
 │   ├── pipeline.rs    # Cell instance drawing, UI layouts, cursor fast-path
@@ -257,6 +263,7 @@ The `[keybindings]` section maps key combinations to actions. All bindings are o
 | `open_settings` | `ctrl+shift+s` | Open settings dialog |
 | `reload_config` | `ctrl+shift+r` | Reload configuration |
 | `command_palette` | `ctrl+shift+p` | Open command palette |
+| `ssh_manager` | `ctrl+shift+o` | Open SSH host picker |
 | `increase_font_size` | `ctrl+equal` / `ctrl+plus` | Increase font size |
 | `decrease_font_size` | `ctrl+minus` | Decrease font size |
 | `reset_font_size` | `ctrl+0` | Reset font size |
@@ -314,11 +321,14 @@ Drop a `.json` file into `~/.config/fasty/themes/` (filename minus `.json` becom
 | `Ctrl + Shift + T` | Open a new tab |
 | `Ctrl + Shift + W` | Close current tab |
 | `Ctrl + Shift + P` | Open command palette |
+| `Ctrl + Shift + O` | Open SSH host picker |
 | `Ctrl + Shift + L` | Snap scroll to bottom |
 | `Ctrl + C` / `Ctrl + Shift + C` | Copy selection |
 | `Ctrl + V` / `Ctrl + Shift + V` | Paste clipboard |
 | `Ctrl + Left Click` | Open URL in browser |
 | `Left Mouse Drag` | Highlight text |
+| `Right Click` | Context menu (tab bar) |
+| `Tab Drag` | Reorder tabs |
 
 ---
 
@@ -344,7 +354,7 @@ Features under consideration for upcoming releases:
 - [x] **Session Restore** -- Persist open tab working directories on shutdown; restore on next launch.
 - [ ] **Split Panes** -- Horizontal/vertical splits per tab (like `tmux`/`Zellij`).
 - [x] **Copy on Select** -- Mouse selection auto-copies to clipboard on release.
-- [ ] **Tab Reordering by Drag** -- Drag-to-reorder + drag-to-detach.
+- [x] **Tab Reordering by Drag** -- Drag-to-reorder tabs.
 - [ ] **Quake-Mode / Drop-Down Terminal** -- Global hotkey toggles a top-anchored sliding window.
 - [ ] **Shell Integration (Command Markers)** -- Mark command boundaries in scrollback, jump between them.
 - [x] **Click-to-Cursor Prompt Positioning** -- Click in prompt area to move cursor.
@@ -359,8 +369,8 @@ Features under consideration for upcoming releases:
 
 ### Modern Integrations
 - [ ] **AI Command Suggestions (opt-in)** -- Local-only: pipe last failed command to a small LLM for fix suggestion.
-- [ ] **Inline Git Status in Topbar** -- Render current tab's repo branch + dirty status.
-- [ ] **Built-in SSH Manager** -- `Ctrl+Shift+S` -> "Connect to..." picker.
+- [x] **Inline Git Status in Bottombar** -- Always-visible bottom bar showing branch, dirty counts, and last commit summary.
+- [x] **Built-in SSH Manager** -- `Ctrl+Shift+O` opens a fuzzy-search picker over `~/.ssh/config` hosts.
 - [ ] **Remote / `fasty://` URL Scheme** -- Register protocol for browser-to-terminal links.
 - [ ] **Cloud Config Sync** -- Optional encrypted sync of `fasty.toml`.
 - [x] **Background Auto-Updater** -- Non-blocking update check + one-click install from topbar.
@@ -379,7 +389,7 @@ Features under consideration for upcoming releases:
 - [x] **First-Frame Render Before Show on Dialogs (v0.2.5)** -- Eliminates white backbuffer flash.
 - [ ] **Scrollback-to-Disk** -- Spill to memory-mapped file beyond 3000 lines.
 - [ ] **GPU-Accelerated Search** -- In-scrollback search as compute shader.
-- [ ] **Crash Reporting & Auto-Restart** -- Opt-in crash dump + automatic restart on panic.
+- [x] **Crash Reporting & Auto-Restart** -- Panic hook writes timestamped crash dump with backtrace to `~/.config/fasty/crashes/` and auto-restarts the terminal.
 - [ ] **Wide-Gamut (P3) and HDR Output** -- Detect HDR displays, emit 10-bit color.
 
 ### Platform & Packaging

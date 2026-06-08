@@ -129,6 +129,7 @@ pub struct Atlas {
     pub icon_text_font: Option<AtlasEntry>,
     pub icon_less: Option<AtlasEntry>,
     pub icon_maximize: Option<AtlasEntry>,
+    pub icon_branch: Option<AtlasEntry>,
 }
 
 struct CachedIcon {
@@ -147,6 +148,7 @@ struct CachedIcons {
     icon_text_font: CachedIcon,
     icon_less: CachedIcon,
     icon_maximize: CachedIcon,
+    icon_branch: CachedIcon,
 }
 
 fn get_cached_icons() -> &'static CachedIcons {
@@ -193,6 +195,7 @@ fn get_cached_icons() -> &'static CachedIcons {
             icon_text_font: render_svg(include_str!("../../assets/icons/text-font.svg"), 64),
             icon_less: render_svg(include_str!("../../assets/icons/less.svg"), 64),
             icon_maximize: render_svg(include_str!("../../assets/icons/maximize.svg"), 64),
+            icon_branch: render_svg(include_str!("../../assets/icons/branch.svg"), 64),
         }
     })
 }
@@ -337,6 +340,7 @@ impl Atlas {
             icon_text_font: None,
             icon_less: None,
             icon_maximize: None,
+            icon_branch: None,
         };
 
         atlas.rasterize_basic_glyphs(device, queue)?;
@@ -373,6 +377,9 @@ impl Atlas {
         }
         if let Ok(entry) = atlas.load_raw_rgba_image(&cached.icon_maximize.rgba, cached.icon_maximize.width, cached.icon_maximize.height, false, queue) {
             atlas.icon_maximize = Some(entry);
+        }
+        if let Ok(entry) = atlas.load_raw_rgba_image(&cached.icon_branch.rgba, cached.icon_branch.width, cached.icon_branch.height, false, queue) {
+            atlas.icon_branch = Some(entry);
         }
 
         tracing::info!(

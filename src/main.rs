@@ -4,11 +4,14 @@
 )]
 
 mod config;
+mod crash;
 mod event_listener;
+mod git;
 mod keybindings;
 mod pty;
 mod renderer;
 mod session;
+mod ssh;
 mod terminal_state;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,7 +82,12 @@ struct Tab {
     search_visible: bool,
     search_current_idx: usize,
     custom_name: Option<String>,
+    git_status: Option<GitStatus>,
+    git_status_check_at: std::time::Instant,
 }
+
+/// Cached git status for a single tab. Populated by a background thread.
+use git::GitStatus;
 
 fn create_new_tab(
     executable: &str,
@@ -127,11 +135,17 @@ fn create_new_tab(
         search_visible: false,
         search_current_idx: 0,
         custom_name: None,
+        git_status: None,
+        git_status_check_at: std::time::Instant::now(),
     })
 }
 
 fn get_padding_top(_tab_count: usize) -> f32 {
     48.0
+}
+
+fn get_padding_bottom() -> f32 {
+    10.0 + 20.0 // PADDING_BOTTOM + BOTTOMBAR_HEIGHT
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +216,25 @@ fn compute_palette_filtered(commands: &[(&'static str, CommandAction)], query: &
     filter_palette(commands, query).into_iter().map(|i| commands[i].0.to_string()).collect()
 }
 
+fn filter_ssh_hosts(hosts: &[ssh::SshHost], query: &str) -> Vec<usize> {
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        return (0..hosts.len()).collect();
+    }
+    hosts.iter().enumerate()
+        .filter(|(_, h)| {
+            h.name.to_lowercase().contains(&q)
+                || h.hostname.to_lowercase().contains(&q)
+                || h.user.to_lowercase().contains(&q)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn compute_ssh_filtered(hosts: &[ssh::SshHost], query: &str) -> Vec<String> {
+    filter_ssh_hosts(hosts, query).into_iter().map(|i| hosts[i].display()).collect()
+}
+
 fn compute_drop_target(
     mouse_x: f64,
     tab_start_x: f64,
@@ -236,12 +269,12 @@ fn resize_all_tabs(
     cell_height: f32,
 ) -> (usize, usize) {
     const PADDING_LEFT: f32 = 10.0;
-    const PADDING_BOTTOM: f32 = 10.0;
     let padding_top = get_padding_top(tabs.len());
+    let padding_bottom = get_padding_bottom();
     let cell_w = cell_width.max(1.0);
     let cell_h = cell_height.max(1.0);
     let cols = (((width as f32 - PADDING_LEFT * 2.0) / cell_w).floor().max(1.0)) as usize;
-    let rows = (((height as f32 - (padding_top + PADDING_BOTTOM)) / cell_h).floor().max(1.0)) as usize;
+    let rows = (((height as f32 - (padding_top + padding_bottom)) / cell_h).floor().max(1.0)) as usize;
 
     for tab in tabs {
         tab.terminal_state.lock().resize(cols, rows);
@@ -283,6 +316,169 @@ fn get_last_path_component(path_str: &str) -> String {
 
 fn get_current_version() -> String {
     format!("v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Detect git status for the given working directory.
+/// Runs `git status --porcelain=v2 --branch` and parses the output.
+/// Returns None if the directory is not inside a git repo or git is missing.
+#[cfg(not(target_os = "windows"))]
+fn detect_git_status(cwd: &std::path::Path) -> Option<GitStatus> {
+    use std::process::Command;
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["status", "--porcelain=v2", "--branch"])
+        .env("LC_ALL", "C")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut branch = String::new();
+    let mut modified = 0usize;
+    let mut staged = 0usize;
+    let mut untracked = 0usize;
+    let mut ahead = 0usize;
+    let mut behind = 0usize;
+
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("# branch.head ") {
+            branch = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
+            // Format: "+<ahead> -<behind>"
+            for part in rest.split(' ') {
+                if let Some(n) = part.strip_prefix('+') {
+                    ahead = n.parse().unwrap_or(0);
+                } else if let Some(n) = part.strip_prefix('-') {
+                    behind = n.parse().unwrap_or(0);
+                }
+            }
+        } else if line.starts_with("1 ") || line.starts_with("2 ") {
+            // Changed entry (1 unstaged, 2 staged+unstaged)
+            let cols: Vec<&str> = line.split(' ').collect();
+            if cols.len() >= 2 {
+                let xy = cols[1];
+                if xy.len() >= 2 {
+                    let x = xy.as_bytes()[0] as char;
+                    let y = xy.as_bytes()[1] as char;
+                    if x != '.' {
+                        modified += 1;
+                    }
+                    if y != '.' {
+                        staged += 1;
+                    }
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("? ") {
+            if !rest.is_empty() {
+                untracked += 1;
+            }
+        }
+    }
+
+    if branch.is_empty() {
+        return None;
+    }
+
+    // Get last commit summary
+    let last_commit_summary = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["log", "-1", "--format=%h %s"])
+        .env("LC_ALL", "C")
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    Some(GitStatus {
+        branch,
+        modified,
+        staged,
+        untracked,
+        ahead,
+        behind,
+        last_commit_summary,
+        checked_at: std::time::Instant::now(),
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn detect_git_status(cwd: &std::path::Path) -> Option<GitStatus> {
+    use std::process::Command;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(cwd)
+        .args(["status", "--porcelain=v2", "--branch"])
+        .env("LC_ALL", "C");
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x08000000);
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut branch = String::new();
+    let mut modified = 0usize;
+    let mut staged = 0usize;
+    let mut untracked = 0usize;
+    let mut ahead = 0usize;
+    let mut behind = 0usize;
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("# branch.head ") {
+            branch = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
+            for part in rest.split(' ') {
+                if let Some(n) = part.strip_prefix('+') {
+                    ahead = n.parse().unwrap_or(0);
+                } else if let Some(n) = part.strip_prefix('-') {
+                    behind = n.parse().unwrap_or(0);
+                }
+            }
+        } else if line.starts_with("1 ") || line.starts_with("2 ") {
+            let cols: Vec<&str> = line.split(' ').collect();
+            if cols.len() >= 2 {
+                let xy = cols[1];
+                if xy.len() >= 2 {
+                    let x = xy.as_bytes()[0] as char;
+                    let y = xy.as_bytes()[1] as char;
+                    if x != '.' { modified += 1; }
+                    if y != '.' { staged += 1; }
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("? ") {
+            if !rest.is_empty() {
+                untracked += 1;
+            }
+        }
+    }
+    if branch.is_empty() { return None; }
+
+    let last_commit_summary = {
+        let mut cmd2 = Command::new("git");
+        cmd2.arg("-C").arg(cwd).args(["log", "-1", "--format=%h %s"]).env("LC_ALL", "C");
+        use std::os::windows::process::CommandExt;
+        cmd2.creation_flags(0x08000000);
+        cmd2.output()
+            .ok()
+            .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { None })
+            .unwrap_or_default()
+    };
+
+    Some(GitStatus {
+        branch, modified, staged, untracked, ahead, behind, last_commit_summary,
+        checked_at: std::time::Instant::now(),
+    })
 }
 
 
@@ -341,12 +537,11 @@ fn main() -> anyhow::Result<()> {
     let app_version = get_current_version();
     std::env::set_var("TERM_PROGRAM_VERSION", app_version.trim_start_matches('v'));
 
-    #[cfg(debug_assertions)]
-    {
-        tracing_subscriber::fmt()
-            .with_env_filter("warn,fasty=info")
-            .init();
-    }
+    crash::install_hook();
+
+    tracing_subscriber::fmt()
+        .with_env_filter("warn,fasty=info")
+        .init();
 
     let mut config = Config::load().unwrap_or_else(|e| {
         tracing::warn!("config: startup load failed, using defaults: {e}");
@@ -435,11 +630,10 @@ fn main() -> anyhow::Result<()> {
 
     let viewport_width = renderer.config.width as f32;
     const PADDING_LEFT: f32 = 10.0;
-    const PADDING_BOTTOM: f32 = 10.0;
 
     let viewport_height = renderer.config.height as f32;
     let mut shell_cols = ((viewport_width - PADDING_LEFT * 2.0) / cell_width).floor().max(1.0) as usize;
-    let mut shell_rows = ((viewport_height - (get_padding_top(1) + PADDING_BOTTOM)) / cell_height).floor().max(1.0) as usize;
+    let mut shell_rows = ((viewport_height - (get_padding_top(1) + get_padding_bottom())) / cell_height).floor().max(1.0) as usize;
     let proxy = event_loop.create_proxy();
     {
         let watcher_proxy = proxy.clone();
@@ -515,6 +709,12 @@ fn main() -> anyhow::Result<()> {
     let mut command_palette_selected: usize = 0;
     let mut command_palette_scroll: usize = 0;
     let palette_commands: Vec<(&'static str, CommandAction)> = build_palette_commands();
+
+    let mut ssh_hosts: Vec<ssh::SshHost> = ssh::parse_ssh_config();
+    let mut ssh_picker_visible = false;
+    let mut ssh_picker_query: String = String::new();
+    let mut ssh_picker_selected: usize = 0;
+
     let start_time = std::time::Instant::now();
     let mut clipboard: Option<arboard::Clipboard> = None;
     let mut context_menu_visible = false;
@@ -580,6 +780,13 @@ fn main() -> anyhow::Result<()> {
     let mut system_fonts = Vec::<String>::new();
     let mut s_mouse_x = 0.0f64;
     let mut s_mouse_y = 0.0f64;
+
+    // Visual settings picker state — when true, an extra row of theme preview
+    // cards is drawn below the existing controls in the settings dialog.
+    let mut settings_visual_picker: bool = false;
+    let mut s_hover_visual_toggle: bool = false;
+    let mut settings_hovered_card_idx: Option<usize> = None;
+    let mut settings_card_scroll_y: f32 = 0.0;
 
     // Secondary about window state
     let mut about_window: Option<Arc<winit::window::Window>> = None;
@@ -894,6 +1101,11 @@ fn main() -> anyhow::Result<()> {
                             } else {
                                 Vec::new()
                             };
+                            let ssh_filtered: Vec<String> = if ssh_picker_visible {
+                                compute_ssh_filtered(&ssh_hosts, &ssh_picker_query)
+                            } else {
+                                Vec::new()
+                            };
 
                             r.render(
                                 next_render_reason,
@@ -945,6 +1157,11 @@ fn main() -> anyhow::Result<()> {
                                 renaming_tab,
                                 &rename_buffer,
                                 rename_cursor,
+                                active_tab.git_status.as_ref(),
+                                ssh_picker_visible,
+                                &ssh_picker_query,
+                                ssh_picker_selected,
+                                &ssh_filtered,
                             );
                             drop(r);
 
@@ -1178,8 +1395,7 @@ fn main() -> anyhow::Result<()> {
                                                     let padding_top = get_padding_top(new_tab_count);
                                                     let physical_size = window_for_redraw.inner_size();
                                                     let new_cols = (((physical_size.width as f32 - PADDING_LEFT * 2.0) / cell_width).floor().max(1.0)) as usize;
-                                                    let new_rows = (((physical_size.height as f32 - (padding_top + PADDING_BOTTOM)) / cell_height).floor().max(1.0)) as usize;
-                                                    if let Ok(new_tab) = create_new_tab(
+                                                    let new_rows = (((physical_size.height as f32 - (padding_top + get_padding_bottom())) / cell_height).floor().max(1.0)) as usize;                                                    if let Ok(new_tab) = create_new_tab(
                                                         &shell, &[], None, config.scrollback, config.font.clone(),
                                                         cell_width, cell_height, new_cols, new_rows, proxy.clone(),
                                                     ) {
@@ -1414,6 +1630,82 @@ fn main() -> anyhow::Result<()> {
                                 return;
                             }
 
+                            if ssh_picker_visible {
+                                use winit::keyboard::NamedKey;
+                                match &event.logical_key {
+                                    Key::Named(NamedKey::Escape) => {
+                                        ssh_picker_visible = false;
+                                        ssh_picker_query.clear();
+                                        ssh_picker_selected = 0;
+                                    }
+                                    Key::Named(NamedKey::Enter) => {
+                                        let filtered = filter_ssh_hosts(&ssh_hosts, &ssh_picker_query);
+                                        if let Some(&idx) = filtered.get(ssh_picker_selected) {
+                                            let host = &ssh_hosts[idx];
+                                            let args = host.ssh_args();
+                                            let new_tab_count = tabs.len() + 1;
+                                            let padding_top = get_padding_top(new_tab_count);
+                                            let physical_size = window_for_redraw.inner_size();
+                                            let new_cols = (((physical_size.width as f32 - PADDING_LEFT * 2.0) / cell_width).floor().max(1.0)) as usize;
+                                            let new_rows = (((physical_size.height as f32 - (padding_top + get_padding_bottom())) / cell_height).floor().max(1.0)) as usize;
+                                            if let Ok(new_tab) = create_new_tab(
+                                                "ssh", &args, None, config.scrollback, config.font.clone(),
+                                                cell_width, cell_height, new_cols, new_rows, proxy.clone(),
+                                            ) {
+                                                tabs.push(new_tab);
+                                                active_tab_index = tabs.len() - 1;
+                                                let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                                                shell_cols = cols;
+                                                shell_rows = rows;
+                                                let mut r = renderer.lock();
+                                                r.set_dirty(true);
+                                                r.grid_dirty = true;
+                                                app_dirty = true;
+                                            }
+                                        }
+                                        ssh_picker_visible = false;
+                                        ssh_picker_query.clear();
+                                        ssh_picker_selected = 0;
+                                    }
+                                    Key::Named(NamedKey::Backspace) => {
+                                        ssh_picker_query.pop();
+                                        ssh_picker_selected = 0;
+                                    }
+                                    Key::Named(NamedKey::ArrowUp) => {
+                                        let f = filter_ssh_hosts(&ssh_hosts, &ssh_picker_query);
+                                        if !f.is_empty() {
+                                            ssh_picker_selected = ssh_picker_selected.saturating_sub(1);
+                                            app_dirty = true;
+                                        }
+                                    }
+                                    Key::Named(NamedKey::ArrowDown) => {
+                                        let filtered = filter_ssh_hosts(&ssh_hosts, &ssh_picker_query);
+                                        if ssh_picker_selected + 1 < filtered.len() {
+                                            ssh_picker_selected += 1;
+                                        }
+                                    }
+                                    Key::Named(NamedKey::Space) => {
+                                        if !ctrl_active && !alt_active {
+                                            ssh_picker_query.push(' ');
+                                            ssh_picker_selected = 0;
+                                        }
+                                    }
+                                    Key::Character(s) => {
+                                        if !ctrl_active && !alt_active {
+                                            ssh_picker_query.push_str(s);
+                                            ssh_picker_selected = 0;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                let mut r = renderer.lock();
+                                r.set_dirty(true);
+                                r.grid_dirty = true;
+                                app_dirty = true;
+                                window_for_redraw.request_redraw();
+                                return;
+                            }
+
                             if let Some(combo) = keybindings::combo_from_event(&event, ctrl_active, shift_active, alt_active) {
                                 if let Some(action) = keybindings::RESOLVER.get_or_init(|| parking_lot::RwLock::new(keybindings::KeyBindingResolver::with_defaults())).read().resolve(&combo) {
                                     match action {
@@ -1422,7 +1714,7 @@ fn main() -> anyhow::Result<()> {
                                             let padding_top = get_padding_top(new_tab_count);
                                             let physical_size = window_for_redraw.inner_size();
                                             let new_cols = (((physical_size.width as f32 - PADDING_LEFT * 2.0) / cell_width).floor().max(1.0)) as usize;
-                                            let new_rows = (((physical_size.height as f32 - (padding_top + PADDING_BOTTOM)) / cell_height).floor().max(1.0)) as usize;
+                                             let new_rows = (((physical_size.height as f32 - (padding_top + get_padding_bottom())) / cell_height).floor().max(1.0)) as usize;
                                             match create_new_tab(
                                                 &shell, &[], None, config.scrollback, config.font.clone(),
                                                 cell_width, cell_height, new_cols, new_rows, proxy.clone(),
@@ -1585,6 +1877,10 @@ fn main() -> anyhow::Result<()> {
                                                                         &themes_list,
                                                                         None,
                                                                         0.0,
+                                                                        settings_visual_picker,
+                                                                        s_hover_visual_toggle,
+                                                                        settings_hovered_card_idx,
+                                                                        settings_card_scroll_y,
                                                                     );
                                                                     settings_window_arc.set_visible(true);
                                                                 }
@@ -1728,6 +2024,18 @@ fn main() -> anyhow::Result<()> {
                                             command_palette_query.clear();
                                             command_palette_selected = 0;
                                             command_palette_scroll = 0;
+                                            let mut r = renderer.lock();
+                                            r.set_dirty(true);
+                                            app_dirty = true;
+                                            return;
+                                        }
+                                        keybindings::Action::SshManager => {
+                                            ssh_picker_visible = !ssh_picker_visible;
+                                            ssh_picker_query.clear();
+                                            ssh_picker_selected = 0;
+                                            if ssh_picker_visible {
+                                                ssh_hosts = ssh::parse_ssh_config();
+                                            }
                                             let mut r = renderer.lock();
                                             r.set_dirty(true);
                                             app_dirty = true;
@@ -1984,7 +2292,7 @@ fn main() -> anyhow::Result<()> {
                                                         let padding_top = get_padding_top(new_tab_count);
                                                         let physical_size = window_for_redraw.inner_size();
                                                         let new_cols = (((physical_size.width as f32 - PADDING_LEFT * 2.0) / cell_width).floor().max(1.0)) as usize;
-                                                        let new_rows = (((physical_size.height as f32 - (padding_top + PADDING_BOTTOM)) / cell_height).floor().max(1.0)) as usize;
+                                            let new_rows = (((physical_size.height as f32 - (padding_top + get_padding_bottom())) / cell_height).floor().max(1.0)) as usize;
                                                         
                                                         match create_new_tab(
                                                             &shell,
@@ -2216,6 +2524,10 @@ fn main() -> anyhow::Result<()> {
                                                                            &themes_list,
                                                                            None,
                                                                            0.0,
+                                                                           settings_visual_picker,
+                                                                           s_hover_visual_toggle,
+                                                                           settings_hovered_card_idx,
+                                                                           settings_card_scroll_y,
                                                                        );
                                                                        settings_window_arc.set_visible(true);
                                                                    }
@@ -2300,7 +2612,7 @@ fn main() -> anyhow::Result<()> {
                                              let padding_top = get_padding_top(new_tab_count);
                                              let physical_size = window_for_redraw.inner_size();
                                              let new_cols = (((physical_size.width as f32 - PADDING_LEFT * 2.0) / cell_width).floor().max(1.0)) as usize;
-                                             let new_rows = (((physical_size.height as f32 - (padding_top + PADDING_BOTTOM)) / cell_height).floor().max(1.0)) as usize;
+                                                        let new_rows = (((physical_size.height as f32 - (padding_top + get_padding_bottom())) / cell_height).floor().max(1.0)) as usize;
                                              
                                              match create_new_tab(
                                                  &shell,
@@ -3189,6 +3501,10 @@ fn main() -> anyhow::Result<()> {
                                         &themes_list,
                                         settings_hovered_theme_idx,
                                         settings_theme_scroll_y,
+                                        settings_visual_picker,
+                                        s_hover_visual_toggle,
+                                        settings_hovered_card_idx,
+                                        settings_card_scroll_y,
                                     );
                                 }
                                 #[cfg(target_os = "windows")]
@@ -3211,6 +3527,8 @@ fn main() -> anyhow::Result<()> {
                                 let old_hover_open_config = s_hover_open_config;
                                 let old_hovered_font_idx = settings_hovered_font_idx;
                                 let old_hovered_theme_idx = settings_hovered_theme_idx;
+                                let old_s_hover_visual_toggle = s_hover_visual_toggle;
+                                let old_settings_hovered_card_idx = settings_hovered_card_idx;
 
                                 let sw_width = sw.inner_size().width as f64 / scale_factor;
                                 s_hover_close = s_mouse_y >= 4.0 && s_mouse_y <= 32.0 && s_mouse_x >= (sw_width - 32.0) && s_mouse_x < (sw_width - 4.0);
@@ -3225,6 +3543,37 @@ fn main() -> anyhow::Result<()> {
                                 s_hover_theme = s_mouse_y >= 172.0 && s_mouse_y <= 198.0 && s_mouse_x >= 140.0 && s_mouse_x < 380.0;
 
                                 s_hover_open_config = s_mouse_y >= 212.0 && s_mouse_y <= 238.0 && s_mouse_x >= 140.0 && s_mouse_x < 380.0;
+
+                                // Visual toggle button (topbar): x=[80, 136], y=[6, 30]
+                                s_hover_visual_toggle = s_mouse_y >= 6.0 && s_mouse_y <= 30.0 && s_mouse_x >= 80.0 && s_mouse_x < 136.0;
+
+                                // Visual picker theme cards (when active)
+                                let mut hovered_card_idx: Option<usize> = None;
+                                if settings_visual_picker {
+                                    let card_w = 170.0f64;
+                                    let card_h = 58.0f64;
+                                    let gap = 8.0f64;
+                                    let grid_x = 20.0f64;
+                                    let grid_y = 256.0f64;
+                                    let cols = 2;
+                                    if s_mouse_x >= grid_x && s_mouse_y >= grid_y {
+                                        let col = ((s_mouse_x - grid_x) / (card_w + gap)) as i32;
+                                        let row = ((s_mouse_y - grid_y + settings_card_scroll_y as f64) / (card_h + gap)) as i32;
+                                        if col >= 0 && col < cols {
+                                            let idx = (row * cols + col) as usize;
+                                            if idx < themes_list.len() {
+                                                let card_x = grid_x + col as f64 * (card_w + gap);
+                                                let card_y = grid_y + row as f64 * (card_h + gap) - settings_card_scroll_y as f64;
+                                                if s_mouse_x >= card_x && s_mouse_x < card_x + card_w
+                                                    && s_mouse_y >= card_y && s_mouse_y < card_y + card_h
+                                                {
+                                                    hovered_card_idx = Some(idx);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                settings_hovered_card_idx = hovered_card_idx;
 
                                 let mut hovered_font_idx = None;
                                 if settings_active_field == 1 && s_mouse_x >= 140.0 && s_mouse_x < 380.0 && s_mouse_y >= 78.0 && s_mouse_y < 258.0 {
@@ -3244,6 +3593,9 @@ fn main() -> anyhow::Result<()> {
                                 }
                                 settings_hovered_theme_idx = hovered_theme_idx;
 
+                                let old_s_hover_visual_toggle = s_hover_visual_toggle;
+                                let old_settings_hovered_card_idx = settings_hovered_card_idx;
+
                                 let any_changed = s_hover_close != old_hover_close
                                     || s_hover_family != old_hover_family
                                     || s_hover_size_minus != old_hover_size_minus
@@ -3253,7 +3605,9 @@ fn main() -> anyhow::Result<()> {
                                     || s_hover_theme != old_hover_theme
                                     || s_hover_open_config != old_hover_open_config
                                     || settings_hovered_font_idx != old_hovered_font_idx
-                                    || settings_hovered_theme_idx != old_hovered_theme_idx;
+                                    || settings_hovered_theme_idx != old_hovered_theme_idx
+                                    || s_hover_visual_toggle != old_s_hover_visual_toggle
+                                    || settings_hovered_card_idx != old_settings_hovered_card_idx;
 
                                 if any_changed {
                                     if let Some(ref mut r) = settings_renderer {
@@ -3270,6 +3624,19 @@ fn main() -> anyhow::Result<()> {
                                         app_dirty = true;
                                     } else if s_mouse_y <= 36.0 {
                                         let _ = sw.drag_window();
+                                    } else if s_hover_visual_toggle {
+                                        // Toggle the visual picker; resize the dialog window accordingly
+                                        settings_visual_picker = !settings_visual_picker;
+                                        settings_active_field = 0;
+                                        let target_h = if settings_visual_picker { 460.0 } else { 260.0 };
+                                        let _ = sw.request_inner_size(winit::dpi::LogicalSize::new(400.0, target_h));
+                                    } else if settings_visual_picker && settings_hovered_card_idx.is_some() {
+                                        if let Some(idx) = settings_hovered_card_idx {
+                                            if idx < themes_list.len() {
+                                                settings_theme = themes_list[idx].clone();
+                                                apply_settings!();
+                                            }
+                                        }
                                     } else if s_hover_family {
                                         if system_fonts.is_empty() {
                                             system_fonts = get_system_fonts();
@@ -3398,6 +3765,8 @@ fn main() -> anyhow::Result<()> {
                                 s_hover_scroll_plus = false;
                                 s_hover_theme = false;
                                 s_hover_open_config = false;
+                                s_hover_visual_toggle = false;
+                                settings_hovered_card_idx = None;
                                 if let Some(ref mut r) = settings_renderer {
                                     r.set_dirty(true);
                                 }
@@ -3413,6 +3782,8 @@ fn main() -> anyhow::Result<()> {
                                     s_hover_scroll_plus = false;
                                     s_hover_theme = false;
                                     s_hover_open_config = false;
+                                    s_hover_visual_toggle = false;
+                                    settings_hovered_card_idx = None;
                                     if let Some(ref mut r) = settings_renderer {
                                         r.set_dirty(true);
                                     }
@@ -3493,6 +3864,27 @@ fn main() -> anyhow::Result<()> {
             }
             winit::event::Event::AboutToWait => {
                 let now = std::time::Instant::now();
+
+                // Poll git status for each tab (throttled to once every 3s per tab).
+                // Only the active tab is polled in real-time; other tabs are checked
+                // at a slower cadence to keep the UI responsive.
+                for (idx, tab) in tabs.iter_mut().enumerate() {
+                    let throttle_ms: u128 = if idx == active_tab_index { 1500 } else { 10000 };
+                    if now.duration_since(tab.git_status_check_at).as_millis() < throttle_ms {
+                        continue;
+                    }
+                    tab.git_status_check_at = now;
+                    let cwd = tab.terminal_state.lock().shell_pid()
+                        .and_then(|pid| std::fs::read_link(format!("/proc/{}/cwd", pid)).ok())
+                        .or_else(|| tab.cwd.clone());
+                    if let Some(dir) = cwd {
+                        tab.git_status = detect_git_status(&dir);
+                    }
+                    if idx == active_tab_index {
+                        app_dirty = true;
+                    }
+                }
+
                 if !first_frame_rendered {
                     first_frame_rendered = true;
                     // Force render the first frame directly to commit the Wayland buffer and map the window!
@@ -3531,6 +3923,12 @@ fn main() -> anyhow::Result<()> {
 
                     let palette_filtered: Vec<String> = if command_palette_visible {
                         compute_palette_filtered(&palette_commands, &command_palette_query)
+                    } else {
+                        Vec::new()
+                    };
+
+                    let ssh_filtered: Vec<String> = if ssh_picker_visible {
+                        compute_ssh_filtered(&ssh_hosts, &ssh_picker_query)
                     } else {
                         Vec::new()
                     };
@@ -3608,6 +4006,11 @@ fn main() -> anyhow::Result<()> {
                         renaming_tab,
                         &rename_buffer,
                         rename_cursor,
+                        active_tab.git_status.as_ref(),
+                        ssh_picker_visible,
+                        &ssh_picker_query,
+                        ssh_picker_selected,
+                        &ssh_filtered,
                     );
                     drop(r);
                     #[cfg(target_os = "windows")]
