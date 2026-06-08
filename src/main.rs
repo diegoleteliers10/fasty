@@ -2337,13 +2337,93 @@ fn main() -> anyhow::Result<()> {
                                                         shell_rows = rows;
                                                     }
                                                     crate::renderer::ContextMenuItem::Separator => {}
-                                                    crate::renderer::ContextMenuItem::OpenLink => {}
-                                                    crate::renderer::ContextMenuItem::CopyWord => {}
-                                                    crate::renderer::ContextMenuItem::CopyLine => {}
-                                                    crate::renderer::ContextMenuItem::CdHere => {}
-                                                    crate::renderer::ContextMenuItem::OpenInEditor => {}
-                                                    crate::renderer::ContextMenuItem::OpenEmail => {}
-                                                    crate::renderer::ContextMenuItem::CopyHex => {}
+                                                    crate::renderer::ContextMenuItem::OpenLink => {
+                                                        if let Some(selection_classifier::Classification::Url(u)) =
+                                                            context_menu_classification.as_ref()
+                                                        {
+                                                            open_url(u);
+                                                        }
+                                                        context_menu_visible = false;
+                                                    }
+                                                    crate::renderer::ContextMenuItem::CopyWord | crate::renderer::ContextMenuItem::CopyHex => {
+                                                        if let Some(sel) = tabs[active_tab_index].selection {
+                                                            copy_selection_to_clipboard(
+                                                                &tabs[active_tab_index].terminal_state,
+                                                                sel,
+                                                                shell_cols,
+                                                                shell_rows,
+                                                                &mut clipboard,
+                                                            );
+                                                            toast = Some((
+                                                                "\u{2713}  Text copied".to_string(),
+                                                                std::time::Instant::now(),
+                                                                1920,
+                                                            ));
+                                                        }
+                                                        context_menu_visible = false;
+                                                    }
+                                                    crate::renderer::ContextMenuItem::CopyLine => {
+                                                        context_menu_visible = false;
+                                                    }
+                                                    crate::renderer::ContextMenuItem::CdHere => {
+                                                        if let Some(selection_classifier::Classification::Path(p)) =
+                                                            context_menu_classification.as_ref()
+                                                        {
+                                                            let resolved = if p.starts_with('/') || p.starts_with('~') {
+                                                                Some(p.clone())
+                                                            } else if let Some(cwd) = tab_live_cwd(&tabs[active_tab_index]) {
+                                                                Some(cwd.join(p).to_string_lossy().into_owned())
+                                                            } else {
+                                                                None
+                                                            };
+                                                            if let Some(cwd) = resolved {
+                                                                if let Ok(new_tab) = create_new_tab(
+                                                                    &shell,
+                                                                    &[],
+                                                                    Some(&cwd),
+                                                                    config.scrollback,
+                                                                    config.font.clone(),
+                                                                    cell_width,
+                                                                    cell_height,
+                                                                    shell_cols,
+                                                                    shell_rows,
+                                                                    proxy.clone(),
+                                                                ) {
+                                                                    tabs.push(new_tab);
+                                                                    active_tab_index = tabs.len() - 1;
+                                                                }
+                                                            }
+                                                        }
+                                                        context_menu_visible = false;
+                                                    }
+                                                    crate::renderer::ContextMenuItem::OpenInEditor => {
+                                                        if let Some(selection_classifier::Classification::Path(p)) =
+                                                            context_menu_classification.as_ref()
+                                                        {
+                                                            let resolved = if p.starts_with('/') || p.starts_with('~') {
+                                                                p.clone()
+                                                            } else if let Some(cwd) = tab_live_cwd(&tabs[active_tab_index]) {
+                                                                cwd.join(p).to_string_lossy().into_owned()
+                                                            } else {
+                                                                p.clone()
+                                                            };
+                                                            let _ = open_file_in_editor(std::path::Path::new(&resolved));
+                                                        }
+                                                        context_menu_visible = false;
+                                                    }
+                                                    crate::renderer::ContextMenuItem::OpenEmail => {
+                                                        if let Some(selection_classifier::Classification::Email(e)) =
+                                                            context_menu_classification.as_ref()
+                                                        {
+                                                            let target = if e.starts_with("mailto:") {
+                                                                e.clone()
+                                                            } else {
+                                                                format!("mailto:{}", e)
+                                                            };
+                                                            open_url(&target);
+                                                        }
+                                                        context_menu_visible = false;
+                                                    }
                                                 }
                                             }
                                         }
