@@ -21,6 +21,9 @@ Inspired by [Ghostty](https://github.com/ghostty-org/ghostty), Fasty leverages `
 - **Command Palette**: `Ctrl+Shift+P` opens a fuzzy-search palette for quick access to settings, tab actions, themes, and font size controls.
 - **Git Status Bottombar**: Always-visible bottom bar showing branch, modified/staged/untracked counts, ahead/behind, and last commit summary when inside a git repo.
 - **Built-in SSH Manager**: `Ctrl+Shift+O` opens a fuzzy-search picker over `~/.ssh/config` hosts. Connects in a new tab with `StrictHostKeyChecking=accept-new`.
+- **Project Jumper**: `Ctrl+Shift+J` opens a fuzzy-search picker over the working directories of currently open tabs. Select one to spawn a new tab at that path.
+- **Git Worktree Picker**: `Ctrl+Alt+W` (from a git repo) lists `git worktree list` entries with branch and short commit. Filter and `Enter` to open the worktree in a new tab, or type `+branch-name` to create a new worktree inline.
+- **Shell Snippets with Tab Expansion**: Type a short trigger (e.g. `gst`, `gcm`, `cb`, `serve`) and press `Tab` to expand into the full command. Bundled defaults cover git, docker, rust, filesystem, and system workflows. Customise via `~/.config/fasty/snippets.toml` (live-reloaded). VSCode-style placeholders supported (`$1`, `${1:default}`, `$0`). TUI apps (vim, fzf, htop) take precedence — Tab passes through when an alternate screen app is active.
 - **Crash Reporting & Auto-Restart**: On panic, writes a timestamped crash dump with backtrace to `~/.config/fasty/crashes/` and auto-restarts the terminal.
 - **TOML Config + Live Reload**: `fasty.toml` edits re-apply on save — no restart needed. Comments and formatting preserved across Settings-dialog writes via `toml_edit` round-tripping.
 - **Asynchronous Background Updater**: Non-blocking update check on startup with one-click install from the topbar "Update" button. Restarts automatically on success.
@@ -93,8 +96,9 @@ src/
 ├── terminal_state.rs  # PTY controller & alacritty_terminal parser wrapper
 ├── keybindings.rs     # Key combo parser, action resolver, user overrides
 ├── session.rs         # Tab cwd persistence (save/restore)
-├── git.rs             # Background git status polling (branch, dirty, last commit)
+├── git.rs             # Background git status polling (branch, dirty, last commit) + worktree helpers
 ├── ssh.rs             # SSH config parser (~/.ssh/config) for built-in SSH manager
+├── snippets.rs        # User snippet loader + VSCode-style placeholder expansion
 ├── crash.rs           # Panic hook, crash dump writer, auto-restart
 ├── renderer/          # wgpu backend components
 │   ├── mod.rs         # Renderer definitions, render passes
@@ -264,6 +268,8 @@ The `[keybindings]` section maps key combinations to actions. All bindings are o
 | `reload_config` | `ctrl+shift+r` | Reload configuration |
 | `command_palette` | `ctrl+shift+p` | Open command palette |
 | `ssh_manager` | `ctrl+shift+o` | Open SSH host picker |
+| `project_jumper` | `ctrl+shift+j` | Open project jumper (jump to an open tab's cwd) |
+| `worktree_picker` | `ctrl+alt+w` | Open git worktree picker |
 | `increase_font_size` | `ctrl+equal` / `ctrl+plus` | Increase font size |
 | `decrease_font_size` | `ctrl+minus` | Decrease font size |
 | `reset_font_size` | `ctrl+0` | Reset font size |
@@ -312,6 +318,33 @@ Drop a `.json` file into `~/.config/fasty/themes/` (filename minus `.json` becom
 }
 ```
 
+### Snippets
+
+Type a short trigger at the prompt and press `Tab` to expand into a full command. Defaults are bundled (git, docker, rust, filesystem, system); overrides live in `~/.config/fasty/snippets.toml` and are live-reloaded on save.
+
+Syntax (VSCode-style):
+- `$0` — final cursor position (only one per snippet)
+- `$1`, `$2`, ... — placeholder markers
+- `${1:default}` — placeholder with default text
+
+```toml
+[snippet]
+
+# Git
+"gst" = "git status"
+"gcm" = "git commit -m \"${1:message}\""
+
+# Filesystem
+"ll"  = "ls -lah"
+".."  = "cd .."
+
+# System
+"myip" = "curl -s ifconfig.me; echo"
+"serve" = "python3 -m http.server "
+```
+
+Expansion is disabled while a TUI app (alternate screen) has focus — `Tab` passes through to vim, fzf, htop, etc.
+
 ---
 
 ## Keyboard Shortcuts
@@ -322,6 +355,9 @@ Drop a `.json` file into `~/.config/fasty/themes/` (filename minus `.json` becom
 | `Ctrl + Shift + W` | Close current tab |
 | `Ctrl + Shift + P` | Open command palette |
 | `Ctrl + Shift + O` | Open SSH host picker |
+| `Ctrl + Shift + J` | Open project jumper (jump to an open tab's cwd) |
+| `Ctrl + Alt + W` | Open git worktree picker (from a git repo) |
+| `Tab` (at prompt) | Expand a snippet trigger (e.g. `gst` → `git status`) |
 | `Ctrl + Shift + L` | Snap scroll to bottom |
 | `Ctrl + C` / `Ctrl + Shift + C` | Copy selection |
 | `Ctrl + V` / `Ctrl + Shift + V` | Paste clipboard |
@@ -351,6 +387,9 @@ Features under consideration for upcoming releases:
 ### Productivity & Workflow
 - [x] **In-Scrollback Search** -- `Ctrl+Shift+F` opens a search bar highlighting matches in live + scrollback buffer.
 - [x] **Command Palette** -- `Ctrl+Shift+P` opens a fuzzy-search palette over settings, tab actions, themes.
+- [x] **Project Jumper** -- `Ctrl+Shift+J` fuzzy-pick from open tab cwds to spawn a new tab there.
+- [x] **Git Worktree Picker** -- `Ctrl+Alt+W` lists worktrees (path, branch, short commit); `+branch` creates a new worktree inline.
+- [x] **Shell Snippets (Tab Expansion)** -- Bundled defaults + `~/.config/fasty/snippets.toml` user overrides; live reload; TUI-safe.
 - [x] **Session Restore** -- Persist open tab working directories on shutdown; restore on next launch.
 - [ ] **Split Panes** -- Horizontal/vertical splits per tab (like `tmux`/`Zellij`).
 - [x] **Copy on Select** -- Mouse selection auto-copies to clipboard on release.

@@ -333,6 +333,14 @@ impl<'a> Renderer<'a> {
         ssh_picker_query: &str,
         ssh_picker_selected: usize,
         ssh_filtered: &[String],
+        project_jumper_visible: bool,
+        project_jumper_query: &str,
+        project_jumper_selected: usize,
+        project_filtered: &[String],
+        worktree_picker_visible: bool,
+        worktree_picker_query: &str,
+        worktree_picker_selected: usize,
+        worktree_filtered: &[String],
     ) {
         if !self.dirty {
             return;
@@ -439,6 +447,14 @@ impl<'a> Renderer<'a> {
                 ssh_picker_query,
                 ssh_picker_selected,
                 ssh_filtered,
+                project_jumper_visible,
+                project_jumper_query,
+                project_jumper_selected,
+                project_filtered,
+                worktree_picker_visible,
+                worktree_picker_query,
+                worktree_picker_selected,
+                worktree_filtered,
             );
         }
 

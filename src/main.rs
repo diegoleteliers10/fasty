@@ -12,6 +12,7 @@ mod pty;
 mod renderer;
 mod selection_classifier;
 mod session;
+mod snippets;
 mod ssh;
 mod terminal_state;
 
@@ -300,9 +301,170 @@ fn get_current_dir_shortened(pid: u32) -> Option<String> {
     Some(path_str)
 }
 
+fn shorten_path(path: &std::path::Path) -> String {
+    let path_str = path.to_string_lossy().into_owned();
+    if let Ok(home) = std::env::var("HOME") {
+        if path_str == home {
+            return "~".to_string();
+        }
+        if let Some(stripped) = path_str.strip_prefix(&home) {
+            if stripped.starts_with('/') {
+                return format!("~{}", stripped);
+            }
+        }
+    }
+    path_str
+}
+
+fn basename_of(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn tail_n(path: &std::path::Path, n: usize) -> String {
+    let parts: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if parts.len() <= n {
+        parts.join("/")
+    } else {
+        parts[parts.len() - n..].join("/")
+    }
+}
+
+/// Build a short display label for a path that disambiguates against other
+/// paths in the same list. Starts with the basename; if any other path has
+/// the same tail-N, adds another component. Caps at 3 components.
+fn display_short(path: &std::path::Path, siblings: &[std::path::PathBuf]) -> String {
+    for depth in 1..=3usize {
+        let candidate = tail_n(path, depth);
+        let ambig = siblings.iter().any(|s| s != path && tail_n(s, depth) == candidate);
+        if !ambig {
+            return candidate;
+        }
+    }
+    tail_n(path, 3)
+}
+
+fn collect_unique_project_dirs(tabs: &[Tab]) -> Vec<std::path::PathBuf> {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for t in tabs.iter().rev() {
+        if let Some(p) = tab_live_cwd(t) {
+            let canon = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+            if seen.insert(canon.clone()) {
+                out.push(canon);
+                continue;
+            }
+        }
+        if let Some(p) = t.cwd.as_ref() {
+            let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            if seen.insert(canon.clone()) {
+                out.push(canon);
+            }
+        }
+    }
+    out
+}
+
+fn filter_project_dirs(items: &[std::path::PathBuf], query: &str) -> Vec<usize> {
+    let q = query.to_lowercase();
+    if q.is_empty() {
+        return (0..items.len()).collect();
+    }
+    items.iter().enumerate()
+        .filter(|(_, p)| shorten_path(p).to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn compute_project_filtered(items: &[std::path::PathBuf], query: &str) -> Vec<String> {
+    filter_project_dirs(items, query)
+        .into_iter()
+        .map(|i| display_short(&items[i], items))
+        .collect()
+}
+
+fn filter_worktrees(items: &[git::Worktree], query: &str) -> Vec<usize> {
+    let q = query.strip_prefix('+').unwrap_or(query).to_lowercase();
+    if q.is_empty() {
+        return (0..items.len()).collect();
+    }
+    items.iter().enumerate()
+        .filter(|(_, w)| {
+            shorten_path(&w.path).to_lowercase().contains(&q)
+                || w.short_branch().to_lowercase().contains(&q)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn compute_worktree_filtered(
+    items: &[git::Worktree],
+    query: &str,
+    toplevel: Option<&std::path::Path>,
+) -> Vec<String> {
+    let paths: Vec<std::path::PathBuf> = items.iter().map(|w| w.path.clone()).collect();
+    let mut out: Vec<String> = filter_worktrees(items, query)
+        .into_iter()
+        .map(|i| display_worktree(&items[i], &paths))
+        .collect();
+    let create_branch = query.strip_prefix('+').map(str::trim).unwrap_or("");
+    if query.starts_with('+') && !create_branch.is_empty() {
+        if let Some(t) = toplevel {
+            out.push(proposed_worktree_label(t, create_branch, &paths));
+        }
+    }
+    out
+}
+
+fn display_worktree(w: &git::Worktree, all_paths: &[std::path::PathBuf]) -> String {
+    let label = display_short(&w.path, all_paths);
+    let branch = w.short_branch();
+    format!("{:<32}  {:<24}  {}", label, branch, w.short_commit())
+}
+
+fn proposed_worktree_label(toplevel: &std::path::Path, branch: &str, all_paths: &[std::path::PathBuf]) -> String {
+    let parent = match toplevel.parent() {
+        Some(p) => p,
+        None => return format!("+{}", branch),
+    };
+    let dir_name = toplevel
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "repo".to_string());
+    let new_path = parent.join(format!("{}-{}", dir_name, git::sanitize_branch_for_path(branch)));
+    let label = display_short(&new_path, all_paths);
+    format!("+ create  {:<32}  {:<24}  new", label, branch)
+}
+
 fn tab_live_cwd(tab: &Tab) -> Option<std::path::PathBuf> {
     let pid = tab.terminal_state.lock().shell_pid()?;
     std::fs::read_link(format!("/proc/{}/cwd", pid)).ok()
+}
+
+fn read_prompt_prefix(terminal_state: &Arc<parking_lot::Mutex<TerminalState>>, cols: usize) -> String {
+    let state = terminal_state.lock();
+    let term_guard = state.term().lock();
+    let grid = term_guard.grid();
+    let point = grid.cursor.point;
+    let line_idx = point.line.0;
+    if !(0..grid.screen_lines() as i32).contains(&line_idx) {
+        return String::new();
+    }
+    let row = &grid[alacritty_terminal::index::Line(line_idx)];
+    let end_col = (point.column.0 as usize).min(cols);
+    let mut s = String::with_capacity(end_col);
+    for c in 0..end_col {
+        let ch = row[alacritty_terminal::index::Column(c)].c;
+        if ch == '\0' { continue; }
+        s.push(ch);
+    }
+    s
 }
 
 fn get_last_path_component(path_str: &str) -> String {
@@ -648,6 +810,16 @@ fn main() -> anyhow::Result<()> {
             tracing::warn!("config: file watcher unavailable, live-reload disabled: {e}");
         }
     }
+    snippets::load();
+    {
+        let snippets_proxy = proxy.clone();
+        if let Err(e) = snippets::start_watcher(move || {
+            snippets::load();
+            let _ = snippets_proxy.send_event(AppEvent::ConfigChanged);
+        }) {
+            tracing::warn!("snippets: file watcher unavailable, live-reload disabled: {e}");
+        }
+    }
     let initial_tab = create_new_tab(
         &executable,
         &exec_args,
@@ -720,6 +892,17 @@ fn main() -> anyhow::Result<()> {
     let mut ssh_picker_visible = false;
     let mut ssh_picker_query: String = String::new();
     let mut ssh_picker_selected: usize = 0;
+
+    let mut project_jumper_items: Vec<std::path::PathBuf> = Vec::new();
+    let mut project_jumper_visible = false;
+    let mut project_jumper_query: String = String::new();
+    let mut project_jumper_selected: usize = 0;
+
+    let mut worktree_items: Vec<git::Worktree> = Vec::new();
+    let mut worktree_toplevel: Option<std::path::PathBuf> = None;
+    let mut worktree_picker_visible = false;
+    let mut worktree_picker_query: String = String::new();
+    let mut worktree_picker_selected: usize = 0;
 
     let start_time = std::time::Instant::now();
     let mut clipboard: Option<arboard::Clipboard> = None;
@@ -1115,6 +1298,18 @@ fn main() -> anyhow::Result<()> {
                                 Vec::new()
                             };
 
+                            let project_filtered: Vec<String> = if project_jumper_visible {
+                                compute_project_filtered(&project_jumper_items, &project_jumper_query)
+                            } else {
+                                Vec::new()
+                            };
+
+                            let worktree_filtered: Vec<String> = if worktree_picker_visible {
+                                compute_worktree_filtered(&worktree_items, &worktree_picker_query, worktree_toplevel.as_deref())
+                            } else {
+                                Vec::new()
+                            };
+
                             r.render(
                                 next_render_reason,
                                 term_ref,
@@ -1171,6 +1366,14 @@ fn main() -> anyhow::Result<()> {
                                 &ssh_picker_query,
                                 ssh_picker_selected,
                                 &ssh_filtered,
+                                project_jumper_visible,
+                                &project_jumper_query,
+                                project_jumper_selected,
+                                &project_filtered,
+                                worktree_picker_visible,
+                                &worktree_picker_query,
+                                worktree_picker_selected,
+                                &worktree_filtered,
                             );
                             drop(r);
 
@@ -1715,6 +1918,194 @@ fn main() -> anyhow::Result<()> {
                                 return;
                             }
 
+                            if project_jumper_visible {
+                                use winit::keyboard::NamedKey;
+                                match &event.logical_key {
+                                    Key::Named(NamedKey::Escape) => {
+                                        project_jumper_visible = false;
+                                        project_jumper_query.clear();
+                                        project_jumper_selected = 0;
+                                    }
+                                    Key::Named(NamedKey::Enter) => {
+                                        let filtered = filter_project_dirs(&project_jumper_items, &project_jumper_query);
+                                        if let Some(&idx) = filtered.get(project_jumper_selected) {
+                                            let path = project_jumper_items[idx].clone();
+                                            let path_str = path.to_string_lossy().into_owned();
+                                            let new_tab_count = tabs.len() + 1;
+                                            let padding_top = get_padding_top(new_tab_count);
+                                            let physical_size = window_for_redraw.inner_size();
+                                            let new_cols = (((physical_size.width as f32 - PADDING_LEFT * 2.0) / cell_width).floor().max(1.0)) as usize;
+                                            let new_rows = (((physical_size.height as f32 - (padding_top + get_padding_bottom())) / cell_height).floor().max(1.0)) as usize;
+                                            if let Ok(new_tab) = create_new_tab(
+                                                &shell, &[], Some(&path_str), config.scrollback, config.font.clone(),
+                                                cell_width, cell_height, new_cols, new_rows, proxy.clone(),
+                                            ) {
+                                                tabs.push(new_tab);
+                                                active_tab_index = tabs.len() - 1;
+                                                let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                                                shell_cols = cols;
+                                                shell_rows = rows;
+                                                let mut r = renderer.lock();
+                                                r.set_dirty(true);
+                                                r.grid_dirty = true;
+                                                app_dirty = true;
+                                            }
+                                        }
+                                        project_jumper_visible = false;
+                                        project_jumper_query.clear();
+                                        project_jumper_selected = 0;
+                                    }
+                                    Key::Named(NamedKey::Backspace) => {
+                                        project_jumper_query.pop();
+                                        project_jumper_selected = 0;
+                                    }
+                                    Key::Named(NamedKey::ArrowUp) => {
+                                        let f = filter_project_dirs(&project_jumper_items, &project_jumper_query);
+                                        if !f.is_empty() {
+                                            project_jumper_selected = project_jumper_selected.saturating_sub(1);
+                                            app_dirty = true;
+                                        }
+                                    }
+                                    Key::Named(NamedKey::ArrowDown) => {
+                                        let filtered = filter_project_dirs(&project_jumper_items, &project_jumper_query);
+                                        if project_jumper_selected + 1 < filtered.len() {
+                                            project_jumper_selected += 1;
+                                        }
+                                    }
+                                    Key::Named(NamedKey::Space) => {
+                                        if !ctrl_active && !alt_active {
+                                            project_jumper_query.push(' ');
+                                            project_jumper_selected = 0;
+                                        }
+                                    }
+                                    Key::Character(s) => {
+                                        if !ctrl_active && !alt_active {
+                                            project_jumper_query.push_str(s);
+                                            project_jumper_selected = 0;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                let mut r = renderer.lock();
+                                r.set_dirty(true);
+                                r.grid_dirty = true;
+                                app_dirty = true;
+                                window_for_redraw.request_redraw();
+                                return;
+                            }
+
+                            if worktree_picker_visible {
+                                use winit::keyboard::NamedKey;
+                                match &event.logical_key {
+                                    Key::Named(NamedKey::Escape) => {
+                                        worktree_picker_visible = false;
+                                        worktree_picker_query.clear();
+                                        worktree_picker_selected = 0;
+                                    }
+                                    Key::Named(NamedKey::Enter) => {
+                                        let create_branch = worktree_picker_query.strip_prefix('+').map(str::trim).unwrap_or("");
+                                        let filtered = filter_worktrees(&worktree_items, &worktree_picker_query);
+                                        let total_rows = filtered.len() + if worktree_picker_query.starts_with('+') && !create_branch.is_empty() { 1 } else { 0 };
+                                        let selected = worktree_picker_selected.min(total_rows.saturating_sub(1));
+                                        if selected >= filtered.len() {
+                                            if let Some(ref toplevel) = worktree_toplevel {
+                                                if !create_branch.is_empty() {
+                                                    match git::create_worktree(toplevel, create_branch) {
+                                                        Some(new_path) => {
+                                                            let path_str = new_path.to_string_lossy().into_owned();
+                                                            let new_tab_count = tabs.len() + 1;
+                                                            let padding_top = get_padding_top(new_tab_count);
+                                                            let physical_size = window_for_redraw.inner_size();
+                                                            let new_cols = (((physical_size.width as f32 - PADDING_LEFT * 2.0) / cell_width).floor().max(1.0)) as usize;
+                                                            let new_rows = (((physical_size.height as f32 - (padding_top + get_padding_bottom())) / cell_height).floor().max(1.0)) as usize;
+                                                            if let Ok(new_tab) = create_new_tab(
+                                                                &shell, &[], Some(&path_str), config.scrollback, config.font.clone(),
+                                                                cell_width, cell_height, new_cols, new_rows, proxy.clone(),
+                                                            ) {
+                                                                tabs.push(new_tab);
+                                                                active_tab_index = tabs.len() - 1;
+                                                                let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                                                                shell_cols = cols;
+                                                                shell_rows = rows;
+                                                                worktree_items = git::list_worktrees(&new_path);
+                                                                worktree_toplevel = Some(new_path);
+                                                                let mut r = renderer.lock();
+                                                                r.set_dirty(true);
+                                                                r.grid_dirty = true;
+                                                                app_dirty = true;
+                                                            }
+                                                        }
+                                                        None => {
+                                                            toast = Some((
+                                                                "git worktree add failed".to_string(),
+                                                                std::time::Instant::now(),
+                                                                3000,
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else if let Some(&wt_idx) = filtered.get(selected) {
+                                            if let Some(wt) = worktree_items.get(wt_idx) {
+                                                let path_str = wt.path.to_string_lossy().into_owned();
+                                                let new_tab_count = tabs.len() + 1;
+                                                let padding_top = get_padding_top(new_tab_count);
+                                                let physical_size = window_for_redraw.inner_size();
+                                                let new_cols = (((physical_size.width as f32 - PADDING_LEFT * 2.0) / cell_width).floor().max(1.0)) as usize;
+                                                let new_rows = (((physical_size.height as f32 - (padding_top + get_padding_bottom())) / cell_height).floor().max(1.0)) as usize;
+                                                if let Ok(new_tab) = create_new_tab(
+                                                    &shell, &[], Some(&path_str), config.scrollback, config.font.clone(),
+                                                    cell_width, cell_height, new_cols, new_rows, proxy.clone(),
+                                                ) {
+                                                    tabs.push(new_tab);
+                                                    active_tab_index = tabs.len() - 1;
+                                                    let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                                                    shell_cols = cols;
+                                                    shell_rows = rows;
+                                                    let mut r = renderer.lock();
+                                                    r.set_dirty(true);
+                                                    r.grid_dirty = true;
+                                                    app_dirty = true;
+                                                }
+                                            }
+                                        }
+                                        worktree_picker_visible = false;
+                                        worktree_picker_query.clear();
+                                        worktree_picker_selected = 0;
+                                    }
+                                    Key::Named(NamedKey::Backspace) => {
+                                        worktree_picker_query.pop();
+                                        worktree_picker_selected = 0;
+                                    }
+                                    Key::Named(NamedKey::ArrowUp) => {
+                                        if worktree_picker_selected > 0 {
+                                            worktree_picker_selected -= 1;
+                                            app_dirty = true;
+                                        }
+                                    }
+                                    Key::Named(NamedKey::ArrowDown) => {
+                                        let filtered = filter_worktrees(&worktree_items, &worktree_picker_query);
+                                        let create_extra = if worktree_picker_query.starts_with('+') && !worktree_picker_query.strip_prefix('+').map(str::trim).unwrap_or("").is_empty() { 1 } else { 0 };
+                                        if worktree_picker_selected + 1 < filtered.len() + create_extra {
+                                            worktree_picker_selected += 1;
+                                        }
+                                    }
+                                    Key::Character(s) => {
+                                        if !ctrl_active && !alt_active {
+                                            worktree_picker_query.push_str(s);
+                                            worktree_picker_selected = 0;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                let mut r = renderer.lock();
+                                r.set_dirty(true);
+                                r.grid_dirty = true;
+                                app_dirty = true;
+                                window_for_redraw.request_redraw();
+                                return;
+                            }
+
                             if let Some(combo) = keybindings::combo_from_event(&event, ctrl_active, shift_active, alt_active) {
                                 if let Some(action) = keybindings::RESOLVER.get_or_init(|| parking_lot::RwLock::new(keybindings::KeyBindingResolver::with_defaults())).read().resolve(&combo) {
                                     match action {
@@ -2050,6 +2441,51 @@ fn main() -> anyhow::Result<()> {
                                             app_dirty = true;
                                             return;
                                         }
+                                        keybindings::Action::ProjectJumper => {
+                                            project_jumper_visible = !project_jumper_visible;
+                                            project_jumper_query.clear();
+                                            project_jumper_selected = 0;
+                                            if project_jumper_visible {
+                                                project_jumper_items = collect_unique_project_dirs(&tabs);
+                                            }
+                                            let mut r = renderer.lock();
+                                            r.set_dirty(true);
+                                            app_dirty = true;
+                                            return;
+                                        }
+                                        keybindings::Action::WorktreePicker => {
+                                            let cwd = tab_live_cwd(&tabs[active_tab_index])
+                                                .or_else(|| tabs[active_tab_index].cwd.clone());
+                                            match cwd {
+                                                Some(dir) if git::is_git_repo(&dir) => {
+                                                    worktree_picker_visible = true;
+                                                    worktree_picker_query.clear();
+                                                    worktree_picker_selected = 0;
+                                                    worktree_toplevel = git::git_toplevel(&dir);
+                                                    worktree_items = git::list_worktrees(&dir);
+                                                }
+                                                Some(_) => {
+                                                    worktree_picker_visible = false;
+                                                    toast = Some((
+                                                        "Not a git repository".to_string(),
+                                                        std::time::Instant::now(),
+                                                        2400,
+                                                    ));
+                                                }
+                                                None => {
+                                                    worktree_picker_visible = false;
+                                                    toast = Some((
+                                                        "No active cwd".to_string(),
+                                                        std::time::Instant::now(),
+                                                        2400,
+                                                    ));
+                                                }
+                                            }
+                                            let mut r = renderer.lock();
+                                            r.set_dirty(true);
+                                            app_dirty = true;
+                                            return;
+                                        }
                                     }
                                 }
                             }
@@ -2108,6 +2544,47 @@ fn main() -> anyhow::Result<()> {
                                             tabs[active_tab_index].scroll_target = 0.0;
                                             tabs[active_tab_index].terminal_state.lock().write_to_pty(&[b]);
                                             return;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Snippet expansion: bare Tab (no modifiers, no pickers, no TUI) tries
+                            // to match the longest trigger at the end of the current prompt line.
+                            if let winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) = &event.logical_key {
+                                if !ctrl_active && !shift_active && !alt_active
+                                    && !ssh_picker_visible && !project_jumper_visible && !command_palette_visible
+                                {
+                                    let snippet_mode = {
+                                        let term = tabs[active_tab_index].terminal_state.lock();
+                                        let term_guard = term.term().lock();
+                                        *term_guard.mode()
+                                    };
+                                    let tui_active = snippet_mode.contains(
+                                        alacritty_terminal::term::TermMode::ALT_SCREEN
+                                    ) || snippet_mode.contains(
+                                        alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
+                                    );
+                                    if !tui_active {
+                                        let prefix = read_prompt_prefix(&tabs[active_tab_index].terminal_state, shell_cols);
+                                        if let Some(trigger_len) = snippets::match_trigger(&prefix) {
+                                            let trigger_start = prefix.len() - trigger_len;
+                                            let trigger = &prefix[trigger_start..];
+                                            if let Some(body) = snippets::get_expansion(trigger) {
+                                                let (expanded, _cursor_pos) = snippets::expand(&body);
+                                                let mut bytes = Vec::with_capacity(trigger_len + expanded.len());
+                                                for _ in 0..trigger_len {
+                                                    bytes.push(0x7F);
+                                                }
+                                                bytes.extend_from_slice(expanded.as_bytes());
+                                                tabs[active_tab_index].scroll_target = 0.0;
+                                                tabs[active_tab_index].terminal_state.lock().write_to_pty(&bytes);
+                                                let mut r = renderer.lock();
+                                                r.set_dirty(true);
+                                                r.grid_dirty = true;
+                                                app_dirty = true;
+                                                return;
+                                            }
                                         }
                                     }
                                 }
@@ -4142,6 +4619,18 @@ fn main() -> anyhow::Result<()> {
                         Vec::new()
                     };
 
+                    let project_filtered: Vec<String> = if project_jumper_visible {
+                        compute_project_filtered(&project_jumper_items, &project_jumper_query)
+                    } else {
+                        Vec::new()
+                    };
+
+                    let worktree_filtered: Vec<String> = if worktree_picker_visible {
+                        compute_worktree_filtered(&worktree_items, &worktree_picker_query, worktree_toplevel.as_deref())
+                    } else {
+                        Vec::new()
+                    };
+
                     let drop_target_idx = if drag_threshold_passed {
                         dragging_tab.map(|_| {
                             let r = renderer.lock();
@@ -4221,6 +4710,14 @@ fn main() -> anyhow::Result<()> {
                         &ssh_picker_query,
                         ssh_picker_selected,
                         &ssh_filtered,
+                        project_jumper_visible,
+                        &project_jumper_query,
+                        project_jumper_selected,
+                        &project_filtered,
+                        worktree_picker_visible,
+                        &worktree_picker_query,
+                        worktree_picker_selected,
+                        &worktree_filtered,
                     );
                     drop(r);
                     #[cfg(target_os = "windows")]

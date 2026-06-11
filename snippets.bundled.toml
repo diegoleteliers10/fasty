@@ -1,0 +1,100 @@
+# Bundled snippets for fasty.
+# Edit, delete, or add your own. This file is only created on first run;
+# your changes survive updates.
+#
+# Syntax:
+#   $0           final cursor position (only one per snippet)
+#   $1, $2, ...  placeholder markers (Tab through them after expansion)
+#   ${1:default} placeholder with default text
+#
+# Most snippets below have no placeholders — the cursor lands at the end
+# after expansion. A few use placeholders for cases where you almost
+# always want to type something (e.g. commit message).
+#
+# Triggers expand on Tab. TUI apps (vim, fzf, htop) take precedence:
+# if fasty detects a full-screen app is running, Tab passes through.
+
+[snippet]
+
+# --- Git ---
+"gst" = "git status"
+"gco" = "git checkout"
+"gcb" = "git checkout -b "
+"gp" = "git push"
+"gpf" = "git push --force-with-lease"
+"gpl" = "git pull --rebase"
+"ga" = "git add "
+"gaa" = "git add --all"
+"gci" = "git commit"
+"gcm" = "git commit -m \"${1:message}\""
+"gcam" = "git commit -am \"${1:message}\""
+"gd" = "git diff"
+"gds" = "git diff --staged"
+"gl" = "git log --oneline -20"
+"gll" = "git log --graph --oneline --decorate -20"
+"gb" = "git branch"
+"gbd" = "git branch -d "
+"gstsh" = "git stash"
+"gstshp" = "git stash push -m \"${1:name}\""
+
+# --- Git worktrees ---
+"gwt" = "git worktree"
+"gwta" = "git worktree add "
+"gwtp" = "git worktree prune"
+"gwtr" = "git worktree remove "
+
+# --- Docker ---
+"dps" = "docker ps"
+"dpsa" = "docker ps -a"
+"di" = "docker images"
+"dcu" = "docker compose up"
+"dcud" = "docker compose up -d"
+"dcd" = "docker compose down"
+"dcl" = "docker compose logs -f "
+"dex" = "docker exec -it "
+"drm" = "docker rm -f "
+"drmi" = "docker rmi -f "
+
+# --- Rust ---
+"cb" = "cargo build"
+"cbr" = "cargo build --release"
+"ct" = "cargo test"
+"ctr" = "cargo test --release"
+"cr" = "cargo run"
+"crr" = "cargo run --release"
+"cc" = "cargo check"
+"cl" = "cargo clippy"
+"clf" = "cargo clippy --fix"
+"cf" = "cargo fmt"
+"cn" = "cargo new "
+"cni" = "cargo new --lib "
+"ca" = "cargo add "
+"cag" = "cargo add --git "
+
+# --- Filesystem / nav ---
+"ll" = "ls -lah"
+"la" = "ls -A"
+"l." = "ls -d .*"
+".." = "cd .."
+"..." = "cd ../.."
+"...." = "cd ../../.."
+"~" = "cd ~"
+"-" = "cd -"
+
+# --- Search / text ---
+"grep" = "grep -rn "
+"grepi" = "grep -rni "
+"psg" = "ps aux | grep "
+"envg" = "env | grep "
+"histg" = "history | grep "
+
+# --- System ---
+"dfh" = "df -h"
+"duh" = "du -sh *"
+"free" = "free -h"
+"ports" = "ss -tlnp"
+"myip" = "curl -s ifconfig.me; echo"
+"serve" = "python3 -m http.server "
+"now" = "date +\"%Y-%m-%d %H:%M:%S\""
+"ts" = "date +%s"
+"untar" = "tar -xzf "

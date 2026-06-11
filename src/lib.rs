@@ -8,4 +8,5 @@ pub mod pty;
 pub mod renderer;
 pub mod selection_classifier;
 pub mod session;
+pub mod snippets;
 pub mod terminal_state;
