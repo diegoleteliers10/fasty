@@ -157,13 +157,30 @@ elif [ "$OS" = "linux" ]; then
     fi
 
     echo "🚀 Copiando el binario a $BIN_DIR/$APP_NAME..."
+    # Note: we MUST use install/cp (not mv/rename) here. When fasty is
+    # currently running, the kernel locks its executable's text segment
+    # and rename(2) fails with ETXTBSY ("Text file busy"), so `mv` would
+    # silently leave the old binary on disk and the relaunched process
+    # would execute the previous version. `install` opens the target
+    # with O_TRUNC and writes through it, which is permitted even while
+    # the inode is being executed.
     if [ -w "$BIN_DIR" ]; then
-        mv "$TEMP_DIR/$APP_NAME" "$BIN_DIR/$APP_NAME"
-        chmod +x "$BIN_DIR/$APP_NAME"
+        install -m 0755 "$TEMP_DIR/$APP_NAME" "$BIN_DIR/$APP_NAME"
     else
         echo "🔑 Se requieren privilegios de administrador (sudo) para escribir en $BIN_DIR."
-        sudo mv "$TEMP_DIR/$APP_NAME" "$BIN_DIR/$APP_NAME"
-        sudo chmod +x "$BIN_DIR/$APP_NAME"
+        sudo install -m 0755 "$TEMP_DIR/$APP_NAME" "$BIN_DIR/$APP_NAME"
+    fi
+
+    # Verify the on-disk binary actually got replaced by comparing
+    # sha256 sums. If the new binary's contents weren't written (e.g.
+    # mv/rename failed with ETXTBSY while the old process is running)
+    # we must NOT signal success, or fasty will relaunch into the
+    # stale binary on next launch.
+    NEW_HASH=$(sha256sum "$TEMP_DIR/$APP_NAME" 2>/dev/null | awk '{print $1}')
+    INSTALLED_HASH=$(sha256sum "$BIN_DIR/$APP_NAME" 2>/dev/null | awk '{print $1}')
+    if [ -z "$NEW_HASH" ] || [ "$NEW_HASH" != "$INSTALLED_HASH" ]; then
+        echo "❌ Error: el binario en $BIN_DIR/$APP_NAME no coincide con el nuevo (posible ETXTBSY). Aborta." >&2
+        exit 1
     fi
 
     echo "$LATEST_TAG" > /tmp/fasty-update-done 2>/dev/null || true
