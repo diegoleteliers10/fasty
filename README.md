@@ -57,6 +57,18 @@ Fasty integrates custom vector icons mapped into the GPU texture atlas as non-co
 
 ## Performance & Memory Optimizations
 
+### Fluid Window Resize (v0.3.5)
+
+Window resizing (width, height, and corner drag) is now smooth and fluid. During rapid resize events (hundreds per second on Wayland), deferred processing collapses all accumulated events into a single GPU surface reconfigure and terminal text reflow per frame, eliminating per-event stalls.
+
+### Rendering Correctness Fixes (v0.3.5)
+
+- **Dingbat/Symbol Width**: Characters in the U+2700–U+27BF range (e.g. ✘ ✦ ✧) now occupy exactly one cell width, matching the treatment of arrow symbols.
+- **Ghost Icon Elimination**: Terminal background and bottom bar no longer show atlas texture artifacts — routed through the rounded-rect SDF path instead of atlas texture sampling.
+- **Bottom Bar Z-Order**: Bottom bar (git status) now renders behind the scrollbar, preventing visual overlap.
+- **Scrollbar to Window Edge**: Scrollbar track extends to within 2px of the window bottom, no longer cut off prematurely.
+- **Settings Simplified**: Removed non-functional Visual toggle from the Settings dialog.
+
 ### Memory Footprint Reduction (30-50MB Linux, 50-70MB Windows)
 
 1. **Scrollback Memory Cap**: Capped at 3000 lines (down from 10,000), reducing allocations by ~37MB.

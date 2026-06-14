@@ -831,12 +831,12 @@ impl Pipeline {
                 viewport_width,
                 viewport_height - 40.0 - 20.0,
                 theme_bg,
-                [0.0, 0.0, 0.0, 0.0],
+                [0.001, 0.0, 0.0, 0.0],
                 0.0,
                 0.0,
                 1.0,
                 1.0,
-                0.0,
+                8.0,
             );
             term_bg_instances.push(terminal_bg);
 
@@ -1153,13 +1153,16 @@ impl Pipeline {
                                                     render_h,
                                                     1.0,
                                                 )
-                                            } else if is_arrow_symbol(cell.c) {
-                                                let x_offset = (cell_width - entry.width) / 2.0;
+                                            } else if is_arrow_symbol(cell.c) || is_dingbat_symbol(cell.c) {
+                                                let scale = (cell_width / entry.width).min(1.0);
+                                                let render_w = entry.width * scale;
+                                                let render_h = entry.height * scale;
+                                                let x_offset = ((cell_width - render_w) / 2.0).max(0.0);
                                                 (
                                                     (cell_x + x_offset).round(),
                                                     (cell_y + atlas.ascent() + entry.top).round(),
-                                                    entry.width,
-                                                    entry.height,
+                                                    render_w,
+                                                    render_h,
                                                     0.0,
                                                 )
                                             } else {
@@ -1265,9 +1268,11 @@ impl Pipeline {
         // Git info is shown only when the active tab is in a git repo.
         {
             const BB_H: f32 = 20.0;
+            const SCROLLBAR_COL_W: f32 = 10.0; // 6px track + 2*2px margin
             let bb_x = 0.0f32;
             let bb_y = viewport_height - BB_H;
             let bb_w = viewport_width;
+            let bb_content_right = viewport_width - SCROLLBAR_COL_W;
 
             let (bg_r, bg_g, bg_b) =
                 named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::Background);
@@ -1278,19 +1283,22 @@ impl Pipeline {
                 bg_alpha,
             ];
 
-            // Flat bottombar background — same color as terminal bg
-            bg_instances.push(CellInstance::new(
+            // Flat bottombar background — same color as terminal bg.
+            // Pushed into term_instances_final so it renders BEFORE
+            // the scrollbar (which also lives in term_instances_final
+            // but is pushed later), giving the scrollbar correct z-order.
+            instances.push(CellInstance::new(
                 bb_x,
                 bb_y,
                 bb_w,
                 BB_H,
                 theme_bg,
-                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 8.0, 8.0],
                 0.0,
                 0.0,
                 1.0,
                 1.0,
-                0.0,
+                8.0,
             ));
 
             // Git info — only when in a repo
@@ -1310,6 +1318,9 @@ impl Pipeline {
                             if c == ' ' {
                                 x += cell_w;
                                 continue;
+                            }
+                            if x >= bb_content_right {
+                                break;
                             }
                             if let Some(entry) = ui_atlas.get_or_rasterize(c, device, queue) {
                                 if entry.width > 0.0 {
@@ -1368,7 +1379,7 @@ impl Pipeline {
                 x = bb_text!(gs.branch.as_str(), x, branch_color);
 
                 // Dirty indicator dot
-                if !gs.is_clean() {
+                if !gs.is_clean() && x < bb_content_right {
                     x += 6.0;
                     let dot_r = 2.5f32;
                     let dot_y = bb_y + BB_H * 0.5;
@@ -1390,20 +1401,22 @@ impl Pipeline {
 
                 // Separator
                 x += 2.0;
-                let sep_color = with_opacity([1.0, 1.0, 1.0, 0.08], chrome_alpha);
-                bg_instances.push(CellInstance::new(
-                    x,
-                    bb_y + 3.0,
-                    1.0,
-                    BB_H - 6.0,
-                    sep_color,
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                ));
+                if x < bb_content_right {
+                    let sep_color = with_opacity([1.0, 1.0, 1.0, 0.08], chrome_alpha);
+                    bg_instances.push(CellInstance::new(
+                        x,
+                        bb_y + 3.0,
+                        1.0,
+                        BB_H - 6.0,
+                        sep_color,
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ));
+                }
                 x += 8.0;
 
                 // Ahead
@@ -1463,20 +1476,22 @@ impl Pipeline {
                     if display_secs < 5.0 {
                         // Separator
                         x += 4.0;
-                        let sep_color = with_opacity([1.0, 1.0, 1.0, 0.08], chrome_alpha);
-                        bg_instances.push(CellInstance::new(
-                            x,
-                            bb_y + 3.0,
-                            1.0,
-                            BB_H - 6.0,
-                            sep_color,
-                            [0.0, 0.0, 0.0, 0.0],
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                        ));
+                        if x < bb_content_right {
+                            let sep_color = with_opacity([1.0, 1.0, 1.0, 0.08], chrome_alpha);
+                            bg_instances.push(CellInstance::new(
+                                x,
+                                bb_y + 3.0,
+                                1.0,
+                                BB_H - 6.0,
+                                sep_color,
+                                [0.0, 0.0, 0.0, 0.0],
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                            ));
+                        }
                         x += 8.0;
 
                         let duration_text = if duration_ms < 1000 {
@@ -1511,7 +1526,7 @@ impl Pipeline {
                             text_w += entry.width * scale + 1.0;
                         }
                     }
-                    let right_x = viewport_width - text_w - 8.0;
+                    let right_x = viewport_width - SCROLLBAR_COL_W - text_w - 8.0;
                     if right_x > x + 16.0 {
                         let _ = bb_text!(
                             summary_text.as_str(),
@@ -1551,6 +1566,9 @@ impl Pipeline {
                             if c == ' ' {
                                 dx += cw;
                                 continue;
+                            }
+                            if dx >= bb_content_right {
+                                break;
                             }
                             if let Some(entry) = ui_atlas.get_or_rasterize(c, device, queue) {
                                 if entry.width > 0.0 {
@@ -2569,7 +2587,7 @@ impl Pipeline {
             let track_top = TOPBAR_HEIGHT;
             let track_width = 6.0f32;
             let track_x = viewport_width - track_width - 2.0f32; // 2px from right edge
-            let track_bottom = viewport_height - 4.0f32;
+            let track_bottom = viewport_height - 2.0;
             let track_height = track_bottom - track_top;
 
             // Draw track (rgba(255,255,255,0.08))
@@ -4178,10 +4196,6 @@ impl Pipeline {
         themes: &[String],
         hovered_theme_idx: Option<usize>,
         theme_scroll_y: f32,
-        visual_picker_active: bool,
-        hover_visual_toggle: bool,
-        hovered_card_idx: Option<usize>,
-        card_scroll_y: f32,
         device: &Device,
         queue: &wgpu::Queue,
         opacity: f32,
@@ -4332,44 +4346,6 @@ impl Pipeline {
             12.0,
             13.5,
             with_opacity([0.85, 0.85, 0.85, 1.0], chrome_alpha),
-            &mut fg_instances,
-        );
-
-        // Draw "Visual" toggle button in the topbar (between title and close)
-        let visual_btn_x = 80.0f32 * scale;
-        let visual_btn_w = 56.0f32 * scale;
-        let visual_btn_h = 24.0f32 * scale;
-        let visual_btn_y = 8.0f32 * scale; // (40 - 24) / 2 — vertically centered
-        let visual_btn_bg = if visual_picker_active {
-            theme_accent
-        } else if hover_visual_toggle {
-            theme_lift_hover
-        } else {
-            theme_lift_rest
-        };
-        bg_instances.push(CellInstance::new(
-            visual_btn_x,
-            visual_btn_y,
-            visual_btn_w,
-            visual_btn_h,
-            visual_btn_bg,
-            [0.0, 0.0, 0.0, 0.0],
-            0.0,
-            0.0,
-            1.0,
-            1.0,
-            5.0 * scale,
-        ));
-        draw_text(
-            atlas,
-            "Visual",
-            visual_btn_x / scale + 8.0,
-            visual_btn_y / scale + 6.0,
-            if visual_picker_active {
-                with_opacity([0.05, 0.05, 0.05, 1.0], chrome_alpha)
-            } else {
-                with_opacity([0.85, 0.85, 0.90, 1.0], chrome_alpha)
-            },
             &mut fg_instances,
         );
 
@@ -5227,196 +5203,6 @@ impl Pipeline {
             }
         }
 
-        // Visual Picker — theme preview cards
-        if visual_picker_active {
-            let grid_x = 20.0f32 * scale;
-            let grid_y = 256.0f32 * scale;
-            let card_w = 170.0f32 * scale;
-            let card_h = 58.0f32 * scale;
-            let gap = 8.0f32 * scale;
-            let cols = 2;
-            let rows_visible =
-                ((viewport_height - grid_y - 12.0 * scale) / (card_h + gap)).floor() as i32;
-            let rows_visible = rows_visible.max(1);
-            let total_rows = ((themes.len() as i32 + cols - 1) / cols).max(1);
-
-            draw_text(
-                atlas,
-                "Theme previews",
-                grid_x / scale,
-                grid_y / scale - 16.0,
-                with_opacity([0.75, 0.75, 0.80, 1.0], chrome_alpha),
-                &mut fg_instances,
-            );
-
-            for (i, theme_name) in themes.iter().enumerate() {
-                let col = (i as i32) % cols;
-                let row = (i as i32) / cols;
-                let card_x = grid_x + col as f32 * (card_w + gap);
-                let card_y = grid_y + row as f32 * (card_h + gap) - card_scroll_y * scale;
-                let card_bottom = card_y + card_h;
-                if card_bottom < grid_y || card_y > viewport_height - 8.0 * scale {
-                    continue;
-                }
-
-                let swatch = named_color_rgb_for_theme(theme_name);
-                let (fg, accent_r, accent_g, _accent_b) = swatch;
-                let prev = crate::config::ACTIVE_THEME.read().clone();
-                crate::config::set_active_theme(theme_name);
-                let t = get_active_theme();
-                let (br, bgc, bb) = t.background;
-                crate::config::set_active_theme(&prev);
-
-                let card_bg = with_opacity(
-                    [
-                        br as f32 / 255.0,
-                        bgc as f32 / 255.0,
-                        bb as f32 / 255.0,
-                        1.0,
-                    ],
-                    chrome_alpha,
-                );
-                let card_fg = with_opacity(
-                    [
-                        fg.0 as f32 / 255.0,
-                        fg.1 as f32 / 255.0,
-                        fg.2 as f32 / 255.0,
-                        1.0,
-                    ],
-                    chrome_alpha,
-                );
-                let card_accent = with_opacity(
-                    [
-                        accent_r.0 as f32 / 255.0,
-                        accent_r.1 as f32 / 255.0,
-                        accent_r.2 as f32 / 255.0,
-                        1.0,
-                    ],
-                    chrome_alpha,
-                );
-
-                let is_active = theme_name == theme;
-                let is_hovered = hovered_card_idx == Some(i);
-
-                let border_color = if is_active {
-                    card_accent
-                } else if is_hovered {
-                    with_opacity([1.0, 1.0, 1.0, 0.30], chrome_alpha)
-                } else {
-                    with_opacity([1.0, 1.0, 1.0, 0.12], chrome_alpha)
-                };
-
-                // Shadow
-                bg_instances.push(CellInstance::new(
-                    card_x + 2.0 * scale,
-                    card_y + 2.0 * scale,
-                    card_w,
-                    card_h,
-                    with_opacity([0.0, 0.0, 0.0, 0.25], chrome_alpha),
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0,
-                    0.0,
-                    1.0,
-                    1.0,
-                    8.0 * scale,
-                ));
-                // Card background — uses the theme's actual bg color
-                bg_instances.push(CellInstance::new(
-                    card_x,
-                    card_y,
-                    card_w,
-                    card_h,
-                    card_bg,
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0,
-                    0.0,
-                    1.0,
-                    1.0,
-                    8.0 * scale,
-                ));
-                // Border ring
-                fg_instances.push(CellInstance::new(
-                    card_x,
-                    card_y,
-                    card_w,
-                    card_h,
-                    border_color,
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0,
-                    0.0,
-                    1.0,
-                    1.0,
-                    8.0 * scale,
-                ));
-
-                let sample_x = card_x + 8.0 * scale;
-                let sample_y = card_y + 6.0 * scale;
-                draw_text(
-                    atlas,
-                    "Aa Bb",
-                    sample_x / scale,
-                    sample_y / scale,
-                    card_fg,
-                    &mut fg_instances,
-                );
-                // Accent strip on the right (small bar using the theme's red/green accent)
-                fg_instances.push(CellInstance::new(
-                    card_x + card_w - 18.0 * scale,
-                    card_y + 8.0 * scale,
-                    10.0 * scale,
-                    4.0 * scale,
-                    card_accent,
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0,
-                    0.0,
-                    1.0,
-                    1.0,
-                    2.0 * scale,
-                ));
-                fg_instances.push(CellInstance::new(
-                    card_x + card_w - 32.0 * scale,
-                    card_y + 8.0 * scale,
-                    10.0 * scale,
-                    4.0 * scale,
-                    with_opacity(
-                        [
-                            accent_g.0 as f32 / 255.0,
-                            accent_g.1 as f32 / 255.0,
-                            accent_g.2 as f32 / 255.0,
-                            1.0,
-                        ],
-                        chrome_alpha,
-                    ),
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0,
-                    0.0,
-                    1.0,
-                    1.0,
-                    2.0 * scale,
-                ));
-
-                draw_text(
-                    atlas,
-                    theme_name,
-                    (card_x + 8.0 * scale) / scale,
-                    (card_y + 30.0 * scale) / scale,
-                    card_fg,
-                    &mut fg_instances,
-                );
-                if is_active {
-                    draw_text(
-                        atlas,
-                        "v",
-                        (card_x + card_w - 18.0 * scale) / scale,
-                        (card_y + 30.0 * scale) / scale,
-                        card_accent,
-                        &mut fg_instances,
-                    );
-                }
-            }
-            let _ = (total_rows, rows_visible);
-        }
-
         // Write buffer and draw
         let bg_count = bg_instances.len();
         let fg_count = fg_instances.len();
@@ -6177,6 +5963,10 @@ fn is_arrow_symbol(ch: char) -> bool {
     matches!(ch as u32, 0x2190..=0x21FF | 0x27A0..=0x27BF | 0x2B00..=0x2BFF)
 }
 
+fn is_dingbat_symbol(ch: char) -> bool {
+    matches!(ch as u32, 0x2700..=0x27BF)
+}
+
 fn render_single_char(
     cell: &alacritty_terminal::term::cell::Cell,
     cell_x: f32,
@@ -6277,18 +6067,21 @@ fn render_single_char(
                         1.0,
                     )
                 } else {
-                    let glyph_x = if is_arrow_symbol(cell.c) {
-                        let x_offset = (actual_cell_width - entry.width) / 2.0;
-                        (cell_x + x_offset).round()
+                    let (glyph_x, render_w, render_h) = if is_arrow_symbol(cell.c) || is_dingbat_symbol(cell.c) {
+                        let scale = (actual_cell_width / entry.width).min(1.0);
+                        let rw = entry.width * scale;
+                        let rh = entry.height * scale;
+                        let x_offset = ((actual_cell_width - rw) / 2.0).max(0.0);
+                        ((cell_x + x_offset).round(), rw, rh)
                     } else {
-                        (cell_x + entry.left).round()
+                        ((cell_x + entry.left).round(), entry.width, entry.height)
                     };
                     let glyph_y = (cell_y + atlas.ascent() + entry.top).round();
                     CellInstance::new(
                         glyph_x,
                         glyph_y,
-                        entry.width,
-                        entry.height,
+                        render_w,
+                        render_h,
                         fg,
                         [0.0, 0.0, 0.0, 0.0],
                         uv_x,

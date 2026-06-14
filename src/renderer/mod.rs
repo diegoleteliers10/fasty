@@ -500,10 +500,6 @@ impl<'a> Renderer<'a> {
         themes: &[String],
         hovered_theme_idx: Option<usize>,
         theme_scroll_y: f32,
-        visual_picker_active: bool,
-        hover_visual_toggle: bool,
-        hovered_card_idx: Option<usize>,
-        card_scroll_y: f32,
         opacity: f32,
     ) {
         if !self.dirty {
@@ -563,10 +559,6 @@ impl<'a> Renderer<'a> {
                 themes,
                 hovered_theme_idx,
                 theme_scroll_y,
-                visual_picker_active,
-                hover_visual_toggle,
-                hovered_card_idx,
-                card_scroll_y,
                 &self.device,
                 &self.queue,
                 opacity,

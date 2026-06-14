@@ -1038,13 +1038,6 @@ fn main() -> anyhow::Result<()> {
     let mut s_mouse_x = 0.0f64;
     let mut s_mouse_y = 0.0f64;
 
-    // Visual settings picker state — when true, an extra row of theme preview
-    // cards is drawn below the existing controls in the settings dialog.
-    let mut settings_visual_picker: bool = false;
-    let mut s_hover_visual_toggle: bool = false;
-    let mut settings_hovered_card_idx: Option<usize> = None;
-    let mut settings_card_scroll_y: f32 = 0.0;
-
     // Secondary about window state
     let mut about_window: Option<Arc<winit::window::Window>> = None;
     let mut about_renderer: Option<Renderer<'static>> = None;
@@ -1053,6 +1046,17 @@ fn main() -> anyhow::Result<()> {
 
     let mut first_frame_rendered = false;
     let mut app_dirty = true;
+    // Set when the window is resized; at the start of the next frame we
+    // flush pending resizes to all background tabs so they catch up.
+    let mut pending_bg_resize = false;
+    // Deferred surface resize: we store the latest physical size and
+    // apply it only right before the next render.  During drag this
+    // avoids N × surface.configure() stalls when N resize events fire
+    // between two frames.
+    let mut pending_surface_resize: Option<(u32, u32)> = None;
+    // Deferred terminal resize: same idea — term.resize() does expensive
+    // text reflow when cols change, so we collapse N resize events into 1.
+    let mut pending_term_resize: Option<(usize, usize)> = None;
     let mut last_render_time = std::time::Instant::now();
     let mut detected_tui_agent: Option<String> = None;
     let mut last_tui_title: Option<String> = None;
@@ -1288,20 +1292,60 @@ fn main() -> anyhow::Result<()> {
                         }
                         WindowEvent::Resized(_size) => {
                             let physical_size = window_for_redraw.inner_size();
-                            let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                            // Calculate cols/rows from the new size
+                            const PADDING_LEFT: f32 = 10.0;
+                            let padding_top = get_padding_top(tabs.len());
+                            let padding_bottom = get_padding_bottom();
+                            let cell_w = cell_width.max(1.0);
+                            let cell_h = cell_height.max(1.0);
+                            let cols = (((physical_size.width as f32 - PADDING_LEFT * 2.0) / cell_w).floor().max(1.0)) as usize;
+                            let rows = (((physical_size.height as f32 - (padding_top + padding_bottom)) / cell_h).floor().max(1.0)) as usize;
 
                             shell_cols = cols;
                             shell_rows = rows;
 
-                            let mut r = renderer.lock();
-                            r.resize(physical_size.width, physical_size.height);
-                            drop(r);
+                            // Defer terminal reflow + PTY resize to render time.
+                            // Width changes trigger expensive text reflow in
+                            // alacritty — collapsing N events into 1 per frame.
+                            pending_term_resize = Some((cols, rows));
+
+                            // Defer surface.configure() to render time.
+                            // During rapid resize events (hundreds per second on
+                            // Wayland), only the last size matters because we
+                            // render once per frame.
+                            pending_surface_resize = Some((physical_size.width, physical_size.height));
                             app_dirty = true;
+                            // Background tabs catch up on the next frame
+                            pending_bg_resize = true;
+                            // Bypass the 16ms frame_time gate in AboutToWait
+                            // so the resize renders on the very next event loop
+                            // tick instead of waiting up to one full frame.
+                            window_for_redraw.request_redraw();
                         }
                         WindowEvent::RedrawRequested => {
+                            // Flush pending background tab resizes from
+                            // the most recent window resize event.
+                            if pending_bg_resize {
+                                pending_bg_resize = false;
+                                for (idx, tab) in tabs.iter().enumerate() {
+                                    if idx != active_tab_index {
+                                        tab.terminal_state.lock().resize(shell_cols, shell_rows);
+                                    }
+                                }
+                            }
                             #[cfg(target_os = "windows")]
                             let was_rendered = first_frame_rendered;
                             first_frame_rendered = true;
+
+                            // Apply deferred resizes BEFORE acquiring the
+                            // terminal state lock below — otherwise the
+                            // non-reentrant parking_lot::Mutex deadlocks.
+                            if let Some((cols, rows)) = pending_term_resize.take() {
+                                tabs[active_tab_index].terminal_state.lock().resize(cols, rows);
+                            }
+                            if let Some((w, h)) = pending_surface_resize.take() {
+                                renderer.lock().resize(w, h);
+                            }
 
                             let mut tab_titles = Vec::new();
                             let mut active_tab_path = "fasty".to_string();
@@ -1852,6 +1896,7 @@ fn main() -> anyhow::Result<()> {
                                                                 (r.instance.clone(), r.device.clone(), r.queue.clone(), r.config.format, r.config.alpha_mode)
                                                             };
                                                             if let Ok(renderer_obj) = Renderer::new_shared(sw_static, &config.font.family, 13.0, shared_instance, shared_device, shared_queue, format, alpha_mode) {
+                                                                settings_window_arc.focus_window();
                                                                 settings_window = Some(settings_window_arc);
                                                                 settings_renderer = Some(renderer_obj);
                                                             }
@@ -2190,9 +2235,9 @@ fn main() -> anyhow::Result<()> {
                                                                 worktree_toplevel = Some(new_path);
                                                                 let mut r = renderer.lock();
                                                                 r.set_dirty(true);
-                                                                r.grid_dirty = true;
-                                                                app_dirty = true;
-                                                            }
+                                                                 r.grid_dirty = true;
+                            app_dirty = true;
+                                                             }
                                                         }
                                                         None => {
                                                             toast = Some((
@@ -2436,13 +2481,10 @@ fn main() -> anyhow::Result<()> {
                                                                         &themes_list,
                                                                         None,
                                                                         0.0,
-                                                                        settings_visual_picker,
-                                                                        s_hover_visual_toggle,
-                                                                        settings_hovered_card_idx,
-                                                                        settings_card_scroll_y,
                                                                         config.opacity,
                                                                     );
                                                                     settings_window_arc.set_visible(true);
+                                                                    settings_window_arc.focus_window();
                                                                 }
                                                                 settings_window = Some(settings_window_arc);
                                                                 settings_renderer = Some(renderer_obj);
@@ -2856,6 +2898,7 @@ fn main() -> anyhow::Result<()> {
                                                                                   renderer_obj.set_dirty(true);
                                                                                    renderer_obj.render_about(&get_current_version(), false, config.opacity);
                                                                                   about_window_arc.set_visible(true);
+                                                                                  about_window_arc.focus_window();
                                                                               }
                                                                               about_window = Some(about_window_arc);
                                                                               about_renderer = Some(renderer_obj);
@@ -3264,45 +3307,42 @@ fn main() -> anyhow::Result<()> {
                                                                    #[cfg(target_os = "windows")]
                                                                    {
                                                                        renderer_obj.set_dirty(true);
-                                                                       renderer_obj.render_settings(
-                                                                           &config.font.family,
-                                                                           config.font.size,
-                                                                           config.scrollback.min(3000),
-                                                                           0,
-                                                                           false, false, false, false, false, false, false, false,
-                                                                           &system_fonts,
-                                                                           0.0,
-                                                                           None,
-                                                                           &settings_theme,
-                                                                           &themes_list,
-                                                                           None,
-                                                                           0.0,
-                                                                           settings_visual_picker,
-                                                                           s_hover_visual_toggle,
-                                                                           settings_hovered_card_idx,
-                                                                           settings_card_scroll_y,
-                                                                           config.opacity,
-                                                                       );
-                                                                       settings_window_arc.set_visible(true);
-                                                                   }
-                                                                   settings_window = Some(settings_window_arc);
-                                                                   settings_renderer = Some(renderer_obj);
-                                                               }
-                                                               Err(e) => {
-                                                                   tracing::error!("Failed to create settings renderer: {:?}", e);
-                                                               }
-                                                           }
-                                                       }
-                                                       Err(e) => {
-                                                           tracing::error!("Failed to create settings window: {:?}", e);
-                                                       }
-                                                   }
-                                               } else {
-                                                   settings_window = None;
-                                                   settings_renderer = None;
-                                               }
-                                               app_dirty = true;
-                                               return;
+                                                                        renderer_obj.render_settings(
+                                                                            &config.font.family,
+                                                                            config.font.size,
+                                                                            config.scrollback.min(3000),
+                                                                            0,
+                                                                            false, false, false, false, false, false, false, false,
+                                                                            &system_fonts,
+                                                                            0.0,
+                                                                            None,
+                                                                            &settings_theme,
+                                                                            &themes_list,
+                                                                            None,
+                                                                            0.0,
+                                                                            config.opacity,
+                                                                        );
+                                                                        settings_window_arc.set_visible(true);
+                                                                        settings_window_arc.focus_window();
+                                                                    }
+                                                                    settings_window = Some(settings_window_arc);
+                                                                    settings_renderer = Some(renderer_obj);
+                                                                }
+                                                                Err(e) => {
+                                                                    tracing::error!("Failed to create settings renderer: {:?}", e);
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::error!("Failed to create settings window: {:?}", e);
+                                                        }
+                                                    }
+                                                } else {
+                                                    settings_window = None;
+                                                    settings_renderer = None;
+                                                }
+                                                app_dirty = true;
+                                                return;
                                            }
 
                                          // 2. Check tab clicks & close tab clicks & new tab click
@@ -3445,7 +3485,7 @@ fn main() -> anyhow::Result<()> {
                                         let total_lines = visible_rows + history_size;
                                         if total_lines > 0.0 {
                                             let ratio = visible_rows / total_lines;
-                                            let track_h = v_height - scrollbar_top_margin - 4.0;
+                                            let track_h = v_height - scrollbar_top_margin - 2.0;
                                             let thumb_h = (track_h * ratio).max(20.0).min(track_h);
 
                                             let scroll_ratio = if history_size > 0.0 {
@@ -4023,7 +4063,7 @@ fn main() -> anyhow::Result<()> {
                                     let ratio = visible_rows / total_lines;
                                     const TOPBAR_HEIGHT: f32 = 40.0;
                                     let scrollbar_top_margin = TOPBAR_HEIGHT;
-                                    let track_h = v_height - scrollbar_top_margin - 4.0;
+                                    let track_h = v_height - scrollbar_top_margin - 2.0;
                                     let thumb_h = (track_h * ratio).max(20.0).min(track_h);
                                     let track_center = track_h - thumb_h;
 
@@ -4330,7 +4370,7 @@ fn main() -> anyhow::Result<()> {
                             }
                             WindowEvent::RedrawRequested => {
                                 if let Some(ref mut r) = settings_renderer {
-                                    r.render_settings(
+                                     r.render_settings(
                                         &settings_family,
                                         settings_size,
                                         settings_scrollback,
@@ -4350,10 +4390,6 @@ fn main() -> anyhow::Result<()> {
                                         &themes_list,
                                         settings_hovered_theme_idx,
                                         settings_theme_scroll_y,
-                                        settings_visual_picker,
-                                        s_hover_visual_toggle,
-                                        settings_hovered_card_idx,
-                                        settings_card_scroll_y,
                                         config.opacity,
                                     );
                                 }
@@ -4377,8 +4413,6 @@ fn main() -> anyhow::Result<()> {
                                 let old_hover_open_config = s_hover_open_config;
                                 let old_hovered_font_idx = settings_hovered_font_idx;
                                 let old_hovered_theme_idx = settings_hovered_theme_idx;
-                                let old_s_hover_visual_toggle = s_hover_visual_toggle;
-                                let old_settings_hovered_card_idx = settings_hovered_card_idx;
 
                                 let sw_width = sw.inner_size().width as f64 / scale_factor;
                                 s_hover_close = s_mouse_y >= 4.0 && s_mouse_y <= 32.0 && s_mouse_x >= (sw_width - 32.0) && s_mouse_x < (sw_width - 4.0);
@@ -4393,37 +4427,6 @@ fn main() -> anyhow::Result<()> {
                                 s_hover_theme = s_mouse_y >= 172.0 && s_mouse_y <= 198.0 && s_mouse_x >= 140.0 && s_mouse_x < 380.0;
 
                                 s_hover_open_config = s_mouse_y >= 212.0 && s_mouse_y <= 238.0 && s_mouse_x >= 140.0 && s_mouse_x < 380.0;
-
-                                // Visual toggle button (topbar): x=[80, 136], y=[6, 30]
-                                s_hover_visual_toggle = s_mouse_y >= 6.0 && s_mouse_y <= 30.0 && s_mouse_x >= 80.0 && s_mouse_x < 136.0;
-
-                                // Visual picker theme cards (when active)
-                                let mut hovered_card_idx: Option<usize> = None;
-                                if settings_visual_picker {
-                                    let card_w = 170.0f64;
-                                    let card_h = 58.0f64;
-                                    let gap = 8.0f64;
-                                    let grid_x = 20.0f64;
-                                    let grid_y = 256.0f64;
-                                    let cols = 2;
-                                    if s_mouse_x >= grid_x && s_mouse_y >= grid_y {
-                                        let col = ((s_mouse_x - grid_x) / (card_w + gap)) as i32;
-                                        let row = ((s_mouse_y - grid_y + settings_card_scroll_y as f64) / (card_h + gap)) as i32;
-                                        if col >= 0 && col < cols {
-                                            let idx = (row * cols + col) as usize;
-                                            if idx < themes_list.len() {
-                                                let card_x = grid_x + col as f64 * (card_w + gap);
-                                                let card_y = grid_y + row as f64 * (card_h + gap) - settings_card_scroll_y as f64;
-                                                if s_mouse_x >= card_x && s_mouse_x < card_x + card_w
-                                                    && s_mouse_y >= card_y && s_mouse_y < card_y + card_h
-                                                {
-                                                    hovered_card_idx = Some(idx);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                settings_hovered_card_idx = hovered_card_idx;
 
                                 let mut hovered_font_idx = None;
                                 if settings_active_field == 1 && s_mouse_x >= 140.0 && s_mouse_x < 380.0 && s_mouse_y >= 78.0 && s_mouse_y < 258.0 {
@@ -4443,9 +4446,6 @@ fn main() -> anyhow::Result<()> {
                                 }
                                 settings_hovered_theme_idx = hovered_theme_idx;
 
-                                let old_s_hover_visual_toggle = s_hover_visual_toggle;
-                                let old_settings_hovered_card_idx = settings_hovered_card_idx;
-
                                 let any_changed = s_hover_close != old_hover_close
                                     || s_hover_family != old_hover_family
                                     || s_hover_size_minus != old_hover_size_minus
@@ -4455,9 +4455,7 @@ fn main() -> anyhow::Result<()> {
                                     || s_hover_theme != old_hover_theme
                                     || s_hover_open_config != old_hover_open_config
                                     || settings_hovered_font_idx != old_hovered_font_idx
-                                    || settings_hovered_theme_idx != old_hovered_theme_idx
-                                    || s_hover_visual_toggle != old_s_hover_visual_toggle
-                                    || settings_hovered_card_idx != old_settings_hovered_card_idx;
+                                    || settings_hovered_theme_idx != old_hovered_theme_idx;
 
                                 if any_changed {
                                     if let Some(ref mut r) = settings_renderer {
@@ -4474,19 +4472,6 @@ fn main() -> anyhow::Result<()> {
                                         app_dirty = true;
                                     } else if s_mouse_y <= 36.0 {
                                         let _ = sw.drag_window();
-                                    } else if s_hover_visual_toggle {
-                                        // Toggle the visual picker; resize the dialog window accordingly
-                                        settings_visual_picker = !settings_visual_picker;
-                                        settings_active_field = 0;
-                                        let target_h = if settings_visual_picker { 460.0 } else { 260.0 };
-                                        let _ = sw.request_inner_size(winit::dpi::LogicalSize::new(400.0, target_h));
-                                    } else if settings_visual_picker && settings_hovered_card_idx.is_some() {
-                                        if let Some(idx) = settings_hovered_card_idx {
-                                            if idx < themes_list.len() {
-                                                settings_theme = themes_list[idx].clone();
-                                                apply_settings!();
-                                            }
-                                        }
                                     } else if s_hover_family {
                                         if system_fonts.is_empty() {
                                             system_fonts = get_system_fonts();
@@ -4615,8 +4600,6 @@ fn main() -> anyhow::Result<()> {
                                 s_hover_scroll_plus = false;
                                 s_hover_theme = false;
                                 s_hover_open_config = false;
-                                s_hover_visual_toggle = false;
-                                settings_hovered_card_idx = None;
                                 if let Some(ref mut r) = settings_renderer {
                                     r.set_dirty(true);
                                 }
@@ -4632,8 +4615,6 @@ fn main() -> anyhow::Result<()> {
                                     s_hover_scroll_plus = false;
                                     s_hover_theme = false;
                                     s_hover_open_config = false;
-                                    s_hover_visual_toggle = false;
-                                    settings_hovered_card_idx = None;
                                     if let Some(ref mut r) = settings_renderer {
                                         r.set_dirty(true);
                                     }
@@ -4825,6 +4806,18 @@ fn main() -> anyhow::Result<()> {
                     } else {
                         None
                     };
+
+                    // Apply deferred terminal resize — exactly once per frame,
+                    // collapsing all rapid resize events into one reflow.
+                    if let Some((cols, rows)) = pending_term_resize.take() {
+                        tabs[active_tab_index].terminal_state.lock().resize(cols, rows);
+                    }
+
+                    // Apply deferred surface resize — exactly once per frame,
+                    // with the final size from all accumulated resize events.
+                    if let Some((w, h)) = pending_surface_resize.take() {
+                        renderer.lock().resize(w, h);
+                    }
 
                     let mut r = renderer.lock();
                     r.set_dirty(true);
