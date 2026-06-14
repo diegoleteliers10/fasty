@@ -72,6 +72,7 @@ struct Tab {
     is_selecting_text: bool,
     selection_start_pos: Option<(f64, f64)>,
     hovered_url: Option<renderer::HoveredUrl>,
+    hovered_url_text: Option<String>,
     hovered_hyperlink: Option<String>,
     pending_hyperlink_open: Option<String>,
     hyperlink_press_pos: Option<(f64, f64)>,
@@ -85,6 +86,7 @@ struct Tab {
     search_visible: bool,
     search_current_idx: usize,
     custom_name: Option<String>,
+    title_override: Option<String>,
     git_status: Option<GitStatus>,
     git_status_check_at: std::time::Instant,
 }
@@ -125,6 +127,7 @@ fn create_new_tab(
         is_selecting_text: false,
         selection_start_pos: None,
         hovered_url: None,
+        hovered_url_text: None,
         hovered_hyperlink: None,
         pending_hyperlink_open: None,
         hyperlink_press_pos: None,
@@ -138,6 +141,7 @@ fn create_new_tab(
         search_visible: false,
         search_current_idx: 0,
         custom_name: None,
+        title_override: None,
         git_status: None,
         git_status_check_at: std::time::Instant::now(),
     })
@@ -480,6 +484,58 @@ fn get_last_path_component(path_str: &str) -> String {
 
 fn get_current_version() -> String {
     format!("v{}", env!("CARGO_PKG_VERSION"))
+}
+
+const TUI_AGENTS: &[&str] = &["claude", "opencode", "hermes", "forge", "agy"];
+
+#[cfg(not(target_os = "windows"))]
+fn detect_tui_agent(shell_pid: Option<u32>) -> Option<String> {
+    let pid = shell_pid?;
+    let children_path = format!("/proc/{}/task/{}/children", pid, pid);
+    let children = std::fs::read_to_string(&children_path).ok()?;
+    for child_pid_str in children.split_whitespace() {
+        let child_pid: u32 = child_pid_str.parse().ok()?;
+        let cmdline_path = format!("/proc/{}/cmdline", child_pid);
+        let cmdline = std::fs::read(&cmdline_path).ok()?;
+        let cmd_str = String::from_utf8_lossy(&cmdline);
+        let first_arg = cmd_str.split('\0').next().unwrap_or("");
+        let cmd_name = std::path::Path::new(first_arg)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        for agent in TUI_AGENTS {
+            if cmd_name == *agent {
+                return Some(agent.to_string());
+            }
+        }
+        // Check grandchildren (one level deeper)
+        let gc_path = format!("/proc/{}/task/{}/children", child_pid, child_pid);
+        if let Ok(gc) = std::fs::read_to_string(&gc_path) {
+            for gc_pid_str in gc.split_whitespace() {
+                let gc_pid: u32 = gc_pid_str.parse().ok()?;
+                let gc_cmdline_path = format!("/proc/{}/cmdline", gc_pid);
+                if let Ok(gc_cmdline) = std::fs::read(&gc_cmdline_path) {
+                    let gc_str = String::from_utf8_lossy(&gc_cmdline);
+                    let gc_first = gc_str.split('\0').next().unwrap_or("");
+                    let gc_name = std::path::Path::new(gc_first)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    for agent in TUI_AGENTS {
+                        if gc_name == *agent {
+                            return Some(agent.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn detect_tui_agent(_shell_pid: Option<u32>) -> Option<String> {
+    None
 }
 
 /// Detect git status for the given working directory.
@@ -918,6 +974,16 @@ fn main() -> anyhow::Result<()> {
     let mut last_scroll_event_time: Option<std::time::Instant> = None;
     let mut mouse_down_button: Option<winit::event::MouseButton> = None;
 
+    // Bell, command timing, and tooltip state
+    let mut bell_flash_time: Option<std::time::Instant> = None;
+    let mut last_command_duration: Option<(u128, Option<i32>)> = None;
+    let mut last_command_duration_display_time: Option<std::time::Instant> = None;
+    let mut hover_tooltip: Option<(String, std::time::Instant)> = None;
+    const TOOLTIP_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+    const COMMAND_DURATION_DISPLAY: std::time::Duration = std::time::Duration::from_secs(5);
+    const BELL_FLASH_DURATION: std::time::Duration = std::time::Duration::from_millis(150);
+    const HOVER_DETECT_PADDING: f64 = 2.0;
+
     // Hover states for main window topbar buttons
     let mut hover_close = false;
     let mut hover_max = false;
@@ -988,6 +1054,8 @@ fn main() -> anyhow::Result<()> {
     let mut first_frame_rendered = false;
     let mut app_dirty = true;
     let mut last_render_time = std::time::Instant::now();
+    let mut detected_tui_agent: Option<String> = None;
+    let mut last_tui_title: Option<String> = None;
     let mut last_blink_index = 0;
     let mut next_render_reason = RenderReason::GridChanged;
 
@@ -1077,11 +1145,12 @@ fn main() -> anyhow::Result<()> {
                                 let ligatures_changed = new_config.font.ligatures != config.font.ligatures;
                                 let weight_changed = (new_config.font.weight - config.font.weight).abs() > f32::EPSILON;
                                 let shell_changed = new_config.shell != config.shell;
+                                let opacity_changed = (new_config.opacity - config.opacity).abs() > f32::EPSILON;
 
-                                if theme_changed || font_changed || scrollback_changed || ligatures_changed || weight_changed || shell_changed {
+                                if theme_changed || font_changed || scrollback_changed || ligatures_changed || weight_changed || shell_changed || opacity_changed {
                                     tracing::info!(
-                                        "config: live-reload theme={} font={} scrollback={} ligatures={} weight={} shell={}",
-                                        theme_changed, font_changed, scrollback_changed, ligatures_changed, weight_changed, shell_changed
+                                        "config: live-reload theme={} font={} scrollback={} ligatures={} weight={} shell={} opacity={}",
+                                        theme_changed, font_changed, scrollback_changed, ligatures_changed, weight_changed, shell_changed, opacity_changed
                                     );
                                     config = new_config;
 
@@ -1156,6 +1225,58 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
+                    AppEvent::Bell => {
+                        bell_flash_time = Some(std::time::Instant::now());
+                        renderer.lock().set_dirty(true);
+                        window_for_redraw.request_redraw();
+                    }
+                    AppEvent::ClipboardStore(text) => {
+                        let mut cb = if clipboard.is_none() {
+                            match arboard::Clipboard::new() {
+                                Ok(ctx) => {
+                                    clipboard = Some(ctx);
+                                    clipboard.as_mut()
+                                }
+                                Err(_) => None,
+                            }
+                        } else {
+                            clipboard.as_mut()
+                        };
+                        if let Some(ctx) = cb.as_mut() {
+                            let _ = ctx.set_text(text);
+                        }
+                    }
+                    AppEvent::ClipboardLoad(_ty) => {
+                        // Note: OSC 52 read responses are handled inline in
+                        // EventListenerProxy (it has the callback). This arm is
+                        // a no-op for forward compatibility.
+                    }
+                    AppEvent::CwdChanged(path) => {
+                        if let Some(tab) = tabs.get_mut(active_tab_index) {
+                            tab.cwd = Some(path.clone());
+                        }
+                        tracing::info!("cwd changed: {}", path.display());
+                        app_dirty = true;
+                        window_for_redraw.request_redraw();
+                    }
+                    AppEvent::TitleChanged(title) => {
+                        if let Some(tab) = tabs.get_mut(active_tab_index) {
+                            tab.title_override = Some(title);
+                        }
+                        app_dirty = true;
+                        window_for_redraw.request_redraw();
+                    }
+                    AppEvent::CommandStarted => {
+                        // Timing handled in PTY reader thread; this event
+                        // is only used to signal that a command is running.
+                    }
+                    AppEvent::CommandFinished { duration_ms, exit_code } => {
+                        tracing::info!("CommandFinished received: duration={}ms exit={:?}", duration_ms, exit_code);
+                        last_command_duration = Some((duration_ms, exit_code));
+                        last_command_duration_display_time = Some(std::time::Instant::now());
+                        renderer.lock().set_dirty(true);
+                        window_for_redraw.request_redraw();
+                    }
                 }
             }
             winit::event::Event::WindowEvent { window_id, event } => {
@@ -1219,6 +1340,24 @@ fn main() -> anyhow::Result<()> {
                                 tab_titles.push(title);
                             }
 
+                            // Detect TUI agent running in the active tab
+                            {
+                                let active_tab = &tabs[active_tab_index];
+                                let shell_pid = active_tab.terminal_state.lock().shell_pid();
+                                let new_agent = detect_tui_agent(shell_pid);
+                                let new_title = match &new_agent {
+                                    Some(agent) => Some(format!("{} - fasty", agent)),
+                                    None => Some("fasty".to_string()),
+                                };
+                                if new_title != last_tui_title {
+                                    last_tui_title = new_title.clone();
+                                    detected_tui_agent = new_agent;
+                                    if let Some(ref t) = new_title {
+                                        window_for_redraw.set_title(t);
+                                    }
+                                }
+                            }
+
                             let active_tab = &tabs[active_tab_index];
                             let term = active_tab.terminal_state.lock();
                             let max_history = term.history_size() as f32;
@@ -1226,6 +1365,16 @@ fn main() -> anyhow::Result<()> {
 
                             let last_activity_time_secs = active_tab.last_activity_time.saturating_duration_since(start_time).as_secs_f32();
                             let current_time = start_time.elapsed().as_secs_f32();
+
+                            let bell_flash_elapsed_ms = bell_flash_time.map(|t| t.elapsed().as_secs_f32() * 1000.0);
+                            let (last_command_duration_ms, command_duration_display_secs, command_exit_code) =
+                                match (last_command_duration, last_command_duration_display_time) {
+                                    (Some((ms, code)), Some(display_time)) => {
+                                        let elapsed = display_time.elapsed().as_secs_f32();
+                                        (Some(ms), Some(elapsed), code)
+                                    }
+                                    _ => (None, None, None),
+                                };
 
                             // Update checker and notifier state integration
                             let latest_ver = {
@@ -1374,6 +1523,14 @@ fn main() -> anyhow::Result<()> {
                                 &worktree_picker_query,
                                 worktree_picker_selected,
                                 &worktree_filtered,
+                                bell_flash_elapsed_ms,
+                                last_command_duration_ms,
+                                command_duration_display_secs,
+                                command_exit_code,
+                                current_mouse_x as f32,
+                                current_mouse_y as f32,
+                                active_tab.hovered_url_text.as_deref(),
+                                config.opacity,
                             );
                             drop(r);
 
@@ -1389,7 +1546,7 @@ fn main() -> anyhow::Result<()> {
                         WindowEvent::ModifiersChanged(modified) => {
                             modifiers = modified.state();
                             let padding_top = get_padding_top(tabs.len());
-                            let new_hover = detect_hovered_url(
+                            let (new_hover, new_hover_text) = detect_hovered_url(
                                 current_mouse_x,
                                 current_mouse_y,
                                 modifiers.control_key() || ctrl_held,
@@ -1403,6 +1560,7 @@ fn main() -> anyhow::Result<()> {
                             );
                             if tabs[active_tab_index].hovered_url != new_hover {
                                 tabs[active_tab_index].hovered_url = new_hover;
+                                tabs[active_tab_index].hovered_url_text = new_hover_text;
                                 let mut r = renderer.lock();
                                 r.set_dirty(true);
                                 r.grid_dirty = true;
@@ -1450,10 +1608,10 @@ fn main() -> anyhow::Result<()> {
 
                             let padding_top = get_padding_top(tabs.len());
 
-                            let new_hover = detect_hovered_url(
+                            let (new_hover, new_hover_text) = detect_hovered_url(
                                 current_mouse_x,
                                 current_mouse_y,
-                                ctrl_active,
+                                modifiers.control_key() || ctrl_held,
                                 &tabs[active_tab_index].terminal_state,
                                 tabs[active_tab_index].scroll_current,
                                 cell_width,
@@ -1464,6 +1622,7 @@ fn main() -> anyhow::Result<()> {
                             );
                             if tabs[active_tab_index].hovered_url != new_hover {
                                 tabs[active_tab_index].hovered_url = new_hover;
+                                tabs[active_tab_index].hovered_url_text = new_hover_text;
                                 let mut r = renderer.lock();
                                 r.set_dirty(true);
                                 r.grid_dirty = true;
@@ -2281,6 +2440,7 @@ fn main() -> anyhow::Result<()> {
                                                                         s_hover_visual_toggle,
                                                                         settings_hovered_card_idx,
                                                                         settings_card_scroll_y,
+                                                                        config.opacity,
                                                                     );
                                                                     settings_window_arc.set_visible(true);
                                                                 }
@@ -2672,12 +2832,12 @@ fn main() -> anyhow::Result<()> {
                                                     crate::renderer::ContextMenuItem::About => {
                                                           if about_window.is_none() {
                                                               let visible = !cfg!(target_os = "windows");
-                                                              match target.create_window(winit::window::WindowAttributes::default()
-                                                                  .with_title("About Fasty")
-                                                                  .with_decorations(false)
-                                                                  .with_transparent(true)
-                                                                  .with_visible(visible)
-                                                                  .with_inner_size(winit::dpi::LogicalSize::new(300.0, 200.0)))
+                                          match target.create_window(winit::window::WindowAttributes::default()
+                                                                   .with_title("About Fasty")
+                                                                   .with_decorations(false)
+                                                                   .with_transparent(true)
+                                                                   .with_visible(visible)
+                                                                   .with_inner_size(winit::dpi::LogicalSize::new(300.0, 200.0)))
                                                               {
                                                                   Ok(window) => {
                                                                       let about_window_arc = Arc::new(window);
@@ -2694,7 +2854,7 @@ fn main() -> anyhow::Result<()> {
                                                                               #[cfg(target_os = "windows")]
                                                                               {
                                                                                   renderer_obj.set_dirty(true);
-                                                                                  renderer_obj.render_about(&get_current_version(), false);
+                                                                                   renderer_obj.render_about(&get_current_version(), false, config.opacity);
                                                                                   about_window_arc.set_visible(true);
                                                                               }
                                                                               about_window = Some(about_window_arc);
@@ -3082,12 +3242,12 @@ fn main() -> anyhow::Result<()> {
                                                     settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                                    settings_active_field = 0;
                                                    let visible = !cfg!(target_os = "windows");
-                                                   match target.create_window(winit::window::WindowAttributes::default()
-                                                       .with_title("fasty Settings")
-                                                       .with_decorations(false)
-                                                       .with_transparent(true)
-                                                       .with_visible(visible)
-                                                       .with_inner_size(winit::dpi::LogicalSize::new(400.0, 260.0)))
+                                                    match target.create_window(winit::window::WindowAttributes::default()
+                                                        .with_title("fasty Settings")
+                                                        .with_decorations(false)
+                                                        .with_transparent(true)
+                                                        .with_visible(visible)
+                                                        .with_inner_size(winit::dpi::LogicalSize::new(400.0, 260.0)))
                                                    {
                                                        Ok(window) => {
                                                            let settings_window_arc = Arc::new(window);
@@ -3121,6 +3281,7 @@ fn main() -> anyhow::Result<()> {
                                                                            s_hover_visual_toggle,
                                                                            settings_hovered_card_idx,
                                                                            settings_card_scroll_y,
+                                                                           config.opacity,
                                                                        );
                                                                        settings_window_arc.set_visible(true);
                                                                    }
@@ -3945,7 +4106,7 @@ fn main() -> anyhow::Result<()> {
                                 app_dirty = true;
                             }
 
-                            let new_hover = detect_hovered_url(
+                            let (new_hover, new_hover_text) = detect_hovered_url(
                                 current_mouse_x,
                                 current_mouse_y,
                                 modifiers.control_key() || ctrl_held,
@@ -3959,6 +4120,7 @@ fn main() -> anyhow::Result<()> {
                             );
                             if tabs[active_tab_index].hovered_url != new_hover {
                                 tabs[active_tab_index].hovered_url = new_hover;
+                                tabs[active_tab_index].hovered_url_text = new_hover_text;
                                 let mut r = renderer.lock();
                                 r.set_dirty(true);
                                 r.grid_dirty = true;
@@ -4061,6 +4223,7 @@ fn main() -> anyhow::Result<()> {
 
                             let url_changed = tabs[active_tab_index].hovered_url.is_some();
                             tabs[active_tab_index].hovered_url = None;
+                            tabs[active_tab_index].hovered_url_text = None;
                             let hyperlink_changed = tabs[active_tab_index].hovered_hyperlink.is_some();
                             tabs[active_tab_index].hovered_hyperlink = None;
 
@@ -4191,6 +4354,7 @@ fn main() -> anyhow::Result<()> {
                                         s_hover_visual_toggle,
                                         settings_hovered_card_idx,
                                         settings_card_scroll_y,
+                                        config.opacity,
                                     );
                                 }
                                 #[cfg(target_os = "windows")]
@@ -4496,7 +4660,7 @@ fn main() -> anyhow::Result<()> {
                             WindowEvent::RedrawRequested => {
                                 if let Some(ref mut r) = about_renderer {
                                     r.set_dirty(true);
-                                    r.render_about(&get_current_version(), about_hover_close);
+                                    r.render_about(&get_current_version(), about_hover_close, config.opacity);
                                 }
                             }
                             WindowEvent::CursorMoved { position, .. } => {
@@ -4606,6 +4770,16 @@ fn main() -> anyhow::Result<()> {
 
                     let last_activity_time_secs = active_tab.last_activity_time.saturating_duration_since(start_time).as_secs_f32();
                     let current_time = start_time.elapsed().as_secs_f32();
+
+                    let bell_flash_elapsed_ms = bell_flash_time.map(|t| t.elapsed().as_secs_f32() * 1000.0);
+                    let (last_command_duration_ms, command_duration_display_secs, command_exit_code) =
+                        match (last_command_duration, last_command_duration_display_time) {
+                            (Some((ms, code)), Some(display_time)) => {
+                                let elapsed = display_time.elapsed().as_secs_f32();
+                                (Some(ms), Some(elapsed), code)
+                            }
+                            _ => (None, None, None),
+                        };
 
                     let palette_filtered: Vec<String> = if command_palette_visible {
                         compute_palette_filtered(&palette_commands, &command_palette_query)
@@ -4718,6 +4892,14 @@ fn main() -> anyhow::Result<()> {
                         &worktree_picker_query,
                         worktree_picker_selected,
                         &worktree_filtered,
+                        bell_flash_elapsed_ms,
+                        last_command_duration_ms,
+                        command_duration_display_secs,
+                        command_exit_code,
+                        current_mouse_x as f32,
+                        current_mouse_y as f32,
+                        active_tab.hovered_url_text.as_deref(),
+                        config.opacity,
                     );
                     drop(r);
                     #[cfg(target_os = "windows")]
@@ -5376,9 +5558,9 @@ fn detect_hovered_url(
     shell_cols: usize,
     shell_rows: usize,
     padding_top: f32,
-) -> Option<renderer::HoveredUrl> {
+) -> (Option<renderer::HoveredUrl>, Option<String>) {
     if current_mouse_y <= padding_top as f64 || !ctrl_pressed {
-        return None;
+        return (None, None);
     }
 
     let term = terminal_state.lock();
@@ -5444,18 +5626,21 @@ fn detect_hovered_url(
                     }
                     
                     if is_url(&trimmed_str) {
-                        return Some(renderer::HoveredUrl {
-                            line: hover_point.line.0,
-                            start_col: trimmed_start,
-                            end_col: trimmed_end - 1,
-                        });
+                        return (
+                            Some(renderer::HoveredUrl {
+                                line: hover_point.line.0,
+                                start_col: trimmed_start,
+                                end_col: trimmed_end - 1,
+                            }),
+                            Some(trimmed_str),
+                        );
                     }
                 }
             }
         }
     }
 
-    None
+    (None, None)
 }
 
 fn get_resize_direction(

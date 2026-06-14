@@ -9,6 +9,11 @@ use wgpu::{Buffer, Device, RenderPipeline};
 use crate::renderer::{CellInstance, RenderReason, RowShapingResult};
 use crate::terminal_state::TerminalState;
 
+fn with_opacity(mut color: [f32; 4], opacity: f32) -> [f32; 4] {
+    color[3] *= opacity;
+    color
+}
+
 pub struct Pipeline {
     pipeline: RenderPipeline,
     instance_buffer: Buffer,
@@ -61,7 +66,7 @@ fn sd_segment(p: vec2<f32>, p1: vec2<f32>, p2: vec2<f32>) -> f32 {
 
 fn sd_connection(p: vec2<f32>, center: vec2<f32>, size: vec2<f32>, dir: u32, style: u32, light: f32, heavy: f32, space: f32) -> f32 {
     if (style == 0u) { return 1e6; }
-    
+
     var p1 = center;
     var p2 = center;
     if (dir == 0u) { // Left
@@ -73,7 +78,7 @@ fn sd_connection(p: vec2<f32>, center: vec2<f32>, size: vec2<f32>, dir: u32, sty
     } else { // Bottom
         p1 = vec2<f32>(center.x, size.y);
     }
-    
+
     if (style == 1u) {
         return sd_segment(p, p1, p2) - light / 2.0;
     } else if (style == 2u) {
@@ -97,7 +102,7 @@ fn sd_connection(p: vec2<f32>, center: vec2<f32>, size: vec2<f32>, dir: u32, sty
 fn draw_block_or_box(code: u32, kind: u32, left_style: u32, right_style: u32, top_style: u32, bottom_style: u32, uv: vec2<f32>, size: vec2<f32>, frag_pos: vec2<f32>) -> f32 {
     let p = uv * size;
     let center = size / 2.0;
-    
+
     if (code >= 0x2580u && code <= 0x259Fu) {
         // Block Elements
         if (code == 0x2588u) { return 1.0; } // Full block
@@ -105,7 +110,7 @@ fn draw_block_or_box(code: u32, kind: u32, left_style: u32, right_style: u32, to
         if (code == 0x2584u) { return f32(uv.y >= 0.5); } // Lower half
         if (code == 0x258Cu) { return f32(uv.x <= 0.5); } // Left half
         if (code == 0x2590u) { return f32(uv.x >= 0.5); } // Right half
-        
+
         // Lower levels
         if (code == 0x2581u) { return f32(uv.y >= 0.875); }
         if (code == 0x2582u) { return f32(uv.y >= 0.75); }
@@ -113,7 +118,7 @@ fn draw_block_or_box(code: u32, kind: u32, left_style: u32, right_style: u32, to
         if (code == 0x2585u) { return f32(uv.y >= 0.375); }
         if (code == 0x2586u) { return f32(uv.y >= 0.25); }
         if (code == 0x2587u) { return f32(uv.y >= 0.125); }
-        
+
         // Left levels
         if (code == 0x2589u) { return f32(uv.x <= 0.875); }
         if (code == 0x258Au) { return f32(uv.x <= 0.75); }
@@ -121,17 +126,17 @@ fn draw_block_or_box(code: u32, kind: u32, left_style: u32, right_style: u32, to
         if (code == 0x258Du) { return f32(uv.x <= 0.375); }
         if (code == 0x258Eu) { return f32(uv.x <= 0.25); }
         if (code == 0x258Fu) { return f32(uv.x <= 0.125); }
-        
+
         // Right and Upper levels
         if (code == 0x2594u) { return f32(uv.y <= 0.125); }
         if (code == 0x2595u) { return f32(uv.x >= 0.875); }
-        
+
         // Quadrants
         if (code == 0x2596u) { return f32(uv.x <= 0.5 && uv.y >= 0.5); }
         if (code == 0x2597u) { return f32(uv.x >= 0.5 && uv.y >= 0.5); }
         if (code == 0x2598u) { return f32(uv.x <= 0.5 && uv.y <= 0.5); }
         if (code == 0x259Du) { return f32(uv.x >= 0.5 && uv.y <= 0.5); }
-        
+
         if (code == 0x2599u) { return f32(!(uv.x >= 0.5 && uv.y <= 0.5)); }
         if (code == 0x259Au) { return f32((uv.x <= 0.5 && uv.y <= 0.5) || (uv.x >= 0.5 && uv.y >= 0.5)); }
         if (code == 0x259Bu) { return f32(!(uv.x >= 0.5 && uv.y >= 0.5)); }
@@ -156,7 +161,7 @@ fn draw_block_or_box(code: u32, kind: u32, left_style: u32, right_style: u32, to
         let light = max(1.0, size.x * 0.08);
         let heavy = light * 2.2;
         let space = light * 1.5;
-        
+
         if (kind == 1u) {
             // Round corners
             let radius = min(center.x, center.y);
@@ -175,7 +180,7 @@ fn draw_block_or_box(code: u32, kind: u32, left_style: u32, right_style: u32, to
                 c = center + vec2<f32>(radius, -radius);
                 is_active_corner = p.x < c.x && p.y > c.y;
             }
-            
+
             if (is_active_corner) {
                 let dist = abs(length(p - c) - radius) - light / 2.0;
                 return 1.0 - smoothstep(-0.75, 0.75, dist);
@@ -201,7 +206,7 @@ fn draw_block_or_box(code: u32, kind: u32, left_style: u32, right_style: u32, to
             var d_right = sd_connection(p, center, size, 1u, right_style, light, heavy, space);
             var d_top = sd_connection(p, center, size, 2u, top_style, light, heavy, space);
             var d_bottom = sd_connection(p, center, size, 3u, bottom_style, light, heavy, space);
-            
+
             // If dashed, mask it out
             if (kind == 3u) {
                 let dash_len = light * 4.0;
@@ -222,7 +227,7 @@ fn draw_block_or_box(code: u32, kind: u32, left_style: u32, right_style: u32, to
                     if (dash == 1u) { d_bottom = 1e6; }
                 }
             }
-            
+
             let min_d = min(min(d_left, d_right), min(d_top, d_bottom));
             return 1.0 - smoothstep(-0.75, 0.75, min_d);
         }
@@ -266,38 +271,49 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let abs_val = -input.is_color;
         let code = u32(abs_val);
         let kind = u32(round((abs_val - f32(code)) * 10.0));
-        
+
         let left_style = u32(round(input.bg_color.r));
         let right_style = u32(round(input.bg_color.g));
         let top_style = u32(round(input.bg_color.b));
         let bottom_style = u32(round(input.bg_color.a));
-        
+
         let alpha = draw_block_or_box(
             code, kind,
             left_style, right_style, top_style, bottom_style,
             input.uv, input.size, input.position.xy
         );
-        
+
         return vec4<f32>(input.fg_color.rgb, input.fg_color.a * alpha);
     }
 
     if (input.is_color > 1.5) {
         let r = input.is_color;
         let p = (input.uv - vec2<f32>(0.5)) * input.size;
-        
-        var b = input.size / 2.0;
-        if (input.bg_color.g > 0.0 || input.bg_color.b > 0.0) {
-            b = (input.size - 2.0 * vec2<f32>(input.bg_color.g, input.bg_color.b)) / 2.0;
-        }
-        
-        let q = abs(p) - b + vec2<f32>(r);
-        let dist = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
-        
+
+        let b = input.size / 2.0;
+
+        // Per-corner radii encoded in bg_color channels: r=TL, g=TR, b=BL, a=BR.
+        // When any of the four is non-zero we use per-corner radii and fall
+        // back to the uniform is_color for the corners that are 0.
+        let r_tl = input.bg_color.r;
+        let r_tr = input.bg_color.g;
+        let r_bl = input.bg_color.b;
+        let r_br = input.bg_color.a;
+        let has_per_corner = r_tl > 0.0 || r_tr > 0.0 || r_bl > 0.0 || r_br > 0.0;
+
+        let sx = step(0.0, p.x);
+        let sy = step(0.0, p.y);
+        let per_corner_r = mix(
+            mix(r_tl, r_tr, sx),
+            mix(r_bl, r_br, sx),
+            sy
+        );
+        let eff_r = select(r, per_corner_r, has_per_corner);
+
+        let q = abs(p) - b + vec2<f32>(eff_r);
+        let dist = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - eff_r;
+
         var blur = 0.5;
-        if (input.bg_color.r > 0.0) {
-            blur = input.bg_color.r;
-        }
-        
         let alpha = 1.0 - smoothstep(-blur, blur, dist);
         return vec4<f32>(input.fg_color.rgb, input.fg_color.a * alpha);
     }
@@ -312,12 +328,8 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
 "#;
 
 const VERTEX_BUFFER_DATA: &[f32] = &[
-    0.0, 0.0,  0.0, 0.0,
-    1.0, 0.0,  1.0, 0.0,
-    0.0, 1.0,  0.0, 1.0,
-    0.0, 1.0,  0.0, 1.0,
-    1.0, 0.0,  1.0, 0.0,
-    1.0, 1.0,  1.0, 1.0,
+    0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0,
+    0.0, 1.0, 1.0, 1.0, 1.0,
 ];
 
 impl Pipeline {
@@ -336,10 +348,12 @@ impl Pipeline {
             format: Some(wgpu::TextureFormat::Rgba8Unorm),
             ..Default::default()
         });
-        let ui_atlas_view = ui_atlas.texture().create_view(&wgpu::TextureViewDescriptor {
-            format: Some(wgpu::TextureFormat::Rgba8Unorm),
-            ..Default::default()
-        });
+        let ui_atlas_view = ui_atlas
+            .texture()
+            .create_view(&wgpu::TextureViewDescriptor {
+                format: Some(wgpu::TextureFormat::Rgba8Unorm),
+                ..Default::default()
+            });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -365,9 +379,10 @@ impl Pipeline {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: true,
         });
-        vertex_buffer.slice(..).get_mapped_range_mut().copy_from_slice(
-            cast_slice(VERTEX_BUFFER_DATA),
-        );
+        vertex_buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .copy_from_slice(cast_slice(VERTEX_BUFFER_DATA));
         vertex_buffer.unmap();
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -647,25 +662,37 @@ impl Pipeline {
         worktree_picker_query: &str,
         worktree_picker_selected: usize,
         worktree_filtered: &[String],
+        bell_flash_elapsed_ms: Option<f32>,
+        last_command_duration_ms: Option<u128>,
+        command_duration_display_secs: Option<f32>,
+        exit_code: Option<i32>,
+        current_mouse_x: f32,
+        current_mouse_y: f32,
+        hovered_url_text: Option<&str>,
+        opacity: f32,
     ) {
         if reason == RenderReason::CursorBlink {
             let term = terminal.term();
             let term_guard = term.lock();
             let content = term_guard.renderable_content();
-            
+
             let (_c_w, _c_h, _c_ox, _c_oy, c_alpha) = match content.cursor.shape {
-                alacritty_terminal::vte::ansi::CursorShape::Block => (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32),
-                alacritty_terminal::vte::ansi::CursorShape::Underline => (cell_width, 1.0f32, 0.0f32, cell_height - 1.0f32, 0.9f32),
-                alacritty_terminal::vte::ansi::CursorShape::Beam => (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32),
-                alacritty_terminal::vte::ansi::CursorShape::Hidden => (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32),
+                alacritty_terminal::vte::ansi::CursorShape::Block => {
+                    (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32)
+                }
+                alacritty_terminal::vte::ansi::CursorShape::Underline => {
+                    (cell_width, 1.0f32, 0.0f32, cell_height - 1.0f32, 0.9f32)
+                }
+                alacritty_terminal::vte::ansi::CursorShape::Beam => {
+                    (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32)
+                }
+                alacritty_terminal::vte::ansi::CursorShape::Hidden => {
+                    (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32)
+                }
                 _ => (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32),
             };
 
-            let final_alpha = if cursor_visible {
-                c_alpha
-            } else {
-                0.0
-            };
+            let final_alpha = if cursor_visible { c_alpha } else { 0.0 };
 
             if let Some(idx) = self.last_cursor_index {
                 if idx < self.cached_final_instances.len() {
@@ -688,15 +715,17 @@ impl Pipeline {
                 render_pass.set_vertex_buffer(1, self.instance_buffer.slice(0..end_offset));
                 render_pass.draw(0..6, 0..term_draw_count as u32);
             }
-            
+
             let ui_draw_count = self.last_ui_draw_count;
             if ui_draw_count > 0 {
                 render_pass.set_pipeline(&self.pipeline);
                 render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
                 render_pass.set_bind_group(0, &self.ui_bind_group, &[]);
                 let start_offset = (term_draw_count * mem::size_of::<CellInstance>()) as u64;
-                let end_offset = ((term_draw_count + ui_draw_count) * mem::size_of::<CellInstance>()) as u64;
-                render_pass.set_vertex_buffer(1, self.instance_buffer.slice(start_offset..end_offset));
+                let end_offset =
+                    ((term_draw_count + ui_draw_count) * mem::size_of::<CellInstance>()) as u64;
+                render_pass
+                    .set_vertex_buffer(1, self.instance_buffer.slice(start_offset..end_offset));
                 render_pass.draw(0..6, 0..ui_draw_count as u32);
             }
             return;
@@ -711,42 +740,64 @@ impl Pipeline {
 
         // Topbar color is a darker variant of the theme bg so it visually
         // separates from the terminal area. The default theme keeps its
-        // hand-tuned #0a0a0a; other themes derive their topbar from bg * 0.83.
-        let (bg_r, bg_g, bg_b) = named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::Background);
-        let theme_bg = [bg_r as f32 / 255.0, bg_g as f32 / 255.0, bg_b as f32 / 255.0, 1.0];
+        // hand-tuned #0a0a0a; other themes derive their topbar from bg * 0.5.
+        // Alpha is bg_alpha directly from the TOML config — same rule as
+        // the settings and about window topbars, no offset.
+        let (bg_r, bg_g, bg_b) =
+            named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::Background);
+        let bg_alpha = opacity.clamp(0.0, 1.0);
+        // Chrome alpha: applies to all topbar/bottom bar/search bar foreground
+        // colors so icons, text, and hover states follow the configured opacity.
+        let chrome_alpha = bg_alpha;
+        // Terminal + window BG also respect the configured opacity so the
+        // whole window (topbar, terminal, bottom bar, settings, about) dims
+        // together.
+        let theme_bg = [
+            bg_r as f32 / 255.0,
+            bg_g as f32 / 255.0,
+            bg_b as f32 / 255.0,
+            bg_alpha,
+        ];
         let active_theme = crate::config::ACTIVE_THEME.read().to_lowercase();
         let theme_topbar = if active_theme == "default" {
-            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0]
+            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, bg_alpha]
         } else {
             [
-                bg_r as f32 / 255.0 * 0.83,
-                bg_g as f32 / 255.0 * 0.83,
-                bg_b as f32 / 255.0 * 0.83,
-                1.0,
+                bg_r as f32 / 255.0 * 0.5,
+                bg_g as f32 / 255.0 * 0.5,
+                bg_b as f32 / 255.0 * 0.5,
+                bg_alpha,
             ]
         };
+        // Active tab gets its own lighter color so it reads as
+        // Active tab matches the terminal color so it merges with the
+        // terminal area below. Alpha is bg_alpha directly from the TOML
+        // config (no offset), same rule as every other component.
+        let theme_active_tab = if active_theme == "default" {
+            [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, bg_alpha]
+        } else {
+            [bg_r as f32 / 255.0, bg_g as f32 / 255.0, bg_b as f32 / 255.0, bg_alpha]
+        };
 
-        // 1. Draw unified bar background (darker variant of theme bg)
+        // 1. Draw topbar background. Single layer with per-corner radii:
+        // top corners rounded (8px), bottom corners square. Encoding is
+        // bg_color = (r_TL, g_TR, b_BL, a_BR). One layer = one bg_alpha
+        // pass, so opacity applies uniformly (no pre-multiplied compositing
+        // double-up with a separate bar_bottom_fill).
         let bar_bg = CellInstance::new(
-            0.0, 0.0,
-            viewport_width, 40.0,
+            0.0,
+            0.0,
+            viewport_width,
+            40.0,
             theme_topbar,
-            [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
-            8.0, // radius of 8 at top corners
+            [8.0, 8.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            8.0, // uniform radius (used for corners with 0 in bg_color)
         );
         ui_bg_instances.push(bar_bg);
-
-        // 2. Draw square block to cover bottom rounded corners of the topbar
-        let bar_bottom_fill = CellInstance::new(
-            0.0, 32.0,
-            viewport_width, 8.0,
-            theme_topbar,
-            [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 0.0, 0.0,
-            0.0, // square
-        );
-        ui_bg_instances.push(bar_bottom_fill);
 
         // (Unified bar bottom border is now drawn segmented below in the tabs rendering logic to bypass the active tab)
 
@@ -758,11 +809,16 @@ impl Pipeline {
 
             // 0. Draw window background (slate dark)
             let window_bg = CellInstance::new(
-                0.0, 0.0,
-                viewport_width, viewport_height,
+                0.0,
+                0.0,
+                viewport_width,
+                viewport_height,
                 theme_bg, // Terminal bg color
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 8.0, // radius of 8
             );
             term_bg_instances.push(window_bg);
@@ -770,11 +826,16 @@ impl Pipeline {
             // 3. Draw terminal background below the unified topbar,
             //    stopping before the bottombar area (15px).
             let terminal_bg = CellInstance::new(
-                0.0, 40.0,
-                viewport_width, viewport_height - 40.0 - 20.0,
+                0.0,
+                40.0,
+                viewport_width,
+                viewport_height - 40.0 - 20.0,
                 theme_bg,
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 0.0,
             );
             term_bg_instances.push(terminal_bg);
@@ -785,9 +846,12 @@ impl Pipeline {
             let fg_instances = &mut term_fg_instances;
 
             let visible_rows_count = visible_rows.round() as usize;
-            let mut row_cells: Vec<Vec<&alacritty_terminal::term::cell::Cell>> = vec![Vec::new(); visible_rows_count];
-            let mut row_points: Vec<Vec<alacritty_terminal::index::Point>> = vec![Vec::new(); visible_rows_count];
-            let mut row_hyperlinks: Vec<Vec<Option<std::sync::Arc<str>>>> = vec![Vec::new(); visible_rows_count];
+            let mut row_cells: Vec<Vec<&alacritty_terminal::term::cell::Cell>> =
+                vec![Vec::new(); visible_rows_count];
+            let mut row_points: Vec<Vec<alacritty_terminal::index::Point>> =
+                vec![Vec::new(); visible_rows_count];
+            let mut row_hyperlinks: Vec<Vec<Option<std::sync::Arc<str>>>> =
+                vec![Vec::new(); visible_rows_count];
 
             // 1. Draw solid background, selection, and underline, and collect cells for layout
             for Indexed { cell, point } in content.display_iter {
@@ -797,22 +861,23 @@ impl Pipeline {
                 if row < visible_rows_count {
                     row_cells[row].push(cell);
                     row_points[row].push(point);
-                    row_hyperlinks[row].push(cell.hyperlink().map(|h| std::sync::Arc::from(h.uri())));
+                    row_hyperlinks[row]
+                        .push(cell.hyperlink().map(|h| std::sync::Arc::from(h.uri())));
                 }
 
-                let is_default_bg = matches!(cell.bg,
+                let is_default_bg = matches!(
+                    cell.bg,
                     alacritty_terminal::vte::ansi::Color::Named(
                         alacritty_terminal::vte::ansi::NamedColor::Background
                     )
                 );
 
-                let in_search_match = search_matches.iter().any(|m| {
-                    m.line == point.line.0
-                        && col >= m.col && col < m.col + m.len
-                });
-                let is_current_search_match = search_matches.get(search_current_idx)
-                    .map(|m| m.line == point.line.0
-                        && col >= m.col && col < m.col + m.len)
+                let in_search_match = search_matches
+                    .iter()
+                    .any(|m| m.line == point.line.0 && col >= m.col && col < m.col + m.len);
+                let is_current_search_match = search_matches
+                    .get(search_current_idx)
+                    .map(|m| m.line == point.line.0 && col >= m.col && col < m.col + m.len)
                     .unwrap_or(false);
 
                 let cell_x = (col as f32 * cell_width).round() + Self::PADDING_LEFT;
@@ -820,12 +885,17 @@ impl Pipeline {
                 let actual_cell_width = next_cell_x - cell_x;
 
                 let cell_y = ((row as f32 + scroll_fraction) * cell_height).round() + padding_top;
-                let next_cell_y = (((row + 1) as f32 + scroll_fraction) * cell_height).round() + padding_top;
+                let next_cell_y =
+                    (((row + 1) as f32 + scroll_fraction) * cell_height).round() + padding_top;
                 let actual_cell_height = next_cell_y - cell_y;
 
                 // Selection check
                 let is_selected = if let Some(sel) = selection {
-                    let (min_p, max_p) = if sel.start <= sel.end { (sel.start, sel.end) } else { (sel.end, sel.start) };
+                    let (min_p, max_p) = if sel.start <= sel.end {
+                        (sel.start, sel.end)
+                    } else {
+                        (sel.end, sel.start)
+                    };
                     point >= min_p && point <= max_p
                 } else {
                     false
@@ -838,7 +908,9 @@ impl Pipeline {
                 };
 
                 if !is_default_bg {
-                    let is_wide = cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR);
+                    let is_wide = cell
+                        .flags
+                        .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR);
                     let cell_w = if is_wide {
                         let end_x = ((col + 2) as f32 * cell_width).round() + Self::PADDING_LEFT;
                         end_x - cell_x
@@ -848,11 +920,16 @@ impl Pipeline {
 
                     let bg = cell_bg_to_f32(cell.bg);
                     let bg_instance = CellInstance::new(
-                        cell_x, cell_y,
-                        cell_w, actual_cell_height,
+                        cell_x,
+                        cell_y,
+                        cell_w,
+                        actual_cell_height,
                         bg,
                         [0.0, 0.0, 0.0, 0.0],
-                        0.0, 0.0, 0.0, 0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
                         0.0,
                     );
                     bg_instances.push(bg_instance);
@@ -861,11 +938,16 @@ impl Pipeline {
                 if is_selected {
                     let sel_color = [66.0 / 255.0, 135.0 / 255.0, 245.0 / 255.0, 0.3];
                     let bg_instance = CellInstance::new(
-                        cell_x, cell_y,
-                        actual_cell_width, actual_cell_height,
+                        cell_x,
+                        cell_y,
+                        actual_cell_width,
+                        actual_cell_height,
                         sel_color,
                         [0.0, 0.0, 0.0, 0.0],
-                        0.0, 0.0, 0.0, 0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
                         0.0,
                     );
                     bg_instances.push(bg_instance);
@@ -874,11 +956,16 @@ impl Pipeline {
                 if is_hovered_url {
                     let underline_color = [66.0 / 255.0, 135.0 / 255.0, 245.0 / 255.0, 0.8];
                     let bg_instance = CellInstance::new(
-                        cell_x, cell_y + actual_cell_height - 2.0,
-                        actual_cell_width, 1.0,
+                        cell_x,
+                        cell_y + actual_cell_height - 2.0,
+                        actual_cell_width,
+                        1.0,
                         underline_color,
                         [0.0, 0.0, 0.0, 0.0],
-                        0.0, 0.0, 0.0, 0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
                         0.0,
                     );
                     bg_instances.push(bg_instance);
@@ -893,11 +980,16 @@ impl Pipeline {
                             [66.0 / 255.0, 135.0 / 255.0, 245.0 / 255.0, 0.55]
                         };
                         let bg_instance = CellInstance::new(
-                            cell_x, cell_y + actual_cell_height - 2.0,
-                            actual_cell_width, 1.0,
+                            cell_x,
+                            cell_y + actual_cell_height - 2.0,
+                            actual_cell_width,
+                            1.0,
                             underline_color,
                             [0.0, 0.0, 0.0, 0.0],
-                            0.0, 0.0, 0.0, 0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
                             0.0,
                         );
                         bg_instances.push(bg_instance);
@@ -911,11 +1003,16 @@ impl Pipeline {
                         [255.0 / 255.0, 220.0 / 255.0, 0.0, 0.75]
                     };
                     let bg_instance = CellInstance::new(
-                        cell_x, cell_y,
-                        actual_cell_width, actual_cell_height,
+                        cell_x,
+                        cell_y,
+                        actual_cell_width,
+                        actual_cell_height,
                         highlight_color,
                         [0.0, 0.0, 0.0, 0.0],
-                        0.0, 0.0, 0.0, 0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
                         0.0,
                     );
                     bg_instances.push(bg_instance);
@@ -929,7 +1026,9 @@ impl Pipeline {
             if use_ligatures {
                 for row in 0..visible_rows_count {
                     let cells = &row_cells[row];
-                    if cells.is_empty() { continue; }
+                    if cells.is_empty() {
+                        continue;
+                    }
 
                     // 1. Build row text
                     let mut row_text = String::new();
@@ -977,7 +1076,9 @@ impl Pipeline {
 
             for row in 0..visible_rows_count {
                 let cells = &row_cells[row];
-                if cells.is_empty() { continue; }
+                if cells.is_empty() {
+                    continue;
+                }
 
                 if let Some(shaping_result) = &row_shaping[row] {
                     let col_map = &shaping_result.col_map;
@@ -985,7 +1086,9 @@ impl Pipeline {
 
                     for (g_idx, info) in glyph_infos.iter().enumerate() {
                         let cluster = info.cluster as usize;
-                        if cluster >= col_map.len() { continue; }
+                        if cluster >= col_map.len() {
+                            continue;
+                        }
                         let start_col = col_map[cluster];
                         let end_col = if g_idx + 1 < glyph_infos.len() {
                             let next_cluster = glyph_infos[g_idx + 1].cluster as usize;
@@ -998,22 +1101,32 @@ impl Pipeline {
                             cells.len()
                         };
 
-                        if end_col <= start_col { continue; }
+                        if end_col <= start_col {
+                            continue;
+                        }
                         let cell = &cells[start_col];
 
                         if cell.c != ' ' && cell.c != '\0' {
                             let is_emoji_or_block_or_wide = crate::renderer::is_emoji(cell.c)
                                 || is_custom_block_drawing(cell.c)
                                 || crate::renderer::is_block_element(cell.c)
-                                || cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR);
+                                || cell
+                                    .flags
+                                    .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR);
 
-                            let cell_x = (start_col as f32 * cell_width).round() + Self::PADDING_LEFT;
-                            let cell_y = ((row as f32 + scroll_fraction) * cell_height).round() + padding_top;
-                            let next_cell_y = (((row + 1) as f32 + scroll_fraction) * cell_height).round() + padding_top;
+                            let cell_x =
+                                (start_col as f32 * cell_width).round() + Self::PADDING_LEFT;
+                            let cell_y = ((row as f32 + scroll_fraction) * cell_height).round()
+                                + padding_top;
+                            let next_cell_y = (((row + 1) as f32 + scroll_fraction) * cell_height)
+                                .round()
+                                + padding_top;
                             let actual_cell_height = next_cell_y - cell_y;
 
                             if !is_emoji_or_block_or_wide {
-                                if let Some(entry) = atlas.get_or_rasterize_glyph(info.glyph_id, device, queue) {
+                                if let Some(entry) =
+                                    atlas.get_or_rasterize_glyph(info.glyph_id, device, queue)
+                                {
                                     if entry.width > 0.0 && entry.height > 0.0 {
                                         let mut fg = cell_fg_to_f32(cell.fg, cell.flags);
                                         if cell.c == '❯' {
@@ -1025,37 +1138,39 @@ impl Pipeline {
                                         let uv_w = uv_end_x - uv_x;
                                         let uv_h = uv_end_y - uv_y;
 
-                                        let (glyph_x, glyph_y, glyph_w, glyph_h, is_color_val) = if entry.is_color {
-                                            let char_width = if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR) { 2.0 } else { 1.0 };
-                                            let scale = actual_cell_height / entry.height;
-                                            let render_w = entry.width * scale;
-                                            let render_h = actual_cell_height;
-                                            let x_offset = ((cell_width * char_width) - render_w) / 2.0;
-                                            (
-                                                (cell_x + x_offset.max(0.0)).round(),
-                                                cell_y.round(),
-                                                render_w,
-                                                render_h,
-                                                1.0,
-                                            )
-                                        } else if is_arrow_symbol(cell.c) {
-                                            let x_offset = (cell_width - entry.width) / 2.0;
-                                            (
-                                                (cell_x + x_offset).round(),
-                                                (cell_y + atlas.ascent() + entry.top).round(),
-                                                entry.width,
-                                                entry.height,
-                                                0.0,
-                                            )
-                                        } else {
-                                            (
-                                                (cell_x + entry.left).round(),
-                                                (cell_y + atlas.ascent() + entry.top).round(),
-                                                entry.width,
-                                                entry.height,
-                                                0.0,
-                                            )
-                                        };
+                                        let (glyph_x, glyph_y, glyph_w, glyph_h, is_color_val) =
+                                            if entry.is_color {
+                                                let char_width = if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR) { 2.0 } else { 1.0 };
+                                                let scale = actual_cell_height / entry.height;
+                                                let render_w = entry.width * scale;
+                                                let render_h = actual_cell_height;
+                                                let x_offset =
+                                                    ((cell_width * char_width) - render_w) / 2.0;
+                                                (
+                                                    (cell_x + x_offset.max(0.0)).round(),
+                                                    cell_y.round(),
+                                                    render_w,
+                                                    render_h,
+                                                    1.0,
+                                                )
+                                            } else if is_arrow_symbol(cell.c) {
+                                                let x_offset = (cell_width - entry.width) / 2.0;
+                                                (
+                                                    (cell_x + x_offset).round(),
+                                                    (cell_y + atlas.ascent() + entry.top).round(),
+                                                    entry.width,
+                                                    entry.height,
+                                                    0.0,
+                                                )
+                                            } else {
+                                                (
+                                                    (cell_x + entry.left).round(),
+                                                    (cell_y + atlas.ascent() + entry.top).round(),
+                                                    entry.width,
+                                                    entry.height,
+                                                    0.0,
+                                                )
+                                            };
 
                                         let text_instance = CellInstance::new(
                                             glyph_x,
@@ -1064,7 +1179,10 @@ impl Pipeline {
                                             glyph_h,
                                             fg,
                                             [0.0, 0.0, 0.0, 0.0],
-                                            uv_x, uv_y, uv_w, uv_h,
+                                            uv_x,
+                                            uv_y,
+                                            uv_w,
+                                            uv_h,
                                             is_color_val,
                                         );
                                         fg_instances.push(text_instance);
@@ -1074,13 +1192,23 @@ impl Pipeline {
                                 for sub_col in start_col..end_col {
                                     let sub_cell = &cells[sub_col];
                                     if sub_cell.c != ' ' && sub_cell.c != '\0' {
-                                        let sub_x = (sub_col as f32 * cell_width).round() + Self::PADDING_LEFT;
-                                        let next_sub_x = ((sub_col + 1) as f32 * cell_width).round() + Self::PADDING_LEFT;
+                                        let sub_x = (sub_col as f32 * cell_width).round()
+                                            + Self::PADDING_LEFT;
+                                        let next_sub_x = ((sub_col + 1) as f32 * cell_width)
+                                            .round()
+                                            + Self::PADDING_LEFT;
                                         let sub_w = next_sub_x - sub_x;
 
                                         render_single_char(
-                                            sub_cell, sub_x, cell_y, sub_w, actual_cell_height,
-                                            atlas, fg_instances, device, queue
+                                            sub_cell,
+                                            sub_x,
+                                            cell_y,
+                                            sub_w,
+                                            actual_cell_height,
+                                            atlas,
+                                            fg_instances,
+                                            device,
+                                            queue,
                                         );
                                     }
                                 }
@@ -1094,21 +1222,33 @@ impl Pipeline {
                 for (col_idx, cell) in cells.iter().enumerate() {
                     if cell.c != ' ' && cell.c != '\0' {
                         let cell_x = (col_idx as f32 * cell_width).round() + Self::PADDING_LEFT;
-                        let next_cell_x = ((col_idx + 1) as f32 * cell_width).round() + Self::PADDING_LEFT;
+                        let next_cell_x =
+                            ((col_idx + 1) as f32 * cell_width).round() + Self::PADDING_LEFT;
                         let actual_cell_width = next_cell_x - cell_x;
-                        let cell_y = ((row as f32 + scroll_fraction) * cell_height).round() + padding_top;
-                        let next_cell_y = (((row + 1) as f32 + scroll_fraction) * cell_height).round() + padding_top;
+                        let cell_y =
+                            ((row as f32 + scroll_fraction) * cell_height).round() + padding_top;
+                        let next_cell_y = (((row + 1) as f32 + scroll_fraction) * cell_height)
+                            .round()
+                            + padding_top;
                         let actual_cell_height = next_cell_y - cell_y;
 
                         render_single_char(
-                            cell, cell_x, cell_y, actual_cell_width, actual_cell_height,
-                            atlas, fg_instances, device, queue
+                            cell,
+                            cell_x,
+                            cell_y,
+                            actual_cell_width,
+                            actual_cell_height,
+                            atlas,
+                            fg_instances,
+                            device,
+                            queue,
                         );
                     }
                 }
             }
 
-            let mut term_instances_flat = Vec::with_capacity(term_bg_instances.len() + term_fg_instances.len() + 10);
+            let mut term_instances_flat =
+                Vec::with_capacity(term_bg_instances.len() + term_fg_instances.len() + 10);
             term_instances_flat.extend(term_bg_instances);
             term_instances_flat.extend(term_fg_instances);
             *cached_grid_instances = term_instances_flat.clone();
@@ -1117,7 +1257,6 @@ impl Pipeline {
         } else {
             cached_grid_instances.clone()
         };
-
 
         let bg_instances = &mut ui_bg_instances;
         let fg_instances = &mut ui_fg_instances;
@@ -1130,16 +1269,27 @@ impl Pipeline {
             let bb_y = viewport_height - BB_H;
             let bb_w = viewport_width;
 
-            let (bg_r, bg_g, bg_b) = named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::Background);
-            let theme_bg = [bg_r as f32 / 255.0, bg_g as f32 / 255.0, bg_b as f32 / 255.0, 1.0];
+            let (bg_r, bg_g, bg_b) =
+                named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::Background);
+            let theme_bg = [
+                bg_r as f32 / 255.0,
+                bg_g as f32 / 255.0,
+                bg_b as f32 / 255.0,
+                bg_alpha,
+            ];
 
             // Flat bottombar background — same color as terminal bg
             bg_instances.push(CellInstance::new(
-                bb_x, bb_y,
-                bb_w, BB_H,
+                bb_x,
+                bb_y,
+                bb_w,
+                BB_H,
                 theme_bg,
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 0.0,
             ));
 
@@ -1157,7 +1307,10 @@ impl Pipeline {
                     ($text:expr, $start_x:expr, $color:expr) => {{
                         let mut x = $start_x;
                         for c in $text.chars() {
-                            if c == ' ' { x += cell_w; continue; }
+                            if c == ' ' {
+                                x += cell_w;
+                                continue;
+                            }
                             if let Some(entry) = ui_atlas.get_or_rasterize(c, device, queue) {
                                 if entry.width > 0.0 {
                                     let gw = entry.width * scale;
@@ -1166,11 +1319,16 @@ impl Pipeline {
                                     let (aw, ah) = ui_atlas.atlas_size();
                                     let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                                     fg_instances.push(CellInstance::new(
-                                        glyph_x, glyph_y,
-                                        gw, entry.height * scale,
+                                        glyph_x,
+                                        glyph_y,
+                                        gw,
+                                        entry.height * scale,
                                         $color,
                                         [0.0, 0.0, 0.0, 0.0],
-                                        uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                                        uv_x,
+                                        uv_y,
+                                        uv_end_x - uv_x,
+                                        uv_end_y - uv_y,
                                         0.0,
                                     ));
                                     x += gw + 1.0;
@@ -1190,18 +1348,23 @@ impl Pipeline {
                     let (aw, ah) = ui_atlas.atlas_size();
                     let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                     fg_instances.push(CellInstance::new(
-                        x, icon_y,
-                        icon_size, icon_size,
-                        [0.75, 0.78, 0.85, 1.0],
+                        x,
+                        icon_y,
+                        icon_size,
+                        icon_size,
+                        with_opacity([0.75, 0.78, 0.85, 1.0], chrome_alpha),
                         [0.0, 0.0, 0.0, 0.0],
-                        uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                        uv_x,
+                        uv_y,
+                        uv_end_x - uv_x,
+                        uv_end_y - uv_y,
                         0.0,
                     ));
                     x += icon_size + 4.0;
                 }
 
                 // Branch name
-                let branch_color = [0.85, 0.88, 0.95, 1.0];
+                let branch_color = with_opacity([0.85, 0.88, 0.95, 1.0], chrome_alpha);
                 x = bb_text!(gs.branch.as_str(), x, branch_color);
 
                 // Dirty indicator dot
@@ -1210,11 +1373,16 @@ impl Pipeline {
                     let dot_r = 2.5f32;
                     let dot_y = bb_y + BB_H * 0.5;
                     bg_instances.push(CellInstance::new(
-                        x - dot_r, dot_y - dot_r,
-                        dot_r * 2.0, dot_r * 2.0,
-                        [0.95, 0.80, 0.45, 1.0],
+                        x - dot_r,
+                        dot_y - dot_r,
+                        dot_r * 2.0,
+                        dot_r * 2.0,
+                        with_opacity([0.95, 0.80, 0.45, 1.0], chrome_alpha),
                         [0.0, 0.0, 0.0, 0.0],
-                        0.0, 0.0, 0.0, 0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
                         dot_r,
                     ));
                     x += dot_r * 2.0 + 6.0;
@@ -1222,13 +1390,18 @@ impl Pipeline {
 
                 // Separator
                 x += 2.0;
-                let sep_color = [1.0, 1.0, 1.0, 0.08];
+                let sep_color = with_opacity([1.0, 1.0, 1.0, 0.08], chrome_alpha);
                 bg_instances.push(CellInstance::new(
-                    x, bb_y + 3.0,
-                    1.0, BB_H - 6.0,
+                    x,
+                    bb_y + 3.0,
+                    1.0,
+                    BB_H - 6.0,
                     sep_color,
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
                     0.0,
                 ));
                 x += 8.0;
@@ -1236,31 +1409,88 @@ impl Pipeline {
                 // Ahead
                 if gs.ahead > 0 {
                     let s = format!("\u{2191}{}", gs.ahead);
-                    x = bb_text!(s.as_str(), x, [0.45, 0.85, 0.55, 1.0]) + 6.0;
+                    x = bb_text!(
+                        s.as_str(),
+                        x,
+                        with_opacity([0.45, 0.85, 0.55, 1.0], chrome_alpha)
+                    ) + 6.0;
                 }
 
                 // Behind
                 if gs.behind > 0 {
                     let s = format!("\u{2193}{}", gs.behind);
-                    x = bb_text!(s.as_str(), x, [0.90, 0.55, 0.40, 1.0]) + 6.0;
+                    x = bb_text!(
+                        s.as_str(),
+                        x,
+                        with_opacity([0.90, 0.55, 0.40, 1.0], chrome_alpha)
+                    ) + 6.0;
                 }
 
                 // Modified
                 if gs.modified > 0 {
                     let s = format!("~{}", gs.modified);
-                    x = bb_text!(s.as_str(), x, [0.95, 0.80, 0.45, 1.0]) + 6.0;
+                    x = bb_text!(
+                        s.as_str(),
+                        x,
+                        with_opacity([0.95, 0.80, 0.45, 1.0], chrome_alpha)
+                    ) + 6.0;
                 }
 
                 // Staged
                 if gs.staged > 0 {
                     let s = format!("+{}", gs.staged);
-                    x = bb_text!(s.as_str(), x, [0.50, 0.80, 0.95, 1.0]) + 6.0;
+                    x = bb_text!(
+                        s.as_str(),
+                        x,
+                        with_opacity([0.50, 0.80, 0.95, 1.0], chrome_alpha)
+                    ) + 6.0;
                 }
 
                 // Untracked
                 if gs.untracked > 0 {
                     let s = format!("?{}", gs.untracked);
-                    x = bb_text!(s.as_str(), x, [0.65, 0.65, 0.75, 1.0]) + 6.0;
+                    x = bb_text!(
+                        s.as_str(),
+                        x,
+                        with_opacity([0.65, 0.65, 0.75, 1.0], chrome_alpha)
+                    ) + 6.0;
+                }
+
+                // Command duration — after git stats, before commit summary
+                if let (Some(duration_ms), Some(display_secs)) =
+                    (last_command_duration_ms, command_duration_display_secs)
+                {
+                    if display_secs < 5.0 {
+                        // Separator
+                        x += 4.0;
+                        let sep_color = with_opacity([1.0, 1.0, 1.0, 0.08], chrome_alpha);
+                        bg_instances.push(CellInstance::new(
+                            x,
+                            bb_y + 3.0,
+                            1.0,
+                            BB_H - 6.0,
+                            sep_color,
+                            [0.0, 0.0, 0.0, 0.0],
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                        ));
+                        x += 8.0;
+
+                        let duration_text = if duration_ms < 1000 {
+                            format!("{}ms", duration_ms)
+                        } else {
+                            format!("{:.1}s", duration_ms as f32 / 1000.0)
+                        };
+                        let duration_color = if exit_code == Some(0) || exit_code.is_none() {
+                            with_opacity([0.45, 0.85, 0.55, 1.0], chrome_alpha)
+                        } else {
+                            with_opacity([0.95, 0.50, 0.45, 1.0], chrome_alpha)
+                        };
+                        x = bb_text!(&duration_text, x, duration_color) + 6.0;
+                    }
                 }
 
                 // Last commit summary — right-aligned, dimmed
@@ -1273,14 +1503,79 @@ impl Pipeline {
                     // Measure text width to right-align
                     let mut text_w = 0.0f32;
                     for c in summary_text.chars() {
-                        if c == ' ' { text_w += cell_w; continue; }
+                        if c == ' ' {
+                            text_w += cell_w;
+                            continue;
+                        }
                         if let Some(entry) = ui_atlas.get_or_rasterize(c, device, queue) {
                             text_w += entry.width * scale + 1.0;
                         }
                     }
                     let right_x = viewport_width - text_w - 8.0;
                     if right_x > x + 16.0 {
-                        let _ = bb_text!(summary_text.as_str(), right_x, [0.50, 0.50, 0.55, 0.6]);
+                        let _ = bb_text!(
+                            summary_text.as_str(),
+                            right_x,
+                            with_opacity([0.50, 0.50, 0.55, 0.6], chrome_alpha)
+                        );
+                    }
+                }
+            }
+
+            // Command duration when no git repo
+            if git_status.is_none() {
+                if let (Some(duration_ms), Some(display_secs)) =
+                    (last_command_duration_ms, command_duration_display_secs)
+                {
+                    if display_secs < 5.0 {
+                        let bb_font: f32 = 12.0;
+                        let s = bb_font / ui_atlas.font_size();
+                        let cw = ui_atlas.cell_size().0 * s;
+                        let asc = ui_atlas.ascent() * s;
+                        let desc = asc * 0.3;
+                        let tbh = asc + desc;
+                        let bl = bb_y + (BB_H - tbh) / 2.0 + asc;
+
+                        let duration_text = if duration_ms < 1000 {
+                            format!("{}ms", duration_ms)
+                        } else {
+                            format!("{:.1}s", duration_ms as f32 / 1000.0)
+                        };
+                        let duration_color = if exit_code == Some(0) || exit_code.is_none() {
+                            with_opacity([0.45, 0.85, 0.55, 1.0], chrome_alpha)
+                        } else {
+                            with_opacity([0.95, 0.50, 0.45, 1.0], chrome_alpha)
+                        };
+                        let mut dx = 8.0f32;
+                        for c in duration_text.chars() {
+                            if c == ' ' {
+                                dx += cw;
+                                continue;
+                            }
+                            if let Some(entry) = ui_atlas.get_or_rasterize(c, device, queue) {
+                                if entry.width > 0.0 {
+                                    let gw = entry.width * s;
+                                    let gx = (dx + entry.left * s).round();
+                                    let gy = (bl + entry.top * s).round();
+                                    let (aw, ah) = ui_atlas.atlas_size();
+                                    let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                                    bg_instances.push(CellInstance::new(
+                                        gx,
+                                        gy,
+                                        gw,
+                                        entry.height * s,
+                                        duration_color,
+                                        [0.0, 0.0, 0.0, 0.0],
+                                        uv_x,
+                                        uv_y,
+                                        uv_end_x - uv_x,
+                                        uv_end_y - uv_y,
+                                        0.0,
+                                    ));
+                                    dx += gw + 1.0;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1299,22 +1594,35 @@ impl Pipeline {
 
             // Floating block background with rounded corners
             let bar_bg = CellInstance::new(
-                bar_x, bar_y,
-                bar_w, bar_h,
-                [18.0 / 255.0, 18.0 / 255.0, 22.0 / 255.0, 0.98],
+                bar_x,
+                bar_y,
+                bar_w,
+                bar_h,
+                with_opacity(
+                    [18.0 / 255.0, 18.0 / 255.0, 22.0 / 255.0, 0.98],
+                    chrome_alpha,
+                ),
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 bar_radius,
             );
             bg_instances.push(bar_bg);
 
             // Subtle 1px border to define the block against the terminal
             let border = CellInstance::new(
-                bar_x + 0.5, bar_y + 0.5,
-                bar_w - 1.0, bar_h - 1.0,
-                [1.0, 1.0, 1.0, 0.10],
+                bar_x + 0.5,
+                bar_y + 0.5,
+                bar_w - 1.0,
+                bar_h - 1.0,
+                with_opacity([1.0, 1.0, 1.0, 0.10], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 bar_radius,
             );
             bg_instances.push(border);
@@ -1347,8 +1655,12 @@ impl Pipeline {
             let text_right_edge = bar_x + bar_w - 70.0f32;
 
             for c in search_query_render.chars() {
-                if c == '\0' { continue; }
-                if cx > text_right_edge { break; }
+                if c == '\0' {
+                    continue;
+                }
+                if cx > text_right_edge {
+                    break;
+                }
                 if c == ' ' {
                     cx += cell_w;
                     continue;
@@ -1369,11 +1681,16 @@ impl Pipeline {
                     // inter-letter gap is uniform regardless of glyph shape.
                     let glyph_x = cx + (cell_w - gw) * 0.5;
                     fg_instances.push(CellInstance::new(
-                        glyph_x, glyph_y,
-                        gw, gh,
-                        [1.0, 1.0, 1.0, 1.0],
+                        glyph_x,
+                        glyph_y,
+                        gw,
+                        gh,
+                        with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha),
                         [0.0, 0.0, 0.0, 0.0],
-                        uv_x, uv_y, uv_w, uv_h,
+                        uv_x,
+                        uv_y,
+                        uv_w,
+                        uv_h,
                         0.0,
                     ));
                     cx += cell_w;
@@ -1387,11 +1704,16 @@ impl Pipeline {
                 // rendered letters.
                 let cursor_top = baseline_y - ascent;
                 fg_instances.push(CellInstance::new(
-                    cx, cursor_top,
-                    1.5, ascent,
-                    [1.0, 1.0, 1.0, 0.85],
+                    cx,
+                    cursor_top,
+                    1.5,
+                    ascent,
+                    with_opacity([1.0, 1.0, 1.0, 0.85], chrome_alpha),
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
                     0.0,
                 ));
             }
@@ -1401,9 +1723,9 @@ impl Pipeline {
             let current = if total > 0 { search_current_idx + 1 } else { 0 };
             let count_str = format!("{} / {}", current, total);
             let count_color = if total == 0 {
-                [0.6, 0.6, 0.6, 1.0]
+                with_opacity([0.6, 0.6, 0.6, 1.0], chrome_alpha)
             } else {
-                [1.0, 0.85, 0.30, 1.0]
+                with_opacity([1.0, 0.85, 0.30, 1.0], chrome_alpha)
             };
             let count_len = count_str.chars().count();
             let count_total_w = count_len as f32 * cell_w;
@@ -1427,11 +1749,16 @@ impl Pipeline {
                     let glyph_y = baseline_y + entry.top * scale;
                     let glyph_x = count_x + (cell_w - gw) * 0.5;
                     fg_instances.push(CellInstance::new(
-                        glyph_x, glyph_y,
-                        gw, gh,
+                        glyph_x,
+                        glyph_y,
+                        gw,
+                        gh,
                         count_color,
                         [0.0, 0.0, 0.0, 0.0],
-                        uv_x, uv_y, uv_w, uv_h,
+                        uv_x,
+                        uv_y,
+                        uv_w,
+                        uv_h,
                         0.0,
                     ));
                     count_x += cell_w;
@@ -1452,11 +1779,16 @@ impl Pipeline {
             let uv_h = uv_end_y - uv_y;
 
             fg_instances.push(CellInstance::new(
-                glyph_x, glyph_y,
-                glyph_w, glyph_h,
-                [1.0, 1.0, 1.0, 1.0],
+                glyph_x,
+                glyph_y,
+                glyph_w,
+                glyph_h,
+                with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                uv_x, uv_y, uv_w, uv_h,
+                uv_x,
+                uv_y,
+                uv_w,
+                uv_h,
                 1.0, // is_color = 1.0
             ));
         } else {
@@ -1473,11 +1805,16 @@ impl Pipeline {
                 let uv_h = uv_end_y - uv_y;
 
                 fg_instances.push(CellInstance::new(
-                    glyph_x, glyph_y,
-                    glyph_w, glyph_h,
-                    [1.0, 0.85, 0.20, 1.0], // Vibrant yellow
+                    glyph_x,
+                    glyph_y,
+                    glyph_w,
+                    glyph_h,
+                    with_opacity([1.0, 0.85, 0.20, 1.0], chrome_alpha), // Vibrant yellow
                     [0.0, 0.0, 0.0, 0.0],
-                    uv_x, uv_y, uv_w, uv_h,
+                    uv_x,
+                    uv_y,
+                    uv_w,
+                    uv_h,
                     0.0,
                 ));
             }
@@ -1498,38 +1835,53 @@ impl Pipeline {
         // active tab has NO bottom border, allowing it to merge seamlessly.
         if active_tab_index < tab_titles.len() {
             let active_tab_x = tab_start_x + active_tab_index as f32 * tab_width;
-            
+
             // Left segment
             if active_tab_x > 0.0 {
                 bg_instances.push(CellInstance::new(
-                    0.0, 39.0,
-                    active_tab_x, 1.0,
-                    [1.0, 1.0, 1.0, 0.06],
+                    0.0,
+                    39.0,
+                    active_tab_x,
+                    1.0,
+                    with_opacity([1.0, 1.0, 1.0, 0.06], chrome_alpha),
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
                     0.0,
                 ));
             }
-            
+
             // Right segment
             let right_start = active_tab_x + tab_width;
             if right_start < viewport_width {
                 bg_instances.push(CellInstance::new(
-                    right_start, 39.0,
-                    viewport_width - right_start, 1.0,
-                    [1.0, 1.0, 1.0, 0.06],
+                    right_start,
+                    39.0,
+                    viewport_width - right_start,
+                    1.0,
+                    with_opacity([1.0, 1.0, 1.0, 0.06], chrome_alpha),
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
                     0.0,
                 ));
             }
         } else {
             bg_instances.push(CellInstance::new(
-                0.0, 39.0,
-                viewport_width, 1.0,
-                [1.0, 1.0, 1.0, 0.06],
+                0.0,
+                39.0,
+                viewport_width,
+                1.0,
+                with_opacity([1.0, 1.0, 1.0, 0.06], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 0.0, 0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
                 0.0,
             ));
         }
@@ -1541,34 +1893,49 @@ impl Pipeline {
             let is_active = i == active_tab_index;
             let is_hovered = hovered_tab_index == Some(i);
 
-            // Active tab bg matches theme terminal bg so the tab merges seamlessly
-            // with the terminal area below. Inactive tab bg is transparent.
+            // Active tab bg uses theme_active_tab (slightly lighter than
+            // the rest of the topbar) so it reads as elevated/selected.
             if is_active {
                 bg_instances.push(CellInstance::new(
-                    tab_x, 0.0,
-                    tab_width, 40.0,
-                    theme_bg,
+                    tab_x,
+                    0.0,
+                    tab_width,
+                    40.0,
+                    theme_active_tab,
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
                     0.0,
                 ));
 
                 // Left border of active tab (subtle 1px vertical line)
                 bg_instances.push(CellInstance::new(
-                    tab_x, 0.0,
-                    1.0, 40.0,
-                    [1.0, 1.0, 1.0, 0.12],
+                    tab_x,
+                    0.0,
+                    1.0,
+                    40.0,
+                    with_opacity([1.0, 1.0, 1.0, 0.12], chrome_alpha),
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
                     0.0,
                 ));
                 // Right border of active tab (subtle 1px vertical line)
                 bg_instances.push(CellInstance::new(
-                    tab_x + tab_width, 0.0,
-                    1.0, 40.0,
-                    [1.0, 1.0, 1.0, 0.12],
+                    tab_x + tab_width,
+                    0.0,
+                    1.0,
+                    40.0,
+                    with_opacity([1.0, 1.0, 1.0, 0.12], chrome_alpha),
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
                     0.0,
                 ));
             }
@@ -1576,11 +1943,16 @@ impl Pipeline {
             // Draw vertical separator (1px vertical line) between inactive tabs only (active tab is separated by its own borders)
             if i + 1 < tab_titles.len() && i != active_tab_index && i + 1 != active_tab_index {
                 bg_instances.push(CellInstance::new(
-                    tab_x + tab_width, 12.0,
-                    1.0, 16.0,
-                    [1.0, 1.0, 1.0, 0.05], // Very subtle separator
+                    tab_x + tab_width,
+                    12.0,
+                    1.0,
+                    16.0,
+                    with_opacity([1.0, 1.0, 1.0, 0.05], chrome_alpha), // Very subtle separator
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
                     0.0,
                 ));
             }
@@ -1605,7 +1977,7 @@ impl Pipeline {
                 while !truncated_title.is_empty() && current_w > max_w - 18.0 {
                     if let Some(c) = truncated_title.pop() {
                         if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
-                           current_w -= entry.width * scale + 1.0;
+                            current_w -= entry.width * scale + 1.0;
                         }
                     }
                 }
@@ -1614,11 +1986,11 @@ impl Pipeline {
 
             let mut char_x = tab_x + 14.0f32;
             let fg_color = if is_active {
-                [1.0, 1.0, 1.0, 1.0] // Active tab text (full opacity)
+                with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha) // Active tab text (full opacity)
             } else if is_hovered {
-                [1.0, 1.0, 1.0, 0.70] // Hover tab text (slightly increased opacity)
+                with_opacity([1.0, 1.0, 1.0, 0.70], chrome_alpha) // Hover tab text
             } else {
-                [1.0, 1.0, 1.0, 0.30] // Inactive tab text (low opacity)
+                with_opacity([1.0, 1.0, 1.0, 0.30], chrome_alpha) // Inactive tab text
             };
 
             let scaled_ascent = atlas.ascent() * scale;
@@ -1637,22 +2009,32 @@ impl Pipeline {
                     let uv_h = uv_end_y - uv_y;
 
                     fg_instances.push(CellInstance::new(
-                        glyph_x, glyph_y,
-                        entry_w, entry_h,
+                        glyph_x,
+                        glyph_y,
+                        entry_w,
+                        entry_h,
                         fg_color,
                         [0.0, 0.0, 0.0, 0.0],
-                        uv_x, uv_y, uv_w, uv_h,
+                        uv_x,
+                        uv_y,
+                        uv_w,
+                        uv_h,
                         0.0,
                     ));
 
                     if is_active {
                         // Bold simulation
                         fg_instances.push(CellInstance::new(
-                            glyph_x + 0.35, glyph_y,
-                            entry_w, entry_h,
+                            glyph_x + 0.35,
+                            glyph_y,
+                            entry_w,
+                            entry_h,
                             fg_color,
                             [0.0, 0.0, 0.0, 0.0],
-                            uv_x, uv_y, uv_w, uv_h,
+                            uv_x,
+                            uv_y,
+                            uv_w,
+                            uv_h,
                             0.0,
                         ));
                     }
@@ -1670,11 +2052,16 @@ impl Pipeline {
                     if is_close_hovered {
                         // Subtle circle background rgba(255,255,255,0.10)
                         bg_instances.push(CellInstance::new(
-                            close_x - 1.0, 11.0,
-                            18.0, 18.0,
-                            [1.0, 1.0, 1.0, 0.10],
+                            close_x - 1.0,
+                            11.0,
+                            18.0,
+                            18.0,
+                            with_opacity([1.0, 1.0, 1.0, 0.10], chrome_alpha),
                             [0.0, 0.0, 0.0, 0.0],
-                            0.0, 0.0, 1.0, 1.0,
+                            0.0,
+                            0.0,
+                            1.0,
+                            1.0,
                             9.0, // perfect circle
                         ));
                     }
@@ -1689,17 +2076,22 @@ impl Pipeline {
                     let uv_h = uv_end_y - uv_y;
 
                     let close_color = if is_close_hovered {
-                        [1.0, 1.0, 1.0, 0.90]
+                        with_opacity([1.0, 1.0, 1.0, 0.90], chrome_alpha)
                     } else {
-                        [1.0, 1.0, 1.0, 0.40]
+                        with_opacity([1.0, 1.0, 1.0, 0.40], chrome_alpha)
                     };
 
                     fg_instances.push(CellInstance::new(
-                        cx, cy,
-                        entry_w, entry_h,
+                        cx,
+                        cy,
+                        entry_w,
+                        entry_h,
                         close_color,
                         [0.0, 0.0, 0.0, 0.0],
-                        uv_x, uv_y, uv_w, uv_h,
+                        uv_x,
+                        uv_y,
+                        uv_w,
+                        uv_h,
                         0.0,
                     ));
                 }
@@ -1710,11 +2102,16 @@ impl Pipeline {
         let new_tab_x = tab_start_x + tab_titles.len() as f32 * tab_width;
         if hover_new_tab {
             bg_instances.push(CellInstance::new(
-                new_tab_x, 0.0,
-                32.0, 40.0,
-                [1.0, 1.0, 1.0, 0.04], // Extremely subtle hover feedback
+                new_tab_x,
+                0.0,
+                32.0,
+                40.0,
+                with_opacity([1.0, 1.0, 1.0, 0.04], chrome_alpha), // Extremely subtle hover feedback
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 0.0,
             ));
         }
@@ -1729,17 +2126,22 @@ impl Pipeline {
             let uv_h = uv_end_y - uv_y;
 
             let icon_color = if hover_new_tab {
-                [1.0, 1.0, 1.0, 0.70] // Consistent with hover tab text
+                with_opacity([1.0, 1.0, 1.0, 0.70], chrome_alpha) // Consistent with hover tab text
             } else {
-                [1.0, 1.0, 1.0, 0.35] // Consistent with inactive tab text
+                with_opacity([1.0, 1.0, 1.0, 0.35], chrome_alpha) // Consistent with inactive tab text
             };
 
             fg_instances.push(CellInstance::new(
-                cx, cy,
-                entry_w, entry_h,
+                cx,
+                cy,
+                entry_w,
+                entry_h,
                 icon_color,
                 [0.0, 0.0, 0.0, 0.0],
-                uv_x, uv_y, uv_w, uv_h,
+                uv_x,
+                uv_y,
+                uv_w,
+                uv_h,
                 0.0,
             ));
         }
@@ -1755,11 +2157,16 @@ impl Pipeline {
                 };
                 let indicator_x = tab_start_x + target as f32 * tab_w;
                 bg_instances.push(CellInstance::new(
-                    indicator_x - 1.0, 4.0,
-                    2.0, 32.0,
+                    indicator_x - 1.0,
+                    4.0,
+                    2.0,
+                    32.0,
                     [0.4, 0.6, 1.0, 0.8],
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
                     0.0,
                 ));
             }
@@ -1781,40 +2188,71 @@ impl Pipeline {
 
             // Draw button background (rounded rect with border)
             let border_color = if hover_update {
-                [255.0 / 255.0, 255.0 / 255.0, 255.0 / 255.0, 0.20] // Lighter border on hover
+                with_opacity(
+                    [255.0 / 255.0, 255.0 / 255.0, 255.0 / 255.0, 0.20],
+                    chrome_alpha,
+                ) // Lighter border on hover
             } else {
-                [255.0 / 255.0, 255.0 / 255.0, 255.0 / 255.0, 0.10] // Subtle border normally
+                with_opacity(
+                    [255.0 / 255.0, 255.0 / 255.0, 255.0 / 255.0, 0.10],
+                    chrome_alpha,
+                ) // Subtle border normally
             };
             let btn_bg_color = if update_in_progress {
-                [40.0 / 255.0, 40.0 / 255.0, 40.0 / 255.0, 1.0]
+                with_opacity(
+                    [40.0 / 255.0, 40.0 / 255.0, 40.0 / 255.0, 1.0],
+                    chrome_alpha,
+                )
             } else if hover_update {
-                [24.0 / 255.0, 24.0 / 255.0, 24.0 / 255.0, 1.0] // Slightly lighter grey on hover
+                with_opacity(
+                    [24.0 / 255.0, 24.0 / 255.0, 24.0 / 255.0, 1.0],
+                    chrome_alpha,
+                ) // Slightly lighter grey on hover
             } else {
-                [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0] // #0c0c0c
+                with_opacity(
+                    [12.0 / 255.0, 12.0 / 255.0, 12.0 / 255.0, 1.0],
+                    chrome_alpha,
+                ) // #0c0c0c
             };
 
             // Outer border
             bg_instances.push(CellInstance::new(
-                update_x, update_y,
-                update_btn_w, update_btn_h,
+                update_x,
+                update_y,
+                update_btn_w,
+                update_btn_h,
                 border_color,
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 5.0, // 5px corner radius
             ));
 
             // Inner background
             bg_instances.push(CellInstance::new(
-                update_x + 1.0, update_y + 1.0,
-                update_btn_w - 2.0, update_btn_h - 2.0,
+                update_x + 1.0,
+                update_y + 1.0,
+                update_btn_w - 2.0,
+                update_btn_h - 2.0,
                 btn_bg_color,
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 4.0, // 4px corner radius
             ));
 
             // Draw button text
-            let text = if update_completed { "Reiniciar" } else if update_in_progress { "Updating..." } else { "Update" };
+            let text = if update_completed {
+                "Reiniciar"
+            } else if update_in_progress {
+                "Updating..."
+            } else {
+                "Update"
+            };
             let text_scale = 11.0f32 / atlas.font_size();
             let text_cell_w = atlas.cell_size().0 * text_scale;
 
@@ -1855,11 +2293,16 @@ impl Pipeline {
                         let uv_h = uv_end_y - uv_y;
 
                         fg_instances.push(CellInstance::new(
-                            glyph_x, glyph_y,
-                            glyph_w, glyph_h,
-                            [1.0, 1.0, 1.0, 1.0], // White text
+                            glyph_x,
+                            glyph_y,
+                            glyph_w,
+                            glyph_h,
+                            with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha), // White text
                             [0.0, 0.0, 0.0, 0.0],
-                            uv_x, uv_y, uv_w, uv_h,
+                            uv_x,
+                            uv_y,
+                            uv_w,
+                            uv_h,
                             0.0,
                         ));
                         curr_x += (entry.width + 1.0) * text_scale;
@@ -1871,11 +2314,16 @@ impl Pipeline {
         // 1. Settings button (⚙)
         if hover_settings {
             bg_instances.push(CellInstance::new(
-                settings_x, controls_y,
-                28.0, 28.0,
-                [1.0, 1.0, 1.0, 0.12], // rgba(255,255,255,0.12)
+                settings_x,
+                controls_y,
+                28.0,
+                28.0,
+                with_opacity([1.0, 1.0, 1.0, 0.12], chrome_alpha), // rgba(255,255,255,0.12)
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 6.0,
             ));
         }
@@ -1889,24 +2337,38 @@ impl Pipeline {
             let uv_w = uv_end_x - uv_x;
             let uv_h = uv_end_y - uv_y;
 
-            let fg_color = if hover_settings { [1.0, 1.0, 1.0, 1.0] } else { [0.7, 0.7, 0.75, 1.0] };
+            let fg_color = if hover_settings {
+                with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha)
+            } else {
+                with_opacity([0.7, 0.7, 0.75, 1.0], chrome_alpha)
+            };
             fg_instances.push(CellInstance::new(
-                glyph_x, glyph_y,
-                entry_w, entry_h,
+                glyph_x,
+                glyph_y,
+                entry_w,
+                entry_h,
                 fg_color,
                 [0.0, 0.0, 0.0, 0.0],
-                uv_x, uv_y, uv_w, uv_h,
+                uv_x,
+                uv_y,
+                uv_w,
+                uv_h,
                 0.0,
             ));
         }
 
         // 2. Vertical separator line (rgba(255,255,255,0.08))
         bg_instances.push(CellInstance::new(
-            viewport_width - 105.0f32, 12.0f32,
-            1.0, 16.0,
-            [1.0, 1.0, 1.0, 0.08],
+            viewport_width - 105.0f32,
+            12.0f32,
+            1.0,
+            16.0,
+            with_opacity([1.0, 1.0, 1.0, 0.08], chrome_alpha),
             [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
             0.0,
         ));
 
@@ -1914,11 +2376,16 @@ impl Pipeline {
         let min_x = viewport_width - 100.0f32;
         if hover_min {
             bg_instances.push(CellInstance::new(
-                min_x, controls_y,
-                28.0, 28.0,
-                [1.0, 1.0, 1.0, 0.12], // rgba(255,255,255,0.12)
+                min_x,
+                controls_y,
+                28.0,
+                28.0,
+                with_opacity([1.0, 1.0, 1.0, 0.12], chrome_alpha), // rgba(255,255,255,0.12)
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 6.0,
             ));
         }
@@ -1932,13 +2399,22 @@ impl Pipeline {
             let uv_w = uv_end_x - uv_x;
             let uv_h = uv_end_y - uv_y;
 
-            let fg_color = if hover_min { [1.0, 1.0, 1.0, 1.0] } else { [0.8, 0.8, 0.85, 1.0] };
+            let fg_color = if hover_min {
+                with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha)
+            } else {
+                with_opacity([0.8, 0.8, 0.85, 1.0], chrome_alpha)
+            };
             fg_instances.push(CellInstance::new(
-                glyph_x, glyph_y,
-                entry_w, entry_h,
+                glyph_x,
+                glyph_y,
+                entry_w,
+                entry_h,
                 fg_color,
                 [0.0, 0.0, 0.0, 0.0],
-                uv_x, uv_y, uv_w, uv_h,
+                uv_x,
+                uv_y,
+                uv_w,
+                uv_h,
                 0.0,
             ));
         }
@@ -1947,11 +2423,16 @@ impl Pipeline {
         let max_x = viewport_width - 68.0f32;
         if hover_max {
             bg_instances.push(CellInstance::new(
-                max_x, controls_y,
-                28.0, 28.0,
-                [1.0, 1.0, 1.0, 0.12], // rgba(255,255,255,0.12)
+                max_x,
+                controls_y,
+                28.0,
+                28.0,
+                with_opacity([1.0, 1.0, 1.0, 0.12], chrome_alpha), // rgba(255,255,255,0.12)
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 6.0,
             ));
         }
@@ -1965,13 +2446,22 @@ impl Pipeline {
             let uv_w = uv_end_x - uv_x;
             let uv_h = uv_end_y - uv_y;
 
-            let fg_color = if hover_max { [1.0, 1.0, 1.0, 1.0] } else { [0.8, 0.8, 0.85, 1.0] };
+            let fg_color = if hover_max {
+                with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha)
+            } else {
+                with_opacity([0.8, 0.8, 0.85, 1.0], chrome_alpha)
+            };
             fg_instances.push(CellInstance::new(
-                glyph_x, glyph_y,
-                entry_w, entry_h,
+                glyph_x,
+                glyph_y,
+                entry_w,
+                entry_h,
                 fg_color,
                 [0.0, 0.0, 0.0, 0.0],
-                uv_x, uv_y, uv_w, uv_h,
+                uv_x,
+                uv_y,
+                uv_w,
+                uv_h,
                 0.0,
             ));
         }
@@ -1980,11 +2470,19 @@ impl Pipeline {
         let close_x = viewport_width - 36.0f32;
         if hover_close {
             bg_instances.push(CellInstance::new(
-                close_x, controls_y,
-                28.0, 28.0,
-                [255.0 / 255.0, 96.0 / 255.0, 96.0 / 255.0, 0.80], // rgba(255,96,96,0.80)
+                close_x,
+                controls_y,
+                28.0,
+                28.0,
+                with_opacity(
+                    [255.0 / 255.0, 96.0 / 255.0, 96.0 / 255.0, 0.80],
+                    chrome_alpha,
+                ), // rgba(255,96,96,0.80)
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 6.0,
             ));
         }
@@ -1998,41 +2496,54 @@ impl Pipeline {
             let uv_w = uv_end_x - uv_x;
             let uv_h = uv_end_y - uv_y;
 
-            let fg_color = if hover_close { [1.0, 1.0, 1.0, 1.0] } else { [0.8, 0.8, 0.85, 1.0] };
+            let fg_color = if hover_close {
+                with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha)
+            } else {
+                with_opacity([0.8, 0.8, 0.85, 1.0], chrome_alpha)
+            };
             fg_instances.push(CellInstance::new(
-                glyph_x, glyph_y,
-                entry_w, entry_h,
+                glyph_x,
+                glyph_y,
+                entry_w,
+                entry_h,
                 fg_color,
                 [0.0, 0.0, 0.0, 0.0],
-                uv_x, uv_y, uv_w, uv_h,
+                uv_x,
+                uv_y,
+                uv_w,
+                uv_h,
                 0.0,
             ));
         }
-
-
 
         // Draw cursor
         let mut cursor_index = None;
         let cursor_row = content.cursor.point.line.0 + content.display_offset as i32;
         if cursor_row >= 0 && cursor_row < visible_rows as i32 {
-            let cursor_x = (content.cursor.point.column.0 as f32 * cell_width).round() + Self::PADDING_LEFT;
-            let cursor_y = ((cursor_row as f32 + scroll_fraction) * cell_height).round() + padding_top;
+            let cursor_x =
+                (content.cursor.point.column.0 as f32 * cell_width).round() + Self::PADDING_LEFT;
+            let cursor_y =
+                ((cursor_row as f32 + scroll_fraction) * cell_height).round() + padding_top;
 
             // Match shape to determine cursor size, offsets, and base opacity
             let (c_w, c_h, c_ox, c_oy, c_alpha) = match content.cursor.shape {
-                alacritty_terminal::vte::ansi::CursorShape::Block => (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32),
-                alacritty_terminal::vte::ansi::CursorShape::Underline => (cell_width, 1.0f32, 0.0f32, cell_height - 1.0f32, 0.9f32),
-                alacritty_terminal::vte::ansi::CursorShape::Beam => (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32),
-                alacritty_terminal::vte::ansi::CursorShape::Hidden => (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32),
+                alacritty_terminal::vte::ansi::CursorShape::Block => {
+                    (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32)
+                }
+                alacritty_terminal::vte::ansi::CursorShape::Underline => {
+                    (cell_width, 1.0f32, 0.0f32, cell_height - 1.0f32, 0.9f32)
+                }
+                alacritty_terminal::vte::ansi::CursorShape::Beam => {
+                    (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32)
+                }
+                alacritty_terminal::vte::ansi::CursorShape::Hidden => {
+                    (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32)
+                }
                 _ => (1.0f32, cell_height, 0.0f32, 0.0f32, 0.9f32),
             };
 
             if c_w > 0.0 && c_h > 0.0 {
-                let final_alpha = if cursor_visible {
-                    c_alpha
-                } else {
-                    0.0
-                };
+                let final_alpha = if cursor_visible { c_alpha } else { 0.0 };
 
                 let cursor_color = [1.0, 1.0, 1.0, final_alpha];
                 let cursor_instance = CellInstance::new(
@@ -2042,7 +2553,10 @@ impl Pipeline {
                     c_h,
                     cursor_color,
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 0.0, 0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
                     0.0,
                 );
                 cursor_index = Some(instances.len());
@@ -2060,11 +2574,16 @@ impl Pipeline {
 
             // Draw track (rgba(255,255,255,0.08))
             let track_instance = CellInstance::new(
-                track_x, track_top,
-                track_width, track_height,
+                track_x,
+                track_top,
+                track_width,
+                track_height,
                 [1.0, 1.0, 1.0, 0.08 * scrollbar_alpha],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 3.0, // corner radius of 3px (half of 6px width for perfect pill shape)
             );
             instances.push(track_instance);
@@ -2086,11 +2605,16 @@ impl Pipeline {
 
                 // Draw thumb (rgba(255,255,255,0.3))
                 let thumb_instance = CellInstance::new(
-                    track_x, thumb_y,
-                    track_width, thumb_h,
+                    track_x,
+                    thumb_y,
+                    track_width,
+                    thumb_h,
                     [1.0, 1.0, 1.0, 0.3 * scrollbar_alpha],
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
                     3.0, // corner radius of 3px
                 );
                 instances.push(thumb_instance);
@@ -2137,22 +2661,32 @@ impl Pipeline {
                 // Outer border
                 let border_color = [1.0, 1.0, 1.0, 0.12 * alpha];
                 instances.push(CellInstance::new(
-                    toast_x, toast_y,
-                    toast_w, toast_h,
+                    toast_x,
+                    toast_y,
+                    toast_w,
+                    toast_h,
                     border_color,
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
                     8.0,
                 ));
 
                 // Inner background
                 let bg_color = [40.0 / 255.0, 42.0 / 255.0, 46.0 / 255.0, 0.95 * alpha];
                 instances.push(CellInstance::new(
-                    toast_x + 1.0, toast_y + 1.0,
-                    toast_w - 2.0, toast_h - 2.0,
+                    toast_x + 1.0,
+                    toast_y + 1.0,
+                    toast_w - 2.0,
+                    toast_h - 2.0,
                     bg_color,
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
                     7.0,
                 ));
 
@@ -2176,11 +2710,16 @@ impl Pipeline {
                             let uv_h = uv_end_y - uv_y;
 
                             instances.push(CellInstance::new(
-                                glyph_x, glyph_y,
-                                glyph_w, glyph_h,
+                                glyph_x,
+                                glyph_y,
+                                glyph_w,
+                                glyph_h,
                                 [1.0, 1.0, 1.0, 0.9 * alpha],
                                 [0.0, 0.0, 0.0, 0.0],
-                                uv_x, uv_y, uv_w, uv_h,
+                                uv_x,
+                                uv_y,
+                                uv_w,
+                                uv_h,
                                 0.0,
                             ));
                             tx += (entry.width + 1.0) * scale;
@@ -2207,7 +2746,7 @@ impl Pipeline {
             for item in &menu_items {
                 menu_h += match item {
                     crate::renderer::ContextMenuItem::Separator => 9.0, // 1px line + 4px top margin + 4px bottom margin
-                    _ => 32.0, // Regular items height 32px
+                    _ => 32.0,                                          // Regular items height 32px
                 };
             }
 
@@ -2222,39 +2761,40 @@ impl Pipeline {
             }
 
             // Animation helper closure to translate, scale, and fade every menu element
-            let mut anim_push = |x: f32, y: f32, w: f32, h: f32, mut fg: [f32; 4], bg: [f32; 4], uv_x: f32, uv_y: f32, uv_w: f32, uv_h: f32, is_color: f32| {
+            let mut anim_push = |x: f32,
+                                 y: f32,
+                                 w: f32,
+                                 h: f32,
+                                 mut fg: [f32; 4],
+                                 bg: [f32; 4],
+                                 uv_x: f32,
+                                 uv_y: f32,
+                                 uv_w: f32,
+                                 uv_h: f32,
+                                 is_color: f32| {
                 let ax = context_menu_x + (x - context_menu_x) * scale_factor;
                 let ay = context_menu_y + (y - context_menu_y) * scale_factor;
                 let aw = w * scale_factor;
                 let ah = h * scale_factor;
                 fg[3] *= opacity_factor;
-                let mut bg_mod = bg;
-                if is_color > 1.5 && (bg[1] > 0.0 || bg[2] > 0.0) {
-                    bg_mod[0] = bg[0] * scale_factor;
-                    bg_mod[1] = bg[1] * scale_factor;
-                    bg_mod[2] = bg[2] * scale_factor;
-                }
                 instances.push(CellInstance::new(
-                    ax, ay, aw, ah,
-                    fg, bg_mod,
-                    uv_x, uv_y, uv_w, uv_h,
-                    is_color
+                    ax, ay, aw, ah, fg, bg, uv_x, uv_y, uv_w, uv_h, is_color,
                 ));
             };
 
-            // 0. Soft drop shadow (rgba(0, 0, 0, 0.4), offset 0px 4px, blur 8px)
-            let shadow_blur = 8.0f32;
-            let shadow_pad = 16.0f32;
-            let shadow_offset_y = 4.0f32;
+            // 0. Drop shadow: 2px expand on sides, 4px y offset, matches menu radius.
             anim_push(
-                context_menu_x - shadow_pad,
-                context_menu_y - shadow_pad + shadow_offset_y,
-                menu_w + 2.0 * shadow_pad,
-                menu_h + 2.0 * shadow_pad,
-                [0.0, 0.0, 0.0, 0.40],
-                [shadow_blur, shadow_pad, shadow_pad, 0.0],
-                0.0, 0.0, 1.0, 1.0,
-                10.0, // Match menu radius
+                context_menu_x - 2.0,
+                context_menu_y + 4.0,
+                menu_w + 4.0,
+                menu_h + 4.0,
+                [0.0, 0.0, 0.0, 0.10],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+                12.0, // Slightly larger radius than menu's 10px for soft falloff
             );
 
             // 1. Outer border (rgba(255, 255, 255, 0.10))
@@ -2265,7 +2805,10 @@ impl Pipeline {
                 menu_h,
                 [1.0, 1.0, 1.0, 0.10],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 10.0, // 10px corner radius on all corners
             );
 
@@ -2289,7 +2832,10 @@ impl Pipeline {
                 menu_h - 2.0,
                 inner_bg_color,
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 9.0, // Alignment inner radius
             );
 
@@ -2314,7 +2860,10 @@ impl Pipeline {
                             1.0,
                             [1.0, 1.0, 1.0, 0.08],
                             [0.0, 0.0, 0.0, 0.0],
-                            0.0, 0.0, 1.0, 1.0,
+                            0.0,
+                            0.0,
+                            1.0,
+                            1.0,
                             0.0,
                         );
                         current_y += 9.0;
@@ -2332,7 +2881,10 @@ impl Pipeline {
                                 item_h,
                                 [1.0, 1.0, 1.0, 0.08],
                                 [0.0, 0.0, 0.0, 0.0],
-                                0.0, 0.0, 1.0, 1.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                                1.0,
                                 6.0, // border radius of 6px
                             );
                         }
@@ -2341,15 +2893,25 @@ impl Pipeline {
                         let (_, label, shortcut) = match item {
                             crate::renderer::ContextMenuItem::Copy => ("📋", "Copiar", Some("⌘C")),
                             crate::renderer::ContextMenuItem::Paste => ("📋", "Pegar", Some("⌘V")),
-                            crate::renderer::ContextMenuItem::NewTab => ("+", "Nueva pestaña", None),
-                            crate::renderer::ContextMenuItem::CloseTab => ("\u{2715}", "Cerrar pestaña", None),
+                            crate::renderer::ContextMenuItem::NewTab => {
+                                ("+", "Nueva pestaña", None)
+                            }
+                            crate::renderer::ContextMenuItem::CloseTab => {
+                                ("\u{2715}", "Cerrar pestaña", None)
+                            }
                             crate::renderer::ContextMenuItem::About => ("", "About", None),
-                            crate::renderer::ContextMenuItem::OpenLink => ("🔗", "Open link", Some("⌘-click")),
+                            crate::renderer::ContextMenuItem::OpenLink => {
+                                ("🔗", "Open link", Some("⌘-click"))
+                            }
                             crate::renderer::ContextMenuItem::CopyWord => ("📋", "Copy", None),
                             crate::renderer::ContextMenuItem::CopyLine => ("📋", "Copy line", None),
                             crate::renderer::ContextMenuItem::CdHere => ("📁", "Open path", None),
-                            crate::renderer::ContextMenuItem::OpenInEditor => ("✏\u{FE0F}", "Open in editor", None),
-                            crate::renderer::ContextMenuItem::OpenEmail => ("✉\u{FE0F}", "Compose email", None),
+                            crate::renderer::ContextMenuItem::OpenInEditor => {
+                                ("✏\u{FE0F}", "Open in editor", None)
+                            }
+                            crate::renderer::ContextMenuItem::OpenEmail => {
+                                ("✉\u{FE0F}", "Compose email", None)
+                            }
                             crate::renderer::ContextMenuItem::CopyHex => ("#", "Copy hex", None),
                             crate::renderer::ContextMenuItem::Separator => ("", "", None),
                         };
@@ -2400,7 +2962,8 @@ impl Pipeline {
 
                         // Render text label left-aligned at relative x=30px (context_menu_x + 30px)
                         let (_, ui_cell_height) = atlas.cell_size();
-                        let text_baseline_y = item_center_y - (ui_cell_height * base_scale) / 2.0 + atlas.ascent() * base_scale;
+                        let text_baseline_y = item_center_y - (ui_cell_height * base_scale) / 2.0
+                            + atlas.ascent() * base_scale;
                         let ctx_cell_w = atlas.cell_size().0 * base_scale;
                         let mut label_x = context_menu_x + 30.0;
                         for c in label.chars() {
@@ -2413,7 +2976,8 @@ impl Pipeline {
                                     let glyph_w = entry.width * base_scale;
                                     let glyph_h = entry.height * base_scale;
                                     let glyph_x = (label_x + entry.left * base_scale).round();
-                                    let glyph_y = (text_baseline_y + entry.top * base_scale).round();
+                                    let glyph_y =
+                                        (text_baseline_y + entry.top * base_scale).round();
 
                                     let (aw, ah) = atlas.atlas_size();
                                     let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
@@ -2457,7 +3021,8 @@ impl Pipeline {
                                         let glyph_y = (item_center_y - glyph_h / 2.0).round();
 
                                         let (aw, ah) = atlas.atlas_size();
-                                        let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                                        let [uv_x, uv_y, uv_end_x, uv_end_y] =
+                                            entry.uv_coords(aw, ah);
                                         let uv_w = uv_end_x - uv_x;
                                         let uv_h = uv_end_y - uv_y;
 
@@ -2492,24 +3057,38 @@ impl Pipeline {
             let menu_h = 44.0f32;
             let pad = 6.0f32;
 
-            let shadow_pad = 8.0f32;
+            let shadow_pad = 2.0f32;
             instances.push(CellInstance::new(
                 tab_ctx_x as f32 - shadow_pad,
-                tab_ctx_y as f32 - shadow_pad + 4.0,
+                tab_ctx_y as f32 + 4.0,
                 menu_w + 2.0 * shadow_pad,
                 menu_h + 2.0 * shadow_pad,
-                [0.0, 0.0, 0.0, 0.40],
-                [10.0, shadow_pad, shadow_pad, 0.0],
-                0.0, 0.0, 1.0, 1.0, 10.0,
+                [0.0, 0.0, 0.0, 0.10],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+                12.0,
             ));
             instances.push(CellInstance::new(
-                tab_ctx_x as f32, tab_ctx_y as f32, menu_w, menu_h,
+                tab_ctx_x as f32,
+                tab_ctx_y as f32,
+                menu_w,
+                menu_h,
                 [1.0, 1.0, 1.0, 0.10],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0, 10.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+                10.0,
             ));
             instances.push(CellInstance::new(
-                tab_ctx_x as f32 + 1.0, tab_ctx_y as f32 + 1.0, menu_w - 2.0, menu_h - 2.0,
+                tab_ctx_x as f32 + 1.0,
+                tab_ctx_y as f32 + 1.0,
+                menu_w - 2.0,
+                menu_h - 2.0,
                 [
                     (theme_bg[0] + 14.0 / 255.0).min(1.0),
                     (theme_bg[1] + 14.0 / 255.0).min(1.0),
@@ -2517,17 +3096,27 @@ impl Pipeline {
                     0.97,
                 ],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0, 9.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+                9.0,
             ));
 
             let is_hover = tab_ctx_hovered == Some(0);
             if is_hover {
                 instances.push(CellInstance::new(
-                    tab_ctx_x as f32 + 4.0, tab_ctx_y as f32 + pad,
-                    menu_w - 8.0, 32.0,
+                    tab_ctx_x as f32 + 4.0,
+                    tab_ctx_y as f32 + pad,
+                    menu_w - 8.0,
+                    32.0,
                     [1.0, 1.0, 1.0, 0.08],
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0, 6.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
+                    6.0,
                 ));
             }
 
@@ -2539,11 +3128,16 @@ impl Pipeline {
             };
 
             let (_, ui_cell_height) = atlas.cell_size();
-            let text_baseline_y = tab_ctx_y as f32 + pad + 16.0 - (ui_cell_height * base_scale) / 2.0 + atlas.ascent() * base_scale;
+            let text_baseline_y = tab_ctx_y as f32 + pad + 16.0
+                - (ui_cell_height * base_scale) / 2.0
+                + atlas.ascent() * base_scale;
             let ctx_cell_w = atlas.cell_size().0 * base_scale;
             let mut label_x = tab_ctx_x as f32 + 12.0;
             for c in "Renombrar".chars() {
-                if c == ' ' { label_x += ctx_cell_w; continue; }
+                if c == ' ' {
+                    label_x += ctx_cell_w;
+                    continue;
+                }
                 if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                     if entry.width > 0.0 {
                         let glyph_w = entry.width * base_scale;
@@ -2553,9 +3147,17 @@ impl Pipeline {
                         let (aw, ah) = atlas.atlas_size();
                         let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                         instances.push(CellInstance::new(
-                            glyph_x, glyph_y, glyph_w, glyph_h,
-                            text_color, [0.0, 0.0, 0.0, 0.0],
-                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y, 0.0,
+                            glyph_x,
+                            glyph_y,
+                            glyph_w,
+                            glyph_h,
+                            text_color,
+                            [0.0, 0.0, 0.0, 0.0],
+                            uv_x,
+                            uv_y,
+                            uv_end_x - uv_x,
+                            uv_end_y - uv_y,
+                            0.0,
                         ));
                         label_x += (entry.width + 1.0) * base_scale;
                     }
@@ -2568,41 +3170,68 @@ impl Pipeline {
             let tab_start_x = 36.0f32;
             let tab_w = if tab_titles.len() > 0 {
                 (tab_area_width / tab_titles.len() as f32).clamp(80.0, 160.0)
-            } else { 160.0 };
+            } else {
+                160.0
+            };
             let input_x = tab_start_x + renaming_idx as f32 * tab_w + 4.0;
             let input_w = tab_w - 8.0;
             let input_h = 24.0;
             let input_y = (40.0 - input_h) / 2.0;
 
             instances.push(CellInstance::new(
-                input_x - 1.0, input_y - 1.0, input_w + 2.0, input_h + 2.0,
+                input_x - 1.0,
+                input_y - 1.0,
+                input_w + 2.0,
+                input_h + 2.0,
                 [0.4, 0.6, 1.0, 0.8],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0, 6.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+                6.0,
             ));
             instances.push(CellInstance::new(
-                input_x, input_y, input_w, input_h,
+                input_x,
+                input_y,
+                input_w,
+                input_h,
                 [theme_bg[0], theme_bg[1], theme_bg[2], 1.0],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0, 5.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+                5.0,
             ));
 
             let base_scale = 11.0f32 / atlas.font_size();
             let (_, ui_cell_height) = atlas.cell_size();
-            let text_baseline_y = input_y + input_h / 2.0 - (ui_cell_height * base_scale) / 2.0 + atlas.ascent() * base_scale;
+            let text_baseline_y = input_y + input_h / 2.0 - (ui_cell_height * base_scale) / 2.0
+                + atlas.ascent() * base_scale;
             let ctx_cell_w = atlas.cell_size().0 * base_scale;
             let mut text_x = input_x + 6.0;
 
             for (i, c) in rename_buffer.chars().enumerate() {
                 if i == rename_cursor {
                     instances.push(CellInstance::new(
-                        text_x, input_y + 3.0, 2.0, input_h - 6.0,
+                        text_x,
+                        input_y + 3.0,
+                        2.0,
+                        input_h - 6.0,
                         [0.4, 0.6, 1.0, 1.0],
                         [0.0, 0.0, 0.0, 0.0],
-                        0.0, 0.0, 1.0, 1.0, 0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0,
+                        0.0,
                     ));
                 }
-                if c == ' ' { text_x += ctx_cell_w; continue; }
+                if c == ' ' {
+                    text_x += ctx_cell_w;
+                    continue;
+                }
                 if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                     if entry.width > 0.0 {
                         let glyph_w = entry.width * base_scale;
@@ -2612,9 +3241,17 @@ impl Pipeline {
                         let (aw, ah) = atlas.atlas_size();
                         let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                         instances.push(CellInstance::new(
-                            glyph_x, glyph_y, glyph_w, glyph_h,
-                            [1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0],
-                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y, 0.0,
+                            glyph_x,
+                            glyph_y,
+                            glyph_w,
+                            glyph_h,
+                            [1.0, 1.0, 1.0, 1.0],
+                            [0.0, 0.0, 0.0, 0.0],
+                            uv_x,
+                            uv_y,
+                            uv_end_x - uv_x,
+                            uv_end_y - uv_y,
+                            0.0,
                         ));
                         text_x += (entry.width + 1.0) * base_scale;
                     }
@@ -2622,10 +3259,17 @@ impl Pipeline {
             }
             if rename_cursor >= rename_buffer.len() {
                 instances.push(CellInstance::new(
-                    text_x, input_y + 3.0, 2.0, input_h - 6.0,
+                    text_x,
+                    input_y + 3.0,
+                    2.0,
+                    input_h - 6.0,
                     [0.4, 0.6, 1.0, 1.0],
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0, 0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
+                    0.0,
                 ));
             }
         }
@@ -2641,19 +3285,29 @@ impl Pipeline {
             let palette_y = 80.0;
 
             instances.push(CellInstance::new(
-                palette_x - 1.0, palette_y - 1.0,
-                palette_w + 2.0, palette_h + 2.0,
+                palette_x - 1.0,
+                palette_y - 1.0,
+                palette_w + 2.0,
+                palette_h + 2.0,
                 [1.0, 1.0, 1.0, 0.18],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 8.0,
             ));
             instances.push(CellInstance::new(
-                palette_x, palette_y,
-                palette_w, palette_h,
+                palette_x,
+                palette_y,
+                palette_w,
+                palette_h,
                 [22.0 / 255.0, 24.0 / 255.0, 28.0 / 255.0, 0.96],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 7.0,
             ));
 
@@ -2678,22 +3332,27 @@ impl Pipeline {
                         let uv_w = uv_end_x - uv_x;
                         let uv_h = uv_end_y - uv_y;
                         instances.push(CellInstance::new(
-                            glyph_x, glyph_y,
-                            glyph_w, glyph_h,
+                            glyph_x,
+                            glyph_y,
+                            glyph_w,
+                            glyph_h,
                             [0.6, 0.85, 1.0, 0.95],
                             [0.0, 0.0, 0.0, 0.0],
-                            uv_x, uv_y, uv_w, uv_h,
+                            uv_x,
+                            uv_y,
+                            uv_w,
+                            uv_h,
                             0.0,
                         ));
                         input_x += (entry.width + 1.0) * input_scale;
                     }
                 }
             }
-                for c in command_palette_query.chars() {
-                    if c == ' ' {
-                        input_x += prompt_cell_w;
-                        continue;
-                    }
+            for c in command_palette_query.chars() {
+                if c == ' ' {
+                    input_x += prompt_cell_w;
+                    continue;
+                }
                 if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                     if entry.width > 0.0 {
                         let glyph_w = entry.width * input_scale;
@@ -2705,11 +3364,16 @@ impl Pipeline {
                         let uv_w = uv_end_x - uv_x;
                         let uv_h = uv_end_y - uv_y;
                         instances.push(CellInstance::new(
-                            glyph_x, glyph_y,
-                            glyph_w, glyph_h,
+                            glyph_x,
+                            glyph_y,
+                            glyph_w,
+                            glyph_h,
                             [0.92, 0.94, 0.98, 1.0],
                             [0.0, 0.0, 0.0, 0.0],
-                            uv_x, uv_y, uv_w, uv_h,
+                            uv_x,
+                            uv_y,
+                            uv_w,
+                            uv_h,
                             0.0,
                         ));
                         input_x += (entry.width + 1.0) * input_scale;
@@ -2719,30 +3383,46 @@ impl Pipeline {
             let cursor_x = input_x + 1.0;
             let cursor_y = palette_y + 6.0;
             instances.push(CellInstance::new(
-                cursor_x, cursor_y,
-                1.5, input_h - 12.0,
+                cursor_x,
+                cursor_y,
+                1.5,
+                input_h - 12.0,
                 [0.6, 0.85, 1.0, 0.85],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 0.0,
             ));
 
             let result_scale = 12.0 / atlas.font_size();
             let result_cell_w = atlas.cell_size().0 * result_scale;
             let result_baseline_offset = atlas.ascent() * result_scale;
-            for (i, label) in command_palette_filtered.iter().take(max_results).enumerate() {
+            for (i, label) in command_palette_filtered
+                .iter()
+                .take(max_results)
+                .enumerate()
+            {
                 let item_y = palette_y + input_h + 8.0 + (i as f32) * item_h;
                 if i == command_palette_selected {
                     instances.push(CellInstance::new(
-                        palette_x + 4.0, item_y,
-                        palette_w - 8.0, item_h - 2.0,
+                        palette_x + 4.0,
+                        item_y,
+                        palette_w - 8.0,
+                        item_h - 2.0,
                         [0.20, 0.45, 0.85, 0.35],
                         [0.0, 0.0, 0.0, 0.0],
-                        0.0, 0.0, 1.0, 1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0,
                         4.0,
                     ));
                 }
-                let baseline_y = item_y + (item_h - atlas.cell_size().1 * result_scale) / 2.0 + result_baseline_offset;
+                let baseline_y = item_y
+                    + (item_h - atlas.cell_size().1 * result_scale) / 2.0
+                    + result_baseline_offset;
                 let mut lx = palette_x + 14.0;
                 for c in label.chars() {
                     if c == ' ' {
@@ -2760,11 +3440,16 @@ impl Pipeline {
                             let uv_w = uv_end_x - uv_x;
                             let uv_h = uv_end_y - uv_y;
                             instances.push(CellInstance::new(
-                                glyph_x, glyph_y,
-                                glyph_w, glyph_h,
+                                glyph_x,
+                                glyph_y,
+                                glyph_w,
+                                glyph_h,
                                 [0.92, 0.94, 0.98, 1.0],
                                 [0.0, 0.0, 0.0, 0.0],
-                                uv_x, uv_y, uv_w, uv_h,
+                                uv_x,
+                                uv_y,
+                                uv_w,
+                                uv_h,
                                 0.0,
                             ));
                             lx += (entry.width + 1.0) * result_scale;
@@ -2785,19 +3470,29 @@ impl Pipeline {
             let picker_y = 80.0;
 
             instances.push(CellInstance::new(
-                picker_x - 1.0, picker_y - 1.0,
-                picker_w + 2.0, picker_h + 2.0,
+                picker_x - 1.0,
+                picker_y - 1.0,
+                picker_w + 2.0,
+                picker_h + 2.0,
                 [1.0, 1.0, 1.0, 0.18],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 8.0,
             ));
             instances.push(CellInstance::new(
-                picker_x, picker_y,
-                picker_w, picker_h,
+                picker_x,
+                picker_y,
+                picker_w,
+                picker_h,
                 [22.0 / 255.0, 24.0 / 255.0, 28.0 / 255.0, 0.96],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 7.0,
             ));
 
@@ -2820,10 +3515,16 @@ impl Pipeline {
                         let (aw, ah) = atlas.atlas_size();
                         let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                         instances.push(CellInstance::new(
-                            gx, gy, gw, gh,
+                            gx,
+                            gy,
+                            gw,
+                            gh,
                             [0.6, 0.85, 1.0, 0.95],
                             [0.0, 0.0, 0.0, 0.0],
-                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                            uv_x,
+                            uv_y,
+                            uv_end_x - uv_x,
+                            uv_end_y - uv_y,
                             0.0,
                         ));
                         input_x += (entry.width + 1.0) * input_scale;
@@ -2844,10 +3545,16 @@ impl Pipeline {
                         let (aw, ah) = atlas.atlas_size();
                         let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                         instances.push(CellInstance::new(
-                            gx, gy, gw, gh,
+                            gx,
+                            gy,
+                            gw,
+                            gh,
                             [0.92, 0.94, 0.98, 1.0],
                             [0.0, 0.0, 0.0, 0.0],
-                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                            uv_x,
+                            uv_y,
+                            uv_end_x - uv_x,
+                            uv_end_y - uv_y,
                             0.0,
                         ));
                         input_x += (entry.width + 1.0) * input_scale;
@@ -2857,11 +3564,16 @@ impl Pipeline {
             let cursor_x = input_x + 1.0;
             let cursor_y = picker_y + 6.0;
             instances.push(CellInstance::new(
-                cursor_x, cursor_y,
-                1.5, input_h - 12.0,
+                cursor_x,
+                cursor_y,
+                1.5,
+                input_h - 12.0,
                 [0.6, 0.85, 1.0, 0.85],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 0.0,
             ));
 
@@ -2872,15 +3584,22 @@ impl Pipeline {
                 let item_y = picker_y + input_h + 8.0 + (i as f32) * item_h;
                 if i == ssh_picker_selected {
                     instances.push(CellInstance::new(
-                        picker_x + 4.0, item_y,
-                        picker_w - 8.0, item_h - 2.0,
+                        picker_x + 4.0,
+                        item_y,
+                        picker_w - 8.0,
+                        item_h - 2.0,
                         [0.20, 0.45, 0.85, 0.35],
                         [0.0, 0.0, 0.0, 0.0],
-                        0.0, 0.0, 1.0, 1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0,
                         4.0,
                     ));
                 }
-                let baseline_y = item_y + (item_h - atlas.cell_size().1 * result_scale) / 2.0 + result_baseline_offset;
+                let baseline_y = item_y
+                    + (item_h - atlas.cell_size().1 * result_scale) / 2.0
+                    + result_baseline_offset;
                 let mut lx = picker_x + 14.0;
                 for c in label.chars() {
                     if c == ' ' || c == '@' {
@@ -2896,10 +3615,16 @@ impl Pipeline {
                             let (aw, ah) = atlas.atlas_size();
                             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                             instances.push(CellInstance::new(
-                                gx, gy, gw, gh,
+                                gx,
+                                gy,
+                                gw,
+                                gh,
                                 [0.92, 0.94, 0.98, 1.0],
                                 [0.0, 0.0, 0.0, 0.0],
-                                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                                uv_x,
+                                uv_y,
+                                uv_end_x - uv_x,
+                                uv_end_y - uv_y,
                                 0.0,
                             ));
                             lx += (entry.width + 1.0) * result_scale;
@@ -2920,19 +3645,29 @@ impl Pipeline {
             let picker_y = 80.0;
 
             instances.push(CellInstance::new(
-                picker_x - 1.0, picker_y - 1.0,
-                picker_w + 2.0, picker_h + 2.0,
+                picker_x - 1.0,
+                picker_y - 1.0,
+                picker_w + 2.0,
+                picker_h + 2.0,
                 [1.0, 1.0, 1.0, 0.18],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 8.0,
             ));
             instances.push(CellInstance::new(
-                picker_x, picker_y,
-                picker_w, picker_h,
+                picker_x,
+                picker_y,
+                picker_w,
+                picker_h,
                 [22.0 / 255.0, 24.0 / 255.0, 28.0 / 255.0, 0.96],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 7.0,
             ));
 
@@ -2955,10 +3690,16 @@ impl Pipeline {
                         let (aw, ah) = atlas.atlas_size();
                         let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                         instances.push(CellInstance::new(
-                            gx, gy, gw, gh,
+                            gx,
+                            gy,
+                            gw,
+                            gh,
                             [0.6, 0.85, 1.0, 0.95],
                             [0.0, 0.0, 0.0, 0.0],
-                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                            uv_x,
+                            uv_y,
+                            uv_end_x - uv_x,
+                            uv_end_y - uv_y,
                             0.0,
                         ));
                         input_x += (entry.width + 1.0) * input_scale;
@@ -2979,10 +3720,16 @@ impl Pipeline {
                         let (aw, ah) = atlas.atlas_size();
                         let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                         instances.push(CellInstance::new(
-                            gx, gy, gw, gh,
+                            gx,
+                            gy,
+                            gw,
+                            gh,
                             [0.92, 0.94, 0.98, 1.0],
                             [0.0, 0.0, 0.0, 0.0],
-                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                            uv_x,
+                            uv_y,
+                            uv_end_x - uv_x,
+                            uv_end_y - uv_y,
                             0.0,
                         ));
                         input_x += (entry.width + 1.0) * input_scale;
@@ -2992,11 +3739,16 @@ impl Pipeline {
             let cursor_x = input_x + 1.0;
             let cursor_y = picker_y + 6.0;
             instances.push(CellInstance::new(
-                cursor_x, cursor_y,
-                1.5, input_h - 12.0,
+                cursor_x,
+                cursor_y,
+                1.5,
+                input_h - 12.0,
                 [0.6, 0.85, 1.0, 0.85],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 0.0,
             ));
 
@@ -3007,15 +3759,22 @@ impl Pipeline {
                 let item_y = picker_y + input_h + 8.0 + (i as f32) * item_h;
                 if i == project_jumper_selected {
                     instances.push(CellInstance::new(
-                        picker_x + 4.0, item_y,
-                        picker_w - 8.0, item_h - 2.0,
+                        picker_x + 4.0,
+                        item_y,
+                        picker_w - 8.0,
+                        item_h - 2.0,
                         [0.20, 0.45, 0.85, 0.35],
                         [0.0, 0.0, 0.0, 0.0],
-                        0.0, 0.0, 1.0, 1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0,
                         4.0,
                     ));
                 }
-                let baseline_y = item_y + (item_h - atlas.cell_size().1 * result_scale) / 2.0 + result_baseline_offset;
+                let baseline_y = item_y
+                    + (item_h - atlas.cell_size().1 * result_scale) / 2.0
+                    + result_baseline_offset;
                 let mut lx = picker_x + 14.0;
                 for c in label.chars() {
                     if c == ' ' || c == '/' {
@@ -3031,10 +3790,16 @@ impl Pipeline {
                             let (aw, ah) = atlas.atlas_size();
                             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                             instances.push(CellInstance::new(
-                                gx, gy, gw, gh,
+                                gx,
+                                gy,
+                                gw,
+                                gh,
                                 [0.92, 0.94, 0.98, 1.0],
                                 [0.0, 0.0, 0.0, 0.0],
-                                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                                uv_x,
+                                uv_y,
+                                uv_end_x - uv_x,
+                                uv_end_y - uv_y,
                                 0.0,
                             ));
                             lx += (entry.width + 1.0) * result_scale;
@@ -3055,19 +3820,29 @@ impl Pipeline {
             let picker_y = 80.0;
 
             instances.push(CellInstance::new(
-                picker_x - 1.0, picker_y - 1.0,
-                picker_w + 2.0, picker_h + 2.0,
+                picker_x - 1.0,
+                picker_y - 1.0,
+                picker_w + 2.0,
+                picker_h + 2.0,
                 [1.0, 1.0, 1.0, 0.18],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 8.0,
             ));
             instances.push(CellInstance::new(
-                picker_x, picker_y,
-                picker_w, picker_h,
+                picker_x,
+                picker_y,
+                picker_w,
+                picker_h,
                 [22.0 / 255.0, 24.0 / 255.0, 28.0 / 255.0, 0.96],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 7.0,
             ));
 
@@ -3090,10 +3865,16 @@ impl Pipeline {
                         let (aw, ah) = atlas.atlas_size();
                         let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                         instances.push(CellInstance::new(
-                            gx, gy, gw, gh,
+                            gx,
+                            gy,
+                            gw,
+                            gh,
                             [0.6, 0.85, 1.0, 0.95],
                             [0.0, 0.0, 0.0, 0.0],
-                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                            uv_x,
+                            uv_y,
+                            uv_end_x - uv_x,
+                            uv_end_y - uv_y,
                             0.0,
                         ));
                         input_x += (entry.width + 1.0) * input_scale;
@@ -3114,10 +3895,16 @@ impl Pipeline {
                         let (aw, ah) = atlas.atlas_size();
                         let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                         instances.push(CellInstance::new(
-                            gx, gy, gw, gh,
+                            gx,
+                            gy,
+                            gw,
+                            gh,
                             [0.92, 0.94, 0.98, 1.0],
                             [0.0, 0.0, 0.0, 0.0],
-                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                            uv_x,
+                            uv_y,
+                            uv_end_x - uv_x,
+                            uv_end_y - uv_y,
                             0.0,
                         ));
                         input_x += (entry.width + 1.0) * input_scale;
@@ -3127,11 +3914,16 @@ impl Pipeline {
             let cursor_x = input_x + 1.0;
             let cursor_y = picker_y + 6.0;
             instances.push(CellInstance::new(
-                cursor_x, cursor_y,
-                1.5, input_h - 12.0,
+                cursor_x,
+                cursor_y,
+                1.5,
+                input_h - 12.0,
                 [0.6, 0.85, 1.0, 0.85],
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 0.0,
             ));
 
@@ -3142,15 +3934,22 @@ impl Pipeline {
                 let item_y = picker_y + input_h + 8.0 + (i as f32) * item_h;
                 if i == worktree_picker_selected {
                     instances.push(CellInstance::new(
-                        picker_x + 4.0, item_y,
-                        picker_w - 8.0, item_h - 2.0,
+                        picker_x + 4.0,
+                        item_y,
+                        picker_w - 8.0,
+                        item_h - 2.0,
                         [0.20, 0.45, 0.85, 0.35],
                         [0.0, 0.0, 0.0, 0.0],
-                        0.0, 0.0, 1.0, 1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0,
                         4.0,
                     ));
                 }
-                let baseline_y = item_y + (item_h - atlas.cell_size().1 * result_scale) / 2.0 + result_baseline_offset;
+                let baseline_y = item_y
+                    + (item_h - atlas.cell_size().1 * result_scale) / 2.0
+                    + result_baseline_offset;
                 let mut lx = picker_x + 14.0;
                 for c in label.chars() {
                     if c == ' ' || c == '/' || c == '+' {
@@ -3166,10 +3965,16 @@ impl Pipeline {
                             let (aw, ah) = atlas.atlas_size();
                             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                             instances.push(CellInstance::new(
-                                gx, gy, gw, gh,
+                                gx,
+                                gy,
+                                gw,
+                                gh,
                                 [0.92, 0.94, 0.98, 1.0],
                                 [0.0, 0.0, 0.0, 0.0],
-                                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                                uv_x,
+                                uv_y,
+                                uv_end_x - uv_x,
+                                uv_end_y - uv_y,
                                 0.0,
                             ));
                             lx += (entry.width + 1.0) * result_scale;
@@ -3179,10 +3984,125 @@ impl Pipeline {
             }
         }
 
-        let ui_extra_instances_final = instances;
+        let mut ui_extra_instances_final = instances;
+
+        // Bell flash overlay — full-screen white flash for 150ms.
+        if let Some(elapsed_ms) = bell_flash_elapsed_ms {
+            if elapsed_ms < 150.0 {
+                let alpha = 1.0 - (elapsed_ms / 150.0);
+                ui_extra_instances_final.push(CellInstance::new(
+                    0.0,
+                    0.0,
+                    viewport_width,
+                    viewport_height,
+                    [1.0, 1.0, 1.0, alpha * 0.18],
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ));
+            }
+        }
+
+        // Hover tooltip — floating label for hyperlinks and URLs.
+        let tooltip_text: Option<&str> = hovered_hyperlink.or(hovered_url_text);
+        if let Some(text) = tooltip_text {
+            let tt_font: f32 = 11.0;
+            let scale = tt_font / atlas.font_size();
+            let cell_w = atlas.cell_size().0 * scale;
+            let scaled_ascent = atlas.ascent() * scale;
+            let descent = scaled_ascent * 0.3;
+            let text_block_h = scaled_ascent + descent;
+            let pad_x = 8.0f32;
+            let pad_y = 4.0f32;
+
+            let display_text = if text.len() > 80 {
+                format!("{}...", &text[..77])
+            } else {
+                text.to_string()
+            };
+
+            let mut text_w = 0.0f32;
+            for c in display_text.chars() {
+                if c == ' ' {
+                    text_w += cell_w;
+                    continue;
+                }
+                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                    text_w += entry.width * scale + 1.0;
+                }
+            }
+            let tt_w = text_w + pad_x * 2.0;
+            let tt_h = text_block_h + pad_y * 2.0;
+            let tt_x = (current_mouse_x + 12.0).clamp(4.0, viewport_width - tt_w - 4.0);
+            let tt_y = (current_mouse_y + 20.0).clamp(4.0, viewport_height - tt_h - 4.0);
+
+            ui_extra_instances_final.push(CellInstance::new(
+                tt_x,
+                tt_y,
+                tt_w,
+                tt_h,
+                [0.12, 0.12, 0.15, 0.95],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+                4.0,
+            ));
+            ui_extra_instances_final.push(CellInstance::new(
+                tt_x + 0.5,
+                tt_y + 0.5,
+                tt_w - 1.0,
+                tt_h - 1.0,
+                [0.18, 0.18, 0.22, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                3.5,
+            ));
+
+            let baseline_y = tt_y + pad_y + scaled_ascent;
+            let mut tx = tt_x + pad_x;
+            let tt_color = [0.85, 0.88, 0.95, 1.0];
+            for c in display_text.chars() {
+                if c == ' ' {
+                    tx += cell_w;
+                    continue;
+                }
+                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                    if entry.width > 0.0 {
+                        let gw = entry.width * scale;
+                        let glyph_x = (tx + entry.left * scale).round();
+                        let glyph_y = (baseline_y + entry.top * scale).round();
+                        let (aw, ah) = atlas.atlas_size();
+                        let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                        ui_extra_instances_final.push(CellInstance::new(
+                            glyph_x,
+                            glyph_y,
+                            gw,
+                            entry.height * scale,
+                            tt_color,
+                            [0.0, 0.0, 0.0, 0.0],
+                            uv_x,
+                            uv_y,
+                            uv_end_x - uv_x,
+                            uv_end_y - uv_y,
+                            0.0,
+                        ));
+                        tx += gw + 1.0;
+                    }
+                }
+            }
+        }
 
         let term_count = term_instances_final.len();
-        let ui_count = ui_bg_instances.len() + ui_fg_instances.len() + ui_extra_instances_final.len();
+        let ui_count =
+            ui_bg_instances.len() + ui_fg_instances.len() + ui_extra_instances_final.len();
 
         let mut final_instances = Vec::with_capacity(term_count + ui_count);
         final_instances.extend(term_instances_final);
@@ -3191,7 +4111,7 @@ impl Pipeline {
         final_instances.extend(ui_extra_instances_final);
 
         let instance_count = final_instances.len().min(self.max_instances);
-        
+
         if instance_count > 0 {
             queue.write_buffer(
                 &self.instance_buffer,
@@ -3199,16 +4119,16 @@ impl Pipeline {
                 cast_slice(&final_instances[..instance_count]),
             );
         }
-        
+
         queue.write_buffer(
             &self.uniform_buffer,
             0,
             cast_slice(&[viewport_width, viewport_height]),
         );
-        
+
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        
+
         let term_draw_count = term_count.min(instance_count);
         if term_draw_count > 0 {
             render_pass.set_bind_group(0, &self.bind_group, &[]);
@@ -3221,7 +4141,8 @@ impl Pipeline {
         if ui_draw_count > 0 {
             render_pass.set_bind_group(0, &self.ui_bind_group, &[]);
             let start_offset = (term_draw_count * mem::size_of::<CellInstance>()) as u64;
-            let end_offset = ((term_draw_count + ui_draw_count) * mem::size_of::<CellInstance>()) as u64;
+            let end_offset =
+                ((term_draw_count + ui_draw_count) * mem::size_of::<CellInstance>()) as u64;
             render_pass.set_vertex_buffer(1, self.instance_buffer.slice(start_offset..end_offset));
             render_pass.draw(0..6, 0..ui_draw_count as u32);
         }
@@ -3263,6 +4184,7 @@ impl Pipeline {
         card_scroll_y: f32,
         device: &Device,
         queue: &wgpu::Queue,
+        opacity: f32,
     ) {
         let scale = if cfg!(target_os = "windows") {
             viewport_width / 400.0
@@ -3278,29 +4200,45 @@ impl Pipeline {
         // derive from bg * 0.83. Also pull the theme's bright blue for
         // selected-item highlights so the active dropdown row reads as
         // "selected" across every theme.
-        let (bg_r, bg_g, bg_b) = named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::Background);
-        let theme_bg = [bg_r as f32 / 255.0, bg_g as f32 / 255.0, bg_b as f32 / 255.0, 1.0];
-        let (bb_r, bb_g, bb_b) = named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::BrightBlue);
-        let theme_accent = [bb_r as f32 / 255.0, bb_g as f32 / 255.0, bb_b as f32 / 255.0, 1.0];
+        let (bg_r, bg_g, bg_b) =
+            named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::Background);
+        let bg_alpha = opacity.clamp(0.0, 1.0);
+        let chrome_alpha = bg_alpha;
+        let theme_bg = [
+            bg_r as f32 / 255.0,
+            bg_g as f32 / 255.0,
+            bg_b as f32 / 255.0,
+            bg_alpha,
+        ];
+        let (bb_r, bb_g, bb_b) =
+            named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::BrightBlue);
+        let theme_accent = [
+            bb_r as f32 / 255.0,
+            bb_g as f32 / 255.0,
+            bb_b as f32 / 255.0,
+            1.0,
+        ];
         let active_theme = crate::config::ACTIVE_THEME.read().to_lowercase();
         let theme_topbar = if active_theme == "default" {
-            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0]
+            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, bg_alpha]
         } else {
             [
                 bg_r as f32 / 255.0 * 0.83,
                 bg_g as f32 / 255.0 * 0.83,
                 bg_b as f32 / 255.0 * 0.83,
-                1.0,
+                bg_alpha,
             ]
         };
         // Lifted theme_bg variants for the closed-box rest/hover/active
         // states. Default ratios: rest = #101014, hover = #16161C, active = #191920.
+        // Lifted backgrounds respect the configured opacity so the dialog
+        // chrome dims together with the rest of the UI.
         let lift = |offset: f32| -> [f32; 4] {
             [
                 (bg_r as f32 / 255.0 + offset / 255.0).min(1.0),
                 (bg_g as f32 / 255.0 + offset / 255.0).min(1.0),
                 (bg_b as f32 / 255.0 + offset / 255.0).min(1.0),
-                1.0,
+                bg_alpha,
             ]
         };
         let theme_lift_rest = lift(4.0);
@@ -3314,38 +4252,34 @@ impl Pipeline {
 
         // 0. Draw window background (theme bg)
         bg_instances.push(CellInstance::new(
-            0.0, 0.0,
-            viewport_width, viewport_height,
+            0.0,
+            0.0,
+            viewport_width,
+            viewport_height,
             theme_bg,
             [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
             8.0 * scale,
         ));
 
-        // 1. Draw topbar background (darker variant of theme bg)
+        // 1. Draw topbar background. Single rounded-rectangle layer with
+        // per-corner radii: top corners rounded (8*scale), bottom square.
+        // No fill — the per-corner encoding handles the bottom edge.
         bg_instances.push(CellInstance::new(
-            0.0, 0.0,
-            viewport_width, 36.0 * scale,
-            theme_topbar,
-            [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
-            8.0 * scale,
-        ));
-        bg_instances.push(CellInstance::new(
-            0.0, 28.0 * scale,
-            viewport_width, 8.0 * scale,
-            theme_topbar,
-            [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 0.0, 0.0,
             0.0,
-        ));
-        bg_instances.push(CellInstance::new(
-            0.0, 36.0 * scale,
-            viewport_width, 1.0 * scale,
-            [1.0, 1.0, 1.0, 0.06], // Consistent with main topbar border
-            [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 0.0, 0.0,
             0.0,
+            viewport_width,
+            40.0 * scale,
+            theme_topbar,
+            [8.0, 8.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            8.0 * scale, // uniform radius (used for corners with 0 in bg_color)
         ));
 
         // Helper to draw text. Spaces must be handled BEFORE the get_or_rasterize
@@ -3354,7 +4288,12 @@ impl Pipeline {
         // letter advances (~entry.width + 2), which is why "Zed Mono Extended"
         // was rendering as "ZedMonoExtended".
         let cell_w = atlas.cell_size().0 * scale;
-        let draw_text = |atlas: &mut crate::renderer::Atlas, text: &str, start_x: f32, start_y: f32, color: [f32; 4], fg_list: &mut Vec<CellInstance>| {
+        let draw_text = |atlas: &mut crate::renderer::Atlas,
+                         text: &str,
+                         start_x: f32,
+                         start_y: f32,
+                         color: [f32; 4],
+                         fg_list: &mut Vec<CellInstance>| {
             let mut x = start_x * scale;
             for c in text.chars() {
                 if c == ' ' {
@@ -3368,11 +4307,16 @@ impl Pipeline {
                         let (aw, ah) = atlas.atlas_size();
                         let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                         fg_list.push(CellInstance::new(
-                            glyph_x, glyph_y,
-                            entry.width, entry.height,
+                            glyph_x,
+                            glyph_y,
+                            entry.width,
+                            entry.height,
                             color,
                             [0.0, 0.0, 0.0, 0.0],
-                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                            uv_x,
+                            uv_y,
+                            uv_end_x - uv_x,
+                            uv_end_y - uv_y,
                             0.0,
                         ));
                         x += entry.width + 2.0 * scale;
@@ -3381,14 +4325,21 @@ impl Pipeline {
             }
         };
 
-        // Draw title
-        draw_text(atlas, "Settings", 12.0, 6.0, [0.85, 0.85, 0.85, 1.0], &mut fg_instances);
+        // Draw title — vertically centered in the 40*scale topbar
+        draw_text(
+            atlas,
+            "Settings",
+            12.0,
+            13.5,
+            with_opacity([0.85, 0.85, 0.85, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
 
         // Draw "Visual" toggle button in the topbar (between title and close)
         let visual_btn_x = 80.0f32 * scale;
         let visual_btn_w = 56.0f32 * scale;
         let visual_btn_h = 24.0f32 * scale;
-        let visual_btn_y = 6.0f32 * scale;
+        let visual_btn_y = 8.0f32 * scale; // (40 - 24) / 2 — vertically centered
         let visual_btn_bg = if visual_picker_active {
             theme_accent
         } else if hover_visual_toggle {
@@ -3397,11 +4348,16 @@ impl Pipeline {
             theme_lift_rest
         };
         bg_instances.push(CellInstance::new(
-            visual_btn_x, visual_btn_y,
-            visual_btn_w, visual_btn_h,
+            visual_btn_x,
+            visual_btn_y,
+            visual_btn_w,
+            visual_btn_h,
             visual_btn_bg,
             [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
             5.0 * scale,
         ));
         draw_text(
@@ -3409,20 +4365,29 @@ impl Pipeline {
             "Visual",
             visual_btn_x / scale + 8.0,
             visual_btn_y / scale + 6.0,
-            if visual_picker_active { [0.05, 0.05, 0.05, 1.0] } else { [0.85, 0.85, 0.90, 1.0] },
+            if visual_picker_active {
+                with_opacity([0.05, 0.05, 0.05, 1.0], chrome_alpha)
+            } else {
+                with_opacity([0.85, 0.85, 0.90, 1.0], chrome_alpha)
+            },
             &mut fg_instances,
         );
 
-        // Draw topbar close button
+        // Draw topbar close button — vertically centered (28*scale box in 40*scale bar)
         let close_x = viewport_width - 32.0 * scale;
-        let close_y = 4.0 * scale;
+        let close_y = 6.0 * scale; // (40 - 28) / 2
         if hover_close {
             bg_instances.push(CellInstance::new(
-                close_x, close_y,
-                28.0 * scale, 28.0 * scale,
-                [0.85, 0.25, 0.25, 0.9],
+                close_x,
+                close_y,
+                28.0 * scale,
+                28.0 * scale,
+                with_opacity([0.85, 0.25, 0.25, 0.9], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 6.0 * scale, // Rounded rectangle
             ));
         }
@@ -3434,20 +4399,53 @@ impl Pipeline {
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
-                glyph_x, glyph_y,
-                entry_w, entry_h,
-                [0.8, 0.8, 0.85, 1.0],
+                glyph_x,
+                glyph_y,
+                entry_w,
+                entry_h,
+                with_opacity([0.8, 0.8, 0.85, 1.0], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                uv_x,
+                uv_y,
+                uv_end_x - uv_x,
+                uv_end_y - uv_y,
                 0.0,
             ));
         }
 
         // Draw labels
-        draw_text(atlas, "Font Family:", 20.0, 56.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
-        draw_text(atlas, "Font Size:", 20.0, 96.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
-        draw_text(atlas, "Scrollback:", 20.0, 136.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
-        draw_text(atlas, "Theme:", 20.0, 176.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
+        draw_text(
+            atlas,
+            "Font Family:",
+            20.0,
+            56.0,
+            with_opacity([0.75, 0.75, 0.80, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
+        draw_text(
+            atlas,
+            "Font Size:",
+            20.0,
+            96.0,
+            with_opacity([0.75, 0.75, 0.80, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
+        draw_text(
+            atlas,
+            "Scrollback:",
+            20.0,
+            136.0,
+            with_opacity([0.75, 0.75, 0.80, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
+        draw_text(
+            atlas,
+            "Theme:",
+            20.0,
+            176.0,
+            with_opacity([0.75, 0.75, 0.80, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
 
         // Draw inputs
         // 1. Font Family select box
@@ -3459,11 +4457,16 @@ impl Pipeline {
             theme_lift_rest
         };
         bg_instances.push(CellInstance::new(
-            140.0 * scale, 52.0 * scale,
-            240.0 * scale, 26.0 * scale,
+            140.0 * scale,
+            52.0 * scale,
+            240.0 * scale,
+            26.0 * scale,
             family_bg,
             [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
             6.0 * scale,
         ));
 
@@ -3476,28 +4479,56 @@ impl Pipeline {
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
-                glyph_x, glyph_y,
-                entry_w, entry_h,
-                [0.7, 0.7, 0.75, 1.0],
+                glyph_x,
+                glyph_y,
+                entry_w,
+                entry_h,
+                with_opacity([0.7, 0.7, 0.75, 1.0], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                uv_x,
+                uv_y,
+                uv_end_x - uv_x,
+                uv_end_y - uv_y,
                 0.0,
             ));
         }
 
         // Draw font family text name
-        draw_text(atlas, font_family, 168.0, 56.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+        draw_text(
+            atlas,
+            font_family,
+            168.0,
+            56.0,
+            with_opacity([0.9, 0.9, 0.95, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
         // Draw dropdown arrow icon (▾)
-        draw_text(atlas, "▾", 362.0, 56.0, [0.7, 0.7, 0.75, 1.0], &mut fg_instances);
+        draw_text(
+            atlas,
+            "▾",
+            362.0,
+            56.0,
+            with_opacity([0.7, 0.7, 0.75, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
 
         // 2. Font Size controls
-        let size_minus_bg = if hover_size_minus { [1.0, 1.0, 1.0, 0.15] } else { [1.0, 1.0, 1.0, 0.05] };
+        let size_minus_bg = if hover_size_minus {
+            with_opacity([1.0, 1.0, 1.0, 0.15], chrome_alpha)
+        } else {
+            with_opacity([1.0, 1.0, 1.0, 0.05], chrome_alpha)
+        };
         bg_instances.push(CellInstance::new(
-            140.0 * scale, 92.0 * scale,
-            28.0 * scale, 26.0 * scale,
+            140.0 * scale,
+            92.0 * scale,
+            28.0 * scale,
+            26.0 * scale,
             size_minus_bg,
             [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
             6.0 * scale,
         ));
         if let Some(entry) = &atlas.icon_less {
@@ -3508,24 +4539,45 @@ impl Pipeline {
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
-                glyph_x, glyph_y,
-                entry_w, entry_h,
-                [0.9, 0.9, 0.95, 1.0],
+                glyph_x,
+                glyph_y,
+                entry_w,
+                entry_h,
+                with_opacity([0.9, 0.9, 0.95, 1.0], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                uv_x,
+                uv_y,
+                uv_end_x - uv_x,
+                uv_end_y - uv_y,
                 0.0,
             ));
         }
 
-        draw_text(atlas, &format!("{:.1}", font_size), 180.0, 96.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+        draw_text(
+            atlas,
+            &format!("{:.1}", font_size),
+            180.0,
+            96.0,
+            with_opacity([0.9, 0.9, 0.95, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
 
-        let size_plus_bg = if hover_size_plus { [1.0, 1.0, 1.0, 0.15] } else { [1.0, 1.0, 1.0, 0.05] };
+        let size_plus_bg = if hover_size_plus {
+            with_opacity([1.0, 1.0, 1.0, 0.15], chrome_alpha)
+        } else {
+            with_opacity([1.0, 1.0, 1.0, 0.05], chrome_alpha)
+        };
         bg_instances.push(CellInstance::new(
-            220.0 * scale, 92.0 * scale,
-            28.0 * scale, 26.0 * scale,
+            220.0 * scale,
+            92.0 * scale,
+            28.0 * scale,
+            26.0 * scale,
             size_plus_bg,
             [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
             6.0 * scale,
         ));
         if let Some(entry) = &atlas.icon_add {
@@ -3536,23 +4588,37 @@ impl Pipeline {
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
-                glyph_x, glyph_y,
-                entry_w, entry_h,
-                [0.9, 0.9, 0.95, 1.0],
+                glyph_x,
+                glyph_y,
+                entry_w,
+                entry_h,
+                with_opacity([0.9, 0.9, 0.95, 1.0], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                uv_x,
+                uv_y,
+                uv_end_x - uv_x,
+                uv_end_y - uv_y,
                 0.0,
             ));
         }
 
         // 3. Scrollback controls
-        let scroll_minus_bg = if hover_scroll_minus { [1.0, 1.0, 1.0, 0.15] } else { [1.0, 1.0, 1.0, 0.05] };
+        let scroll_minus_bg = if hover_scroll_minus {
+            with_opacity([1.0, 1.0, 1.0, 0.15], chrome_alpha)
+        } else {
+            with_opacity([1.0, 1.0, 1.0, 0.05], chrome_alpha)
+        };
         bg_instances.push(CellInstance::new(
-            140.0 * scale, 132.0 * scale,
-            28.0 * scale, 26.0 * scale,
+            140.0 * scale,
+            132.0 * scale,
+            28.0 * scale,
+            26.0 * scale,
             scroll_minus_bg,
             [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
             6.0 * scale,
         ));
         if let Some(entry) = &atlas.icon_less {
@@ -3563,24 +4629,45 @@ impl Pipeline {
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
-                glyph_x, glyph_y,
-                entry_w, entry_h,
-                [0.9, 0.9, 0.95, 1.0],
+                glyph_x,
+                glyph_y,
+                entry_w,
+                entry_h,
+                with_opacity([0.9, 0.9, 0.95, 1.0], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                uv_x,
+                uv_y,
+                uv_end_x - uv_x,
+                uv_end_y - uv_y,
                 0.0,
             ));
         }
 
-        draw_text(atlas, &format!("{}", scrollback), 180.0, 136.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+        draw_text(
+            atlas,
+            &format!("{}", scrollback),
+            180.0,
+            136.0,
+            with_opacity([0.9, 0.9, 0.95, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
 
-        let scroll_plus_bg = if hover_scroll_plus { [1.0, 1.0, 1.0, 0.15] } else { [1.0, 1.0, 1.0, 0.05] };
+        let scroll_plus_bg = if hover_scroll_plus {
+            with_opacity([1.0, 1.0, 1.0, 0.15], chrome_alpha)
+        } else {
+            with_opacity([1.0, 1.0, 1.0, 0.05], chrome_alpha)
+        };
         bg_instances.push(CellInstance::new(
-            240.0 * scale, 132.0 * scale,
-            28.0 * scale, 26.0 * scale,
+            240.0 * scale,
+            132.0 * scale,
+            28.0 * scale,
+            26.0 * scale,
             scroll_plus_bg,
             [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
             6.0 * scale,
         ));
         if let Some(entry) = &atlas.icon_add {
@@ -3591,11 +4678,16 @@ impl Pipeline {
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
-                glyph_x, glyph_y,
-                entry_w, entry_h,
-                [0.9, 0.9, 0.95, 1.0],
+                glyph_x,
+                glyph_y,
+                entry_w,
+                entry_h,
+                with_opacity([0.9, 0.9, 0.95, 1.0], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                uv_x,
+                uv_y,
+                uv_end_x - uv_x,
+                uv_end_y - uv_y,
                 0.0,
             ));
         }
@@ -3609,11 +4701,16 @@ impl Pipeline {
             theme_lift_rest
         };
         bg_instances.push(CellInstance::new(
-            140.0 * scale, 172.0 * scale,
-            240.0 * scale, 26.0 * scale,
+            140.0 * scale,
+            172.0 * scale,
+            240.0 * scale,
+            26.0 * scale,
             theme_bg,
             [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
             6.0 * scale,
         ));
 
@@ -3630,22 +4727,51 @@ impl Pipeline {
         for (i, (r, g, b)) in swatch_colors.iter().enumerate() {
             let cx = swatch_x + i as f32 * 4.0f32 * scale;
             fg_instances.push(CellInstance::new(
-                cx, swatch_y,
-                3.0f32 * scale, 12.0f32 * scale,
-                [*r as f32 / 255.0, *g as f32 / 255.0, *b as f32 / 255.0, 1.0],
+                cx,
+                swatch_y,
+                3.0f32 * scale,
+                12.0f32 * scale,
+                with_opacity(
+                    [*r as f32 / 255.0, *g as f32 / 255.0, *b as f32 / 255.0, 1.0],
+                    chrome_alpha,
+                ),
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 0.0, 0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
                 1.0f32 * scale,
             ));
         }
 
         // Theme name text
-        draw_text(atlas, theme, 172.0, 176.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+        draw_text(
+            atlas,
+            theme,
+            172.0,
+            176.0,
+            with_opacity([0.9, 0.9, 0.95, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
         // Dropdown arrow
-        draw_text(atlas, "▾", 362.0, 176.0, [0.7, 0.7, 0.75, 1.0], &mut fg_instances);
+        draw_text(
+            atlas,
+            "▾",
+            362.0,
+            176.0,
+            with_opacity([0.7, 0.7, 0.75, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
 
         // 5. Config File option
-        draw_text(atlas, "Config File:", 20.0, 216.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
+        draw_text(
+            atlas,
+            "Config File:",
+            20.0,
+            216.0,
+            with_opacity([0.75, 0.75, 0.80, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
 
         let config_bg = if hover_open_config {
             theme_lift_hover
@@ -3653,11 +4779,16 @@ impl Pipeline {
             theme_lift_rest
         };
         bg_instances.push(CellInstance::new(
-            140.0 * scale, 212.0 * scale,
-            240.0 * scale, 26.0 * scale,
+            140.0 * scale,
+            212.0 * scale,
+            240.0 * scale,
+            26.0 * scale,
             config_bg,
             [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
             6.0 * scale,
         ));
 
@@ -3670,16 +4801,28 @@ impl Pipeline {
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
-                glyph_x, glyph_y,
-                entry_w, entry_h,
-                [0.7, 0.7, 0.75, 1.0],
+                glyph_x,
+                glyph_y,
+                entry_w,
+                entry_h,
+                with_opacity([0.7, 0.7, 0.75, 1.0], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                uv_x,
+                uv_y,
+                uv_end_x - uv_x,
+                uv_end_y - uv_y,
                 0.0,
             ));
         }
 
-        draw_text(atlas, "Open fasty.toml", 168.0, 216.0, [0.9, 0.9, 0.95, 1.0], &mut fg_instances);
+        draw_text(
+            atlas,
+            "Open fasty.toml",
+            168.0,
+            216.0,
+            with_opacity([0.9, 0.9, 0.95, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
 
         // Save & Cancel buttons removed — settings apply live.
 
@@ -3690,33 +4833,48 @@ impl Pipeline {
             let drop_w = 240.0f32 * scale;
             let drop_h = 180.0f32 * scale;
 
-            // Draw dropdown background shadow
+            // Draw dropdown background shadow: 2px expand, 2px y offset
             fg_instances.push(CellInstance::new(
-                drop_x - 4.0 * scale, drop_y - 2.0 * scale,
-                drop_w + 8.0 * scale, drop_h + 8.0 * scale,
-                [0.0, 0.0, 0.0, 0.35],
-                [4.0 * scale, 4.0 * scale, 4.0 * scale, 0.0],
-                0.0, 0.0, 1.0, 1.0,
-                6.0 * scale,
+                drop_x - 2.0 * scale,
+                drop_y + 2.0 * scale,
+                drop_w + 4.0 * scale,
+                drop_h + 4.0 * scale,
+                with_opacity([0.0, 0.0, 0.0, 0.08], chrome_alpha),
+                [0.0, 0.0, 0.0, 0.0],
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+                8.0 * scale, // Slightly larger than border's 6.0 for soft falloff
             ));
 
             // Draw dropdown border
             fg_instances.push(CellInstance::new(
-                drop_x, drop_y,
-                drop_w, drop_h,
-                [1.0, 1.0, 1.0, 0.15],
+                drop_x,
+                drop_y,
+                drop_w,
+                drop_h,
+                with_opacity([1.0, 1.0, 1.0, 0.15], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 6.0 * scale,
             ));
 
-            // Draw dropdown background (theme bg) - 100% opaque alpha!
+            // Draw dropdown background (theme bg)
             fg_instances.push(CellInstance::new(
-                drop_x + 1.0 * scale, drop_y + 1.0 * scale,
-                drop_w - 2.0 * scale, drop_h - 2.0 * scale,
+                drop_x + 1.0 * scale,
+                drop_y + 1.0 * scale,
+                drop_w - 2.0 * scale,
+                drop_h - 2.0 * scale,
                 theme_bg,
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 5.0 * scale,
             ));
 
@@ -3736,39 +4894,52 @@ impl Pipeline {
                     // Draw item background on hover/selection (themed)
                     if is_hovered {
                         fg_instances.push(CellInstance::new(
-                            drop_x + 4.0 * scale, item_top_y + 1.0 * scale,
-                            drop_w - 8.0 * scale, item_h - 2.0 * scale,
+                            drop_x + 4.0 * scale,
+                            item_top_y + 1.0 * scale,
+                            drop_w - 8.0 * scale,
+                            item_h - 2.0 * scale,
                             theme_item_hover,
                             [0.0, 0.0, 0.0, 0.0],
-                            0.0, 0.0, 1.0, 1.0,
+                            0.0,
+                            0.0,
+                            1.0,
+                            1.0,
                             4.0 * scale,
                         ));
                     } else if is_selected {
                         fg_instances.push(CellInstance::new(
-                            drop_x + 4.0 * scale, item_top_y + 1.0 * scale,
-                            drop_w - 8.0 * scale, item_h - 2.0 * scale,
-                            [theme_accent[0], theme_accent[1], theme_accent[2], 0.20],
+                            drop_x + 4.0 * scale,
+                            item_top_y + 1.0 * scale,
+                            drop_w - 8.0 * scale,
+                            item_h - 2.0 * scale,
+                            with_opacity(
+                                [theme_accent[0], theme_accent[1], theme_accent[2], 0.20],
+                                chrome_alpha,
+                            ),
                             [0.0, 0.0, 0.0, 0.0],
-                            0.0, 0.0, 1.0, 1.0,
+                            0.0,
+                            0.0,
+                            1.0,
+                            1.0,
                             4.0 * scale,
                         ));
                     }
 
                     // Render item text
                     let text_color = if is_selected {
-                        theme_accent
+                        with_opacity(theme_accent, chrome_alpha)
                     } else if is_hovered {
-                        [1.0, 1.0, 1.0, 1.0]
+                        with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha)
                     } else {
-                        [0.85, 0.85, 0.90, 1.0]
+                        with_opacity([0.85, 0.85, 0.90, 1.0], chrome_alpha)
                     };
 
                     // Draw text inside item (vertically centered)
                     let text_y = item_top_y + (item_h - atlas.cell_size().1) / 2.0;
                     let mut tx = drop_x + padding_x;
-                    
+
                     // Simple text clipping: truncate if too long
-                    let max_text_w = drop_w - padding_x * 2.0 - 10.0 * scale; 
+                    let max_text_w = drop_w - padding_x * 2.0 - 10.0 * scale;
                     let mut current_w = 0.0f32;
 
                     // Space must be handled BEFORE the rasterize call so a
@@ -3793,15 +4964,22 @@ impl Pipeline {
                                 let glyph_y = (text_y + atlas.ascent() + entry.top).round();
 
                                 // Clip glyph vertically to dropdown client area
-                                if glyph_y + glyph_h <= drop_y + drop_h - 2.0 * scale && glyph_y >= drop_y + 2.0 * scale {
+                                if glyph_y + glyph_h <= drop_y + drop_h - 2.0 * scale
+                                    && glyph_y >= drop_y + 2.0 * scale
+                                {
                                     let (aw, ah) = atlas.atlas_size();
                                     let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                                     fg_instances.push(CellInstance::new(
-                                        glyph_x, glyph_y,
-                                        glyph_w, glyph_h,
+                                        glyph_x,
+                                        glyph_y,
+                                        glyph_w,
+                                        glyph_h,
                                         text_color,
                                         [0.0, 0.0, 0.0, 0.0],
-                                        uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                                        uv_x,
+                                        uv_y,
+                                        uv_end_x - uv_x,
+                                        uv_end_y - uv_y,
                                         0.0,
                                     ));
                                 }
@@ -3822,11 +5000,16 @@ impl Pipeline {
                 let sbar_y = drop_y + ((font_scroll_y * scale) / total_h) * drop_h;
 
                 fg_instances.push(CellInstance::new(
-                    sbar_x, sbar_y,
-                    sbar_w, sbar_h,
-                    [1.0, 1.0, 1.0, 0.25],
+                    sbar_x,
+                    sbar_y,
+                    sbar_w,
+                    sbar_h,
+                    with_opacity([1.0, 1.0, 1.0, 0.25], chrome_alpha),
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
                     2.0 * scale,
                 ));
             }
@@ -3843,33 +5026,48 @@ impl Pipeline {
             let total_h = themes.len() as f32 * item_h;
             let drop_h = total_h.min(visible_h).max(item_h);
 
-            // Draw dropdown background shadow
+            // Draw dropdown background shadow: 2px expand, 2px y offset
             fg_instances.push(CellInstance::new(
-                drop_x - 4.0 * scale, drop_y - 2.0 * scale,
-                drop_w + 8.0 * scale, drop_h + 8.0 * scale,
-                [0.0, 0.0, 0.0, 0.35],
-                [4.0 * scale, 4.0 * scale, 4.0 * scale, 0.0],
-                0.0, 0.0, 1.0, 1.0,
-                6.0 * scale,
+                drop_x - 2.0 * scale,
+                drop_y + 2.0 * scale,
+                drop_w + 4.0 * scale,
+                drop_h + 4.0 * scale,
+                with_opacity([0.0, 0.0, 0.0, 0.08], chrome_alpha),
+                [0.0, 0.0, 0.0, 0.0],
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+                8.0 * scale, // Slightly larger than border's 6.0 for soft falloff
             ));
 
             // Draw dropdown border
             fg_instances.push(CellInstance::new(
-                drop_x, drop_y,
-                drop_w, drop_h,
-                [1.0, 1.0, 1.0, 0.15],
+                drop_x,
+                drop_y,
+                drop_w,
+                drop_h,
+                with_opacity([1.0, 1.0, 1.0, 0.15], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 6.0 * scale,
             ));
 
             // Draw dropdown background (theme bg)
             fg_instances.push(CellInstance::new(
-                drop_x + 1.0 * scale, drop_y + 1.0 * scale,
-                drop_w - 2.0 * scale, drop_h - 2.0 * scale,
+                drop_x + 1.0 * scale,
+                drop_y + 1.0 * scale,
+                drop_w - 2.0 * scale,
+                drop_h - 2.0 * scale,
                 theme_bg,
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 5.0 * scale,
             ));
 
@@ -3887,20 +5085,33 @@ impl Pipeline {
 
                 if is_hovered {
                     fg_instances.push(CellInstance::new(
-                        drop_x + 4.0 * scale, item_top_y + 1.0 * scale,
-                        drop_w - 8.0 * scale, item_h - 2.0 * scale,
+                        drop_x + 4.0 * scale,
+                        item_top_y + 1.0 * scale,
+                        drop_w - 8.0 * scale,
+                        item_h - 2.0 * scale,
                         theme_item_hover,
                         [0.0, 0.0, 0.0, 0.0],
-                        0.0, 0.0, 1.0, 1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0,
                         4.0 * scale,
                     ));
                 } else if is_selected {
                     fg_instances.push(CellInstance::new(
-                        drop_x + 4.0 * scale, item_top_y + 1.0 * scale,
-                        drop_w - 8.0 * scale, item_h - 2.0 * scale,
-                        [theme_accent[0], theme_accent[1], theme_accent[2], 0.20],
+                        drop_x + 4.0 * scale,
+                        item_top_y + 1.0 * scale,
+                        drop_w - 8.0 * scale,
+                        item_h - 2.0 * scale,
+                        with_opacity(
+                            [theme_accent[0], theme_accent[1], theme_accent[2], 0.20],
+                            chrome_alpha,
+                        ),
                         [0.0, 0.0, 0.0, 0.0],
-                        0.0, 0.0, 1.0, 1.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0,
                         4.0 * scale,
                     ));
                 }
@@ -3918,21 +5129,29 @@ impl Pipeline {
                 for (j, (r, g, b)) in swatch_colors_arr.iter().enumerate() {
                     let cx = swatch_x + j as f32 * 4.0f32 * scale;
                     fg_instances.push(CellInstance::new(
-                        cx, swatch_y,
-                        3.0f32 * scale, 10.0f32 * scale,
-                        [*r as f32 / 255.0, *g as f32 / 255.0, *b as f32 / 255.0, 1.0],
+                        cx,
+                        swatch_y,
+                        3.0f32 * scale,
+                        10.0f32 * scale,
+                        with_opacity(
+                            [*r as f32 / 255.0, *g as f32 / 255.0, *b as f32 / 255.0, 1.0],
+                            chrome_alpha,
+                        ),
                         [0.0, 0.0, 0.0, 0.0],
-                        0.0, 0.0, 0.0, 0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
                         1.0f32 * scale,
                     ));
                 }
 
                 let text_color = if is_selected {
-                    theme_accent
+                    with_opacity(theme_accent, chrome_alpha)
                 } else if is_hovered {
-                    [1.0, 1.0, 1.0, 1.0]
+                    with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha)
                 } else {
-                    [0.85, 0.85, 0.90, 1.0]
+                    with_opacity([0.85, 0.85, 0.90, 1.0], chrome_alpha)
                 };
 
                 let text_y = item_top_y + (item_h - atlas.cell_size().1) / 2.0;
@@ -3959,15 +5178,22 @@ impl Pipeline {
                             let glyph_x = (tx + entry.left).round();
                             let glyph_y = (text_y + atlas.ascent() + entry.top).round();
 
-                            if glyph_y + glyph_h <= drop_y + drop_h - 2.0 * scale && glyph_y >= drop_y + 2.0 * scale {
+                            if glyph_y + glyph_h <= drop_y + drop_h - 2.0 * scale
+                                && glyph_y >= drop_y + 2.0 * scale
+                            {
                                 let (aw, ah) = atlas.atlas_size();
                                 let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                                 fg_instances.push(CellInstance::new(
-                                    glyph_x, glyph_y,
-                                    glyph_w, glyph_h,
+                                    glyph_x,
+                                    glyph_y,
+                                    glyph_w,
+                                    glyph_h,
                                     text_color,
                                     [0.0, 0.0, 0.0, 0.0],
-                                    uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                                    uv_x,
+                                    uv_y,
+                                    uv_end_x - uv_x,
+                                    uv_end_y - uv_y,
                                     0.0,
                                 ));
                             }
@@ -3986,11 +5212,16 @@ impl Pipeline {
                 let sbar_y = drop_y + ((theme_scroll_y * scale) / total_h) * drop_h;
 
                 fg_instances.push(CellInstance::new(
-                    sbar_x, sbar_y,
-                    sbar_w, sbar_h,
-                    [1.0, 1.0, 1.0, 0.25],
+                    sbar_x,
+                    sbar_y,
+                    sbar_w,
+                    sbar_h,
+                    with_opacity([1.0, 1.0, 1.0, 0.25], chrome_alpha),
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
                     2.0 * scale,
                 ));
             }
@@ -4004,11 +5235,19 @@ impl Pipeline {
             let card_h = 58.0f32 * scale;
             let gap = 8.0f32 * scale;
             let cols = 2;
-            let rows_visible = ((viewport_height - grid_y - 12.0 * scale) / (card_h + gap)).floor() as i32;
+            let rows_visible =
+                ((viewport_height - grid_y - 12.0 * scale) / (card_h + gap)).floor() as i32;
             let rows_visible = rows_visible.max(1);
             let total_rows = ((themes.len() as i32 + cols - 1) / cols).max(1);
 
-            draw_text(atlas, "Theme previews", grid_x / scale, grid_y / scale - 16.0, [0.75, 0.75, 0.80, 1.0], &mut fg_instances);
+            draw_text(
+                atlas,
+                "Theme previews",
+                grid_x / scale,
+                grid_y / scale - 16.0,
+                with_opacity([0.75, 0.75, 0.80, 1.0], chrome_alpha),
+                &mut fg_instances,
+            );
 
             for (i, theme_name) in themes.iter().enumerate() {
                 let col = (i as i32) % cols;
@@ -4028,9 +5267,33 @@ impl Pipeline {
                 let (br, bgc, bb) = t.background;
                 crate::config::set_active_theme(&prev);
 
-                let card_bg = [br as f32 / 255.0, bgc as f32 / 255.0, bb as f32 / 255.0, 1.0];
-                let card_fg = [fg.0 as f32 / 255.0, fg.1 as f32 / 255.0, fg.2 as f32 / 255.0, 1.0];
-                let card_accent = [accent_r.0 as f32 / 255.0, accent_r.1 as f32 / 255.0, accent_r.2 as f32 / 255.0, 1.0];
+                let card_bg = with_opacity(
+                    [
+                        br as f32 / 255.0,
+                        bgc as f32 / 255.0,
+                        bb as f32 / 255.0,
+                        1.0,
+                    ],
+                    chrome_alpha,
+                );
+                let card_fg = with_opacity(
+                    [
+                        fg.0 as f32 / 255.0,
+                        fg.1 as f32 / 255.0,
+                        fg.2 as f32 / 255.0,
+                        1.0,
+                    ],
+                    chrome_alpha,
+                );
+                let card_accent = with_opacity(
+                    [
+                        accent_r.0 as f32 / 255.0,
+                        accent_r.1 as f32 / 255.0,
+                        accent_r.2 as f32 / 255.0,
+                        1.0,
+                    ],
+                    chrome_alpha,
+                );
 
                 let is_active = theme_name == theme;
                 let is_hovered = hovered_card_idx == Some(i);
@@ -4038,63 +5301,117 @@ impl Pipeline {
                 let border_color = if is_active {
                     card_accent
                 } else if is_hovered {
-                    [1.0, 1.0, 1.0, 0.30]
+                    with_opacity([1.0, 1.0, 1.0, 0.30], chrome_alpha)
                 } else {
-                    [1.0, 1.0, 1.0, 0.12]
+                    with_opacity([1.0, 1.0, 1.0, 0.12], chrome_alpha)
                 };
 
                 // Shadow
                 bg_instances.push(CellInstance::new(
-                    card_x + 2.0 * scale, card_y + 2.0 * scale,
-                    card_w, card_h,
-                    [0.0, 0.0, 0.0, 0.25],
+                    card_x + 2.0 * scale,
+                    card_y + 2.0 * scale,
+                    card_w,
+                    card_h,
+                    with_opacity([0.0, 0.0, 0.0, 0.25], chrome_alpha),
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
                     8.0 * scale,
                 ));
                 // Card background — uses the theme's actual bg color
                 bg_instances.push(CellInstance::new(
-                    card_x, card_y,
-                    card_w, card_h,
+                    card_x,
+                    card_y,
+                    card_w,
+                    card_h,
                     card_bg,
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
                     8.0 * scale,
                 ));
                 // Border ring
                 fg_instances.push(CellInstance::new(
-                    card_x, card_y,
-                    card_w, card_h,
+                    card_x,
+                    card_y,
+                    card_w,
+                    card_h,
                     border_color,
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
                     8.0 * scale,
                 ));
 
                 let sample_x = card_x + 8.0 * scale;
                 let sample_y = card_y + 6.0 * scale;
-                draw_text(atlas, "Aa Bb", sample_x / scale, sample_y / scale, card_fg, &mut fg_instances);
+                draw_text(
+                    atlas,
+                    "Aa Bb",
+                    sample_x / scale,
+                    sample_y / scale,
+                    card_fg,
+                    &mut fg_instances,
+                );
                 // Accent strip on the right (small bar using the theme's red/green accent)
                 fg_instances.push(CellInstance::new(
-                    card_x + card_w - 18.0 * scale, card_y + 8.0 * scale,
-                    10.0 * scale, 4.0 * scale,
+                    card_x + card_w - 18.0 * scale,
+                    card_y + 8.0 * scale,
+                    10.0 * scale,
+                    4.0 * scale,
                     card_accent,
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
                     2.0 * scale,
                 ));
                 fg_instances.push(CellInstance::new(
-                    card_x + card_w - 32.0 * scale, card_y + 8.0 * scale,
-                    10.0 * scale, 4.0 * scale,
-                    [accent_g.0 as f32 / 255.0, accent_g.1 as f32 / 255.0, accent_g.2 as f32 / 255.0, 1.0],
+                    card_x + card_w - 32.0 * scale,
+                    card_y + 8.0 * scale,
+                    10.0 * scale,
+                    4.0 * scale,
+                    with_opacity(
+                        [
+                            accent_g.0 as f32 / 255.0,
+                            accent_g.1 as f32 / 255.0,
+                            accent_g.2 as f32 / 255.0,
+                            1.0,
+                        ],
+                        chrome_alpha,
+                    ),
                     [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
                     2.0 * scale,
                 ));
 
-                draw_text(atlas, theme_name, (card_x + 8.0 * scale) / scale, (card_y + 30.0 * scale) / scale, card_fg, &mut fg_instances);
+                draw_text(
+                    atlas,
+                    theme_name,
+                    (card_x + 8.0 * scale) / scale,
+                    (card_y + 30.0 * scale) / scale,
+                    card_fg,
+                    &mut fg_instances,
+                );
                 if is_active {
-                    draw_text(atlas, "v", (card_x + card_w - 18.0 * scale) / scale, (card_y + 30.0 * scale) / scale, card_accent, &mut fg_instances);
+                    draw_text(
+                        atlas,
+                        "v",
+                        (card_x + card_w - 18.0 * scale) / scale,
+                        (card_y + 30.0 * scale) / scale,
+                        card_accent,
+                        &mut fg_instances,
+                    );
                 }
             }
             let _ = (total_rows, rows_visible);
@@ -4142,66 +5459,75 @@ impl Pipeline {
         hover_close: bool,
         device: &Device,
         queue: &wgpu::Queue,
+        opacity: f32,
     ) {
         let mut bg_instances = Vec::new();
         let mut fg_instances = Vec::new();
 
         // Theme-aware bg / topbar, same convention as the main window.
-        let (bg_r, bg_g, bg_b) = named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::Background);
-        let theme_bg = [bg_r as f32 / 255.0, bg_g as f32 / 255.0, bg_b as f32 / 255.0, 1.0];
+        let (bg_r, bg_g, bg_b) =
+            named_color_rgb(alacritty_terminal::vte::ansi::NamedColor::Background);
+        let bg_alpha = opacity.clamp(0.0, 1.0);
+        let chrome_alpha = bg_alpha;
+        let theme_bg = [
+            bg_r as f32 / 255.0,
+            bg_g as f32 / 255.0,
+            bg_b as f32 / 255.0,
+            bg_alpha,
+        ];
         let active_theme = crate::config::ACTIVE_THEME.read().to_lowercase();
         let theme_topbar = if active_theme == "default" {
-            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, 1.0]
+            [10.0 / 255.0, 10.0 / 255.0, 10.0 / 255.0, bg_alpha]
         } else {
             [
                 bg_r as f32 / 255.0 * 0.83,
                 bg_g as f32 / 255.0 * 0.83,
                 bg_b as f32 / 255.0 * 0.83,
-                1.0,
+                bg_alpha,
             ]
         };
 
         // 0. Draw window background (theme bg)
         bg_instances.push(CellInstance::new(
-            0.0, 0.0,
-            viewport_width, viewport_height,
+            0.0,
+            0.0,
+            viewport_width,
+            viewport_height,
             theme_bg,
             [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
             8.0,
         ));
 
-        // 1. Draw topbar background (darker variant of theme bg)
+        // 1. Draw topbar background. Single rounded-rectangle layer with
+        // per-corner radii: top corners rounded (8px), bottom square.
         bg_instances.push(CellInstance::new(
-            0.0, 0.0,
-            viewport_width, 36.0,
-            theme_topbar,
-            [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 1.0, 1.0,
-            8.0,
-        ));
-        bg_instances.push(CellInstance::new(
-            0.0, 28.0,
-            viewport_width, 8.0,
-            theme_topbar,
-            [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 0.0, 0.0,
             0.0,
-        ));
-        bg_instances.push(CellInstance::new(
-            0.0, 36.0,
-            viewport_width, 1.0,
-            [1.0, 1.0, 1.0, 0.06], // Divider line
-            [0.0, 0.0, 0.0, 0.0],
-            0.0, 0.0, 0.0, 0.0,
             0.0,
+            viewport_width,
+            40.0,
+            theme_topbar,
+            [8.0, 8.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            8.0, // uniform radius (used for corners with 0 in bg_color)
         ));
 
         // Helper to draw text. Spaces must be handled BEFORE the get_or_rasterize
         // call (a space can return None or a 0-width entry) and must advance by
         // the actual cell width so spaces look like spaces.
         let about_cell_w = atlas.cell_size().0;
-        let draw_text = |atlas: &mut crate::renderer::Atlas, text: &str, start_x: f32, start_y: f32, color: [f32; 4], fg_list: &mut Vec<CellInstance>| {
+        let draw_text = |atlas: &mut crate::renderer::Atlas,
+                         text: &str,
+                         start_x: f32,
+                         start_y: f32,
+                         color: [f32; 4],
+                         fg_list: &mut Vec<CellInstance>| {
             let mut x = start_x;
             for c in text.chars() {
                 if c == ' ' {
@@ -4215,11 +5541,16 @@ impl Pipeline {
                         let (aw, ah) = atlas.atlas_size();
                         let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                         fg_list.push(CellInstance::new(
-                            glyph_x, glyph_y,
-                            entry.width, entry.height,
+                            glyph_x,
+                            glyph_y,
+                            entry.width,
+                            entry.height,
                             color,
                             [0.0, 0.0, 0.0, 0.0],
-                            uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                            uv_x,
+                            uv_y,
+                            uv_end_x - uv_x,
+                            uv_end_y - uv_y,
                             0.0,
                         ));
                         x += entry.width + 2.0;
@@ -4244,17 +5575,29 @@ impl Pipeline {
             w
         };
 
-        // Draw title
-        draw_text(atlas, "About Fasty", 12.0, 6.0, [0.85, 0.85, 0.90, 1.0], &mut fg_instances);
+        // Draw title — vertically centered in the 40px topbar
+        draw_text(
+            atlas,
+            "About Fasty",
+            12.0,
+            13.5,
+            with_opacity([0.85, 0.85, 0.90, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
 
-        // Draw topbar close button
+        // Draw topbar close button — vertically centered (28px box in 40px bar)
         if hover_close {
             bg_instances.push(CellInstance::new(
-                viewport_width - 32.0, 4.0,
-                28.0, 28.0,
-                [0.85, 0.25, 0.25, 0.9],
+                viewport_width - 32.0,
+                6.0,
+                28.0,
+                28.0,
+                with_opacity([0.85, 0.25, 0.25, 0.9], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 6.0,
             ));
         }
@@ -4262,15 +5605,20 @@ impl Pipeline {
             let entry_w = 14.0f32;
             let entry_h = 14.0f32;
             let glyph_x = (viewport_width - 32.0) + (28.0 - entry_w) / 2.0;
-            let glyph_y = 4.0 + (28.0 - entry_h) / 2.0;
+            let glyph_y = 6.0 + (28.0 - entry_h) / 2.0; // close_y now 6.0 for vertical centering
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
-                glyph_x, glyph_y,
-                entry_w, entry_h,
-                [0.8, 0.8, 0.85, 1.0],
+                glyph_x,
+                glyph_y,
+                entry_w,
+                entry_h,
+                with_opacity([0.8, 0.8, 0.85, 1.0], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                uv_x,
+                uv_y,
+                uv_end_x - uv_x,
+                uv_end_y - uv_y,
                 0.0,
             ));
         }
@@ -4284,11 +5632,16 @@ impl Pipeline {
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             fg_instances.push(CellInstance::new(
-                logo_x, logo_y,
-                logo_w, logo_h,
-                [1.0, 1.0, 1.0, 1.0],
+                logo_x,
+                logo_y,
+                logo_w,
+                logo_h,
+                with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha),
                 [0.0, 0.0, 0.0, 0.0],
-                uv_x, uv_y, uv_end_x - uv_x, uv_end_y - uv_y,
+                uv_x,
+                uv_y,
+                uv_end_x - uv_x,
+                uv_end_y - uv_y,
                 1.0,
             ));
         }
@@ -4297,20 +5650,41 @@ impl Pipeline {
         let name_str = "Fasty";
         let name_w = get_text_width(atlas, name_str);
         let name_x = (viewport_width - name_w) / 2.0;
-        draw_text(atlas, name_str, name_x, 110.0, [1.0, 1.0, 1.0, 1.0], &mut fg_instances);
+        draw_text(
+            atlas,
+            name_str,
+            name_x,
+            110.0,
+            with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
 
         // Draw Version: e.g. Version 0.1.3
         let ver_clean = version.trim_start_matches('v');
         let ver_str = format!("Version {}", ver_clean);
         let ver_w = get_text_width(atlas, &ver_str);
         let ver_x = (viewport_width - ver_w) / 2.0;
-        draw_text(atlas, &ver_str, ver_x, 134.0, [0.6, 0.6, 0.65, 1.0], &mut fg_instances);
+        draw_text(
+            atlas,
+            &ver_str,
+            ver_x,
+            134.0,
+            with_opacity([0.6, 0.6, 0.65, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
 
         // Draw description
         let desc_str = "GPU-accelerated Terminal Emulator";
         let desc_w = get_text_width(atlas, desc_str);
         let desc_x = (viewport_width - desc_w) / 2.0;
-        draw_text(atlas, desc_str, desc_x, 158.0, [0.45, 0.45, 0.5, 1.0], &mut fg_instances);
+        draw_text(
+            atlas,
+            desc_str,
+            desc_x,
+            158.0,
+            with_opacity([0.45, 0.45, 0.5, 1.0], chrome_alpha),
+            &mut fg_instances,
+        );
 
         // Write buffer and draw
         let bg_count = bg_instances.len();
@@ -4350,32 +5724,48 @@ fn cell_fg_to_f32(
     _flags: alacritty_terminal::term::cell::Flags,
 ) -> [f32; 4] {
     match color {
-        alacritty_terminal::vte::ansi::Color::Spec(rgb) => {
-            [rgb.r as f32 / 255.0, rgb.g as f32 / 255.0, rgb.b as f32 / 255.0, 1.0]
-        }
+        alacritty_terminal::vte::ansi::Color::Spec(rgb) => [
+            rgb.r as f32 / 255.0,
+            rgb.g as f32 / 255.0,
+            rgb.b as f32 / 255.0,
+            1.0,
+        ],
         alacritty_terminal::vte::ansi::Color::Named(named) => {
             let (r, g, b) = named_color_rgb(named);
             [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
         }
         alacritty_terminal::vte::ansi::Color::Indexed(idx) => {
             let rgb = index_to_ansi_color(idx as usize);
-            [rgb.0 as f32 / 255.0, rgb.1 as f32 / 255.0, rgb.2 as f32 / 255.0, 1.0]
+            [
+                rgb.0 as f32 / 255.0,
+                rgb.1 as f32 / 255.0,
+                rgb.2 as f32 / 255.0,
+                1.0,
+            ]
         }
     }
 }
 
 fn cell_bg_to_f32(color: alacritty_terminal::vte::ansi::Color) -> [f32; 4] {
     match color {
-        alacritty_terminal::vte::ansi::Color::Spec(rgb) => {
-            [rgb.r as f32 / 255.0, rgb.g as f32 / 255.0, rgb.b as f32 / 255.0, 1.0]
-        }
+        alacritty_terminal::vte::ansi::Color::Spec(rgb) => [
+            rgb.r as f32 / 255.0,
+            rgb.g as f32 / 255.0,
+            rgb.b as f32 / 255.0,
+            1.0,
+        ],
         alacritty_terminal::vte::ansi::Color::Named(named) => {
             let (r, g, b) = named_color_rgb(named);
             [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
         }
         alacritty_terminal::vte::ansi::Color::Indexed(idx) => {
             let rgb = index_to_ansi_color(idx as usize);
-            [rgb.0 as f32 / 255.0, rgb.1 as f32 / 255.0, rgb.2 as f32 / 255.0, 1.0]
+            [
+                rgb.0 as f32 / 255.0,
+                rgb.1 as f32 / 255.0,
+                rgb.2 as f32 / 255.0,
+                1.0,
+            ]
         }
     }
 }
@@ -4510,7 +5900,8 @@ fn get_active_theme() -> Theme {
             bright_cyan: (0x93, 0xA1, 0xA1),
             bright_white: (0xFD, 0xF6, 0xE3),
         },
-        _ => Theme { // Fasty (Default)
+        _ => Theme {
+            // Fasty (Default)
             foreground: (0xC5, 0xC8, 0xC6),
             background: (0x0C, 0x0C, 0x0C),
             black: (0x1D, 0x1F, 0x21),
@@ -4529,11 +5920,13 @@ fn get_active_theme() -> Theme {
             bright_magenta: (0xB2, 0x94, 0xBB),
             bright_cyan: (0x8A, 0xBE, 0xB7),
             bright_white: (0xFF, 0xFF, 0xFF),
-        }
+        },
     }
 }
 
-fn named_color_rgb_for_theme(theme_name: &str) -> ((u8, u8, u8), (u8, u8, u8), (u8, u8, u8), (u8, u8, u8)) {
+fn named_color_rgb_for_theme(
+    theme_name: &str,
+) -> ((u8, u8, u8), (u8, u8, u8), (u8, u8, u8), (u8, u8, u8)) {
     let previous = crate::config::ACTIVE_THEME.read().clone();
     crate::config::set_active_theme(theme_name);
     let t = get_active_theme();
@@ -4611,7 +6004,7 @@ pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
     if !(0x2500..=0x257F).contains(&code) {
         return None;
     }
-    
+
     // Returns (left, right, top, bottom, kind)
     // Styles: 0: none, 1: light, 2: heavy, 3: double
     // Kinds: 0: normal, 1: round corner, 2: diagonal, 3: dashed
@@ -4621,7 +6014,7 @@ pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
         0x2501 => (2, 2, 0, 0, 0), // ━
         0x2502 => (0, 0, 1, 1, 0), // │
         0x2503 => (0, 0, 2, 2, 0), // ┃
-        
+
         // Dashed lines
         0x2504 => (1, 1, 0, 0, 3), // ┄
         0x2505 => (2, 2, 0, 0, 3), // ┅
@@ -4631,31 +6024,31 @@ pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
         0x2509 => (2, 2, 0, 0, 3), // ┉
         0x250A => (0, 0, 1, 1, 3), // ┊
         0x250B => (0, 0, 2, 2, 3), // ┋
-        
+
         // Corners: Down and Right
         0x250C => (0, 1, 0, 1, 0), // ┌
         0x250D => (0, 2, 0, 1, 0), // ┍
         0x250E => (0, 1, 0, 2, 0), // ┎
         0x250F => (0, 2, 0, 2, 0), // ┏
-        
+
         // Corners: Down and Left
         0x2510 => (1, 0, 0, 1, 0), // ┐
         0x2511 => (2, 0, 0, 1, 0), // ┑
         0x2512 => (1, 0, 0, 2, 0), // ┒
         0x2513 => (2, 0, 0, 2, 0), // ┓
-        
+
         // Corners: Up and Right
         0x2514 => (0, 1, 1, 0, 0), // └
         0x2515 => (0, 2, 1, 0, 0), // ┕
         0x2516 => (0, 1, 2, 0, 0), // ┚ (Actually ┖)
         0x2517 => (0, 2, 2, 0, 0), // ┗
-        
+
         // Corners: Up and Left
         0x2518 => (1, 0, 1, 0, 0), // ┘
         0x2519 => (2, 0, 1, 0, 0), // ┙
         0x251A => (1, 0, 2, 0, 0), // ┚
         0x251B => (2, 0, 2, 0, 0), // ┛
-        
+
         // Tees: Vertical and Right
         0x251C => (0, 1, 1, 1, 0), // ├
         0x251D => (0, 2, 1, 1, 0), // ┝
@@ -4665,7 +6058,7 @@ pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
         0x2521 => (0, 2, 2, 1, 0), // ┡
         0x2522 => (0, 2, 1, 2, 0), // ┢
         0x2523 => (0, 2, 2, 2, 0), // ┣
-        
+
         // Tees: Vertical and Left
         0x2524 => (1, 0, 1, 1, 0), // ┤
         0x2525 => (2, 0, 1, 1, 0), // ┥
@@ -4675,7 +6068,7 @@ pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
         0x2529 => (2, 0, 2, 1, 0), // ┩
         0x252A => (2, 0, 1, 2, 0), // ┪
         0x252B => (2, 0, 2, 2, 0), // ┫
-        
+
         // Tees: Down and Horizontal
         0x252C => (1, 1, 0, 1, 0), // ┬
         0x252D => (2, 1, 0, 1, 0), // ┭
@@ -4685,7 +6078,7 @@ pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
         0x2531 => (2, 1, 0, 2, 0), // ┱
         0x2532 => (1, 2, 0, 2, 0), // ┲
         0x2533 => (2, 2, 0, 2, 0), // ┳
-        
+
         // Tees: Up and Horizontal
         0x2534 => (1, 1, 1, 0, 0), // ┴
         0x2535 => (2, 1, 1, 0, 0), // ┵
@@ -4695,7 +6088,7 @@ pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
         0x2539 => (2, 1, 2, 0, 0), // ┹
         0x253A => (1, 2, 2, 0, 0), // ┺
         0x253B => (2, 2, 2, 0, 0), // ┻
-        
+
         // Crossings
         0x253C => (1, 1, 1, 1, 0), // ┼
         0x253D => (2, 1, 1, 1, 0), // ┽
@@ -4713,13 +6106,13 @@ pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
         0x2549 => (2, 1, 2, 2, 0), // ╉
         0x254A => (1, 2, 2, 2, 0), // ╊
         0x254B => (2, 2, 2, 2, 0), // ╋
-        
+
         // Double dashed
         0x254C => (1, 1, 0, 0, 3), // ╌
         0x254D => (2, 2, 0, 0, 3), // ╍
         0x254E => (0, 0, 1, 1, 3), // ╎
         0x254F => (0, 0, 2, 2, 3), // ╏
-        
+
         // Double Lines
         0x2550 => (3, 3, 0, 0, 0), // ═
         0x2551 => (0, 0, 3, 3, 0), // ║
@@ -4750,18 +6143,18 @@ pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
         0x256A => (3, 3, 1, 1, 0), // ╪
         0x256B => (1, 1, 3, 3, 0), // ╫
         0x256C => (3, 3, 3, 3, 0), // ╬
-        
+
         // Round corners
         0x256D => (0, 1, 0, 1, 1), // ╭
         0x256E => (1, 0, 0, 1, 1), // ╮
         0x256F => (1, 0, 1, 0, 1), // ╯
         0x2570 => (0, 1, 1, 0, 1), // ╰
-        
+
         // Diagonals
         0x2571 => (0, 0, 0, 0, 2), // ╱
         0x2572 => (0, 0, 0, 0, 2), // ╲
         0x2573 => (0, 0, 0, 0, 2), // ╳
-        
+
         // Light / Heavy half lines
         0x2574 => (1, 0, 0, 0, 0), // ╴
         0x2575 => (0, 0, 1, 0, 0), // ╵
@@ -4775,7 +6168,7 @@ pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
         0x257D => (0, 0, 1, 2, 0), // ╽
         0x257E => (2, 1, 0, 0, 0), // ╾
         0x257F => (0, 0, 2, 1, 0), // ╿
-        
+
         _ => (0, 0, 0, 0, 0),
     })
 }
@@ -4822,7 +6215,10 @@ fn render_single_char(
                 actual_cell_height,
                 fg,
                 [left, right, top, bottom],
-                0.0, 0.0, 1.0, 1.0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
                 is_color_val,
             );
             fg_instances.push(block_instance);
@@ -4846,11 +6242,21 @@ fn render_single_char(
                         actual_cell_height,
                         fg,
                         [0.0, 0.0, 0.0, 0.0],
-                        uv_x, uv_y, uv_w, uv_h,
+                        uv_x,
+                        uv_y,
+                        uv_w,
+                        uv_h,
                         if entry.is_color { 1.0 } else { 0.0 },
                     )
                 } else if entry.is_color {
-                    let char_width = if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR) { 2.0 } else { 1.0 };
+                    let char_width = if cell
+                        .flags
+                        .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR)
+                    {
+                        2.0
+                    } else {
+                        1.0
+                    };
                     let scale = actual_cell_height / entry.height;
                     let emoji_render_width = entry.width * scale;
                     let emoji_render_height = actual_cell_height;
@@ -4864,7 +6270,10 @@ fn render_single_char(
                         emoji_render_height,
                         fg,
                         [0.0, 0.0, 0.0, 0.0],
-                        uv_x, uv_y, uv_w, uv_h,
+                        uv_x,
+                        uv_y,
+                        uv_w,
+                        uv_h,
                         1.0,
                     )
                 } else {
@@ -4882,7 +6291,10 @@ fn render_single_char(
                         entry.height,
                         fg,
                         [0.0, 0.0, 0.0, 0.0],
-                        uv_x, uv_y, uv_w, uv_h,
+                        uv_x,
+                        uv_y,
+                        uv_w,
+                        uv_h,
                         0.0,
                     )
                 };

@@ -341,6 +341,14 @@ impl<'a> Renderer<'a> {
         worktree_picker_query: &str,
         worktree_picker_selected: usize,
         worktree_filtered: &[String],
+        bell_flash_elapsed_ms: Option<f32>,
+        last_command_duration_ms: Option<u128>,
+        command_duration_display_secs: Option<f32>,
+        exit_code: Option<i32>,
+        current_mouse_x: f32,
+        current_mouse_y: f32,
+        hovered_url_text: Option<&str>,
+        opacity: f32,
     ) {
         if !self.dirty {
             return;
@@ -455,6 +463,14 @@ impl<'a> Renderer<'a> {
                 worktree_picker_query,
                 worktree_picker_selected,
                 worktree_filtered,
+                bell_flash_elapsed_ms,
+                last_command_duration_ms,
+                command_duration_display_secs,
+                exit_code,
+                current_mouse_x,
+                current_mouse_y,
+                hovered_url_text,
+                opacity,
             );
         }
 
@@ -488,6 +504,7 @@ impl<'a> Renderer<'a> {
         hover_visual_toggle: bool,
         hovered_card_idx: Option<usize>,
         card_scroll_y: f32,
+        opacity: f32,
     ) {
         if !self.dirty {
             return;
@@ -552,6 +569,7 @@ impl<'a> Renderer<'a> {
                 card_scroll_y,
                 &self.device,
                 &self.queue,
+                opacity,
             );
         }
 
@@ -564,6 +582,7 @@ impl<'a> Renderer<'a> {
         &mut self,
         version: &str,
         hover_close: bool,
+        opacity: f32,
     ) {
         if !self.dirty {
             return;
@@ -607,6 +626,7 @@ impl<'a> Renderer<'a> {
                 hover_close,
                 &self.device,
                 &self.queue,
+                opacity,
             );
         }
 

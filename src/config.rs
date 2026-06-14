@@ -196,6 +196,8 @@ pub struct Config {
     pub keybindings: std::collections::HashMap<String, String>,
     #[serde(default = "default_session_restore")]
     pub session_restore: bool,
+    #[serde(default = "default_opacity")]
+    pub opacity: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +219,7 @@ fn default_font_size() -> f32 { 14.0 }
 fn default_font_weight() -> f32 { 400.0 }
 fn default_font_ligatures() -> bool { true }
 fn default_session_restore() -> bool { true }
+fn default_opacity() -> f32 { 1.0 }
 
 impl Default for Config {
     fn default() -> Self {
@@ -227,6 +230,7 @@ impl Default for Config {
             theme: default_theme(),
             keybindings: std::collections::HashMap::new(),
             session_restore: default_session_restore(),
+            opacity: default_opacity(),
         }
     }
 }
@@ -291,6 +295,7 @@ fn ensure_table(doc: &mut DocumentMut, key: &str) {
 
 fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
     doc["scrollback"] = value(c.scrollback as i64);
+    doc["opacity"] = value(c.opacity as f64);
     match &c.shell {
         Some(s) => doc["shell"] = value(s.as_str()),
         None => { doc.as_table_mut().remove("shell"); }
