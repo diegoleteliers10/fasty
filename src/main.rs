@@ -89,6 +89,8 @@ struct Tab {
     title_override: Option<String>,
     git_status: Option<GitStatus>,
     git_status_check_at: std::time::Instant,
+    is_running: bool,
+    last_exit_code: Option<i32>,
 }
 
 /// Cached git status for a single tab. Populated by a background thread.
@@ -144,6 +146,8 @@ fn create_new_tab(
         title_override: None,
         git_status: None,
         git_status_check_at: std::time::Instant::now(),
+        is_running: false,
+        last_exit_code: None,
     })
 }
 
@@ -190,25 +194,27 @@ fn palette_label(action: CommandAction) -> &'static str {
     }
 }
 
-fn build_palette_commands() -> Vec<(&'static str, CommandAction)> {
-    vec![
-        ("new tab", CommandAction::NewTab),
-        ("close tab", CommandAction::CloseTab),
-        ("new window", CommandAction::NewWindow),
-        ("next tab", CommandAction::NextTab),
-        ("previous tab", CommandAction::PrevTab),
-        ("open settings", CommandAction::OpenSettings),
-        ("open search", CommandAction::OpenSearch),
-        ("reload config", CommandAction::ReloadConfig),
-        ("increase font size", CommandAction::IncreaseFontSize),
-        ("decrease font size", CommandAction::DecreaseFontSize),
-        ("reset font size", CommandAction::ResetFontSize),
-        ("snap to bottom", CommandAction::SnapToBottom),
-        ("rename tab", CommandAction::RenameTab),
-    ]
+fn build_palette_commands() -> Vec<(String, CommandAction)> {
+    let mut cmds = Vec::new();
+    cmds.extend(vec![
+        ("new tab".to_string(), CommandAction::NewTab),
+        ("close tab".to_string(), CommandAction::CloseTab),
+        ("new window".to_string(), CommandAction::NewWindow),
+        ("next tab".to_string(), CommandAction::NextTab),
+        ("previous tab".to_string(), CommandAction::PrevTab),
+        ("open settings".to_string(), CommandAction::OpenSettings),
+        ("open search".to_string(), CommandAction::OpenSearch),
+        ("reload config".to_string(), CommandAction::ReloadConfig),
+        ("increase font size".to_string(), CommandAction::IncreaseFontSize),
+        ("decrease font size".to_string(), CommandAction::DecreaseFontSize),
+        ("reset font size".to_string(), CommandAction::ResetFontSize),
+        ("snap to bottom".to_string(), CommandAction::SnapToBottom),
+        ("rename tab".to_string(), CommandAction::RenameTab),
+    ]);
+    cmds
 }
 
-fn filter_palette(commands: &[(&'static str, CommandAction)], query: &str) -> Vec<usize> {
+fn filter_palette(commands: &[(String, CommandAction)], query: &str) -> Vec<usize> {
     let q = query.to_lowercase();
     if q.is_empty() {
         return (0..commands.len()).collect();
@@ -219,8 +225,8 @@ fn filter_palette(commands: &[(&'static str, CommandAction)], query: &str) -> Ve
         .collect()
 }
 
-fn compute_palette_filtered(commands: &[(&'static str, CommandAction)], query: &str) -> Vec<String> {
-    filter_palette(commands, query).into_iter().map(|i| commands[i].0.to_string()).collect()
+fn compute_palette_filtered(commands: &[(String, CommandAction)], query: &str) -> Vec<String> {
+    filter_palette(commands, query).into_iter().map(|i| commands[i].0.clone()).collect()
 }
 
 fn filter_ssh_hosts(hosts: &[ssh::SshHost], query: &str) -> Vec<usize> {
@@ -942,7 +948,7 @@ fn main() -> anyhow::Result<()> {
     let mut command_palette_query: String = String::new();
     let mut command_palette_selected: usize = 0;
     let mut command_palette_scroll: usize = 0;
-    let palette_commands: Vec<(&'static str, CommandAction)> = build_palette_commands();
+    let mut palette_commands: Vec<(String, CommandAction)> = build_palette_commands();
 
     let mut ssh_hosts: Vec<ssh::SshHost> = ssh::parse_ssh_config();
     let mut ssh_picker_visible = false;
@@ -983,6 +989,12 @@ fn main() -> anyhow::Result<()> {
     const COMMAND_DURATION_DISPLAY: std::time::Duration = std::time::Duration::from_secs(5);
     const BELL_FLASH_DURATION: std::time::Duration = std::time::Duration::from_millis(150);
     const HOVER_DETECT_PADDING: f64 = 2.0;
+
+    // Scroll momentum
+    let mut scroll_velocity: f32 = 0.0;
+    const SCROLL_DECELERATION: f32 = 0.88;
+    const SCROLL_SNAP_THRESHOLD: f32 = 0.3;
+    const SCROLL_MAX_VELOCITY: f32 = 15.0;
 
     // Hover states for main window topbar buttons
     let mut hover_close = false;
@@ -1272,11 +1284,13 @@ fn main() -> anyhow::Result<()> {
                         window_for_redraw.request_redraw();
                     }
                     AppEvent::CommandStarted => {
-                        // Timing handled in PTY reader thread; this event
-                        // is only used to signal that a command is running.
+                        tabs[active_tab_index].is_running = true;
+                        renderer.lock().set_dirty(true);
+                        window_for_redraw.request_redraw();
                     }
                     AppEvent::CommandFinished { duration_ms, exit_code } => {
-                        tracing::info!("CommandFinished received: duration={}ms exit={:?}", duration_ms, exit_code);
+                        tabs[active_tab_index].is_running = false;
+                        tabs[active_tab_index].last_exit_code = exit_code;
                         last_command_duration = Some((duration_ms, exit_code));
                         last_command_duration_display_time = Some(std::time::Instant::now());
                         renderer.lock().set_dirty(true);
@@ -1409,6 +1423,9 @@ fn main() -> anyhow::Result<()> {
                                 tab_titles.push(title);
                             }
 
+                            let tab_running_states: Vec<bool> = tabs.iter().map(|t| t.is_running).collect();
+                            let tab_exit_codes: Vec<Option<i32>> = tabs.iter().map(|t| t.last_exit_code).collect();
+
                             // Detect TUI agent running in the active tab
                             {
                                 let active_tab = &tabs[active_tab_index];
@@ -1505,11 +1522,13 @@ fn main() -> anyhow::Result<()> {
                             r.update_completed = completed;
                             r.hover_update = hover_update;
                             r.set_dirty(true);
+                            let win_width = r.config.width as f32;
                             let palette_filtered: Vec<String> = if command_palette_visible {
                                 compute_palette_filtered(&palette_commands, &command_palette_query)
                             } else {
                                 Vec::new()
                             };
+
                             let ssh_filtered: Vec<String> = if ssh_picker_visible {
                                 compute_ssh_filtered(&ssh_hosts, &ssh_picker_query)
                             } else {
@@ -1554,6 +1573,8 @@ fn main() -> anyhow::Result<()> {
                                 toast.as_ref().map(|(msg, t, d)| (msg.as_str(), *t, *d)),
                                 active_tab_index,
                                 &tab_titles,
+                                &tab_running_states,
+                                &tab_exit_codes,
                                 &active_tab_path,
                                 context_menu_visible,
                                 context_menu_is_about,
@@ -1569,6 +1590,7 @@ fn main() -> anyhow::Result<()> {
                                 &command_palette_query,
                                 command_palette_selected,
                                 &palette_filtered,
+                                command_palette_scroll,
                                 dragging_tab,
                                 drag_current_x as f32,
                                 drop_target_idx,
@@ -2037,10 +2059,17 @@ fn main() -> anyhow::Result<()> {
                                         let n = filter_palette(&palette_commands, &command_palette_query).len();
                                         if n > 0 {
                                             command_palette_selected = (command_palette_selected + 1).min(n - 1);
+                                            const MAX_VISIBLE: usize = 8;
+                                            if command_palette_selected >= command_palette_scroll + MAX_VISIBLE {
+                                                command_palette_scroll = command_palette_selected + 1 - MAX_VISIBLE;
+                                            }
                                         }
                                     }
                                     Key::Named(NamedKey::ArrowUp) => {
                                         command_palette_selected = command_palette_selected.saturating_sub(1);
+                                        if command_palette_selected < command_palette_scroll {
+                                            command_palette_scroll = command_palette_selected;
+                                        }
                                     }
                                     Key::Named(NamedKey::Backspace) => {
                                         command_palette_query.pop();
@@ -2651,6 +2680,9 @@ fn main() -> anyhow::Result<()> {
                                             command_palette_query.clear();
                                             command_palette_selected = 0;
                                             command_palette_scroll = 0;
+                                            if command_palette_visible {
+                                                palette_commands = build_palette_commands();
+                                            }
                                             let mut r = renderer.lock();
                                             r.set_dirty(true);
                                             app_dirty = true;
@@ -4011,47 +4043,48 @@ fn main() -> anyhow::Result<()> {
                                 hover_update = false;
                             }
 
-                            hovered_tab_index = None;
-                            hovered_close_tab_index = None;
-                            hover_new_tab = false;
+                                let prev_hovered_tab = hovered_tab_index;
+                                hovered_tab_index = None;
+                                hovered_close_tab_index = None;
+                                hover_new_tab = false;
 
-                            if current_mouse_y >= 0.0 && current_mouse_y <= 40.0 {
-                                let tab_start_x = 36.0;
-                                let path_center_x = v_width / 2.0;
-                                let tab_area_max_x = path_center_x - 40.0;
-                                let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
-                                let tabs_len = tabs.len();
-                                let tab_width = if tabs_len > 0 {
-                                    (tab_area_width / tabs_len as f64).clamp(80.0, 160.0)
-                                } else {
-                                    160.0
-                                };
+                                if current_mouse_y >= 0.0 && current_mouse_y <= 40.0 {
+                                    let tab_start_x = 36.0;
+                                    let path_center_x = v_width / 2.0;
+                                    let tab_area_max_x = path_center_x - 40.0;
+                                    let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                                    let tabs_len = tabs.len();
+                                    let tab_width = if tabs_len > 0 {
+                                        (tab_area_width / tabs_len as f64).clamp(80.0, 160.0)
+                                    } else {
+                                        160.0
+                                    };
 
-                                let tabs_total_width = tabs_len as f64 * tab_width;
-                                if current_mouse_x >= tab_start_x && current_mouse_x < tab_start_x + tabs_total_width {
-                                    let idx = ((current_mouse_x - tab_start_x) / tab_width) as usize;
-                                    if idx < tabs_len {
-                                        hovered_tab_index = Some(idx);
-                                        
-                                        let tab_x = tab_start_x + idx as f64 * tab_width;
-                                        let close_x = tab_x + tab_width - 30.0;
-                                        let close_min_x = close_x - 4.0;
-                                        let close_max_x = close_x + 20.0;
-                                        let close_min_y = 8.0;
-                                        let close_max_y = 32.0;
-                                        if current_mouse_x >= close_min_x && current_mouse_x <= close_max_x
-                                            && current_mouse_y >= close_min_y && current_mouse_y <= close_max_y
-                                        {
-                                            hovered_close_tab_index = Some(idx);
+                                    let tabs_total_width = tabs_len as f64 * tab_width;
+                                    if current_mouse_x >= tab_start_x && current_mouse_x < tab_start_x + tabs_total_width {
+                                        let idx = ((current_mouse_x - tab_start_x) / tab_width) as usize;
+                                        if idx < tabs_len {
+                                            hovered_tab_index = Some(idx);
+                                            
+                                            let tab_x = tab_start_x + idx as f64 * tab_width;
+                                            let close_x = tab_x + tab_width - 30.0;
+                                            let close_min_x = close_x - 4.0;
+                                            let close_max_x = close_x + 20.0;
+                                            let close_min_y = 8.0;
+                                            let close_max_y = 32.0;
+                                            if current_mouse_x >= close_min_x && current_mouse_x <= close_max_x
+                                                && current_mouse_y >= close_min_y && current_mouse_y <= close_max_y
+                                            {
+                                                hovered_close_tab_index = Some(idx);
+                                            }
+                                        }
+                                    } else {
+                                        let new_tab_x = tab_start_x + tabs_total_width;
+                                        if current_mouse_x >= new_tab_x && current_mouse_x < new_tab_x + 32.0 {
+                                            hover_new_tab = true;
                                         }
                                     }
-                                } else {
-                                    let new_tab_x = tab_start_x + tabs_total_width;
-                                    if current_mouse_x >= new_tab_x && current_mouse_x < new_tab_x + 32.0 {
-                                        hover_new_tab = true;
-                                    }
                                 }
-                            }
 
                             if hover_close != old_hover_close
                                 || hover_max != old_hover_max
@@ -4216,7 +4249,7 @@ fn main() -> anyhow::Result<()> {
                             };
 
                             let max_history = tabs[active_tab_index].terminal_state.lock().history_size() as f32;
-                            let scroll_speed = 3.0f32;
+                            let scroll_speed = 1.0f32;
 
                             let delta_scroll = match delta {
                                 MouseScrollDelta::LineDelta(_, _) => lines * scroll_speed,
@@ -4264,10 +4297,10 @@ fn main() -> anyhow::Result<()> {
                                     }
                                 } else {
                                     drop(term_state);
-                                    tabs[active_tab_index].scroll_target = (tabs[active_tab_index].scroll_target + delta_scroll).clamp(0.0, max_history);
+                                    scroll_velocity += delta_scroll;
                                 }
                             } else {
-                                tabs[active_tab_index].scroll_target = (tabs[active_tab_index].scroll_target + delta_scroll).clamp(0.0, max_history);
+                                scroll_velocity += delta_scroll;
                             }
                             app_dirty = true;
                         }
@@ -4770,6 +4803,9 @@ fn main() -> anyhow::Result<()> {
                         tab_titles.push(title);
                     }
 
+                    let tab_running_states: Vec<bool> = tabs.iter().map(|t| t.is_running).collect();
+                    let tab_exit_codes: Vec<Option<i32>> = tabs.iter().map(|t| t.last_exit_code).collect();
+
                     let active_tab = &tabs[active_tab_index];
                     let term = active_tab.terminal_state.lock();
                     let max_history = term.history_size() as f32;
@@ -4873,6 +4909,8 @@ fn main() -> anyhow::Result<()> {
                         toast.as_ref().map(|(msg, t, d)| (msg.as_str(), *t, *d)),
                         active_tab_index,
                         &tab_titles,
+                        &tab_running_states,
+                        &tab_exit_codes,
                         &active_tab_path,
                         context_menu_visible,
                         context_menu_is_about,
@@ -4888,6 +4926,7 @@ fn main() -> anyhow::Result<()> {
                         &command_palette_query,
                         command_palette_selected,
                         &palette_filtered,
+                        command_palette_scroll,
                         dragging_tab,
                         drag_current_x as f32,
                         drop_target_idx,
@@ -4952,10 +4991,24 @@ fn main() -> anyhow::Result<()> {
                     let max_history = term.history_size() as f32;
                     tab.scroll_target = tab.scroll_target.clamp(0.0, max_history);
 
+                    // Apply scroll momentum
+                    if scroll_velocity.abs() > 0.01 {
+                        tab.scroll_target = (tab.scroll_target + scroll_velocity).clamp(0.0, max_history);
+                        scroll_velocity *= SCROLL_DECELERATION;
+                        if scroll_velocity.abs() < SCROLL_SNAP_THRESHOLD {
+                            scroll_velocity = 0.0;
+                        }
+                        animating = true;
+                    }
+
                     let diff = tab.scroll_target - tab.scroll_current;
                     let mut current_scroll_diff = 0;
                     if diff.abs() > 0.01 {
-                        tab.scroll_current += diff * 0.15;
+                        // Smooth lerp toward target -- gentle, predictable
+                        tab.scroll_current += diff * 0.18;
+                        if diff.abs() <= 0.5 {
+                            tab.scroll_current = tab.scroll_target;
+                        }
 
                         let target_offset = tab.scroll_current.round() as isize;
                         let scroll_diff = target_offset - term.display_offset() as isize;
@@ -5024,7 +5077,9 @@ fn main() -> anyhow::Result<()> {
 
                 let alpha_diff = target_alpha - scrollbar_alpha;
                 if alpha_diff.abs() > 0.01 {
-                    scrollbar_alpha += alpha_diff * 0.15;
+                    // Faster fade-in, slower fade-out to avoid flicker
+                    let fade_rate = if alpha_diff > 0.0 { 0.25 } else { 0.12 };
+                    scrollbar_alpha += alpha_diff * fade_rate;
                     animating = true;
                 } else {
                     scrollbar_alpha = target_alpha;

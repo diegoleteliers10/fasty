@@ -616,6 +616,8 @@ impl Pipeline {
         toast: Option<(&str, std::time::Instant, u64)>,
         active_tab_index: usize,
         tab_titles: &[String],
+        tab_running_states: &[bool],
+        tab_exit_codes: &[Option<i32>],
         _active_tab_path: &str,
         context_menu_visible: bool,
         context_menu_is_about: bool,
@@ -639,6 +641,7 @@ impl Pipeline {
         command_palette_query: &str,
         command_palette_selected: usize,
         command_palette_filtered: &[String],
+        command_palette_scroll: usize,
         dragging_tab: Option<usize>,
         drag_current_x: f32,
         drop_target_idx: Option<usize>,
@@ -2002,7 +2005,7 @@ impl Pipeline {
                 truncated_title.push_str("...");
             }
 
-            let mut char_x = tab_x + 14.0f32;
+            let mut char_x = tab_x + 20.0f32;
             let fg_color = if is_active {
                 with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha) // Active tab text (full opacity)
             } else if is_hovered {
@@ -2059,6 +2062,47 @@ impl Pipeline {
 
                     char_x += entry.width * scale + 1.0;
                 }
+            }
+
+            // Tab status indicator (spinner when running, exit code dot when finished)
+            let is_running = tab_running_states.get(i).copied().unwrap_or(false);
+            let exit_code = tab_exit_codes.get(i).copied().flatten();
+            let indicator_x = tab_x + 6.0;
+            let indicator_y = 18.0;
+            let indicator_r = 4.0;
+
+            if is_running {
+                // Spinning dot (animated by time)
+                let angle = (current_time * 4.0) % (std::f32::consts::PI * 2.0);
+                let spin_x = indicator_x + angle.cos() * 2.0;
+                let spin_y = indicator_y + angle.sin() * 2.0;
+                bg_instances.push(CellInstance::new(
+                    spin_x,
+                    spin_y,
+                    indicator_r,
+                    indicator_r,
+                    [0.4, 0.7, 1.0, 0.8],
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, 1.0,
+                    indicator_r / 2.0,
+                ));
+            } else if let Some(code) = exit_code {
+                // Exit code dot: green for 0, red for non-zero
+                let color = if code == 0 {
+                    [0.35, 0.75, 0.35, 0.7]
+                } else {
+                    [0.85, 0.30, 0.30, 0.7]
+                };
+                bg_instances.push(CellInstance::new(
+                    indicator_x,
+                    indicator_y,
+                    indicator_r,
+                    indicator_r,
+                    color,
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0, 0.0, 1.0, 1.0,
+                    indicator_r / 2.0,
+                ));
             }
 
             // Tab Close Button U+00D7 (×) -> \u{2715} (✕)
@@ -3419,11 +3463,14 @@ impl Pipeline {
             let result_baseline_offset = atlas.ascent() * result_scale;
             for (i, label) in command_palette_filtered
                 .iter()
+                .skip(command_palette_scroll)
                 .take(max_results)
                 .enumerate()
             {
+                let actual_idx = i + command_palette_scroll;
                 let item_y = palette_y + input_h + 8.0 + (i as f32) * item_h;
-                if i == command_palette_selected {
+
+                if actual_idx == command_palette_selected {
                     instances.push(CellInstance::new(
                         palette_x + 4.0,
                         item_y,
@@ -3438,14 +3485,43 @@ impl Pipeline {
                         4.0,
                     ));
                 }
+
                 let baseline_y = item_y
                     + (item_h - atlas.cell_size().1 * result_scale) / 2.0
                     + result_baseline_offset;
                 let mut lx = palette_x + 14.0;
+                let max_text_w = palette_w - 28.0;
                 for c in label.chars() {
                     if c == ' ' {
                         lx += result_cell_w * 1.3;
                         continue;
+                    }
+                    if lx > palette_x + max_text_w {
+                        // Truncate with ellipsis
+                        if let Some(entry) = atlas.get_or_rasterize('.', device, queue) {
+                            if entry.width > 0.0 {
+                                let glyph_w = entry.width * result_scale;
+                                let glyph_h = entry.height * result_scale;
+                                let glyph_x = (lx + entry.left * result_scale).round();
+                                let glyph_y = (baseline_y + entry.top * result_scale).round();
+                                let (aw, ah) = atlas.atlas_size();
+                                let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                                instances.push(CellInstance::new(
+                                    glyph_x,
+                                    glyph_y,
+                                    glyph_w,
+                                    glyph_h,
+                                    [0.92, 0.94, 0.98, 1.0],
+                                    [0.0, 0.0, 0.0, 0.0],
+                                    uv_x,
+                                    uv_y,
+                                    uv_end_x - uv_x,
+                                    uv_end_y - uv_y,
+                                    0.0,
+                                ));
+                            }
+                        }
+                        break;
                     }
                     if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
                         if entry.width > 0.0 {
