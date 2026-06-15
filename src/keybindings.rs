@@ -107,7 +107,7 @@ impl KeyBindingResolver {
         insert("ctrl+shift+n", Action::NewWindow);
         insert("ctrl+shift+c", Action::Copy);
         insert("ctrl+shift+v", Action::Paste);
-        insert("ctrl+shift+f", Action::OpenSearch);
+        insert("ctrl+f", Action::OpenSearch);
         insert("ctrl+shift+s", Action::OpenSettings);
         insert("ctrl+shift+r", Action::ReloadConfig);
         insert("ctrl+shift+p", Action::CommandPalette);

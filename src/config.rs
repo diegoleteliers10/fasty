@@ -198,6 +198,8 @@ pub struct Config {
     pub session_restore: bool,
     #[serde(default = "default_opacity")]
     pub opacity: f32,
+    #[serde(default = "default_notify_on_command_finish")]
+    pub notify_on_command_finish: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +222,7 @@ fn default_font_weight() -> f32 { 400.0 }
 fn default_font_ligatures() -> bool { true }
 fn default_session_restore() -> bool { true }
 fn default_opacity() -> f32 { 1.0 }
+fn default_notify_on_command_finish() -> bool { true }
 
 impl Default for Config {
     fn default() -> Self {
@@ -231,6 +234,7 @@ impl Default for Config {
             keybindings: std::collections::HashMap::new(),
             session_restore: default_session_restore(),
             opacity: default_opacity(),
+            notify_on_command_finish: default_notify_on_command_finish(),
         }
     }
 }

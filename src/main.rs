@@ -998,6 +998,7 @@ fn main() -> anyhow::Result<()> {
     let mut drag_tab_offset: f64 = 0.0;
     let mut drag_current_x: f64 = 0.0;
     let mut drag_threshold_passed = false;
+    let mut window_focused = true;
 
     // Tab rename state
     let mut renaming_tab: Option<usize> = None;
@@ -1280,6 +1281,25 @@ fn main() -> anyhow::Result<()> {
                         last_command_duration_display_time = Some(std::time::Instant::now());
                         renderer.lock().set_dirty(true);
                         window_for_redraw.request_redraw();
+
+                        // Send desktop notification when window is unfocused
+                        if !window_focused && config.notify_on_command_finish {
+                            let duration_str = if duration_ms < 1000 {
+                                format!("{}ms", duration_ms)
+                            } else {
+                                format!("{:.1}s", duration_ms as f64 / 1000.0)
+                            };
+                            let exit_str = match exit_code {
+                                Some(code) => format!(" (exit: {})", code),
+                                None => String::new(),
+                            };
+                            let body = format!("Finished in {}{}", duration_str, exit_str);
+                            let _ = notify_rust::Notification::new()
+                                .summary("Fasty")
+                                .body(&body)
+                                .appname("Fasty")
+                                .show();
+                        }
                     }
                 }
             }
@@ -1353,21 +1373,18 @@ fn main() -> anyhow::Result<()> {
                                 let title = if let Some(ref name) = tab.custom_name {
                                     name.clone()
                                 } else {
-                                    let path_str = if let Some(pid) = tab.terminal_state.lock().shell_pid() {
-                                        get_current_dir_shortened(pid)
-                                    } else {
-                                        None
-                                    };
-                                    if let Some(ref path) = path_str {
-                                        get_last_path_component(path)
-                                    } else {
-                                        "bash".to_string()
-                                    }
-                                };
-
-                                if idx == active_tab_index {
-                                    if tab.custom_name.is_some() {
-                                        active_tab_path = title.clone();
+                                    let shell_pid = tab.terminal_state.lock().shell_pid();
+                                    let agent = detect_tui_agent(shell_pid);
+                                    if let Some(ref agent_name) = agent {
+                                        let path_str = if let Some(pid) = tab.terminal_state.lock().shell_pid() {
+                                            get_current_dir_shortened(pid)
+                                        } else {
+                                            None
+                                        };
+                                        let path_component = path_str.as_ref()
+                                            .map(|p| get_last_path_component(p))
+                                            .unwrap_or_else(|| "fasty".to_string());
+                                        format!("{} - {}", agent_name, path_component)
                                     } else {
                                         let path_str = if let Some(pid) = tab.terminal_state.lock().shell_pid() {
                                             get_current_dir_shortened(pid)
@@ -1375,10 +1392,18 @@ fn main() -> anyhow::Result<()> {
                                             None
                                         };
                                         if let Some(ref path) = path_str {
-                                            active_tab_path = path.clone();
+                                            get_last_path_component(path)
                                         } else {
-                                            active_tab_path = "bash".to_string();
+                                            "bash".to_string()
                                         }
+                                    }
+                                };
+
+                                if idx == active_tab_index {
+                                    if tab.custom_name.is_some() {
+                                        active_tab_path = title.clone();
+                                    } else {
+                                        active_tab_path = title.clone();
                                     }
                                 }
                                 tab_titles.push(title);
@@ -4275,6 +4300,7 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                         WindowEvent::Focused(focused) => {
+                            window_focused = focused;
                             if !focused {
                                 let old_hover_close = hover_close;
                                 let old_hover_max = hover_max;
@@ -5932,7 +5958,7 @@ fn trigger_update(
     #[cfg(not(target_os = "windows"))]
     {
         if let Some(tab) = tabs.get(active_tab_index) {
-            let cmd = b"curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash\n";
+            let cmd = b"curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash -s -- --user\n";
             tab.terminal_state.lock().write_to_pty(cmd);
         }
 
