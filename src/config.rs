@@ -214,7 +214,7 @@ pub struct FontConfig {
     pub ligatures: bool,
 }
 
-fn default_scrollback() -> usize { 3000 }
+fn default_scrollback() -> usize { 1000 }
 fn default_theme() -> Option<String> { Some("default".to_string()) }
 fn default_font_family() -> String { "monospace".to_string() }
 fn default_font_size() -> f32 { 14.0 }
@@ -327,7 +327,7 @@ fn config_to_toml_string(c: &Config) -> String {
 fn migrate_legacy_json_to_toml(toml_path: &Path, json_path: &Path) -> anyhow::Result<()> {
     let content = std::fs::read_to_string(json_path)?;
     let mut parsed: Config = serde_json::from_str(&content)?;
-    parsed.scrollback = parsed.scrollback.min(3000);
+    parsed.scrollback = parsed.scrollback.min(1000);
     atomic_write(toml_path, config_to_toml_string(&parsed).as_bytes())?;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -372,7 +372,7 @@ impl Config {
             let h = content_hash(content.as_bytes());
             match toml_edit::de::from_str::<Config>(&content) {
                 Ok(mut cfg) => {
-                    cfg.scrollback = cfg.scrollback.min(3000);
+                    cfg.scrollback = cfg.scrollback.min(1000);
                     *ACTIVE_THEME.write() = cfg.theme.clone().unwrap_or_else(|| "default".to_string());
                     set_last_applied_hash(h);
                     return Ok(cfg);

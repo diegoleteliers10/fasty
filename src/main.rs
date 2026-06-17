@@ -1215,7 +1215,7 @@ fn main() -> anyhow::Result<()> {
                                     if settings_window.is_some() {
                                         settings_family = config.font.family.clone();
                                         settings_size = config.font.size;
-                                        settings_scrollback = config.scrollback.min(3000);
+                                        settings_scrollback = config.scrollback.min(1000);
                                         settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                         if let Some(ref mut sr) = settings_renderer {
                                             sr.set_dirty(true);
@@ -1924,7 +1924,7 @@ fn main() -> anyhow::Result<()> {
                                                         }
                                                         settings_family = config.font.family.clone();
                                                         settings_size = config.font.size;
-                                                        settings_scrollback = config.scrollback.min(3000);
+                                                        settings_scrollback = config.scrollback.min(1000);
                                                         settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                                         settings_active_field = 0;
                                                         let visible = !cfg!(target_os = "windows");
@@ -2496,7 +2496,7 @@ fn main() -> anyhow::Result<()> {
                                                 }
                                                 settings_family = config.font.family.clone();
                                                 settings_size = config.font.size;
-                                                settings_scrollback = config.scrollback.min(3000);
+                                                settings_scrollback = config.scrollback.min(1000);
                                                 settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                                 settings_active_field = 0;
                                                 let visible = !cfg!(target_os = "windows");
@@ -2525,7 +2525,7 @@ fn main() -> anyhow::Result<()> {
                                                                     renderer_obj.render_settings(
                                                                         &config.font.family,
                                                                         config.font.size,
-                                                                        config.scrollback.min(3000),
+                                                                        config.scrollback.min(1000),
                                                                         0,
                                                                         false, false, false, false, false, false, false, false,
                                                                         &system_fonts,
@@ -3338,7 +3338,7 @@ fn main() -> anyhow::Result<()> {
                                                     }
                                                     settings_family = config.font.family.clone();
                                                     settings_size = config.font.size;
-                                                    settings_scrollback = config.scrollback.min(3000);
+                                                    settings_scrollback = config.scrollback.min(1000);
                                                     settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                                    settings_active_field = 0;
                                                    let visible = !cfg!(target_os = "windows");
@@ -3367,7 +3367,7 @@ fn main() -> anyhow::Result<()> {
                                                                         renderer_obj.render_settings(
                                                                             &config.font.family,
                                                                             config.font.size,
-                                                                            config.scrollback.min(3000),
+                                                                            config.scrollback.min(1000),
                                                                             0,
                                                                             false, false, false, false, false, false, false, false,
                                                                             &system_fonts,
@@ -4575,7 +4575,7 @@ fn main() -> anyhow::Result<()> {
                                         settings_scrollback = settings_scrollback.saturating_sub(1000).max(1000);
                                         apply_settings!();
                                     } else if s_hover_scroll_plus {
-                                        settings_scrollback = settings_scrollback.saturating_add(1000).min(3000);
+                                        settings_scrollback = settings_scrollback.saturating_add(1000).min(1000);
                                         apply_settings!();
                                     } else if s_hover_open_config {
                                         let mut current_config = Config::load().unwrap_or_default();

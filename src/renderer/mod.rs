@@ -27,7 +27,7 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     a: 0.0,
 };
 
-const ATLAS_SIZE: u32 = if cfg!(target_os = "windows") { 1024 } else { 1536 };
+const ATLAS_SIZE: u32 = 1024;
 
 pub struct Renderer<'a> {
     surface: Surface<'a>,

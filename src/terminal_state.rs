@@ -58,7 +58,7 @@ impl TerminalState {
         let rows = ((viewport_height as usize) / cell_h).max(24);
 
         let mut config = AlacrittyConfig::default();
-        config.scrolling_history = scrollback.min(3000);
+        config.scrolling_history = scrollback.min(1000);
         let size = TermSize::new(cols, rows);
 
         let pty_system = native_pty_system();

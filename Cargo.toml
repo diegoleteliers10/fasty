@@ -16,9 +16,9 @@ required-features = []
 # Use the windows subsystem to hide console window
 
 [dependencies]
-winit = "0.30"
-wgpu = { version = "22", features = ["wgsl"] }
-alacritty_terminal = "0.24"
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+wgpu = { version = "22", default-features = false, features = ["wgsl"] }
+alacritty_terminal = { version = "0.24", default-features = false }
 portable-pty = "0.8"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.3"
@@ -34,11 +34,11 @@ parking_lot = "0.12"
 raw-window-handle = "0.6"
 unicode-width = "0.1"
 rustix = { version = "0.38", features = ["std"] }
-image = "0.25"
-arboard = { version = "3", features = ["wayland-data-control"] }
-resvg = "0.47.0"
-usvg = "0.47.0"
-tiny-skia = "0.12.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+resvg = { version = "0.47.0", default-features = false, features = ["text"] }
+usvg = { version = "0.47.0", default-features = false }
+tiny-skia = { version = "0.12.0", default-features = false, features = ["std"] }
 rustybuzz = "0.12.1"
 notify-rust = "4"
 
@@ -48,8 +48,15 @@ winres = "0.1"
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"
 
-[target.'cfg(all(target_os = "linux", not(windows)))'.dependencies]
-x11 = { version = "2.21", features = ["xlib", "xfixes"] }
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "22", default-features = false, features = ["wgsl", "webgl"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "22", default-features = false, features = ["wgsl", "metal"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { version = "22", default-features = false, features = ["wgsl", "dx12"] }
+winres = "0.1"
 
 [target.'cfg(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
 freetype-rs = { version = "0.37" }
@@ -57,12 +64,9 @@ freetype-rs = { version = "0.37" }
 [target.'cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))'.dependencies]
 freetype-rs = { version = "0.37", features = ["bundled"] }
 
-[target.'cfg(windows)'.dependencies]
-winres = "0.1"
-
 [profile.release]
 opt-level = 3
-lto = true
+lto = "fat"
 codegen-units = 1
 strip = true       # strips debug symbols — reduces binary size
 panic = "unwind"    # enables crash reporting + auto-restart
