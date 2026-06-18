@@ -674,5 +674,6 @@ pub enum ContextMenuItem {
     CdHere,
     OpenInEditor,
     OpenEmail,
+    MoveToNewWindow,
     CopyHex,
 }

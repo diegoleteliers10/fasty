@@ -2724,6 +2724,9 @@ impl Pipeline {
                                 ("✉\u{FE0F}", "Compose email", None)
                             }
                             crate::renderer::ContextMenuItem::CopyHex => ("#", "Copy hex", None),
+                            crate::renderer::ContextMenuItem::MoveToNewWindow => {
+                                ("\u{2197}", "Move to new window", None)
+                            }
                             crate::renderer::ContextMenuItem::Separator => ("", "", None),
                         };
 
@@ -2864,9 +2867,10 @@ impl Pipeline {
 
         // Tab right-click context menu
         if tab_ctx_visible {
-            let menu_w = 160.0f32;
-            let menu_h = 44.0f32;
+            let menu_w = 200.0f32;
+            let menu_h = 76.0f32;
             let pad = 6.0f32;
+            let item_h = 32.0f32;
 
             let shadow_pad = 2.0f32;
             instances.push(CellInstance::new(
@@ -2914,63 +2918,66 @@ impl Pipeline {
                 9.0,
             ));
 
-            let is_hover = tab_ctx_hovered == Some(0);
-            if is_hover {
-                instances.push(CellInstance::new(
-                    tab_ctx_x as f32 + 4.0,
-                    tab_ctx_y as f32 + pad,
-                    menu_w - 8.0,
-                    32.0,
-                    [1.0, 1.0, 1.0, 0.08],
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0,
-                    0.0,
-                    1.0,
-                    1.0,
-                    6.0,
-                ));
-            }
-
             let base_scale = 13.0f32 / atlas.font_size();
-            let text_color = if is_hover {
-                [1.0, 1.0, 1.0, 1.0]
-            } else {
-                [220.0 / 255.0, 222.0 / 255.0, 226.0 / 255.0, 1.0]
-            };
-
             let (_, ui_cell_height) = atlas.cell_size();
-            let text_baseline_y = tab_ctx_y as f32 + pad + 16.0
-                - (ui_cell_height * base_scale) / 2.0
-                + atlas.ascent() * base_scale;
             let ctx_cell_w = atlas.cell_size().0 * base_scale;
-            let mut label_x = tab_ctx_x as f32 + 12.0;
-            for c in "Renombrar".chars() {
-                if c == ' ' {
-                    label_x += ctx_cell_w;
-                    continue;
+            let items: &[&str] = &["Renombrar", "Mover a nueva ventana"];
+
+            for (i, label) in items.iter().enumerate() {
+                let item_y = tab_ctx_y as f32 + pad + i as f32 * item_h;
+                let is_hover = tab_ctx_hovered == Some(i);
+                if is_hover {
+                    instances.push(CellInstance::new(
+                        tab_ctx_x as f32 + 4.0,
+                        item_y,
+                        menu_w - 8.0,
+                        item_h - 2.0,
+                        [1.0, 1.0, 1.0, 0.08],
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0,
+                        6.0,
+                    ));
                 }
-                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
-                    if entry.width > 0.0 {
-                        let glyph_w = entry.width * base_scale;
-                        let glyph_h = entry.height * base_scale;
-                        let glyph_x = (label_x + entry.left * base_scale).round();
-                        let glyph_y = (text_baseline_y + entry.top * base_scale).round();
-                        let (aw, ah) = atlas.atlas_size();
-                        let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
-                        instances.push(CellInstance::new(
-                            glyph_x,
-                            glyph_y,
-                            glyph_w,
-                            glyph_h,
-                            text_color,
-                            [0.0, 0.0, 0.0, 0.0],
-                            uv_x,
-                            uv_y,
-                            uv_end_x - uv_x,
-                            uv_end_y - uv_y,
-                            0.0,
-                        ));
-                        label_x += (entry.width + 1.0) * base_scale;
+                let text_color = if is_hover {
+                    [1.0, 1.0, 1.0, 1.0]
+                } else {
+                    [220.0 / 255.0, 222.0 / 255.0, 226.0 / 255.0, 1.0]
+                };
+                let text_baseline_y = item_y + 16.0
+                    - (ui_cell_height * base_scale) / 2.0
+                    + atlas.ascent() * base_scale;
+                let mut label_x = tab_ctx_x as f32 + 12.0;
+                for c in label.chars() {
+                    if c == ' ' {
+                        label_x += ctx_cell_w;
+                        continue;
+                    }
+                    if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                        if entry.width > 0.0 {
+                            let glyph_w = entry.width * base_scale;
+                            let glyph_h = entry.height * base_scale;
+                            let glyph_x = (label_x + entry.left * base_scale).round();
+                            let glyph_y = (text_baseline_y + entry.top * base_scale).round();
+                            let (aw, ah) = atlas.atlas_size();
+                            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                            instances.push(CellInstance::new(
+                                glyph_x,
+                                glyph_y,
+                                glyph_w,
+                                glyph_h,
+                                text_color,
+                                [0.0, 0.0, 0.0, 0.0],
+                                uv_x,
+                                uv_y,
+                                uv_end_x - uv_x,
+                                uv_end_y - uv_y,
+                                0.0,
+                            ));
+                            label_x += (entry.width + 1.0) * base_scale;
+                        }
                     }
                 }
             }

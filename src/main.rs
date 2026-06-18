@@ -1001,6 +1001,12 @@ fn main() -> anyhow::Result<()> {
 
     let mut active_tab_index = 0usize;
 
+    let mut pending_pop_out: Option<usize> = None;
+    let mut popped_out_windows: std::collections::HashMap<
+        winit::window::WindowId,
+        window_context::WindowContext,
+    > = std::collections::HashMap::new();
+
     const BB_H: f32 = 20.0;
     let mut bar_layout = build_bar_layout(&config);
     let mut bar_y: f32 = 0.0;
@@ -3044,8 +3050,8 @@ fn main() -> anyhow::Result<()> {
 
                             if tab_ctx_visible {
                                 if state == ElementState::Pressed && button == MouseButton::Left {
-                                    let menu_h = 44.0f64;
-                                    let menu_w = 160.0f64;
+                                    let menu_h = 76.0f64;
+                                    let menu_w = 200.0f64;
                                     if current_mouse_x >= tab_ctx_x && current_mouse_x < tab_ctx_x + menu_w
                                         && current_mouse_y >= tab_ctx_y && current_mouse_y < tab_ctx_y + menu_h
                                     {
@@ -3060,6 +3066,8 @@ fn main() -> anyhow::Result<()> {
                                                     if let Some(ref p) = path_str { get_last_path_component(p) } else { "bash".to_string() }
                                                 });
                                             rename_cursor = rename_buffer.len();
+                                        } else if rel_y >= 38.0 && rel_y < 70.0 && tabs.len() >= 2 {
+                                            pending_pop_out = Some(tab_ctx_tab_idx);
                                         }
                                     }
                                     tab_ctx_visible = false;
@@ -3255,6 +3263,7 @@ fn main() -> anyhow::Result<()> {
                                                         shell_cols = cols;
                                                         shell_rows = rows;
                                                     }
+                                                    crate::renderer::ContextMenuItem::MoveToNewWindow => {}
                                                     crate::renderer::ContextMenuItem::Separator => {}
                                                     crate::renderer::ContextMenuItem::OpenLink => {
                                                         if let Some(selection_classifier::Classification::Url(u)) =
@@ -4125,13 +4134,19 @@ fn main() -> anyhow::Result<()> {
                             }
 
                             if tab_ctx_visible {
-                                let menu_w = 160.0f64;
-                                let menu_h = 44.0f64;
+                                let menu_w = 200.0f64;
+                                let menu_h = 76.0f64;
                                 if current_mouse_x >= tab_ctx_x && current_mouse_x < tab_ctx_x + menu_w
                                     && current_mouse_y >= tab_ctx_y && current_mouse_y < tab_ctx_y + menu_h
                                 {
                                     let rel_y = current_mouse_y - tab_ctx_y;
-                                    tab_ctx_hovered = if rel_y >= 6.0 && rel_y < 38.0 { Some(0) } else { None };
+                                    tab_ctx_hovered = if rel_y >= 6.0 && rel_y < 38.0 {
+                                        Some(0)
+                                    } else if rel_y >= 38.0 && rel_y < 70.0 {
+                                        Some(1)
+                                    } else {
+                                        None
+                                    };
                                 } else {
                                     tab_ctx_hovered = None;
                                 }
