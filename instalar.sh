@@ -156,30 +156,38 @@ elif [ "$OS" = "linux" ]; then
         fi
     fi
 
-    echo "🚀 Copiando el binario a $BIN_DIR/$APP_NAME..."
-    # Note: we MUST use install/cp (not mv/rename) here. When fasty is
-    # currently running, the kernel locks its executable's text segment
-    # and rename(2) fails with ETXTBSY ("Text file busy"), so `mv` would
-    # silently leave the old binary on disk and the relaunched process
-    # would execute the previous version. `install` opens the target
-    # with O_TRUNC and writes through it, which is permitted even while
-    # the inode is being executed.
+    echo "🚀 Reemplazando el binario en $BIN_DIR/$APP_NAME..."
+    # Reemplazo robusto en Linux:
+    #   1. rm -f  -> elimina la entrada de directorio del binario viejo.
+    #                Funciona aunque el binario esté en ejecución (sólo
+    #                remueve el dirent; el inodo sigue vivo mientras el
+    #                proceso lo tenga mapeado).
+    #   2. cp     -> crea un inodo NUEVO con el contenido nuevo. No
+    #                toca el inodo viejo, así que no hay ETXTBSY.
+    #   3. chmod  -> fija permisos del archivo recién creado.
+    # mv/rename(2) sobre un ejecutable en ejecución falla con ETXTBSY
+    # ("Text file busy") en Linux y deja el binario viejo en disco,
+    # por eso no usamos mv ni install (que internamente hace rename
+    # atómico sobre el destino).
     if [ -w "$BIN_DIR" ]; then
-        install -m 0755 "$TEMP_DIR/$APP_NAME" "$BIN_DIR/$APP_NAME"
+        rm -f "$BIN_DIR/$APP_NAME"
+        cp -f "$TEMP_DIR/$APP_NAME" "$BIN_DIR/$APP_NAME"
+        chmod 0755 "$BIN_DIR/$APP_NAME"
     else
         echo "🔑 Se requieren privilegios de administrador (sudo) para escribir en $BIN_DIR."
-        sudo install -m 0755 "$TEMP_DIR/$APP_NAME" "$BIN_DIR/$APP_NAME"
+        sudo rm -f "$BIN_DIR/$APP_NAME"
+        sudo cp -f "$TEMP_DIR/$APP_NAME" "$BIN_DIR/$APP_NAME"
+        sudo chmod 0755 "$BIN_DIR/$APP_NAME"
     fi
 
-    # Verify the on-disk binary actually got replaced by comparing
-    # sha256 sums. If the new binary's contents weren't written (e.g.
-    # mv/rename failed with ETXTBSY while the old process is running)
-    # we must NOT signal success, or fasty will relaunch into the
-    # stale binary on next launch.
+    # Verifica que el binario en disco realmente fue reemplazado
+    # comparando hashes sha256. Si la copia falló (p.ej. cp no pudo
+    # escribir) NO marcamos el update como completado para que el
+    # usuario pueda reintentar.
     NEW_HASH=$(sha256sum "$TEMP_DIR/$APP_NAME" 2>/dev/null | awk '{print $1}')
     INSTALLED_HASH=$(sha256sum "$BIN_DIR/$APP_NAME" 2>/dev/null | awk '{print $1}')
-    if [ -z "$NEW_HASH" ] || [ "$NEW_HASH" != "$INSTALLED_HASH" ]; then
-        echo "❌ Error: el binario en $BIN_DIR/$APP_NAME no coincide con el nuevo (posible ETXTBSY). Aborta." >&2
+    if [ -z "$NEW_HASH" ] || [ -z "$INSTALLED_HASH" ] || [ "$NEW_HASH" != "$INSTALLED_HASH" ]; then
+        echo "❌ Error: el binario en $BIN_DIR/$APP_NAME no coincide con el nuevo (copia fallida). Aborta." >&2
         exit 1
     fi
 
