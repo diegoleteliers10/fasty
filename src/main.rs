@@ -5,6 +5,7 @@
 
 mod config;
 mod crash;
+mod cross_window_drag;
 mod event_listener;
 mod git;
 mod keybindings;
@@ -15,6 +16,8 @@ mod session;
 mod snippets;
 mod ssh;
 mod terminal_state;
+mod widgets;
+mod window_context;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -153,6 +156,107 @@ fn create_new_tab(
 
 fn get_padding_top(_tab_count: usize) -> f32 {
     48.0
+}
+
+fn build_bar_layout(config: &Config) -> widgets::BarLayout {
+    if config.bottombar.widgets.is_empty() {
+        widgets::BarLayout::new(vec![Box::new(
+            widgets::builtin::git::GitWidget::new(widgets::Align::Left, None),
+        )])
+    } else {
+        widgets::BarLayout::from_specs(&config.bottombar.widgets)
+    }
+}
+
+fn poll_and_layout_bar(
+    layout: &mut widgets::BarLayout,
+    active_tab_cwd: Option<&std::path::Path>,
+    active_tab_git: Option<&GitStatus>,
+    opacity: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> (f32, f32) {
+    let now = std::time::Instant::now();
+    let ctx = widgets::WidgetContext {
+        active_tab_cwd,
+        active_tab_git,
+        opacity,
+    };
+
+    for w in layout.widgets.iter_mut() {
+        if now.duration_since(w.last_poll()) >= w.poll_interval() {
+            w.set_last_poll(now);
+            w.poll(&ctx);
+        }
+    }
+
+    const BB_H: f32 = 20.0;
+    const SCROLLBAR_COL_W: f32 = 10.0;
+    let bar_y = viewport_height - BB_H;
+    let right_edge = viewport_width - SCROLLBAR_COL_W;
+    let mid_x = viewport_width * 0.5;
+
+    let mut left_x: f32 = 8.0;
+    let mut right_x: f32 = right_edge - 8.0;
+    let mut left_out: Vec<widgets::LaidOutWidget> = Vec::new();
+    let mut right_out: Vec<widgets::LaidOutWidget> = Vec::new();
+
+    for (idx, w) in layout.widgets.iter_mut().enumerate() {
+        let segments = w.render(&widgets::WidgetContext {
+            active_tab_cwd,
+            active_tab_git,
+            opacity,
+        });
+        if segments.is_empty() {
+            continue;
+        }
+        let tooltip = w.tooltip();
+
+        let measure = |text: &str, scale: f32| -> f32 {
+            text.chars().fold(0.0f32, |acc, c| {
+                if c == ' ' { return acc + 7.0 * scale; }
+                acc + 7.0 * scale + 1.0
+            })
+        };
+        let scale_approx: f32 = 12.0 / 14.0;
+        let width = segments.iter().map(|s| measure(&s.text, scale_approx)).sum::<f32>();
+
+        match w.align() {
+            widgets::Align::Left => {
+                if left_x + width >= mid_x { continue; }
+                let rect = widgets::Rect { x: left_x, y: bar_y, w: width, h: BB_H };
+                left_out.push(widgets::LaidOutWidget {
+                    widget_index: idx,
+                    rect,
+                    segments,
+                    tooltip: tooltip.clone(),
+                });
+                left_x = rect.x + width + 12.0;
+            }
+            widgets::Align::Right => {
+                if right_x - width <= mid_x { continue; }
+                let rect = widgets::Rect {
+                    x: right_x - width,
+                    y: bar_y,
+                    w: width,
+                    h: BB_H,
+                };
+                right_out.push(widgets::LaidOutWidget {
+                    widget_index: idx,
+                    rect,
+                    segments,
+                    tooltip,
+                });
+                right_x = rect.x - 12.0;
+            }
+        }
+    }
+
+    left_out.extend(right_out);
+    let hit_rects = left_out.iter().map(|lo| lo.rect).collect();
+    layout.laid_out = left_out;
+    layout.hit_rects = hit_rects;
+    (bar_y, BB_H)
 }
 
 fn get_padding_bottom() -> f32 {
@@ -896,6 +1000,11 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     let mut active_tab_index = 0usize;
+
+    const BB_H: f32 = 20.0;
+    let mut bar_layout = build_bar_layout(&config);
+    let mut bar_y: f32 = 0.0;
+    let mut bar_h: f32 = BB_H;
     let mut tabs = if config.session_restore && fasty_args.command.is_none() {
         match session::load() {
             Some(s) if !s.tabs.is_empty() => {
@@ -1170,6 +1279,7 @@ fn main() -> anyhow::Result<()> {
                                         theme_changed, font_changed, scrollback_changed, ligatures_changed, weight_changed, shell_changed, opacity_changed
                                     );
                                     config = new_config;
+                                    bar_layout = build_bar_layout(&config);
 
                                     if theme_changed {
                                         if let Some(t) = &config.theme {
@@ -1380,6 +1490,28 @@ fn main() -> anyhow::Result<()> {
                             if let Some((w, h)) = pending_surface_resize.take() {
                                 renderer.lock().resize(w, h);
                             }
+
+                            let r_cfg = renderer.lock();
+                            let vw = r_cfg.config.width as f32;
+                            let vh = r_cfg.config.height as f32;
+                            drop(r_cfg);
+
+                            let active_tab_cwd = tabs[active_tab_index].terminal_state.lock()
+                                .shell_pid()
+                                .and_then(|pid| std::fs::read_link(format!("/proc/{}/cwd", pid)).ok())
+                                .or_else(|| tabs[active_tab_index].cwd.clone());
+                            let active_tab_git = tabs[active_tab_index].git_status.clone();
+
+                            let (computed_bar_y, computed_bar_h) = poll_and_layout_bar(
+                                &mut bar_layout,
+                                active_tab_cwd.as_deref(),
+                                active_tab_git.as_ref(),
+                                config.opacity,
+                                vw,
+                                vh,
+                            );
+                            bar_y = computed_bar_y;
+                            bar_h = computed_bar_h;
 
                             let mut tab_titles = Vec::new();
                             let mut active_tab_path = "fasty".to_string();
@@ -1602,6 +1734,9 @@ fn main() -> anyhow::Result<()> {
                                 &rename_buffer,
                                 rename_cursor,
                                 active_tab.git_status.as_ref(),
+                                &bar_layout.laid_out,
+                                bar_y,
+                                bar_h,
                                 ssh_picker_visible,
                                 &ssh_picker_query,
                                 ssh_picker_selected,
@@ -2865,6 +3000,47 @@ fn main() -> anyhow::Result<()> {
                             let padding_top = get_padding_top(tabs.len());
                             tabs[active_tab_index].last_activity_time = std::time::Instant::now();
                             tabs[active_tab_index].cursor_visible = true;
+
+                            if state == ElementState::Pressed && button == MouseButton::Left {
+                                let r_cfg = renderer.lock();
+                                let vh = r_cfg.config.height as f32;
+                                drop(r_cfg);
+                                if current_mouse_y as f32 >= vh - bar_h {
+                                    if let Some(idx) = bar_layout.hit_test(current_mouse_x as f32, current_mouse_y as f32) {
+                                        let cwd = tabs[active_tab_index].terminal_state.lock()
+                                            .shell_pid()
+                                            .and_then(|pid| std::fs::read_link(format!("/proc/{}/cwd", pid)).ok())
+                                            .or_else(|| tabs[active_tab_index].cwd.clone());
+                                        let ctx = widgets::WidgetContext {
+                                            active_tab_cwd: cwd.as_deref(),
+                                            active_tab_git: tabs[active_tab_index].git_status.as_ref(),
+                                            opacity: config.opacity,
+                                        };
+                                        if let Some(w) = bar_layout.widgets.get_mut(idx) {
+                                            let action = w.on_click(&ctx);
+                                            match action {
+                                                widgets::ClickAction::None => {}
+                                                widgets::ClickAction::CopyToClipboard(s) => {
+                                                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                                                        let _ = cb.set_text(s);
+                                                    }
+                                                    toast = Some(("copied to clipboard".to_string(), std::time::Instant::now(), 1500));
+                                                }
+                                                widgets::ClickAction::RunCommand(s) => {
+                                                    let _ = tabs[active_tab_index].terminal_state.lock().write_to_pty(s.as_bytes());
+                                                }
+                                                widgets::ClickAction::OpenUrl(s) => {
+                                                    let _ = std::process::Command::new("xdg-open").arg(&s).spawn();
+                                                }
+                                                widgets::ClickAction::Custom => {}
+                                            }
+                                        }
+                                        renderer.lock().set_dirty(true);
+                                        app_dirty = true;
+                                        return;
+                                    }
+                                }
+                            }
 
                             if tab_ctx_visible {
                                 if state == ElementState::Pressed && button == MouseButton::Left {
@@ -4938,6 +5114,9 @@ fn main() -> anyhow::Result<()> {
                         &rename_buffer,
                         rename_cursor,
                         active_tab.git_status.as_ref(),
+                        &bar_layout.laid_out,
+                        bar_y,
+                        bar_h,
                         ssh_picker_visible,
                         &ssh_picker_query,
                         ssh_picker_selected,

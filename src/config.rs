@@ -200,6 +200,75 @@ pub struct Config {
     pub opacity: f32,
     #[serde(default = "default_notify_on_command_finish")]
     pub notify_on_command_finish: bool,
+    #[serde(default)]
+    pub bottombar: BottombarConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BottombarConfig {
+    #[serde(default)]
+    pub widgets: Vec<WidgetSpec>,
+}
+
+/// Configuration for one bottombar widget.
+///
+/// `kebab-case` `type` maps to a built-in widget id (`git`, `time`, `kube`,
+/// `aws`, `command`). Unknown types are skipped at load time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum WidgetSpec {
+    Git {
+        #[serde(default)]
+        align: Option<AlignSpec>,
+        #[serde(default)]
+        interval_ms: Option<u64>,
+    },
+    Time {
+        #[serde(default)]
+        format: Option<String>,
+        #[serde(default)]
+        align: Option<AlignSpec>,
+        #[serde(default)]
+        interval_ms: Option<u64>,
+    },
+    Kube {
+        #[serde(default)]
+        align: Option<AlignSpec>,
+        #[serde(default)]
+        interval_ms: Option<u64>,
+    },
+    Aws {
+        #[serde(default)]
+        align: Option<AlignSpec>,
+        #[serde(default)]
+        interval_ms: Option<u64>,
+    },
+    Command {
+        name: String,
+        command: String,
+        #[serde(default)]
+        on_click: Option<String>,
+        #[serde(default)]
+        align: Option<AlignSpec>,
+        #[serde(default)]
+        interval_ms: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AlignSpec {
+    Left,
+    Right,
+}
+
+impl From<AlignSpec> for crate::widgets::Align {
+    fn from(a: AlignSpec) -> Self {
+        match a {
+            AlignSpec::Left => crate::widgets::Align::Left,
+            AlignSpec::Right => crate::widgets::Align::Right,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +304,7 @@ impl Default for Config {
             session_restore: default_session_restore(),
             opacity: default_opacity(),
             notify_on_command_finish: default_notify_on_command_finish(),
+            bottombar: BottombarConfig::default(),
         }
     }
 }

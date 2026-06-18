@@ -653,6 +653,9 @@ impl Pipeline {
         rename_buffer: &str,
         rename_cursor: usize,
         git_status: Option<&crate::git::GitStatus>,
+        bar_segments: &[crate::widgets::LaidOutWidget],
+        bar_y: f32,
+        bar_h: f32,
         ssh_picker_visible: bool,
         ssh_picker_query: &str,
         ssh_picker_selected: usize,
@@ -1267,14 +1270,9 @@ impl Pipeline {
         let bg_instances = &mut ui_bg_instances;
         let fg_instances = &mut ui_fg_instances;
 
-        // Bottombar — always rendered (15px strip at the bottom).
-        // Git info is shown only when the active tab is in a git repo.
+        // Bottombar — widget-based (see src/widgets).
         {
-            const BB_H: f32 = 20.0;
-            const SCROLLBAR_COL_W: f32 = 10.0; // 6px track + 2*2px margin
-            let bb_x = 0.0f32;
-            let bb_y = viewport_height - BB_H;
-            let bb_w = viewport_width;
+            const SCROLLBAR_COL_W: f32 = 10.0;
             let bb_content_right = viewport_width - SCROLLBAR_COL_W;
 
             let (bg_r, bg_g, bg_b) =
@@ -1291,10 +1289,10 @@ impl Pipeline {
             // the scrollbar (which also lives in term_instances_final
             // but is pushed later), giving the scrollbar correct z-order.
             instances.push(CellInstance::new(
-                bb_x,
-                bb_y,
-                bb_w,
-                BB_H,
+                0.0,
+                bar_y,
+                viewport_width,
+                bar_h,
                 theme_bg,
                 [0.0, 0.0, 8.0, 8.0],
                 0.0,
@@ -1304,297 +1302,48 @@ impl Pipeline {
                 8.0,
             ));
 
-            // Git info — only when in a repo
-            if let Some(gs) = git_status {
-                let bb_font: f32 = 12.0;
-                let scale = bb_font / ui_atlas.font_size();
-                let cell_w = ui_atlas.cell_size().0 * scale;
-                let scaled_ascent = ui_atlas.ascent() * scale;
-                let descent = scaled_ascent * 0.3;
-                let text_block_h = scaled_ascent + descent;
-                let baseline_y = bb_y + (BB_H - text_block_h) / 2.0 + scaled_ascent;
+            // Walk laid-out widgets and push their glyphs.
+            let bb_font: f32 = 12.0;
+            let scale = bb_font / ui_atlas.font_size();
+            let scaled_ascent = ui_atlas.ascent() * scale;
+            let descent = scaled_ascent * 0.3;
+            let text_block_h = scaled_ascent + descent;
+            let baseline_y = bar_y + (bar_h - text_block_h) / 2.0 + scaled_ascent;
 
-                macro_rules! bb_text {
-                    ($text:expr, $start_x:expr, $color:expr) => {{
-                        let mut x = $start_x;
-                        for c in $text.chars() {
-                            if c == ' ' {
-                                x += cell_w;
-                                continue;
-                            }
-                            if x >= bb_content_right {
-                                break;
-                            }
-                            if let Some(entry) = ui_atlas.get_or_rasterize(c, device, queue) {
-                                if entry.width > 0.0 {
-                                    let gw = entry.width * scale;
-                                    let glyph_x = (x + entry.left * scale).round();
-                                    let glyph_y = (baseline_y + entry.top * scale).round();
-                                    let (aw, ah) = ui_atlas.atlas_size();
-                                    let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
-                                    fg_instances.push(CellInstance::new(
-                                        glyph_x,
-                                        glyph_y,
-                                        gw,
-                                        entry.height * scale,
-                                        $color,
-                                        [0.0, 0.0, 0.0, 0.0],
-                                        uv_x,
-                                        uv_y,
-                                        uv_end_x - uv_x,
-                                        uv_end_y - uv_y,
-                                        0.0,
-                                    ));
-                                    x += gw + 1.0;
-                                }
-                            }
-                        }
-                        x
-                    }};
-                }
+            for laid_out in bar_segments {
+                let mut x = laid_out.rect.x;
+                if x >= bb_content_right { continue; }
 
-                let mut x = 8.0f32;
-
-                // Branch icon
-                if let Some(entry) = &ui_atlas.icon_branch {
-                    let icon_size = bb_font;
-                    let icon_y = bb_y + (BB_H - icon_size) / 2.0;
-                    let (aw, ah) = ui_atlas.atlas_size();
-                    let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
-                    fg_instances.push(CellInstance::new(
-                        x,
-                        icon_y,
-                        icon_size,
-                        icon_size,
-                        with_opacity([0.75, 0.78, 0.85, 1.0], chrome_alpha),
-                        [0.0, 0.0, 0.0, 0.0],
-                        uv_x,
-                        uv_y,
-                        uv_end_x - uv_x,
-                        uv_end_y - uv_y,
-                        0.0,
-                    ));
-                    x += icon_size + 4.0;
-                }
-
-                // Branch name
-                let branch_color = with_opacity([0.85, 0.88, 0.95, 1.0], chrome_alpha);
-                x = bb_text!(gs.branch.as_str(), x, branch_color);
-
-                // Dirty indicator dot
-                if !gs.is_clean() && x < bb_content_right {
-                    x += 6.0;
-                    let dot_r = 2.5f32;
-                    let dot_y = bb_y + BB_H * 0.5;
-                    bg_instances.push(CellInstance::new(
-                        x - dot_r,
-                        dot_y - dot_r,
-                        dot_r * 2.0,
-                        dot_r * 2.0,
-                        with_opacity([0.95, 0.80, 0.45, 1.0], chrome_alpha),
-                        [0.0, 0.0, 0.0, 0.0],
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                        dot_r,
-                    ));
-                    x += dot_r * 2.0 + 6.0;
-                }
-
-                // Separator
-                x += 2.0;
-                if x < bb_content_right {
-                    let sep_color = with_opacity([1.0, 1.0, 1.0, 0.08], chrome_alpha);
-                    bg_instances.push(CellInstance::new(
-                        x,
-                        bb_y + 3.0,
-                        1.0,
-                        BB_H - 6.0,
-                        sep_color,
-                        [0.0, 0.0, 0.0, 0.0],
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                    ));
-                }
-                x += 8.0;
-
-                // Ahead
-                if gs.ahead > 0 {
-                    let s = format!("\u{2191}{}", gs.ahead);
-                    x = bb_text!(
-                        s.as_str(),
-                        x,
-                        with_opacity([0.45, 0.85, 0.55, 1.0], chrome_alpha)
-                    ) + 6.0;
-                }
-
-                // Behind
-                if gs.behind > 0 {
-                    let s = format!("\u{2193}{}", gs.behind);
-                    x = bb_text!(
-                        s.as_str(),
-                        x,
-                        with_opacity([0.90, 0.55, 0.40, 1.0], chrome_alpha)
-                    ) + 6.0;
-                }
-
-                // Modified
-                if gs.modified > 0 {
-                    let s = format!("~{}", gs.modified);
-                    x = bb_text!(
-                        s.as_str(),
-                        x,
-                        with_opacity([0.95, 0.80, 0.45, 1.0], chrome_alpha)
-                    ) + 6.0;
-                }
-
-                // Staged
-                if gs.staged > 0 {
-                    let s = format!("+{}", gs.staged);
-                    x = bb_text!(
-                        s.as_str(),
-                        x,
-                        with_opacity([0.50, 0.80, 0.95, 1.0], chrome_alpha)
-                    ) + 6.0;
-                }
-
-                // Untracked
-                if gs.untracked > 0 {
-                    let s = format!("?{}", gs.untracked);
-                    x = bb_text!(
-                        s.as_str(),
-                        x,
-                        with_opacity([0.65, 0.65, 0.75, 1.0], chrome_alpha)
-                    ) + 6.0;
-                }
-
-                // Command duration — after git stats, before commit summary
-                if let (Some(duration_ms), Some(display_secs)) =
-                    (last_command_duration_ms, command_duration_display_secs)
-                {
-                    if display_secs < 5.0 {
-                        // Separator
-                        x += 4.0;
-                        if x < bb_content_right {
-                            let sep_color = with_opacity([1.0, 1.0, 1.0, 0.08], chrome_alpha);
-                            bg_instances.push(CellInstance::new(
-                                x,
-                                bb_y + 3.0,
-                                1.0,
-                                BB_H - 6.0,
-                                sep_color,
-                                [0.0, 0.0, 0.0, 0.0],
-                                0.0,
-                                0.0,
-                                0.0,
-                                0.0,
-                                0.0,
-                            ));
-                        }
-                        x += 8.0;
-
-                        let duration_text = if duration_ms < 1000 {
-                            format!("{}ms", duration_ms)
-                        } else {
-                            format!("{:.1}s", duration_ms as f32 / 1000.0)
-                        };
-                        let duration_color = if exit_code == Some(0) || exit_code.is_none() {
-                            with_opacity([0.45, 0.85, 0.55, 1.0], chrome_alpha)
-                        } else {
-                            with_opacity([0.95, 0.50, 0.45, 1.0], chrome_alpha)
-                        };
-                        x = bb_text!(&duration_text, x, duration_color) + 6.0;
-                    }
-                }
-
-                // Last commit summary — right-aligned, dimmed
-                if !gs.last_commit_summary.is_empty() {
-                    let summary_text = if gs.last_commit_summary.len() > 60 {
-                        format!("{}...", &gs.last_commit_summary[..57])
-                    } else {
-                        gs.last_commit_summary.clone()
-                    };
-                    // Measure text width to right-align
-                    let mut text_w = 0.0f32;
-                    for c in summary_text.chars() {
+                for seg in &laid_out.segments {
+                    for c in seg.text.chars() {
                         if c == ' ' {
-                            text_w += cell_w;
+                            x += ui_atlas.cell_size().0 * scale;
                             continue;
                         }
+                        if x >= bb_content_right { break; }
                         if let Some(entry) = ui_atlas.get_or_rasterize(c, device, queue) {
-                            text_w += entry.width * scale + 1.0;
-                        }
-                    }
-                    let right_x = viewport_width - SCROLLBAR_COL_W - text_w - 8.0;
-                    if right_x > x + 16.0 {
-                        let _ = bb_text!(
-                            summary_text.as_str(),
-                            right_x,
-                            with_opacity([0.50, 0.50, 0.55, 0.6], chrome_alpha)
-                        );
-                    }
-                }
-            }
-
-            // Command duration when no git repo
-            if git_status.is_none() {
-                if let (Some(duration_ms), Some(display_secs)) =
-                    (last_command_duration_ms, command_duration_display_secs)
-                {
-                    if display_secs < 5.0 {
-                        let bb_font: f32 = 12.0;
-                        let s = bb_font / ui_atlas.font_size();
-                        let cw = ui_atlas.cell_size().0 * s;
-                        let asc = ui_atlas.ascent() * s;
-                        let desc = asc * 0.3;
-                        let tbh = asc + desc;
-                        let bl = bb_y + (BB_H - tbh) / 2.0 + asc;
-
-                        let duration_text = if duration_ms < 1000 {
-                            format!("{}ms", duration_ms)
-                        } else {
-                            format!("{:.1}s", duration_ms as f32 / 1000.0)
-                        };
-                        let duration_color = if exit_code == Some(0) || exit_code.is_none() {
-                            with_opacity([0.45, 0.85, 0.55, 1.0], chrome_alpha)
-                        } else {
-                            with_opacity([0.95, 0.50, 0.45, 1.0], chrome_alpha)
-                        };
-                        let mut dx = 8.0f32;
-                        for c in duration_text.chars() {
-                            if c == ' ' {
-                                dx += cw;
-                                continue;
-                            }
-                            if dx >= bb_content_right {
-                                break;
-                            }
-                            if let Some(entry) = ui_atlas.get_or_rasterize(c, device, queue) {
-                                if entry.width > 0.0 {
-                                    let gw = entry.width * s;
-                                    let gx = (dx + entry.left * s).round();
-                                    let gy = (bl + entry.top * s).round();
-                                    let (aw, ah) = ui_atlas.atlas_size();
-                                    let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
-                                    bg_instances.push(CellInstance::new(
-                                        gx,
-                                        gy,
-                                        gw,
-                                        entry.height * s,
-                                        duration_color,
-                                        [0.0, 0.0, 0.0, 0.0],
-                                        uv_x,
-                                        uv_y,
-                                        uv_end_x - uv_x,
-                                        uv_end_y - uv_y,
-                                        0.0,
-                                    ));
-                                    dx += gw + 1.0;
-                                }
+                            if entry.width > 0.0 {
+                                let gw = entry.width * scale;
+                                let glyph_x = (x + entry.left * scale).round();
+                                let glyph_y = (baseline_y + entry.top * scale).round();
+                                let (aw, ah) = ui_atlas.atlas_size();
+                                let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                                let mut color = seg.color;
+                                color[3] *= chrome_alpha;
+                                fg_instances.push(CellInstance::new(
+                                    glyph_x,
+                                    glyph_y,
+                                    gw,
+                                    entry.height * scale,
+                                    color,
+                                    [0.0, 0.0, 0.0, 0.0],
+                                    uv_x,
+                                    uv_y,
+                                    uv_end_x - uv_x,
+                                    uv_end_y - uv_y,
+                                    0.0,
+                                ));
+                                x += gw + 1.0;
                             }
                         }
                     }
