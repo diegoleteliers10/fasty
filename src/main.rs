@@ -158,6 +158,92 @@ fn get_padding_top(_tab_count: usize) -> f32 {
     48.0
 }
 
+fn handle_popped_out_event(
+    window_id: winit::window::WindowId,
+    event: WindowEvent,
+    popped: &mut std::collections::HashMap<winit::window::WindowId, window_context::WindowContext>,
+    _config: &Config,
+    _proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+) {
+    let Some(wc) = popped.get_mut(&window_id) else { return; };
+
+    match event {
+        WindowEvent::CloseRequested => {
+            popped.remove(&window_id);
+        }
+        WindowEvent::Resized(size) => {
+            wc.renderer.lock().resize(size.width, size.height);
+            let term = wc.tabs[0].terminal_state.lock();
+            let cols = (size.width as f32 / wc.cell_width).floor().max(1.0) as usize;
+            let rows = (size.height as f32 / (wc.cell_height + 30.0 + 20.0)).floor().max(1.0) as usize;
+            drop(term);
+            wc.tabs[0].terminal_state.lock().resize(cols.max(80), rows.max(24));
+            wc.shell_cols = cols;
+            wc.shell_rows = rows;
+            wc.window.request_redraw();
+        }
+        WindowEvent::ScaleFactorChanged { .. } => {
+            wc.window.request_redraw();
+        }
+        WindowEvent::KeyboardInput { event, .. } => {
+            use winit::event::ElementState;
+            if event.state == ElementState::Pressed {
+                if let Some(text) = &event.text {
+                    let bytes = text.as_bytes();
+                    if !bytes.is_empty() {
+                        let _ = wc.tabs[0].terminal_state.lock().write_to_pty(bytes);
+                    }
+                }
+                use winit::keyboard::{Key, NamedKey};
+                let key = &event.logical_key;
+                let bytes: Option<Vec<u8>> = match key {
+                    Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
+                    Key::Named(NamedKey::Backspace) => Some(vec![0x7f]),
+                    Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
+                    Key::Named(NamedKey::Escape) => Some(b"\x1b".to_vec()),
+                    Key::Named(NamedKey::ArrowUp) => Some(b"\x1b[A".to_vec()),
+                    Key::Named(NamedKey::ArrowDown) => Some(b"\x1b[B".to_vec()),
+                    Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),
+                    Key::Named(NamedKey::ArrowLeft) => Some(b"\x1b[D".to_vec()),
+                    Key::Named(NamedKey::Home) => Some(b"\x1b[H".to_vec()),
+                    Key::Named(NamedKey::End) => Some(b"\x1b[F".to_vec()),
+                    Key::Named(NamedKey::Delete) => Some(b"\x1b[3~".to_vec()),
+                    Key::Named(NamedKey::PageUp) => Some(b"\x1b[5~".to_vec()),
+                    Key::Named(NamedKey::PageDown) => Some(b"\x1b[6~".to_vec()),
+                    _ => None,
+                };
+                if let Some(b) = bytes {
+                    let _ = wc.tabs[0].terminal_state.lock().write_to_pty(&b);
+                }
+            }
+            wc.window.request_redraw();
+        }
+        WindowEvent::MouseWheel { delta, .. } => {
+            use winit::event::MouseScrollDelta;
+            let lines: i32 = match delta {
+                MouseScrollDelta::LineDelta(_, y) => -(y as i32),
+                MouseScrollDelta::PixelDelta(p) => -(p.y / 20.0) as i32,
+            };
+            if lines != 0 {
+                let abs = lines.unsigned_abs() as u8;
+                let byte = if lines > 0 { b'A' } else { b'B' };
+                let bytes = vec![0x1b, b'[', b'6' - (abs - 1) + (byte - b'A'), b'~'];
+                let _ = wc.tabs[0].terminal_state.lock().write_to_pty(&bytes);
+            }
+            wc.window.request_redraw();
+        }
+        WindowEvent::RedrawRequested => {
+            // TODO: render call. The 77-arg signature is brittle to maintain
+            // in isolation; refactor `Renderer::render` to take a `RenderInputs`
+            // struct, then call from here with minimal inputs.
+            let _ = wc;
+        }
+        _ => {
+            wc.window.request_redraw();
+        }
+    }
+}
+
 fn build_bar_layout(config: &Config) -> widgets::BarLayout {
     if config.bottombar.widgets.is_empty() {
         widgets::BarLayout::new(vec![Box::new(
@@ -1434,6 +1520,18 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             winit::event::Event::WindowEvent { window_id, event } => {
+                if window_id != window_for_redraw.id() {
+                    if popped_out_windows.contains_key(&window_id) {
+                        handle_popped_out_event(
+                            window_id,
+                            event,
+                            &mut popped_out_windows,
+                            &config,
+                            proxy.clone(),
+                        );
+                        return;
+                    }
+                }
                 if window_id == window_for_redraw.id() {
                     // --- Main Window Event Handler ---
                     match event {
@@ -4945,6 +5043,68 @@ fn main() -> anyhow::Result<()> {
             }
             winit::event::Event::AboutToWait => {
                 let now = std::time::Instant::now();
+
+                if let Some(idx) = pending_pop_out.take() {
+                    if idx < tabs.len() && tabs.len() >= 2 {
+                        let tab = tabs.remove(idx);
+                        if active_tab_index >= tabs.len() && !tabs.is_empty() {
+                            active_tab_index = tabs.len() - 1;
+                        }
+                        if !tabs.is_empty() {
+                            let physical_size = window_for_redraw.inner_size();
+                            let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                            shell_cols = cols;
+                            shell_rows = rows;
+                        }
+                        let visible = !cfg!(target_os = "windows");
+                        let cursor_pos = current_mouse_x.max(0.0) as i32;
+                        let cursor_pos_y = current_mouse_y.max(0.0) as i32;
+                        let attrs = winit::window::WindowAttributes::default()
+                            .with_title(tab.custom_name.as_deref().unwrap_or("fasty"))
+                            .with_decorations(false)
+                            .with_transparent(true)
+                            .with_visible(visible)
+                            .with_position(winit::dpi::PhysicalPosition::new(cursor_pos, cursor_pos_y))
+                            .with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0));
+                        if let Ok(window) = target.create_window(attrs) {
+                            let window_arc = Arc::new(window);
+                            let w_ref: &winit::window::Window = &*window_arc;
+                            let w_static: &'static winit::window::Window = unsafe { std::mem::transmute(w_ref) };
+                            let (shared_instance, shared_device, shared_queue, format, alpha_mode) = {
+                                let r = renderer.lock();
+                                (r.instance.clone(), r.device.clone(), r.queue.clone(), r.config.format, r.config.alpha_mode)
+                            };
+                            if let Ok(r) = Renderer::new_shared(w_static, &config.font.family, config.font.size, shared_instance, shared_device, shared_queue, format, alpha_mode) {
+                                let (cols, rows) = resize_all_tabs(
+                                    std::slice::from_ref(&tab),
+                                    window_arc.inner_size().width,
+                                    window_arc.inner_size().height,
+                                    cell_width, cell_height,
+                                );
+                                let mut bar = widgets::BarLayout::new(vec![Box::new(
+                                    widgets::builtin::git::GitWidget::new(widgets::Align::Left, None),
+                                )]);
+                                let _ = (cols, rows);
+                                let wc = window_context::WindowContext::new(
+                                    window_arc,
+                                    Arc::new(parking_lot::Mutex::new(r)),
+                                    vec![tab],
+                                    cell_width,
+                                    cell_height,
+                                    shell_cols,
+                                    shell_rows,
+                                    bar,
+                                    proxy.clone(),
+                                );
+                                let id = wc.window.id();
+                                popped_out_windows.insert(id, wc);
+                                if let Some(wc) = popped_out_windows.get(&id) {
+                                    wc.window.request_redraw();
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Poll git status for each tab (throttled to once every 3s per tab).
                 // Only the active tab is polled in real-time; other tabs are checked
