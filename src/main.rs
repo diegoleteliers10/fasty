@@ -158,6 +158,24 @@ fn get_padding_top(_tab_count: usize) -> f32 {
     48.0
 }
 
+/// Returns true if the cursor is more than 8px outside the window's
+/// outer bounds. `mouse_x`/`mouse_y` are in window-local logical pixels.
+fn mouse_outside_window(window: &winit::window::Window, mx: f64, my: f64) -> bool {
+    const SLACK_PX: f64 = 8.0;
+    let scale = window.scale_factor();
+    let pos = match window.outer_position() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let size = window.outer_size();
+    let sx = (pos.x as f64) + mx * scale;
+    let sy = (pos.y as f64) + my * scale;
+    sx < (pos.x as f64) - SLACK_PX * scale
+        || sy < (pos.y as f64) - SLACK_PX * scale
+        || sx > (pos.x as f64 + size.width as f64) + SLACK_PX * scale
+        || sy > (pos.y as f64 + size.height as f64) + SLACK_PX * scale
+}
+
 fn handle_popped_out_event(
     window_id: winit::window::WindowId,
     event: WindowEvent,
@@ -4039,7 +4057,14 @@ fn main() -> anyhow::Result<()> {
                                                 160.0
                                             };
                                             let target = compute_drop_target(current_mouse_x, tab_start_x, tab_width, tabs_len);
-                                            if target != drag_idx {
+                                            let popped_out = mouse_outside_window(
+                                                &window_for_redraw,
+                                                current_mouse_x,
+                                                current_mouse_y,
+                                            );
+                                            if popped_out && tabs.len() >= 2 {
+                                                pending_pop_out = Some(drag_idx);
+                                            } else if target != drag_idx {
                                                 let tab = tabs.remove(drag_idx);
                                                 tabs.insert(target, tab);
                                                 active_tab_index = target;
