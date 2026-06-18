@@ -1,25 +1,71 @@
-//! Persisted tab state across restarts.
+//! Persisted tab/window state across restarts.
 //!
-//! On graceful exit we write `~/.config/fasty/session.json` with the cwd
-//! of each open tab and the active tab index. On startup, if
-//! `config.session_restore` is true and the file parses, we spawn a
-//! new tab in each saved cwd.
+//! On graceful exit we write `~/.config/fasty/session.json`. On startup, if
+//! `config.session_restore` is true and the file parses, we restore each
+//! window and its tabs.
 //!
-//! We do not track the in-session cwd (no OSC 7 listener for v0.2.9),
-//! so the restored cwd is the cwd at the time the tab was spawned.
+//! The schema is multi-window: `Session { windows: Vec<WindowSession> }`. An
+//! older `tabs: Vec<TabInfo>` field is still accepted and migrated to one
+//! window on load.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    #[serde(default)]
+    pub windows: Vec<WindowSession>,
+    /// Active window index. `0` if there is only one window.
+    #[serde(default)]
+    pub active_window: usize,
+    /// Legacy single-window field. Loaded if `windows` is empty.
+    #[serde(default, rename = "tabs")]
+    pub legacy_tabs: Vec<TabInfo>,
+    /// Legacy single-window field. Used when migrating from old session.
+    #[serde(default, rename = "active_tab")]
+    pub legacy_active_tab: usize,
+}
+
+impl Session {
+    pub fn migrate(self) -> Session {
+        if !self.windows.is_empty() {
+            return self;
+        }
+        if self.legacy_tabs.is_empty() {
+            return self;
+        }
+        Session {
+            windows: vec![WindowSession {
+                tabs: self.legacy_tabs.clone(),
+                active_tab: self.legacy_active_tab,
+                position: None,
+                size: None,
+            }],
+            active_window: 0,
+            legacy_tabs: self.legacy_tabs,
+            legacy_active_tab: self.legacy_active_tab,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowSession {
     pub tabs: Vec<TabInfo>,
+    #[serde(default)]
     pub active_tab: usize,
+    #[serde(default)]
+    pub position: Option<(i32, i32)>,
+    #[serde(default)]
+    pub size: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabInfo {
     pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub custom_name: Option<String>,
+    #[serde(default)]
+    pub title_override: Option<String>,
 }
 
 pub fn session_path() -> PathBuf {
@@ -32,13 +78,14 @@ pub fn session_path() -> PathBuf {
 pub fn load() -> Option<Session> {
     let path = session_path();
     let content = std::fs::read_to_string(&path).ok()?;
-    match serde_json::from_str::<Session>(&content) {
-        Ok(s) => Some(s),
+    let s: Session = match serde_json::from_str(&content) {
+        Ok(s) => s,
         Err(e) => {
             tracing::warn!("session: failed to parse {}: {e}", path.display());
-            None
+            return None;
         }
-    }
+    };
+    Some(s.migrate())
 }
 
 pub fn save(session: &Session) -> anyhow::Result<()> {

@@ -1099,9 +1099,10 @@ fn main() -> anyhow::Result<()> {
     let mut bar_h: f32 = BB_H;
     let mut tabs = if config.session_restore && fasty_args.command.is_none() {
         match session::load() {
-            Some(s) if !s.tabs.is_empty() => {
+            Some(s) if !s.windows.is_empty() => {
+                let first_window = &s.windows[s.active_window.min(s.windows.len() - 1)];
                 let mut restored = Vec::new();
-                for tab_info in &s.tabs {
+                for tab_info in &first_window.tabs {
                     let tab_cwd = tab_info.cwd.as_ref().and_then(|p| p.to_str());
                     match create_new_tab(
                         &shell, &[], tab_cwd, config.scrollback, config.font.clone(),
@@ -1112,7 +1113,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 if !restored.is_empty() {
-                    active_tab_index = s.active_tab.min(restored.len() - 1);
+                    active_tab_index = first_window.active_tab.min(restored.len() - 1);
                     restored
                 } else {
                     vec![initial_tab]
@@ -1330,9 +1331,45 @@ fn main() -> anyhow::Result<()> {
             winit::event::Event::LoopExiting => {
                 if config.session_restore {
                     let saved: Vec<session::TabInfo> = tabs.iter().map(|t| {
-                        session::TabInfo { cwd: tab_live_cwd(t).or_else(|| t.cwd.clone()) }
+                        session::TabInfo {
+                            cwd: tab_live_cwd(t).or_else(|| t.cwd.clone()),
+                            custom_name: t.custom_name.clone(),
+                            title_override: t.title_override.clone(),
+                        }
                     }).collect();
-                    let s = session::Session { tabs: saved, active_tab: active_tab_index };
+                    let mut all_windows = vec![session::WindowSession {
+                        tabs: saved,
+                        active_tab: active_tab_index,
+                        position: window_for_redraw.outer_position().ok().map(|p| (p.x, p.y)),
+                        size: {
+                            let s = window_for_redraw.inner_size();
+                            Some((s.width, s.height))
+                        },
+                    }];
+                    for wc in popped_out_windows.values() {
+                        let saved_tabs: Vec<session::TabInfo> = wc.tabs.iter().map(|t| {
+                            session::TabInfo {
+                                cwd: t.cwd.clone(),
+                                custom_name: t.custom_name.clone(),
+                                title_override: t.title_override.clone(),
+                            }
+                        }).collect();
+                        all_windows.push(session::WindowSession {
+                            tabs: saved_tabs,
+                            active_tab: wc.active_tab_index,
+                            position: wc.window.outer_position().ok().map(|p| (p.x, p.y)),
+                            size: {
+                                let s = wc.window.inner_size();
+                                Some((s.width, s.height))
+                            },
+                        });
+                    }
+                    let s = session::Session {
+                        windows: all_windows,
+                        active_window: 0,
+                        legacy_tabs: Vec::new(),
+                        legacy_active_tab: 0,
+                    };
                     if let Err(e) = session::save(&s) {
                         tracing::warn!("session: save failed: {e}");
                     }
