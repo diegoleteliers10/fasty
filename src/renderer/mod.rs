@@ -228,14 +228,37 @@ impl<'a> Renderer<'a> {
 
         let surface = instance.create_surface(window)?;
 
-        let adapter = instance
+        let mut adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: Some(&surface),
             })
-            .await
-            .expect("Failed to find compatible graphics adapter");
+            .await;
+
+        if adapter.is_none() {
+            tracing::warn!("Failed to find high-performance adapter. Retrying with LowPower...");
+            adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    force_fallback_adapter: false,
+                    compatible_surface: Some(&surface),
+                })
+                .await;
+        }
+
+        if adapter.is_none() {
+            tracing::warn!("Failed to find compatible hardware adapter. Retrying with software fallback...");
+            adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::None,
+                    force_fallback_adapter: true,
+                    compatible_surface: Some(&surface),
+                })
+                .await;
+        }
+
+        let adapter = adapter.expect("Failed to find any compatible graphics adapter (including software fallback)");
 
         let (device, queue) = adapter
             .request_device(

@@ -79,9 +79,17 @@ $ExeDestPath = Join-Path $InstallDir $BinaryName
 
 Write-Host "🚀 Copiando binario a su ubicación final..." -ForegroundColor Cyan
 try {
+    if (Test-Path $ExeDestPath) {
+        # Si el ejecutable ya existe, intentamos renombrarlo para evitar problemas de bloqueo (archivo en ejecución)
+        $OldExePath = "$ExeDestPath.old"
+        if (Test-Path $OldExePath) {
+            Remove-Item -Path $OldExePath -Force -ErrorAction SilentlyContinue
+        }
+        Rename-Item -Path $ExeDestPath -NewName "$BinaryName.old" -Force -ErrorAction SilentlyContinue
+    }
     Copy-Item -Path $ExeSourcePath -Destination $ExeDestPath -Force
 } catch {
-    Write-Error "❌ Error al copiar el archivo ejecutable a $InstallDir"
+    Write-Error "❌ Error al copiar el archivo ejecutable a $InstallDir: $_"
     $ProgressPreference = $oldProgressPreference
     exit 1
 }

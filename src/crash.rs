@@ -11,6 +11,7 @@ fn crashes_dir() -> PathBuf {
 }
 
 pub fn install_hook() {
+    let start_time = std::time::Instant::now();
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         let thread = std::thread::current().name().unwrap_or("<unnamed>").to_string();
@@ -53,8 +54,12 @@ pub fn install_hook() {
 
         let _ = default_hook(info);
 
-        if let Ok(exe) = std::env::current_exe() {
-            let _ = std::process::Command::new(exe).spawn();
+        if start_time.elapsed().as_secs() > 5 {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe).spawn();
+            }
+        } else {
+            eprintln!("fasty: crash occurred within 5 seconds of startup, skipping auto-restart to prevent crash loop.");
         }
     }));
 }

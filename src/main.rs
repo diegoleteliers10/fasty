@@ -1539,6 +1539,16 @@ fn main() -> anyhow::Result<()> {
 
     let _ = std::fs::remove_file("/tmp/fasty-update-done");
 
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(current_exe) = std::env::current_exe() {
+            let old_exe = current_exe.with_extension("exe.old");
+            if old_exe.exists() {
+                let _ = std::fs::remove_file(old_exe);
+            }
+        }
+    }
+
     crash::install_hook();
 
     tracing_subscriber::fmt()
@@ -4144,7 +4154,7 @@ fn main() -> anyhow::Result<()> {
                                                     let _ = tabs[active_tab_index].terminal_state.lock().write_to_pty(s.as_bytes());
                                                 }
                                                 widgets::ClickAction::OpenUrl(s) => {
-                                                    let _ = std::process::Command::new("xdg-open").arg(&s).spawn();
+                                                    open_url(&s);
                                                 }
                                                 widgets::ClickAction::Custom => {}
                                             }
