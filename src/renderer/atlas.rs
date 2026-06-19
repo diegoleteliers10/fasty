@@ -51,6 +51,7 @@ impl AtlasEntry {
     }
 }
 
+#[derive(Clone)]
 struct ShelfPacker {
     width: u32,
     height: u32,
@@ -104,7 +105,7 @@ pub enum GlyphKey {
 }
 
 pub struct Atlas {
-    texture: wgpu::Texture,
+    texture: std::sync::Arc<wgpu::Texture>,
     entries: HashMap<GlyphKey, AtlasEntry>,
     packer: ShelfPacker,
     primary_path: String,
@@ -201,6 +202,44 @@ fn get_cached_icons() -> &'static CachedIcons {
 }
 
 impl Atlas {
+    pub fn try_clone(&self) -> anyhow::Result<Self> {
+        let hb_face = if let Some(bytes) = &self.primary_font_bytes {
+            rustybuzz::Face::from_slice(bytes, 0).map(|face| unsafe {
+                std::mem::transmute::<rustybuzz::Face<'_>, rustybuzz::Face<'static>>(face)
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            texture: self.texture.clone(),
+            entries: self.entries.clone(),
+            packer: self.packer.clone(),
+            primary_path: self.primary_path.clone(),
+            primary_font_bytes: self.primary_font_bytes.clone(),
+            hb_face,
+            shaping_cache: self.shaping_cache.clone(),
+            fallback_paths: self.fallback_paths.clone(),
+            fallback_glyph: self.fallback_glyph.clone(),
+            cell_width: self.cell_width,
+            cell_height: self.cell_height,
+            ascent: self.ascent,
+            atlas_width: self.atlas_width,
+            atlas_height: self.atlas_height,
+            font_size: self.font_size,
+            scale_factor: self.scale_factor,
+            app_icon: self.app_icon.clone(),
+            icon_add: self.icon_add.clone(),
+            icon_close: self.icon_close.clone(),
+            icon_copy: self.icon_copy.clone(),
+            icon_paste: self.icon_paste.clone(),
+            icon_settings: self.icon_settings.clone(),
+            icon_text_font: self.icon_text_font.clone(),
+            icon_less: self.icon_less.clone(),
+            icon_maximize: self.icon_maximize.clone(),
+            icon_branch: self.icon_branch.clone(),
+        })
+    }
+
     pub fn new(
         device: &Device,
         queue: &Queue,
@@ -210,7 +249,7 @@ impl Atlas {
         font_size: f32,
         scale_factor: f32,
     ) -> anyhow::Result<Self> {
-        let texture = device.create_texture(&TextureDescriptor {
+        let texture = std::sync::Arc::new(device.create_texture(&TextureDescriptor {
             label: Some("glyph-atlas"),
             size: wgpu::Extent3d {
                 width,
@@ -223,7 +262,7 @@ impl Atlas {
             mip_level_count: 1,
             sample_count: 1,
             view_formats: &[],
-        });
+        }));
 
         let primary_path_initial = Self::load_font_path(font_family).unwrap_or_else(|_| "monospace".to_string());
         let physical_size = font_size * scale_factor;
@@ -285,7 +324,7 @@ impl Atlas {
         let white_pixel = [255u8; 4];
         queue.write_texture(
             wgpu::ImageCopyTextureBase {
-                texture: &texture,
+                texture: texture.as_ref(),
                 mip_level: 0,
                 origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
                 aspect: wgpu::TextureAspect::All,
@@ -1050,6 +1089,7 @@ impl Atlas {
         &self.primary_path
     }
 
+    #[allow(dead_code)]
     pub fn primary_font_bytes(&self) -> Option<&[u8]> {
         self.primary_font_bytes.as_deref()
     }
@@ -1084,9 +1124,10 @@ impl Atlas {
     }
 
     pub fn texture(&self) -> &wgpu::Texture {
-        &self.texture
+        self.texture.as_ref()
     }
 
+    #[allow(dead_code)]
     pub fn load_custom_image(
         &mut self,
         path: &str,
@@ -1143,6 +1184,7 @@ impl Atlas {
         }
     }
 
+    #[allow(dead_code)]
     pub fn load_svg_icon(
         &mut self,
         path: &str,
@@ -1223,6 +1265,7 @@ impl Atlas {
         }
     }
 
+    #[allow(dead_code)]
     pub fn load_custom_image_from_memory(
         &mut self,
         bytes: &[u8],
@@ -1332,6 +1375,7 @@ impl Atlas {
         }
     }
 
+    #[allow(dead_code)]
     pub fn load_svg_icon_from_memory(
         &mut self,
         svg_data: &str,

@@ -6,10 +6,8 @@
 
 use std::sync::Arc;
 
-use winit::event_loop::EventLoopProxy;
 use winit::window::Window;
 
-use crate::terminal_state::AppEvent;
 use crate::widgets::BarLayout;
 
 pub struct WindowContext {
@@ -23,11 +21,21 @@ pub struct WindowContext {
     pub cell_height: f32,
     pub dragging_tab: Option<usize>,
     pub drag_start_x: f64,
+    pub drag_start_y: f64,
     pub drag_current_x: f64,
+    pub drag_current_y: f64,
     pub drag_tab_offset: f64,
     pub drag_threshold_passed: bool,
+    pub pending_pop_out: Option<usize>,
     pub bar_layout: BarLayout,
-    pub proxy: EventLoopProxy<AppEvent>,
+    pub hover_close: bool,
+    pub hover_max: bool,
+    pub hover_min: bool,
+    pub hover_settings: bool,
+    pub hovered_tab_index: Option<usize>,
+    pub hovered_close_tab_index: Option<usize>,
+    pub hover_new_tab: bool,
+    pub last_click_time: Option<std::time::Instant>,
 }
 
 impl WindowContext {
@@ -40,7 +48,6 @@ impl WindowContext {
         shell_cols: usize,
         shell_rows: usize,
         bar_layout: BarLayout,
-        proxy: EventLoopProxy<AppEvent>,
     ) -> Self {
         Self {
             window,
@@ -53,17 +60,21 @@ impl WindowContext {
             cell_height,
             dragging_tab: None,
             drag_start_x: 0.0,
+            drag_start_y: 0.0,
             drag_current_x: 0.0,
+            drag_current_y: 0.0,
             drag_tab_offset: 0.0,
             drag_threshold_passed: false,
+            pending_pop_out: None,
             bar_layout,
-            proxy,
+            hover_close: false,
+            hover_max: false,
+            hover_min: false,
+            hover_settings: false,
+            hovered_tab_index: None,
+            hovered_close_tab_index: None,
+            hover_new_tab: false,
+            last_click_time: None,
         }
-    }
-
-    /// Drag-out is only enabled when the window has 2+ tabs. A single-tab
-    /// window cannot be split — the only tab stays put.
-    pub fn can_pop_out(&self) -> bool {
-        self.tabs.len() >= 2
     }
 }

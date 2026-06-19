@@ -54,13 +54,6 @@ unsafe impl Send for EventListenerProxy {}
 unsafe impl Sync for EventListenerProxy {}
 
 impl EventListenerProxy {
-    pub fn new(writer: Box<dyn Write + Send>) -> Self {
-        Self {
-            writer: Arc::new(Mutex::new(writer)),
-            app_proxy: None,
-        }
-    }
-
     pub fn from_arc(writer: Arc<Mutex<Box<dyn Write + Send>>>) -> Self {
         Self { writer, app_proxy: None }
     }

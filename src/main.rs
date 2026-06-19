@@ -9,7 +9,6 @@ mod cross_window_drag;
 mod event_listener;
 mod git;
 mod keybindings;
-mod pty;
 mod renderer;
 mod selection_classifier;
 mod session;
@@ -31,6 +30,7 @@ use winit::{
     event::{ElementState, WindowEvent, MouseButton, MouseScrollDelta},
     event_loop::EventLoop,
     keyboard::Key,
+    window::CursorGrabMode,
 };
 
 fn get_login_shell() -> String {
@@ -94,6 +94,9 @@ struct Tab {
     git_status_check_at: std::time::Instant,
     is_running: bool,
     last_exit_code: Option<i32>,
+    /// Cursor blink phase index, reset on activity. Per-tab so that
+    /// popped-out windows can blink independently of the main window.
+    last_blink_index: u64,
 }
 
 /// Cached git status for a single tab. Populated by a background thread.
@@ -151,6 +154,7 @@ fn create_new_tab(
         git_status_check_at: std::time::Instant::now(),
         is_running: false,
         last_exit_code: None,
+        last_blink_index: 0,
     })
 }
 
@@ -158,109 +162,703 @@ fn get_padding_top(_tab_count: usize) -> f32 {
     48.0
 }
 
-/// Returns true if the cursor is more than 8px outside the window's
-/// outer bounds. `mouse_x`/`mouse_y` are in window-local logical pixels.
-fn mouse_outside_window(window: &winit::window::Window, mx: f64, my: f64) -> bool {
-    const SLACK_PX: f64 = 8.0;
-    let scale = window.scale_factor();
-    let pos = match window.outer_position() {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let size = window.outer_size();
-    let sx = (pos.x as f64) + mx * scale;
-    let sy = (pos.y as f64) + my * scale;
-    sx < (pos.x as f64) - SLACK_PX * scale
-        || sy < (pos.y as f64) - SLACK_PX * scale
-        || sx > (pos.x as f64 + size.width as f64) + SLACK_PX * scale
-        || sy > (pos.y as f64 + size.height as f64) + SLACK_PX * scale
+fn cursor_outside_tab_area(mx: f64, my: f64, vw: f64, vh: f64) -> bool {
+    mx < 0.0 || mx >= vw || my < 0.0 || my >= vh || my >= 80.0
 }
 
 fn handle_popped_out_event(
     window_id: winit::window::WindowId,
     event: WindowEvent,
     popped: &mut std::collections::HashMap<winit::window::WindowId, window_context::WindowContext>,
-    _config: &Config,
-    _proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+    config: &Config,
+    proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+    main_window_id: winit::window::WindowId,
+    main_tabs: &mut Vec<crate::Tab>,
+    main_active_tab_index: &mut usize,
+    main_shell_cols: &mut usize,
+    main_shell_rows: &mut usize,
+    main_cell_width: f32,
+    main_cell_height: f32,
+    main_window: &winit::window::Window,
+    hovered_window: &mut Option<winit::window::WindowId>,
+    pending_new_window_from_drag: &mut bool,
+    main_mouse_x: f64,
+    shell: &str,
 ) {
-    let Some(wc) = popped.get_mut(&window_id) else { return; };
-
     match event {
         WindowEvent::CloseRequested => {
             popped.remove(&window_id);
         }
+        WindowEvent::CursorEntered { .. } => {
+            *hovered_window = Some(window_id);
+        }
+        WindowEvent::CursorLeft { .. } => {
+            if *hovered_window == Some(window_id) {
+                *hovered_window = None;
+            }
+            // If the cursor left the window while dragging a tab into
+            // cross_window_drag, create a new window immediately.
+            if let Some(wc) = popped.get_mut(&window_id) {
+                if wc.dragging_tab.is_some() && cross_window_drag::is_active() {
+                    wc.dragging_tab = None;
+                    wc.drag_threshold_passed = false;
+                    wc.pending_pop_out = None;
+                    *pending_new_window_from_drag = true;
+                    {
+                        let mut r = wc.renderer.lock();
+                        r.set_dirty(true);
+                        r.grid_dirty = true;
+                    }
+                    wc.window.request_redraw();
+                }
+            }
+        }
+        WindowEvent::CursorMoved { position, .. } => {
+            let Some(wc) = popped.get_mut(&window_id) else { return; };
+            wc.drag_current_x = position.x;
+            wc.drag_current_y = position.y;
+
+            let old_hover_close = wc.hover_close;
+            let old_hover_max = wc.hover_max;
+            let old_hover_min = wc.hover_min;
+            let old_hover_settings = wc.hover_settings;
+            let old_hovered_tab = wc.hovered_tab_index;
+            let old_hovered_close = wc.hovered_close_tab_index;
+            let old_hover_new = wc.hover_new_tab;
+
+            let (vw, vh) = {
+                let r = wc.renderer.lock();
+                (r.config.width as f64, r.config.height as f64)
+            };
+
+            wc.hover_close = position.y >= 6.0 && position.y <= 34.0 && position.x >= (vw - 36.0) && position.x < (vw - 8.0);
+            wc.hover_max = position.y >= 6.0 && position.y <= 34.0 && position.x >= (vw - 68.0) && position.x < (vw - 40.0);
+            wc.hover_min = position.y >= 6.0 && position.y <= 34.0 && position.x >= (vw - 100.0) && position.x < (vw - 72.0);
+            wc.hover_settings = position.y >= 6.0 && position.y <= 34.0 && position.x >= (vw - 137.0) && position.x < (vw - 109.0);
+
+            wc.hovered_tab_index = None;
+            wc.hovered_close_tab_index = None;
+            wc.hover_new_tab = false;
+
+            if position.y >= 0.0 && position.y <= 40.0 {
+                let tab_start_x = 36.0;
+                let path_center_x = vw / 2.0;
+                let tab_area_max_x = path_center_x - 40.0;
+                let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                let tabs_len = wc.tabs.len();
+                let tab_width = if tabs_len > 0 {
+                    (tab_area_width / tabs_len as f64).clamp(80.0, 160.0)
+                } else {
+                    160.0
+                };
+
+                let tabs_total_width = tabs_len as f64 * tab_width;
+                if position.x >= tab_start_x && position.x < tab_start_x + tabs_total_width {
+                    let idx = ((position.x - tab_start_x) / tab_width) as usize;
+                    if idx < tabs_len {
+                        wc.hovered_tab_index = Some(idx);
+                        
+                        let tab_x = tab_start_x + idx as f64 * tab_width;
+                        let close_x = tab_x + tab_width - 30.0;
+                        let close_min_x = close_x - 4.0;
+                        let close_max_x = close_x + 20.0;
+                        let close_min_y = 8.0;
+                        let close_max_y = 32.0;
+                        if position.x >= close_min_x && position.x <= close_max_x
+                            && position.y >= close_min_y && position.y <= close_max_y
+                        {
+                            wc.hovered_close_tab_index = Some(idx);
+                        }
+                    }
+                } else {
+                    let new_tab_x = tab_start_x + tabs_total_width;
+                    if position.x >= new_tab_x && position.x < new_tab_x + 32.0 {
+                        wc.hover_new_tab = true;
+                    }
+                }
+            }
+
+            if wc.hover_close != old_hover_close
+                || wc.hover_max != old_hover_max
+                || wc.hover_min != old_hover_min
+                || wc.hover_settings != old_hover_settings
+                || wc.hovered_tab_index != old_hovered_tab
+                || wc.hovered_close_tab_index != old_hovered_close
+                || wc.hover_new_tab != old_hover_new
+            {
+                wc.renderer.lock().set_dirty(true);
+                wc.window.request_redraw();
+            }
+
+            // Window resizing cursor icon setting
+            let is_dragging_anything = wc.dragging_tab.is_some() || wc.tabs.get(wc.active_tab_index).map(|t| t.is_dragging || t.selection_start_pos.is_some()).unwrap_or(false);
+            const RESIZE_BORDER_WIDTH: f64 = 8.0;
+            if !is_dragging_anything {
+                if let Some(dir) = get_resize_direction(position.x, position.y, vw, vh, RESIZE_BORDER_WIDTH) {
+                    wc.window.set_cursor(resize_direction_to_cursor(dir));
+                } else {
+                    let padding_top = get_padding_top(wc.tabs.len()) as f64;
+                    if position.y >= padding_top {
+                        wc.window.set_cursor(winit::window::CursorIcon::Text);
+                    } else {
+                        wc.window.set_cursor(winit::window::CursorIcon::Default);
+                    }
+                }
+            }
+
+            if let Some(drag_idx) = wc.dragging_tab {
+                if !wc.drag_threshold_passed && ((position.x - wc.drag_start_x).abs() > 5.0 || (position.y - wc.drag_start_y).abs() > 5.0) {
+                    wc.drag_threshold_passed = true;
+                }
+                if wc.drag_threshold_passed {
+                    // On Linux (X11/Wayland), an implicit pointer grab keeps
+                    // CursorMoved events flowing with out-of-bounds coordinates
+                    // while the mouse button is held. Track when the cursor has
+                    // physically left so the MouseInput release handler treats
+                    // it as a drop outside.
+                    let cursor_outside_window =
+                        position.x < 0.0 || position.x >= vw
+                        || position.y < 0.0 || position.y >= vh;
+                    if cursor_outside_window && *hovered_window == Some(window_id) {
+                        *hovered_window = None;
+                    } else if !cursor_outside_window && hovered_window.is_none() {
+                        *hovered_window = Some(window_id);
+                    }
+
+                    if cursor_outside_window {
+                        if wc.pending_pop_out.is_none() && wc.tabs.len() >= 2 {
+                            wc.pending_pop_out = Some(drag_idx);
+                            let tab = wc.tabs.remove(drag_idx);
+                            *cross_window_drag::DRAG.lock() = Some(cross_window_drag::CrossWindowDrag {
+                                source_window_id: window_id,
+                                tab,
+                            });
+                            if wc.active_tab_index >= wc.tabs.len() && !wc.tabs.is_empty() {
+                                wc.active_tab_index = wc.tabs.len() - 1;
+                            }
+                            let (cols, rows) = resize_all_tabs(&wc.tabs, wc.window.inner_size().width, wc.window.inner_size().height, wc.cell_width, wc.cell_height);
+                            wc.shell_cols = cols;
+                            wc.shell_rows = rows;
+                        }
+                        if cross_window_drag::is_active() {
+                            wc.dragging_tab = None;
+                            wc.drag_threshold_passed = false;
+                            wc.pending_pop_out = None;
+                            let _ = wc.window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                            *pending_new_window_from_drag = true;
+                        }
+                    } else if cursor_outside_tab_area(position.x, position.y, vw, vh) {
+                        if wc.pending_pop_out.is_none() && wc.tabs.len() >= 2 {
+                            wc.pending_pop_out = Some(drag_idx);
+                            let tab = wc.tabs.remove(drag_idx);
+                            *cross_window_drag::DRAG.lock() = Some(cross_window_drag::CrossWindowDrag {
+                                source_window_id: window_id,
+                                tab,
+                            });
+                            if wc.active_tab_index >= wc.tabs.len() && !wc.tabs.is_empty() {
+                                wc.active_tab_index = wc.tabs.len() - 1;
+                            }
+                            let (cols, rows) = resize_all_tabs(&wc.tabs, wc.window.inner_size().width, wc.window.inner_size().height, wc.cell_width, wc.cell_height);
+                            wc.shell_cols = cols;
+                            wc.shell_rows = rows;
+                        }
+                    } else {
+                        // Dragged back inside
+                        if let Some(original_idx) = wc.pending_pop_out.take() {
+                            if let Some(drag) = cross_window_drag::take() {
+                                let insert_idx = original_idx.min(wc.tabs.len());
+                                wc.tabs.insert(insert_idx, drag.tab);
+                                wc.active_tab_index = insert_idx;
+                                let (cols, rows) = resize_all_tabs(&wc.tabs, wc.window.inner_size().width, wc.window.inner_size().height, wc.cell_width, wc.cell_height);
+                                wc.shell_cols = cols;
+                                wc.shell_rows = rows;
+                            }
+                        }
+                    }
+                    wc.renderer.lock().set_dirty(true);
+                    wc.window.request_redraw();
+                }
+            } else {
+                if cross_window_drag::is_active() && *hovered_window == Some(window_id) {
+                    wc.window.request_redraw();
+                }
+            }
+        }
+        WindowEvent::MouseInput { state, button, .. } => {
+            use winit::event::ElementState;
+            use winit::event::MouseButton;
+
+            if state == ElementState::Pressed && button == MouseButton::Left {
+                let Some(wc) = popped.get_mut(&window_id) else { return; };
+                let vw = wc.window.inner_size().width as f64;
+                let vh = wc.window.inner_size().height as f64;
+                const RESIZE_BORDER_WIDTH: f64 = 8.0;
+                if let Some(dir) = get_resize_direction(wc.drag_current_x, wc.drag_current_y, vw, vh, RESIZE_BORDER_WIDTH) {
+                    let _ = wc.window.drag_resize_window(dir);
+                    return;
+                }
+
+                if wc.drag_current_y <= 40.0 {
+                    if wc.hover_close {
+                        popped.remove(&window_id);
+                        return;
+                    } else if wc.hover_max {
+                        let is_max = wc.window.is_maximized();
+                        wc.window.set_maximized(!is_max);
+                        return;
+                    } else if wc.hover_min {
+                        wc.window.set_minimized(true);
+                        return;
+                    }
+
+                    let tab_start_x = 36.0;
+                    let path_center_x = vw / 2.0;
+                    let tab_area_max_x = path_center_x - 40.0;
+                    let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                    let tabs_len = wc.tabs.len();
+                    let tab_width = if tabs_len > 0 {
+                        (tab_area_width / tabs_len as f64).clamp(80.0, 160.0)
+                    } else {
+                        160.0
+                    };
+
+                    let tabs_total_width = tabs_len as f64 * tab_width;
+                    if wc.drag_current_x >= tab_start_x && wc.drag_current_x < tab_start_x + tabs_total_width {
+                        let clicked_tab_idx = ((wc.drag_current_x - tab_start_x) / tab_width) as usize;
+                        if clicked_tab_idx < tabs_len {
+                            let tab_x = tab_start_x + clicked_tab_idx as f64 * tab_width;
+                            let close_x = tab_x + tab_width - 30.0;
+                            let close_min_x = close_x - 4.0;
+                            let close_max_x = close_x + 20.0;
+                            let close_min_y = 8.0;
+                            let close_max_y = 32.0;
+                            let is_close_click = wc.drag_current_x >= close_min_x && wc.drag_current_x <= close_max_x
+                                && wc.drag_current_y >= close_min_y && wc.drag_current_y <= close_max_y;
+
+                            if is_close_click {
+                                wc.tabs.remove(clicked_tab_idx);
+                                if wc.tabs.is_empty() {
+                                    popped.remove(&window_id);
+                                    return;
+                                }
+                                if wc.active_tab_index >= wc.tabs.len() {
+                                    wc.active_tab_index = wc.tabs.len() - 1;
+                                }
+                                let (cols, rows) = resize_all_tabs(&wc.tabs, wc.window.inner_size().width, wc.window.inner_size().height, wc.cell_width, wc.cell_height);
+                                wc.shell_cols = cols;
+                                wc.shell_rows = rows;
+                            } else {
+                                wc.dragging_tab = Some(clicked_tab_idx);
+                                wc.drag_start_x = wc.drag_current_x;
+                                wc.drag_start_y = wc.drag_current_y;
+                                wc.drag_tab_offset = wc.drag_current_x - tab_x;
+                                wc.drag_threshold_passed = false;
+                                let _ = wc.window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                            }
+                            wc.renderer.lock().set_dirty(true);
+                            wc.window.request_redraw();
+                            return;
+                        }
+                    }
+
+                    // Check new tab button click
+                    let new_tab_x = tab_start_x + tabs_total_width;
+                    if wc.drag_current_x >= new_tab_x && wc.drag_current_x < new_tab_x + 32.0 {
+                        let new_tab_count = wc.tabs.len() + 1;
+                        let padding_top = get_padding_top(new_tab_count);
+                        let physical_size = wc.window.inner_size();
+                        const PADDING_LEFT: f32 = 10.0;
+                        let new_cols = (((physical_size.width as f32 - PADDING_LEFT * 2.0) / wc.cell_width).floor().max(1.0)) as usize;
+                        let new_rows = (((physical_size.height as f32 - (padding_top + get_padding_bottom())) / wc.cell_height).floor().max(1.0)) as usize;
+                        
+                        match create_new_tab(
+                            shell,
+                            &[],
+                            None,
+                            config.scrollback,
+                            config.font.clone(),
+                            wc.cell_width,
+                            wc.cell_height,
+                            new_cols,
+                            new_rows,
+                            proxy.clone(),
+                        ) {
+                            Ok(new_tab) => {
+                                wc.tabs.push(new_tab);
+                                wc.active_tab_index = wc.tabs.len() - 1;
+                                wc.shell_cols = new_cols;
+                                wc.shell_rows = new_rows;
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to create new tab in popped window: {:?}", e);
+                            }
+                        }
+                        wc.renderer.lock().set_dirty(true);
+                        wc.renderer.lock().grid_dirty = true;
+                        wc.window.request_redraw();
+                        return;
+                    }
+
+                    // Otherwise (blank space click), drag the window
+                    if wc.drag_current_x < (vw - 141.0) {
+                        let now = std::time::Instant::now();
+                        let is_double_click = if let Some(last_time) = wc.last_click_time {
+                            now.duration_since(last_time) < std::time::Duration::from_millis(300)
+                        } else {
+                            false
+                        };
+                        wc.last_click_time = Some(now);
+
+                        if is_double_click {
+                            let is_max = wc.window.is_maximized();
+                            wc.window.set_maximized(!is_max);
+                        } else {
+                            let _ = wc.window.drag_window();
+                        }
+                    }
+                }
+            } else if state == ElementState::Released && button == MouseButton::Left {
+                // To avoid E0499 double-mutable-borrow of `popped`, we scope the access to `wc`
+                let (drag_idx, vw, _vh, drag_threshold_passed) = {
+                    let Some(wc) = popped.get_mut(&window_id) else { return; };
+                    let drag_idx = wc.dragging_tab;
+                    let vw = wc.window.inner_size().width as f64;
+                    let vh = wc.window.inner_size().height as f64;
+                    let drag_threshold_passed = wc.drag_threshold_passed;
+                    
+                    wc.pending_pop_out = None;
+                    wc.dragging_tab = None;
+                    wc.drag_threshold_passed = false;
+
+                    (drag_idx, vw, vh, drag_threshold_passed)
+                };
+
+                if let Some(drag_idx_val) = drag_idx {
+                    if let Some(target_win) = *hovered_window {
+                        // Take the tab from cross_window_drag, or remove it
+                        // from the source window's tabs.
+                        let tab_opt = cross_window_drag::take().map(|d| d.tab).or_else(|| {
+                            let wc = popped.get_mut(&window_id)?;
+                            if wc.tabs.len() >= 2 {
+                                Some(wc.tabs.remove(drag_idx_val))
+                            } else {
+                                None
+                            }
+                        });
+                        if target_win != window_id {
+                            if let Some(tab) = tab_opt {
+                                if target_win == main_window_id {
+                                    let tab_start_x = 36.0;
+                                    let target_vw = main_window.inner_size().width as f64;
+                                    let path_center_x = target_vw / 2.0;
+                                    let tab_area_max_x = path_center_x - 40.0;
+                                    let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                                    let tabs_len = main_tabs.len() + 1;
+                                    let tab_width = (tab_area_width / tabs_len as f64).clamp(80.0, 160.0);
+                                    let insert_idx = compute_drop_target(main_mouse_x, tab_start_x, tab_width, tabs_len);
+                                    main_tabs.insert(insert_idx, tab);
+                                    *main_active_tab_index = insert_idx;
+                                    let (cols, rows) = resize_all_tabs(main_tabs, main_window.inner_size().width, main_window.inner_size().height, main_cell_width, main_cell_height);
+                                    *main_shell_cols = cols;
+                                    *main_shell_rows = rows;
+                                    main_window.request_redraw();
+                                } else if let Some(target_wc) = popped.get_mut(&target_win) {
+                                    let tab_start_x = 36.0;
+                                    let target_vw = target_wc.window.inner_size().width as f64;
+                                    let path_center_x = target_vw / 2.0;
+                                    let tab_area_max_x = path_center_x - 40.0;
+                                    let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                                    let tabs_len = target_wc.tabs.len() + 1;
+                                    let tab_width = (tab_area_width / tabs_len as f64).clamp(80.0, 160.0);
+                                    let insert_idx = compute_drop_target(target_wc.drag_current_x, tab_start_x, tab_width, tabs_len);
+                                    
+                                    target_wc.tabs.insert(insert_idx, tab);
+                                    target_wc.active_tab_index = insert_idx;
+                                    let (cols, rows) = resize_all_tabs(&target_wc.tabs, target_wc.window.inner_size().width, target_wc.window.inner_size().height, target_wc.cell_width, target_wc.cell_height);
+                                    target_wc.shell_cols = cols;
+                                    target_wc.shell_rows = rows;
+                                    target_wc.renderer.lock().set_dirty(true);
+                                    target_wc.window.request_redraw();
+                                }
+                            }
+                        } else {
+                            // Dropped on itself
+                            let Some(wc) = popped.get_mut(&window_id) else { return; };
+                            if let Some(tab) = tab_opt {
+                                let tab_start_x = 36.0;
+                                let path_center_x = vw / 2.0;
+                                let tab_area_max_x = path_center_x - 40.0;
+                                let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                                let tabs_len = wc.tabs.len() + 1;
+                                let tab_width = (tab_area_width / tabs_len as f64).clamp(80.0, 160.0);
+                                let target = compute_drop_target(wc.drag_current_x, tab_start_x, tab_width, tabs_len);
+                                let target_idx = target.min(wc.tabs.len());
+                                wc.tabs.insert(target_idx, tab);
+                                wc.active_tab_index = target_idx;
+                                let (cols, rows) = resize_all_tabs(&wc.tabs, wc.window.inner_size().width, wc.window.inner_size().height, wc.cell_width, wc.cell_height);
+                                wc.shell_cols = cols;
+                                wc.shell_rows = rows;
+                            } else if drag_threshold_passed {
+                                let tab_start_x = 36.0;
+                                let path_center_x = vw / 2.0;
+                                let tab_area_max_x = path_center_x - 40.0;
+                                let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                                let tabs_len = wc.tabs.len();
+                                let tab_width = (tab_area_width / tabs_len as f64).clamp(80.0, 160.0);
+                                let target = compute_drop_target(wc.drag_current_x, tab_start_x, tab_width, tabs_len);
+                                if target != drag_idx_val {
+                                    let tab = wc.tabs.remove(drag_idx_val);
+                                    wc.tabs.insert(target, tab);
+                                    wc.active_tab_index = target;
+                                    let (cols, rows) = resize_all_tabs(&wc.tabs, wc.window.inner_size().width, wc.window.inner_size().height, wc.cell_width, wc.cell_height);
+                                    wc.shell_cols = cols;
+                                    wc.shell_rows = rows;
+                                }
+                            } else {
+                                wc.active_tab_index = drag_idx_val;
+                            }
+                        }
+                    } else if cross_window_drag::is_active() {
+                        // Cursor left the window — create a new window
+                        *pending_new_window_from_drag = true;
+                    } else if !drag_threshold_passed {
+                        let Some(wc) = popped.get_mut(&window_id) else { return; };
+                        wc.active_tab_index = drag_idx_val;
+                    }
+                }
+
+                // If source window is empty, clean it up. Otherwise redraw it.
+                if let Some(wc) = popped.get_mut(&window_id) {
+                    if wc.tabs.is_empty() {
+                        popped.remove(&window_id);
+                        return;
+                    }
+                    let (cols, rows) = resize_all_tabs(&wc.tabs, wc.window.inner_size().width, wc.window.inner_size().height, wc.cell_width, wc.cell_height);
+                    wc.shell_cols = cols;
+                    wc.shell_rows = rows;
+                    wc.renderer.lock().set_dirty(true);
+                    wc.window.request_redraw();
+                }
+            }
+        }
         WindowEvent::Resized(size) => {
+            let Some(wc) = popped.get_mut(&window_id) else { return; };
             wc.renderer.lock().resize(size.width, size.height);
-            let term = wc.tabs[0].terminal_state.lock();
-            let cols = (size.width as f32 / wc.cell_width).floor().max(1.0) as usize;
-            let rows = (size.height as f32 / (wc.cell_height + 30.0 + 20.0)).floor().max(1.0) as usize;
-            drop(term);
-            wc.tabs[0].terminal_state.lock().resize(cols.max(80), rows.max(24));
+            let (cols, rows) = resize_all_tabs(&wc.tabs, size.width, size.height, wc.cell_width, wc.cell_height);
             wc.shell_cols = cols;
             wc.shell_rows = rows;
             wc.window.request_redraw();
         }
         WindowEvent::ScaleFactorChanged { .. } => {
+            let Some(wc) = popped.get_mut(&window_id) else { return; };
             wc.window.request_redraw();
         }
         WindowEvent::KeyboardInput { event, .. } => {
             use winit::event::ElementState;
-            if event.state == ElementState::Pressed {
-                if let Some(text) = &event.text {
-                    let bytes = text.as_bytes();
-                    if !bytes.is_empty() {
-                        let _ = wc.tabs[0].terminal_state.lock().write_to_pty(bytes);
+            let Some(wc) = popped.get_mut(&window_id) else { return; };
+            let active_idx = wc.active_tab_index.min(wc.tabs.len().saturating_sub(1));
+            if let Some(tab) = wc.tabs.get_mut(active_idx) {
+                if event.state == ElementState::Pressed {
+                    if let Some(text) = &event.text {
+                        let bytes = text.as_bytes();
+                        if !bytes.is_empty() {
+                            let _ = tab.terminal_state.lock().write_to_pty(bytes);
+                        }
                     }
-                }
-                use winit::keyboard::{Key, NamedKey};
-                let key = &event.logical_key;
-                let bytes: Option<Vec<u8>> = match key {
-                    Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
-                    Key::Named(NamedKey::Backspace) => Some(vec![0x7f]),
-                    Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
-                    Key::Named(NamedKey::Escape) => Some(b"\x1b".to_vec()),
-                    Key::Named(NamedKey::ArrowUp) => Some(b"\x1b[A".to_vec()),
-                    Key::Named(NamedKey::ArrowDown) => Some(b"\x1b[B".to_vec()),
-                    Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),
-                    Key::Named(NamedKey::ArrowLeft) => Some(b"\x1b[D".to_vec()),
-                    Key::Named(NamedKey::Home) => Some(b"\x1b[H".to_vec()),
-                    Key::Named(NamedKey::End) => Some(b"\x1b[F".to_vec()),
-                    Key::Named(NamedKey::Delete) => Some(b"\x1b[3~".to_vec()),
-                    Key::Named(NamedKey::PageUp) => Some(b"\x1b[5~".to_vec()),
-                    Key::Named(NamedKey::PageDown) => Some(b"\x1b[6~".to_vec()),
-                    _ => None,
-                };
-                if let Some(b) = bytes {
-                    let _ = wc.tabs[0].terminal_state.lock().write_to_pty(&b);
+                    use winit::keyboard::{Key, NamedKey};
+                    let key = &event.logical_key;
+                    let bytes: Option<Vec<u8>> = match key {
+                        Key::Named(NamedKey::Enter) => Some(b"\r".to_vec()),
+                        Key::Named(NamedKey::Backspace) => Some(vec![0x7f]),
+                        Key::Named(NamedKey::Tab) => Some(b"\t".to_vec()),
+                        Key::Named(NamedKey::Escape) => Some(b"\x1b".to_vec()),
+                        Key::Named(NamedKey::ArrowUp) => Some(b"\x1b[A".to_vec()),
+                        Key::Named(NamedKey::ArrowDown) => Some(b"\x1b[B".to_vec()),
+                        Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C".to_vec()),
+                        Key::Named(NamedKey::ArrowLeft) => Some(b"\x1b[D".to_vec()),
+                        Key::Named(NamedKey::Home) => Some(b"\x1b[H".to_vec()),
+                        Key::Named(NamedKey::End) => Some(b"\x1b[F".to_vec()),
+                        Key::Named(NamedKey::Delete) => Some(b"\x1b[3~".to_vec()),
+                        Key::Named(NamedKey::PageUp) => Some(b"\x1b[5~".to_vec()),
+                        Key::Named(NamedKey::PageDown) => Some(b"\x1b[6~".to_vec()),
+                        _ => None,
+                    };
+                    if let Some(b) = bytes {
+                        let _ = tab.terminal_state.lock().write_to_pty(&b);
+                    }
                 }
             }
             wc.window.request_redraw();
         }
         WindowEvent::MouseWheel { delta, .. } => {
             use winit::event::MouseScrollDelta;
-            let lines: i32 = match delta {
-                MouseScrollDelta::LineDelta(_, y) => -(y as i32),
-                MouseScrollDelta::PixelDelta(p) => -(p.y / 20.0) as i32,
-            };
-            if lines != 0 {
-                let abs = lines.unsigned_abs() as u8;
-                let byte = if lines > 0 { b'A' } else { b'B' };
-                let bytes = vec![0x1b, b'[', b'6' - (abs - 1) + (byte - b'A'), b'~'];
-                let _ = wc.tabs[0].terminal_state.lock().write_to_pty(&bytes);
+            let Some(wc) = popped.get_mut(&window_id) else { return; };
+            let active_idx = wc.active_tab_index.min(wc.tabs.len().saturating_sub(1));
+            if let Some(tab) = wc.tabs.get_mut(active_idx) {
+                let lines: i32 = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => -(y as i32),
+                    MouseScrollDelta::PixelDelta(p) => -(p.y / 20.0) as i32,
+                };
+                if lines != 0 {
+                    let abs = lines.unsigned_abs() as u8;
+                    let byte = if lines > 0 { b'A' } else { b'B' };
+                    let bytes = vec![0x1b, b'[', b'6' - (abs - 1) + (byte - b'A'), b'~'];
+                    let _ = tab.terminal_state.lock().write_to_pty(&bytes);
+                }
             }
             wc.window.request_redraw();
         }
         WindowEvent::RedrawRequested => {
-            // TODO: render call. The 77-arg signature is brittle to maintain
-            // in isolation; refactor `Renderer::render` to take a `RenderInputs`
-            // struct, then call from here with minimal inputs.
-            let _ = wc;
+            let Some(wc) = popped.get_mut(&window_id) else { return; };
+            let active_idx = wc.active_tab_index.min(wc.tabs.len().saturating_sub(1));
+            if let Some(tab) = wc.tabs.get(active_idx) {
+                let mut tab_titles = Vec::new();
+                let mut active_tab_path = "fasty".to_string();
+                for (idx, t) in wc.tabs.iter().enumerate() {
+                    let title = if let Some(ref name) = t.custom_name {
+                        name.clone()
+                    } else {
+                        let shell_pid = t.terminal_state.lock().shell_pid();
+                        let agent = detect_tui_agent(shell_pid);
+                        if let Some(ref agent_name) = agent {
+                            let path_str = if let Some(pid) = t.terminal_state.lock().shell_pid() {
+                                get_current_dir_shortened(pid)
+                            } else {
+                                None
+                            };
+                            let path_component = path_str.as_ref()
+                                .map(|p| get_last_path_component(p))
+                                .unwrap_or_else(|| "fasty".to_string());
+                            format!("{} - {}", agent_name, path_component)
+                        } else {
+                            let path_str = if let Some(pid) = t.terminal_state.lock().shell_pid() {
+                                get_current_dir_shortened(pid)
+                            } else {
+                                None
+                            };
+                            if let Some(ref path) = path_str {
+                                get_last_path_component(path)
+                            } else {
+                                "bash".to_string()
+                            }
+                        }
+                    };
+                    
+                    if idx == active_idx {
+                        let path_str = if let Some(pid) = t.terminal_state.lock().shell_pid() {
+                            get_current_dir_shortened(pid)
+                        } else {
+                            None
+                        };
+                        if let Some(ref path) = path_str {
+                            active_tab_path = path.clone();
+                        } else {
+                            active_tab_path = "bash".to_string();
+                        }
+                    }
+                    tab_titles.push(title);
+                }
+
+                let tab_running_states: Vec<bool> = wc.tabs.iter().map(|t| t.is_running).collect();
+                let tab_exit_codes: Vec<Option<i32>> = wc.tabs.iter().map(|t| t.last_exit_code).collect();
+
+                // Extract cwd info BEFORE acquiring the long-held terminal
+                // lock for rendering — avoids same-thread deadlock on
+                // parking_lot::Mutex (which is non-reentrant).
+                let active_tab_cwd = tab.terminal_state.lock()
+                    .shell_pid()
+                    .and_then(|pid| std::fs::read_link(format!("/proc/{}/cwd", pid)).ok())
+                    .or_else(|| tab.cwd.clone());
+                let active_tab_git = tab.git_status.clone();
+
+                let (v_width, v_height) = {
+                    let r_lock = wc.renderer.lock();
+                    (r_lock.config.width as f64, r_lock.config.height as f32)
+                };
+
+                let term = tab.terminal_state.lock();
+                let max_history = term.history_size() as f32;
+                let visible_rows = wc.shell_rows as f32;
+                let term_ref: &crate::terminal_state::TerminalState = &*term;
+
+                let (computed_bar_y, computed_bar_h) = poll_and_layout_bar(
+                    &mut wc.bar_layout,
+                    active_tab_cwd.as_deref(),
+                    active_tab_git.as_ref(),
+                    config.opacity,
+                    v_width as f32,
+                    v_height,
+                );
+
+                // Compute drop target for target window
+                let adopting_drag = cross_window_drag::is_active() && *hovered_window == Some(window_id);
+                let (dragging_tab_val, drop_target_val) = if adopting_drag {
+                    let tab_start_x = 36.0;
+                    let path_center_x = v_width / 2.0;
+                    let tab_area_max_x = path_center_x - 40.0;
+                    let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                    let tabs_len = wc.tabs.len() + 1;
+                    let tab_width = (tab_area_width / tabs_len as f64).clamp(80.0, 160.0);
+                    let target = compute_drop_target(wc.drag_current_x, tab_start_x, tab_width, tabs_len);
+                    (Some(wc.tabs.len()), Some(target))
+                } else if wc.drag_threshold_passed {
+                    wc.dragging_tab.map(|_| {
+                        let tab_start_x = 36.0;
+                        let path_center_x = v_width / 2.0;
+                        let tab_area_max_x = path_center_x - 40.0;
+                        let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                        let tabs_len = wc.tabs.len();
+                        let tab_width = if tabs_len > 0 {
+                            (tab_area_width / tabs_len as f64).clamp(80.0, 160.0)
+                        } else {
+                            160.0
+                        };
+                        compute_drop_target(wc.drag_current_x, tab_start_x, tab_width, tabs_len)
+                    }).map(|t| (wc.dragging_tab, Some(t))).unwrap_or((wc.dragging_tab, None))
+                } else {
+                    (wc.dragging_tab, None)
+                };
+
+                let inputs = renderer::RenderInputs {
+                    ligatures: config.font.ligatures,
+                    scroll_current: tab.scroll_current,
+                    history_size: max_history,
+                    visible_rows,
+                    selection: tab.selection,
+                    active_tab_index: active_idx,
+                    tab_titles: &tab_titles,
+                    tab_running_states: &tab_running_states,
+                    tab_exit_codes: &tab_exit_codes,
+                    active_tab_path: &active_tab_path,
+                    dragging_tab: dragging_tab_val,
+                    drag_current_x: wc.drag_current_x as f32,
+                    drag_tab_offset: wc.drag_tab_offset as f32,
+                    drop_target_idx: drop_target_val,
+                    git_status: tab.git_status.as_ref(),
+                    opacity: config.opacity,
+                    hover_close: wc.hover_close,
+                    hover_max: wc.hover_max,
+                    hover_min: wc.hover_min,
+                    hover_settings: wc.hover_settings,
+                    hovered_tab_index: wc.hovered_tab_index,
+                    hovered_close_tab_index: wc.hovered_close_tab_index,
+                    hover_new_tab: wc.hover_new_tab,
+                    bar_segments: &wc.bar_layout.laid_out,
+                    bar_y: computed_bar_y,
+                    bar_h: computed_bar_h,
+                    ..renderer::RenderInputs::default()
+                };
+
+                let mut r = wc.renderer.lock();
+                r.set_dirty(true);
+                r.grid_dirty = true;
+                r.render(renderer::RenderReason::GridChanged, term_ref, tab.cursor_visible, inputs);
+            }
         }
-        _ => {
-            wc.window.request_redraw();
-        }
+        _ => {}
     }
 }
+
 
 fn build_bar_layout(config: &Config) -> widgets::BarLayout {
     if config.bottombar.widgets.is_empty() {
@@ -384,24 +982,6 @@ enum CommandAction {
     RenameTab,
 }
 
-fn palette_label(action: CommandAction) -> &'static str {
-    match action {
-        CommandAction::NewTab => "New Tab",
-        CommandAction::CloseTab => "Close Tab",
-        CommandAction::NewWindow => "New Window",
-        CommandAction::NextTab => "Next Tab",
-        CommandAction::PrevTab => "Previous Tab",
-        CommandAction::OpenSettings => "Open Settings",
-        CommandAction::OpenSearch => "Open Search",
-        CommandAction::ReloadConfig => "Reload Config",
-        CommandAction::IncreaseFontSize => "Increase Font Size",
-        CommandAction::DecreaseFontSize => "Decrease Font Size",
-        CommandAction::ResetFontSize => "Reset Font Size",
-        CommandAction::SnapToBottom => "Snap to Bottom",
-        CommandAction::RenameTab => "Rename Tab",
-    }
-}
-
 fn build_palette_commands() -> Vec<(String, CommandAction)> {
     let mut cmds = Vec::new();
     cmds.extend(vec![
@@ -476,12 +1056,6 @@ fn compute_drop_target(
     remaining
 }
 
-macro_rules! dispatch_palette_action {
-    ($self:ident, $a:expr) => {{
-        // Stub — actual dispatch happens inline below in the run() closure.
-    }};
-}
-
 fn resize_all_tabs(
     tabs: &[Tab],
     width: u32,
@@ -532,12 +1106,6 @@ fn shorten_path(path: &std::path::Path) -> String {
         }
     }
     path_str
-}
-
-fn basename_of(path: &std::path::Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 fn tail_n(path: &std::path::Path, n: usize) -> String {
@@ -843,7 +1411,6 @@ fn detect_git_status(cwd: &std::path::Path) -> Option<GitStatus> {
         ahead,
         behind,
         last_commit_summary,
-        checked_at: std::time::Instant::now(),
     })
 }
 
@@ -911,7 +1478,6 @@ fn detect_git_status(cwd: &std::path::Path) -> Option<GitStatus> {
 
     Some(GitStatus {
         branch, modified, staged, untracked, ahead, behind, last_commit_summary,
-        checked_at: std::time::Instant::now(),
     })
 }
 
@@ -1104,12 +1670,18 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     let mut active_tab_index = 0usize;
+    let mut hovered_window: Option<winit::window::WindowId> = None;
+    let mut pending_new_window_from_drag = false;
 
     let mut pending_pop_out: Option<usize> = None;
     let mut popped_out_windows: std::collections::HashMap<
         winit::window::WindowId,
         window_context::WindowContext,
     > = std::collections::HashMap::new();
+    // Windows saved in the session that should be re-spawned as popped-out
+    // windows. We can't create them here (no `ActiveEventLoop` yet) so we
+    // process the queue in `AboutToWait`.
+    let mut pending_session_windows: Vec<session::WindowSession> = Vec::new();
 
     const BB_H: f32 = 20.0;
     let mut bar_layout = build_bar_layout(&config);
@@ -1118,7 +1690,16 @@ fn main() -> anyhow::Result<()> {
     let mut tabs = if config.session_restore && fasty_args.command.is_none() {
         match session::load() {
             Some(s) if !s.windows.is_empty() => {
-                let first_window = &s.windows[s.active_window.min(s.windows.len() - 1)];
+                let active_idx = s.active_window.min(s.windows.len() - 1);
+                let first_window = &s.windows[active_idx];
+                if let Some((x, y)) = first_window.position {
+                    let _ = window_arc.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                }
+                if let Some((w, h)) = first_window.size {
+                    if w > 0 && h > 0 {
+                        let _ = window_arc.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+                    }
+                }
                 let mut restored = Vec::new();
                 for tab_info in &first_window.tabs {
                     let tab_cwd = tab_info.cwd.as_ref().and_then(|p| p.to_str());
@@ -1128,6 +1709,14 @@ fn main() -> anyhow::Result<()> {
                     ) {
                         Ok(t) => restored.push(t),
                         Err(e) => tracing::warn!("session: failed to restore tab: {e:?}"),
+                    }
+                }
+                // Queue the other windows regardless of whether the first window
+                // had recoverable tabs, so a partial failure on window 0 doesn't
+                // drop the rest of the saved session.
+                for (i, w) in s.windows.iter().enumerate() {
+                    if i != active_idx {
+                        pending_session_windows.push(w.clone());
                     }
                 }
                 if !restored.is_empty() {
@@ -1204,17 +1793,11 @@ fn main() -> anyhow::Result<()> {
     let mut bell_flash_time: Option<std::time::Instant> = None;
     let mut last_command_duration: Option<(u128, Option<i32>)> = None;
     let mut last_command_duration_display_time: Option<std::time::Instant> = None;
-    let mut hover_tooltip: Option<(String, std::time::Instant)> = None;
-    const TOOLTIP_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
-    const COMMAND_DURATION_DISPLAY: std::time::Duration = std::time::Duration::from_secs(5);
-    const BELL_FLASH_DURATION: std::time::Duration = std::time::Duration::from_millis(150);
-    const HOVER_DETECT_PADDING: f64 = 2.0;
 
     // Scroll momentum
     let mut scroll_velocity: f32 = 0.0;
     const SCROLL_DECELERATION: f32 = 0.88;
     const SCROLL_SNAP_THRESHOLD: f32 = 0.3;
-    const SCROLL_MAX_VELOCITY: f32 = 15.0;
 
     // Hover states for main window topbar buttons
     let mut hover_close = false;
@@ -1227,6 +1810,7 @@ fn main() -> anyhow::Result<()> {
     let mut hover_new_tab = false;
     let mut dragging_tab: Option<usize> = None;
     let mut drag_start_x: f64 = 0.0;
+    let mut drag_start_y: f64 = 0.0;
     let mut drag_tab_offset: f64 = 0.0;
     let mut drag_current_x: f64 = 0.0;
     let mut drag_threshold_passed = false;
@@ -1254,7 +1838,7 @@ fn main() -> anyhow::Result<()> {
     let mut settings_theme = String::new();
     let mut s_hover_theme = false;
     let mut settings_hovered_theme_idx: Option<usize> = None;
-    let mut themes_list = config::all_theme_names();
+    let themes_list = config::all_theme_names();
     
     let mut s_hover_close = false;
     let mut s_hover_family = false;
@@ -1291,7 +1875,6 @@ fn main() -> anyhow::Result<()> {
     // text reflow when cols change, so we collapse N resize events into 1.
     let mut pending_term_resize: Option<(usize, usize)> = None;
     let mut last_render_time = std::time::Instant::now();
-    let mut detected_tui_agent: Option<String> = None;
     let mut last_tui_title: Option<String> = None;
     let mut last_blink_index = 0;
     let mut next_render_reason = RenderReason::GridChanged;
@@ -1367,7 +1950,7 @@ fn main() -> anyhow::Result<()> {
                     for wc in popped_out_windows.values() {
                         let saved_tabs: Vec<session::TabInfo> = wc.tabs.iter().map(|t| {
                             session::TabInfo {
-                                cwd: t.cwd.clone(),
+                                cwd: tab_live_cwd(t).or_else(|| t.cwd.clone()),
                                 custom_name: t.custom_name.clone(),
                                 title_override: t.title_override.clone(),
                             }
@@ -1583,6 +2166,18 @@ fn main() -> anyhow::Result<()> {
                             &mut popped_out_windows,
                             &config,
                             proxy.clone(),
+                            window_for_redraw.id(),
+                            &mut tabs,
+                            &mut active_tab_index,
+                            &mut shell_cols,
+                            &mut shell_rows,
+                            cell_width,
+                            cell_height,
+                            &window_for_redraw,
+                            &mut hovered_window,
+                            &mut pending_new_window_from_drag,
+                            current_mouse_x,
+                            &shell,
                         );
                         return;
                     }
@@ -1728,7 +2323,6 @@ fn main() -> anyhow::Result<()> {
                                 };
                                 if new_title != last_tui_title {
                                     last_tui_title = new_title.clone();
-                                    detected_tui_agent = new_agent;
                                     if let Some(ref t) = new_title {
                                         window_for_redraw.set_title(t);
                                     }
@@ -1813,7 +2407,6 @@ fn main() -> anyhow::Result<()> {
                             r.update_completed = completed;
                             r.hover_update = hover_update;
                             r.set_dirty(true);
-                            let win_width = r.config.width as f32;
                             let palette_filtered: Vec<String> = if command_palette_visible {
                                 compute_palette_filtered(&palette_commands, &command_palette_query)
                             } else {
@@ -1838,85 +2431,94 @@ fn main() -> anyhow::Result<()> {
                                 Vec::new()
                             };
 
-                            r.render(
-                                next_render_reason,
-                                term_ref,
-                                active_tab.cursor_visible,
-                                config.font.ligatures,
+                            let inputs = renderer::RenderInputs {
+                                ligatures: config.font.ligatures,
                                 scrollbar_alpha,
-                                active_tab.scroll_current,
-                                max_history,
-                                shell_rows as f32,
+                                scroll_current: active_tab.scroll_current,
+                                history_size: max_history,
+                                visible_rows: shell_rows as f32,
                                 hover_close,
                                 hover_max,
                                 hover_min,
                                 hover_settings,
                                 last_activity_time_secs,
                                 current_time,
-                                active_tab.selection,
-                                active_tab.hovered_url,
-                                active_tab.hovered_hyperlink.as_deref(),
-                                &active_tab.search_matches,
-                                active_tab.search_current_idx,
-                                active_tab.search_visible,
-                                &active_tab.search_query,
-                                config.font.size,
-                                toast.as_ref().map(|(msg, t, d)| (msg.as_str(), *t, *d)),
+                                selection: active_tab.selection,
+                                hovered_url: active_tab.hovered_url,
+                                hovered_hyperlink: active_tab.hovered_hyperlink.as_deref(),
+                                search_matches: &active_tab.search_matches,
+                                search_current_idx: active_tab.search_current_idx,
+                                search_visible: active_tab.search_visible,
+                                search_query_render: &active_tab.search_query,
+                                terminal_font_size: config.font.size,
+                                toast: toast.as_ref().map(|(msg, t, d)| (msg.as_str(), *t, *d)),
                                 active_tab_index,
-                                &tab_titles,
-                                &tab_running_states,
-                                &tab_exit_codes,
-                                &active_tab_path,
+                                tab_titles: &tab_titles,
+                                tab_running_states: &tab_running_states,
+                                tab_exit_codes: &tab_exit_codes,
+                                active_tab_path: &active_tab_path,
                                 context_menu_visible,
                                 context_menu_is_about,
-                                context_menu_x as f32,
-                                context_menu_y as f32,
+                                context_menu_x: context_menu_x as f32,
+                                context_menu_y: context_menu_y as f32,
                                 context_menu_hovered_idx,
                                 context_menu_open_time_secs,
-                                &context_menu_items,
+                                context_menu_items: &context_menu_items,
                                 hovered_tab_index,
                                 hovered_close_tab_index,
                                 hover_new_tab,
                                 command_palette_visible,
-                                &command_palette_query,
+                                command_palette_query: &command_palette_query,
                                 command_palette_selected,
-                                &palette_filtered,
+                                command_palette_filtered: &palette_filtered,
                                 command_palette_scroll,
-                                dragging_tab,
-                                drag_current_x as f32,
-                                drop_target_idx,
+                                dragging_tab: if cross_window_drag::is_active() && hovered_window == Some(window_for_redraw.id()) { Some(tabs.len()) } else { dragging_tab },
+                                drag_current_x: drag_current_x as f32,
+                                drag_tab_offset: drag_tab_offset as f32,
+                                drop_target_idx: if cross_window_drag::is_active() && hovered_window == Some(window_for_redraw.id()) {
+                                    let tab_start_x = 36.0;
+                                    let path_center_x = (window_for_redraw.inner_size().width as f64) / 2.0;
+                                    let tab_area_max_x = path_center_x - 40.0;
+                                    let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                                    let tabs_len = tabs.len() + 1;
+                                    let tab_width = (tab_area_width / tabs_len as f64).clamp(80.0, 160.0);
+                                    Some(compute_drop_target(current_mouse_x, tab_start_x, tab_width, tabs_len))
+                                } else {
+                                    drop_target_idx
+                                },
                                 tab_ctx_visible,
-                                tab_ctx_x as f32,
-                                tab_ctx_y as f32,
+                                tab_ctx_x: tab_ctx_x as f32,
+                                tab_ctx_y: tab_ctx_y as f32,
                                 tab_ctx_hovered,
                                 renaming_tab,
-                                &rename_buffer,
+                                rename_buffer: &rename_buffer,
                                 rename_cursor,
-                                active_tab.git_status.as_ref(),
-                                &bar_layout.laid_out,
+                                git_status: active_tab.git_status.as_ref(),
+                                bar_segments: &bar_layout.laid_out,
                                 bar_y,
                                 bar_h,
                                 ssh_picker_visible,
-                                &ssh_picker_query,
+                                ssh_picker_query: &ssh_picker_query,
                                 ssh_picker_selected,
-                                &ssh_filtered,
+                                ssh_filtered: &ssh_filtered,
                                 project_jumper_visible,
-                                &project_jumper_query,
+                                project_jumper_query: &project_jumper_query,
                                 project_jumper_selected,
-                                &project_filtered,
+                                project_filtered: &project_filtered,
                                 worktree_picker_visible,
-                                &worktree_picker_query,
+                                worktree_picker_query: &worktree_picker_query,
                                 worktree_picker_selected,
-                                &worktree_filtered,
+                                worktree_filtered: &worktree_filtered,
                                 bell_flash_elapsed_ms,
                                 last_command_duration_ms,
                                 command_duration_display_secs,
-                                command_exit_code,
-                                current_mouse_x as f32,
-                                current_mouse_y as f32,
-                                active_tab.hovered_url_text.as_deref(),
-                                config.opacity,
-                            );
+                                exit_code: command_exit_code,
+                                current_mouse_x: current_mouse_x as f32,
+                                current_mouse_y: current_mouse_y as f32,
+                                hovered_url_text: active_tab.hovered_url_text.as_deref(),
+                                opacity: config.opacity,
+                            };
+                            r.render(next_render_reason, term_ref, active_tab.cursor_visible, inputs);
                             drop(r);
 
                             #[cfg(target_os = "windows")]
@@ -2030,7 +2632,7 @@ fn main() -> anyhow::Result<()> {
                                 return;
                             }
 
-                            if let Some(renaming_idx) = renaming_tab {
+                            if renaming_tab.is_some() {
                                 use winit::keyboard::NamedKey;
                                 match &event.logical_key {
                                     Key::Named(NamedKey::Enter) => {
@@ -3780,12 +4382,15 @@ fn main() -> anyhow::Result<()> {
                                                      let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
                                                      shell_cols = cols;
                                                      shell_rows = rows;
-                                                 } else {
-                                                     dragging_tab = Some(clicked_tab_idx);
-                                                     drag_start_x = current_mouse_x;
-                                                     drag_tab_offset = current_mouse_x - tab_x;
-                                                     drag_threshold_passed = false;
-                                                 }
+                                                  } else {
+                                                      dragging_tab = Some(clicked_tab_idx);
+                                                      drag_start_x = current_mouse_x;
+                                                      drag_start_y = current_mouse_y;
+                                                      drag_tab_offset = current_mouse_x - tab_x;
+                                                      drag_threshold_passed = false;
+                                                      // Do not confine the cursor so dragging it out can trigger window pop-out.
+                                                      let _ = window_for_redraw.set_cursor_grab(CursorGrabMode::None);
+                                                  }
                                                  let mut r = renderer.lock();
                                                  r.set_dirty(true);
                                                  r.grid_dirty = true;
@@ -4042,40 +4647,96 @@ fn main() -> anyhow::Result<()> {
                                     is_dragging_scrollbar = false;
 
                                     if let Some(drag_idx) = dragging_tab {
-                                        if drag_threshold_passed {
-                                            let r = renderer.lock();
-                                            let v_width = r.config.width as f64;
-                                            drop(r);
-                                            let tab_start_x = 36.0;
-                                            let path_center_x = v_width / 2.0;
-                                            let tab_area_max_x = path_center_x - 40.0;
-                                            let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
-                                            let tabs_len = tabs.len();
-                                            let tab_width = if tabs_len > 0 {
-                                                (tab_area_width / tabs_len as f64).clamp(80.0, 160.0)
+                                        let _ = window_for_redraw.set_cursor_grab(CursorGrabMode::None);
+
+                                        let vw = renderer.lock().config.width as f64;
+
+                                        pending_pop_out = None;
+
+                                        if let Some(target_win) = hovered_window {
+                                            if target_win != window_for_redraw.id() {
+                                                // Dropped on another window!
+                                                let tab_opt = cross_window_drag::take().map(|d| d.tab).or_else(|| {
+                                                    if tabs.len() >= 2 {
+                                                        Some(tabs.remove(drag_idx))
+                                                    } else {
+                                                        None
+                                                    }
+                                                });
+
+                                                if let Some(tab) = tab_opt {
+                                                    if let Some(target_wc) = popped_out_windows.get_mut(&target_win) {
+                                                        let tab_start_x = 36.0;
+                                                        let target_vw = target_wc.window.inner_size().width as f64;
+                                                        let path_center_x = target_vw / 2.0;
+                                                        let tab_area_max_x = path_center_x - 40.0;
+                                                        let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                                                        let tabs_len = target_wc.tabs.len() + 1;
+                                                        let tab_width = (tab_area_width / tabs_len as f64).clamp(80.0, 160.0);
+                                                        let insert_idx = compute_drop_target(target_wc.drag_current_x, tab_start_x, tab_width, tabs_len);
+                                                        
+                                                        target_wc.tabs.insert(insert_idx, tab);
+                                                        target_wc.active_tab_index = insert_idx;
+                                                        let (cols, rows) = resize_all_tabs(&target_wc.tabs, target_wc.window.inner_size().width, target_wc.window.inner_size().height, target_wc.cell_width, target_wc.cell_height);
+                                                        target_wc.shell_cols = cols;
+                                                        target_wc.shell_rows = rows;
+                                                        target_wc.renderer.lock().set_dirty(true);
+                                                        target_wc.window.request_redraw();
+                                                    }
+                                                    
+                                                    if tabs.is_empty() {
+                                                        target.exit();
+                                                        return;
+                                                    }
+                                                    let physical_size = window_for_redraw.inner_size();
+                                                    let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                                                    shell_cols = cols;
+                                                    shell_rows = rows;
+                                                }
                                             } else {
-                                                160.0
-                                            };
-                                            let target = compute_drop_target(current_mouse_x, tab_start_x, tab_width, tabs_len);
-                                            let popped_out = mouse_outside_window(
-                                                &window_for_redraw,
-                                                current_mouse_x,
-                                                current_mouse_y,
-                                            );
-                                            if popped_out && tabs.len() >= 2 {
-                                                pending_pop_out = Some(drag_idx);
-                                            } else if target != drag_idx {
-                                                let tab = tabs.remove(drag_idx);
-                                                tabs.insert(target, tab);
-                                                active_tab_index = target;
-                                                let physical_size = window_for_redraw.inner_size();
-                                                let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
-                                                shell_cols = cols;
-                                                shell_rows = rows;
+                                                // Dropped on itself!
+                                                if let Some(drag) = cross_window_drag::take() {
+                                                    let tab_start_x = 36.0;
+                                                    let path_center_x = vw / 2.0;
+                                                    let tab_area_max_x = path_center_x - 40.0;
+                                                    let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                                                    let tabs_len = tabs.len() + 1;
+                                                    let tab_width = (tab_area_width / tabs_len as f64).clamp(80.0, 160.0);
+                                                    let target = compute_drop_target(current_mouse_x, tab_start_x, tab_width, tabs_len);
+                                                    let target_idx = target.min(tabs.len());
+                                                    tabs.insert(target_idx, drag.tab);
+                                                    active_tab_index = target_idx;
+                                                    let physical_size = window_for_redraw.inner_size();
+                                                    let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                                                    shell_cols = cols;
+                                                    shell_rows = rows;
+                                                } else if drag_threshold_passed {
+                                                    let tab_start_x = 36.0;
+                                                    let path_center_x = vw / 2.0;
+                                                    let tab_area_max_x = path_center_x - 40.0;
+                                                    let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                                                    let tabs_len = tabs.len();
+                                                    let tab_width = (tab_area_width / tabs_len as f64).clamp(80.0, 160.0);
+                                                    let target = compute_drop_target(current_mouse_x, tab_start_x, tab_width, tabs_len);
+                                                    if target != drag_idx {
+                                                        let tab = tabs.remove(drag_idx);
+                                                        tabs.insert(target, tab);
+                                                        active_tab_index = target;
+                                                        let physical_size = window_for_redraw.inner_size();
+                                                        let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                                                        shell_cols = cols;
+                                                        shell_rows = rows;
+                                                    }
+                                                } else {
+                                                    active_tab_index = drag_idx;
+                                                }
                                             }
-                                        } else {
+                                        } else if cross_window_drag::is_active() {
+                                            pending_new_window_from_drag = true;
+                                        } else if !drag_threshold_passed {
                                             active_tab_index = drag_idx;
                                         }
+
                                         dragging_tab = None;
                                         drag_threshold_passed = false;
                                         let mut r = renderer.lock();
@@ -4394,7 +5055,6 @@ fn main() -> anyhow::Result<()> {
                                 hover_update = false;
                             }
 
-                                let prev_hovered_tab = hovered_tab_index;
                                 hovered_tab_index = None;
                                 hovered_close_tab_index = None;
                                 hover_new_tab = false;
@@ -4450,12 +5110,85 @@ fn main() -> anyhow::Result<()> {
                                 app_dirty = true;
                             }
 
-                            if let Some(_drag_idx) = dragging_tab {
-                                if !drag_threshold_passed && (current_mouse_x - drag_start_x).abs() > 5.0 {
+                            if let Some(drag_idx) = dragging_tab {
+                                if !drag_threshold_passed && ((current_mouse_x - drag_start_x).abs() > 5.0 || (current_mouse_y - drag_start_y).abs() > 5.0) {
                                     drag_threshold_passed = true;
                                 }
                                 if drag_threshold_passed {
                                     drag_current_x = current_mouse_x;
+                                    let (vw, vh) = {
+                                        let r = renderer.lock();
+                                        (r.config.width as f64, r.config.height as f64)
+                                    };
+
+                                    // On Linux (X11/Wayland), an implicit pointer grab
+                                    // keeps CursorMoved events flowing with out-of-bounds
+                                    // coordinates while the mouse button is held. CursorLeft
+                                    // does NOT fire in this scenario. Track when the cursor
+                                    // has physically left the window so the MouseInput
+                                    // release handler treats it as a drop outside.
+                                    let cursor_outside_window =
+                                        current_mouse_x < 0.0 || current_mouse_x >= vw
+                                        || current_mouse_y < 0.0 || current_mouse_y >= vh;
+                                    if cursor_outside_window && hovered_window == Some(window_for_redraw.id()) {
+                                        hovered_window = None;
+                                    } else if !cursor_outside_window && hovered_window.is_none() {
+                                        // Cursor came back inside the window
+                                        hovered_window = Some(window_for_redraw.id());
+                                    }
+
+                                    if cursor_outside_window {
+                                        if pending_pop_out.is_none() && tabs.len() >= 2 {
+                                            pending_pop_out = Some(drag_idx);
+                                            let tab = tabs.remove(drag_idx);
+                                            *cross_window_drag::DRAG.lock() = Some(cross_window_drag::CrossWindowDrag {
+                                                source_window_id: window_for_redraw.id(),
+                                                tab,
+                                            });
+                                            if active_tab_index >= tabs.len() && !tabs.is_empty() {
+                                                active_tab_index = tabs.len() - 1;
+                                            }
+                                            let physical_size = window_for_redraw.inner_size();
+                                            let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                                            shell_cols = cols;
+                                            shell_rows = rows;
+                                        }
+                                        if cross_window_drag::is_active() {
+                                            dragging_tab = None;
+                                            drag_threshold_passed = false;
+                                            pending_pop_out = None;
+                                            let _ = window_for_redraw.set_cursor_grab(winit::window::CursorGrabMode::None);
+                                            pending_new_window_from_drag = true;
+                                        }
+                                    } else if cursor_outside_tab_area(current_mouse_x, current_mouse_y, vw, vh) {
+                                        if pending_pop_out.is_none() && tabs.len() >= 2 {
+                                            pending_pop_out = Some(drag_idx);
+                                            let tab = tabs.remove(drag_idx);
+                                            *cross_window_drag::DRAG.lock() = Some(cross_window_drag::CrossWindowDrag {
+                                                source_window_id: window_for_redraw.id(),
+                                                tab,
+                                            });
+                                            if active_tab_index >= tabs.len() && !tabs.is_empty() {
+                                                active_tab_index = tabs.len() - 1;
+                                            }
+                                            let physical_size = window_for_redraw.inner_size();
+                                            let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                                            shell_cols = cols;
+                                            shell_rows = rows;
+                                        }
+                                    } else {
+                                        if let Some(original_idx) = pending_pop_out.take() {
+                                            if let Some(drag) = cross_window_drag::take() {
+                                                let insert_idx = original_idx.min(tabs.len());
+                                                tabs.insert(insert_idx, drag.tab);
+                                                active_tab_index = insert_idx;
+                                                let physical_size = window_for_redraw.inner_size();
+                                                let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
+                                                shell_cols = cols;
+                                                shell_rows = rows;
+                                            }
+                                        }
+                                    }
                                     renderer.lock().set_dirty(true);
                                     app_dirty = true;
                                 }
@@ -4599,7 +5332,6 @@ fn main() -> anyhow::Result<()> {
                                 }
                             };
 
-                            let max_history = tabs[active_tab_index].terminal_state.lock().history_size() as f32;
                             let scroll_speed = 1.0f32;
 
                             let delta_scroll = match delta {
@@ -4658,6 +5390,30 @@ fn main() -> anyhow::Result<()> {
                         WindowEvent::CursorLeft { .. } => {
                             window_for_redraw.set_cursor(winit::window::CursorIcon::Default);
 
+                            // Update hovered_window tracking
+                            if hovered_window == Some(window_for_redraw.id()) {
+                                hovered_window = None;
+                            }
+
+                            // If we're mid-drag and the tab has been popped into
+                            // cross_window_drag, the user has dragged outside the
+                            // window.  Immediately create a new window — we will
+                            // never get a MouseInput::Released because the cursor
+                            // is no longer over this window.
+                            if dragging_tab.is_some() && cross_window_drag::is_active() {
+                                dragging_tab = None;
+                                drag_threshold_passed = false;
+                                pending_pop_out = None;
+                                let _ = window_for_redraw.set_cursor_grab(CursorGrabMode::None);
+                                pending_new_window_from_drag = true;
+                                {
+                                    let mut r = renderer.lock();
+                                    r.set_dirty(true);
+                                    r.grid_dirty = true;
+                                }
+                                app_dirty = true;
+                            }
+
                             let old_hover_close = hover_close;
                             let old_hover_max = hover_max;
                             let old_hover_min = hover_min;
@@ -4683,6 +5439,10 @@ fn main() -> anyhow::Result<()> {
                                 app_dirty = true;
                             }
                         }
+                        WindowEvent::CursorEntered { .. } => {
+                            hovered_window = Some(window_for_redraw.id());
+                        }
+
                         WindowEvent::Focused(focused) => {
                             window_focused = focused;
                             if !focused {
@@ -4699,6 +5459,26 @@ fn main() -> anyhow::Result<()> {
                                 hover_update = false;
                                 tabs[active_tab_index].is_dragging = false;
                                 is_dragging_scrollbar = false;
+
+                                // If focus is lost mid-drag, the release event may
+                                // never come. If the tab was already popped into
+                                // cross_window_drag (user dragged it out), create
+                                // a new window. Otherwise, cancel the gesture.
+                                if dragging_tab.is_some() {
+                                    if cross_window_drag::is_active() {
+                                        pending_new_window_from_drag = true;
+                                        {
+                                            let mut r = renderer.lock();
+                                            r.set_dirty(true);
+                                            r.grid_dirty = true;
+                                        }
+                                        app_dirty = true;
+                                    }
+                                    dragging_tab = None;
+                                    drag_threshold_passed = false;
+                                    pending_pop_out = None;
+                                    let _ = window_for_redraw.set_cursor_grab(CursorGrabMode::None);
+                                }
 
                                 ctrl_held = false;
                                 shift_held = false;
@@ -5118,50 +5898,205 @@ fn main() -> anyhow::Result<()> {
                             shell_cols = cols;
                             shell_rows = rows;
                         }
-                        let visible = !cfg!(target_os = "windows");
-                        let cursor_pos = current_mouse_x.max(0.0) as i32;
-                        let cursor_pos_y = current_mouse_y.max(0.0) as i32;
+                        // Main window's tab strip just lost one tab; force a redraw
+                        // so the user sees the tab disappear immediately.
+                        {
+                            let mut r = renderer.lock();
+                            r.set_dirty(true);
+                            r.grid_dirty = true;
+                        }
+                        window_for_redraw.request_redraw();
+
+                        *cross_window_drag::DRAG.lock() = Some(cross_window_drag::CrossWindowDrag {
+                            source_window_id: window_for_redraw.id(),
+                            tab,
+                        });
+                        pending_new_window_from_drag = true;
+                    }
+                }
+
+                if pending_new_window_from_drag {
+                    pending_new_window_from_drag = false;
+                    if let Some(drag) = cross_window_drag::take() {
+                        let tab = drag.tab;
+                        let source_id = drag.source_window_id;
+                        // Compute screen position: use the source window's outer
+                        // position + cursor offset. For the main window we use
+                        // `current_mouse_x/y`; for a popped-out window we use
+                        // its stored cursor position.
+                        let (sx, sy) = if source_id == window_for_redraw.id() {
+                            match window_for_redraw.outer_position() {
+                                Ok(p) => (
+                                    p.x + current_mouse_x.max(0.0) as i32,
+                                    p.y + current_mouse_y.max(0.0) as i32,
+                                ),
+                                Err(_) => (0, 0),
+                            }
+                        } else if let Some(src_wc) = popped_out_windows.get(&source_id) {
+                            match src_wc.window.outer_position() {
+                                Ok(p) => (
+                                    p.x + src_wc.drag_current_x.max(0.0) as i32,
+                                    p.y + src_wc.drag_current_y.max(0.0) as i32,
+                                ),
+                                Err(_) => (0, 0),
+                            }
+                        } else {
+                            (0, 0)
+                        };
                         let attrs = winit::window::WindowAttributes::default()
                             .with_title(tab.custom_name.as_deref().unwrap_or("fasty"))
                             .with_decorations(false)
                             .with_transparent(true)
-                            .with_visible(visible)
-                            .with_position(winit::dpi::PhysicalPosition::new(cursor_pos, cursor_pos_y))
+                            .with_visible(true)
+                            .with_position(winit::dpi::PhysicalPosition::new(sx, sy))
                             .with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0));
                         if let Ok(window) = target.create_window(attrs) {
                             let window_arc = Arc::new(window);
                             let w_ref: &winit::window::Window = &*window_arc;
                             let w_static: &'static winit::window::Window = unsafe { std::mem::transmute(w_ref) };
-                            let (shared_instance, shared_device, shared_queue, format, alpha_mode) = {
+                            let (shared_instance, shared_device, shared_queue, format, alpha_mode, cloned_atlas, cloned_ui_atlas) = {
                                 let r = renderer.lock();
-                                (r.instance.clone(), r.device.clone(), r.queue.clone(), r.config.format, r.config.alpha_mode)
+                                (
+                                    r.instance.clone(),
+                                    r.device.clone(),
+                                    r.queue.clone(),
+                                    r.config.format,
+                                    r.config.alpha_mode,
+                                    r.atlas.try_clone().ok(),
+                                    r.ui_atlas.try_clone().ok(),
+                                )
                             };
-                            if let Ok(r) = Renderer::new_shared(w_static, &config.font.family, config.font.size, shared_instance, shared_device, shared_queue, format, alpha_mode) {
+                            let r_result = if let (Some(a), Some(ui_a)) = (cloned_atlas, cloned_ui_atlas) {
+                                Renderer::new_shared_fast(w_static, shared_instance, shared_device, shared_queue, format, alpha_mode, a, ui_a)
+                            } else {
+                                Renderer::new_shared(w_static, &config.font.family, config.font.size, shared_instance, shared_device, shared_queue, format, alpha_mode)
+                            };
+                            if let Ok(r) = r_result {
                                 let (cols, rows) = resize_all_tabs(
                                     std::slice::from_ref(&tab),
                                     window_arc.inner_size().width,
                                     window_arc.inner_size().height,
                                     cell_width, cell_height,
                                 );
-                                let mut bar = widgets::BarLayout::new(vec![Box::new(
+                                let bar = widgets::BarLayout::new(vec![Box::new(
                                     widgets::builtin::git::GitWidget::new(widgets::Align::Left, None),
                                 )]);
-                                let _ = (cols, rows);
                                 let wc = window_context::WindowContext::new(
                                     window_arc,
                                     Arc::new(parking_lot::Mutex::new(r)),
                                     vec![tab],
                                     cell_width,
                                     cell_height,
-                                    shell_cols,
-                                    shell_rows,
+                                    cols,
+                                    rows,
                                     bar,
-                                    proxy.clone(),
                                 );
                                 let id = wc.window.id();
                                 popped_out_windows.insert(id, wc);
                                 if let Some(wc) = popped_out_windows.get(&id) {
+                                    #[cfg(target_os = "windows")]
+                                    wc.window.set_visible(true);
+                                    wc.window.focus_window();
+                                    let _ = wc.window.drag_window();
+                                    // Mark dirty and request redraw immediately so
+                                    // the first RedrawRequested renders full content.
+                                    // Skip present_blank() — it forces a GPU roundtrip
+                                    // for a blank frame the user never sees, adding
+                                    // visible latency.
+                                    {
+                                        let mut r = wc.renderer.lock();
+                                        r.set_dirty(true);
+                                        r.grid_dirty = true;
+                                    }
                                     wc.window.request_redraw();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Restore additional windows from the session file (Test 7).
+                // These are popped-out windows saved on the previous run. We
+                // create them in `AboutToWait` because we need an
+                // `ActiveEventLoop` to call `create_window`.
+                if !pending_session_windows.is_empty() {
+                    let queue = std::mem::take(&mut pending_session_windows);
+                    for ws in queue {
+                        if ws.tabs.is_empty() {
+                            continue;
+                        }
+                        let mut restored_tabs = Vec::with_capacity(ws.tabs.len());
+                        for tab_info in &ws.tabs {
+                            let tab_cwd = tab_info.cwd.as_ref().and_then(|p| p.to_str());
+                            match create_new_tab(
+                                &shell, &[], tab_cwd, config.scrollback, config.font.clone(),
+                                cell_width, cell_height, shell_cols, shell_rows, proxy.clone(),
+                            ) {
+                                Ok(t) => restored_tabs.push(t),
+                                Err(e) => tracing::warn!("session: failed to restore tab: {e:?}"),
+                            }
+                        }
+                        if restored_tabs.is_empty() {
+                            continue;
+                        }
+                        let mut attrs = winit::window::WindowAttributes::default()
+                            .with_title("fasty")
+                            .with_decorations(false)
+                            .with_transparent(true)
+                            .with_visible(true);
+                        if let Some((x, y)) = ws.position {
+                            attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
+                        }
+                        if let Some((w, h)) = ws.size {
+                            if w > 0 && h > 0 {
+                                attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(w, h));
+                            } else {
+                                attrs = attrs.with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0));
+                            }
+                        } else {
+                            attrs = attrs.with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0));
+                        }
+                        if let Ok(window) = target.create_window(attrs) {
+                            let window_arc = Arc::new(window);
+                            let w_ref: &winit::window::Window = &*window_arc;
+                            let w_static: &'static winit::window::Window = unsafe { std::mem::transmute(w_ref) };
+                            let (shared_instance, shared_device, shared_queue, format, alpha_mode, cloned_atlas, cloned_ui_atlas) = {
+                                let r = renderer.lock();
+                                (
+                                    r.instance.clone(),
+                                    r.device.clone(),
+                                    r.queue.clone(),
+                                    r.config.format,
+                                    r.config.alpha_mode,
+                                    r.atlas.try_clone().ok(),
+                                    r.ui_atlas.try_clone().ok(),
+                                )
+                            };
+                            let r_result = if let (Some(a), Some(ui_a)) = (cloned_atlas, cloned_ui_atlas) {
+                                Renderer::new_shared_fast(w_static, shared_instance, shared_device, shared_queue, format, alpha_mode, a, ui_a)
+                            } else {
+                                Renderer::new_shared(w_static, &config.font.family, config.font.size, shared_instance, shared_device, shared_queue, format, alpha_mode)
+                            };
+                            if let Ok(r) = r_result {
+                                let bar = widgets::BarLayout::new(vec![Box::new(
+                                    widgets::builtin::git::GitWidget::new(widgets::Align::Left, None),
+                                )]);
+                                let wc = window_context::WindowContext::new(
+                                    window_arc,
+                                    Arc::new(parking_lot::Mutex::new(r)),
+                                    restored_tabs,
+                                    cell_width,
+                                    cell_height,
+                                    shell_cols,
+                                    shell_rows,
+                                    bar,
+                                );
+                                let id = wc.window.id();
+                                popped_out_windows.insert(id, wc);
+                                if let Some(wc) = popped_out_windows.get(&id) {
+                                    #[cfg(target_os = "windows")]
+                                    wc.window.set_visible(true);
+                                    wc.renderer.lock().present_blank();
                                 }
                             }
                         }
@@ -5296,85 +6231,94 @@ fn main() -> anyhow::Result<()> {
 
                     let mut r = renderer.lock();
                     r.set_dirty(true);
-                    r.render(
-                        next_render_reason,
-                        term_ref,
-                        active_tab.cursor_visible,
-                        config.font.ligatures,
+                    let inputs = renderer::RenderInputs {
+                        ligatures: config.font.ligatures,
                         scrollbar_alpha,
-                        active_tab.scroll_current,
-                        max_history,
-                        shell_rows as f32,
+                        scroll_current: active_tab.scroll_current,
+                        history_size: max_history,
+                        visible_rows: shell_rows as f32,
                         hover_close,
                         hover_max,
                         hover_min,
                         hover_settings,
                         last_activity_time_secs,
                         current_time,
-                        active_tab.selection,
-                        active_tab.hovered_url,
-                        active_tab.hovered_hyperlink.as_deref(),
-                        &active_tab.search_matches,
-                        active_tab.search_current_idx,
-                        active_tab.search_visible,
-                        &active_tab.search_query,
-                        config.font.size,
-                        toast.as_ref().map(|(msg, t, d)| (msg.as_str(), *t, *d)),
+                        selection: active_tab.selection,
+                        hovered_url: active_tab.hovered_url,
+                        hovered_hyperlink: active_tab.hovered_hyperlink.as_deref(),
+                        search_matches: &active_tab.search_matches,
+                        search_current_idx: active_tab.search_current_idx,
+                        search_visible: active_tab.search_visible,
+                        search_query_render: &active_tab.search_query,
+                        terminal_font_size: config.font.size,
+                        toast: toast.as_ref().map(|(msg, t, d)| (msg.as_str(), *t, *d)),
                         active_tab_index,
-                        &tab_titles,
-                        &tab_running_states,
-                        &tab_exit_codes,
-                        &active_tab_path,
+                        tab_titles: &tab_titles,
+                        tab_running_states: &tab_running_states,
+                        tab_exit_codes: &tab_exit_codes,
+                        active_tab_path: &active_tab_path,
                         context_menu_visible,
                         context_menu_is_about,
-                        context_menu_x as f32,
-                        context_menu_y as f32,
+                        context_menu_x: context_menu_x as f32,
+                        context_menu_y: context_menu_y as f32,
                         context_menu_hovered_idx,
                         context_menu_open_time_secs,
-                        &context_menu_items,
+                        context_menu_items: &context_menu_items,
                         hovered_tab_index,
                         hovered_close_tab_index,
                         hover_new_tab,
                         command_palette_visible,
-                        &command_palette_query,
+                        command_palette_query: &command_palette_query,
                         command_palette_selected,
-                        &palette_filtered,
+                        command_palette_filtered: &palette_filtered,
                         command_palette_scroll,
-                        dragging_tab,
-                        drag_current_x as f32,
-                        drop_target_idx,
+                        dragging_tab: if cross_window_drag::is_active() && hovered_window == Some(window_for_redraw.id()) { Some(tabs.len()) } else { dragging_tab },
+                        drag_current_x: drag_current_x as f32,
+                        drag_tab_offset: drag_tab_offset as f32,
+                        drop_target_idx: if cross_window_drag::is_active() && hovered_window == Some(window_for_redraw.id()) {
+                            let tab_start_x = 36.0;
+                            let path_center_x = (window_for_redraw.inner_size().width as f64) / 2.0;
+                            let tab_area_max_x = path_center_x - 40.0;
+                            let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
+                            let tabs_len = tabs.len() + 1;
+                            let tab_width = (tab_area_width / tabs_len as f64).clamp(80.0, 160.0);
+                            Some(compute_drop_target(current_mouse_x, tab_start_x, tab_width, tabs_len))
+                        } else {
+                            drop_target_idx
+                        },
                         tab_ctx_visible,
-                        tab_ctx_x as f32,
-                        tab_ctx_y as f32,
+                        tab_ctx_x: tab_ctx_x as f32,
+                        tab_ctx_y: tab_ctx_y as f32,
                         tab_ctx_hovered,
                         renaming_tab,
-                        &rename_buffer,
+                        rename_buffer: &rename_buffer,
                         rename_cursor,
-                        active_tab.git_status.as_ref(),
-                        &bar_layout.laid_out,
+                        git_status: active_tab.git_status.as_ref(),
+                        bar_segments: &bar_layout.laid_out,
                         bar_y,
                         bar_h,
                         ssh_picker_visible,
-                        &ssh_picker_query,
+                        ssh_picker_query: &ssh_picker_query,
                         ssh_picker_selected,
-                        &ssh_filtered,
+                        ssh_filtered: &ssh_filtered,
                         project_jumper_visible,
-                        &project_jumper_query,
+                        project_jumper_query: &project_jumper_query,
                         project_jumper_selected,
-                        &project_filtered,
+                        project_filtered: &project_filtered,
                         worktree_picker_visible,
-                        &worktree_picker_query,
+                        worktree_picker_query: &worktree_picker_query,
                         worktree_picker_selected,
-                        &worktree_filtered,
+                        worktree_filtered: &worktree_filtered,
                         bell_flash_elapsed_ms,
                         last_command_duration_ms,
                         command_duration_display_secs,
-                        command_exit_code,
-                        current_mouse_x as f32,
-                        current_mouse_y as f32,
-                        active_tab.hovered_url_text.as_deref(),
-                        config.opacity,
-                    );
+                        exit_code: command_exit_code,
+                        current_mouse_x: current_mouse_x as f32,
+                        current_mouse_y: current_mouse_y as f32,
+                        hovered_url_text: active_tab.hovered_url_text.as_deref(),
+                        opacity: config.opacity,
+                    };
+                    r.render(next_render_reason, term_ref, active_tab.cursor_visible, inputs);
                     drop(r);
                     #[cfg(target_os = "windows")]
                     {
@@ -5459,6 +6403,67 @@ fn main() -> anyhow::Result<()> {
                         if idx == active_tab_index {
                             app_dirty = true;
                             renderer.lock().grid_dirty = true;
+                        }
+                    }
+                }
+
+                // Popped-out windows run their own PTY readers, so we
+                // must poll their render generations here (the main tab
+                // loop above only sees tabs in `tabs`). When a popped-out
+                // tab's terminal state changes, mark its renderer dirty
+                // and request a redraw so the new output is presented.
+                let mut popped_out_redraw_wakeup: Option<std::time::Instant> = None;
+                for wc in popped_out_windows.values_mut() {
+                    // Poll git status for popped-out tabs (throttled)
+                    let active_idx = wc.active_tab_index.min(wc.tabs.len().saturating_sub(1));
+                    for (tidx, tab) in wc.tabs.iter_mut().enumerate() {
+                        let throttle_ms: u128 = if tidx == active_idx { 1500 } else { 10000 };
+                        if now.duration_since(tab.git_status_check_at).as_millis() < throttle_ms {
+                            continue;
+                        }
+                        tab.git_status_check_at = now;
+                        let cwd = tab.terminal_state.lock().shell_pid()
+                            .and_then(|pid| std::fs::read_link(format!("/proc/{}/cwd", pid)).ok())
+                            .or_else(|| tab.cwd.clone());
+                        if let Some(dir) = cwd {
+                            tab.git_status = detect_git_status(&dir);
+                        }
+                    }
+
+                    // Sync render generation for the active tab
+                    if let Some(tab) = wc.tabs.get_mut(active_idx) {
+                        let last_rg = rg.load(Ordering::Relaxed);
+                        tab.terminal_state.lock().update_render_generation(&rg);
+                        let current_rg = rg.load(Ordering::Relaxed);
+                        if current_rg != last_rg {
+                            tab.last_activity_time = std::time::Instant::now();
+                            tab.cursor_visible = true;
+                            let mut r = wc.renderer.lock();
+                            r.set_dirty(true);
+                            r.grid_dirty = true;
+                            wc.window.request_redraw();
+                        }
+                        // Cursor blink: flip visibility and request redraw
+                        // every 500ms while the cursor is idle.
+                        let now_b = std::time::Instant::now();
+                        let activity_end = tab.last_activity_time + std::time::Duration::from_millis(500);
+                        if now_b >= activity_end {
+                            let idle_ms = now_b.duration_since(activity_end).as_millis();
+                            let blink_index: u64 = (idle_ms / 500) as u64;
+                            if blink_index > tab.last_blink_index {
+                                tab.last_blink_index = blink_index;
+                                tab.cursor_visible = !tab.cursor_visible;
+                                let mut r = wc.renderer.lock();
+                                r.set_dirty(true);
+                                wc.window.request_redraw();
+                            }
+                            let next_blink = activity_end
+                                + std::time::Duration::from_millis((blink_index + 1) * 500);
+                            match popped_out_redraw_wakeup {
+                                None => popped_out_redraw_wakeup = Some(next_blink),
+                                Some(t) if next_blink < t => popped_out_redraw_wakeup = Some(next_blink),
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -5593,12 +6598,21 @@ fn main() -> anyhow::Result<()> {
                                     next_wakeup = Some(fade_out_time);
                                 }
                             }
-                            
+
                             // Also wake up when it completely expires to clear the toast
                             let toast_expire_time = toast_start + std::time::Duration::from_millis(duration_ms);
                             if next_wakeup.is_none() || toast_expire_time < next_wakeup.unwrap() {
                                 next_wakeup = Some(toast_expire_time);
                             }
+                        }
+                    }
+
+                    // Popped-out windows: schedule a wakeup at the next
+                    // cursor-blink boundary so the loop ticks even when
+                    // the main window is idle.
+                    if let Some(t) = popped_out_redraw_wakeup {
+                        if next_wakeup.is_none() || t < next_wakeup.unwrap() {
+                            next_wakeup = Some(t);
                         }
                     }
                 }

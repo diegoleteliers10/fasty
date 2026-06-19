@@ -612,7 +612,7 @@ impl Pipeline {
         search_current_idx: usize,
         search_visible: bool,
         search_query_render: &str,
-        terminal_font_size: f32,
+        _terminal_font_size: f32,
         toast: Option<(&str, std::time::Instant, u64)>,
         active_tab_index: usize,
         tab_titles: &[String],
@@ -644,6 +644,7 @@ impl Pipeline {
         command_palette_scroll: usize,
         dragging_tab: Option<usize>,
         drag_current_x: f32,
+        drag_tab_offset: f32,
         drop_target_idx: Option<usize>,
         tab_ctx_visible: bool,
         tab_ctx_x: f32,
@@ -652,7 +653,7 @@ impl Pipeline {
         renaming_tab: Option<usize>,
         rename_buffer: &str,
         rename_cursor: usize,
-        git_status: Option<&crate::git::GitStatus>,
+        _git_status: Option<&crate::git::GitStatus>,
         bar_segments: &[crate::widgets::LaidOutWidget],
         bar_y: f32,
         bar_h: f32,
@@ -669,9 +670,9 @@ impl Pipeline {
         worktree_picker_selected: usize,
         worktree_filtered: &[String],
         bell_flash_elapsed_ms: Option<f32>,
-        last_command_duration_ms: Option<u128>,
-        command_duration_display_secs: Option<f32>,
-        exit_code: Option<i32>,
+        _last_command_duration_ms: Option<u128>,
+        _command_duration_display_secs: Option<f32>,
+        _exit_code: Option<i32>,
         current_mouse_x: f32,
         current_mouse_y: f32,
         hovered_url_text: Option<&str>,
@@ -1658,144 +1659,145 @@ impl Pipeline {
 
         let scale = 13.0f32 / atlas.font_size();
 
-        for (i, title) in tab_titles.iter().enumerate() {
-            let tab_x = tab_start_x + i as f32 * tab_width;
-            let is_active = i == active_tab_index;
-            let is_hovered = hovered_tab_index == Some(i);
+        macro_rules! draw_single_tab {
+            ($idx:expr, $title:expr, $tab_x_val:expr) => {{
+                let i = $idx;
+                let title = $title;
+                let tab_x = $tab_x_val;
+                let is_active = i == active_tab_index;
+                let is_hovered = hovered_tab_index == Some(i);
 
-            // Active tab bg uses theme_active_tab (slightly lighter than
-            // the rest of the topbar) so it reads as elevated/selected.
-            if is_active {
-                bg_instances.push(CellInstance::new(
-                    tab_x,
-                    0.0,
-                    tab_width,
-                    40.0,
-                    theme_active_tab,
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                ));
+                let is_dragged = Some(i) == dragging_tab;
+                let cursor_outside_tab = current_mouse_x < 0.0
+                    || current_mouse_x >= viewport_width
+                    || current_mouse_y < 0.0
+                    || current_mouse_y >= viewport_height
+                    || current_mouse_y >= 80.0;
+                let is_pop_out_pending = is_dragged && cursor_outside_tab && tab_titles.len() >= 2;
 
-                // Left border of active tab (subtle 1px vertical line)
-                bg_instances.push(CellInstance::new(
-                    tab_x,
-                    0.0,
-                    1.0,
-                    40.0,
-                    with_opacity([1.0, 1.0, 1.0, 0.12], chrome_alpha),
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                ));
-                // Right border of active tab (subtle 1px vertical line)
-                bg_instances.push(CellInstance::new(
-                    tab_x + tab_width,
-                    0.0,
-                    1.0,
-                    40.0,
-                    with_opacity([1.0, 1.0, 1.0, 0.12], chrome_alpha),
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                ));
-            }
+                let tab_alpha = if is_dragged && is_pop_out_pending {
+                    chrome_alpha * 0.4
+                } else {
+                    chrome_alpha
+                };
 
-            // Draw vertical separator (1px vertical line) between inactive tabs only (active tab is separated by its own borders)
-            if i + 1 < tab_titles.len() && i != active_tab_index && i + 1 != active_tab_index {
-                bg_instances.push(CellInstance::new(
-                    tab_x + tab_width,
-                    12.0,
-                    1.0,
-                    16.0,
-                    with_opacity([1.0, 1.0, 1.0, 0.05], chrome_alpha), // Very subtle separator
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                ));
-            }
-
-            let is_close_visible = is_active || is_hovered;
-            let max_w = tab_width - 28.0f32 - (if is_close_visible { 20.0f32 } else { 0.0f32 });
-            let display_title = title;
-
-            let mut truncated_title = String::new();
-            let mut current_w = 0.0f32;
-            for c in display_title.chars() {
-                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
-                    let w = entry.width * scale + 1.0;
-                    if current_w + w > max_w {
-                        break;
-                    }
-                    truncated_title.push(c);
-                    current_w += w;
-                }
-            }
-            if truncated_title.len() < display_title.len() {
-                while !truncated_title.is_empty() && current_w > max_w - 18.0 {
-                    if let Some(c) = truncated_title.pop() {
-                        if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
-                            current_w -= entry.width * scale + 1.0;
-                        }
-                    }
-                }
-                truncated_title.push_str("...");
-            }
-
-            let mut char_x = tab_x + 20.0f32;
-            let fg_color = if is_active {
-                with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha) // Active tab text (full opacity)
-            } else if is_hovered {
-                with_opacity([1.0, 1.0, 1.0, 0.70], chrome_alpha) // Hover tab text
-            } else {
-                with_opacity([1.0, 1.0, 1.0, 0.30], chrome_alpha) // Inactive tab text
-            };
-
-            let scaled_ascent = atlas.ascent() * scale;
-            let baseline_y = (40.0f32 - 13.0f32) / 2.0f32 + scaled_ascent;
-
-            for c in truncated_title.chars() {
-                if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
-                    let entry_w = entry.width * scale;
-                    let entry_h = entry.height * scale;
-                    let glyph_x = (char_x + entry.left * scale).round();
-                    let glyph_y = (baseline_y + entry.top * scale).round();
-
-                    let (aw, ah) = atlas.atlas_size();
-                    let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
-                    let uv_w = uv_end_x - uv_x;
-                    let uv_h = uv_end_y - uv_y;
-
-                    fg_instances.push(CellInstance::new(
-                        glyph_x,
-                        glyph_y,
-                        entry_w,
-                        entry_h,
-                        fg_color,
+                // Active tab bg uses theme_active_tab (slightly lighter than
+                // the rest of the topbar) so it reads as elevated/selected.
+                if is_active {
+                    bg_instances.push(CellInstance::new(
+                        tab_x,
+                        0.0,
+                        tab_width,
+                        40.0,
+                        theme_active_tab,
                         [0.0, 0.0, 0.0, 0.0],
-                        uv_x,
-                        uv_y,
-                        uv_w,
-                        uv_h,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
                         0.0,
                     ));
 
-                    if is_active {
-                        // Bold simulation
+                    // Left border of active tab (subtle 1px vertical line)
+                    bg_instances.push(CellInstance::new(
+                        tab_x,
+                        0.0,
+                        1.0,
+                        40.0,
+                        with_opacity([1.0, 1.0, 1.0, 0.12], tab_alpha),
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ));
+                    // Right border of active tab (subtle 1px vertical line)
+                    bg_instances.push(CellInstance::new(
+                        tab_x + tab_width,
+                        0.0,
+                        1.0,
+                        40.0,
+                        with_opacity([1.0, 1.0, 1.0, 0.12], tab_alpha),
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ));
+                }
+
+                // Draw vertical separator (1px vertical line) between inactive tabs only (active tab is separated by its own borders)
+                if i + 1 < tab_titles.len() && i != active_tab_index && i + 1 != active_tab_index {
+                    bg_instances.push(CellInstance::new(
+                        tab_x + tab_width,
+                        12.0,
+                        1.0,
+                        16.0,
+                        with_opacity([1.0, 1.0, 1.0, 0.05], tab_alpha), // Very subtle separator
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ));
+                }
+
+                let is_close_visible = is_active || is_hovered;
+                let max_w = tab_width - 28.0f32 - (if is_close_visible { 20.0f32 } else { 0.0f32 });
+                let display_title = title;
+
+                let mut truncated_title = String::new();
+                let mut current_w = 0.0f32;
+                for c in display_title.chars() {
+                    if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                        let w = entry.width * scale + 1.0;
+                        if current_w + w > max_w {
+                            break;
+                        }
+                        truncated_title.push(c);
+                        current_w += w;
+                    }
+                }
+                if truncated_title.len() < display_title.len() {
+                    while !truncated_title.is_empty() && current_w > max_w - 18.0 {
+                        if let Some(c) = truncated_title.pop() {
+                            if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                                current_w -= entry.width * scale + 1.0;
+                            }
+                        }
+                    }
+                    truncated_title.push_str("...");
+                }
+
+                let mut char_x = tab_x + 20.0f32;
+                let fg_color = if is_active {
+                    with_opacity([1.0, 1.0, 1.0, 1.0], tab_alpha) // Active tab text (full opacity)
+                } else if is_hovered {
+                    with_opacity([1.0, 1.0, 1.0, 0.70], tab_alpha) // Hover tab text
+                } else {
+                    with_opacity([1.0, 1.0, 1.0, 0.30], tab_alpha) // Inactive tab text
+                };
+
+                let scaled_ascent = atlas.ascent() * scale;
+                let baseline_y = (40.0f32 - 13.0f32) / 2.0f32 + scaled_ascent;
+
+                for c in truncated_title.chars() {
+                    if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                        let entry_w = entry.width * scale;
+                        let entry_h = entry.height * scale;
+                        let glyph_x = (char_x + entry.left * scale).round();
+                        let glyph_y = (baseline_y + entry.top * scale).round();
+
+                        let (aw, ah) = atlas.atlas_size();
+                        let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                        let uv_w = uv_end_x - uv_x;
+                        let uv_h = uv_end_y - uv_y;
+
                         fg_instances.push(CellInstance::new(
-                            glyph_x + 0.35,
+                            glyph_x,
                             glyph_y,
                             entry_w,
                             entry_h,
@@ -1807,106 +1809,154 @@ impl Pipeline {
                             uv_h,
                             0.0,
                         ));
-                    }
 
-                    char_x += entry.width * scale + 1.0;
+                        if is_active {
+                            // Bold simulation
+                            fg_instances.push(CellInstance::new(
+                                glyph_x + 0.35,
+                                glyph_y,
+                                entry_w,
+                                entry_h,
+                                fg_color,
+                                [0.0, 0.0, 0.0, 0.0],
+                                uv_x,
+                                uv_y,
+                                uv_w,
+                                uv_h,
+                                0.0,
+                            ));
+                        }
+
+                        char_x += entry.width * scale + 1.0;
+                    }
                 }
-            }
 
-            // Tab status indicator (spinner when running, exit code dot when finished)
-            let is_running = tab_running_states.get(i).copied().unwrap_or(false);
-            let exit_code = tab_exit_codes.get(i).copied().flatten();
-            let indicator_x = tab_x + 6.0;
-            let indicator_y = 18.0;
-            let indicator_r = 4.0;
+                // Tab status indicator (spinner when running, exit code dot when finished)
+                let is_running = tab_running_states.get(i).copied().unwrap_or(false);
+                let exit_code = tab_exit_codes.get(i).copied().flatten();
+                let indicator_x = tab_x + 6.0;
+                let indicator_y = 18.0;
+                let indicator_r = 4.0;
 
-            if is_running {
-                // Spinning dot (animated by time)
-                let angle = (current_time * 4.0) % (std::f32::consts::PI * 2.0);
-                let spin_x = indicator_x + angle.cos() * 2.0;
-                let spin_y = indicator_y + angle.sin() * 2.0;
-                bg_instances.push(CellInstance::new(
-                    spin_x,
-                    spin_y,
-                    indicator_r,
-                    indicator_r,
-                    [0.4, 0.7, 1.0, 0.8],
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
-                    indicator_r / 2.0,
-                ));
-            } else if let Some(code) = exit_code {
-                // Exit code dot: green for 0, red for non-zero
-                let color = if code == 0 {
-                    [0.35, 0.75, 0.35, 0.7]
-                } else {
-                    [0.85, 0.30, 0.30, 0.7]
-                };
-                bg_instances.push(CellInstance::new(
-                    indicator_x,
-                    indicator_y,
-                    indicator_r,
-                    indicator_r,
-                    color,
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0, 0.0, 1.0, 1.0,
-                    indicator_r / 2.0,
-                ));
-            }
-
-            // Tab Close Button U+00D7 (×) -> \u{2715} (✕)
-            if is_close_visible {
-                if let Some(entry) = &atlas.icon_close {
-                    let close_x = tab_x + tab_width - 30.0f32;
-                    let is_close_hovered = hovered_close_tab_index == Some(i);
-
-                    if is_close_hovered {
-                        // Subtle circle background rgba(255,255,255,0.10)
-                        bg_instances.push(CellInstance::new(
-                            close_x - 1.0,
-                            11.0,
-                            18.0,
-                            18.0,
-                            with_opacity([1.0, 1.0, 1.0, 0.10], chrome_alpha),
-                            [0.0, 0.0, 0.0, 0.0],
-                            0.0,
-                            0.0,
-                            1.0,
-                            1.0,
-                            9.0, // perfect circle
-                        ));
-                    }
-
-                    let entry_w = 12.0f32;
-                    let entry_h = 12.0f32;
-                    let cx = close_x + (16.0f32 - entry_w) / 2.0f32;
-                    let cy = (40.0f32 - entry_h) / 2.0f32;
-                    let (aw, ah) = atlas.atlas_size();
-                    let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
-                    let uv_w = uv_end_x - uv_x;
-                    let uv_h = uv_end_y - uv_y;
-
-                    let close_color = if is_close_hovered {
-                        with_opacity([1.0, 1.0, 1.0, 0.90], chrome_alpha)
-                    } else {
-                        with_opacity([1.0, 1.0, 1.0, 0.40], chrome_alpha)
-                    };
-
-                    fg_instances.push(CellInstance::new(
-                        cx,
-                        cy,
-                        entry_w,
-                        entry_h,
-                        close_color,
+                if is_running {
+                    // Spinning dot (animated by time)
+                    let angle = (current_time * 4.0) % (std::f32::consts::PI * 2.0);
+                    let spin_x = indicator_x + angle.cos() * 2.0;
+                    let spin_y = indicator_y + angle.sin() * 2.0;
+                    bg_instances.push(CellInstance::new(
+                        spin_x,
+                        spin_y,
+                        indicator_r,
+                        indicator_r,
+                        [0.4, 0.7, 1.0, 0.8],
                         [0.0, 0.0, 0.0, 0.0],
-                        uv_x,
-                        uv_y,
-                        uv_w,
-                        uv_h,
-                        0.0,
+                        0.0, 0.0, 1.0, 1.0,
+                        indicator_r / 2.0,
+                    ));
+                } else if let Some(code) = exit_code {
+                    // Exit code dot: green for 0, red for non-zero
+                    let color = if code == 0 {
+                        [0.35, 0.75, 0.35, 0.7]
+                    } else {
+                        [0.85, 0.30, 0.30, 0.7]
+                    };
+                    bg_instances.push(CellInstance::new(
+                        indicator_x,
+                        indicator_y,
+                        indicator_r,
+                        indicator_r,
+                        color,
+                        [0.0, 0.0, 0.0, 0.0],
+                        0.0, 0.0, 1.0, 1.0,
+                        indicator_r / 2.0,
                     ));
                 }
+
+                // Tab Close Button U+00D7 (×) -> \u{2715} (✕)
+                if is_close_visible {
+                    if let Some(entry) = &atlas.icon_close {
+                        let close_x = tab_x + tab_width - 30.0f32;
+                        let is_close_hovered = hovered_close_tab_index == Some(i);
+
+                        if is_close_hovered {
+                            // Subtle circle background rgba(255,255,255,0.10)
+                            bg_instances.push(CellInstance::new(
+                                close_x - 1.0,
+                                11.0,
+                                18.0,
+                                18.0,
+                                with_opacity([1.0, 1.0, 1.0, 0.10], tab_alpha),
+                                [0.0, 0.0, 0.0, 0.0],
+                                0.0,
+                                0.0,
+                                1.0,
+                                1.0,
+                                9.0, // perfect circle
+                            ));
+                        }
+
+                        let entry_w = 12.0f32;
+                        let entry_h = 12.0f32;
+                        let cx = close_x + (16.0f32 - entry_w) / 2.0f32;
+                        let cy = (40.0f32 - entry_h) / 2.0f32;
+                        let (aw, ah) = atlas.atlas_size();
+                        let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                        let uv_w = uv_end_x - uv_x;
+                        let uv_h = uv_end_y - uv_y;
+
+                        let close_color = if is_close_hovered {
+                            with_opacity([1.0, 1.0, 1.0, 0.90], tab_alpha)
+                        } else {
+                            with_opacity([1.0, 1.0, 1.0, 0.40], tab_alpha)
+                        };
+
+                        fg_instances.push(CellInstance::new(
+                            cx,
+                            cy,
+                            entry_w,
+                            entry_h,
+                            close_color,
+                            [0.0, 0.0, 0.0, 0.0],
+                            uv_x,
+                            uv_y,
+                            uv_w,
+                            uv_h,
+                            0.0,
+                        ));
+                    }
+                }
+            }};
+        }
+
+        let mut drag_tab_to_render = None;
+
+        for (i, title) in tab_titles.iter().enumerate() {
+            let is_dragged = Some(i) == dragging_tab;
+            if is_dragged {
+                let drag_x = (drag_current_x - drag_tab_offset)
+                    .max(tab_start_x)
+                    .min(tab_start_x + tab_area_width - tab_width);
+                drag_tab_to_render = Some((i, title, drag_x));
+                continue;
             }
+
+            let tab_x = if let (Some(drag_idx), Some(target_idx)) = (dragging_tab, drop_target_idx) {
+                if drag_idx < target_idx && i > drag_idx && i <= target_idx {
+                    tab_start_x + (i - 1) as f32 * tab_width
+                } else if drag_idx > target_idx && i < drag_idx && i >= target_idx {
+                    tab_start_x + (i + 1) as f32 * tab_width
+                } else {
+                    tab_start_x + i as f32 * tab_width
+                }
+            } else {
+                tab_start_x + i as f32 * tab_width
+            };
+
+            draw_single_tab!(i, title, tab_x);
+        }
+
+        if let Some((i, title, tab_x)) = drag_tab_to_render {
+            draw_single_tab!(i, title, tab_x);
         }
 
         // Draw New Tab Button (+)
@@ -3093,7 +3143,7 @@ impl Pipeline {
         }
 
         if command_palette_visible {
-            let mut palette_w = 500.0f32;
+            let palette_w = 500.0f32;
             let max_results = 8usize;
             let item_h = 22.0f32;
             let input_h = 28.0f32;

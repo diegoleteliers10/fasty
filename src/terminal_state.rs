@@ -15,6 +15,7 @@ use crate::config::FontConfig;
 use crate::event_listener::EventListenerProxy;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum AppEvent {
     Wakeup,
     Exit,
@@ -331,10 +332,6 @@ impl TerminalState {
         let _ = w.flush();
     }
 
-    pub fn mark_dirty(&self) {
-        self.render_generation.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub fn update_scrollback(&self, scrollback: usize) {
         let mut term = self.term.lock();
         term.grid_mut().update_history(scrollback.min(3000));
@@ -383,16 +380,6 @@ impl TerminalState {
 
     pub fn term(&self) -> &Arc<ParkingMutex<alacritty_terminal::term::Term<EventListenerProxy>>> {
         &self.term
-    }
-}
-
-/// Strip the OSC 7 prefix (`7;`) from a raw OSC payload, returning the remainder.
-/// Returns None if the payload does not start with `7;`.
-fn strip_osc7_prefix(buf: &[u8]) -> Option<&[u8]> {
-    if buf.len() >= 2 && buf[0] == b'7' && buf[1] == b';' {
-        Some(&buf[2..])
-    } else {
-        None
     }
 }
 

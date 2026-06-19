@@ -28,6 +28,7 @@ pub enum Align {
 
 /// Per-frame context handed to widgets on render and click.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct WidgetContext<'a> {
     pub active_tab_cwd: Option<&'a Path>,
     pub active_tab_git: Option<&'a GitStatus>,
@@ -36,6 +37,7 @@ pub struct WidgetContext<'a> {
 
 /// A run of glyphs with one color, optionally carrying a hover tooltip.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Segment {
     pub text: String,
     pub color: [f32; 4],
@@ -53,6 +55,7 @@ pub enum ClickAction {
 }
 
 /// A single bottombar widget.
+#[allow(dead_code)]
 pub trait Widget: Send {
     /// Stable id for hit-test, debug logs, and config `name` field.
     fn id(&self) -> &'static str;
@@ -92,6 +95,7 @@ impl Rect {
 
 /// Pre-laid-out widget data, fed into the renderer.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct LaidOutWidget {
     pub widget_index: usize,
     pub rect: Rect,
@@ -132,14 +136,4 @@ impl BarLayout {
             .iter()
             .position(|r| r.contains(x, y))
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.widgets.is_empty()
-    }
-}
-
-/// Build a `Box<dyn Widget>` from a config spec. Returns `None` on unknown
-/// widget type so the rest of the bar still renders.
-pub fn build(spec: &WidgetSpec) -> Option<Box<dyn Widget>> {
-    builtin::build(spec)
 }

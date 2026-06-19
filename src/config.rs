@@ -141,12 +141,6 @@ pub fn all_theme_names() -> Vec<String> {
     names
 }
 
-pub fn try_get_custom_theme(name: &str) -> Option<(u8, u8, u8)> {
-    let custom = CUSTOM_THEMES.get()?.read();
-    let theme = custom.get(name)?;
-    parse_hex_color(&theme.background)
-}
-
 /// Returns the full 18-color palette for a custom theme (background, foreground, then the
 /// 16 ANSI colors in standard order). Returns None if the theme doesn't exist or
 /// any required field is unparseable. Falls back to bg/fg for missing color slots.

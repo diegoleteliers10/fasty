@@ -12,7 +12,6 @@ pub struct GitStatus {
     pub ahead: usize,
     pub behind: usize,
     pub last_commit_summary: String,
-    pub checked_at: std::time::Instant,
 }
 
 impl GitStatus {

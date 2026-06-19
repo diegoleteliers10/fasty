@@ -4,7 +4,6 @@ pub mod config;
 pub mod event_listener;
 pub mod git;
 pub mod keybindings;
-pub mod pty;
 pub mod renderer;
 pub mod selection_classifier;
 pub mod session;
