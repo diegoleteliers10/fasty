@@ -3762,94 +3762,33 @@ fn main() -> anyhow::Result<()> {
                             tabs[active_tab_index].last_activity_time = std::time::Instant::now();
                             tabs[active_tab_index].cursor_visible = true;
 
-                            if state == ElementState::Pressed && button == MouseButton::Left {
-                                let r_cfg = renderer.lock();
-                                let vh = r_cfg.config.height as f32;
-                                drop(r_cfg);
-                                if current_mouse_y as f32 >= vh - bar_h {
-                                    if let Some(idx) = bar_layout.hit_test(current_mouse_x as f32, current_mouse_y as f32) {
-                                        let cwd = tabs[active_tab_index].terminal_state.lock()
-                                            .shell_pid()
-                                            .and_then(|pid| std::fs::read_link(format!("/proc/{}/cwd", pid)).ok())
-                                            .or_else(|| tabs[active_tab_index].cwd.clone());
-                                        let ctx = widgets::WidgetContext {
-                                            active_tab_cwd: cwd.as_deref(),
-                                            active_tab_git: tabs[active_tab_index].git_status.as_ref(),
-                                            opacity: config.opacity,
-                                        };
-                                        if let Some(w) = bar_layout.widgets.get_mut(idx) {
-                                            let action = w.on_click(&ctx);
-                                            match action {
-                                                widgets::ClickAction::None => {}
-                                                widgets::ClickAction::CopyToClipboard(s) => {
-                                                    if let Ok(mut cb) = arboard::Clipboard::new() {
-                                                        let _ = cb.set_text(s);
-                                                    }
-                                                    toast = Some(("copied to clipboard".to_string(), std::time::Instant::now(), 1500));
-                                                }
-                                                widgets::ClickAction::RunCommand(s) => {
-                                                    let _ = tabs[active_tab_index].terminal_state.lock().write_to_pty(s.as_bytes());
-                                                }
-                                                widgets::ClickAction::OpenUrl(s) => {
-                                                    let _ = std::process::Command::new("xdg-open").arg(&s).spawn();
-                                                }
-                                                widgets::ClickAction::Custom => {}
+                            if tab_ctx_visible {
+                                if state == ElementState::Pressed {
+                                    if button == MouseButton::Left {
+                                        let menu_h = 76.0f64;
+                                        let menu_w = 200.0f64;
+                                        if current_mouse_x >= tab_ctx_x && current_mouse_x < tab_ctx_x + menu_w
+                                            && current_mouse_y >= tab_ctx_y && current_mouse_y < tab_ctx_y + menu_h
+                                        {
+                                            let rel_y = current_mouse_y - tab_ctx_y;
+                                            if rel_y >= 6.0 && rel_y < 38.0 {
+                                                renaming_tab = Some(tab_ctx_tab_idx);
+                                                rename_buffer = tabs[tab_ctx_tab_idx].custom_name.clone()
+                                                    .unwrap_or_else(|| {
+                                                        let path_str = if let Some(pid) = tabs[tab_ctx_tab_idx].terminal_state.lock().shell_pid() {
+                                                            get_current_dir_shortened(pid)
+                                                        } else { None };
+                                                        if let Some(ref p) = path_str { get_last_path_component(p) } else { "bash".to_string() }
+                                                    });
+                                                rename_cursor = rename_buffer.len();
+                                            } else if rel_y >= 38.0 && rel_y < 70.0 && tabs.len() >= 2 {
+                                                pending_pop_out = Some(tab_ctx_tab_idx);
                                             }
                                         }
-                                        renderer.lock().set_dirty(true);
-                                        app_dirty = true;
-                                        return;
-                                    }
-                                }
-                            }
-
-                            if tab_ctx_visible {
-                                if state == ElementState::Pressed && button == MouseButton::Left {
-                                    let menu_h = 76.0f64;
-                                    let menu_w = 200.0f64;
-                                    if current_mouse_x >= tab_ctx_x && current_mouse_x < tab_ctx_x + menu_w
-                                        && current_mouse_y >= tab_ctx_y && current_mouse_y < tab_ctx_y + menu_h
-                                    {
-                                        let rel_y = current_mouse_y - tab_ctx_y;
-                                        if rel_y >= 6.0 && rel_y < 38.0 {
-                                            renaming_tab = Some(tab_ctx_tab_idx);
-                                            rename_buffer = tabs[tab_ctx_tab_idx].custom_name.clone()
-                                                .unwrap_or_else(|| {
-                                                    let path_str = if let Some(pid) = tabs[tab_ctx_tab_idx].terminal_state.lock().shell_pid() {
-                                                        get_current_dir_shortened(pid)
-                                                    } else { None };
-                                                    if let Some(ref p) = path_str { get_last_path_component(p) } else { "bash".to_string() }
-                                                });
-                                            rename_cursor = rename_buffer.len();
-                                        } else if rel_y >= 38.0 && rel_y < 70.0 && tabs.len() >= 2 {
-                                            pending_pop_out = Some(tab_ctx_tab_idx);
-                                        }
                                     }
                                     tab_ctx_visible = false;
                                     renderer.lock().set_dirty(true);
                                     app_dirty = true;
-                                    return;
-                                } else if state == ElementState::Pressed && button == MouseButton::Right {
-                                    tab_ctx_visible = false;
-                                    renderer.lock().set_dirty(true);
-                                    app_dirty = true;
-                                    return;
-                                }
-                            }
-
-                            if renaming_tab.is_some() {
-                                if state == ElementState::Pressed && button == MouseButton::Left {
-                                    if current_mouse_y >= padding_top as f64 {
-                                        let idx = renaming_tab.take().unwrap();
-                                        if rename_buffer.is_empty() {
-                                            tabs[idx].custom_name = None;
-                                        } else {
-                                            tabs[idx].custom_name = Some(rename_buffer.clone());
-                                        }
-                                        rename_buffer.clear();
-                                        renderer.lock().set_dirty(true);
-                                        app_dirty = true;
-                                    }
                                 }
                                 return;
                             }
@@ -3870,7 +3809,7 @@ fn main() -> anyhow::Result<()> {
                                                     crate::renderer::ContextMenuItem::About => {
                                                           if about_window.is_none() {
                                                               let visible = !cfg!(target_os = "windows");
-                                          match target.create_window(winit::window::WindowAttributes::default()
+                                                              match target.create_window(winit::window::WindowAttributes::default()
                                                                    .with_title("About Fasty")
                                                                    .with_decorations(false)
                                                                    .with_transparent(true)
@@ -4176,6 +4115,64 @@ fn main() -> anyhow::Result<()> {
                                 return;
                             }
 
+                            if state == ElementState::Pressed && button == MouseButton::Left {
+                                let r_cfg = renderer.lock();
+                                let vh = r_cfg.config.height as f32;
+                                drop(r_cfg);
+                                if current_mouse_y as f32 >= vh - bar_h {
+                                    if let Some(idx) = bar_layout.hit_test(current_mouse_x as f32, current_mouse_y as f32) {
+                                        let cwd = tabs[active_tab_index].terminal_state.lock()
+                                            .shell_pid()
+                                            .and_then(|pid| std::fs::read_link(format!("/proc/{}/cwd", pid)).ok())
+                                            .or_else(|| tabs[active_tab_index].cwd.clone());
+                                        let ctx = widgets::WidgetContext {
+                                            active_tab_cwd: cwd.as_deref(),
+                                            active_tab_git: tabs[active_tab_index].git_status.as_ref(),
+                                            opacity: config.opacity,
+                                        };
+                                        if let Some(w) = bar_layout.widgets.get_mut(idx) {
+                                            let action = w.on_click(&ctx);
+                                            match action {
+                                                widgets::ClickAction::None => {}
+                                                widgets::ClickAction::CopyToClipboard(s) => {
+                                                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                                                        let _ = cb.set_text(s);
+                                                    }
+                                                    toast = Some(("copied to clipboard".to_string(), std::time::Instant::now(), 1500));
+                                                }
+                                                widgets::ClickAction::RunCommand(s) => {
+                                                    let _ = tabs[active_tab_index].terminal_state.lock().write_to_pty(s.as_bytes());
+                                                }
+                                                widgets::ClickAction::OpenUrl(s) => {
+                                                    let _ = std::process::Command::new("xdg-open").arg(&s).spawn();
+                                                }
+                                                widgets::ClickAction::Custom => {}
+                                            }
+                                        }
+                                        renderer.lock().set_dirty(true);
+                                        app_dirty = true;
+                                        return;
+                                    }
+                                }
+                            }
+
+                            if renaming_tab.is_some() {
+                                if state == ElementState::Pressed && button == MouseButton::Left {
+                                    if current_mouse_y >= padding_top as f64 {
+                                        let idx = renaming_tab.take().unwrap();
+                                        if rename_buffer.is_empty() {
+                                            tabs[idx].custom_name = None;
+                                        } else {
+                                            tabs[idx].custom_name = Some(rename_buffer.clone());
+                                        }
+                                        rename_buffer.clear();
+                                        renderer.lock().set_dirty(true);
+                                        app_dirty = true;
+                                    }
+                                }
+                                return;
+                            }
+
                             if state == ElementState::Pressed {
                                 mouse_down_button = Some(button);
                             } else {
@@ -4386,6 +4383,7 @@ fn main() -> anyhow::Result<()> {
                                                       dragging_tab = Some(clicked_tab_idx);
                                                       drag_start_x = current_mouse_x;
                                                       drag_start_y = current_mouse_y;
+                                                      drag_current_x = current_mouse_x;
                                                       drag_tab_offset = current_mouse_x - tab_x;
                                                       drag_threshold_passed = false;
                                                       // Do not confine the cursor so dragging it out can trigger window pop-out.
@@ -4514,7 +4512,11 @@ fn main() -> anyhow::Result<()> {
                                         current_mouse_x, current_mouse_y,
                                         &tabs[active_tab_index].terminal_state,
                                         tabs[active_tab_index].scroll_current,
-                                        cell_width, cell_height, shell_cols, shell_rows, padding_top,
+                                        cell_width,
+                                        cell_height,
+                                        shell_cols,
+                                        shell_rows,
+                                        padding_top,
                                     ) {
                                         // OSC 8 hyperlink: open URL on plain click
                                         tabs[active_tab_index].pending_hyperlink_open = Some(uri.clone());
@@ -5017,7 +5019,7 @@ fn main() -> anyhow::Result<()> {
                             let is_dragging_anything = tabs[active_tab_index].is_dragging || is_dragging_scrollbar || tabs[active_tab_index].selection_start_pos.is_some();
                             const RESIZE_BORDER_WIDTH: f64 = 8.0;
                              
-                            if context_menu_visible {
+                            if context_menu_visible || tab_ctx_visible {
                                 window_for_redraw.set_cursor(winit::window::CursorIcon::Default);
                             } else if !is_dragging_anything {
                                 if let Some(dir) = get_resize_direction(current_mouse_x, current_mouse_y, v_width, v_height as f64, RESIZE_BORDER_WIDTH) {
@@ -5042,18 +5044,28 @@ fn main() -> anyhow::Result<()> {
                             let old_hovered_close = hovered_close_tab_index;
                             let old_hover_new = hover_new_tab;
 
-                            hover_close = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 36.0) && current_mouse_x < (v_width - 8.0);
-                            hover_max = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 68.0) && current_mouse_x < (v_width - 40.0);
-                            hover_min = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 100.0) && current_mouse_x < (v_width - 72.0);
-                            hover_settings = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 137.0) && current_mouse_x < (v_width - 109.0);
-
-                            let is_update_available = update_available.lock().is_some();
-                            if is_update_available {
-                                hover_update = current_mouse_y >= 10.0 && current_mouse_y <= 30.0
-                                    && current_mouse_x >= (v_width - 219.0) && current_mouse_x < (v_width - 149.0);
-                            } else {
+                            if context_menu_visible || tab_ctx_visible {
+                                hover_close = false;
+                                hover_max = false;
+                                hover_min = false;
+                                hover_settings = false;
                                 hover_update = false;
-                            }
+                                hovered_tab_index = None;
+                                hovered_close_tab_index = None;
+                                hover_new_tab = false;
+                            } else {
+                                hover_close = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 36.0) && current_mouse_x < (v_width - 8.0);
+                                hover_max = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 68.0) && current_mouse_x < (v_width - 40.0);
+                                hover_min = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 100.0) && current_mouse_x < (v_width - 72.0);
+                                hover_settings = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 137.0) && current_mouse_x < (v_width - 109.0);
+
+                                let is_update_available = update_available.lock().is_some();
+                                if is_update_available {
+                                    hover_update = current_mouse_y >= 10.0 && current_mouse_y <= 30.0
+                                        && current_mouse_x >= (v_width - 219.0) && current_mouse_x < (v_width - 149.0);
+                                } else {
+                                    hover_update = false;
+                                }
 
                                 hovered_tab_index = None;
                                 hovered_close_tab_index = None;
@@ -5096,6 +5108,7 @@ fn main() -> anyhow::Result<()> {
                                         }
                                     }
                                 }
+                            }
 
                             if hover_close != old_hover_close
                                 || hover_max != old_hover_max
@@ -5322,6 +5335,9 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                         WindowEvent::MouseWheel { delta, .. } => {
+                            if context_menu_visible || tab_ctx_visible {
+                                return;
+                            }
                             last_scroll_event_time = Some(std::time::Instant::now());
                             renderer.lock().set_dirty(true);
 
@@ -5618,6 +5634,17 @@ fn main() -> anyhow::Result<()> {
 
                                 s_hover_open_config = s_mouse_y >= 212.0 && s_mouse_y <= 238.0 && s_mouse_x >= 140.0 && s_mouse_x < 380.0;
 
+                                if settings_active_field != 0 {
+                                    s_hover_close = false;
+                                    s_hover_family = false;
+                                    s_hover_size_minus = false;
+                                    s_hover_size_plus = false;
+                                    s_hover_scroll_minus = false;
+                                    s_hover_scroll_plus = false;
+                                    s_hover_theme = false;
+                                    s_hover_open_config = false;
+                                }
+
                                 let mut hovered_font_idx = None;
                                 if settings_active_field == 1 && s_mouse_x >= 140.0 && s_mouse_x < 380.0 && s_mouse_y >= 78.0 && s_mouse_y < 258.0 {
                                     let idx = (((s_mouse_y - 78.0) + settings_font_scroll_y as f64) / 22.0) as usize;
@@ -5656,6 +5683,49 @@ fn main() -> anyhow::Result<()> {
                             }
                             WindowEvent::MouseInput { state, button, .. } => {
                                 if button == MouseButton::Left && state == ElementState::Pressed {
+                                    if settings_active_field == 1 {
+                                        // Font dropdown is open. Bounding box: x: 140..380, y: 78..258
+                                        if s_mouse_x >= 140.0 && s_mouse_x < 380.0 && s_mouse_y >= 78.0 && s_mouse_y < 258.0 {
+                                            let idx = (((s_mouse_y - 78.0) + settings_font_scroll_y as f64) / 22.0) as usize;
+                                            if idx < system_fonts.len() {
+                                                settings_family = system_fonts[idx].clone();
+                                                settings_active_field = 0;
+                                                apply_settings!();
+                                            }
+                                        } else {
+                                            // Clicked outside — close dropdown and consume event
+                                            settings_active_field = 0;
+                                        }
+                                        if let Some(ref mut r) = settings_renderer {
+                                            r.set_dirty(true);
+                                        }
+                                        if let Some(ref w) = settings_window {
+                                            w.request_redraw();
+                                        }
+                                        return;
+                                    } else if settings_active_field == 2 {
+                                        // Theme dropdown is open. Bounding box: x: 140..380, y: 198..198 + themes_list.len() * 22.0
+                                        let theme_dropdown_h = themes_list.len() as f64 * 22.0;
+                                        if s_mouse_x >= 140.0 && s_mouse_x < 380.0 && s_mouse_y >= 198.0 && s_mouse_y < 198.0 + theme_dropdown_h {
+                                            let idx = (((s_mouse_y - 198.0) + settings_theme_scroll_y as f64) / 22.0) as usize;
+                                            if idx < themes_list.len() {
+                                                settings_theme = themes_list[idx].clone();
+                                                settings_active_field = 0;
+                                                apply_settings!();
+                                            }
+                                        } else {
+                                            // Clicked outside — close dropdown and consume event
+                                            settings_active_field = 0;
+                                        }
+                                        if let Some(ref mut r) = settings_renderer {
+                                            r.set_dirty(true);
+                                        }
+                                        if let Some(ref w) = settings_window {
+                                            w.request_redraw();
+                                        }
+                                        return;
+                                    }
+
                                     if s_hover_close {
                                         settings_window = None;
                                         settings_renderer = None;
@@ -5675,27 +5745,8 @@ fn main() -> anyhow::Result<()> {
                                         settings_active_field = 1;
                                         settings_font_scroll_y = 0.0;
                                     } else if s_hover_theme {
-                                        // Box clicks MUST take priority over dropdown-item checks,
-                                        // because the theme box (y 172-198) sits inside the font
-                                        // dropdown's y range (78-258). Without this, clicking the
-                                        // theme box while the font dropdown is open gets consumed
-                                        // as a font item selection.
                                         settings_active_field = 2;
                                         settings_theme_scroll_y = 0.0;
-                                    } else if settings_active_field == 1 && s_mouse_x >= 140.0 && s_mouse_x < 380.0 && s_mouse_y >= 78.0 && s_mouse_y < 258.0 {
-                                        let idx = (((s_mouse_y - 78.0) + settings_font_scroll_y as f64) / 22.0) as usize;
-                                        if idx < system_fonts.len() {
-                                            settings_family = system_fonts[idx].clone();
-                                            settings_active_field = 0;
-                                            apply_settings!();
-                                        }
-                                    } else if settings_active_field == 2 && s_mouse_x >= 140.0 && s_mouse_x < 380.0 && s_mouse_y >= 198.0 && s_mouse_y < 198.0 + themes_list.len() as f64 * 22.0 {
-                                        let idx = (((s_mouse_y - 198.0) + settings_theme_scroll_y as f64) / 22.0) as usize;
-                                        if idx < themes_list.len() {
-                                            settings_theme = themes_list[idx].clone();
-                                            settings_active_field = 0;
-                                            apply_settings!();
-                                        }
                                     } else if s_hover_size_minus {
                                         settings_size = (settings_size - 1.0).max(6.0);
                                         apply_settings!();
