@@ -19,7 +19,7 @@ Inspired by [Ghostty](https://github.com/ghostty-org/ghostty), Fasty leverages `
 - **Custom Keybindings**: User-rebindable shortcuts via `[keybindings]` in `fasty.toml`. 14 actions available; defaults preserved when omitted.
 - **Session Restore**: Saves open tab working directories on exit, restores to saved paths on next launch. Enabled by default; opt-out via `session_restore = false`.
 - **Command Palette**: `Ctrl+Shift+P` opens a fuzzy-search palette for quick access to settings, tab actions, themes, and font size controls.
-- **Git Status Bottombar**: Always-visible bottom bar showing branch, modified/staged/untracked counts, ahead/behind, and last commit summary when inside a git repo.
+- **Git Status Bottombar**: Always-visible bottom bar showing branch, modified/staged/untracked counts, ahead/behind, and last commit summary when inside a git repo. Composable: built-in widgets for `git`, `time`, `kube`, `aws`, and arbitrary shell `command`, plus configurable click actions (`copy`, `run`, `open`). See [Bottombar Widgets](#bottombar-widgets).
 - **Built-in SSH Manager**: `Ctrl+Shift+O` opens a fuzzy-search picker over `~/.ssh/config` hosts. Connects in a new tab with `StrictHostKeyChecking=accept-new`.
 - **Project Jumper**: `Ctrl+Shift+J` opens a fuzzy-search picker over the working directories of currently open tabs. Select one to spawn a new tab at that path.
 - **Git Worktree Picker**: `Ctrl+Alt+W` (from a git repo) lists `git worktree list` entries with branch and short commit. Filter and `Enter` to open the worktree in a new tab, or type `+branch-name` to create a new worktree inline.
@@ -334,6 +334,76 @@ Drop a `.json` file into `~/.config/fasty/themes/` (filename minus `.json` becom
   "bright_white":   "#c0caf5"
 }
 ```
+
+### Bottombar Widgets
+
+The bottombar (the 20px strip above the terminal scrollback) is a slot for compact status widgets — git branch, current time, kubectl context, AWS profile, or anything else you can run as a shell command. Widgets are configured under `[bottombar]` and live-reload on save.
+
+**Common fields** (all widgets):
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `align` | `left` \| `right` | widget default | Which side of the bar to anchor to. Widgets on `left` pack from the left edge; widgets on `right` pack from the right (above the scrollbar). The first widget that does not fit is dropped, so order matters. |
+| `interval_ms` | `integer` | widget default | How often `poll()` fires (ms). Use a larger value for expensive commands to avoid spamming the shell. |
+
+**Built-in widgets:**
+
+| `type` | Description | Default interval | Notes |
+| :--- | :--- | :--- | :--- |
+| `git` | Branch + dirty dot + ahead/behind/modified/staged/untracked counts for the active tab's cwd. Hover tooltip = last commit summary. | `1500` ms | Reads the cached `GitStatus`; click is a no-op (`ClickAction::Custom` ignored). |
+| `time` | Local time-of-day. `format` field uses `strftime`-style tokens (`%H:%M:%S`, `%Y-%m-%d`, etc.). | `1000` ms | No shell-out; pure Rust formatter (no `chrono` dependency). |
+| `kube` | Current kubectl context (`kubectl config current-context`). | `30000` ms | Click cycles to the next context. Shows an error dot if `kubectl` is missing or fails. |
+| `aws` | Active AWS profile + account + ARN (`aws sts get-caller-identity`). | `300000` ms | Click opens the AWS console for the current account. |
+| `command` | Runs an arbitrary shell command on every poll; stdout is shown. `on_click` selects what happens when the user clicks the widget. | `5000` ms | Max 4096 bytes of stdout (truncated with `\u{2026}`). |
+
+**`command` click actions** (`on_click`):
+
+| Value | Behavior |
+| :--- | :--- |
+| `copy` | Copies the latest stdout to the clipboard. |
+| `run` | Sends the latest stdout as input to the active terminal (PTY). |
+| `open` | Opens the latest stdout as a URL (`xdg-open` / `open` / `cmd /c start`). |
+| omitted / other | No action. |
+
+**Example:**
+
+```toml
+[bottombar]
+
+[[bottombar.widgets]]
+type = "git"
+align = "left"
+
+[[bottombar.widgets]]
+type = "time"
+format = "%H:%M"
+align = "left"
+interval_ms = 1000
+
+[[bottombar.widgets]]
+type = "kube"
+align = "right"
+interval_ms = 30000
+
+[[bottombar.widgets]]
+type = "aws"
+align = "right"
+interval_ms = 300000
+
+[[bottombar.widgets]]
+type = "command"
+name = "ip"
+command = "hostname -I | awk '{print $1}'"
+on_click = "copy"
+align = "right"
+interval_ms = 10000
+```
+
+If `[bottombar.widgets]` is empty (or omitted), a single `git` widget on the left is used as the default — same as before this section existed.
+
+Adding a new widget is intentionally a Rust change, not a config-only affair. See `src/widgets/mod.rs` for the trait and `src/widgets/builtin/` for examples.
+
+---
 
 ### Snippets
 
