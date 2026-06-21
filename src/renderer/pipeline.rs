@@ -1171,6 +1171,18 @@ impl Pipeline {
                                                     render_h,
                                                     1.0,
                                                 )
+                                            } else if cell.c == '⇡' {
+                                                let scale = (cell_width / entry.width).min(1.0);
+                                                let render_w = entry.width * scale;
+                                                let render_h = entry.height * scale;
+                                                let x_offset = ((cell_width - render_w) / 2.0).max(0.0);
+                                                (
+                                                    (cell_x + x_offset).round(),
+                                                    (cell_y + atlas.ascent() + entry.top).round(),
+                                                    render_w,
+                                                    render_h,
+                                                    0.0,
+                                                )
                                             } else if is_arrow_symbol(cell.c) || is_dingbat_symbol(cell.c) || crate::renderer::is_emoji(cell.c) {
                                                 let emoji_available = cell_width * 1.5;
                                                 let scale = (emoji_available / entry.width).min(1.0);
@@ -5966,7 +5978,13 @@ fn render_single_char(
                         1.0,
                     )
                 } else {
-                    let (glyph_x, render_w, render_h) = if is_arrow_symbol(cell.c) || is_dingbat_symbol(cell.c) || crate::renderer::is_emoji(cell.c) {
+                    let (glyph_x, render_w, render_h) = if cell.c == '⇡' {
+                        let scale = (actual_cell_width / entry.width).min(1.0);
+                        let rw = entry.width * scale;
+                        let rh = entry.height * scale;
+                        let x_offset = ((actual_cell_width - rw) / 2.0).max(0.0);
+                        ((cell_x + x_offset).round(), rw, rh)
+                    } else if is_arrow_symbol(cell.c) || is_dingbat_symbol(cell.c) || crate::renderer::is_emoji(cell.c) {
                         let emoji_available = actual_cell_width * 1.5;
                         let scale = (emoji_available / entry.width).min(1.0);
                         let rw = entry.width * scale;
