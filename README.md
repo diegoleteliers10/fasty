@@ -57,6 +57,17 @@ Fasty integrates custom vector icons mapped into the GPU texture atlas as non-co
 
 ## Performance & Memory Optimizations
 
+### E2E Benchmarking & Parser Verification (v0.4.0)
+
+- **E2E Benchmark Runner**: Introduces an automated end-to-end benchmark script (`scripts/benchmark_e2e.py`) to measure startup latency, plain text throughput (100k lines), and ANSI/SGR styled color throughput (50k lines) against Ghostty and Konsole.
+- **Micro-benchmarks**: Criterion integration (`benches/parser_bench.rs`) for checking VTE parser overhead.
+
+### PTY & GPU Rendering Optimizations (v0.4.0)
+
+- **64KB PTY Buffer Size**: Increased the reading buffer size of the PTY from 8KB to **64KB**, minimizing OS read syscalls and CPU context switches during heavy throughput.
+- **Lazy Font Loading & Batch Pre-rasterization**: Restructured atlas initialization. Instead of pre-rendering hundreds of unused glyphs at startup, Fasty now only pre-rasterizes alphanumeric characters and common punctuation at size 13px (UI size) using an optimized batch process (`rasterize_batch`). This keeps startup extremely fast while avoiding buffer/texture queue writes inside active render passes during UI popups.
+- **ShaderModule Cache**: Caches compiled WGSL shaders on GPU using a static `std::sync::OnceLock`. Avoids compiler overhead during atlas resizing and window creation.
+
 ### Instant Window Creation & Tab Tearing (v0.3.7)
 
 - **Shared GPU Atlases**: Main text and UI texture atlases are shared across all window renderers using `Arc` wrapping. This reduces the latency of creating new windows/popping out tabs from ~200-500ms to sub-millisecond (instantaneous) since the GPU textures and glyph caches do not need to be reallocated and recompiled.
