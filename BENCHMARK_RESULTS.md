@@ -3,6 +3,6 @@ Runs per test case: 3
 
 | Terminal | Startup Latency (sh -c true) | Plain Text Throughput (100k lines) | ANSI/SGR Colors Throughput (50k lines) |
 | --- | --- | --- | --- |
-| **fasty (This Project)** | 9.115s ± 0.410s | 12.289s ± 0.408s | 10.566s ± 0.386s |
-| **Ghostty** | 3.111s ± 0.305s | 4.802s ± 0.401s | 3.780s ± 0.282s |
-| **Konsole (KDE Terminal)** | 1.019s ± 0.393s | 5.300s ± 0.153s | 2.174s ± 0.313s |
+| **fasty (This Project)** | 1.053s ± 0.280s | 1.988s ± 0.079s | 1.942s ± 0.126s |
+| **Ghostty** | 1.772s ± 0.305s | 2.405s ± 0.277s | 1.987s ± 0.253s |
+| **Konsole (KDE Terminal)** | 0.684s ± 0.248s | 2.256s ± 0.493s | 1.202s ± 0.323s |
