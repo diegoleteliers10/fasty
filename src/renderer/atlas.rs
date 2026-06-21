@@ -382,8 +382,12 @@ impl Atlas {
             icon_branch: None,
         };
 
-        atlas.rasterize_basic_glyphs(device, queue)?;
-
+        // Pre-rasterize basic alphanumeric and punctuation characters at startup
+        // to avoid calling queue.write_texture inside active RenderPasses for UI windows.
+        let startup_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.- :";
+        for c in startup_chars.chars() {
+            let _ = atlas.get_or_rasterize(c, device, queue);
+        }
         if let Some(space) = atlas.entries.get(&GlyphKey::Char(' ')) {
             atlas.fallback_glyph = Some(*space);
         }
@@ -729,38 +733,6 @@ impl Atlas {
             .filter(|p| *p != primary_path)
             .cloned()
             .collect()
-    }
-
-    fn rasterize_basic_glyphs(&mut self, device: &Device, queue: &Queue) -> anyhow::Result<()> {
-        let chars: Vec<char> = (0x20u32..=0x7Fu32)
-            .chain(0x2500u32..=0x257Fu32)
-            .filter_map(std::char::from_u32)
-            .collect();
-
-        FT_LIB.with(|lib| {
-            if let Ok(face) = lib.new_face(&self.primary_path, 0) {
-                let physical_size = self.font_size * self.scale_factor;
-                let _ = face.set_pixel_sizes(0, physical_size as u32);
-                let is_color = face.has_fixed_sizes();
-
-                for c in chars {
-                    if let Some(idx) = face.get_char_index(c as usize) {
-                        if idx != 0 {
-                            let load_flags = if is_color {
-                                LoadFlag::RENDER | LoadFlag::COLOR
-                            } else {
-                                LoadFlag::RENDER
-                            };
-                            if face.load_glyph(idx, load_flags).is_ok() {
-                                let _ = self.rasterize_freetype_glyph_key(device, queue, GlyphKey::Char(c), &face.glyph(), is_color);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        Ok(())
     }
 
     fn rasterize_freetype_glyph_key(

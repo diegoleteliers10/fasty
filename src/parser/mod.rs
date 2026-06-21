@@ -91,7 +91,9 @@ impl VtParser {
 
     pub fn feed_str(&mut self, bytes: &[u8]) -> Vec<Action> {
         self.performer.actions.clear();
-        self.inner.advance(&mut self.performer, bytes);
+        for &byte in bytes {
+            self.inner.advance(&mut self.performer, byte);
+        }
         std::mem::take(&mut self.performer.actions)
     }
 }

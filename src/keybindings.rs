@@ -89,6 +89,8 @@ pub enum Action {
     SshManager,
     ProjectJumper,
     WorktreePicker,
+    PrevPrompt,
+    NextPrompt,
 }
 
 pub struct KeyBindingResolver {
@@ -127,6 +129,9 @@ impl KeyBindingResolver {
         insert("ctrl+page_down", Action::NextTab);
         insert("ctrl+shift+tab", Action::PrevTab);
         insert("ctrl+page_up", Action::PrevTab);
+        insert("ctrl+shift+up", Action::PrevPrompt);
+        insert("ctrl+shift+h", Action::PrevPrompt);
+        insert("ctrl+shift+down", Action::NextPrompt);
         for n in 1..=9u8 {
             insert(&format!("alt+{n}"), Action::SelectTab(n));
         }
@@ -231,6 +236,8 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "reset_font_size" => Some(Action::ResetFontSize),
         "next_tab" => Some(Action::NextTab),
         "prev_tab" => Some(Action::PrevTab),
+        "prev_prompt" => Some(Action::PrevPrompt),
+        "next_prompt" => Some(Action::NextPrompt),
         _ => None,
     }
 }

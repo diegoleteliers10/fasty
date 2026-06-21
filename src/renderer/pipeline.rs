@@ -332,6 +332,8 @@ const VERTEX_BUFFER_DATA: &[f32] = &[
     0.0, 1.0, 1.0, 1.0, 1.0,
 ];
 
+static SHADER_MODULE: std::sync::OnceLock<wgpu::ShaderModule> = std::sync::OnceLock::new();
+
 impl Pipeline {
     pub fn new(
         device: &Device,
@@ -339,9 +341,11 @@ impl Pipeline {
         ui_atlas: &crate::renderer::Atlas,
         format: wgpu::TextureFormat,
     ) -> Self {
-        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("cell-shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER_SOURCE.into()),
+        let shader_module = SHADER_MODULE.get_or_init(|| {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("cell-shader"),
+                source: wgpu::ShaderSource::Wgsl(SHADER_SOURCE.into()),
+            })
         });
 
         let atlas_view = atlas.texture().create_view(&wgpu::TextureViewDescriptor {
@@ -1147,24 +1151,32 @@ impl Pipeline {
 
                                         let (glyph_x, glyph_y, glyph_w, glyph_h, is_color_val) =
                                             if entry.is_color {
-                                                let char_width = if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR) { 2.0 } else { 1.0 };
-                                                let scale = actual_cell_height / entry.height;
+                                                let char_width = if cell.flags.contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR) {
+                                                    2.0
+                                                } else {
+                                                    1.5
+                                                };
+                                                let available_w = cell_width * char_width;
+                                                let scale_h = actual_cell_height / entry.height;
+                                                let scale_w = available_w / entry.width;
+                                                let scale = scale_h.min(scale_w);
                                                 let render_w = entry.width * scale;
-                                                let render_h = actual_cell_height;
-                                                let x_offset =
-                                                    ((cell_width * char_width) - render_w) / 2.0;
+                                                let render_h = entry.height * scale;
+                                                let x_offset = (available_w - render_w) / 2.0;
+                                                let y_offset = (actual_cell_height - render_h) / 2.0;
                                                 (
                                                     (cell_x + x_offset.max(0.0)).round(),
-                                                    cell_y.round(),
+                                                    (cell_y + y_offset.max(0.0)).round(),
                                                     render_w,
                                                     render_h,
                                                     1.0,
                                                 )
-                                            } else if is_arrow_symbol(cell.c) || is_dingbat_symbol(cell.c) {
-                                                let scale = (cell_width / entry.width).min(1.0);
+                                            } else if is_arrow_symbol(cell.c) || is_dingbat_symbol(cell.c) || crate::renderer::is_emoji(cell.c) {
+                                                let emoji_available = cell_width * 1.5;
+                                                let scale = (emoji_available / entry.width).min(1.0);
                                                 let render_w = entry.width * scale;
                                                 let render_h = entry.height * scale;
-                                                let x_offset = ((cell_width - render_w) / 2.0).max(0.0);
+                                                let x_offset = ((emoji_available - render_w) / 2.0).max(0.0);
                                                 (
                                                     (cell_x + x_offset).round(),
                                                     (cell_y + atlas.ascent() + entry.top).round(),
@@ -5377,7 +5389,7 @@ impl Pipeline {
         );
 
         render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_bind_group(0, &self.bind_group, &[]);
+        render_pass.set_bind_group(0, &self.ui_bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
 
@@ -5569,24 +5581,24 @@ fn get_active_theme() -> Theme {
             bright_white: (0xFD, 0xF6, 0xE3),
         },
         _ => Theme {
-            // Fasty (Default)
-            foreground: (0xC5, 0xC8, 0xC6),
+            // Fasty (Default) – crisp, high-clarity text colors
+            foreground: (0xE5, 0xE9, 0xF0),
             background: (0x0C, 0x0C, 0x0C),
-            black: (0x1D, 0x1F, 0x21),
-            red: (0xCC, 0x66, 0x66),
-            green: (0xB5, 0xBD, 0x68),
-            yellow: (0xF0, 0xC6, 0x74),
-            blue: (0x81, 0xA2, 0xBE),
-            magenta: (0xB2, 0x94, 0xBB),
-            cyan: (0x8A, 0xBE, 0xB7),
-            white: (0xC5, 0xC8, 0xC6),
-            bright_black: (0x66, 0x66, 0x66),
-            bright_red: (0xCC, 0x66, 0x66),
-            bright_green: (0xB5, 0xBD, 0x68),
-            bright_yellow: (0xF0, 0xC6, 0x74),
-            bright_blue: (0x81, 0xA2, 0xBE),
-            bright_magenta: (0xB2, 0x94, 0xBB),
-            bright_cyan: (0x8A, 0xBE, 0xB7),
+            black: (0x3B, 0x42, 0x52),
+            red: (0xF0, 0x4E, 0x4E),
+            green: (0x8E, 0xE0, 0x44),
+            yellow: (0xFA, 0xC8, 0x2E),
+            blue: (0x5A, 0xB0, 0xF0),
+            magenta: (0xD0, 0x7E, 0xE0),
+            cyan: (0x56, 0xE2, 0xDB),
+            white: (0xE5, 0xE9, 0xF0),
+            bright_black: (0x84, 0x8B, 0x98),
+            bright_red: (0xFF, 0x6B, 0x6B),
+            bright_green: (0xA6, 0xF0, 0x5E),
+            bright_yellow: (0xFF, 0xE0, 0x4A),
+            bright_blue: (0x74, 0xCC, 0xFF),
+            bright_magenta: (0xE8, 0x96, 0xFA),
+            bright_cyan: (0x6A, 0xF5, 0xF0),
             bright_white: (0xFF, 0xFF, 0xFF),
         },
     }
@@ -5927,14 +5939,19 @@ fn render_single_char(
                     {
                         2.0
                     } else {
-                        1.0
+                        1.5
                     };
-                    let scale = actual_cell_height / entry.height;
+                    let available_w = actual_cell_width * char_width;
+                    // Scale uniformly so the emoji fits within both dimensions
+                    let scale_h = actual_cell_height / entry.height;
+                    let scale_w = available_w / entry.width;
+                    let scale = scale_h.min(scale_w);
                     let emoji_render_width = entry.width * scale;
-                    let emoji_render_height = actual_cell_height;
-                    let x_offset = ((actual_cell_width * char_width) - emoji_render_width) / 2.0;
+                    let emoji_render_height = entry.height * scale;
+                    let x_offset = (available_w - emoji_render_width) / 2.0;
+                    let y_offset = (actual_cell_height - emoji_render_height) / 2.0;
                     let glyph_x = (cell_x + x_offset.max(0.0)).round();
-                    let glyph_y = cell_y.round();
+                    let glyph_y = (cell_y + y_offset.max(0.0)).round();
                     CellInstance::new(
                         glyph_x,
                         glyph_y,
@@ -5949,11 +5966,12 @@ fn render_single_char(
                         1.0,
                     )
                 } else {
-                    let (glyph_x, render_w, render_h) = if is_arrow_symbol(cell.c) || is_dingbat_symbol(cell.c) {
-                        let scale = (actual_cell_width / entry.width).min(1.0);
+                    let (glyph_x, render_w, render_h) = if is_arrow_symbol(cell.c) || is_dingbat_symbol(cell.c) || crate::renderer::is_emoji(cell.c) {
+                        let emoji_available = actual_cell_width * 1.5;
+                        let scale = (emoji_available / entry.width).min(1.0);
                         let rw = entry.width * scale;
                         let rh = entry.height * scale;
-                        let x_offset = ((actual_cell_width - rw) / 2.0).max(0.0);
+                        let x_offset = ((emoji_available - rw) / 2.0).max(0.0);
                         ((cell_x + x_offset).round(), rw, rh)
                     } else {
                         ((cell_x + entry.left).round(), entry.width, entry.height)

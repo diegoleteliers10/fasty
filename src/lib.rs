@@ -8,5 +8,6 @@ pub mod renderer;
 pub mod selection_classifier;
 pub mod session;
 pub mod snippets;
+pub mod parser;
 pub mod terminal_state;
 pub mod widgets;

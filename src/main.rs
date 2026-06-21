@@ -97,6 +97,7 @@ struct Tab {
     /// Cursor blink phase index, reset on activity. Per-tab so that
     /// popped-out windows can blink independently of the main window.
     last_blink_index: u64,
+    prompts: Vec<u64>,
 }
 
 /// Cached git status for a single tab. Populated by a background thread.
@@ -155,6 +156,7 @@ fn create_new_tab(
         is_running: false,
         last_exit_code: None,
         last_blink_index: 0,
+        prompts: Vec::new(),
     })
 }
 
@@ -210,6 +212,19 @@ fn handle_popped_out_event(
                         r.grid_dirty = true;
                     }
                     wc.window.request_redraw();
+                }
+            }
+        }
+        WindowEvent::Focused(focused) => {
+            if let Some(wc) = popped.get_mut(&window_id) {
+                if let Some(tab) = wc.tabs.get(wc.active_tab_index) {
+                    let term_state = tab.terminal_state.lock();
+                    let term = term_state.term().lock();
+                    if term.mode().contains(alacritty_terminal::term::TermMode::FOCUS_IN_OUT) {
+                        let seq = if focused { "\x1b[I" } else { "\x1b[O" };
+                        drop(term);
+                        term_state.write_to_pty(seq.as_bytes());
+                    }
                 }
             }
         }
@@ -1825,6 +1840,7 @@ fn main() -> anyhow::Result<()> {
     let mut drag_current_x: f64 = 0.0;
     let mut drag_threshold_passed = false;
     let mut window_focused = true;
+    let mut window_occluded = false;
 
     // Tab rename state
     let mut renaming_tab: Option<usize> = None;
@@ -2096,6 +2112,21 @@ fn main() -> anyhow::Result<()> {
                         bell_flash_time = Some(std::time::Instant::now());
                         renderer.lock().set_dirty(true);
                         window_for_redraw.request_redraw();
+
+                        if !window_focused || window_occluded {
+                            let tab_title = tabs.get(active_tab_index)
+                                .and_then(|t| t.title_override.clone())
+                                .unwrap_or_else(|| format!("Tab {}", active_tab_index + 1));
+                            let body = format!("Terminal bell in {}", tab_title);
+                            if let Err(e) = notify_rust::Notification::new()
+                                .summary("Fasty Bell Alert")
+                                .body(&body)
+                                .appname("Fasty")
+                                .show()
+                            {
+                                tracing::warn!("Failed to send bell desktop notification: {:?}", e);
+                            }
+                        }
                     }
                     AppEvent::ClipboardStore(text) => {
                         let mut cb = if clipboard.is_none() {
@@ -2146,8 +2177,8 @@ fn main() -> anyhow::Result<()> {
                         renderer.lock().set_dirty(true);
                         window_for_redraw.request_redraw();
 
-                        // Send desktop notification when window is unfocused
-                        if !window_focused && config.notify_on_command_finish {
+                        // Send desktop notification when window is unfocused or occluded
+                        if (!window_focused || window_occluded) && config.notify_on_command_finish {
                             let duration_str = if duration_ms < 1000 {
                                 format!("{}ms", duration_ms)
                             } else {
@@ -2158,11 +2189,34 @@ fn main() -> anyhow::Result<()> {
                                 None => String::new(),
                             };
                             let body = format!("Finished in {}{}", duration_str, exit_str);
-                            let _ = notify_rust::Notification::new()
+                            if let Err(e) = notify_rust::Notification::new()
                                 .summary("Fasty")
                                 .body(&body)
                                 .appname("Fasty")
-                                .show();
+                                .show()
+                            {
+                                tracing::warn!("Failed to send command finished notification: {:?}", e);
+                            }
+                        }
+                    }
+                    AppEvent::Notification { title, body } => {
+                        if let Err(e) = notify_rust::Notification::new()
+                            .summary(&title)
+                            .body(&body)
+                            .appname("Fasty")
+                            .show()
+                        {
+                            tracing::warn!("Failed to send desktop notification: {:?}", e);
+                        }
+                    }
+                    AppEvent::PromptStarted { absolute_line } => {
+                        if let Some(tab) = tabs.get_mut(active_tab_index) {
+                            if tab.prompts.last() != Some(&absolute_line) {
+                                tab.prompts.push(absolute_line);
+                                if tab.prompts.len() > 1000 {
+                                    tab.prompts.remove(0);
+                                }
+                            }
                         }
                     }
                 }
@@ -3570,6 +3624,72 @@ fn main() -> anyhow::Result<()> {
                                             }
                                             return;
                                         }
+                                        keybindings::Action::PrevPrompt => {
+                                            let tab = &mut tabs[active_tab_index];
+                                            let term_state = tab.terminal_state.lock();
+                                            let term = term_state.term().lock();
+                                            let current_total = term_state.total_lines_pushed.load(Ordering::Relaxed);
+                                            let screen_lines = term.grid().screen_lines() as i32;
+                                            let display_offset = term.grid().display_offset() as i32;
+
+                                            let viewport_top_absolute = (current_total as i32 - screen_lines).max(0) - display_offset;
+
+                                            let mut target_prompt = None;
+                                            for &p in &tab.prompts {
+                                                if (p as i32) < viewport_top_absolute {
+                                                    target_prompt = Some(p);
+                                                }
+                                            }
+
+                                            if let Some(p) = target_prompt {
+                                                let new_offset = current_total as i32 - screen_lines - p as i32;
+                                                let clamped_offset = new_offset.clamp(0, term.grid().history_size() as i32);
+                                                drop(term);
+                                                term_state.scroll(clamped_offset as isize - display_offset as isize);
+                                                tab.scroll_target = clamped_offset as f32;
+                                                let mut r = renderer.lock();
+                                                r.set_dirty(true);
+                                                app_dirty = true;
+                                            }
+                                            return;
+                                        }
+                                        keybindings::Action::NextPrompt => {
+                                            let tab = &mut tabs[active_tab_index];
+                                            let term_state = tab.terminal_state.lock();
+                                            let term = term_state.term().lock();
+                                            let current_total = term_state.total_lines_pushed.load(Ordering::Relaxed);
+                                            let screen_lines = term.grid().screen_lines() as i32;
+                                            let display_offset = term.grid().display_offset() as i32;
+
+                                            let viewport_top_absolute = (current_total as i32 - screen_lines).max(0) - display_offset;
+
+                                            let mut target_prompt = None;
+                                            for &p in &tab.prompts {
+                                                if (p as i32) > viewport_top_absolute {
+                                                    target_prompt = Some(p);
+                                                    break;
+                                                }
+                                            }
+
+                                            if let Some(p) = target_prompt {
+                                                let new_offset = current_total as i32 - screen_lines - p as i32;
+                                                let clamped_offset = new_offset.clamp(0, term.grid().history_size() as i32);
+                                                drop(term);
+                                                term_state.scroll(clamped_offset as isize - display_offset as isize);
+                                                tab.scroll_target = clamped_offset as f32;
+                                                let mut r = renderer.lock();
+                                                r.set_dirty(true);
+                                                app_dirty = true;
+                                            } else {
+                                                drop(term);
+                                                term_state.scroll(-display_offset as isize);
+                                                tab.scroll_target = 0.0;
+                                                let mut r = renderer.lock();
+                                                r.set_dirty(true);
+                                                app_dirty = true;
+                                            }
+                                            return;
+                                        }
                                         keybindings::Action::SelectTab(n) => {
                                             let target_idx = (n - 1) as usize;
                                             if target_idx < tabs.len() {
@@ -3834,7 +3954,7 @@ fn main() -> anyhow::Result<()> {
                                                                           let r = renderer.lock();
                                                                           (r.instance.clone(), r.device.clone(), r.queue.clone(), r.config.format, r.config.alpha_mode)
                                                                       };
-                                                                      match Renderer::new_shared(aw_static, "Inter", 13.0, shared_instance, shared_device, shared_queue, format, alpha_mode) {
+                                                                      match Renderer::new_shared(aw_static, &config.font.family, 13.0, shared_instance, shared_device, shared_queue, format, alpha_mode) {
                                                                           Ok(renderer_obj) => {
                                                                               #[cfg(target_os = "windows")]
                                                                               let mut renderer_obj = renderer_obj;
@@ -5471,6 +5591,19 @@ fn main() -> anyhow::Result<()> {
 
                         WindowEvent::Focused(focused) => {
                             window_focused = focused;
+                            tracing::info!("Window focus changed: focused={}", focused);
+
+                            // Send focus reporting sequences to PTY if requested by application
+                            if let Some(tab) = tabs.get(active_tab_index) {
+                                let term_state = tab.terminal_state.lock();
+                                let term = term_state.term().lock();
+                                if term.mode().contains(alacritty_terminal::term::TermMode::FOCUS_IN_OUT) {
+                                    let seq = if focused { "\x1b[I" } else { "\x1b[O" };
+                                    drop(term);
+                                    term_state.write_to_pty(seq.as_bytes());
+                                }
+                            }
+
                             if !focused {
                                 let old_hover_close = hover_close;
                                 let old_hover_max = hover_max;
@@ -5518,6 +5651,10 @@ fn main() -> anyhow::Result<()> {
                                     app_dirty = true;
                                 }
                             }
+                        }
+                        WindowEvent::Occluded(occluded) => {
+                            window_occluded = occluded;
+                            tracing::info!("Window occlusion changed: occluded={}", occluded);
                         }
                         _ => {}
                     }

@@ -8,6 +8,7 @@ use std::thread;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::Config as AlacrittyConfig;
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+use alacritty_terminal::grid::Dimensions;
 use parking_lot::Mutex as ParkingMutex;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
@@ -28,6 +29,8 @@ pub enum AppEvent {
     TitleChanged(String),
     CommandStarted,
     CommandFinished { duration_ms: u128, exit_code: Option<i32> },
+    Notification { title: String, body: String },
+    PromptStarted { absolute_line: u64 },
 }
 
 
@@ -38,6 +41,7 @@ pub struct TerminalState {
     writer: Arc<ParkingMutex<Box<dyn Write + Send>>>,
     master: Arc<ParkingMutex<Box<dyn MasterPty + Send>>>,
     shell_pid: Option<u32>,
+    pub total_lines_pushed: Arc<AtomicU64>,
 }
 
 impl TerminalState {
@@ -75,7 +79,7 @@ impl TerminalState {
         let mut cmd = CommandBuilder::new(executable);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("TERM_PROGRAM", "fasty");
+        cmd.env("TERM_PROGRAM", "ghostty");
         if let Some(dir) = cwd {
             cmd.cwd(dir);
         }
@@ -195,25 +199,83 @@ impl TerminalState {
         let render_gen_clone = Arc::clone(&render_generation);
         let term_clone = Arc::clone(&term);
         let proxy_clone = proxy.clone();
+        let total_lines_pushed = Arc::new(AtomicU64::new(0));
+        let total_lines_pushed_clone = Arc::clone(&total_lines_pushed);
+        let writer_clone = Arc::clone(&writer_arc);
         thread::spawn(move || {
             use std::io::Read;
 
-            let mut buf = [0u8; 8192];
+            let mut buf = [0u8; 65536];
             let mut parser: Processor<StdSyncHandler> = Processor::new();
 
-            // Generalized OSC pre-filter.
-            // Detects OSC sequences (ESC ] <code> ; <payload> BEL/ST) and
-            // dispatches events. Also filters them from the alacritty parser.
-            //
-            // Supported OSC codes:
-            //   7   → CwdChanged (file:// URL)
-            //   133 → CommandStarted / CommandFinished (FinalTerm markers)
-            let mut osc_buf: Vec<u8> = Vec::new();
-            let mut osc_active = false;
-            let mut last_esc = false;
+            #[derive(Clone, Copy, Debug, PartialEq)]
+            enum OscParseState {
+                Normal,
+                Esc,
+                Osc,
+                OscEsc,
+            }
 
-            // Command timing state
+            let mut osc_state = OscParseState::Normal;
+            let mut osc_buf: Vec<u8> = Vec::new();
             let mut cmd_start_time: Option<std::time::Instant> = None;
+
+            struct PendingNotification {
+                title: String,
+                body: String,
+            }
+            let mut pending_notifications: std::collections::HashMap<String, PendingNotification> = std::collections::HashMap::new();
+
+            let mut handle_cmd = |cmd: OscCommand, cursor_line: i32, screen_lines: i32, base: u64| {
+                match cmd {
+                    OscCommand::NotificationQuery { id } => {
+                        let resp = format!("\x1b]99;i={}:p=OK;\x1b\\", id);
+                        let mut w = writer_clone.lock();
+                        let _ = w.write_all(resp.as_bytes());
+                        let _ = w.flush();
+                    }
+                    OscCommand::NotificationFragment { id, p_type, done, payload } => {
+                        if let Some(query_id) = id {
+                            let entry = pending_notifications.entry(query_id.clone()).or_insert_with(|| PendingNotification {
+                                title: String::new(),
+                                body: String::new(),
+                            });
+                            match p_type.as_deref() {
+                                Some("title") => entry.title.push_str(&payload),
+                                Some("body") | None => entry.body.push_str(&payload),
+                                _ => {}
+                            }
+                            if done {
+                                if let Some(finished) = pending_notifications.remove(&query_id) {
+                                    let title = if finished.title.is_empty() {
+                                        "Fasty".to_string()
+                                    } else {
+                                        finished.title
+                                    };
+                                    dispatch_osc_action(
+                                        &OscCommand::Notification { title, body: finished.body },
+                                        &proxy_clone,
+                                        cursor_line,
+                                        base,
+                                        screen_lines,
+                                    );
+                                }
+                            }
+                        } else {
+                            dispatch_osc_action(
+                                &OscCommand::Notification { title: "Fasty".to_string(), body: payload },
+                                &proxy_clone,
+                                cursor_line,
+                                base,
+                                screen_lines,
+                            );
+                        }
+                    }
+                    _ => {
+                        dispatch_osc_action(&cmd, &proxy_clone, cursor_line, base, screen_lines);
+                    }
+                }
+            };
 
             loop {
                 match reader.read(&mut buf) {
@@ -222,82 +284,71 @@ impl TerminalState {
                         break;
                     }
                     Ok(n) => {
-                        // Pass 1: Pre-scan bytes to detect and classify OSC sequences.
-                        // We record which byte ranges to filter from the alacritty parser.
-                        // Each range is (start_idx, end_idx) within buf[..n].
-                        let mut filter_ranges: Vec<(usize, usize)> = Vec::new();
-                        let mut osc_start_idx: usize = 0;
-
-                        for (i, &byte) in buf[..n].iter().enumerate() {
-                            if !osc_active {
-                                if last_esc && byte == b']' {
-                                    osc_active = true;
-                                    osc_buf.clear();
-                                    osc_start_idx = i - 1; // ESC was at i-1
-                                    last_esc = false;
-                                } else {
-                                    last_esc = byte == 0x1b;
-                                }
-                            } else {
-                                let dominated = if byte == 0x07 {
-                                    true
-                                } else if osc_buf.last() == Some(&0x1b) && byte == b'\\' {
-                                    true
-                                } else if osc_buf.len() > 4096 {
-                                    true // safety abort
-                                } else {
-                                    false
-                                };
-
-                                if dominated {
-                                    let osc_end = if byte == 0x07 {
-                                        i + 1 // include BEL
-                                    } else if byte == b'\\' {
-                                        i + 1 // include backslash
-                                    } else {
-                                        i // safety: don't include this byte
-                                    };
-
-                                    filter_ranges.push((osc_start_idx, osc_end));
-
-                                    // Classify and dispatch
-                                    if byte != 0x1b || byte == b'\\' {
-                                        // For ST terminator (ESC \), strip trailing ESC from buf
-                                        let dispatch_buf = if byte == b'\\' && osc_buf.last() == Some(&0x1b) {
-                                            &osc_buf[..osc_buf.len() - 1]
-                                        } else {
-                                            &osc_buf[..]
-                                        };
-                                        dispatch_osc(dispatch_buf, &proxy_clone, &mut cmd_start_time);
-                                    }
-
-                                    osc_active = false;
-                                    osc_buf.clear();
-                                } else {
-                                    osc_buf.push(byte);
-                                }
-                            }
-                        }
-
-                        // Pass 2: Feed non-filtered bytes to alacritty parser.
                         let mut term_locked = term_clone.lock();
-                        let mut filter_idx = 0;
-                        for (i, &byte) in buf[..n].iter().enumerate() {
-                            // Skip filtered ranges
-                            if filter_idx < filter_ranges.len() {
-                                let (start, end) = filter_ranges[filter_idx];
-                                if i < end {
-                                    if i >= start {
-                                        continue;
-                                    }
-                                } else {
-                                    filter_idx += 1;
-                                }
+                        let mut local_lines = 0;
+
+                        for &byte in buf[..n].iter() {
+                            if byte == 0x0A {
+                                local_lines += 1;
                             }
 
                             parser.advance(&mut *term_locked, byte);
+
+                            match osc_state {
+                                OscParseState::Normal => {
+                                    if byte == 0x1b {
+                                        osc_state = OscParseState::Esc;
+                                    }
+                                }
+                                OscParseState::Esc => {
+                                    if byte == b']' {
+                                        osc_state = OscParseState::Osc;
+                                        osc_buf.clear();
+                                    } else {
+                                        osc_state = OscParseState::Normal;
+                                    }
+                                }
+                                OscParseState::Osc => {
+                                    if byte == 0x07 {
+                                        if let Some(cmd) = parse_osc(&osc_buf, &mut cmd_start_time) {
+                                            let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
+                                            let screen_lines = term_locked.grid().screen_lines() as i32;
+                                            let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
+                                            handle_cmd(cmd, cursor_line, screen_lines, base);
+                                        }
+                                        osc_state = OscParseState::Normal;
+                                    } else if byte == 0x1b {
+                                        osc_state = OscParseState::OscEsc;
+                                    } else {
+                                        osc_buf.push(byte);
+                                        if osc_buf.len() > 4096 {
+                                            osc_state = OscParseState::Normal;
+                                        }
+                                    }
+                                }
+                                OscParseState::OscEsc => {
+                                    if byte == b'\\' {
+                                        if let Some(cmd) = parse_osc(&osc_buf, &mut cmd_start_time) {
+                                            let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
+                                            let screen_lines = term_locked.grid().screen_lines() as i32;
+                                            let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
+                                            handle_cmd(cmd, cursor_line, screen_lines, base);
+                                        }
+                                        osc_state = OscParseState::Normal;
+                                    } else {
+                                        osc_buf.push(0x1b);
+                                        osc_buf.push(byte);
+                                        osc_state = OscParseState::Osc;
+                                        if osc_buf.len() > 4096 {
+                                            osc_state = OscParseState::Normal;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         drop(term_locked);
+
+                        total_lines_pushed_clone.fetch_add(local_lines, Ordering::Relaxed);
 
                         render_gen_clone.fetch_add(1, Ordering::Relaxed);
                         let _ = proxy_clone.send_event(AppEvent::Wakeup);
@@ -319,6 +370,7 @@ impl TerminalState {
             writer: writer_arc,
             master: master_arc,
             shell_pid,
+            total_lines_pushed,
         })
     }
 
@@ -434,68 +486,230 @@ fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
-/// Classify an OSC payload and emit the appropriate AppEvent.
-/// `buf` contains the raw bytes between `ESC ]` and the terminator (BEL/ST),
-/// i.e. the full `code;payload` string.
-fn dispatch_osc(
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut table = [0u8; 256];
+    for (i, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".iter().enumerate() {
+        table[c as usize] = i as u8;
+    }
+    
+    let mut out = Vec::new();
+    let mut buffer = 0u32;
+    let mut bits = 0;
+    
+    for &b in s.as_bytes() {
+        if b == b'=' {
+            break;
+        }
+        let val = table[b as usize];
+        if val == 0 && b != b'A' {
+            continue; // Skip whitespace/invalid chars
+        }
+        buffer = (buffer << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+#[derive(Debug, Clone)]
+enum OscCommand {
+    Cwd(String),
+    CommandStarted,
+    CommandFinished { duration_ms: u128, exit_code: Option<i32> },
+    PromptStarted,
+    Notification { title: String, body: String },
+    NotificationQuery { id: String },
+    NotificationFragment {
+        id: Option<String>,
+        p_type: Option<String>,
+        done: bool,
+        payload: String,
+    },
+}
+
+fn parse_osc(
     buf: &[u8],
-    proxy: &winit::event_loop::EventLoopProxy<AppEvent>,
     cmd_start_time: &mut Option<std::time::Instant>,
-) {
-    // Split into code and payload at the first semicolon
-    let semicolon = match buf.iter().position(|&b| b == b';') {
-        Some(pos) => pos,
-        None => return, // no payload separator
-    };
+) -> Option<OscCommand> {
+    let semicolon = buf.iter().position(|&b| b == b';')?;
     let code = &buf[..semicolon];
     let payload = &buf[semicolon + 1..];
 
     match code {
         b"7" => {
-            // OSC 7: CwdChanged
-            if let Some(path) = file_url_to_path(payload) {
-                let _ = proxy.send_event(AppEvent::CwdChanged(path));
+            if let Ok(s) = std::str::from_utf8(payload) {
+                Some(OscCommand::Cwd(s.to_string()))
+            } else {
+                None
+            }
+        }
+        b"9" => {
+            if let Ok(msg) = std::str::from_utf8(payload) {
+                Some(OscCommand::Notification {
+                    title: "Fasty".to_string(),
+                    body: msg.to_string(),
+                })
+            } else {
+                None
+            }
+        }
+        b"99" => {
+            let (metadata_bytes, payload_bytes) = if let Some(idx) = payload.iter().position(|&b| b == b';') {
+                (&payload[..idx], &payload[idx + 1..])
+            } else {
+                (payload, &[][..])
+            };
+
+            let metadata = std::str::from_utf8(metadata_bytes).ok()?;
+            let actual_payload = std::str::from_utf8(payload_bytes).ok()?;
+
+            let mut id = None;
+            let mut p_type = None;
+            let mut done = true;
+            let mut is_base64 = false;
+
+            for part in metadata.split(':') {
+                if let Some(eq) = part.find('=') {
+                    let key = &part[..eq];
+                    let val = &part[eq + 1..];
+                    match key {
+                        "i" => id = Some(val.to_string()),
+                        "p" => p_type = Some(val.to_string()),
+                        "d" => done = val == "1" || val != "0",
+                        "e" => is_base64 = val == "1",
+                        _ => {}
+                    }
+                }
+            }
+
+            let decoded_payload = if is_base64 {
+                if let Some(bytes) = base64_decode(actual_payload) {
+                    String::from_utf8(bytes).unwrap_or_else(|_| actual_payload.to_string())
+                } else {
+                    actual_payload.to_string()
+                }
+            } else {
+                actual_payload.to_string()
+            };
+
+            if p_type.as_deref() == Some("?") {
+                if let Some(query_id) = id {
+                    return Some(OscCommand::NotificationQuery { id: query_id });
+                }
+            }
+
+            Some(OscCommand::NotificationFragment {
+                id,
+                p_type,
+                done,
+                payload: decoded_payload,
+            })
+        }
+        b"777" => {
+            if payload.starts_with(b"notify;") {
+                let parts: Vec<&[u8]> = payload[7..].split(|&b| b == b';').collect();
+                if parts.len() >= 2 {
+                    let title = std::str::from_utf8(parts[0]).unwrap_or("Fasty").to_string();
+                    let body = parts[1..]
+                        .iter()
+                        .map(|p| std::str::from_utf8(p).unwrap_or(""))
+                        .collect::<Vec<&str>>()
+                        .join(";");
+                    Some(OscCommand::Notification { title, body })
+                } else if parts.len() == 1 {
+                    let body = std::str::from_utf8(parts[0]).unwrap_or("").to_string();
+                    Some(OscCommand::Notification {
+                        title: "Fasty".to_string(),
+                        body,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
             }
         }
         b"133" => {
-            tracing::info!("OSC 133 marker: payload={}", std::str::from_utf8(payload).unwrap_or("?"));
-            // OSC 133: FinalTerm / VS Code command markers
-            // A = prompt start, B = command start, C = command exec, D = command done
             match payload {
+                b"A" => {
+                    Some(OscCommand::PromptStarted)
+                }
                 b"B" => {
                     *cmd_start_time = Some(std::time::Instant::now());
-                    tracing::info!("OSC 133: CommandStarted");
-                    let _ = proxy.send_event(AppEvent::CommandStarted);
+                    Some(OscCommand::CommandStarted)
                 }
                 b"D" => {
-                    // payload is just "D" — exit code was not included in this form
                     if let Some(start) = cmd_start_time.take() {
                         let duration_ms = start.elapsed().as_millis();
-                        tracing::info!("OSC 133: CommandFinished duration={}ms", duration_ms);
-                        let _ = proxy.send_event(AppEvent::CommandFinished {
+                        Some(OscCommand::CommandFinished {
                             duration_ms,
                             exit_code: None,
-                        });
+                        })
+                    } else {
+                        None
                     }
                 }
                 _ => {
-                    // Could be "D;exitcode" — check for that
                     if payload.starts_with(b"D;") {
                         let exit_str = std::str::from_utf8(&payload[2..]).unwrap_or("0");
                         let exit_code: Option<i32> = exit_str.parse().ok();
                         if let Some(start) = cmd_start_time.take() {
                             let duration_ms = start.elapsed().as_millis();
-                            tracing::info!("OSC 133: CommandFinished duration={}ms exit={:?}", duration_ms, exit_code);
-                            let _ = proxy.send_event(AppEvent::CommandFinished {
+                            Some(OscCommand::CommandFinished {
                                 duration_ms,
                                 exit_code,
-                            });
+                            })
+                        } else {
+                            None
                         }
+                    } else {
+                        None
                     }
-                    // A and C are ignored (no event needed)
                 }
             }
         }
-        _ => {}
+        _ => None,
+    }
+}
+
+fn dispatch_osc_action(
+    cmd: &OscCommand,
+    proxy: &winit::event_loop::EventLoopProxy<AppEvent>,
+    cursor_line: i32,
+    absolute_base: u64,
+    screen_lines: i32,
+) {
+    match cmd {
+        OscCommand::Cwd(path) => {
+            if let Some(p) = file_url_to_path(path.as_bytes()) {
+                let _ = proxy.send_event(AppEvent::CwdChanged(p));
+            }
+        }
+        OscCommand::CommandStarted => {
+            let _ = proxy.send_event(AppEvent::CommandStarted);
+        }
+        OscCommand::CommandFinished { duration_ms, exit_code } => {
+            let _ = proxy.send_event(AppEvent::CommandFinished {
+                duration_ms: *duration_ms,
+                exit_code: *exit_code,
+            });
+        }
+        OscCommand::PromptStarted => {
+            let scrolled = (absolute_base as i32 - screen_lines).max(0);
+            let absolute_line = scrolled + cursor_line;
+            let _ = proxy.send_event(AppEvent::PromptStarted {
+                absolute_line: absolute_line.max(0) as u64,
+            });
+        }
+        OscCommand::Notification { title, body } => {
+            let _ = proxy.send_event(AppEvent::Notification {
+                title: title.clone(),
+                body: body.clone(),
+            });
+        }
+        OscCommand::NotificationQuery { .. } | OscCommand::NotificationFragment { .. } => {}
     }
 }
