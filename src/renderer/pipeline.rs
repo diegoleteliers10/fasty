@@ -55,6 +55,8 @@ struct VertexOutput {
     @location(2) fg_color: vec4<f32>,
     @location(3) is_color: f32,
     @location(4) size: vec2<f32>,
+    @location(5) vertex_uv: vec2<f32>,
+    @location(6) custom_coords: vec3<f32>,
 }
 
 fn sd_segment(p: vec2<f32>, p1: vec2<f32>, p2: vec2<f32>) -> f32 {
@@ -99,7 +101,7 @@ fn sd_connection(p: vec2<f32>, center: vec2<f32>, size: vec2<f32>, dir: u32, sty
     return 1e6;
 }
 
-fn draw_block_or_box(code: u32, kind: u32, left_style: u32, right_style: u32, top_style: u32, bottom_style: u32, uv: vec2<f32>, size: vec2<f32>, frag_pos: vec2<f32>) -> f32 {
+fn draw_block_or_box(code: u32, kind: u32, left_style: u32, right_style: u32, top_style: u32, bottom_style: u32, uv: vec2<f32>, size: vec2<f32>, frag_pos: vec2<f32>, custom_coords: vec3<f32>) -> f32 {
     let p = uv * size;
     let center = size / 2.0;
 
@@ -163,29 +165,61 @@ fn draw_block_or_box(code: u32, kind: u32, left_style: u32, right_style: u32, to
         let space = light * 1.5;
 
         if (kind == 1u) {
-            // Round corners
-            let radius = min(center.x, center.y);
-            var c = center;
+            // Round corners using precise CPU-computed midpoints and thickness
+            let mid_x_rel = custom_coords.x;
+            let mid_y_rel = custom_coords.y;
+            let thickness = custom_coords.z;
+
+            let radius = min(mid_x_rel, mid_y_rel);
+
+            var c = vec2<f32>(mid_x_rel, mid_y_rel);
             var is_active_corner = false;
+            var d_line = 1e6;
+
             if (right_style > 0u && bottom_style > 0u) { // ╭
-                c = center + vec2<f32>(radius, radius);
+                c = vec2<f32>(mid_x_rel + radius, mid_y_rel + radius);
                 is_active_corner = p.x < c.x && p.y < c.y;
+                if (p.x >= mid_x_rel - thickness/2.0 && p.x <= mid_x_rel + thickness/2.0 && p.y >= mid_y_rel + radius) {
+                    d_line = abs(p.x - mid_x_rel);
+                }
+                if (p.y >= mid_y_rel - thickness/2.0 && p.y <= mid_y_rel + thickness/2.0 && p.x >= mid_x_rel + radius) {
+                    d_line = min(d_line, abs(p.y - mid_y_rel));
+                }
             } else if (left_style > 0u && bottom_style > 0u) { // ╮
-                c = center + vec2<f32>(-radius, radius);
+                c = vec2<f32>(mid_x_rel - radius, mid_y_rel + radius);
                 is_active_corner = p.x > c.x && p.y < c.y;
+                if (p.x >= mid_x_rel - thickness/2.0 && p.x <= mid_x_rel + thickness/2.0 && p.y >= mid_y_rel + radius) {
+                    d_line = abs(p.x - mid_x_rel);
+                }
+                if (p.y >= mid_y_rel - thickness/2.0 && p.y <= mid_y_rel + thickness/2.0 && p.x <= mid_x_rel - radius) {
+                    d_line = min(d_line, abs(p.y - mid_y_rel));
+                }
             } else if (left_style > 0u && top_style > 0u) { // ╯
-                c = center + vec2<f32>(-radius, -radius);
+                c = vec2<f32>(mid_x_rel - radius, mid_y_rel - radius);
                 is_active_corner = p.x > c.x && p.y > c.y;
+                if (p.x >= mid_x_rel - thickness/2.0 && p.x <= mid_x_rel + thickness/2.0 && p.y <= mid_y_rel - radius) {
+                    d_line = abs(p.x - mid_x_rel);
+                }
+                if (p.y >= mid_y_rel - thickness/2.0 && p.y <= mid_y_rel + thickness/2.0 && p.x <= mid_x_rel - radius) {
+                    d_line = min(d_line, abs(p.y - mid_y_rel));
+                }
             } else if (right_style > 0u && top_style > 0u) { // ╰
-                c = center + vec2<f32>(radius, -radius);
+                c = vec2<f32>(mid_x_rel + radius, mid_y_rel - radius);
                 is_active_corner = p.x < c.x && p.y > c.y;
+                if (p.x >= mid_x_rel - thickness/2.0 && p.x <= mid_x_rel + thickness/2.0 && p.y <= mid_y_rel - radius) {
+                    d_line = abs(p.x - mid_x_rel);
+                }
+                if (p.y >= mid_y_rel - thickness/2.0 && p.y <= mid_y_rel + thickness/2.0 && p.x >= mid_x_rel + radius) {
+                    d_line = min(d_line, abs(p.y - mid_y_rel));
+                }
             }
 
+            var dist = 1e6;
             if (is_active_corner) {
-                let dist = abs(length(p - c) - radius) - light / 2.0;
-                return 1.0 - smoothstep(-0.75, 0.75, dist);
+                dist = abs(length(p - c) - radius) - thickness / 2.0;
             }
-            return 0.0;
+            dist = min(dist, d_line - thickness / 2.0);
+            return 1.0 - smoothstep(-0.75, 0.75, dist);
         } else if (kind == 2u) {
             // Diagonals
             var dist = 1e6;
@@ -261,6 +295,8 @@ fn vertex_main(
     output.fg_color = cell_fg;
     output.is_color = cell_is_color;
     output.size = cell_size;
+    output.vertex_uv = vertex_uv;
+    output.custom_coords = vec3<f32>(cell_uv_offset.x, cell_uv_offset.y, cell_uv_size.x);
 
     return output;
 }
@@ -280,7 +316,8 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         let alpha = draw_block_or_box(
             code, kind,
             left_style, right_style, top_style, bottom_style,
-            input.uv, input.size, input.position.xy
+            input.vertex_uv, input.size, input.position.xy,
+            input.custom_coords
         );
 
         return vec4<f32>(input.fg_color.rgb, input.fg_color.a * alpha);
@@ -5873,6 +5910,149 @@ fn is_dingbat_symbol(ch: char) -> bool {
     matches!(ch as u32, 0x2700..=0x27BF)
 }
 
+fn render_box_drawing_instances(
+    ch: char,
+    cell_x: f32,
+    cell_y: f32,
+    cell_width: f32,
+    cell_height: f32,
+    fg_color: [f32; 4],
+) -> Vec<CellInstance> {
+    let mut instances = Vec::new();
+    let decoded = decode_box_drawing(ch);
+    if decoded.is_none() {
+        return instances;
+    }
+    let (left_style, right_style, top_style, bottom_style, kind) = decoded.unwrap();
+
+    // Fall back to shader for rounded corners (kind == 1), diagonals (kind == 2) and dashed lines (kind == 3)
+    if kind == 1 || kind == 2 || kind == 3 {
+        let code = ch as u32 as f32;
+        let is_color_val = -(code + kind as f32 / 10.0);
+        
+        let mid_y = (cell_y + cell_height / 2.0).round();
+        let mid_x = (cell_x + cell_width / 2.0).round();
+        let thickness = (cell_height * 0.10).round().max(1.0);
+        
+        let mid_x_rel = mid_x - cell_x;
+        let mid_y_rel = mid_y - cell_y;
+
+        instances.push(CellInstance::new(
+            cell_x,
+            cell_y,
+            cell_width,
+            cell_height,
+            fg_color,
+            [left_style as f32, right_style as f32, top_style as f32, bottom_style as f32],
+            mid_x_rel,
+            mid_y_rel,
+            thickness,
+            1.0,
+            is_color_val,
+        ));
+        return instances;
+    }
+
+    // Compute once, reuse everywhere — never recalculate per-character
+    let mid_y = (cell_y + cell_height / 2.0).round();      // shared horizontal line Y
+    let mid_x = (cell_x + cell_width / 2.0).round();        // shared vertical line X
+    let thickness = (cell_height * 0.10).round().max(1.0);  // shared thickness, min 1px
+    let _half_thick = thickness / 2.0;
+
+    let t_light = thickness;
+    let t_heavy = (thickness * 2.2).round().max(2.0);
+    // Double lines use light thickness and some space between them
+    let space = (t_light * 1.5).round().max(2.0);
+
+    let mut push_segment_direct = |x: f32, y: f32, w: f32, h: f32| {
+        instances.push(CellInstance::new(
+            x,
+            y,
+            w,
+            h,
+            fg_color,
+            [0.0, 0.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            -9608.0, // Solid full block shader path (0x2588)
+        ));
+    };
+
+    let mut draw_rect = |x1: f32, y1: f32, x2: f32, y2: f32| {
+        let rx1 = x1.round();
+        let ry1 = y1.round();
+        let rx2 = x2.round();
+        let ry2 = y2.round();
+        if rx2 > rx1 && ry2 > ry1 {
+            push_segment_direct(rx1, ry1, rx2 - rx1, ry2 - ry1);
+        }
+    };
+
+    let get_thickness = |style: u8| -> f32 {
+        match style {
+            1 => t_light,
+            2 => t_heavy,
+            3 => t_light,
+            _ => 0.0,
+        }
+    };
+
+    let t_left = get_thickness(left_style);
+    let t_right = get_thickness(right_style);
+    let t_top = get_thickness(top_style);
+    let t_bottom = get_thickness(bottom_style);
+
+    // Draw horizontal lines (Left and Right)
+    if left_style > 0 {
+        if left_style == 3 {
+            // Double horizontal line
+            draw_rect(cell_x, mid_y - space - t_left / 2.0, mid_x, mid_y - space + t_left / 2.0);
+            draw_rect(cell_x, mid_y + space - t_left / 2.0, mid_x, mid_y + space + t_left / 2.0);
+        } else {
+            draw_rect(cell_x, mid_y - t_left / 2.0, mid_x, mid_y + t_left / 2.0);
+        }
+    }
+
+    if right_style > 0 {
+        if right_style == 3 {
+            // Double horizontal line
+            draw_rect(mid_x, mid_y - space - t_right / 2.0, cell_x + cell_width, mid_y - space + t_right / 2.0);
+            draw_rect(mid_x, mid_y + space - t_right / 2.0, cell_x + cell_width, mid_y + space + t_right / 2.0);
+        } else {
+            draw_rect(mid_x, mid_y - t_right / 2.0, cell_x + cell_width, mid_y + t_right / 2.0);
+        }
+    }
+
+    // Draw vertical lines (Top and Bottom)
+    if top_style > 0 {
+        if top_style == 3 {
+            // Double vertical line
+            let y2 = if bottom_style > 0 { mid_y + space + t_top } else { mid_y + space + t_top / 2.0 };
+            draw_rect(mid_x - space - t_top / 2.0, cell_y, mid_x - space + t_top / 2.0, y2);
+            draw_rect(mid_x + space - t_top / 2.0, cell_y, mid_x + space + t_top / 2.0, y2);
+        } else {
+            let y2 = if bottom_style > 0 { mid_y + t_top } else { mid_y + t_top / 2.0 };
+            draw_rect(mid_x - t_top / 2.0, cell_y, mid_x + t_top / 2.0, y2);
+        }
+    }
+
+    if bottom_style > 0 {
+        if bottom_style == 3 {
+            // Double vertical line
+            let y1 = if top_style > 0 { mid_y - space - t_bottom } else { mid_y - space - t_bottom / 2.0 };
+            draw_rect(mid_x - space - t_bottom / 2.0, y1, mid_x - space + t_bottom / 2.0, cell_y + cell_height);
+            draw_rect(mid_x + space - t_bottom / 2.0, y1, mid_x + space + t_bottom / 2.0, cell_y + cell_height);
+        } else {
+            let y1 = if top_style > 0 { mid_y - t_bottom } else { mid_y - t_bottom / 2.0 };
+            draw_rect(mid_x - t_bottom / 2.0, y1, mid_x + t_bottom / 2.0, cell_y + cell_height);
+        }
+    }
+
+    instances
+}
+
 fn render_single_char(
     cell: &alacritty_terminal::term::cell::Cell,
     cell_x: f32,
@@ -5887,37 +6067,43 @@ fn render_single_char(
     if cell.c != ' ' && cell.c != '\0' {
         if is_custom_block_drawing(cell.c) {
             let fg = cell_fg_to_f32(cell.fg, cell.flags);
-            let mut left = 0.0;
-            let mut right = 0.0;
-            let mut top = 0.0;
-            let mut bottom = 0.0;
-            let mut kind = 0.0;
+            let code = cell.c as u32;
+            if (0x2500..=0x257F).contains(&code) {
+                let instances = render_box_drawing_instances(cell.c, cell_x, cell_y, actual_cell_width, actual_cell_height, fg);
+                fg_instances.extend(instances);
+            } else {
+                let mut left = 0.0;
+                let mut right = 0.0;
+                let mut top = 0.0;
+                let mut bottom = 0.0;
+                let mut kind = 0.0;
 
-            if let Some((l, r, t, b, k)) = decode_box_drawing(cell.c) {
-                left = l as f32;
-                right = r as f32;
-                top = t as f32;
-                bottom = b as f32;
-                kind = k as f32;
+                if let Some((l, r, t, b, k)) = decode_box_drawing(cell.c) {
+                    left = l as f32;
+                    right = r as f32;
+                    top = t as f32;
+                    bottom = b as f32;
+                    kind = k as f32;
+                }
+
+                let code = cell.c as u32 as f32;
+                let is_color_val = -(code + kind / 10.0);
+
+                let block_instance = CellInstance::new(
+                    cell_x,
+                    cell_y,
+                    actual_cell_width,
+                    actual_cell_height,
+                    fg,
+                    [left, right, top, bottom],
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
+                    is_color_val,
+                );
+                fg_instances.push(block_instance);
             }
-
-            let code = cell.c as u32 as f32;
-            let is_color_val = -(code + kind / 10.0);
-
-            let block_instance = CellInstance::new(
-                cell_x,
-                cell_y,
-                actual_cell_width,
-                actual_cell_height,
-                fg,
-                [left, right, top, bottom],
-                0.0,
-                0.0,
-                1.0,
-                1.0,
-                is_color_val,
-            );
-            fg_instances.push(block_instance);
         } else if let Some(entry) = atlas.get_or_rasterize(cell.c, device, queue) {
             if entry.width > 0.0 && entry.height > 0.0 {
                 let mut fg = cell_fg_to_f32(cell.fg, cell.flags);
