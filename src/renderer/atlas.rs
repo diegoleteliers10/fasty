@@ -385,9 +385,7 @@ impl Atlas {
         // Pre-rasterize basic alphanumeric and punctuation characters at startup
         // to avoid calling queue.write_texture inside active RenderPasses for UI windows.
         let startup_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.- :";
-        for c in startup_chars.chars() {
-            let _ = atlas.get_or_rasterize(c, device, queue);
-        }
+        atlas.rasterize_batch(startup_chars, device, queue);
         if let Some(space) = atlas.entries.get(&GlyphKey::Char(' ')) {
             atlas.fallback_glyph = Some(*space);
         }
@@ -904,6 +902,135 @@ impl Atlas {
         }
 
         Ok(())
+    }
+
+    pub fn rasterize_batch(&mut self, chars: &str, device: &Device, queue: &Queue) {
+        let mut missing_chars = Vec::new();
+        for c in chars.chars() {
+            if let Some(entry) = self.entries.get(&GlyphKey::Char(c)) {
+                if entry.width > 0.0 || entry.height > 0.0 {
+                    continue;
+                }
+            }
+            missing_chars.push(c);
+        }
+
+        if missing_chars.is_empty() {
+            return;
+        }
+
+        let physical_size = self.font_size * self.scale_factor;
+
+        FT_LIB.with(|lib| {
+            // 1. Try primary font face
+            if let Ok(face) = lib.new_face(&self.primary_path, 0) {
+                let _ = face.set_pixel_sizes(0, physical_size as u32);
+                let is_color_font = face.has_fixed_sizes();
+
+                let mut still_missing = Vec::new();
+                for c in missing_chars {
+                    let is_color = is_color_font || is_emoji(c);
+                    let load_flags = if is_color {
+                        LoadFlag::RENDER | LoadFlag::COLOR
+                    } else {
+                        LoadFlag::RENDER
+                    };
+
+                    let mut found = false;
+                    if let Some(idx) = face.get_char_index(c as usize) {
+                        if idx != 0 {
+                            if face.load_glyph(idx, load_flags).is_ok() {
+                                let _ = self.rasterize_freetype_glyph_key(device, queue, GlyphKey::Char(c), &face.glyph(), is_color);
+                                found = true;
+                            }
+                        }
+                    }
+
+                    if !found {
+                        still_missing.push(c);
+                    }
+                }
+                missing_chars = still_missing;
+            }
+
+            if missing_chars.is_empty() {
+                return;
+            }
+
+            // 2. Try fallbacks
+            let paths_to_try = self.fallback_paths.clone();
+            for path in &paths_to_try {
+                if missing_chars.is_empty() {
+                    break;
+                }
+                if let Ok(face) = lib.new_face(path, 0) {
+                    let is_color_font = face.has_fixed_sizes();
+                    let mut still_missing = Vec::new();
+
+                    for c in missing_chars {
+                        let is_color = is_color_font || is_emoji(c);
+                        if is_color {
+                            let num_fixed_sizes = face.raw().num_fixed_sizes;
+                            if num_fixed_sizes > 0 {
+                                let mut best_index = 0;
+                                let mut best_diff = i32::MAX;
+                                let target_size = physical_size as i32;
+                                let sizes = unsafe {
+                                    std::slice::from_raw_parts(face.raw().available_sizes, num_fixed_sizes as usize)
+                                };
+                                for (i, sz) in sizes.iter().enumerate() {
+                                    let diff = (sz.height as i32 - target_size).abs();
+                                    if diff < best_diff {
+                                        best_diff = diff;
+                                        best_index = i;
+                                    }
+                                }
+                                unsafe {
+                                    freetype::ffi::FT_Select_Size(face.raw() as *const _ as *mut _, best_index as i32);
+                                }
+                            }
+                        } else {
+                            let _ = face.set_pixel_sizes(0, physical_size as u32);
+                        }
+
+                        let mut found = false;
+                        if let Some(idx) = face.get_char_index(c as usize) {
+                            if idx != 0 {
+                                let load_flags = if is_color {
+                                    LoadFlag::RENDER | LoadFlag::COLOR
+                                } else {
+                                    LoadFlag::RENDER
+                                };
+                                if face.load_glyph(idx, load_flags).is_ok() {
+                                    let _ = self.rasterize_freetype_glyph_key(device, queue, GlyphKey::Char(c), &face.glyph(), is_color);
+                                    found = true;
+                                }
+                            }
+                        }
+
+                        if !found {
+                            still_missing.push(c);
+                        }
+                    }
+                    missing_chars = still_missing;
+                }
+            }
+
+            // For anything remaining, insert a zero-sized entry in entries
+            for c in missing_chars {
+                let dummy = AtlasEntry {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                    left: 0.0,
+                    top: 0.0,
+                    is_color: false,
+                    is_block: false,
+                };
+                self.entries.insert(GlyphKey::Char(c), dummy);
+            }
+        });
     }
 
     pub fn get_or_rasterize(&mut self, c: char, device: &Device, queue: &Queue) -> Option<AtlasEntry> {
