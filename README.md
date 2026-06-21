@@ -1,5 +1,9 @@
 # Fasty
 
+<p align="center">
+  <img src="assets/fastyIcon.png" alt="Fasty Logo" width="128" />
+</p>
+
 GPU-accelerated terminal emulator built with Rust, `winit`, and `wgpu`.
 
 Inspired by [Ghostty](https://github.com/ghostty-org/ghostty), Fasty leverages `wgpu` (the modern, cross-platform GPU API powering GPUI/Zed) for rendering instead of raw Vulkan/Metal implementations, presenting a minimal UI footprint with ultra-high performance.
