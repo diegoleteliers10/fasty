@@ -54,6 +54,7 @@ pub struct RenderInputs<'a> {
     pub context_menu_is_about: bool,
     pub context_menu_x: f32,
     pub context_menu_y: f32,
+    pub context_menu_scroll_y: f32,
     pub context_menu_hovered_idx: Option<usize>,
     pub context_menu_open_time_secs: Option<f32>,
     pub context_menu_items: &'a [crate::renderer::ContextMenuItem],
@@ -134,6 +135,7 @@ impl<'a> Default for RenderInputs<'a> {
             context_menu_is_about: false,
             context_menu_x: 0.0,
             context_menu_y: 0.0,
+            context_menu_scroll_y: 0.0,
             context_menu_hovered_idx: None,
             context_menu_open_time_secs: None,
             context_menu_items: &[],
@@ -311,7 +313,7 @@ impl<'a> Renderer<'a> {
 
         let scale_factor = window.scale_factor() as f32;
         let atlas = Atlas::new(&device, &queue, ATLAS_SIZE, ATLAS_SIZE, font_family, font_size, scale_factor)?;
-        let ui_atlas = Atlas::new(&device, &queue, ATLAS_SIZE, ATLAS_SIZE, font_family, 13.0, scale_factor)?;
+        let ui_atlas = Atlas::new(&device, &queue, ATLAS_SIZE, ATLAS_SIZE, font_family, 12.0, scale_factor)?;
         let (cell_width, cell_height) = atlas.cell_size();
         tracing::info!("Atlas created with {} entries, cell_size: {}x{}", atlas.entries_len(), cell_width, cell_height);
         let pipeline = Pipeline::new(&device, &atlas, &ui_atlas, format);
@@ -364,7 +366,7 @@ impl<'a> Renderer<'a> {
 
         let scale_factor = window.scale_factor() as f32;
         let atlas = Atlas::new(&device, &queue, ATLAS_SIZE, ATLAS_SIZE, font_family, font_size, scale_factor)?;
-        let ui_atlas = Atlas::new(&device, &queue, ATLAS_SIZE, ATLAS_SIZE, font_family, 13.0, scale_factor)?;
+        let ui_atlas = Atlas::new(&device, &queue, ATLAS_SIZE, ATLAS_SIZE, font_family, 12.0, scale_factor)?;
         let (cell_width, cell_height) = atlas.cell_size();
         tracing::info!("Atlas created with {} entries, cell_size: {}x{}", atlas.entries_len(), cell_width, cell_height);
         let pipeline = Pipeline::new(&device, &atlas, &ui_atlas, format);
@@ -520,7 +522,7 @@ impl<'a> Renderer<'a> {
                 ATLAS_SIZE,
                 ATLAS_SIZE,
                 font_family,
-                13.0,
+                12.0,
                 scale_factor,
             )?;
             let pipeline = Pipeline::new(&self.device, &new_atlas, &new_ui_atlas, self.config.format);
@@ -635,6 +637,7 @@ impl<'a> Renderer<'a> {
                 inputs.context_menu_is_about,
                 inputs.context_menu_x,
                 inputs.context_menu_y,
+                inputs.context_menu_scroll_y,
                 inputs.context_menu_hovered_idx,
                 inputs.context_menu_items,
                 inputs.context_menu_open_time_secs,
@@ -866,7 +869,7 @@ pub struct SearchMatch {
     pub len: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum ContextMenuItem {
     Copy,
@@ -883,4 +886,6 @@ pub enum ContextMenuItem {
     OpenEmail,
     MoveToNewWindow,
     CopyHex,
+    GithubActionInfo { label: String, status: String, url: Option<String> },
+    CommandItem { label: String, command: String, cwd: String },
 }

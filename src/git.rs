@@ -1,22 +1,59 @@
 //! Git status types and worktree helpers shared between main and renderer.
 
 use std::path::{Path, PathBuf};
+use winit::event_loop::EventLoopProxy;
+use crate::terminal_state::AppEvent;
+use notify::Watcher;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SyncStatus {
+    #[default]
+    UpToDate,     // ✓
+    Behind(usize), // needs pull
+    Ahead(usize),  // needs push
+    Diverged,      // needs merge/rebase
+    Unknown,       // no remote
+}
 
 /// Cached git status for a single tab. Populated by `detect_git_status` in main.rs.
 #[derive(Debug, Clone)]
 pub struct GitStatus {
-    pub branch: String,
-    pub modified: usize,
-    pub staged: usize,
-    pub untracked: usize,
-    pub ahead: usize,
-    pub behind: usize,
-    pub last_commit_summary: String,
+    pub branch: String,           // "main"
+    pub is_detached: bool,        // true when HEAD is a raw commit, not a branch ref
+    pub ahead: usize,             // commits ahead of remote
+    pub behind: usize,            // commits behind remote
+    pub staged: usize,            // staged files count
+    pub unstaged: usize,          // modified unstaged count
+    pub untracked: usize,         // untracked files count (? count)
+    pub sync_status: SyncStatus,
+    pub last_commit_hash: String, // first 7 chars
+    pub last_commit_summary: String, // hash + commit subject line
+    pub last_updated: std::time::Instant,
 }
+
+pub type GitInfo = GitStatus;
 
 impl GitStatus {
     pub fn is_clean(&self) -> bool {
-        self.modified == 0 && self.staged == 0 && self.untracked == 0
+        self.unstaged == 0 && self.staged == 0 && self.untracked == 0
+    }
+}
+
+impl Default for GitStatus {
+    fn default() -> Self {
+        Self {
+            branch: String::new(),
+            is_detached: false,
+            ahead: 0,
+            behind: 0,
+            staged: 0,
+            unstaged: 0,
+            untracked: 0,
+            sync_status: SyncStatus::default(),
+            last_commit_hash: String::new(),
+            last_commit_summary: String::new(),
+            last_updated: std::time::Instant::now(),
+        }
     }
 }
 
@@ -94,13 +131,13 @@ fn run_git(cwd: Option<&Path>, args: &[&str]) -> Option<String> {
 }
 
 pub fn is_git_repo(cwd: &Path) -> bool {
-    run_git(Some(cwd), &["rev-parse", "--show-toplevel"]).is_some()
+    git2::Repository::discover(cwd).is_ok()
 }
 
 pub fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
-    let s = run_git(Some(cwd), &["rev-parse", "--show-toplevel"])?;
-    let trimmed = s.trim();
-    Some(PathBuf::from(trimmed))
+    let repo = git2::Repository::discover(cwd).ok()?;
+    let path = repo.workdir()?;
+    Some(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
 }
 
 pub fn list_worktrees(cwd: &Path) -> Vec<Worktree> {
@@ -131,4 +168,154 @@ pub fn create_worktree(toplevel: &Path, new_branch: &str) -> Option<PathBuf> {
         &["worktree", "add", &new_path_str, "-b", new_branch],
     )?;
     Some(new_path)
+}
+
+pub fn fetch_git_info(repo_path: &Path) -> Option<GitInfo> {
+    let repo = git2::Repository::open(repo_path).ok()?;
+
+    // Branch name + detached HEAD detection
+    let head = repo.head().ok()?;
+    let is_detached = !head.is_branch();
+    let branch = head.shorthand().unwrap_or("HEAD").to_string();
+
+    // Last commit
+    let commit = head.peel_to_commit().ok()?;
+    let hash = commit.id().to_string();
+    let hash_short = if hash.len() >= 7 { hash[..7].to_string() } else { hash.clone() };
+    let summary = commit.summary().unwrap_or("").to_string();
+    
+    // Ahead/behind vs remote
+    let (ahead, behind) = get_ahead_behind(&repo, &branch);
+    
+    // File status counts
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true).recurse_untracked_dirs(true);
+    let statuses = repo.statuses(Some(&mut opts)).ok()?;
+    
+    let mut staged = 0usize;
+    let mut unstaged = 0usize;
+    let mut untracked = 0usize;
+    
+    for entry in statuses.iter() {
+        let s = entry.status();
+        if s.intersects(
+            git2::Status::INDEX_NEW | git2::Status::INDEX_MODIFIED | 
+            git2::Status::INDEX_DELETED | git2::Status::INDEX_RENAMED
+        ) { staged += 1; }
+        if s.intersects(
+            git2::Status::WT_MODIFIED | git2::Status::WT_DELETED
+        ) { unstaged += 1; }
+        if s.contains(git2::Status::WT_NEW) { untracked += 1; }
+    }
+    
+    let sync_status = {
+        let local_refname = format!("refs/heads/{}", branch);
+        let remote_refname = format!("refs/remotes/origin/{}", branch);
+        let has_local = repo.refname_to_id(&local_refname).is_ok();
+        let has_remote = repo.refname_to_id(&remote_refname).is_ok();
+        if !has_local || !has_remote {
+            SyncStatus::Unknown
+        } else {
+            match (ahead, behind) {
+                (0, 0) => SyncStatus::UpToDate,
+                (a, 0) => SyncStatus::Ahead(a),
+                (0, b) => SyncStatus::Behind(b),
+                _      => SyncStatus::Diverged,
+            }
+        }
+    };
+    
+    Some(GitInfo {
+        branch,
+        is_detached,
+        ahead,
+        behind,
+        staged,
+        unstaged,
+        untracked,
+        sync_status,
+        last_commit_hash: hash_short,
+        last_commit_summary: format!("{} {}", &hash[..hash.len().min(7)], summary),
+        last_updated: std::time::Instant::now(),
+    })
+}
+
+fn get_ahead_behind(repo: &git2::Repository, branch: &str) -> (usize, usize) {
+    let local = match repo.refname_to_id(&format!("refs/heads/{}", branch)) {
+        Ok(id) => id,
+        Err(_) => return (0, 0),
+    };
+    let remote = match repo.refname_to_id(&format!("refs/remotes/origin/{}", branch)) {
+        Ok(id) => id,
+        Err(_) => return (0, 0),
+    };
+    repo.graph_ahead_behind(local, remote).unwrap_or((0, 0))
+}
+
+pub struct GitWatcherManager {
+    watchers: std::collections::HashMap<PathBuf, notify::RecommendedWatcher>,
+    proxy: EventLoopProxy<AppEvent>,
+}
+
+impl GitWatcherManager {
+    pub fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
+        Self {
+            watchers: std::collections::HashMap::new(),
+            proxy,
+        }
+    }
+
+    pub fn watch_repo(&mut self, repo_path: &Path) {
+        let repo_path = repo_path.to_path_buf();
+        if self.watchers.contains_key(&repo_path) {
+            return;
+        }
+
+        let git_dir = repo_path.join(".git");
+        if !git_dir.exists() {
+            return;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if res.is_ok() {
+                let _ = tx.send(());
+            }
+        }) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+
+        for path in &["HEAD", "index", "COMMIT_EDITMSG", "refs/heads"] {
+            let _ = watcher.watch(
+                &git_dir.join(path),
+                notify::RecursiveMode::NonRecursive,
+            );
+        }
+
+        let proxy_clone = self.proxy.clone();
+        let repo_path_clone = repo_path.clone();
+
+        std::thread::spawn(move || {
+            loop {
+                if rx.recv().is_ok() {
+                    // Debounce: drain rapid successive events
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    while rx.try_recv().is_ok() {}
+
+                    let _ = proxy_clone.send_event(AppEvent::GitRepoChanged {
+                        repo_path: repo_path_clone.clone(),
+                    });
+                } else {
+                    break;
+                }
+            }
+        });
+
+        self.watchers.insert(repo_path, watcher);
+    }
+
+    pub fn prune_unreferenced(&mut self, active_repos: &std::collections::HashSet<PathBuf>) {
+        self.watchers.retain(|path, _| active_repos.contains(path));
+    }
 }

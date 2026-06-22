@@ -664,6 +664,7 @@ impl Pipeline {
         context_menu_is_about: bool,
         context_menu_x: f32,
         context_menu_y: f32,
+        context_menu_scroll_y: f32,
         context_menu_hovered_idx: Option<usize>,
         context_menu_items: &[crate::renderer::ContextMenuItem],
         context_menu_open_time_secs: Option<f32>,
@@ -1718,7 +1719,7 @@ impl Pipeline {
             ));
         }
 
-        let scale = 13.0f32 / atlas.font_size();
+        let scale = 12.0f32 / atlas.font_size();
 
         macro_rules! draw_single_tab {
             ($idx:expr, $title:expr, $tab_x_val:expr) => {{
@@ -1843,7 +1844,7 @@ impl Pipeline {
                 };
 
                 let scaled_ascent = atlas.ascent() * scale;
-                let baseline_y = (40.0f32 - 13.0f32) / 2.0f32 + scaled_ascent;
+                let baseline_y = (40.0f32 - 12.0f32) / 2.0f32 + scaled_ascent;
 
                 for c in truncated_title.chars() {
                     if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
@@ -2557,7 +2558,7 @@ impl Pipeline {
             };
 
             if alpha > 0.0 {
-                let scale = 13.0 / atlas.font_size();
+                let scale = 12.0 / atlas.font_size();
                 let toast_cell_w = atlas.cell_size().0 * scale;
                 let mut text_w = 0.0f32;
                 for c in msg.chars() {
@@ -2660,17 +2661,37 @@ impl Pipeline {
                 menu_items.extend_from_slice(context_menu_items);
             }
 
-            let menu_w = 180.0f32; // Target design: Min width 180px
-            let padding_y = 6.0f32; // Target design: Padding 6px top and bottom
+            let is_git_actions_menu = menu_items.iter().any(|item| matches!(item, crate::renderer::ContextMenuItem::GithubActionInfo {..} | crate::renderer::ContextMenuItem::CommandItem {..}));
 
-            // Compute menu_h based on target item sizes
-            let mut menu_h = padding_y * 2.0;
+            let padding_y = 6.0f32;
+            let mut total_menu_h = padding_y * 2.0;
             for item in &menu_items {
-                menu_h += match item {
-                    crate::renderer::ContextMenuItem::Separator => 9.0, // 1px line + 4px top margin + 4px bottom margin
-                    _ => 32.0,                                          // Regular items height 32px
+                total_menu_h += match item {
+                    crate::renderer::ContextMenuItem::Separator => 9.0,
+                    _ => 32.0,
                 };
             }
+
+            let (menu_w, menu_h) = if is_git_actions_menu {
+                (320.0f32, 320.0f32)
+            } else {
+                let mut calc_w = 180.0f32;
+                for item in &menu_items {
+                    match item {
+                        crate::renderer::ContextMenuItem::GithubActionInfo { label, .. } | crate::renderer::ContextMenuItem::CommandItem { label, .. } => {
+                            let estimated_w = 40.0 + label.chars().count() as f32 * 7.5;
+                            if estimated_w > calc_w {
+                                calc_w = estimated_w;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                (calc_w.clamp(180.0, 450.0), total_menu_h)
+            };
+
+            let menu_min_y = context_menu_y + 6.0;
+            let menu_max_y = context_menu_y + menu_h - 6.0;
 
             // Animation factors: 80ms fade-in
             let mut opacity_factor = 1.0f32;
@@ -2762,20 +2783,43 @@ impl Pipeline {
             );
 
             // 3. Draw items
-            let base_scale = 13.0f32 / atlas.font_size();
-            let mut current_y = context_menu_y + padding_y;
+            let mut clip_push = |x: f32,
+                                 y: f32,
+                                 w: f32,
+                                 h: f32,
+                                 fg: [f32; 4],
+                                 bg: [f32; 4],
+                                 uv_x: f32,
+                                 uv_y: f32,
+                                 uv_w: f32,
+                                 uv_h: f32,
+                                 is_color: f32| {
+                let cy = y.max(menu_min_y);
+                let c_end_y = (y + h).min(menu_max_y);
+                if c_end_y > cy {
+                    let ch = c_end_y - cy;
+                    let top_diff = cy - y;
+                    let bottom_diff = (y + h) - c_end_y;
+                    let (new_uv_y, new_uv_h) = if h > 0.0 {
+                        (uv_y + (top_diff / h) * uv_h, uv_h - ((top_diff + bottom_diff) / h) * uv_h)
+                    } else {
+                        (uv_y, uv_h)
+                    };
+                    anim_push(x, cy, w, ch, fg, bg, uv_x, new_uv_y, uv_w, new_uv_h, is_color);
+                }
+            };
+
+            let base_scale = 12.0f32 / atlas.font_size();
+            let mut current_y = context_menu_y + padding_y - context_menu_scroll_y;
 
             for (idx, item) in menu_items.iter().enumerate() {
                 let is_hovered = context_menu_hovered_idx == Some(idx);
 
                 match item {
                     crate::renderer::ContextMenuItem::Separator => {
-                        // Horizontal separator line (color: rgba(255, 255, 255, 0.08), height 1px)
-                        // width: menu_width - 16px (8px margin on each side)
-                        // vertical margin: 4px above and below
                         let sep_x = context_menu_x + 8.0;
                         let sep_w = menu_w - 16.0;
-                        anim_push(
+                        clip_push(
                             sep_x,
                             current_y + 4.0,
                             sep_w,
@@ -2793,10 +2837,8 @@ impl Pipeline {
                     _ => {
                         let item_h = 32.0f32; // Height: 32px
 
-                        // Draw hover background: rgba(255, 255, 255, 0.08), border radius 6px
-                        // inset 4px from menu edges (x starts at 4, width is menu_w - 8)
                         if is_hovered {
-                            anim_push(
+                            clip_push(
                                 context_menu_x + 4.0,
                                 current_y,
                                 menu_w - 8.0,
@@ -2807,7 +2849,7 @@ impl Pipeline {
                                 0.0,
                                 1.0,
                                 1.0,
-                                6.0, // border radius of 6px
+                                6.0,
                             );
                         }
 
@@ -2838,14 +2880,30 @@ impl Pipeline {
                             crate::renderer::ContextMenuItem::MoveToNewWindow => {
                                 ("\u{2197}", "Move to new window", None)
                             }
+                            crate::renderer::ContextMenuItem::GithubActionInfo { label, .. } => {
+                                ("", label.as_str(), None)
+                            }
+                            crate::renderer::ContextMenuItem::CommandItem { label, .. } => {
+                                ("", label.as_str(), None)
+                            }
                             crate::renderer::ContextMenuItem::Separator => ("", "", None),
                         };
 
-                        // Text color: hover = white, normal = rgba(220, 222, 226, 1.0)
+                        // Text color
                         let text_color = if is_hovered {
                             [1.0, 1.0, 1.0, 1.0]
                         } else {
-                            [220.0 / 255.0, 222.0 / 255.0, 226.0 / 255.0, 1.0]
+                            match item {
+                                crate::renderer::ContextMenuItem::GithubActionInfo { status, .. } => {
+                                    match status.as_str() {
+                                        "success" => [0.45, 0.85, 0.55, 1.0], // green
+                                        "failure" | "timed_out" | "action_required" => [0.90, 0.40, 0.40, 1.0], // red
+                                        "skipped" => [0.65, 0.65, 0.65, 1.0], // gray
+                                        _ => [0.95, 0.80, 0.45, 1.0], // yellow/orange for in_progress/queued
+                                    }
+                                }
+                                _ => [220.0 / 255.0, 222.0 / 255.0, 226.0 / 255.0, 1.0],
+                            }
                         };
 
                         let item_center_y = current_y + item_h / 2.0;
@@ -2870,7 +2928,7 @@ impl Pipeline {
                             let uv_w = uv_end_x - uv_x;
                             let uv_h = uv_end_y - uv_y;
 
-                            anim_push(
+                            clip_push(
                                 glyph_x,
                                 glyph_y,
                                 entry_w,
@@ -2885,7 +2943,7 @@ impl Pipeline {
                             );
                         }
 
-                        // Render text label left-aligned at relative x=30px (context_menu_x + 30px)
+                        // Render text label left-aligned
                         let (_, ui_cell_height) = atlas.cell_size();
                         let text_baseline_y = item_center_y - (ui_cell_height * base_scale) / 2.0
                             + atlas.ascent() * base_scale;
@@ -2897,19 +2955,31 @@ impl Pipeline {
                                 continue;
                             }
                             if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
+                                let char_scale = if c == '📦' {
+                                    if entry.height > 0.0 {
+                                        (base_scale * atlas.font_size() * 0.85) / entry.height
+                                    } else {
+                                        base_scale * 0.48
+                                    }
+                                } else {
+                                    base_scale
+                                };
                                 if entry.width > 0.0 {
-                                    let glyph_w = entry.width * base_scale;
-                                    let glyph_h = entry.height * base_scale;
-                                    let glyph_x = (label_x + entry.left * base_scale).round();
-                                    let glyph_y =
-                                        (text_baseline_y + entry.top * base_scale).round();
+                                    let glyph_w = entry.width * char_scale;
+                                    let glyph_h = entry.height * char_scale;
+                                    let glyph_x = (label_x + entry.left * char_scale).round();
+                                    let glyph_y = if c == '📦' {
+                                        (item_center_y - glyph_h / 2.0).round()
+                                    } else {
+                                        (text_baseline_y + entry.top * char_scale).round()
+                                    };
 
                                     let (aw, ah) = atlas.atlas_size();
                                     let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                                     let uv_w = uv_end_x - uv_x;
                                     let uv_h = uv_end_y - uv_y;
 
-                                    anim_push(
+                                    clip_push(
                                         glyph_x,
                                         glyph_y,
                                         glyph_w,
@@ -2922,12 +2992,12 @@ impl Pipeline {
                                         uv_h,
                                         0.0,
                                     );
-                                    label_x += (entry.width + 1.0) * base_scale;
+                                    label_x += (entry.width + 1.0) * char_scale;
                                 }
                             }
                         }
 
-                        // Render shortcut text (e.g. ⌘V) aligned right, ending at menu_w - 12.0
+                        // Render shortcut text
                         if let Some(sh) = shortcut {
                             let mut shortcut_w = 0.0f32;
                             for c in sh.chars() {
@@ -2951,7 +3021,7 @@ impl Pipeline {
                                         let uv_w = uv_end_x - uv_x;
                                         let uv_h = uv_end_y - uv_y;
 
-                                        anim_push(
+                                        clip_push(
                                             glyph_x,
                                             glyph_y,
                                             glyph_w,
@@ -3029,7 +3099,7 @@ impl Pipeline {
                 9.0,
             ));
 
-            let base_scale = 13.0f32 / atlas.font_size();
+            let base_scale = 12.0f32 / atlas.font_size();
             let (_, ui_cell_height) = atlas.cell_size();
             let ctx_cell_w = atlas.cell_size().0 * base_scale;
             let items: &[&str] = &["Renombrar", "Mover a nueva ventana"];

@@ -3,6 +3,7 @@ use winit::window::WindowId;
 
 pub static DRAG: Mutex<Option<CrossWindowDrag>> = Mutex::new(None);
 
+#[allow(dead_code)]
 pub struct CrossWindowDrag {
     pub source_window_id: WindowId,
     pub tab: crate::Tab,

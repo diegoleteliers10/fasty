@@ -31,6 +31,16 @@ pub enum AppEvent {
     CommandFinished { duration_ms: u128, exit_code: Option<i32> },
     Notification { title: String, body: String },
     PromptStarted { absolute_line: u64 },
+    ShowToast { message: String, duration_ms: u64 },
+    ForcePollWidgets,
+    GitStatusUpdated {
+        window_id: Option<winit::window::WindowId>,
+        tab_idx: usize,
+        status: Option<crate::git::GitStatus>,
+    },
+    GitRepoChanged {
+        repo_path: std::path::PathBuf,
+    },
 }
 
 
@@ -425,9 +435,10 @@ impl TerminalState {
         term.history_size()
     }
 
-    pub fn update_render_generation(&self, rg: &Arc<AtomicU64>) {
-        let current = self.render_generation.load(Ordering::Relaxed);
-        rg.store(current, Ordering::Relaxed);
+
+
+    pub fn render_generation(&self) -> u64 {
+        self.render_generation.load(Ordering::Relaxed)
     }
 
     pub fn term(&self) -> &Arc<ParkingMutex<alacritty_terminal::term::Term<EventListenerProxy>>> {

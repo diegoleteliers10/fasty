@@ -217,6 +217,12 @@ pub enum WidgetSpec {
         #[serde(default)]
         interval_ms: Option<u64>,
     },
+    GitActions {
+        #[serde(default)]
+        align: Option<AlignSpec>,
+        #[serde(default)]
+        interval_ms: Option<u64>,
+    },
     Time {
         #[serde(default)]
         format: Option<String>,
@@ -224,6 +230,8 @@ pub enum WidgetSpec {
         align: Option<AlignSpec>,
         #[serde(default)]
         interval_ms: Option<u64>,
+        #[serde(default)]
+        timezone: Option<i32>,
     },
     Kube {
         #[serde(default)]
@@ -242,6 +250,18 @@ pub enum WidgetSpec {
         command: String,
         #[serde(default)]
         on_click: Option<String>,
+        #[serde(default)]
+        align: Option<AlignSpec>,
+        #[serde(default)]
+        interval_ms: Option<u64>,
+    },
+    GitSync {
+        #[serde(default)]
+        align: Option<AlignSpec>,
+        #[serde(default)]
+        interval_ms: Option<u64>,
+    },
+    GitPrs {
         #[serde(default)]
         align: Option<AlignSpec>,
         #[serde(default)]

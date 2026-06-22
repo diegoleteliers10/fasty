@@ -18,8 +18,11 @@ mod terminal_state;
 mod widgets;
 mod window_context;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+const SCROLL_DECELERATION: f32 = 0.88;
+const SCROLL_SNAP_THRESHOLD: f32 = 0.3;
 
 use config::Config;
 use renderer::{Renderer, Selection, RenderReason};
@@ -92,12 +95,14 @@ struct Tab {
     title_override: Option<String>,
     git_status: Option<GitStatus>,
     git_status_check_at: std::time::Instant,
+    last_git_cwd: Option<std::path::PathBuf>,
     is_running: bool,
     last_exit_code: Option<i32>,
     /// Cursor blink phase index, reset on activity. Per-tab so that
     /// popped-out windows can blink independently of the main window.
     last_blink_index: u64,
     prompts: Vec<u64>,
+    last_render_generation: u64,
 }
 
 /// Cached git status for a single tab. Populated by a background thread.
@@ -153,10 +158,12 @@ fn create_new_tab(
         title_override: None,
         git_status: None,
         git_status_check_at: std::time::Instant::now(),
+        last_git_cwd: None,
         is_running: false,
         last_exit_code: None,
         last_blink_index: 0,
         prompts: Vec::new(),
+        last_render_generation: 0,
     })
 }
 
@@ -658,10 +665,21 @@ fn handle_popped_out_event(
         }
         WindowEvent::Resized(size) => {
             let Some(wc) = popped.get_mut(&window_id) else { return; };
-            wc.renderer.lock().resize(size.width, size.height);
-            let (cols, rows) = resize_all_tabs(&wc.tabs, size.width, size.height, wc.cell_width, wc.cell_height);
+            if size.width < 100 || size.height < 100 {
+                return;
+            }
+            const PADDING_LEFT: f32 = 10.0;
+            let padding_top = get_padding_top(wc.tabs.len());
+            let padding_bottom = get_padding_bottom();
+            let cell_w = wc.cell_width.max(1.0);
+            let cell_h = wc.cell_height.max(1.0);
+            let cols = (((size.width as f32 - PADDING_LEFT * 2.0) / cell_w).floor().max(1.0)) as usize;
+            let rows = (((size.height as f32 - (padding_top + padding_bottom)) / cell_h).floor().max(1.0)) as usize;
+            
             wc.shell_cols = cols;
             wc.shell_rows = rows;
+            wc.pending_term_resize = Some((cols, rows));
+            wc.pending_surface_resize = Some((size.width, size.height));
             wc.window.request_redraw();
         }
         WindowEvent::ScaleFactorChanged { .. } => {
@@ -671,6 +689,25 @@ fn handle_popped_out_event(
         WindowEvent::KeyboardInput { event, .. } => {
             use winit::event::ElementState;
             let Some(wc) = popped.get_mut(&window_id) else { return; };
+            let pressed = event.state == ElementState::Pressed;
+            
+            // Track Ctrl, Shift and Alt modifiers manually in case ModifiersChanged is missed
+            match event.physical_key {
+                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ControlLeft) |
+                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ControlRight) => {
+                    wc.ctrl_held = pressed;
+                }
+                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ShiftLeft) |
+                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ShiftRight) => {
+                    wc.shift_held = pressed;
+                }
+                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::AltLeft) |
+                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::AltRight) => {
+                    wc.alt_held = pressed;
+                }
+                _ => {}
+            }
+
             let active_idx = wc.active_tab_index.min(wc.tabs.len().saturating_sub(1));
             if let Some(tab) = wc.tabs.get_mut(active_idx) {
                 if event.state == ElementState::Pressed {
@@ -705,20 +742,75 @@ fn handle_popped_out_event(
             }
             wc.window.request_redraw();
         }
+        WindowEvent::ModifiersChanged(modified) => {
+            let Some(wc) = popped.get_mut(&window_id) else { return; };
+            wc.modifiers = modified.state();
+        }
         WindowEvent::MouseWheel { delta, .. } => {
             use winit::event::MouseScrollDelta;
             let Some(wc) = popped.get_mut(&window_id) else { return; };
-            let active_idx = wc.active_tab_index.min(wc.tabs.len().saturating_sub(1));
+            let tabs_len = wc.tabs.len();
+            let active_idx = wc.active_tab_index.min(tabs_len.saturating_sub(1));
             if let Some(tab) = wc.tabs.get_mut(active_idx) {
-                let lines: i32 = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => -(y as i32),
-                    MouseScrollDelta::PixelDelta(p) => -(p.y / 20.0) as i32,
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        pos.y as f32 / wc.cell_height
+                    }
                 };
-                if lines != 0 {
-                    let abs = lines.unsigned_abs() as u8;
-                    let byte = if lines > 0 { b'A' } else { b'B' };
-                    let bytes = vec![0x1b, b'[', b'6' - (abs - 1) + (byte - b'A'), b'~'];
-                    let _ = tab.terminal_state.lock().write_to_pty(&bytes);
+
+                let scroll_speed = 1.0f32;
+
+                let delta_scroll = match delta {
+                    MouseScrollDelta::LineDelta(_, _) => lines * scroll_speed,
+                    MouseScrollDelta::PixelDelta(_) => lines,
+                };
+
+                let r = wc.renderer.lock();
+                let v_width = r.config.width as f64;
+                drop(r);
+                let padding_top = get_padding_top(tabs_len);
+                let is_in_term = wc.drag_current_y > padding_top as f64 && wc.drag_current_x <= (v_width - 20.0);
+
+                let shift_active = wc.modifiers.shift_key() || wc.shift_held;
+
+                if lines != 0.0 && !shift_active {
+                    let term_state = tab.terminal_state.lock();
+                    let (has_sgr, has_click) = {
+                        let term_locked = term_state.term().lock();
+                        let mode = term_locked.mode();
+                        (
+                            mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE),
+                            mode.contains(alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK),
+                        )
+                    };
+
+                    if is_in_term && (has_sgr || has_click) {
+                        let padding_top = get_padding_top(tabs_len);
+                        let col = (((wc.drag_current_x as f32 - 10.0) / wc.cell_width).floor() as i32)
+                            .clamp(0, wc.shell_cols as i32 - 1) + 1;
+                        let row = (((wc.drag_current_y as f32 - padding_top) / wc.cell_height).floor() as i32)
+                            .clamp(0, wc.shell_rows as i32 - 1) + 1;
+
+                        if has_sgr {
+                            let seq = if lines > 0.0 {
+                                format!("\x1b[<64;{};{}M", col, row)
+                            } else {
+                                format!("\x1b[<65;{};{}M", col, row)
+                            };
+                            term_state.write_to_pty(seq.as_bytes());
+                        } else {
+                            let btn = if lines > 0.0 { 96 } else { 97 };
+                            let col_byte = (col.clamp(1, 223) as u8) + 32;
+                            let row_byte = (row.clamp(1, 223) as u8) + 32;
+                            term_state.write_to_pty(&[0x1b, b'[', b'M', btn, col_byte, row_byte]);
+                        }
+                    } else {
+                        drop(term_state);
+                        wc.scroll_velocity += delta_scroll;
+                    }
+                } else {
+                    wc.scroll_velocity += delta_scroll;
                 }
             }
             wc.window.request_redraw();
@@ -726,6 +818,14 @@ fn handle_popped_out_event(
         WindowEvent::RedrawRequested => {
             let Some(wc) = popped.get_mut(&window_id) else { return; };
             let active_idx = wc.active_tab_index.min(wc.tabs.len().saturating_sub(1));
+            if let Some((cols, rows)) = wc.pending_term_resize.take() {
+                for t in &wc.tabs {
+                    t.terminal_state.lock().resize(cols, rows);
+                }
+            }
+            if let Some((w, h)) = wc.pending_surface_resize.take() {
+                wc.renderer.lock().resize(w, h);
+            }
             if let Some(tab) = wc.tabs.get(active_idx) {
                 let mut tab_titles = Vec::new();
                 let mut active_tab_path = "fasty".to_string();
@@ -1338,162 +1438,8 @@ fn detect_tui_agent(_shell_pid: Option<u32>) -> Option<String> {
 /// Detect git status for the given working directory.
 /// Runs `git status --porcelain=v2 --branch` and parses the output.
 /// Returns None if the directory is not inside a git repo or git is missing.
-#[cfg(not(target_os = "windows"))]
 fn detect_git_status(cwd: &std::path::Path) -> Option<GitStatus> {
-    use std::process::Command;
-
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["status", "--porcelain=v2", "--branch"])
-        .env("LC_ALL", "C")
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut branch = String::new();
-    let mut modified = 0usize;
-    let mut staged = 0usize;
-    let mut untracked = 0usize;
-    let mut ahead = 0usize;
-    let mut behind = 0usize;
-
-    for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix("# branch.head ") {
-            branch = rest.to_string();
-        } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
-            // Format: "+<ahead> -<behind>"
-            for part in rest.split(' ') {
-                if let Some(n) = part.strip_prefix('+') {
-                    ahead = n.parse().unwrap_or(0);
-                } else if let Some(n) = part.strip_prefix('-') {
-                    behind = n.parse().unwrap_or(0);
-                }
-            }
-        } else if line.starts_with("1 ") || line.starts_with("2 ") {
-            // Changed entry (1 unstaged, 2 staged+unstaged)
-            let cols: Vec<&str> = line.split(' ').collect();
-            if cols.len() >= 2 {
-                let xy = cols[1];
-                if xy.len() >= 2 {
-                    let x = xy.as_bytes()[0] as char;
-                    let y = xy.as_bytes()[1] as char;
-                    if x != '.' {
-                        modified += 1;
-                    }
-                    if y != '.' {
-                        staged += 1;
-                    }
-                }
-            }
-        } else if let Some(rest) = line.strip_prefix("? ") {
-            if !rest.is_empty() {
-                untracked += 1;
-            }
-        }
-    }
-
-    if branch.is_empty() {
-        return None;
-    }
-
-    // Get last commit summary
-    let last_commit_summary = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["log", "-1", "--format=%h %s"])
-        .env("LC_ALL", "C")
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
-
-    Some(GitStatus {
-        branch,
-        modified,
-        staged,
-        untracked,
-        ahead,
-        behind,
-        last_commit_summary,
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn detect_git_status(cwd: &std::path::Path) -> Option<GitStatus> {
-    use std::process::Command;
-    let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(cwd)
-        .args(["status", "--porcelain=v2", "--branch"])
-        .env("LC_ALL", "C");
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(0x08000000);
-    let output = cmd.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut branch = String::new();
-    let mut modified = 0usize;
-    let mut staged = 0usize;
-    let mut untracked = 0usize;
-    let mut ahead = 0usize;
-    let mut behind = 0usize;
-    for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix("# branch.head ") {
-            branch = rest.to_string();
-        } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
-            for part in rest.split(' ') {
-                if let Some(n) = part.strip_prefix('+') {
-                    ahead = n.parse().unwrap_or(0);
-                } else if let Some(n) = part.strip_prefix('-') {
-                    behind = n.parse().unwrap_or(0);
-                }
-            }
-        } else if line.starts_with("1 ") || line.starts_with("2 ") {
-            let cols: Vec<&str> = line.split(' ').collect();
-            if cols.len() >= 2 {
-                let xy = cols[1];
-                if xy.len() >= 2 {
-                    let x = xy.as_bytes()[0] as char;
-                    let y = xy.as_bytes()[1] as char;
-                    if x != '.' { modified += 1; }
-                    if y != '.' { staged += 1; }
-                }
-            }
-        } else if let Some(rest) = line.strip_prefix("? ") {
-            if !rest.is_empty() {
-                untracked += 1;
-            }
-        }
-    }
-    if branch.is_empty() { return None; }
-
-    let last_commit_summary = {
-        let mut cmd2 = Command::new("git");
-        cmd2.arg("-C").arg(cwd).args(["log", "-1", "--format=%h %s"]).env("LC_ALL", "C");
-        use std::os::windows::process::CommandExt;
-        cmd2.creation_flags(0x08000000);
-        cmd2.output()
-            .ok()
-            .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { None })
-            .unwrap_or_default()
-    };
-
-    Some(GitStatus {
-        branch, modified, staged, untracked, ahead, behind, last_commit_summary,
-    })
+    git::fetch_git_info(cwd)
 }
 
 
@@ -1695,6 +1641,7 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     let mut active_tab_index = 0usize;
+    let mut last_active_tab_index = active_tab_index;
     let mut hovered_window: Option<winit::window::WindowId> = None;
     let mut pending_new_window_from_drag = false;
 
@@ -1712,7 +1659,7 @@ fn main() -> anyhow::Result<()> {
     let mut bar_layout = build_bar_layout(&config);
     let mut bar_y: f32 = 0.0;
     let mut bar_h: f32 = BB_H;
-    let mut tabs = if config.session_restore && fasty_args.command.is_none() {
+    let mut tabs = if config.session_restore && fasty_args.command.is_none() && fasty_args.working_dir.is_none() {
         match session::load() {
             Some(s) if !s.windows.is_empty() => {
                 let active_idx = s.active_window.min(s.windows.len() - 1);
@@ -1761,8 +1708,6 @@ fn main() -> anyhow::Result<()> {
     let mut ctrl_held = false;
     let mut shift_held = false;
     let mut alt_held = false;
-    let render_generation = Arc::new(AtomicU64::new(0));
-    let rg = Arc::clone(&render_generation);
 
     let window_for_redraw = window_arc.clone();
     
@@ -1809,6 +1754,7 @@ fn main() -> anyhow::Result<()> {
     let mut context_menu_hovered_idx: Option<usize> = None;
     let mut context_menu_classification: Option<selection_classifier::Classification> = None;
     let mut context_menu_items: Vec<renderer::ContextMenuItem> = Vec::new();
+    let mut context_menu_scroll_y = 0.0f64;
     let mut context_menu_open_time: Option<std::time::Instant> = None;
     let mut context_menu_open_time_secs: Option<f32> = None;
     let mut last_scroll_event_time: Option<std::time::Instant> = None;
@@ -1821,8 +1767,6 @@ fn main() -> anyhow::Result<()> {
 
     // Scroll momentum
     let mut scroll_velocity: f32 = 0.0;
-    const SCROLL_DECELERATION: f32 = 0.88;
-    const SCROLL_SNAP_THRESHOLD: f32 = 0.3;
 
     // Hover states for main window topbar buttons
     let mut hover_close = false;
@@ -1952,6 +1896,8 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    let mut git_watcher_manager = git::GitWatcherManager::new(proxy.clone());
+
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     event_loop.run(move |event, target| {
         match event {
@@ -2007,6 +1953,88 @@ fn main() -> anyhow::Result<()> {
                     AppEvent::Wakeup => {
                         app_dirty = true;
                         renderer.lock().grid_dirty = true;
+                    }
+                    AppEvent::ShowToast { message, duration_ms } => {
+                        toast = Some((message, std::time::Instant::now(), duration_ms));
+                        app_dirty = true;
+                        renderer.lock().grid_dirty = true;
+                        window_for_redraw.request_redraw();
+                    }
+                    AppEvent::ForcePollWidgets => {
+                        let now = std::time::Instant::now();
+                        for w in bar_layout.widgets.iter_mut() {
+                            w.set_last_poll(now - w.poll_interval());
+                        }
+                        app_dirty = true;
+                        renderer.lock().grid_dirty = true;
+                        window_for_redraw.request_redraw();
+                    }
+                    AppEvent::GitStatusUpdated { window_id, tab_idx, status } => {
+                        if let Some(win_id) = window_id {
+                            if let Some(wc) = popped_out_windows.get_mut(&win_id) {
+                                if let Some(tab) = wc.tabs.get_mut(tab_idx) {
+                                    tab.git_status = status;
+                                    wc.renderer.lock().set_dirty(true);
+                                    wc.window.request_redraw();
+                                }
+                            }
+                        } else {
+                            if let Some(tab) = tabs.get_mut(tab_idx) {
+                                tab.git_status = status;
+                                app_dirty = true;
+                                renderer.lock().set_dirty(true);
+                                window_for_redraw.request_redraw();
+                            }
+                        }
+                    }
+                    AppEvent::GitRepoChanged { repo_path } => {
+                        for (idx, tab) in tabs.iter_mut().enumerate() {
+                            let cwd = tab.terminal_state.lock().shell_pid()
+                                .and_then(|pid| std::fs::read_link(format!("/proc/{}/cwd", pid)).ok())
+                                .or_else(|| tab.cwd.clone());
+                            if let Some(ref dir) = cwd {
+                                if let Some(top) = git::git_toplevel(dir) {
+                                    if top == repo_path {
+                                        let dir_clone = dir.clone();
+                                        let proxy_clone = proxy.clone();
+                                        let tab_idx = idx;
+                                        std::thread::spawn(move || {
+                                            let status = detect_git_status(&dir_clone);
+                                            let _ = proxy_clone.send_event(AppEvent::GitStatusUpdated {
+                                                window_id: None,
+                                                tab_idx,
+                                                status,
+                                            });
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        for (win_id, wc) in popped_out_windows.iter_mut() {
+                            let win_id_val = *win_id;
+                            for (tidx, tab) in wc.tabs.iter_mut().enumerate() {
+                                let cwd = tab.terminal_state.lock().shell_pid()
+                                    .and_then(|pid| std::fs::read_link(format!("/proc/{}/cwd", pid)).ok())
+                                    .or_else(|| tab.cwd.clone());
+                                if let Some(ref dir) = cwd {
+                                    if let Some(top) = git::git_toplevel(dir) {
+                                        if top == repo_path {
+                                            let dir_clone = dir.clone();
+                                            let proxy_clone = proxy.clone();
+                                            let tab_idx = tidx;
+                                            std::thread::spawn(move || {
+                                                let status = detect_git_status(&dir_clone);
+                                                let _ = proxy_clone.send_event(AppEvent::GitStatusUpdated {
+                                                    window_id: Some(win_id_val),
+                                                    tab_idx,
+                                                    status,
+                                                });
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     AppEvent::Exit => {
                         if auto_close {
@@ -2527,6 +2555,7 @@ fn main() -> anyhow::Result<()> {
                                 context_menu_y: context_menu_y as f32,
                                 context_menu_hovered_idx,
                                 context_menu_open_time_secs,
+                                context_menu_scroll_y: context_menu_scroll_y as f32,
                                 context_menu_items: &context_menu_items,
                                 hovered_tab_index,
                                 hovered_close_tab_index,
@@ -3934,8 +3963,67 @@ fn main() -> anyhow::Result<()> {
                                                 context_menu_items.clone()
                                             };
                                             if hovered_idx < menu_items.len() {
-                                                let item = menu_items[hovered_idx];
+                                                let item = &menu_items[hovered_idx];
                                                 match item {
+                                                    crate::renderer::ContextMenuItem::GithubActionInfo { url, .. } => {
+                                                        if let Some(ref u) = url {
+                                                            open_url(u);
+                                                        }
+                                                        context_menu_visible = false;
+                                                    }
+                                                    crate::renderer::ContextMenuItem::CommandItem { label, command, cwd } => {
+                                                         let cmd_clone = command.clone();
+                                                         let cwd_clone = cwd.clone();
+                                                         let label_clone = label.clone();
+                                                         let proxy_clone = proxy.clone();
+
+                                                         let _ = proxy_clone.send_event(AppEvent::ShowToast {
+                                                             message: format!("Running: {}...", label_clone),
+                                                             duration_ms: 3000,
+                                                         });
+
+                                                         std::thread::spawn(move || {
+                                                             let mut c = std::process::Command::new("sh");
+                                                             c.arg("-c").arg(&cmd_clone);
+                                                             c.current_dir(&cwd_clone);
+                                                             #[cfg(target_os = "windows")]
+                                                             {
+                                                                 use std::os::windows::process::CommandExt;
+                                                                 c.creation_flags(0x08000000);
+                                                             }
+                                                             match c.output() {
+                                                                 Ok(output) => {
+                                                                     if output.status.success() {
+                                                                         let _ = proxy_clone.send_event(AppEvent::ShowToast {
+                                                                             message: format!("✓ Success: {}", label_clone),
+                                                                             duration_ms: 4000,
+                                                                         });
+                                                                     } else {
+                                                                         let stderr = String::from_utf8_lossy(&output.stderr);
+                                                                         let err_msg = if stderr.is_empty() {
+                                                                             String::from_utf8_lossy(&output.stdout)
+                                                                         } else {
+                                                                             stderr
+                                                                         };
+                                                                         let clean_err = err_msg.trim().chars().take(40).collect::<String>();
+                                                                         let _ = proxy_clone.send_event(AppEvent::ShowToast {
+                                                                             message: format!("✗ Failed: {}", clean_err),
+                                                                             duration_ms: 6000,
+                                                                         });
+                                                                     }
+                                                                     let _ = proxy_clone.send_event(AppEvent::ForcePollWidgets);
+                                                                 }
+                                                                 Err(e) => {
+                                                                     let _ = proxy_clone.send_event(AppEvent::ShowToast {
+                                                                         message: format!("✗ Error: {}", e),
+                                                                         duration_ms: 6000,
+                                                                     });
+                                                                     let _ = proxy_clone.send_event(AppEvent::ForcePollWidgets);
+                                                                 }
+                                                             }
+                                                         });
+                                                         context_menu_visible = false;
+                                                     }
                                                     crate::renderer::ContextMenuItem::About => {
                                                           if about_window.is_none() {
                                                               let visible = !cfg!(target_os = "windows");
@@ -4277,6 +4365,32 @@ fn main() -> anyhow::Result<()> {
                                                     open_url(&s);
                                                 }
                                                 widgets::ClickAction::Custom => {}
+                                                widgets::ClickAction::ShowActionsMenu => {
+                                                    if let Some(menu_items) = w.get_context_menu_items() {
+                                                        context_menu_classification = None;
+                                                        context_menu_items = menu_items;
+                                                        context_menu_scroll_y = 0.0;
+                                                        let (menu_w, menu_h) = get_context_menu_size(&context_menu_items);
+                                                        context_menu_x = current_mouse_x;
+                                                        context_menu_y = current_mouse_y;
+                                                        context_menu_open_time = Some(std::time::Instant::now());
+                                                        context_menu_open_time_secs = Some(start_time.elapsed().as_secs_f32());
+                                                        
+                                                        let v_width = renderer.lock().config.width as f64;
+                                                        let v_height = window_for_redraw.inner_size().height as f64;
+                                                        if context_menu_x + menu_w > v_width {
+                                                            context_menu_x = v_width - menu_w - 4.0;
+                                                        }
+                                                        if context_menu_y + menu_h > v_height {
+                                                            context_menu_y = context_menu_y - menu_h;
+                                                            if context_menu_y < 0.0 {
+                                                                context_menu_y = 4.0;
+                                                            }
+                                                        }
+                                                        context_menu_visible = true;
+                                                        context_menu_hovered_idx = None;
+                                                    }
+                                                }
                                             }
                                         }
                                         renderer.lock().set_dirty(true);
@@ -5030,6 +5144,7 @@ fn main() -> anyhow::Result<()> {
                                         };
                                         context_menu_classification = classification;
                                         context_menu_items = menu_items;
+                                        context_menu_scroll_y = 0.0;
                                         let (menu_w, menu_h) = get_context_menu_size(&context_menu_items);
 
                                         context_menu_x = current_mouse_x;
@@ -5078,7 +5193,7 @@ fn main() -> anyhow::Result<()> {
                                 if current_mouse_x >= context_menu_x && current_mouse_x <= context_menu_x + menu_w
                                    && current_mouse_y >= context_menu_y && current_mouse_y <= context_menu_y + menu_h {
                                     let relative_y = (current_mouse_y - context_menu_y) as f32;
-                                    context_menu_hovered_idx = get_menu_item_at_y(&menu_items, relative_y);
+                                    context_menu_hovered_idx = get_menu_item_at_y(&menu_items, relative_y, context_menu_scroll_y as f32, menu_h as f32);
                                 } else {
                                     context_menu_hovered_idx = None;
                                 }
@@ -5465,7 +5580,32 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                         WindowEvent::MouseWheel { delta, .. } => {
-                            if context_menu_visible || tab_ctx_visible {
+                            if context_menu_visible {
+                                let is_git_actions_menu = context_menu_items.iter().any(|item| matches!(item, crate::renderer::ContextMenuItem::GithubActionInfo {..} | crate::renderer::ContextMenuItem::CommandItem {..}));
+                                let mut total_menu_h = 12.0f64;
+                                for item in &context_menu_items {
+                                    total_menu_h += match item {
+                                        crate::renderer::ContextMenuItem::Separator => 9.0,
+                                        _ => 32.0,
+                                    };
+                                }
+                                let menu_h = if is_git_actions_menu {
+                                    320.0f64
+                                } else {
+                                    total_menu_h
+                                };
+                                let lines = match delta {
+                                    MouseScrollDelta::LineDelta(_, y) => y,
+                                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / cell_height,
+                                };
+                                let scroll_speed = 24.0f64;
+                                context_menu_scroll_y = (context_menu_scroll_y - lines as f64 * scroll_speed)
+                                    .clamp(0.0, (total_menu_h - menu_h).max(0.0));
+                                renderer.lock().set_dirty(true);
+                                app_dirty = true;
+                                return;
+                            }
+                            if tab_ctx_visible {
                                 return;
                             }
                             last_scroll_event_time = Some(std::time::Instant::now());
@@ -6170,45 +6310,52 @@ fn main() -> anyhow::Result<()> {
                                 Renderer::new_shared(w_static, &config.font.family, config.font.size, shared_instance, shared_device, shared_queue, format, alpha_mode)
                             };
                             if let Ok(r) = r_result {
-                                let (cols, rows) = resize_all_tabs(
-                                    std::slice::from_ref(&tab),
-                                    window_arc.inner_size().width,
-                                    window_arc.inner_size().height,
-                                    cell_width, cell_height,
-                                );
-                                let bar = widgets::BarLayout::new(vec![Box::new(
-                                    widgets::builtin::git::GitWidget::new(widgets::Align::Left, None),
-                                )]);
-                                let wc = window_context::WindowContext::new(
-                                    window_arc,
-                                    Arc::new(parking_lot::Mutex::new(r)),
-                                    vec![tab],
-                                    cell_width,
-                                    cell_height,
-                                    cols,
-                                    rows,
-                                    bar,
-                                );
-                                let id = wc.window.id();
-                                popped_out_windows.insert(id, wc);
-                                if let Some(wc) = popped_out_windows.get(&id) {
-                                    #[cfg(target_os = "windows")]
-                                    wc.window.set_visible(true);
-                                    wc.window.focus_window();
-                                    let _ = wc.window.drag_window();
-                                    // Mark dirty and request redraw immediately so
-                                    // the first RedrawRequested renders full content.
-                                    // Skip present_blank() — it forces a GPU roundtrip
-                                    // for a blank frame the user never sees, adding
-                                    // visible latency.
-                                    {
-                                        let mut r = wc.renderer.lock();
-                                        r.set_dirty(true);
-                                        r.grid_dirty = true;
-                                    }
-                                    wc.window.request_redraw();
-                                }
-                            }
+                                 let actual_cell_w = r.cell_width();
+                                 let actual_cell_h = r.cell_height();
+                                 let w_size = window_arc.inner_size();
+                                 let (w_width, w_height) = if w_size.width < 100 || w_size.height < 100 {
+                                     let sf = window_arc.scale_factor() as f32;
+                                     ((800.0 * sf) as u32, (520.0 * sf) as u32)
+                                 } else {
+                                     (w_size.width, w_size.height)
+                                 };
+                                 let (cols, rows) = resize_all_tabs(
+                                     std::slice::from_ref(&tab),
+                                     w_width,
+                                     w_height,
+                                     actual_cell_w, actual_cell_h,
+                                 );
+                                 let bar = build_bar_layout(&config);
+                                 let wc = window_context::WindowContext::new(
+                                     window_arc,
+                                     Arc::new(parking_lot::Mutex::new(r)),
+                                     vec![tab],
+                                     actual_cell_w,
+                                     actual_cell_h,
+                                     cols,
+                                     rows,
+                                     bar,
+                                 );
+                                 let id = wc.window.id();
+                                 popped_out_windows.insert(id, wc);
+                                 if let Some(wc) = popped_out_windows.get(&id) {
+                                     #[cfg(target_os = "windows")]
+                                     wc.window.set_visible(true);
+                                     wc.window.focus_window();
+                                     let _ = wc.window.drag_window();
+                                     // Mark dirty and request redraw immediately so
+                                     // the first RedrawRequested renders full content.
+                                     // Skip present_blank() — it forces a GPU roundtrip
+                                     // for a blank frame the user never sees, adding
+                                     // visible latency.
+                                     {
+                                         let mut r = wc.renderer.lock();
+                                         r.set_dirty(true);
+                                         r.grid_dirty = true;
+                                     }
+                                     wc.window.request_redraw();
+                                 }
+                             }
                         }
                     }
                 }
@@ -6276,17 +6423,39 @@ fn main() -> anyhow::Result<()> {
                                 Renderer::new_shared(w_static, &config.font.family, config.font.size, shared_instance, shared_device, shared_queue, format, alpha_mode)
                             };
                             if let Ok(r) = r_result {
-                                let bar = widgets::BarLayout::new(vec![Box::new(
-                                    widgets::builtin::git::GitWidget::new(widgets::Align::Left, None),
-                                )]);
+                                let actual_cell_w = r.cell_width();
+                                let actual_cell_h = r.cell_height();
+                                let w_size = window_arc.inner_size();
+                                let (w_width, w_height) = if w_size.width < 100 || w_size.height < 100 {
+                                    if let Some((w, h)) = ws.size {
+                                        if w > 0 && h > 0 {
+                                            (w, h)
+                                        } else {
+                                            let sf = window_arc.scale_factor() as f32;
+                                            ((800.0 * sf) as u32, (520.0 * sf) as u32)
+                                        }
+                                    } else {
+                                        let sf = window_arc.scale_factor() as f32;
+                                        ((800.0 * sf) as u32, (520.0 * sf) as u32)
+                                    }
+                                } else {
+                                    (w_size.width, w_size.height)
+                                };
+                                let (cols, rows) = resize_all_tabs(
+                                    &restored_tabs,
+                                    w_width,
+                                    w_height,
+                                    actual_cell_w, actual_cell_h,
+                                );
+                                let bar = build_bar_layout(&config);
                                 let wc = window_context::WindowContext::new(
                                     window_arc,
                                     Arc::new(parking_lot::Mutex::new(r)),
                                     restored_tabs,
-                                    cell_width,
-                                    cell_height,
-                                    shell_cols,
-                                    shell_rows,
+                                    actual_cell_w,
+                                    actual_cell_h,
+                                    cols,
+                                    rows,
                                     bar,
                                 );
                                 let id = wc.window.id();
@@ -6301,23 +6470,56 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Poll git status for each tab (throttled to once every 3s per tab).
+                if active_tab_index != last_active_tab_index {
+                    if let Some(tab) = tabs.get_mut(active_tab_index) {
+                        tab.git_status_check_at = now.checked_sub(std::time::Duration::from_secs(60)).unwrap_or(now);
+                    }
+                    last_active_tab_index = active_tab_index;
+                }
+
+                let mut active_repos = std::collections::HashSet::new();
+
+                // Poll git status for each tab (throttled to once every 1.5s per tab).
                 // Only the active tab is polled in real-time; other tabs are checked
                 // at a slower cadence to keep the UI responsive.
+                // However, if the current working directory of the tab changes, we bypass
+                // the throttle to immediately reflect git widget visibility / state.
                 for (idx, tab) in tabs.iter_mut().enumerate() {
-                    let throttle_ms: u128 = if idx == active_tab_index { 1500 } else { 10000 };
-                    if now.duration_since(tab.git_status_check_at).as_millis() < throttle_ms {
-                        continue;
-                    }
-                    tab.git_status_check_at = now;
                     let cwd = tab.terminal_state.lock().shell_pid()
                         .and_then(|pid| std::fs::read_link(format!("/proc/{}/cwd", pid)).ok())
                         .or_else(|| tab.cwd.clone());
-                    if let Some(dir) = cwd {
-                        tab.git_status = detect_git_status(&dir);
+
+                    if let Some(ref dir) = cwd {
+                        if let Some(top) = git::git_toplevel(dir) {
+                            git_watcher_manager.watch_repo(&top);
+                            active_repos.insert(top);
+                        }
                     }
-                    if idx == active_tab_index {
-                        app_dirty = true;
+
+                    let cwd_changed = cwd != tab.last_git_cwd;
+                    let throttle_ms: u128 = if idx == active_tab_index { 1500 } else { 10000 };
+
+                    if !cwd_changed && now.duration_since(tab.git_status_check_at).as_millis() < throttle_ms {
+                        continue;
+                    }
+
+                    tab.git_status_check_at = now;
+                    tab.last_git_cwd = cwd.clone();
+
+                    if let Some(ref dir) = cwd {
+                        let dir_clone = dir.clone();
+                        let proxy_clone = proxy.clone();
+                        let tab_idx = idx;
+                        std::thread::spawn(move || {
+                            let status = detect_git_status(&dir_clone);
+                            let _ = proxy_clone.send_event(AppEvent::GitStatusUpdated {
+                                window_id: None,
+                                tab_idx,
+                                status,
+                            });
+                        });
+                    } else {
+                        tab.git_status = None;
                     }
                 }
 
@@ -6461,6 +6663,7 @@ fn main() -> anyhow::Result<()> {
                         context_menu_y: context_menu_y as f32,
                         context_menu_hovered_idx,
                         context_menu_open_time_secs,
+                        context_menu_scroll_y: context_menu_scroll_y as f32,
                         context_menu_items: &context_menu_items,
                         hovered_tab_index,
                         hovered_close_tab_index,
@@ -6592,10 +6795,9 @@ fn main() -> anyhow::Result<()> {
                     tab.last_scroll_diff = current_scroll_diff;
 
                     // Sync render generation
-                    let last_rg = rg.load(Ordering::Relaxed);
-                    term.update_render_generation(&rg);
-                    let current_rg = rg.load(Ordering::Relaxed);
-                    if current_rg != last_rg {
+                    let current_rg = term.render_generation();
+                    if current_rg != tab.last_render_generation {
+                        tab.last_render_generation = current_rg;
                         tab.last_activity_time = std::time::Instant::now();
                         tab.cursor_visible = true;
                         if idx == active_tab_index {
@@ -6612,28 +6814,132 @@ fn main() -> anyhow::Result<()> {
                 // and request a redraw so the new output is presented.
                 let mut popped_out_redraw_wakeup: Option<std::time::Instant> = None;
                 for wc in popped_out_windows.values_mut() {
-                    // Poll git status for popped-out tabs (throttled)
                     let active_idx = wc.active_tab_index.min(wc.tabs.len().saturating_sub(1));
-                    for (tidx, tab) in wc.tabs.iter_mut().enumerate() {
-                        let throttle_ms: u128 = if tidx == active_idx { 1500 } else { 10000 };
-                        if now.duration_since(tab.git_status_check_at).as_millis() < throttle_ms {
-                            continue;
+
+                    // Update scroll momentum and lerp offsets for all tabs in this popped-out window
+                    let mut wc_animating = false;
+                    for (idx, tab) in wc.tabs.iter_mut().enumerate() {
+                        let term = tab.terminal_state.lock();
+
+                        // Sync scroll position if PTY printed output or terminal was resized
+                        let actual_offset = term.display_offset();
+                        if actual_offset != tab.last_actual_offset {
+                            let diff_offset = actual_offset as f32 - tab.last_actual_offset as f32;
+                            let pty_change = diff_offset - tab.last_scroll_diff as f32;
+                            if pty_change.abs() > 0.01 {
+                                tab.scroll_target += pty_change;
+                                tab.scroll_current += pty_change;
+                                if idx == active_idx {
+                                    wc_animating = true;
+                                    wc.renderer.lock().grid_dirty = true;
+                                }
+                            }
                         }
-                        tab.git_status_check_at = now;
+
+                        let max_history = term.history_size() as f32;
+                        tab.scroll_target = tab.scroll_target.clamp(0.0, max_history);
+
+                        // Apply scroll momentum
+                        if wc.scroll_velocity.abs() > 0.01 {
+                            tab.scroll_target = (tab.scroll_target + wc.scroll_velocity).clamp(0.0, max_history);
+                            wc.scroll_velocity *= SCROLL_DECELERATION;
+                            if wc.scroll_velocity.abs() < SCROLL_SNAP_THRESHOLD {
+                                wc.scroll_velocity = 0.0;
+                            }
+                            wc_animating = true;
+                        }
+
+                        let diff = tab.scroll_target - tab.scroll_current;
+                        let mut current_scroll_diff = 0;
+                        if diff.abs() > 0.01 {
+                            // Smooth lerp toward target -- gentle, predictable
+                            tab.scroll_current += diff * 0.18;
+                            if diff.abs() <= 0.5 {
+                                tab.scroll_current = tab.scroll_target;
+                            }
+
+                            let target_offset = tab.scroll_current.round() as isize;
+                            let scroll_diff = target_offset - term.display_offset() as isize;
+                            if scroll_diff != 0 {
+                                term.scroll(scroll_diff);
+                                current_scroll_diff = scroll_diff;
+                            }
+                            if idx == active_idx {
+                                wc_animating = true;
+                                wc.renderer.lock().grid_dirty = true;
+                            }
+                        } else {
+                            if tab.scroll_current != tab.scroll_target {
+                                tab.scroll_current = tab.scroll_target;
+                                if idx == active_idx {
+                                    wc.renderer.lock().grid_dirty = true;
+                                    wc_animating = true;
+                                }
+                            }
+                        }
+
+                        tab.last_actual_offset = term.display_offset();
+                        tab.last_scroll_diff = current_scroll_diff;
+                    }
+                    if wc_animating {
+                        animating = true;
+                        wc.window.request_redraw();
+                    }
+
+                    // Poll git status for popped-out tabs (throttled)
+                    if active_idx != wc.last_active_tab_index {
+                        if let Some(tab) = wc.tabs.get_mut(active_idx) {
+                            tab.git_status_check_at = now.checked_sub(std::time::Duration::from_secs(60)).unwrap_or(now);
+                        }
+                        wc.last_active_tab_index = active_idx;
+                    }
+
+                    // Poll git status for popped-out tabs (throttled)
+                    for (tidx, tab) in wc.tabs.iter_mut().enumerate() {
                         let cwd = tab.terminal_state.lock().shell_pid()
                             .and_then(|pid| std::fs::read_link(format!("/proc/{}/cwd", pid)).ok())
                             .or_else(|| tab.cwd.clone());
-                        if let Some(dir) = cwd {
-                            tab.git_status = detect_git_status(&dir);
+
+                        if let Some(ref dir) = cwd {
+                            if let Some(top) = git::git_toplevel(dir) {
+                                git_watcher_manager.watch_repo(&top);
+                                active_repos.insert(top);
+                            }
+                        }
+
+                        let cwd_changed = cwd != tab.last_git_cwd;
+                        let throttle_ms: u128 = if tidx == active_idx { 1500 } else { 10000 };
+
+                        if !cwd_changed && now.duration_since(tab.git_status_check_at).as_millis() < throttle_ms {
+                            continue;
+                        }
+
+                        tab.git_status_check_at = now;
+                        tab.last_git_cwd = cwd.clone();
+
+                        let win_id = wc.window.id();
+                        if let Some(ref dir) = cwd {
+                            let dir_clone = dir.clone();
+                            let proxy_clone = proxy.clone();
+                            let tab_idx = tidx;
+                            std::thread::spawn(move || {
+                                let status = detect_git_status(&dir_clone);
+                                let _ = proxy_clone.send_event(AppEvent::GitStatusUpdated {
+                                    window_id: Some(win_id),
+                                    tab_idx,
+                                    status,
+                                });
+                            });
+                        } else {
+                            tab.git_status = None;
                         }
                     }
 
                     // Sync render generation for the active tab
                     if let Some(tab) = wc.tabs.get_mut(active_idx) {
-                        let last_rg = rg.load(Ordering::Relaxed);
-                        tab.terminal_state.lock().update_render_generation(&rg);
-                        let current_rg = rg.load(Ordering::Relaxed);
-                        if current_rg != last_rg {
+                        let current_rg = tab.terminal_state.lock().render_generation();
+                        if current_rg != tab.last_render_generation {
+                            tab.last_render_generation = current_rg;
                             tab.last_activity_time = std::time::Instant::now();
                             tab.cursor_visible = true;
                             let mut r = wc.renderer.lock();
@@ -6665,6 +6971,8 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+
+                git_watcher_manager.prune_unreferenced(&active_repos);
 
                 // Opacity animation of the scrollbar (uses active tab details)
                 let v_width = renderer.lock().config.width as f64;
@@ -7445,27 +7753,48 @@ fn build_smart_menu(
 }
 
 fn get_context_menu_size(menu_items: &[crate::renderer::ContextMenuItem]) -> (f64, f64) {
+    let is_git_actions_menu = menu_items.iter().any(|item| matches!(item, crate::renderer::ContextMenuItem::GithubActionInfo {..} | crate::renderer::ContextMenuItem::CommandItem {..}));
+    if is_git_actions_menu {
+        return (320.0, 320.0);
+    }
+
     let mut h = 12.0f64; // 6px top + 6px bottom padding
+    let mut w = 180.0f64;
     for item in menu_items {
         h += match item {
             crate::renderer::ContextMenuItem::Separator => 9.0,
             _ => 32.0,
         };
+        match item {
+            crate::renderer::ContextMenuItem::GithubActionInfo { label, .. } | crate::renderer::ContextMenuItem::CommandItem { label, .. } => {
+                let estimated_w = 40.0 + label.chars().count() as f64 * 7.5;
+                if estimated_w > w {
+                    w = estimated_w;
+                }
+            }
+            _ => {}
+        }
     }
-    (180.0, h)
+    (w.clamp(180.0, 450.0), h)
 }
 
-fn get_menu_item_at_y(menu_items: &[crate::renderer::ContextMenuItem], relative_y: f32) -> Option<usize> {
-    if relative_y < 6.0 {
+fn get_menu_item_at_y(
+    menu_items: &[crate::renderer::ContextMenuItem],
+    relative_y: f32,
+    scroll_y: f32,
+    menu_h: f32,
+) -> Option<usize> {
+    if relative_y < 6.0 || relative_y >= menu_h - 6.0 {
         return None;
     }
+    let relative_y_content = relative_y + scroll_y;
     let mut current_y = 6.0f32;
     for (idx, item) in menu_items.iter().enumerate() {
         let item_h = match item {
             crate::renderer::ContextMenuItem::Separator => 9.0f32,
             _ => 32.0f32,
         };
-        if relative_y >= current_y && relative_y < current_y + item_h {
+        if relative_y_content >= current_y && relative_y_content < current_y + item_h {
             match item {
                 crate::renderer::ContextMenuItem::Separator => return None,
                 _ => return Some(idx),

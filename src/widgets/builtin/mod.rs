@@ -3,6 +3,9 @@
 pub mod aws;
 pub mod command;
 pub mod git;
+pub mod git_actions;
+pub mod git_sync;
+pub mod git_prs;
 pub mod kube;
 pub mod time;
 
@@ -17,10 +20,23 @@ pub fn build(spec: &WidgetSpec) -> Option<Box<dyn Widget>> {
             align.unwrap_or(crate::config::AlignSpec::Left).into(),
             *interval_ms,
         )),
-        WidgetSpec::Time { format, align, interval_ms } => Box::new(time::TimeWidget::new(
+        WidgetSpec::GitActions { align, interval_ms } => Box::new(git_actions::GitActionsWidget::new(
+            align.unwrap_or(crate::config::AlignSpec::Left).into(),
+            *interval_ms,
+        )),
+        WidgetSpec::GitSync { align, interval_ms } => Box::new(git_sync::GitSyncWidget::new(
+            align.unwrap_or(crate::config::AlignSpec::Left).into(),
+            *interval_ms,
+        )),
+        WidgetSpec::GitPrs { align, interval_ms } => Box::new(git_prs::GitPrsWidget::new(
+            align.unwrap_or(crate::config::AlignSpec::Left).into(),
+            *interval_ms,
+        )),
+        WidgetSpec::Time { format, align, interval_ms, timezone } => Box::new(time::TimeWidget::new(
             format.clone().unwrap_or_else(|| "%H:%M:%S".to_string()),
             align.unwrap_or(crate::config::AlignSpec::Right).into(),
             *interval_ms,
+            *timezone,
         )),
         WidgetSpec::Kube { align, interval_ms } => Box::new(kube::KubeWidget::new(
             align.unwrap_or(crate::config::AlignSpec::Left).into(),

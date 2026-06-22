@@ -52,6 +52,7 @@ pub enum ClickAction {
     RunCommand(String),
     OpenUrl(String),
     Custom,
+    ShowActionsMenu,
 }
 
 /// A single bottombar widget.
@@ -76,6 +77,8 @@ pub trait Widget: Send {
     fn tooltip(&self) -> Option<String> { None }
     /// Click handler. Default: nothing.
     fn on_click(&mut self, _ctx: &WidgetContext) -> ClickAction { ClickAction::None }
+    /// Get custom context menu items for this widget (e.g. for ClickAction::ShowActionsMenu).
+    fn get_context_menu_items(&self) -> Option<Vec<crate::renderer::ContextMenuItem>> { None }
 }
 
 /// Axis-aligned pixel rectangle.

@@ -12,16 +12,18 @@ pub struct TimeWidget {
     last_poll: Instant,
     interval: Duration,
     cached: String,
+    timezone_offset_hours: Option<i32>,
 }
 
 impl TimeWidget {
-    pub fn new(format: String, align: Align, interval_ms: Option<u64>) -> Self {
+    pub fn new(format: String, align: Align, interval_ms: Option<u64>, timezone: Option<i32>) -> Self {
         Self {
             format,
             align,
             last_poll: Instant::now() - Duration::from_secs(60),
             interval: Duration::from_millis(interval_ms.unwrap_or(DEFAULT_INTERVAL_MS)),
             cached: String::new(),
+            timezone_offset_hours: timezone,
         }
     }
 }
@@ -34,7 +36,7 @@ impl Widget for TimeWidget {
     fn set_last_poll(&mut self, t: Instant) { self.last_poll = t; }
 
     fn poll(&mut self, _ctx: &WidgetContext) {
-        self.cached = format_now(&self.format);
+        self.cached = format_now(&self.format, self.timezone_offset_hours);
     }
 
     fn render(&mut self, _ctx: &WidgetContext) -> Vec<Segment> {
@@ -49,11 +51,23 @@ impl Widget for TimeWidget {
     }
 }
 
-fn format_now(fmt: &str) -> String {
-    let secs = SystemTime::now()
+fn format_now(fmt: &str, timezone_offset_hours: Option<i32>) -> String {
+    let mut secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+
+    let offset_secs = if let Some(h) = timezone_offset_hours {
+        h as i64 * 3600
+    } else {
+        get_local_time_offset_secs() as i64
+    };
+
+    secs += offset_secs;
+    if secs < 0 {
+        secs = 0;
+    }
+
     let (h, m, s) = (
         (secs / 3600) % 24,
         (secs / 60) % 60,
@@ -76,4 +90,20 @@ fn format_now(fmt: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_local_time_offset_secs() -> i32 {
+    unsafe {
+        let mut t: libc::time_t = 0;
+        libc::time(&mut t);
+        let mut tm = std::mem::zeroed::<libc::tm>();
+        libc::localtime_r(&t, &mut tm);
+        tm.tm_gmtoff as i32
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn get_local_time_offset_secs() -> i32 {
+    0
 }

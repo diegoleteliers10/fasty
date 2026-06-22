@@ -15,6 +15,7 @@ pub struct WindowContext {
     pub renderer: Arc<parking_lot::Mutex<crate::renderer::Renderer<'static>>>,
     pub tabs: Vec<crate::Tab>,
     pub active_tab_index: usize,
+    pub last_active_tab_index: usize,
     pub shell_cols: usize,
     pub shell_rows: usize,
     pub cell_width: f32,
@@ -36,6 +37,13 @@ pub struct WindowContext {
     pub hovered_close_tab_index: Option<usize>,
     pub hover_new_tab: bool,
     pub last_click_time: Option<std::time::Instant>,
+    pub pending_term_resize: Option<(usize, usize)>,
+    pub pending_surface_resize: Option<(u32, u32)>,
+    pub modifiers: winit::keyboard::ModifiersState,
+    pub ctrl_held: bool,
+    pub shift_held: bool,
+    pub alt_held: bool,
+    pub scroll_velocity: f32,
 }
 
 impl WindowContext {
@@ -54,6 +62,7 @@ impl WindowContext {
             renderer,
             tabs,
             active_tab_index: 0,
+            last_active_tab_index: 0,
             shell_cols,
             shell_rows,
             cell_width,
@@ -75,6 +84,13 @@ impl WindowContext {
             hovered_close_tab_index: None,
             hover_new_tab: false,
             last_click_time: None,
+            pending_term_resize: None,
+            pending_surface_resize: None,
+            modifiers: winit::keyboard::ModifiersState::default(),
+            ctrl_held: false,
+            shift_held: false,
+            alt_held: false,
+            scroll_velocity: 0.0,
         }
     }
 }
