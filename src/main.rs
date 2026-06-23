@@ -171,6 +171,46 @@ fn get_padding_top(_tab_count: usize) -> f32 {
     48.0
 }
 
+fn mark_grid_dirty(renderer: &Arc<parking_lot::Mutex<Renderer>>, app_dirty: &mut bool) {
+    let mut r = renderer.lock();
+    r.set_dirty(true);
+    r.grid_dirty = true;
+    *app_dirty = true;
+}
+
+fn apply_font_size(
+    config: &mut Config,
+    new_size: f32,
+    tabs: &mut Vec<Tab>,
+    shell_cols: &mut usize,
+    shell_rows: &mut usize,
+    cell_width: &mut f32,
+    cell_height: &mut f32,
+    renderer: &Arc<parking_lot::Mutex<Renderer>>,
+    window: &winit::window::Window,
+    app_dirty: &mut bool,
+) {
+    if config.font.size == new_size {
+        return;
+    }
+    config.font.size = new_size;
+    if let Err(e) = config.save(&Config::get_active_config_path()) {
+        tracing::warn!("config: save failed: {e}");
+    }
+    if let Err(e) = renderer.lock().update_font(&config.font.family, config.font.size) {
+        tracing::error!("Failed to update renderer font: {:?}", e);
+    }
+    let cell_w = renderer.lock().cell_width();
+    let cell_h = renderer.lock().cell_height();
+    let physical_size = window.inner_size();
+    let (cols, rows) = resize_all_tabs(tabs, physical_size.width, physical_size.height, cell_w, cell_h);
+    *shell_cols = cols;
+    *shell_rows = rows;
+    *cell_width = cell_w;
+    *cell_height = cell_h;
+    mark_grid_dirty(renderer, app_dirty);
+}
+
 fn cursor_outside_tab_area(mx: f64, my: f64, vw: f64, vh: f64) -> bool {
     mx < 0.0 || mx >= vw || my < 0.0 || my >= vh || my >= 80.0
 }
@@ -2641,10 +2681,7 @@ fn main() -> anyhow::Result<()> {
                             if tabs[active_tab_index].hovered_url != new_hover {
                                 tabs[active_tab_index].hovered_url = new_hover;
                                 tabs[active_tab_index].hovered_url_text = new_hover_text;
-                                let mut r = renderer.lock();
-                                r.set_dirty(true);
-                                r.grid_dirty = true;
-                                app_dirty = true;
+                                mark_grid_dirty(&renderer, &mut app_dirty);
                             }
                             let new_hyperlink = detect_hovered_hyperlink(
                                 current_mouse_x, current_mouse_y,
@@ -2703,10 +2740,7 @@ fn main() -> anyhow::Result<()> {
                             if tabs[active_tab_index].hovered_url != new_hover {
                                 tabs[active_tab_index].hovered_url = new_hover;
                                 tabs[active_tab_index].hovered_url_text = new_hover_text;
-                                let mut r = renderer.lock();
-                                r.set_dirty(true);
-                                r.grid_dirty = true;
-                                app_dirty = true;
+                                mark_grid_dirty(&renderer, &mut app_dirty);
                             }
                             let new_hyperlink = detect_hovered_hyperlink(
                                 current_mouse_x, current_mouse_y,
@@ -2855,10 +2889,7 @@ fn main() -> anyhow::Result<()> {
                                                         let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
                                                         shell_cols = cols;
                                                         shell_rows = rows;
-                                                        let mut r = renderer.lock();
-                                                        r.set_dirty(true);
-                                                        r.grid_dirty = true;
-                                                        app_dirty = true;
+                                                        mark_grid_dirty(&renderer, &mut app_dirty);
                                                     }
                                                 }
                                                 CommandAction::CloseTab => {
@@ -2873,19 +2904,13 @@ fn main() -> anyhow::Result<()> {
                                                         let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
                                                         shell_cols = cols;
                                                         shell_rows = rows;
-                                                        let mut r = renderer.lock();
-                                                        r.set_dirty(true);
-                                                        r.grid_dirty = true;
-                                                        app_dirty = true;
+                                                        mark_grid_dirty(&renderer, &mut app_dirty);
                                                     }
                                                 }
                                                 CommandAction::NextTab => {
                                                     if tabs.len() > 1 {
                                                         active_tab_index = (active_tab_index + 1) % tabs.len();
-                                                        let mut r = renderer.lock();
-                                                        r.set_dirty(true);
-                                                        r.grid_dirty = true;
-                                                        app_dirty = true;
+                                                        mark_grid_dirty(&renderer, &mut app_dirty);
                                                     }
                                                 }
                                                 CommandAction::PrevTab => {
@@ -2895,10 +2920,7 @@ fn main() -> anyhow::Result<()> {
                                                         } else {
                                                             active_tab_index -= 1;
                                                         }
-                                                        let mut r = renderer.lock();
-                                                        r.set_dirty(true);
-                                                        r.grid_dirty = true;
-                                                        app_dirty = true;
+                                                        mark_grid_dirty(&renderer, &mut app_dirty);
                                                     }
                                                 }
                                                 CommandAction::OpenSettings => {
@@ -2953,69 +2975,33 @@ fn main() -> anyhow::Result<()> {
                                                     let _ = proxy.send_event(AppEvent::ConfigChanged);
                                                 }
                                                 CommandAction::IncreaseFontSize => {
-                                                    let mut current_config = Config::load().unwrap_or_default();
-                                                    let new_size = (current_config.font.size + 0.5).min(72.0);
-                                                    if new_size != current_config.font.size {
-                                                        current_config.font.size = new_size;
-                                                        let _ = current_config.save(&Config::get_active_config_path());
-                                                        config = current_config;
-                                                        let _ = renderer.lock().update_font(&config.font.family, config.font.size);
-                                                        let cell_w = renderer.lock().cell_width();
-                                                        let cell_h = renderer.lock().cell_height();
-                                                        let physical_size = window_for_redraw.inner_size();
-                                                        let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_w, cell_h);
-                                                        shell_cols = cols;
-                                                        shell_rows = rows;
-                                                        cell_width = cell_w;
-                                                        cell_height = cell_h;
-                                                        let mut r = renderer.lock();
-                                                        r.set_dirty(true);
-                                                        r.grid_dirty = true;
-                                                        app_dirty = true;
-                                                    }
+                                                    config = Config::load().unwrap_or_default();
+                                                    let new_size = (config.font.size + 0.5).min(72.0);
+                                                    apply_font_size(
+                                                        &mut config, new_size,
+                                                        &mut tabs, &mut shell_cols, &mut shell_rows,
+                                                        &mut cell_width, &mut cell_height,
+                                                        &renderer, &window_for_redraw, &mut app_dirty,
+                                                    );
                                                 }
                                                 CommandAction::DecreaseFontSize => {
-                                                    let mut current_config = Config::load().unwrap_or_default();
-                                                    let new_size = (current_config.font.size - 0.5).max(6.0);
-                                                    if new_size != current_config.font.size {
-                                                        current_config.font.size = new_size;
-                                                        let _ = current_config.save(&Config::get_active_config_path());
-                                                        config = current_config;
-                                                        let _ = renderer.lock().update_font(&config.font.family, config.font.size);
-                                                        let cell_w = renderer.lock().cell_width();
-                                                        let cell_h = renderer.lock().cell_height();
-                                                        let physical_size = window_for_redraw.inner_size();
-                                                        let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_w, cell_h);
-                                                        shell_cols = cols;
-                                                        shell_rows = rows;
-                                                        cell_width = cell_w;
-                                                        cell_height = cell_h;
-                                                        let mut r = renderer.lock();
-                                                        r.set_dirty(true);
-                                                        r.grid_dirty = true;
-                                                        app_dirty = true;
-                                                    }
+                                                    config = Config::load().unwrap_or_default();
+                                                    let new_size = (config.font.size - 0.5).max(6.0);
+                                                    apply_font_size(
+                                                        &mut config, new_size,
+                                                        &mut tabs, &mut shell_cols, &mut shell_rows,
+                                                        &mut cell_width, &mut cell_height,
+                                                        &renderer, &window_for_redraw, &mut app_dirty,
+                                                    );
                                                 }
                                                 CommandAction::ResetFontSize => {
-                                                    let mut current_config = Config::load().unwrap_or_default();
-                                                    if current_config.font.size != 13.0 {
-                                                        current_config.font.size = 13.0;
-                                                        let _ = current_config.save(&Config::get_active_config_path());
-                                                        config = current_config;
-                                                        let _ = renderer.lock().update_font(&config.font.family, config.font.size);
-                                                        let cell_w = renderer.lock().cell_width();
-                                                        let cell_h = renderer.lock().cell_height();
-                                                        let physical_size = window_for_redraw.inner_size();
-                                                        let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_w, cell_h);
-                                                        shell_cols = cols;
-                                                        shell_rows = rows;
-                                                        cell_width = cell_w;
-                                                        cell_height = cell_h;
-                                                        let mut r = renderer.lock();
-                                                        r.set_dirty(true);
-                                                        r.grid_dirty = true;
-                                                        app_dirty = true;
-                                                    }
+                                                    config = Config::load().unwrap_or_default();
+                                                    apply_font_size(
+                                                        &mut config, 13.0,
+                                                        &mut tabs, &mut shell_cols, &mut shell_rows,
+                                                        &mut cell_width, &mut cell_height,
+                                                        &renderer, &window_for_redraw, &mut app_dirty,
+                                                    );
                                                 }
                                                 CommandAction::NewWindow => {
                                                     if let Ok(exe) = std::env::current_exe() {
@@ -3081,10 +3067,7 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     _ => {}
                                 }
-                                let mut r = renderer.lock();
-                                r.set_dirty(true);
-                                r.grid_dirty = true;
-                                app_dirty = true;
+                                mark_grid_dirty(&renderer, &mut app_dirty);
                                 window_for_redraw.request_redraw();
                                 return;
                             }
@@ -3116,10 +3099,7 @@ fn main() -> anyhow::Result<()> {
                                                 let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
                                                 shell_cols = cols;
                                                 shell_rows = rows;
-                                                let mut r = renderer.lock();
-                                                r.set_dirty(true);
-                                                r.grid_dirty = true;
-                                                app_dirty = true;
+                                                mark_grid_dirty(&renderer, &mut app_dirty);
                                             }
                                         }
                                         ssh_picker_visible = false;
@@ -3157,10 +3137,7 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     _ => {}
                                 }
-                                let mut r = renderer.lock();
-                                r.set_dirty(true);
-                                r.grid_dirty = true;
-                                app_dirty = true;
+                                mark_grid_dirty(&renderer, &mut app_dirty);
                                 window_for_redraw.request_redraw();
                                 return;
                             }
@@ -3192,10 +3169,7 @@ fn main() -> anyhow::Result<()> {
                                                 let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
                                                 shell_cols = cols;
                                                 shell_rows = rows;
-                                                let mut r = renderer.lock();
-                                                r.set_dirty(true);
-                                                r.grid_dirty = true;
-                                                app_dirty = true;
+                                                mark_grid_dirty(&renderer, &mut app_dirty);
                                             }
                                         }
                                         project_jumper_visible = false;
@@ -3233,10 +3207,7 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     _ => {}
                                 }
-                                let mut r = renderer.lock();
-                                r.set_dirty(true);
-                                r.grid_dirty = true;
-                                app_dirty = true;
+                                mark_grid_dirty(&renderer, &mut app_dirty);
                                 window_for_redraw.request_redraw();
                                 return;
                             }
@@ -3276,10 +3247,7 @@ fn main() -> anyhow::Result<()> {
                                                                 shell_rows = rows;
                                                                 worktree_items = git::list_worktrees(&new_path);
                                                                 worktree_toplevel = Some(new_path);
-                                                                let mut r = renderer.lock();
-                                                                r.set_dirty(true);
-                                                                 r.grid_dirty = true;
-                            app_dirty = true;
+                                                                mark_grid_dirty(&renderer, &mut app_dirty);
                                                              }
                                                         }
                                                         None => {
@@ -3309,10 +3277,7 @@ fn main() -> anyhow::Result<()> {
                                                     let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
                                                     shell_cols = cols;
                                                     shell_rows = rows;
-                                                    let mut r = renderer.lock();
-                                                    r.set_dirty(true);
-                                                    r.grid_dirty = true;
-                                                    app_dirty = true;
+                                                    mark_grid_dirty(&renderer, &mut app_dirty);
                                                 }
                                             }
                                         }
@@ -3345,10 +3310,7 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     _ => {}
                                 }
-                                let mut r = renderer.lock();
-                                r.set_dirty(true);
-                                r.grid_dirty = true;
-                                app_dirty = true;
+                                mark_grid_dirty(&renderer, &mut app_dirty);
                                 window_for_redraw.request_redraw();
                                 return;
                             }
@@ -3372,10 +3334,7 @@ fn main() -> anyhow::Result<()> {
                                                     let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
                                                     shell_cols = cols;
                                                     shell_rows = rows;
-                                                    let mut r = renderer.lock();
-                                                    r.set_dirty(true);
-                                                    r.grid_dirty = true;
-                                                    app_dirty = true;
+                                                    mark_grid_dirty(&renderer, &mut app_dirty);
                                                 }
                                                 Err(e) => tracing::error!("Failed to create new tab: {:?}", e),
                                             }
@@ -3393,10 +3352,7 @@ fn main() -> anyhow::Result<()> {
                                                 let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_width, cell_height);
                                                 shell_cols = cols;
                                                 shell_rows = rows;
-                                                let mut r = renderer.lock();
-                                                r.set_dirty(true);
-                                                r.grid_dirty = true;
-                                                app_dirty = true;
+                                                mark_grid_dirty(&renderer, &mut app_dirty);
                                             }
                                             return;
                                         }
@@ -3417,10 +3373,7 @@ fn main() -> anyhow::Result<()> {
                                                     std::time::Instant::now(),
                                                     1920,
                                                 ));
-                                                let mut r = renderer.lock();
-                                                r.set_dirty(true);
-                                                r.grid_dirty = true;
-                                                app_dirty = true;
+                                                mark_grid_dirty(&renderer, &mut app_dirty);
                                             }
                                             return;
                                         }
@@ -3550,92 +3503,41 @@ fn main() -> anyhow::Result<()> {
                                             return;
                                         }
                                         keybindings::Action::IncreaseFontSize => {
-                                            let mut current_config = Config::load().unwrap_or_default();
-                                            let new_size = (current_config.font.size + 0.5).min(72.0);
-                                            if new_size != current_config.font.size {
-                                                current_config.font.size = new_size;
-                                                if let Err(e) = current_config.save(&Config::get_active_config_path()) {
-                                                    tracing::warn!("config: save failed: {e}");
-                                                }
-                                                config = current_config;
-                                                if let Err(e) = renderer.lock().update_font(&config.font.family, config.font.size) {
-                                                    tracing::error!("Failed to update renderer font: {:?}", e);
-                                                }
-                                                let cell_w = renderer.lock().cell_width();
-                                                let cell_h = renderer.lock().cell_height();
-                                                let physical_size = window_for_redraw.inner_size();
-                                                let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_w, cell_h);
-                                                shell_cols = cols;
-                                                shell_rows = rows;
-                                                cell_width = cell_w;
-                                                cell_height = cell_h;
-                                                let mut r = renderer.lock();
-                                                r.set_dirty(true);
-                                                r.grid_dirty = true;
-                                                app_dirty = true;
-                                            }
+                                            config = Config::load().unwrap_or_default();
+                                            let new_size = (config.font.size + 0.5).min(72.0);
+                                            apply_font_size(
+                                                &mut config, new_size,
+                                                &mut tabs, &mut shell_cols, &mut shell_rows,
+                                                &mut cell_width, &mut cell_height,
+                                                &renderer, &window_for_redraw, &mut app_dirty,
+                                            );
                                             return;
                                         }
                                         keybindings::Action::DecreaseFontSize => {
-                                            let mut current_config = Config::load().unwrap_or_default();
-                                            let new_size = (current_config.font.size - 0.5).max(6.0);
-                                            if new_size != current_config.font.size {
-                                                current_config.font.size = new_size;
-                                                if let Err(e) = current_config.save(&Config::get_active_config_path()) {
-                                                    tracing::warn!("config: save failed: {e}");
-                                                }
-                                                config = current_config;
-                                                if let Err(e) = renderer.lock().update_font(&config.font.family, config.font.size) {
-                                                    tracing::error!("Failed to update renderer font: {:?}", e);
-                                                }
-                                                let cell_w = renderer.lock().cell_width();
-                                                let cell_h = renderer.lock().cell_height();
-                                                let physical_size = window_for_redraw.inner_size();
-                                                let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_w, cell_h);
-                                                shell_cols = cols;
-                                                shell_rows = rows;
-                                                cell_width = cell_w;
-                                                cell_height = cell_h;
-                                                let mut r = renderer.lock();
-                                                r.set_dirty(true);
-                                                r.grid_dirty = true;
-                                                app_dirty = true;
-                                            }
+                                            config = Config::load().unwrap_or_default();
+                                            let new_size = (config.font.size - 0.5).max(6.0);
+                                            apply_font_size(
+                                                &mut config, new_size,
+                                                &mut tabs, &mut shell_cols, &mut shell_rows,
+                                                &mut cell_width, &mut cell_height,
+                                                &renderer, &window_for_redraw, &mut app_dirty,
+                                            );
                                             return;
                                         }
                                         keybindings::Action::ResetFontSize => {
-                                            let mut current_config = Config::load().unwrap_or_default();
-                                            if current_config.font.size != 13.0 {
-                                                current_config.font.size = 13.0;
-                                                if let Err(e) = current_config.save(&Config::get_active_config_path()) {
-                                                    tracing::warn!("config: save failed: {e}");
-                                                }
-                                                config = current_config;
-                                                if let Err(e) = renderer.lock().update_font(&config.font.family, config.font.size) {
-                                                    tracing::error!("Failed to update renderer font: {:?}", e);
-                                                }
-                                                let cell_w = renderer.lock().cell_width();
-                                                let cell_h = renderer.lock().cell_height();
-                                                let physical_size = window_for_redraw.inner_size();
-                                                let (cols, rows) = resize_all_tabs(&tabs, physical_size.width, physical_size.height, cell_w, cell_h);
-                                                shell_cols = cols;
-                                                shell_rows = rows;
-                                                cell_width = cell_w;
-                                                cell_height = cell_h;
-                                                let mut r = renderer.lock();
-                                                r.set_dirty(true);
-                                                r.grid_dirty = true;
-                                                app_dirty = true;
-                                            }
+                                            config = Config::load().unwrap_or_default();
+                                            apply_font_size(
+                                                &mut config, 13.0,
+                                                &mut tabs, &mut shell_cols, &mut shell_rows,
+                                                &mut cell_width, &mut cell_height,
+                                                &renderer, &window_for_redraw, &mut app_dirty,
+                                            );
                                             return;
                                         }
                                         keybindings::Action::NextTab => {
                                             if tabs.len() > 1 {
                                                 active_tab_index = (active_tab_index + 1) % tabs.len();
-                                                let mut r = renderer.lock();
-                                                r.set_dirty(true);
-                                                r.grid_dirty = true;
-                                                app_dirty = true;
+                                                mark_grid_dirty(&renderer, &mut app_dirty);
                                             }
                                             return;
                                         }
@@ -3646,10 +3548,7 @@ fn main() -> anyhow::Result<()> {
                                                 } else {
                                                     active_tab_index -= 1;
                                                 }
-                                                let mut r = renderer.lock();
-                                                r.set_dirty(true);
-                                                r.grid_dirty = true;
-                                                app_dirty = true;
+                                                mark_grid_dirty(&renderer, &mut app_dirty);
                                             }
                                             return;
                                         }
@@ -3723,10 +3622,7 @@ fn main() -> anyhow::Result<()> {
                                             let target_idx = (n - 1) as usize;
                                             if target_idx < tabs.len() {
                                                 active_tab_index = target_idx;
-                                                let mut r = renderer.lock();
-                                                r.set_dirty(true);
-                                                r.grid_dirty = true;
-                                                app_dirty = true;
+                                                mark_grid_dirty(&renderer, &mut app_dirty);
                                             }
                                             return;
                                         }
@@ -3842,10 +3738,7 @@ fn main() -> anyhow::Result<()> {
                                     }
                                     _ => {}
                                 }
-                                let mut r = renderer.lock();
-                                r.set_dirty(true);
-                                r.grid_dirty = true;
-                                app_dirty = true;
+                                mark_grid_dirty(&renderer, &mut app_dirty);
                                 return;
                             }
 
@@ -3893,10 +3786,7 @@ fn main() -> anyhow::Result<()> {
                                                 bytes.extend_from_slice(expanded.as_bytes());
                                                 tabs[active_tab_index].scroll_target = 0.0;
                                                 tabs[active_tab_index].terminal_state.lock().write_to_pty(&bytes);
-                                                let mut r = renderer.lock();
-                                                r.set_dirty(true);
-                                                r.grid_dirty = true;
-                                                app_dirty = true;
+                                                mark_grid_dirty(&renderer, &mut app_dirty);
                                                 return;
                                             }
                                         }
@@ -4073,10 +3963,7 @@ fn main() -> anyhow::Result<()> {
                                                          context_menu_open_time = None;
                                                          context_menu_open_time_secs = None;
                                                          context_menu_hovered_idx = None;
-                                                         let mut r = renderer.lock();
-                                                         r.set_dirty(true);
-                                                         r.grid_dirty = true;
-                                                         app_dirty = true;
+                                                         mark_grid_dirty(&renderer, &mut app_dirty);
                                                      }
                                                     crate::renderer::ContextMenuItem::Copy => {
                                                         if let Some(sel) = tabs[active_tab_index].selection {
@@ -4325,10 +4212,7 @@ fn main() -> anyhow::Result<()> {
                                     context_menu_open_time = None;
                                     context_menu_open_time_secs = None;
                                     context_menu_hovered_idx = None;
-                                    let mut r = renderer.lock();
-                                    r.set_dirty(true);
-                                    r.grid_dirty = true;
-                                    app_dirty = true;
+                                    mark_grid_dirty(&renderer, &mut app_dirty);
                                 }
                                 return;
                             }
@@ -4633,10 +4517,7 @@ fn main() -> anyhow::Result<()> {
                                                       // Do not confine the cursor so dragging it out can trigger window pop-out.
                                                       let _ = window_for_redraw.set_cursor_grab(CursorGrabMode::None);
                                                   }
-                                                 let mut r = renderer.lock();
-                                                 r.set_dirty(true);
-                                                 r.grid_dirty = true;
-                                                 app_dirty = true;
+                                                 mark_grid_dirty(&renderer, &mut app_dirty);
                                              }
                                              return;
                                          }
@@ -4674,10 +4555,7 @@ fn main() -> anyhow::Result<()> {
                                                      tracing::error!("Failed to create new tab: {:?}", e);
                                                  }
                                              }
-                                             let mut r = renderer.lock();
-                                             r.set_dirty(true);
-                                             r.grid_dirty = true;
-                                             app_dirty = true;
+                                             mark_grid_dirty(&renderer, &mut app_dirty);
                                              return;
                                          }
 
@@ -4985,10 +4863,7 @@ fn main() -> anyhow::Result<()> {
 
                                         dragging_tab = None;
                                         drag_threshold_passed = false;
-                                        let mut r = renderer.lock();
-                                        r.set_dirty(true);
-                                        r.grid_dirty = true;
-                                        app_dirty = true;
+                                        mark_grid_dirty(&renderer, &mut app_dirty);
                                         return;
                                     }
 
@@ -5012,10 +4887,7 @@ fn main() -> anyhow::Result<()> {
                                     } else if tabs[active_tab_index].selection_start_pos.is_some() {
                                         // Simple click release (no drag occurred): clear selection
                                         tabs[active_tab_index].selection = None;
-                                        let mut r = renderer.lock();
-                                        r.set_dirty(true);
-                                        r.grid_dirty = true;
-                                        app_dirty = true;
+                                        mark_grid_dirty(&renderer, &mut app_dirty);
 
                                         // Click-to-cursor-position in normal shell mode (no TUI app owns mouse):
                                         let padding_top = get_padding_top(tabs.len());
@@ -5506,10 +5378,7 @@ fn main() -> anyhow::Result<()> {
                                             padding_top,
                                         );
                                         tabs[active_tab_index].selection = Some(Selection { start: start_point, end: current_point });
-                                        let mut r = renderer.lock();
-                                        r.set_dirty(true);
-                                        r.grid_dirty = true;
-                                        app_dirty = true;
+                                        mark_grid_dirty(&renderer, &mut app_dirty);
                                     }
                                 } else {
                                     let term = tabs[active_tab_index].terminal_state.lock();
@@ -5531,10 +5400,7 @@ fn main() -> anyhow::Result<()> {
                                     if let Some(ref mut sel) = tabs[active_tab_index].selection {
                                         if sel.end != current_point {
                                             sel.end = current_point;
-                                            let mut r = renderer.lock();
-                                            r.set_dirty(true);
-                                            r.grid_dirty = true;
-                                            app_dirty = true;
+                                            mark_grid_dirty(&renderer, &mut app_dirty);
                                         }
                                     }
                                 }
@@ -5561,10 +5427,7 @@ fn main() -> anyhow::Result<()> {
                             if tabs[active_tab_index].hovered_url != new_hover {
                                 tabs[active_tab_index].hovered_url = new_hover;
                                 tabs[active_tab_index].hovered_url_text = new_hover_text;
-                                let mut r = renderer.lock();
-                                r.set_dirty(true);
-                                r.grid_dirty = true;
-                                app_dirty = true;
+                                mark_grid_dirty(&renderer, &mut app_dirty);
                             }
                             let new_hyperlink = detect_hovered_hyperlink(
                                 current_mouse_x, current_mouse_y,
