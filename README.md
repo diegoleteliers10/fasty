@@ -12,7 +12,7 @@ Inspired by [Ghostty](https://github.com/ghostty-org/ghostty), Fasty leverages `
 
 ## Recent Updates
 
-### v0.4.3 (2025-01-XX)
+### v0.4.3 (2026-06-25)
 - **UI refinements:** Fixed tab border vertical alignment and centered loader/close button for cleaner tab appearance
 - **Build improvements:** Vendor OpenSSL for git2 to fix macOS x86_64 cross-compilation
 
