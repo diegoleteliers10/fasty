@@ -10,6 +10,19 @@ Inspired by [Ghostty](https://github.com/ghostty-org/ghostty), Fasty leverages `
 
 ---
 
+## Recent Updates
+
+### v0.4.3 (2025-01-XX)
+- **UI refinements:** Fixed tab border vertical alignment and centered loader/close button for cleaner tab appearance
+- **Build improvements:** Vendor OpenSSL for git2 to fix macOS x86_64 cross-compilation
+
+### v0.4.2
+- Bottombar widget refactor with composable architecture
+- Git context menu with GitHub Actions integration
+- Significant LOC reduction across codebase
+
+---
+
 ## Key Features
 
 - **GPU-Accelerated Rendering**: Built on `wgpu` (Vulkan, Metal, DX12, GLES) and WGSL shaders for low-latency cell grid updates.
