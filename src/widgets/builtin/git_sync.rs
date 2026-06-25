@@ -244,7 +244,7 @@ impl Widget for GitSyncWidget {
     }
 
     fn on_click(&mut self, _ctx: &WidgetContext) -> ClickAction {
-        ClickAction::ShowActionsMenu
+        ClickAction::None
     }
 
     fn get_context_menu_items(&self) -> Option<Vec<ContextMenuItem>> {

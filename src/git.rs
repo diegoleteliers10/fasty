@@ -28,6 +28,7 @@ pub struct GitStatus {
     pub sync_status: SyncStatus,
     pub last_commit_hash: String, // first 7 chars
     pub last_commit_summary: String, // hash + commit subject line
+    pub remote_url: Option<String>, // origin URL (e.g. https://github.com/user/repo)
     pub last_updated: std::time::Instant,
 }
 
@@ -52,6 +53,7 @@ impl Default for GitStatus {
             sync_status: SyncStatus::default(),
             last_commit_hash: String::new(),
             last_commit_summary: String::new(),
+            remote_url: None,
             last_updated: std::time::Instant::now(),
         }
     }
@@ -224,7 +226,11 @@ pub fn fetch_git_info(repo_path: &Path) -> Option<GitInfo> {
             }
         }
     };
-    
+
+    let remote_url = repo.find_remote("origin")
+        .ok()
+        .and_then(|r| r.url().map(|s| s.to_string()));
+
     Some(GitInfo {
         branch,
         is_detached,
@@ -236,6 +242,7 @@ pub fn fetch_git_info(repo_path: &Path) -> Option<GitInfo> {
         sync_status,
         last_commit_hash: hash_short,
         last_commit_summary: format!("{} {}", &hash[..hash.len().min(7)], summary),
+        remote_url,
         last_updated: std::time::Instant::now(),
     })
 }
@@ -250,6 +257,41 @@ fn get_ahead_behind(repo: &git2::Repository, branch: &str) -> (usize, usize) {
         Err(_) => return (0, 0),
     };
     repo.graph_ahead_behind(local, remote).unwrap_or((0, 0))
+}
+
+pub fn get_recent_commits(repo_path: &Path, limit: usize) -> Vec<String> {
+    let repo = match git2::Repository::open(repo_path) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut revwalk = match repo.revwalk() {
+        Ok(rw) => rw,
+        Err(_) => return Vec::new(),
+    };
+
+    if let Err(_) = revwalk.push_head() {
+        return Vec::new();
+    }
+
+    let mut commits = Vec::new();
+    for (i, oid) in revwalk.enumerate() {
+        if i >= limit {
+            break;
+        }
+        let oid = match oid {
+            Ok(id) => id,
+            Err(_) => break,
+        };
+        let commit = match repo.find_commit(oid) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let hash = &oid.to_string()[..7];
+        let summary = commit.summary().unwrap_or("<no message>");
+        commits.push(format!("{} {}", hash, summary));
+    }
+    commits
 }
 
 pub struct GitWatcherManager {

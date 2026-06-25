@@ -193,7 +193,7 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     a: 0.0,
 };
 
-const ATLAS_SIZE: u32 = 1024;
+const ATLAS_SIZE: u32 = 2048;
 
 pub struct Renderer<'a> {
     surface: Surface<'a>,

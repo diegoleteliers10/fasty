@@ -837,7 +837,7 @@ impl Pipeline {
             0.0,
             0.0,
             viewport_width,
-            40.0,
+            30.0,
             theme_topbar,
             [8.0, 8.0, 0.0, 0.0],
             0.0,
@@ -911,7 +911,16 @@ impl Pipeline {
                     row_cells[row].push(cell);
                     row_points[row].push(point);
                     row_hyperlinks[row]
-                        .push(cell.hyperlink().map(|h| std::sync::Arc::from(h.uri())));
+                        .push(cell.hyperlink().map(|h| {
+                            let uri = h.uri().to_string();
+                            if let Some(cached) = atlas.hyperlink_cache.get(&uri) {
+                                cached.clone()
+                            } else {
+                                let arc: std::sync::Arc<str> = std::sync::Arc::from(uri.as_str());
+                                atlas.hyperlink_cache.insert(uri, arc.clone());
+                                arc
+                            }
+                        }));
                 }
 
                 let is_default_bg = matches!(
@@ -1073,6 +1082,7 @@ impl Pipeline {
             let mut row_shaping = vec![None; visible_rows_count];
 
             if use_ligatures {
+                let mut row_text = String::with_capacity(256);
                 for row in 0..visible_rows_count {
                     let cells = &row_cells[row];
                     if cells.is_empty() {
@@ -1080,7 +1090,7 @@ impl Pipeline {
                     }
 
                     // 1. Build row text
-                    let mut row_text = String::new();
+                    row_text.clear();
                     for cell in cells.iter() {
                         row_text.push(cell.c);
                     }
@@ -1422,7 +1432,7 @@ impl Pipeline {
             let bar_w = (viewport_width * 0.32).clamp(280.0, 480.0);
             let bar_h = 52.0f32;
             let bar_x = viewport_width - bar_w - 16.0;
-            let bar_y = 40.0f32 + 8.0f32;
+            let bar_y = 30.0f32 + 8.0f32;
             let bar_radius = 8.0f32;
 
             // Floating block background with rounded corners
@@ -1605,7 +1615,7 @@ impl Pipeline {
             let glyph_w = entry.width * icon_scale;
             let glyph_h = entry.height * icon_scale;
             let glyph_x = 8.0f32 + (16.0f32 - glyph_w) / 2.0f32;
-            let glyph_y = 12.0f32 + (16.0f32 - glyph_h) / 2.0f32;
+            let glyph_y = 7.0f32 + (16.0f32 - glyph_h) / 2.0f32;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             let uv_w = uv_end_x - uv_x;
@@ -1631,7 +1641,7 @@ impl Pipeline {
                 let glyph_w = entry.width * icon_scale;
                 let glyph_h = entry.height * icon_scale;
                 let glyph_x = (8.0f32 + (16.0f32 - glyph_w) / 2.0f32).round();
-                let glyph_y = (12.0f32 + (16.0f32 - glyph_h) / 2.0f32).round();
+                let glyph_y = (7.0f32 + (16.0f32 - glyph_h) / 2.0f32).round();
                 let (aw, ah) = atlas.atlas_size();
                 let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                 let uv_w = uv_end_x - uv_x;
@@ -1653,8 +1663,9 @@ impl Pipeline {
             }
         }
 
-        // Draw tabs
-        let tab_start_x = 36.0f32;
+        // Draw tabs (zen mode: hide when only one tab)
+        if tab_titles.len() > 1 {
+            let tab_start_x = 36.0f32;
         let path_center_x = viewport_width / 2.0f32;
         let tab_area_max_x = path_center_x - 40.0f32;
         let tab_area_width = tab_area_max_x - tab_start_x - 32.0f32; // 32px for new tab button
@@ -1673,7 +1684,7 @@ impl Pipeline {
             if active_tab_x > 0.0 {
                 bg_instances.push(CellInstance::new(
                     0.0,
-                    39.0,
+                    29.0,
                     active_tab_x,
                     1.0,
                     with_opacity([1.0, 1.0, 1.0, 0.06], chrome_alpha),
@@ -1691,7 +1702,7 @@ impl Pipeline {
             if right_start < viewport_width {
                 bg_instances.push(CellInstance::new(
                     right_start,
-                    39.0,
+                    29.0,
                     viewport_width - right_start,
                     1.0,
                     with_opacity([1.0, 1.0, 1.0, 0.06], chrome_alpha),
@@ -1706,7 +1717,7 @@ impl Pipeline {
         } else {
             bg_instances.push(CellInstance::new(
                 0.0,
-                39.0,
+                29.0,
                 viewport_width,
                 1.0,
                 with_opacity([1.0, 1.0, 1.0, 0.06], chrome_alpha),
@@ -1734,7 +1745,7 @@ impl Pipeline {
                     || current_mouse_x >= viewport_width
                     || current_mouse_y < 0.0
                     || current_mouse_y >= viewport_height
-                    || current_mouse_y >= 80.0;
+                    || current_mouse_y >= 70.0;
                 let is_pop_out_pending = is_dragged && cursor_outside_tab && tab_titles.len() >= 2;
 
                 let tab_alpha = if is_dragged && is_pop_out_pending {
@@ -1750,7 +1761,7 @@ impl Pipeline {
                         tab_x,
                         0.0,
                         tab_width,
-                        40.0,
+                        30.0,
                         theme_active_tab,
                         [0.0, 0.0, 0.0, 0.0],
                         0.0,
@@ -1765,7 +1776,7 @@ impl Pipeline {
                         tab_x,
                         0.0,
                         1.0,
-                        40.0,
+                        30.0,
                         with_opacity([1.0, 1.0, 1.0, 0.12], tab_alpha),
                         [0.0, 0.0, 0.0, 0.0],
                         0.0,
@@ -1779,7 +1790,7 @@ impl Pipeline {
                         tab_x + tab_width,
                         0.0,
                         1.0,
-                        40.0,
+                        30.0,
                         with_opacity([1.0, 1.0, 1.0, 0.12], tab_alpha),
                         [0.0, 0.0, 0.0, 0.0],
                         0.0,
@@ -1794,9 +1805,9 @@ impl Pipeline {
                 if i + 1 < tab_titles.len() && i != active_tab_index && i + 1 != active_tab_index {
                     bg_instances.push(CellInstance::new(
                         tab_x + tab_width,
-                        12.0,
+                        9.0,
                         1.0,
-                        16.0,
+                        12.0,
                         with_opacity([1.0, 1.0, 1.0, 0.05], tab_alpha), // Very subtle separator
                         [0.0, 0.0, 0.0, 0.0],
                         0.0,
@@ -1844,7 +1855,7 @@ impl Pipeline {
                 };
 
                 let scaled_ascent = atlas.ascent() * scale;
-                let baseline_y = (40.0f32 - 12.0f32) / 2.0f32 + scaled_ascent;
+                let baseline_y = (30.0f32 - 12.0f32) / 2.0f32 + scaled_ascent;
 
                 for c in truncated_title.chars() {
                     if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
@@ -1897,7 +1908,7 @@ impl Pipeline {
                 let is_running = tab_running_states.get(i).copied().unwrap_or(false);
                 let exit_code = tab_exit_codes.get(i).copied().flatten();
                 let indicator_x = tab_x + 6.0;
-                let indicator_y = 18.0;
+                let indicator_y = 15.0;
                 let indicator_r = 4.0;
 
                 if is_running {
@@ -1944,7 +1955,7 @@ impl Pipeline {
                             // Subtle circle background rgba(255,255,255,0.10)
                             bg_instances.push(CellInstance::new(
                                 close_x - 1.0,
-                                11.0,
+                                6.0,
                                 18.0,
                                 18.0,
                                 with_opacity([1.0, 1.0, 1.0, 0.10], tab_alpha),
@@ -1960,7 +1971,7 @@ impl Pipeline {
                         let entry_w = 12.0f32;
                         let entry_h = 12.0f32;
                         let cx = close_x + (16.0f32 - entry_w) / 2.0f32;
-                        let cy = (40.0f32 - entry_h) / 2.0f32;
+                        let cy = (30.0f32 - entry_h) / 2.0f32;
                         let (aw, ah) = atlas.atlas_size();
                         let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
                         let uv_w = uv_end_x - uv_x;
@@ -2028,7 +2039,7 @@ impl Pipeline {
                 new_tab_x,
                 0.0,
                 32.0,
-                40.0,
+                30.0,
                 with_opacity([1.0, 1.0, 1.0, 0.04], chrome_alpha), // Extremely subtle hover feedback
                 [0.0, 0.0, 0.0, 0.0],
                 0.0,
@@ -2042,7 +2053,7 @@ impl Pipeline {
             let entry_w = 16.0f32;
             let entry_h = 16.0f32;
             let cx = new_tab_x + (32.0f32 - entry_w) / 2.0f32;
-            let cy = (40.0f32 - entry_h) / 2.0f32;
+            let cy = (30.0f32 - entry_h) / 2.0f32;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
             let uv_w = uv_end_x - uv_x;
@@ -2081,9 +2092,9 @@ impl Pipeline {
                 let indicator_x = tab_start_x + target as f32 * tab_w;
                 bg_instances.push(CellInstance::new(
                     indicator_x - 1.0,
-                    4.0,
+                    3.0,
                     2.0,
-                    32.0,
+                    24.0,
                     [0.4, 0.6, 1.0, 0.8],
                     [0.0, 0.0, 0.0, 0.0],
                     0.0,
@@ -2094,11 +2105,12 @@ impl Pipeline {
                 ));
             }
         }
+        } // End: zen mode - hide tabs when only one tab
 
         // Centered path display removed — the active tab already shows its name.
 
         // Draw window controls (Settings, vertical line, Minimize, Maximize, Close)
-        let controls_y = 6.0f32; // centered vertically: (40 - 28)/2
+        let controls_y = 1.0f32; // centered vertically: (30 - 28)/2
         let _icon_scale = 15.0f32 / atlas.font_size();
 
         // 0. Update button (if update is available)
@@ -2488,7 +2500,7 @@ impl Pipeline {
         }
 
         if scrollbar_alpha > 0.001 {
-            const TOPBAR_HEIGHT: f32 = 40.0;
+            const TOPBAR_HEIGHT: f32 = 30.0;
             let track_top = TOPBAR_HEIGHT;
             let track_width = 6.0f32;
             let track_x = viewport_width - track_width - 2.0f32; // 2px from right edge
@@ -2955,7 +2967,14 @@ impl Pipeline {
                                 continue;
                             }
                             if let Some(entry) = atlas.get_or_rasterize(c, device, queue) {
-                                let char_scale = if c == '📦' {
+                                let is_emoji = c == '📦' || matches!(c,
+                                    '🔍' | '⎇' | '🔧' | '📋' | '🔗' | '✏' | '✉' | '📁' | '🎇' |
+                                    '⬇' | '⬆' | '↻' | '📊' | '📌' | '⚡' | '📝' | '📜' | '🔀' | '➕' |
+                                    '🖥' | '📅' | '📦' | '✓' | '⚠' | '❌' | 'ℹ' | '🔔' | '👁' |
+                                    '🎨' | '🔬' | '🔭' | '📐' | '🏗' | '⚒' | '🔄' | '🆕' | '🔖' | '📂' |
+                                    '🔒' | '💾' | '🔐' | '🗝' | '🛠' | '🔧'
+                                ) || (c as u32 >= 0x1F300 && c as u32 <= 0x1F9FF);
+                                let char_scale = if is_emoji {
                                     if entry.height > 0.0 {
                                         (base_scale * atlas.font_size() * 0.85) / entry.height
                                     } else {
@@ -3164,14 +3183,18 @@ impl Pipeline {
             }
         }
 
-        // Rename input overlay on tab
-        if let Some(renaming_idx) = renaming_tab {
-            let tab_start_x = 36.0f32;
-            let tab_w = if tab_titles.len() > 0 {
-                (tab_area_width / tab_titles.len() as f32).clamp(80.0, 160.0)
-            } else {
-                160.0
-            };
+        // Rename input overlay on tab (only when tabs are visible)
+        if tab_titles.len() > 1 {
+            if let Some(renaming_idx) = renaming_tab {
+                let tab_start_x = 36.0f32;
+                let path_center_x = viewport_width / 2.0f32;
+                let tab_area_max_x = path_center_x - 40.0f32;
+                let tab_area_width = tab_area_max_x - tab_start_x - 32.0f32;
+                let tab_w = if tab_titles.len() > 0 {
+                    (tab_area_width / tab_titles.len() as f32).clamp(80.0, 160.0)
+                } else {
+                    160.0
+                };
             let input_x = tab_start_x + renaming_idx as f32 * tab_w + 4.0;
             let input_w = tab_w - 8.0;
             let input_h = 24.0;
@@ -3272,6 +3295,7 @@ impl Pipeline {
                 ));
             }
         }
+        }
 
         if command_palette_visible {
             let palette_w = 500.0f32;
@@ -3281,7 +3305,7 @@ impl Pipeline {
             let n_shown = command_palette_filtered.len().min(max_results);
             let palette_h = input_h + (n_shown as f32) * item_h + 16.0;
             let palette_x = (viewport_width - palette_w) / 2.0;
-            let palette_y = 80.0;
+            let palette_y = 70.0;
 
             instances.push(CellInstance::new(
                 palette_x - 1.0,

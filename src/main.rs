@@ -168,7 +168,7 @@ fn create_new_tab(
 }
 
 fn get_padding_top(_tab_count: usize) -> f32 {
-    48.0
+    58.0
 }
 
 fn mark_grid_dirty(renderer: &Arc<parking_lot::Mutex<Renderer>>, app_dirty: &mut bool) {
@@ -4580,7 +4580,7 @@ fn main() -> anyhow::Result<()> {
                                          return;
                                      }
 
-                                    const TOPBAR_HEIGHT: f32 = 40.0;
+                                    const TOPBAR_HEIGHT: f32 = 30.0;
                                     let scrollbar_top_margin = TOPBAR_HEIGHT;
                                     let show_scrollbar = {
                                         let term_guard = tabs[active_tab_index].terminal_state.lock();
@@ -5333,7 +5333,7 @@ fn main() -> anyhow::Result<()> {
                                 let total_lines = visible_rows + history_size;
                                 if total_lines > 0.0 {
                                     let ratio = visible_rows / total_lines;
-                                    const TOPBAR_HEIGHT: f32 = 40.0;
+                                    const TOPBAR_HEIGHT: f32 = 30.0;
                                     let scrollbar_top_margin = TOPBAR_HEIGHT;
                                     let track_h = v_height - scrollbar_top_margin - 2.0;
                                     let thumb_h = (track_h * ratio).max(20.0).min(track_h);
@@ -6839,7 +6839,7 @@ fn main() -> anyhow::Result<()> {
 
                 // Opacity animation of the scrollbar (uses active tab details)
                 let v_width = renderer.lock().config.width as f64;
-                const TOPBAR_HEIGHT: f32 = 40.0;
+                const TOPBAR_HEIGHT: f32 = 30.0;
                 let scrollbar_top_margin = TOPBAR_HEIGHT;
                 
                 let show_scrollbar = {
@@ -7346,15 +7346,16 @@ fn compute_search_matches(
 
     for line_idx in min_line..max_line {
         let row = &grid[alacritty_terminal::index::Line(line_idx)];
-        let row_chars: Vec<char> = (0..shell_cols).map(|c| row[alacritty_terminal::index::Column(c)].c).collect();
-        for start in 0..row_chars.len() {
-            if start + q_chars.len() > row_chars.len() {
+
+        for start in 0..shell_cols {
+            if start + q_chars.len() > shell_cols {
                 break;
             }
             let mut ok = true;
             for i in 0..q_chars.len() {
-                let rc = row_chars[start + i];
-                if rc.to_lowercase().next().unwrap_or('\0') != query_lower[i] {
+                let cell = &row[alacritty_terminal::index::Column(start + i)];
+                let cell_char = cell.c;
+                if cell_char.to_lowercase().next().unwrap_or('\0') != query_lower[i] {
                     ok = false;
                     break;
                 }

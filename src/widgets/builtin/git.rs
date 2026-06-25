@@ -124,6 +124,7 @@ impl Widget for GitWidget {
         let mut items = Vec::new();
 
         if let Some(gs) = &self.cached {
+            // Sync status
             let (label, status) = match &gs.sync_status {
                 crate::git::SyncStatus::UpToDate => ("\u{2713} Up to date with remote".to_string(), "success".to_string()),
                 crate::git::SyncStatus::Behind(n) => (format!("\u{2193} Behind remote by {} commit(s)", n), "queued".to_string()),
@@ -136,9 +137,50 @@ impl Widget for GitWidget {
                 status,
                 url: None,
             });
+
+            // Last commit
+            if !gs.last_commit_summary.is_empty() {
+                let truncated = if gs.last_commit_summary.len() > 30 {
+                    format!("{}...", &gs.last_commit_summary[..27])
+                } else {
+                    gs.last_commit_summary.clone()
+                };
+                items.push(crate::renderer::ContextMenuItem::GithubActionInfo {
+                    label: format!("\u{1F50F} {}", truncated),
+                    status: "skipped".to_string(),
+                    url: None,
+                });
+            }
+
+            // Remote URL (if GitHub)
+            if let Some(remote_url) = &gs.remote_url {
+                if remote_url.contains("github.com") {
+                    // GitHub Actions link
+                    let repo_path = remote_url.trim_start_matches("https://")
+                        .trim_start_matches("git@github.com:")
+                        .trim_start_matches("http://")
+                        .trim_start_matches("github.com/")
+                        .trim_end_matches(".git");
+
+                    items.push(crate::renderer::ContextMenuItem::GithubActionInfo {
+                        label: "\u{2692} GitHub Actions".to_string(),
+                        status: "skipped".to_string(),
+                        url: Some(format!("https://github.com/{}/actions", repo_path)),
+                    });
+
+                    // Repository link
+                    items.push(crate::renderer::ContextMenuItem::GithubActionInfo {
+                        label: "\u{1F517} Open Repository".to_string(),
+                        status: "skipped".to_string(),
+                        url: Some(remote_url.clone()),
+                    });
+                }
+            }
+
             items.push(crate::renderer::ContextMenuItem::Separator);
         }
 
+        // Sync actions
         items.push(crate::renderer::ContextMenuItem::CommandItem {
             label: "\u{2B07} Pull  [git pull]".to_string(),
             command: "git pull".to_string(),
@@ -152,6 +194,39 @@ impl Widget for GitWidget {
         items.push(crate::renderer::ContextMenuItem::CommandItem {
             label: "\u{21BA} Fetch [git fetch]".to_string(),
             command: "git fetch".to_string(),
+            cwd: cwd_str.clone(),
+        });
+
+        // Additional git commands
+        items.push(crate::renderer::ContextMenuItem::Separator);
+
+        items.push(crate::renderer::ContextMenuItem::CommandItem {
+            label: "\u{1F4CB} Status [git status]".to_string(),
+            command: "git status".to_string(),
+            cwd: cwd_str.clone(),
+        });
+
+        items.push(crate::renderer::ContextMenuItem::CommandItem {
+            label: "\u{1F4C5} Log (5) [git log]".to_string(),
+            command: "git log --oneline -5".to_string(),
+            cwd: cwd_str.clone(),
+        });
+
+        items.push(crate::renderer::ContextMenuItem::CommandItem {
+            label: "\u{1F4DD} Diff [git diff]".to_string(),
+            command: "git diff".to_string(),
+            cwd: cwd_str.clone(),
+        });
+
+        items.push(crate::renderer::ContextMenuItem::CommandItem {
+            label: "\u{2795} Stage All [git add]".to_string(),
+            command: "git add .".to_string(),
+            cwd: cwd_str.clone(),
+        });
+
+        items.push(crate::renderer::ContextMenuItem::CommandItem {
+            label: "\u{1F4BE} Commit [git commit]".to_string(),
+            command: "git commit".to_string(),
             cwd: cwd_str,
         });
 
