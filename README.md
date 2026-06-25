@@ -1,403 +1,144 @@
 # Fasty
 
-<p align="center">
+<div align="center">
   <img src="assets/fastyIcon.png" alt="Fasty Logo" width="128" />
-</p>
+</div>
 
-GPU-accelerated terminal emulator built with Rust, `winit`, and `wgpu`.
+> GPU-accelerated terminal emulator built with Rust, winit, and wgpu
 
-Inspired by [Ghostty](https://github.com/ghostty-org/ghostty), Fasty leverages `wgpu` (the modern, cross-platform GPU API powering GPUI/Zed) for rendering instead of raw Vulkan/Metal implementations, presenting a minimal UI footprint with ultra-high performance.
+Fasty leverages `wgpu` (the modern, cross-platform GPU API powering GPUI/Zed) for rendering instead of raw Vulkan/Metal implementations, presenting a minimal UI footprint with ultra-high performance. Inspired by [Ghostty](https://github.com/ghostty-org/ghostty).
 
----
+## Overview
 
-## Recent Updates
+Fasty is a modern terminal emulator that combines GPU acceleration with a minimal feature set. It runs on Vulkan, Metal, DX12, and OpenGL ES through wgpu, providing consistent performance across platforms.
 
-### v0.4.3 (2026-06-25)
-- **UI refinements:** Fixed tab border vertical alignment and centered loader/close button for cleaner tab appearance
-- **Build improvements:** Vendor OpenSSL for git2 to fix macOS x86_64 cross-compilation
+**Key characteristics:**
+- GPU-accelerated rendering with `<1%` CPU idle usage
+- Native UI with vector icons and smooth animations
+- Tabbed interface with session restore
+- Git integration, SSH manager, and command palette
+- TOML configuration with live reload
+- Crash reporting and auto-restart
 
-### v0.4.2
-- Bottombar widget refactor with composable architecture
-- Git context menu with GitHub Actions integration
-- Significant LOC reduction across codebase
+## Installation
 
----
+### Quick Install
 
-## Key Features
-
-- **GPU-Accelerated Rendering**: Built on `wgpu` (Vulkan, Metal, DX12, GLES) and WGSL shaders for low-latency cell grid updates.
-- **Modern SVG Vector Icons**: High-contrast vector icons loaded from `assets/icons/` via `resvg`, `usvg`, and `tiny-skia` — replaces default unicode/font glyphs in context menus, topbar, tabs, and settings.
-- **Ultra-Low CPU Idle Footprint**: `<1%` CPU at idle via `winit`'s `ControlFlow::Wait`, blocking PTY read loop, and micro-optimized cursor blink GPU fast-path.
-- **Animated Scrollbar Fading**: Smoothly fades the scrollbar out during TUI mouse reporting or alternate screen buffers, fades back in instantly on exit.
-- **Seamless TUI Mouse Integration**: Perfect mouse clicks and drag selections passed directly to the PTY (htop, vim, Claude Code) without interfering with desktop text selection.
-- **Tabbed Layout & Tearing**: Multiple independent tabs, each running a native shell process. Tabs support drag-to-reorder, right-click rename, and Chrome-style drag-out to create a new window instantly.
-- **Live-Apply Settings**: Font family, size (1pt step), scrollback, and theme applied instantly — no Save/Cancel buttons.
-- **Built-in Color Themes**: `default` (Fasty), `catppuccin`, `one-dark`, `solarized-dark`, `high-contrast`. Switches apply live across main window, settings, and about dialogs.
-- **Custom Keybindings**: User-rebindable shortcuts via `[keybindings]` in `fasty.toml`. 14 actions available; defaults preserved when omitted.
-- **Session Restore**: Saves open tab working directories on exit, restores to saved paths on next launch. Enabled by default; opt-out via `session_restore = false`.
-- **Command Palette**: `Ctrl+Shift+P` opens a fuzzy-search palette for quick access to settings, tab actions, themes, and font size controls.
-- **Git Status Bottombar**: Always-visible bottom bar showing branch, modified/staged/untracked counts, ahead/behind, and last commit summary when inside a git repo. Composable: built-in widgets for `git`, `time`, `kube`, `aws`, and arbitrary shell `command`, plus configurable click actions (`copy`, `run`, `open`). See [Bottombar Widgets](#bottombar-widgets).
-- **Built-in SSH Manager**: `Ctrl+Shift+O` opens a fuzzy-search picker over `~/.ssh/config` hosts. Connects in a new tab with `StrictHostKeyChecking=accept-new`.
-- **Project Jumper**: `Ctrl+Shift+J` opens a fuzzy-search picker over the working directories of currently open tabs. Select one to spawn a new tab at that path.
-- **Git Worktree Picker**: `Ctrl+Alt+W` (from a git repo) lists `git worktree list` entries with branch and short commit. Filter and `Enter` to open the worktree in a new tab, or type `+branch-name` to create a new worktree inline.
-- **Shell Snippets with Tab Expansion**: Type a short trigger (e.g. `gst`, `gcm`, `cb`, `serve`) and press `Tab` to expand into the full command. Bundled defaults cover git, docker, rust, filesystem, and system workflows. Customise via `~/.config/fasty/snippets.toml` (live-reloaded). VSCode-style placeholders supported (`$1`, `${1:default}`, `$0`). TUI apps (vim, fzf, htop) take precedence — Tab passes through when an alternate screen app is active.
-- **Crash Reporting & Auto-Restart**: On panic, writes a timestamped crash dump with backtrace to `~/.config/fasty/crashes/` and auto-restarts the terminal.
-- **TOML Config + Live Reload**: `fasty.toml` edits re-apply on save — no restart needed. Comments and formatting preserved across Settings-dialog writes via `toml_edit` round-tripping.
-- **Asynchronous Background Updater**: Non-blocking update check on startup with one-click install from the topbar "Update" button. Restarts automatically on success.
-
----
-
-## SVG Icon UI System
-
-Fasty integrates custom vector icons mapped into the GPU texture atlas as non-color stencils. Sharp rendering at all DPI scales without system-installed icon fonts.
-
-| UI Component | Action / Function | SVG Icon Asset | Render Size |
-| :--- | :--- | :--- | :--- |
-| **Topbar** | Close Window | `close.svg` | `14x14 px` |
-| | Maximize Window | `maximize.svg` | `14x14 px` |
-| | Minimize Window | `less.svg` | `14x14 px` |
-| | Open Settings Panel | `settings.svg` | `16x16 px` |
-| **Tabs Bar** | Add New Tab | `add.svg` | `16x16 px` |
-| | Close Tab | `close.svg` | `12x12 px` |
-| **Settings Panel** | Close Settings | `close.svg` | `14x14 px` |
-| | Font Family Selector | `text-font.svg` | `14x14 px` |
-| | Increase/Decrease Font | `add.svg` / `less.svg` | `14x14 px` |
-| | Increase/Decrease Scrollback | `add.svg` / `less.svg` | `14x14 px` |
-| **Context Menu** | Copy Text | `copy.svg` | `14x14 px` |
-| | Paste Text | `paste.svg` | `14x14 px` |
-| | Open New Tab | `add.svg` | `14x14 px` |
-| | Close Tab | `close.svg` | `14x14 px` |
-
-> Icons like `add.svg` and `less.svg` are custom-drawn with a stroke thickness of `2.5` to ensure subpixel visibility and high contrast at tiny render dimensions.
-
----
-
-## Performance & Memory Optimizations
-
-### E2E Benchmarking & Parser Verification (v0.4.0)
-
-- **E2E Benchmark Runner**: Introduces an automated end-to-end benchmark script (`scripts/benchmark_e2e.py`) to measure startup latency, plain text throughput (100k lines), and ANSI/SGR styled color throughput (50k lines) against Ghostty and Konsole.
-- **Micro-benchmarks**: Criterion integration (`benches/parser_bench.rs`) for checking VTE parser overhead.
-
-### PTY & GPU Rendering Optimizations (v0.4.0)
-
-- **64KB PTY Buffer Size**: Increased the reading buffer size of the PTY from 8KB to **64KB**, minimizing OS read syscalls and CPU context switches during heavy throughput.
-- **Lazy Font Loading & Batch Pre-rasterization**: Restructured atlas initialization. Instead of pre-rendering hundreds of unused glyphs at startup, Fasty now only pre-rasterizes alphanumeric characters and common punctuation at size 13px (UI size) using an optimized batch process (`rasterize_batch`). This keeps startup extremely fast while avoiding buffer/texture queue writes inside active render passes during UI popups.
-- **ShaderModule Cache**: Caches compiled WGSL shaders on GPU using a static `std::sync::OnceLock`. Avoids compiler overhead during atlas resizing and window creation.
-
-### Instant Window Creation & Tab Tearing (v0.3.7)
-
-- **Shared GPU Atlases**: Main text and UI texture atlases are shared across all window renderers using `Arc` wrapping. This reduces the latency of creating new windows/popping out tabs from ~200-500ms to sub-millisecond (instantaneous) since the GPU textures and glyph caches do not need to be reallocated and recompiled.
-- **Chrome-Style Drag-Out**: When dragging a tab outside the window boundaries, the tab detaches instantly and spawns a new window that snaps directly to the cursor coordinates, triggering the OS window-drag gesture.
-
-### Fluid Window Resize (v0.3.5)
-
-Window resizing (width, height, and corner drag) is now smooth and fluid. During rapid resize events (hundreds per second on Wayland), deferred processing collapses all accumulated events into a single GPU surface reconfigure and terminal text reflow per frame, eliminating per-event stalls.
-
-### Rendering Correctness Fixes (v0.3.5)
-
-- **Dingbat/Symbol Width**: Characters in the U+2700–U+27BF range (e.g. ✘ ✦ ✧) now occupy exactly one cell width, matching the treatment of arrow symbols.
-- **Ghost Icon Elimination**: Terminal background and bottom bar no longer show atlas texture artifacts — routed through the rounded-rect SDF path instead of atlas texture sampling.
-- **Bottom Bar Z-Order**: Bottom bar (git status) now renders behind the scrollbar, preventing visual overlap.
-- **Scrollbar to Window Edge**: Scrollbar track extends to within 2px of the window bottom, no longer cut off prematurely.
-- **Settings Simplified**: Removed non-functional Visual toggle from the Settings dialog.
-
-### Memory Footprint Reduction (30-50MB Linux, 50-70MB Windows)
-
-1. **Scrollback Memory Cap**: Capped at 3000 lines (down from 10,000), reducing allocations by ~37MB.
-2. **GPU Texture Atlas Scaling**: Main and UI texture atlases sized at `1536x1536` on Linux/macOS and `1024x1024` on Windows (down from `2048x2048`).
-3. **Logging Overhead Elimination**: Removed duplicate logging crates in favor of standard `tracing`. Output conditionalized to debug configurations only.
-4. **Hardened Release Profile**: LTO (`lto = true`), unit splitting (`codegen-units = 1`), debug symbols stripped (`strip = true`), panic unwinding enabled (`panic = "unwind"`) for crash reporting support.
-
-### Windows Memory & UX Hardening (v0.2.5)
-
-1. **D3D12 Debug Layer Disabled in Release**: `wgpu::InstanceFlags::from_build_config()` skips the validation layer. Cuts ~70MB of D3D12 debug-layer shadow copies.
-2. **MemoryHints::MemoryUsage**: Prevents the D3D12 driver from creating CPU-accessible staging copies. Cuts ~20-50MB.
-3. **Atlas Sizing on Windows**: 1024x1024 atlases (sufficient for basic + box-drawing + emoji set). Cuts ~10MB per renderer.
-4. **No-Console-Startup**: All Windows child process spawns use `creation_flags(0x08000000)` (`CREATE_NO_WINDOW`). Zero console flashes.
-5. **No Dialog White Flash**: Settings and About dialogs commit first swapchain frame before `set_visible(true)`.
-
-**Result on Windows**: 200MB -> 50-70MB RAM, zero console flashes, zero dialog white flash.
-
-### Micro-Optimized Cursor Blinking
-
-Instead of full layout rebuild on cursor blink (~8% CPU), Fasty implements a fast-path renderer:
-1. `RenderReason::CursorBlink` updates only the transparency byte of the cursor quad in `cached_final_instances`.
-2. Single 48-byte buffer write (`queue.write_buffer`) directly to GPU instance buffer.
-3. Command encoder submitted immediately with cached draw count values — skips cell iterations, atlas dirty checks, and font rasterization.
-
-### OS-Level Sleeping
-
-- **Event Loop**: Rests in `Wait` state until window event, keypress, or PTY output.
-- **PTY Reader Thread**: Blocks at OS kernel level on read calls, generating `0.0%` CPU wakeups when idle.
-
----
-
-## Codebase Architecture
-
-```
-src/
-├── main.rs            # Entry point, event loop, tab manager, UI state
-├── terminal_state.rs  # PTY controller & alacritty_terminal parser wrapper
-├── keybindings.rs     # Key combo parser, action resolver, user overrides
-├── session.rs         # Tab cwd persistence (save/restore)
-├── git.rs             # Background git status polling (branch, dirty, last commit) + worktree helpers
-├── ssh.rs             # SSH config parser (~/.ssh/config) for built-in SSH manager
-├── snippets.rs        # User snippet loader + VSCode-style placeholder expansion
-├── crash.rs           # Panic hook, crash dump writer, auto-restart
-├── renderer/          # wgpu backend components
-│   ├── mod.rs         # Renderer definitions, render passes
-│   ├── pipeline.rs    # Cell instance drawing, UI layouts, cursor fast-path
-│   └── atlas.rs       # Dynamic Glyph and SVG Stencil GPU texture cache
-├── config.rs          # TOML config, live-reload watcher, atomic save
-└── event_listener.rs  # PTY write proxy
-```
-
----
-
-## Installation & Setup
-
-### Automatic Installation via Scripts
-
-#### Linux & macOS
+**Linux & macOS:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash
 ```
 
-#### Windows
+**Windows (PowerShell):**
 ```powershell
 irm https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.ps1 | iex
 ```
 
-### Manual Installation from Release Archives
+### Manual Install
 
-Download from the [Releases page](https://github.com/diegoleteliers10/fasty/releases).
+Download from [Releases](https://github.com/diegoleteliers10/fasty/releases).
 
-#### Linux & macOS (`.tar.gz`)
-1. Download the archive for your architecture:
-   - Linux: `fasty-x86_64-unknown-linux-gnu.tar.gz`
-   - macOS (Intel): `fasty-x86_64-apple-darwin.tar.gz`
-   - macOS (Apple Silicon): `fasty-aarch64-apple-darwin.tar.gz`
-2. Extract: `tar -xzf fasty-*.tar.gz`
-3. Install:
-   - **Linux**:
-     ```bash
-     mkdir -p ~/.local/bin
-     mv fasty ~/.local/bin/
-     ```
-   - **macOS**:
-     ```bash
-     mv Fasty.app /Applications/
-     ln -s /Applications/Fasty.app/Contents/MacOS/fasty /usr/local/bin/fasty
-     ```
+Extract and install:
+```bash
+# Linux
+mkdir -p ~/.local/bin
+mv fasty ~/.local/bin/
 
-#### Windows (`.zip`)
-1. Download `fasty-x86_64-pc-windows-msvc.zip`.
-2. Extract the archive.
-3. Move `fasty.exe` to a folder in your path:
-   ```powershell
-   Move-Item -Path .\fasty.exe -Destination "$env:USERPROFILE\.local\bin\fasty.exe" -Force
-   ```
-4. Ensure `$env:USERPROFILE\.local\bin` is in your `PATH`.
+# macOS
+mv Fasty.app /Applications/
+```
 
 ### Build from Source
 
-#### Install System Dependencies
-
-- **macOS**: `xcode-select --install`
-- **Linux (Wayland)**: `sudo apt install libvulkan-dev libwayland-dev`
-- **Linux (X11)**: `sudo apt install libvulkan-dev libx11-dev`
-- **Windows**: Install the [Vulkan SDK](https://vulkan.lunarg.com/).
-
-#### Build
-
 ```bash
-cargo build              # Debug profile
-cargo build --release    # Release profile (LTO + optimizations)
+# System dependencies
+# macOS: xcode-select --install
+# Linux: sudo apt install libvulkan-dev libwayland-dev (or libx11-dev)
+# Windows: Install Vulkan SDK
 
-# Linux backend selection
-cargo build --features wayland
-cargo build --features x11
+cargo build --release
 ```
 
----
+## Getting Started
 
-## Command Line Interface
-
-| Option | Alias | Description |
-| :--- | :--- | :--- |
-| `-e` | `--command` | Spawn a specific command and auto-close on exit |
-| `-d` | `--working-dir` | Override the PTY startup working directory |
-| | `--title` | Set a custom window title |
-
+**Basic usage:**
 ```bash
 fasty                                    # Default shell
-fasty -e htop                            # Run htop, auto-close on exit
-fasty -e nvim src/main.rs                # Open file in neovim
+fasty -e htop                            # Run command, auto-close on exit
 fasty -e ssh user@server                 # SSH session
 fasty -d ~/my-project -e bun run dev    # Dev server in specific directory
-fasty --title "Dev Server" -d ~/my-project -e bun run dev
-fasty -e bash -c "cargo build && cargo test"
 ```
 
----
-
-## Configuration
-
-Fasty reads `fasty.toml` from the first existing path:
-
-1. `./fasty.toml` (current working directory -- portable mode)
-2. `/etc/fasty/fasty.toml` (system-wide)
-3. `~/.config/fasty/fasty.toml` (user -- default)
-
-If no file is found, defaults are applied. On startup, window dimensions default to **800 x 520** pixels.
-
-**Live reload (v0.2.8+):** Edits to `fasty.toml` re-apply on save. Settings changed via the Settings dialog persist to this same file. Comments and formatting are preserved via `toml_edit` round-tripping.
-
-**Live-reload exceptions:**
-- `font.ligatures`: requires restart (atlas-level cache rebuild).
-- `shell`: applies only to newly spawned tabs.
-
-**Migration from v0.2.7 or earlier:** On first launch, v0.2.8 auto-converts `~/.config/fasty/config.json` into `~/.config/fasty/fasty.toml` and renames the original to `config.json.bak`.
-
-### Configuration Template
+**Configuration:**
+Fasty reads `fasty.toml` from:
+1. `./fasty.toml` (portable)
+2. `/etc/fasty/fasty.toml` (system)
+3. `~/.config/fasty/fasty.toml` (user)
 
 ```toml
-shell = "/bin/bash"        # optional; omit to detect system default
+shell = "/bin/bash"
 scrollback = 3000
 theme = "default"
-session_restore = true     # restore last tabs on launch
+session_restore = true
 
 [font]
 family = "JetBrains Mono"
 size = 14.0
-weight = 400.0
 ligatures = true
 
 [keybindings]
-# All bindings are optional. Omitted keys use defaults.
-# Example overrides:
-# ctrl+shift+t = "new_tab"
-# ctrl+shift+w = "close_tab"
-# ctrl+shift+p = "command_palette"
+ctrl+shift+t = "new_tab"
+ctrl+shift+p = "command_palette"
 ```
 
-### Config Properties
+## Features
 
-| Property | Type | Description |
-| :--- | :--- | :--- |
-| `font.family` | `string` | Font family name loaded via FontConfig / FreeType |
-| `font.size` | `float` | Font size in logical points |
-| `font.weight` | `float` | Numeric font weight (e.g. `400.0` for Regular) |
-| `font.ligatures` | `boolean` | Toggle font ligatures (restart required) |
-| `shell` | `string?` | Custom shell path; omit to detect system default |
-| `scrollback` | `integer` | Lines of scrollback buffer (default 3000, capped at 3000) |
-| `theme` | `string` | Color scheme: `default`, `catppuccin`, `one-dark`, `solarized-dark`, `high-contrast`, or custom name |
-| `session_restore` | `boolean` | Restore previously open tabs on launch (default: `true`) |
+**Performance & UX:**
+- GPU-accelerated rendering via wgpu (Vulkan, Metal, DX12, GLES)
+- `<1%` CPU idle usage with optimized cursor blink
+- Shared GPU atlases for instant window creation and tab tearing
+- Animated scrollbar fading and TUI mouse integration
+- Memory footprint: 30-50MB (Linux), 50-70MB (Windows)
 
-### Keybindings
+**Terminal Features:**
+- Tabbed layout with drag-to-reorder and tear-out windows
+- Session restore (saves and restores tab directories)
+- Live-apply settings for fonts, scrollback, and themes
+- Built-in themes: default, catppuccin, one-dark, solarized-dark, high-contrast
+- Custom keybindings and TOML config with live reload
 
-The `[keybindings]` section maps key combinations to actions. All bindings are optional; omitted keys use defaults.
+**Developer Tools:**
+- Git status bottombar with branch, dirty counts, and commit info
+- Built-in SSH manager (`Ctrl+Shift+O`)
+- Project jumper for quick navigation between open tabs
+- Git worktree picker (`Ctrl+Alt+W`)
+- Shell snippets with Tab expansion
+- Command palette (`Ctrl+Shift+P`)
 
-**Available actions:**
+**Reliability:**
+- Crash reporting with auto-restart
+- Asynchronous background updater
+- URL hover detection and opening
+- Copy on select
 
-| Action | Default Binding | Description |
-| :--- | :--- | :--- |
-| `new_tab` | `ctrl+shift+t` | Open a new tab |
-| `close_tab` | `ctrl+shift+w` | Close current tab |
-| `new_window` | `ctrl+shift+n` | Open a new window |
-| `copy` | `ctrl+shift+c` | Copy selection to clipboard |
-| `paste` | `ctrl+shift+v` | Paste from clipboard |
-| `open_search` | `ctrl+shift+f` | Open search bar |
-| `open_settings` | `ctrl+shift+s` | Open settings dialog |
-| `reload_config` | `ctrl+shift+r` | Reload configuration |
-| `command_palette` | `ctrl+shift+p` | Open command palette |
-| `ssh_manager` | `ctrl+shift+o` | Open SSH host picker |
-| `project_jumper` | `ctrl+shift+j` | Open project jumper (jump to an open tab's cwd) |
-| `worktree_picker` | `ctrl+alt+w` | Open git worktree picker |
-| `increase_font_size` | `ctrl+equal` / `ctrl+plus` | Increase font size |
-| `decrease_font_size` | `ctrl+minus` | Decrease font size |
-| `reset_font_size` | `ctrl+0` | Reset font size |
-| `next_tab` | `ctrl+tab` | Switch to next tab |
-| `prev_tab` | `ctrl+shift+tab` | Switch to previous tab |
-| `select_tab_N` | `alt+N` (1-9) | Switch to tab N |
+## Configuration
 
-### Built-in Themes
+**Themes:**
+Built-in themes available: `default`, `catppuccin`, `one-dark`, `solarized-dark`, `high-contrast`
 
-| Theme | Background | Foreground | Notes |
-| :--- | :--- | :--- | :--- |
-| `default` | `#0C0C0C` | `#C5C8C6` | Fasty -- original terminal bg, Tomorrow Night palette |
-| `catppuccin` | `#24273A` | `#CAD3F5` | Soft pastel, easy on the eyes |
-| `one-dark` | `#282C34` | `#ABB2BF` | Atom One Dark |
-| `solarized-dark` | `#002B36` | `#839496` | Classic Solarized dark |
-| `high-contrast` | `#000000` | `#FFFFFF` | WCAG AAA, maximum contrast |
-
-Theme changes take effect immediately on the live terminal. Each cell instance looks up its named color through `named_color_rgb()` / `index_to_ansi_color()` which dispatch to the active theme.
-
-**Themed surfaces** (all re-render on theme change): main window bg, topbar, active tab fill, scrollback area, settings dialog, about dialog, context menu.
-
-### Custom Themes
-
-Drop a `.json` file into `~/.config/fasty/themes/` (filename minus `.json` becomes the theme name). All 18 fields are optional except `background` and `foreground`; missing ANSI colors fall back to `foreground`.
-
+Custom themes as JSON in `~/.config/fasty/themes/`:
 ```json
 {
   "background": "#1a1b26",
   "foreground": "#c0caf5",
-  "black":   "#15161e",
-  "red":     "#f7768e",
-  "green":   "#9ece6a",
-  "yellow":  "#e0af68",
-  "blue":    "#7aa2f7",
-  "magenta": "#bb9af7",
-  "cyan":    "#7dcfff",
-  "white":   "#a9b1d6",
-  "bright_black":   "#414868",
-  "bright_red":     "#f7768e",
-  "bright_green":   "#9ece6a",
-  "bright_yellow":  "#e0af68",
-  "bright_blue":    "#7aa2f7",
-  "bright_magenta": "#bb9af7",
-  "bright_cyan":    "#7dcfff",
-  "bright_white":   "#c0caf5"
+  "black": "#15161e",
+  "red": "#f7768e",
+  "green": "#9ece6a"
 }
 ```
 
-### Bottombar Widgets
-
-The bottombar (the 20px strip above the terminal scrollback) is a slot for compact status widgets — git branch, current time, kubectl context, AWS profile, or anything else you can run as a shell command. Widgets are configured under `[bottombar]` and live-reload on save.
-
-**Common fields** (all widgets):
-
-| Field | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `align` | `left` \| `right` | widget default | Which side of the bar to anchor to. Widgets on `left` pack from the left edge; widgets on `right` pack from the right (above the scrollbar). The first widget that does not fit is dropped, so order matters. |
-| `interval_ms` | `integer` | widget default | How often `poll()` fires (ms). Use a larger value for expensive commands to avoid spamming the shell. |
-
-**Built-in widgets:**
-
-| `type` | Description | Default interval | Notes |
-| :--- | :--- | :--- | :--- |
-| `git` | Branch + dirty dot + ahead/behind/modified/staged/untracked counts for the active tab's cwd. Hover tooltip = last commit summary. | `1500` ms | Reads the cached `GitStatus`; click is a no-op (`ClickAction::Custom` ignored). |
-| `time` | Local time-of-day. `format` field uses `strftime`-style tokens (`%H:%M:%S`, `%Y-%m-%d`, etc.). | `1000` ms | No shell-out; pure Rust formatter (no `chrono` dependency). |
-| `kube` | Current kubectl context (`kubectl config current-context`). | `30000` ms | Click cycles to the next context. Shows an error dot if `kubectl` is missing or fails. |
-| `aws` | Active AWS profile + account + ARN (`aws sts get-caller-identity`). | `300000` ms | Click opens the AWS console for the current account. |
-| `command` | Runs an arbitrary shell command on every poll; stdout is shown. `on_click` selects what happens when the user clicks the widget. | `5000` ms | Max 4096 bytes of stdout (truncated with `\u{2026}`). |
-
-**`command` click actions** (`on_click`):
-
-| Value | Behavior |
-| :--- | :--- |
-| `copy` | Copies the latest stdout to the clipboard. |
-| `run` | Sends the latest stdout as input to the active terminal (PTY). |
-| `open` | Opens the latest stdout as a URL (`xdg-open` / `open` / `cmd /c start`). |
-| omitted / other | No action. |
-
-**Example:**
-
+**Bottombar Widgets:**
 ```toml
-[bottombar]
-
 [[bottombar.widgets]]
 type = "git"
 align = "left"
@@ -406,161 +147,81 @@ align = "left"
 type = "time"
 format = "%H:%M"
 align = "left"
-interval_ms = 1000
-
-[[bottombar.widgets]]
-type = "kube"
-align = "right"
-interval_ms = 30000
-
-[[bottombar.widgets]]
-type = "aws"
-align = "right"
-interval_ms = 300000
 
 [[bottombar.widgets]]
 type = "command"
-name = "ip"
 command = "hostname -I | awk '{print $1}'"
 on_click = "copy"
-align = "right"
 interval_ms = 10000
 ```
 
-If `[bottombar.widgets]` is empty (or omitted), a single `git` widget on the left is used as the default — same as before this section existed.
+Available widget types: `git`, `time`, `kube`, `aws`, `command`
 
-Adding a new widget is intentionally a Rust change, not a config-only affair. See `src/widgets/mod.rs` for the trait and `src/widgets/builtin/` for examples.
-
----
-
-### Snippets
-
-Type a short trigger at the prompt and press `Tab` to expand into a full command. Defaults are bundled (git, docker, rust, filesystem, system); overrides live in `~/.config/fasty/snippets.toml` and are live-reloaded on save.
-
-Syntax (VSCode-style):
-- `$0` — final cursor position (only one per snippet)
-- `$1`, `$2`, ... — placeholder markers
-- `${1:default}` — placeholder with default text
-
+**Snippets:**
+Shell command expansion via Tab in `~/.config/fasty/snippets.toml`:
 ```toml
-[snippet]
-
-# Git
 "gst" = "git status"
 "gcm" = "git commit -m \"${1:message}\""
-
-# Filesystem
-"ll"  = "ls -lah"
-".."  = "cd .."
-
-# System
-"myip" = "curl -s ifconfig.me; echo"
-"serve" = "python3 -m http.server "
+"ll" = "ls -lah"
+"serve" = "python3 -m http.server"
 ```
-
-Expansion is disabled while a TUI app (alternate screen) has focus — `Tab` passes through to vim, fzf, htop, etc.
-
----
 
 ## Keyboard Shortcuts
 
 | Shortcut | Action |
-| :--- | :--- |
-| `Ctrl + Shift + T` | Open a new tab |
-| `Ctrl + Shift + W` | Close current tab |
-| `Ctrl + Shift + P` | Open command palette |
-| `Ctrl + Shift + O` | Open SSH host picker |
-| `Ctrl + Shift + J` | Open project jumper (jump to an open tab's cwd) |
-| `Ctrl + Alt + W` | Open git worktree picker (from a git repo) |
-| `Tab` (at prompt) | Expand a snippet trigger (e.g. `gst` → `git status`) |
-| `Ctrl + Shift + L` | Snap scroll to bottom |
-| `Ctrl + C` / `Ctrl + Shift + C` | Copy selection |
-| `Ctrl + V` / `Ctrl + Shift + V` | Paste clipboard |
-| `Ctrl + Left Click` | Open URL in browser |
-| `Left Mouse Drag` | Highlight text |
-| `Right Click` | Context menu (tab bar) |
-| `Tab Drag` | Reorder tabs |
+|----------|--------|
+| `Ctrl+Shift+T` | New tab |
+| `Ctrl+Shift+W` | Close tab |
+| `Ctrl+Shift+P` | Command palette |
+| `Ctrl+Shift+O` | SSH manager |
+| `Ctrl+Shift+J` | Project jumper |
+| `Ctrl+Alt+W` | Git worktree picker |
+| `Ctrl+Shift+F` | Search in scrollback |
+| `Ctrl+Shift+S` | Settings |
+| `Tab` | Expand snippet |
+| `Ctrl+Plus/Minus` | Adjust font size |
 
----
+## Architecture
 
-## Roadmap
+```
+src/
+├── main.rs            # Entry point, event loop, UI state
+├── terminal_state.rs  # PTY controller & parser wrapper
+├── renderer/          # wgpu backend (pipeline, atlas, shaders)
+├── config.rs          # TOML config & live reload
+├── keybindings.rs     # Key combo parser & action resolver
+├── git.rs             # Git status polling & worktree helpers
+├── ssh.rs             # SSH config parser
+├── snippets.rs        # Shell snippet expansion
+├── session.rs         # Tab directory persistence
+└── crash.rs           # Panic hook & crash reporter
+```
 
-Features under consideration for upcoming releases:
-- **High** = high demand + low-medium effort
-- **Medium** = clear value but moderate effort
-- **Exploratory** = speculative, high effort or niche
+## Performance
 
-`[x]` = implemented  |  `[ ]` = planned
+Fasty achieves sub-1% CPU idle through:
+- `winit`'s `ControlFlow::Wait` for event-driven sleeping
+- Blocking PTY read loop at OS kernel level
+- Micro-optimized cursor blink with GPU fast-path (48-byte buffer write)
+- 64KB PTY buffer to minimize syscalls
+- Lazy font loading with batch pre-rasterization
+- Cached WGSL shaders with `std::sync::OnceLock`
 
-### Graphics & Terminal Protocols
-- [x] **OSC 8 Hyperlinks** -- Clickable inline hyperlinks via OSC 8 escape sequences.
-- [ ] **Inline Image Protocol (iTerm2/Kitty)** -- Render PNG/JPEG inline via the Kitty graphics protocol.
-- [ ] **Sixel Graphics** -- Legacy image protocol for `img2sixel`, `ls -6`.
-- [ ] **Unicode 16 + Complex Shaping** -- Better emoji ZWJ sequences, RTL text, Indic scripts.
-- [x] **OpenType Font Ligatures** -- Configurable via `font.ligatures`; rendered via `rustybuzz` shaping.
+Memory optimizations:
+- Scrollback capped at 3000 lines (37MB reduction)
+- GPU texture atlases: 1536x1536 (Linux/macOS), 1024x1024 (Windows)
+- LTO + stripped symbols in release builds
+- Windows: D3D12 debug layer disabled, no staging copies
 
-### Productivity & Workflow
-- [x] **In-Scrollback Search** -- `Ctrl+Shift+F` opens a search bar highlighting matches in live + scrollback buffer.
-- [x] **Command Palette** -- `Ctrl+Shift+P` opens a fuzzy-search palette over settings, tab actions, themes.
-- [x] **Project Jumper** -- `Ctrl+Shift+J` fuzzy-pick from open tab cwds to spawn a new tab there.
-- [x] **Git Worktree Picker** -- `Ctrl+Alt+W` lists worktrees (path, branch, short commit); `+branch` creates a new worktree inline.
-- [x] **Shell Snippets (Tab Expansion)** -- Bundled defaults + `~/.config/fasty/snippets.toml` user overrides; live reload; TUI-safe.
-- [x] **Session Restore** -- Persist open tab working directories on shutdown; restore on next launch.
-- [ ] **Split Panes** -- Horizontal/vertical splits per tab (like `tmux`/`Zellij`).
-- [x] **Copy on Select** -- Mouse selection auto-copies to clipboard on release.
-- [x] **Tab Reordering & Tearing** -- Drag-to-reorder tabs or drag outside to create a new window instantly.
-- [ ] **Quake-Mode / Drop-Down Terminal** -- Global hotkey toggles a top-anchored sliding window.
-- [ ] **Shell Integration (Command Markers)** -- Mark command boundaries in scrollback, jump between them.
-- [x] **Click-to-Cursor Prompt Positioning** -- Click in prompt area to move cursor.
-- [x] **URL Hover Detection** -- `Ctrl+hover` highlights URLs; `Ctrl+click` opens in browser.
+## Acknowledgments
 
-### Customization & Configuration
-- [x] **Themes (Color Schemes)** -- Built-in `default`, `catppuccin`, `one-dark`, `solarized-dark`. Live switching.
-- [x] **TOML Config + Live Reload (v0.2.8)** -- `fasty.toml` re-applies on save. Round-tripped with `toml_edit`.
-- [x] **Custom Keybindings** -- User-rebindable shortcuts in `fasty.toml` `[keybindings]` section.
-- [ ] **Visual Settings Picker** -- Replace text-number fields with visual theme/font picker.
-- [ ] **Plugin System (Lua/WASM)** -- Ghostty/WezTerm-style scripting.
+Built with excellent open-source tools:
+- [wgpu](https://wgpu.rs) - Modern cross-platform GPU API
+- [Ghostty](https://github.com/ghostty-org/ghostty) - Inspiration for GPU-native terminal features
+- [alacritty_terminal](https://github.com/alacritty/alacritty) - ANSI/VT parser
+- [portable-pty](https://docs.rs/portable-pty) - Cross-platform PTY management
+- [The TTY demystified](http://www.linasakesson.net/programming/tty/) - Terminal PTY reference
 
-### Modern Integrations
-- [ ] **AI Command Suggestions (opt-in)** -- Local-only: pipe last failed command to a small LLM for fix suggestion.
-- [x] **Inline Git Status in Bottombar** -- Always-visible bottom bar showing branch, dirty counts, and last commit summary.
-- [x] **Built-in SSH Manager** -- `Ctrl+Shift+O` opens a fuzzy-search picker over `~/.ssh/config` hosts.
-- [ ] **Remote / `fasty://` URL Scheme** -- Register protocol for browser-to-terminal links.
-- [ ] **Cloud Config Sync** -- Optional encrypted sync of `fasty.toml`.
-- [x] **Background Auto-Updater** -- Non-blocking update check + one-click install from topbar.
+## License
 
-### Accessibility
-- [ ] **Screen Reader Bridge (Windows UIA / Linux AT-SPI / macOS AX)** -- Announce output to assistive tech.
-- [x] **High-Contrast Theme** -- WCAG AAA-compliant palette for low vision.
-- [ ] **Color-Blind Palettes** -- Deuteranopia/protanopia-friendly variants.
-- [ ] **DPI Override Per-Monitor** -- Verified behavior on mixed-DPI setups.
-- [ ] **Touch / Gesture Input** -- Long-press to select, two-finger scroll. Targets 2-in-1 laptops.
-
-### Performance & Reliability
-- [x] **D3D12 Debug Layer Disabled in Release (v0.2.5)** -- Skips validation layer.
-- [x] **MemoryHints::MemoryUsage on Windows (v0.2.5)** -- Prevents D3D12 shadow copies.
-- [x] **CREATE_NO_WINDOW on All Windows Spawns (v0.2.5)** -- Zero console flashes.
-- [x] **First-Frame Render Before Show on Dialogs (v0.2.5)** -- Eliminates white backbuffer flash.
-- [ ] **Scrollback-to-Disk** -- Spill to memory-mapped file beyond 3000 lines.
-- [ ] **GPU-Accelerated Search** -- In-scrollback search as compute shader.
-- [x] **Crash Reporting & Auto-Restart** -- Panic hook writes timestamped crash dump with backtrace to `~/.config/fasty/crashes/` and auto-restarts the terminal.
-- [ ] **Wide-Gamut (P3) and HDR Output** -- Detect HDR displays, emit 10-bit color.
-
-### Platform & Packaging
-- [ ] **Signed MSIX / `.msi` Installer for Windows** -- Replace PowerShell installer.
-- [x] **Start Menu Shortcut on Windows** -- Auto-registered on first launch.
-- [ ] **Flatpak for Linux** -- Sandbox-friendly distribution.
-- [ ] **Homebrew Formula Maintenance** -- Real tap overdue.
-- [ ] **Android (via `winit` + `wgpu` Mobile)** -- Touch-friendly input and on-screen keyboard.
-
-> Have a feature request? Open an issue on GitHub. Anything that fits the "minimal, fast, GPU-native terminal" philosophy is welcome.
-
----
-
-## Acknowledgements & Resources
-
-- [wgpu](https://wgpu.rs) - Graphics framework for Rust.
-- [Ghostty](https://github.com/ghostty-org/ghostty) - Inspiration for modern GPU terminal features.
-- [alacritty_terminal](https://github.com/alacritty/alacritty) - ANSI parser and state wrapper.
-- [portable-pty](https://docs.rs/portable-pty/latest/portable_pty/) - Cross-platform PTY manager.
-- [The TTY demystified](http://www.linasakesson.net/programming/tty/) - Indispensable resource for terminal PTY structure.
+See [LICENSE](LICENSE) file.
