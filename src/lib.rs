@@ -1,6 +1,7 @@
 //! fasty library - winit/wgpu terminal emulator
 
 pub mod config;
+pub mod chrome_layout;
 pub mod event_listener;
 pub mod git;
 pub mod keybindings;

@@ -132,6 +132,12 @@ pub struct Atlas {
     pub icon_less: Option<AtlasEntry>,
     pub icon_maximize: Option<AtlasEntry>,
     pub icon_branch: Option<AtlasEntry>,
+    #[cfg(target_os = "macos")]
+    pub mac_close: Option<AtlasEntry>,
+    #[cfg(target_os = "macos")]
+    pub mac_min: Option<AtlasEntry>,
+    #[cfg(target_os = "macos")]
+    pub mac_max: Option<AtlasEntry>,
 }
 
 struct CachedIcon {
@@ -151,6 +157,12 @@ struct CachedIcons {
     icon_less: CachedIcon,
     icon_maximize: CachedIcon,
     icon_branch: CachedIcon,
+    #[cfg(target_os = "macos")]
+    mac_close: CachedIcon,
+    #[cfg(target_os = "macos")]
+    mac_min: CachedIcon,
+    #[cfg(target_os = "macos")]
+    mac_max: CachedIcon,
 }
 
 fn get_cached_icons() -> &'static CachedIcons {
@@ -198,6 +210,12 @@ fn get_cached_icons() -> &'static CachedIcons {
             icon_less: render_svg(include_str!("../../assets/icons/less.svg"), 64),
             icon_maximize: render_svg(include_str!("../../assets/icons/maximize.svg"), 64),
             icon_branch: render_svg(include_str!("../../assets/icons/branch.svg"), 64),
+            #[cfg(target_os = "macos")]
+            mac_close: render_svg(include_str!("../../assets/icons/mac_close.svg"), 64),
+            #[cfg(target_os = "macos")]
+            mac_min: render_svg(include_str!("../../assets/icons/mac_min.svg"), 64),
+            #[cfg(target_os = "macos")]
+            mac_max: render_svg(include_str!("../../assets/icons/mac_max.svg"), 64),
         }
     })
 }
@@ -239,6 +257,12 @@ impl Atlas {
             icon_less: self.icon_less.clone(),
             icon_maximize: self.icon_maximize.clone(),
             icon_branch: self.icon_branch.clone(),
+            #[cfg(target_os = "macos")]
+            mac_close: self.mac_close.clone(),
+            #[cfg(target_os = "macos")]
+            mac_min: self.mac_min.clone(),
+            #[cfg(target_os = "macos")]
+            mac_max: self.mac_max.clone(),
         })
     }
 
@@ -383,6 +407,12 @@ impl Atlas {
             icon_less: None,
             icon_maximize: None,
             icon_branch: None,
+            #[cfg(target_os = "macos")]
+            mac_close: None,
+            #[cfg(target_os = "macos")]
+            mac_min: None,
+            #[cfg(target_os = "macos")]
+            mac_max: None,
         };
 
         // Pre-rasterize basic alphanumeric and punctuation characters at startup
@@ -424,6 +454,18 @@ impl Atlas {
         }
         if let Ok(entry) = atlas.load_raw_rgba_image(&cached.icon_branch.rgba, cached.icon_branch.width, cached.icon_branch.height, false, queue) {
             atlas.icon_branch = Some(entry);
+        }
+        #[cfg(target_os = "macos")]
+        if let Ok(entry) = atlas.load_raw_rgba_image(&cached.mac_close.rgba, cached.mac_close.width, cached.mac_close.height, false, queue) {
+            atlas.mac_close = Some(entry);
+        }
+        #[cfg(target_os = "macos")]
+        if let Ok(entry) = atlas.load_raw_rgba_image(&cached.mac_min.rgba, cached.mac_min.width, cached.mac_min.height, false, queue) {
+            atlas.mac_min = Some(entry);
+        }
+        #[cfg(target_os = "macos")]
+        if let Ok(entry) = atlas.load_raw_rgba_image(&cached.mac_max.rgba, cached.mac_max.width, cached.mac_max.height, false, queue) {
+            atlas.mac_max = Some(entry);
         }
 
         tracing::info!(

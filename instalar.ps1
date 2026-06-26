@@ -1,40 +1,38 @@
 # ==============================================================================
-# Script de Instalación de PowerShell para Windows (Fasty)
+# Fasty installation script for Windows (PowerShell)
 # ==============================================================================
-# Ejecutar directamente desde PowerShell con:
+# Run directly from PowerShell with:
 # irm https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.ps1 | iex
 # ==============================================================================
 
-# CONFIGURACIÓN
 $GitHubUser = "diegoleteliers10"
 $GitHubRepo = "fasty"
 $AppName    = "fasty"
 $BinaryName = "fasty.exe"
 
-# Habilitar TLS 1.2 para conexiones HTTPS
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-Write-Host "=== Iniciando instalación de $AppName en Windows ===" -ForegroundColor Green
+Write-Host "=== Starting $AppName installation on Windows ===" -ForegroundColor Green
 
-# 1. Consultar la API de GitHub para obtener la última versión
-Write-Host "🔍 Consultando la última versión en la API de GitHub..." -ForegroundColor Cyan
+# 1. Query the GitHub API for the latest release
+Write-Host "Fetching the latest version from the GitHub API..." -ForegroundColor Cyan
 $ApiUrl = "https://api.github.com/repos/$GitHubUser/$GitHubRepo/releases/latest"
 
 try {
     $oldProgressPreference = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
-    
+
     $Response = Invoke-RestMethod -Uri $ApiUrl -Method Get
     $LatestTag = $Response.tag_name
 } catch {
-    Write-Error "❌ Error: No se pudo obtener la última versión desde la API de GitHub. Verifica la conexión o el repositorio."
+    Write-Error "ERROR: Could not fetch the latest version from the GitHub API. Check your connection or the repository."
     $ProgressPreference = $oldProgressPreference
     exit 1
 }
 
-Write-Host "📦 Última versión encontrada: $LatestTag" -ForegroundColor Green
+Write-Host "Latest version found: $LatestTag" -ForegroundColor Green
 
-# 2. Descargar el archivo .zip de Windows
+# 2. Download the Windows .zip asset
 $Target = "x86_64-pc-windows-msvc"
 $ZipName = "$AppName-$Target.zip"
 $DownloadUrl = "https://github.com/$GitHubUser/$GitHubRepo/releases/download/$LatestTag/$ZipName"
@@ -48,39 +46,39 @@ New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 $ZipPath = Join-Path $TempDir $ZipName
 $ExtractDir = Join-Path $TempDir "extracted"
 
-Write-Host "📥 Descargando $ZipName..." -ForegroundColor Cyan
+Write-Host "Downloading $ZipName..." -ForegroundColor Cyan
 try {
     Invoke-WebRequest -Uri $DownloadUrl -OutFile $ZipPath -UseBasicParsing
 } catch {
-    Write-Error "❌ Error al descargar el archivo desde $DownloadUrl"
+    Write-Error "ERROR: Failed to download the file from $DownloadUrl"
     $ProgressPreference = $oldProgressPreference
     exit 1
 }
 
-# 3. Descomprimir archivos
-Write-Host "🔓 Descomprimiendo archivos..." -ForegroundColor Cyan
+# 3. Extract
+Write-Host "Extracting files..." -ForegroundColor Cyan
 try {
     Expand-Archive -Path $ZipPath -DestinationPath $ExtractDir -Force
 } catch {
-    Write-Error "❌ Error al descomprimir el archivo ZIP."
+    Write-Error "ERROR: Failed to extract the ZIP archive."
     $ProgressPreference = $oldProgressPreference
     exit 1
 }
 
-# 4. Instalar en el directorio del perfil local del usuario
+# 4. Install into the user's local profile directory
 $InstallDir = Join-Path $env:USERPROFILE ".local\bin"
 if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    Write-Host "📂 Directorio creado: $InstallDir" -ForegroundColor Yellow
+    Write-Host "Directory created: $InstallDir" -ForegroundColor Yellow
 }
 
 $ExeSourcePath = Join-Path $ExtractDir $BinaryName
 $ExeDestPath = Join-Path $InstallDir $BinaryName
 
-Write-Host "🚀 Copiando binario a su ubicación final..." -ForegroundColor Cyan
+Write-Host "Copying the binary to its final location..." -ForegroundColor Cyan
 try {
     if (Test-Path $ExeDestPath) {
-        # Si el ejecutable ya existe, intentamos renombrarlo para evitar problemas de bloqueo (archivo en ejecución)
+        # If the executable already exists, rename it to avoid locking issues (file in use)
         $OldExePath = "$ExeDestPath.old"
         if (Test-Path $OldExePath) {
             Remove-Item -Path $OldExePath -Force -ErrorAction SilentlyContinue
@@ -89,17 +87,16 @@ try {
     }
     Copy-Item -Path $ExeSourcePath -Destination $ExeDestPath -Force
 } catch {
-    Write-Error "❌ Error al copiar el archivo ejecutable a $InstallDir: $_"
+    Write-Error "ERROR: Failed to copy the executable to $InstallDir: $_"
     $ProgressPreference = $oldProgressPreference
     exit 1
 }
 
-# Restablecer la preferencia de progreso original
 $ProgressPreference = $oldProgressPreference
 
-Write-Host "🎉 ¡$AppName instalado con éxito en $ExeDestPath!" -ForegroundColor Green
+Write-Host "$AppName installed successfully at $ExeDestPath!" -ForegroundColor Green
 
-# 5. Agregar la ruta al PATH del usuario de manera permanente (sin privilegios de administrador)
+# 5. Add the directory to the user PATH permanently (no administrator privileges)
 $UserPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::User)
 $PathList = $UserPath -split ";"
 $NormalizedInstallDir = $InstallDir.TrimEnd('\')
@@ -113,38 +110,38 @@ foreach ($p in $PathList) {
 }
 
 if (-not $IsInPath) {
-    Write-Host "⚙️ Añadiendo $InstallDir al PATH de tu usuario de forma permanente..." -ForegroundColor Yellow
+    Write-Host "Adding $InstallDir to your user PATH permanently..." -ForegroundColor Yellow
     $NewUserPath = $UserPath
     if (-not $NewUserPath.EndsWith(";")) {
         $NewUserPath += ";"
     }
     $NewUserPath += $NormalizedInstallDir
-    
+
     [Environment]::SetEnvironmentVariable("Path", $NewUserPath, [EnvironmentVariableTarget]::User)
     $env:Path += ";" + $NormalizedInstallDir
-    
-    Write-Host "💡 El PATH se ha actualizado permanentemente. Por favor, reinicia tu terminal o editor de código para aplicar los cambios en nuevas sesiones." -ForegroundColor Yellow
+
+    Write-Host "The PATH has been updated permanently. Please restart your terminal or code editor for the change to take effect in new sessions." -ForegroundColor Yellow
 } else {
-    Write-Host "✅ El directorio $InstallDir ya se encuentra en tu PATH." -ForegroundColor Green
+    Write-Host "The directory $InstallDir is already in your PATH." -ForegroundColor Green
 }
 
-# 6. Crear un acceso directo en el Menú Inicio para que aparezca como aplicación del sistema
-Write-Host "🖥️ Creando acceso directo en el Menú de Inicio..." -ForegroundColor Cyan
+# 6. Create a Start Menu shortcut so it appears as a system application
+Write-Host "Creating Start Menu shortcut..." -ForegroundColor Cyan
 try {
     $StartMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
     $ShortcutPath = Join-Path $StartMenuDir "Fasty.lnk"
-    
+
     $WshShell = New-Object -ComObject WScript.Shell
     $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
     $Shortcut.TargetPath = $ExeDestPath
     $Shortcut.WorkingDirectory = $InstallDir
     $Shortcut.Description = "Fasty Terminal Emulator"
     $Shortcut.Save()
-    
-    Write-Host "✅ Acceso directo creado en el Menú Inicio con éxito." -ForegroundColor Green
+
+    Write-Host "Start Menu shortcut created successfully." -ForegroundColor Green
 } catch {
-    Write-Host "⚠️ Advertencia: No se pudo crear el acceso directo en el Menú Inicio." -ForegroundColor Yellow
+    Write-Host "WARNING: Could not create the Start Menu shortcut." -ForegroundColor Yellow
 }
 
-# Limpieza final del directorio temporal
+# Final cleanup of the temp directory
 Remove-Item -Recurse -Force $TempDir -ErrorAction SilentlyContinue

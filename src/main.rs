@@ -9,6 +9,8 @@ mod cross_window_drag;
 mod event_listener;
 mod git;
 mod keybindings;
+mod macos_maximize;
+mod chrome_layout;
 mod renderer;
 mod selection_classifier;
 mod session;
@@ -293,17 +295,18 @@ fn handle_popped_out_event(
                 (r.config.width as f64, r.config.height as f64)
             };
 
-            wc.hover_close = position.y >= 6.0 && position.y <= 34.0 && position.x >= (vw - 36.0) && position.x < (vw - 8.0);
-            wc.hover_max = position.y >= 6.0 && position.y <= 34.0 && position.x >= (vw - 68.0) && position.x < (vw - 40.0);
-            wc.hover_min = position.y >= 6.0 && position.y <= 34.0 && position.x >= (vw - 100.0) && position.x < (vw - 72.0);
-            wc.hover_settings = position.y >= 6.0 && position.y <= 34.0 && position.x >= (vw - 137.0) && position.x < (vw - 109.0);
+            let vw_f = vw as f32;
+            wc.hover_close = chrome_layout::close_rect(vw_f).contains(position.x, position.y);
+            wc.hover_max = chrome_layout::max_rect(vw_f).contains(position.x, position.y);
+            wc.hover_min = chrome_layout::min_rect(vw_f).contains(position.x, position.y);
+            wc.hover_settings = chrome_layout::settings_rect(vw_f).contains(position.x, position.y);
 
             wc.hovered_tab_index = None;
             wc.hovered_close_tab_index = None;
             wc.hover_new_tab = false;
 
             if position.y >= 0.0 && position.y <= 40.0 {
-                let tab_start_x = 36.0;
+                let tab_start_x = chrome_layout::tab_start_x() as f64;
                 let path_center_x = vw / 2.0;
                 let tab_area_max_x = path_center_x - 40.0;
                 let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
@@ -315,7 +318,7 @@ fn handle_popped_out_event(
                 };
 
                 let tabs_total_width = tabs_len as f64 * tab_width;
-                if position.x >= tab_start_x && position.x < tab_start_x + tabs_total_width {
+                if tabs_len > 1 && position.x >= tab_start_x && position.x < tab_start_x + tabs_total_width {
                     let idx = ((position.x - tab_start_x) / tab_width) as usize;
                     if idx < tabs_len {
                         wc.hovered_tab_index = Some(idx);
@@ -465,15 +468,14 @@ fn handle_popped_out_event(
                         popped.remove(&window_id);
                         return;
                     } else if wc.hover_max {
-                        let is_max = wc.window.is_maximized();
-                        wc.window.set_maximized(!is_max);
+                        macos_maximize::toggle_maximize(&wc.window, &mut wc.maximize_state);
                         return;
                     } else if wc.hover_min {
                         wc.window.set_minimized(true);
                         return;
                     }
 
-                    let tab_start_x = 36.0;
+                    let tab_start_x = chrome_layout::tab_start_x() as f64;
                     let path_center_x = vw / 2.0;
                     let tab_area_max_x = path_center_x - 40.0;
                     let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
@@ -485,7 +487,7 @@ fn handle_popped_out_event(
                     };
 
                     let tabs_total_width = tabs_len as f64 * tab_width;
-                    if wc.drag_current_x >= tab_start_x && wc.drag_current_x < tab_start_x + tabs_total_width {
+                    if tabs_len > 1 && wc.drag_current_x >= tab_start_x && wc.drag_current_x < tab_start_x + tabs_total_width {
                         let clicked_tab_idx = ((wc.drag_current_x - tab_start_x) / tab_width) as usize;
                         if clicked_tab_idx < tabs_len {
                             let tab_x = tab_start_x + clicked_tab_idx as f64 * tab_width;
@@ -525,7 +527,7 @@ fn handle_popped_out_event(
 
                     // Check new tab button click
                     let new_tab_x = tab_start_x + tabs_total_width;
-                    if wc.drag_current_x >= new_tab_x && wc.drag_current_x < new_tab_x + 32.0 {
+                    if tabs_len > 1 && wc.drag_current_x >= new_tab_x && wc.drag_current_x < new_tab_x + 32.0 {
                         let new_tab_count = wc.tabs.len() + 1;
                         let padding_top = get_padding_top(new_tab_count);
                         let physical_size = wc.window.inner_size();
@@ -562,7 +564,7 @@ fn handle_popped_out_event(
                     }
 
                     // Otherwise (blank space click), drag the window
-                    if wc.drag_current_x < (vw - 141.0) {
+                    if wc.drag_current_x < (chrome_layout::drag_max_x(vw as f32) as f64) {
                         let now = std::time::Instant::now();
                         let is_double_click = if let Some(last_time) = wc.last_click_time {
                             now.duration_since(last_time) < std::time::Duration::from_millis(300)
@@ -572,8 +574,7 @@ fn handle_popped_out_event(
                         wc.last_click_time = Some(now);
 
                         if is_double_click {
-                            let is_max = wc.window.is_maximized();
-                            wc.window.set_maximized(!is_max);
+                            macos_maximize::toggle_maximize(&wc.window, &mut wc.maximize_state);
                         } else {
                             let _ = wc.window.drag_window();
                         }
@@ -610,7 +611,7 @@ fn handle_popped_out_event(
                         if target_win != window_id {
                             if let Some(tab) = tab_opt {
                                 if target_win == main_window_id {
-                                    let tab_start_x = 36.0;
+                                    let tab_start_x = chrome_layout::tab_start_x() as f64;
                                     let target_vw = main_window.inner_size().width as f64;
                                     let path_center_x = target_vw / 2.0;
                                     let tab_area_max_x = path_center_x - 40.0;
@@ -625,7 +626,7 @@ fn handle_popped_out_event(
                                     *main_shell_rows = rows;
                                     main_window.request_redraw();
                                 } else if let Some(target_wc) = popped.get_mut(&target_win) {
-                                    let tab_start_x = 36.0;
+                                    let tab_start_x = chrome_layout::tab_start_x() as f64;
                                     let target_vw = target_wc.window.inner_size().width as f64;
                                     let path_center_x = target_vw / 2.0;
                                     let tab_area_max_x = path_center_x - 40.0;
@@ -647,7 +648,7 @@ fn handle_popped_out_event(
                             // Dropped on itself
                             let Some(wc) = popped.get_mut(&window_id) else { return; };
                             if let Some(tab) = tab_opt {
-                                let tab_start_x = 36.0;
+                                let tab_start_x = chrome_layout::tab_start_x() as f64;
                                 let path_center_x = vw / 2.0;
                                 let tab_area_max_x = path_center_x - 40.0;
                                 let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
@@ -661,7 +662,7 @@ fn handle_popped_out_event(
                                 wc.shell_cols = cols;
                                 wc.shell_rows = rows;
                             } else if drag_threshold_passed {
-                                let tab_start_x = 36.0;
+                                let tab_start_x = chrome_layout::tab_start_x() as f64;
                                 let path_center_x = vw / 2.0;
                                 let tab_area_max_x = path_center_x - 40.0;
                                 let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
@@ -948,7 +949,7 @@ fn handle_popped_out_event(
                 // Compute drop target for target window
                 let adopting_drag = cross_window_drag::is_active() && *hovered_window == Some(window_id);
                 let (dragging_tab_val, drop_target_val) = if adopting_drag {
-                    let tab_start_x = 36.0;
+                    let tab_start_x = chrome_layout::tab_start_x() as f64;
                     let path_center_x = v_width / 2.0;
                     let tab_area_max_x = path_center_x - 40.0;
                     let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
@@ -958,7 +959,7 @@ fn handle_popped_out_event(
                     (Some(wc.tabs.len()), Some(target))
                 } else if wc.drag_threshold_passed {
                     wc.dragging_tab.map(|_| {
-                        let tab_start_x = 36.0;
+                        let tab_start_x = chrome_layout::tab_start_x() as f64;
                         let path_center_x = v_width / 2.0;
                         let tab_area_max_x = path_center_x - 40.0;
                         let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
@@ -1759,6 +1760,7 @@ fn main() -> anyhow::Result<()> {
     let mut current_mouse_x = 0.0f64;
     let mut current_mouse_y = 0.0f64;
     let mut last_click_time: Option<std::time::Instant> = None;
+    let mut maximize_state = macos_maximize::MaximizeState::default();
     let mut last_term_click_time: Option<std::time::Instant> = None;
     let mut last_term_click_cell: Option<(i32, usize)> = None;
     let mut toast: Option<(String, std::time::Instant, u64)> = None;
@@ -2517,7 +2519,7 @@ fn main() -> anyhow::Result<()> {
                             let drop_target_idx = if drag_threshold_passed {
                                 dragging_tab.map(|_| {
                                     let vw = { let rr = renderer.lock(); let w = rr.config.width as f64; drop(rr); w };
-                                    let tab_start_x = 36.0;
+                                    let tab_start_x = chrome_layout::tab_start_x() as f64;
                                     let path_center_x = vw / 2.0;
                                     let tab_area_max_x = path_center_x - 40.0;
                                     let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
@@ -2609,7 +2611,7 @@ fn main() -> anyhow::Result<()> {
                                 drag_current_x: drag_current_x as f32,
                                 drag_tab_offset: drag_tab_offset as f32,
                                 drop_target_idx: if cross_window_drag::is_active() && hovered_window == Some(window_for_redraw.id()) {
-                                    let tab_start_x = 36.0;
+                                    let tab_start_x = chrome_layout::tab_start_x() as f64;
                                     let path_center_x = (window_for_redraw.inner_size().width as f64) / 2.0;
                                     let tab_area_max_x = path_center_x - 40.0;
                                     let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
@@ -4355,10 +4357,11 @@ fn main() -> anyhow::Result<()> {
 
                                     if current_mouse_y <= 40.0 {
                                          // 1. Check topbar control buttons first
-                                         let is_hovering_close = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 36.0) && current_mouse_x < (v_width - 8.0);
-                                         let is_hovering_max = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 68.0) && current_mouse_x < (v_width - 40.0);
-                                         let is_hovering_min = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 100.0) && current_mouse_x < (v_width - 72.0);
-                                         let is_hovering_settings = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 137.0) && current_mouse_x < (v_width - 109.0);
+                                         let vw_f = v_width as f32;
+                                         let is_hovering_close = chrome_layout::close_rect(vw_f).contains(current_mouse_x, current_mouse_y);
+                                         let is_hovering_max = chrome_layout::max_rect(vw_f).contains(current_mouse_x, current_mouse_y);
+                                         let is_hovering_min = chrome_layout::min_rect(vw_f).contains(current_mouse_x, current_mouse_y);
+                                         let is_hovering_settings = chrome_layout::settings_rect(vw_f).contains(current_mouse_x, current_mouse_y);
 
                                          let is_update_available = update_available.lock().is_some();
                                          if is_update_available {
@@ -4382,8 +4385,7 @@ fn main() -> anyhow::Result<()> {
                                              target.exit();
                                              return;
                                          } else if is_hovering_max {
-                                             let is_max = window_for_redraw.is_maximized();
-                                             window_for_redraw.set_maximized(!is_max);
+                                             macos_maximize::toggle_maximize(&window_for_redraw, &mut maximize_state);
                                              return;
                                          } else if is_hovering_min {
                                              window_for_redraw.set_minimized(true);
@@ -4468,7 +4470,7 @@ fn main() -> anyhow::Result<()> {
                                            }
 
                                          // 2. Check tab clicks & close tab clicks & new tab click
-                                         let tab_start_x = 36.0;
+                                         let tab_start_x = chrome_layout::tab_start_x() as f64;
                                          let path_center_x = v_width / 2.0;
                                          let tab_area_max_x = path_center_x - 40.0;
                                          let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
@@ -4480,7 +4482,7 @@ fn main() -> anyhow::Result<()> {
                                          };
 
                                          let tabs_total_width = tabs_len as f64 * tab_width;
-                                         if current_mouse_x >= tab_start_x && current_mouse_x < tab_start_x + tabs_total_width {
+                                         if tabs_len > 1 && current_mouse_x >= tab_start_x && current_mouse_x < tab_start_x + tabs_total_width {
                                              let clicked_tab_idx = ((current_mouse_x - tab_start_x) / tab_width) as usize;
                                              if clicked_tab_idx < tabs_len {
                                                  tab_ctx_visible = false;
@@ -4524,7 +4526,7 @@ fn main() -> anyhow::Result<()> {
 
                                          // Check new tab button click
                                          let new_tab_x = tab_start_x + tabs_total_width;
-                                         if current_mouse_x >= new_tab_x && current_mouse_x < new_tab_x + 32.0 {
+                                         if tabs_len > 1 && current_mouse_x >= new_tab_x && current_mouse_x < new_tab_x + 32.0 {
                                              let new_tab_count = tabs.len() + 1;
                                              let padding_top = get_padding_top(new_tab_count);
                                              let physical_size = window_for_redraw.inner_size();
@@ -4561,7 +4563,7 @@ fn main() -> anyhow::Result<()> {
 
                                          // 3. Otherwise (blank space click), drag the window
                                          // Don't drag the window if clicking near the control buttons region
-                                         if current_mouse_x < (v_width - 141.0) {
+                                         if current_mouse_x < (chrome_layout::drag_max_x(v_width as f32) as f64) {
                                              let now = std::time::Instant::now();
                                              let is_double_click = if let Some(last_time) = last_click_time {
                                                  now.duration_since(last_time) < std::time::Duration::from_millis(300)
@@ -4571,8 +4573,7 @@ fn main() -> anyhow::Result<()> {
                                              last_click_time = Some(now);
 
                                              if is_double_click {
-                                                 let is_max = window_for_redraw.is_maximized();
-                                                 window_for_redraw.set_maximized(!is_max);
+                                                 macos_maximize::toggle_maximize(&window_for_redraw, &mut maximize_state);
                                              } else {
                                                  let _ = window_for_redraw.drag_window();
                                              }
@@ -4790,7 +4791,7 @@ fn main() -> anyhow::Result<()> {
 
                                                 if let Some(tab) = tab_opt {
                                                     if let Some(target_wc) = popped_out_windows.get_mut(&target_win) {
-                                                        let tab_start_x = 36.0;
+                                                        let tab_start_x = chrome_layout::tab_start_x() as f64;
                                                         let target_vw = target_wc.window.inner_size().width as f64;
                                                         let path_center_x = target_vw / 2.0;
                                                         let tab_area_max_x = path_center_x - 40.0;
@@ -4820,7 +4821,7 @@ fn main() -> anyhow::Result<()> {
                                             } else {
                                                 // Dropped on itself!
                                                 if let Some(drag) = cross_window_drag::take() {
-                                                    let tab_start_x = 36.0;
+                                                    let tab_start_x = chrome_layout::tab_start_x() as f64;
                                                     let path_center_x = vw / 2.0;
                                                     let tab_area_max_x = path_center_x - 40.0;
                                                     let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
@@ -4835,7 +4836,7 @@ fn main() -> anyhow::Result<()> {
                                                     shell_cols = cols;
                                                     shell_rows = rows;
                                                 } else if drag_threshold_passed {
-                                                    let tab_start_x = 36.0;
+                                                    let tab_start_x = chrome_layout::tab_start_x() as f64;
                                                     let path_center_x = vw / 2.0;
                                                     let tab_area_max_x = path_center_x - 40.0;
                                                     let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
@@ -5171,10 +5172,11 @@ fn main() -> anyhow::Result<()> {
                                 hovered_close_tab_index = None;
                                 hover_new_tab = false;
                             } else {
-                                hover_close = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 36.0) && current_mouse_x < (v_width - 8.0);
-                                hover_max = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 68.0) && current_mouse_x < (v_width - 40.0);
-                                hover_min = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 100.0) && current_mouse_x < (v_width - 72.0);
-                                hover_settings = current_mouse_y >= 6.0 && current_mouse_y <= 34.0 && current_mouse_x >= (v_width - 137.0) && current_mouse_x < (v_width - 109.0);
+                                let vw_f = v_width as f32;
+                                hover_close = chrome_layout::close_rect(vw_f).contains(current_mouse_x, current_mouse_y);
+                                hover_max = chrome_layout::max_rect(vw_f).contains(current_mouse_x, current_mouse_y);
+                                hover_min = chrome_layout::min_rect(vw_f).contains(current_mouse_x, current_mouse_y);
+                                hover_settings = chrome_layout::settings_rect(vw_f).contains(current_mouse_x, current_mouse_y);
 
                                 let is_update_available = update_available.lock().is_some();
                                 if is_update_available {
@@ -5189,7 +5191,7 @@ fn main() -> anyhow::Result<()> {
                                 hover_new_tab = false;
 
                                 if current_mouse_y >= 0.0 && current_mouse_y <= 40.0 {
-                                    let tab_start_x = 36.0;
+                                    let tab_start_x = chrome_layout::tab_start_x() as f64;
                                     let path_center_x = v_width / 2.0;
                                     let tab_area_max_x = path_center_x - 40.0;
                                     let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
@@ -5201,7 +5203,7 @@ fn main() -> anyhow::Result<()> {
                                     };
 
                                     let tabs_total_width = tabs_len as f64 * tab_width;
-                                    if current_mouse_x >= tab_start_x && current_mouse_x < tab_start_x + tabs_total_width {
+                                    if tabs_len > 1 && current_mouse_x >= tab_start_x && current_mouse_x < tab_start_x + tabs_total_width {
                                         let idx = ((current_mouse_x - tab_start_x) / tab_width) as usize;
                                         if idx < tabs_len {
                                             hovered_tab_index = Some(idx);
@@ -5771,7 +5773,11 @@ fn main() -> anyhow::Result<()> {
                                 let old_hovered_theme_idx = settings_hovered_theme_idx;
 
                                 let sw_width = sw.inner_size().width as f64 / scale_factor;
-                                s_hover_close = s_mouse_y >= 4.0 && s_mouse_y <= 32.0 && s_mouse_x >= (sw_width - 32.0) && s_mouse_x < (sw_width - 4.0);
+                                s_hover_close = if cfg!(target_os = "macos") {
+                                    s_mouse_y >= 4.0 && s_mouse_y <= 32.0 && s_mouse_x >= 4.0 && s_mouse_x < 32.0
+                                } else {
+                                    s_mouse_y >= 4.0 && s_mouse_y <= 32.0 && s_mouse_x >= (sw_width - 32.0) && s_mouse_x < (sw_width - 4.0)
+                                };
                                 s_hover_family = s_mouse_y >= 52.0 && s_mouse_y <= 78.0 && s_mouse_x >= 140.0 && s_mouse_x < 380.0;
 
                                 s_hover_size_minus = s_mouse_y >= 92.0 && s_mouse_y <= 118.0 && s_mouse_x >= 140.0 && s_mouse_x < 168.0;
@@ -6043,7 +6049,11 @@ fn main() -> anyhow::Result<()> {
 
                                 let old_hover_close = about_hover_close;
                                 let aw_width = aw.inner_size().width as f64 / scale_factor;
-                                about_hover_close = m_y >= 4.0 && m_y <= 32.0 && m_x >= (aw_width - 32.0) && m_x < (aw_width - 4.0);
+                                about_hover_close = if cfg!(target_os = "macos") {
+                                    m_y >= 4.0 && m_y <= 32.0 && m_x >= 4.0 && m_x < 32.0
+                                } else {
+                                    m_y >= 4.0 && m_y <= 32.0 && m_x >= (aw_width - 32.0) && m_x < (aw_width - 4.0)
+                                };
 
                                 if about_hover_close != old_hover_close {
                                     if let Some(ref mut r) = about_renderer {
@@ -6464,7 +6474,7 @@ fn main() -> anyhow::Result<()> {
                             let r = renderer.lock();
                             let vw = r.config.width as f64;
                             drop(r);
-                            let tab_start_x = 36.0;
+                            let tab_start_x = chrome_layout::tab_start_x() as f64;
                             let path_center_x = vw / 2.0;
                             let tab_area_max_x = path_center_x - 40.0;
                             let tab_area_width = tab_area_max_x - tab_start_x - 32.0;
@@ -6540,7 +6550,7 @@ fn main() -> anyhow::Result<()> {
                         drag_current_x: drag_current_x as f32,
                         drag_tab_offset: drag_tab_offset as f32,
                         drop_target_idx: if cross_window_drag::is_active() && hovered_window == Some(window_for_redraw.id()) {
-                            let tab_start_x = 36.0;
+                            let tab_start_x = chrome_layout::tab_start_x() as f64;
                             let path_center_x = (window_for_redraw.inner_size().width as f64) / 2.0;
                             let tab_area_max_x = path_center_x - 40.0;
                             let tab_area_width = tab_area_max_x - tab_start_x - 32.0;

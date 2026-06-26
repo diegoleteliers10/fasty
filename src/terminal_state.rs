@@ -103,9 +103,10 @@ impl TerminalState {
         // Shell integration: write OSC 133 command markers so fasty can
         // detect command start/finish for duration tracking.
         let integration_path = std::env::temp_dir().join("fasty_shell_integration.sh");
+        let integration_path_zsh = std::env::temp_dir().join("fasty_shell_integration.zsh");
         let integration_path_fish = std::env::temp_dir().join("fasty_shell_integration.fish");
 
-        // POSIX shell integration (bash/zsh)
+        // POSIX shell integration (bash)
         let _ = std::fs::write(
             &integration_path,
             "# fasty shell integration — OSC 133 command markers\n\
@@ -118,6 +119,23 @@ impl TerminalState {
              }\n\
              PROMPT_COMMAND=\"__fasty_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"\n\
              trap '__fasty_cmd_start' DEBUG\n",
+        );
+
+        // Zsh shell integration: precmd/preexec hooks appended via add-zsh-hook
+        // so user-defined hooks in ~/.zshrc are preserved, not overwritten.
+        let _ = std::fs::write(
+            &integration_path_zsh,
+            "# fasty shell integration — OSC 133 command markers\n\
+             autoload -Uz add-zsh-hook\n\
+             __fasty_preexec() {\n\
+             \techo -ne \"\\e]133;B\\e\\\\\"\n\
+             }\n\
+             __fasty_precmd() {\n\
+             \techo -ne \"\\e]133;D;$?\\e\\\\\"\n\
+             \techo -ne \"\\e]133;A\\e\\\\\"\n\
+             }\n\
+             add-zsh-hook preexec __fasty_preexec\n\
+             add-zsh-hook precmd __fasty_precmd\n",
         );
 
         // Fish shell integration
@@ -160,12 +178,24 @@ impl TerminalState {
             );
             cmd.args(&["--rcfile", wrapper_path.to_str().unwrap_or("")]);
         } else if shell_name == "zsh" && exec_args.is_empty() {
-            // Zsh: use ZDOTDIR to inject .zshenv
+            // Zsh: redirect ZDOTDIR to a wrapper dir that still sources the
+            // user's ~/.zshenv and ~/.zshrc (zsh reads both from $ZDOTDIR,
+            // so overriding it would otherwise skip the user's config).
+            let home = std::env::var("HOME").unwrap_or_default();
+            let user_zshenv = format!("{}/.zshenv", home);
+            let user_zshrc = format!("{}/.zshrc", home);
             let zdotdir = std::env::temp_dir().join("fasty_zsh");
             let _ = std::fs::create_dir_all(&zdotdir);
             let _ = std::fs::write(
                 zdotdir.join(".zshenv"),
-                format!(". {}\n", integration_path.display()),
+                format!("[ -f {user_zshenv} ] && . {user_zshenv}\n"),
+            );
+            let _ = std::fs::write(
+                zdotdir.join(".zshrc"),
+                format!(
+                    "[ -f {user_zshrc} ] && . {user_zshrc}\n. {}\n",
+                    integration_path_zsh.display(),
+                ),
             );
             cmd.env("ZDOTDIR", zdotdir);
         } else if shell_name == "fish" && exec_args.is_empty() {

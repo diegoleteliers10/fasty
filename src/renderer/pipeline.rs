@@ -1610,11 +1610,12 @@ impl Pipeline {
         }
 
         // Draw unified topbar app icon or fallback lightning icon (⚡) U+26A1
+        let icon_base_x = crate::chrome_layout::icon_rect(viewport_width).x;
         if let Some(entry) = &atlas.app_icon {
             let icon_scale = 16.0f32 / entry.height;
             let glyph_w = entry.width * icon_scale;
             let glyph_h = entry.height * icon_scale;
-            let glyph_x = 8.0f32 + (16.0f32 - glyph_w) / 2.0f32;
+            let glyph_x = icon_base_x + (16.0f32 - glyph_w) / 2.0f32;
             let glyph_y = 7.0f32 + (16.0f32 - glyph_h) / 2.0f32;
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
@@ -1640,7 +1641,7 @@ impl Pipeline {
                 let icon_scale = 16.0f32 / atlas.font_size();
                 let glyph_w = entry.width * icon_scale;
                 let glyph_h = entry.height * icon_scale;
-                let glyph_x = (8.0f32 + (16.0f32 - glyph_w) / 2.0f32).round();
+                let glyph_x = (icon_base_x + (16.0f32 - glyph_w) / 2.0f32).round();
                 let glyph_y = (7.0f32 + (16.0f32 - glyph_h) / 2.0f32).round();
                 let (aw, ah) = atlas.atlas_size();
                 let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
@@ -1665,7 +1666,7 @@ impl Pipeline {
 
         // Draw tabs (zen mode: hide when only one tab)
         if tab_titles.len() > 1 {
-            let tab_start_x = 36.0f32;
+            let tab_start_x = crate::chrome_layout::tab_start_x();
         let path_center_x = viewport_width / 2.0f32;
         let tab_area_max_x = path_center_x - 40.0f32;
         let tab_area_width = tab_area_max_x - tab_start_x - 32.0f32; // 32px for new tab button
@@ -2292,24 +2293,27 @@ impl Pipeline {
             ));
         }
 
-        // 2. Vertical separator line (rgba(255,255,255,0.08))
-        bg_instances.push(CellInstance::new(
-            viewport_width - 105.0f32,
-            12.0f32,
-            1.0,
-            16.0,
-            with_opacity([1.0, 1.0, 1.0, 0.08], chrome_alpha),
-            [0.0, 0.0, 0.0, 0.0],
-            0.0,
-            0.0,
-            1.0,
-            1.0,
-            0.0,
-        ));
+        // 2. Vertical separator line (rgba(255,255,255,0.08)) — skipped on macOS
+        //    where min/max/close are traffic lights on the left.
+        if !cfg!(target_os = "macos") {
+            bg_instances.push(CellInstance::new(
+                viewport_width - 105.0f32,
+                12.0f32,
+                1.0,
+                16.0,
+                with_opacity([1.0, 1.0, 1.0, 0.08], chrome_alpha),
+                [0.0, 0.0, 0.0, 0.0],
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+                0.0,
+            ));
+        }
 
         // 3. Minimize button (─)
-        let min_x = viewport_width - 100.0f32;
-        if hover_min {
+        let min_x = crate::chrome_layout::min_rect(viewport_width).x;
+        if hover_min && !cfg!(target_os = "macos") {
             bg_instances.push(CellInstance::new(
                 min_x,
                 controls_y,
@@ -2324,39 +2328,47 @@ impl Pipeline {
                 6.0,
             ));
         }
-        if let Some(entry) = &atlas.icon_less {
-            let entry_w = 14.0f32;
-            let entry_h = 14.0f32;
-            let glyph_x = min_x + (28.0f32 - entry_w) / 2.0f32;
-            let glyph_y = controls_y + (28.0f32 - entry_h) / 2.0f32;
-            let (aw, ah) = atlas.atlas_size();
-            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
-            let uv_w = uv_end_x - uv_x;
-            let uv_h = uv_end_y - uv_y;
-
-            let fg_color = if hover_min {
-                with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha)
-            } else {
-                with_opacity([0.8, 0.8, 0.85, 1.0], chrome_alpha)
+        {
+            let entry_opt = {
+                #[cfg(target_os = "macos")]
+                { atlas.mac_min.as_ref() }
+                #[cfg(not(target_os = "macos"))]
+                { atlas.icon_less.as_ref() }
             };
-            fg_instances.push(CellInstance::new(
-                glyph_x,
-                glyph_y,
-                entry_w,
-                entry_h,
-                fg_color,
-                [0.0, 0.0, 0.0, 0.0],
-                uv_x,
-                uv_y,
-                uv_w,
-                uv_h,
-                0.0,
-            ));
+            if let Some(entry) = entry_opt {
+                let entry_w = 14.0f32;
+                let entry_h = 14.0f32;
+                let glyph_x = min_x + (28.0f32 - entry_w) / 2.0f32;
+                let glyph_y = controls_y + (28.0f32 - entry_h) / 2.0f32;
+                let (aw, ah) = atlas.atlas_size();
+                let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                let uv_w = uv_end_x - uv_x;
+                let uv_h = uv_end_y - uv_y;
+
+                let fg_color = if hover_min {
+                    with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha)
+                } else {
+                    with_opacity([0.8, 0.8, 0.85, 1.0], chrome_alpha)
+                };
+                fg_instances.push(CellInstance::new(
+                    glyph_x,
+                    glyph_y,
+                    entry_w,
+                    entry_h,
+                    fg_color,
+                    [0.0, 0.0, 0.0, 0.0],
+                    uv_x,
+                    uv_y,
+                    uv_w,
+                    uv_h,
+                    0.0,
+                ));
+            }
         }
 
         // 4. Maximize button (▢)
-        let max_x = viewport_width - 68.0f32;
-        if hover_max {
+        let max_x = crate::chrome_layout::max_rect(viewport_width).x;
+        if hover_max && !cfg!(target_os = "macos") {
             bg_instances.push(CellInstance::new(
                 max_x,
                 controls_y,
@@ -2371,39 +2383,47 @@ impl Pipeline {
                 6.0,
             ));
         }
-        if let Some(entry) = &atlas.icon_maximize {
-            let entry_w = 14.0f32;
-            let entry_h = 14.0f32;
-            let glyph_x = max_x + (28.0f32 - entry_w) / 2.0f32;
-            let glyph_y = controls_y + (28.0f32 - entry_h) / 2.0f32;
-            let (aw, ah) = atlas.atlas_size();
-            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
-            let uv_w = uv_end_x - uv_x;
-            let uv_h = uv_end_y - uv_y;
-
-            let fg_color = if hover_max {
-                with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha)
-            } else {
-                with_opacity([0.8, 0.8, 0.85, 1.0], chrome_alpha)
+        {
+            let entry_opt = {
+                #[cfg(target_os = "macos")]
+                { atlas.mac_max.as_ref() }
+                #[cfg(not(target_os = "macos"))]
+                { atlas.icon_maximize.as_ref() }
             };
-            fg_instances.push(CellInstance::new(
-                glyph_x,
-                glyph_y,
-                entry_w,
-                entry_h,
-                fg_color,
-                [0.0, 0.0, 0.0, 0.0],
-                uv_x,
-                uv_y,
-                uv_w,
-                uv_h,
-                0.0,
-            ));
+            if let Some(entry) = entry_opt {
+                let entry_w = 14.0f32;
+                let entry_h = 14.0f32;
+                let glyph_x = max_x + (28.0f32 - entry_w) / 2.0f32;
+                let glyph_y = controls_y + (28.0f32 - entry_h) / 2.0f32;
+                let (aw, ah) = atlas.atlas_size();
+                let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                let uv_w = uv_end_x - uv_x;
+                let uv_h = uv_end_y - uv_y;
+
+                let fg_color = if hover_max {
+                    with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha)
+                } else {
+                    with_opacity([0.8, 0.8, 0.85, 1.0], chrome_alpha)
+                };
+                fg_instances.push(CellInstance::new(
+                    glyph_x,
+                    glyph_y,
+                    entry_w,
+                    entry_h,
+                    fg_color,
+                    [0.0, 0.0, 0.0, 0.0],
+                    uv_x,
+                    uv_y,
+                    uv_w,
+                    uv_h,
+                    0.0,
+                ));
+            }
         }
 
         // 5. Close button (✕)
-        let close_x = viewport_width - 36.0f32;
-        if hover_close {
+        let close_x = crate::chrome_layout::close_rect(viewport_width).x;
+        if hover_close && !cfg!(target_os = "macos") {
             bg_instances.push(CellInstance::new(
                 close_x,
                 controls_y,
@@ -2421,34 +2441,42 @@ impl Pipeline {
                 6.0,
             ));
         }
-        if let Some(entry) = &atlas.icon_close {
-            let entry_w = 14.0f32;
-            let entry_h = 14.0f32;
-            let glyph_x = close_x + (28.0f32 - entry_w) / 2.0f32;
-            let glyph_y = controls_y + (28.0f32 - entry_h) / 2.0f32;
-            let (aw, ah) = atlas.atlas_size();
-            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
-            let uv_w = uv_end_x - uv_x;
-            let uv_h = uv_end_y - uv_y;
-
-            let fg_color = if hover_close {
-                with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha)
-            } else {
-                with_opacity([0.8, 0.8, 0.85, 1.0], chrome_alpha)
+        {
+            let entry_opt = {
+                #[cfg(target_os = "macos")]
+                { atlas.mac_close.as_ref() }
+                #[cfg(not(target_os = "macos"))]
+                { atlas.icon_close.as_ref() }
             };
-            fg_instances.push(CellInstance::new(
-                glyph_x,
-                glyph_y,
-                entry_w,
-                entry_h,
-                fg_color,
-                [0.0, 0.0, 0.0, 0.0],
-                uv_x,
-                uv_y,
-                uv_w,
-                uv_h,
-                0.0,
-            ));
+            if let Some(entry) = entry_opt {
+                let entry_w = 14.0f32;
+                let entry_h = 14.0f32;
+                let glyph_x = close_x + (28.0f32 - entry_w) / 2.0f32;
+                let glyph_y = controls_y + (28.0f32 - entry_h) / 2.0f32;
+                let (aw, ah) = atlas.atlas_size();
+                let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                let uv_w = uv_end_x - uv_x;
+                let uv_h = uv_end_y - uv_y;
+
+                let fg_color = if hover_close {
+                    with_opacity([1.0, 1.0, 1.0, 1.0], chrome_alpha)
+                } else {
+                    with_opacity([0.8, 0.8, 0.85, 1.0], chrome_alpha)
+                };
+                fg_instances.push(CellInstance::new(
+                    glyph_x,
+                    glyph_y,
+                    entry_w,
+                    entry_h,
+                    fg_color,
+                    [0.0, 0.0, 0.0, 0.0],
+                    uv_x,
+                    uv_y,
+                    uv_w,
+                    uv_h,
+                    0.0,
+                ));
+            }
         }
 
         // Draw cursor
@@ -4376,18 +4404,42 @@ impl Pipeline {
             }
         };
 
-        // Draw title — vertically centered in the 40*scale topbar
+        // Draw title — vertically centered in the 40*scale topbar.
+        // macOS: right-aligned (close button is on the left). Other platforms: left.
+        let settings_title = "Settings";
+        let title_x = if cfg!(target_os = "macos") {
+            let mut tw = 0.0f32;
+            for c in settings_title.chars() {
+                if c == ' ' {
+                    tw += cell_w;
+                    continue;
+                }
+                if let Some(e) = atlas.get_or_rasterize(c, device, queue) {
+                    if e.width > 0.0 {
+                        tw += e.width + 2.0 * scale;
+                    }
+                }
+            }
+            (viewport_width - 12.0 * scale - tw) / scale
+        } else {
+            12.0
+        };
         draw_text(
             atlas,
-            "Settings",
-            12.0,
+            settings_title,
+            title_x,
             13.5,
             with_opacity([0.85, 0.85, 0.85, 1.0], chrome_alpha),
             &mut fg_instances,
         );
 
-        // Draw topbar close button — vertically centered (28*scale box in 40*scale bar)
-        let close_x = viewport_width - 32.0 * scale;
+        // Draw topbar close button — vertically centered (28*scale box in 40*scale bar).
+        // macOS: left side; other platforms: right side.
+        let close_x = if cfg!(target_os = "macos") {
+            4.0 * scale
+        } else {
+            viewport_width - 32.0 * scale
+        };
         let close_y = 6.0 * scale; // (40 - 28) / 2
         if hover_close {
             bg_instances.push(CellInstance::new(
@@ -5398,20 +5450,33 @@ impl Pipeline {
             w
         };
 
-        // Draw title — vertically centered in the 40px topbar
+        // Draw title — vertically centered in the 40px topbar.
+        // macOS: right-aligned (close button is on the left). Other platforms: left.
+        let about_title = "About Fasty";
+        let title_x = if cfg!(target_os = "macos") {
+            viewport_width - 12.0 - get_text_width(atlas, about_title)
+        } else {
+            12.0
+        };
         draw_text(
             atlas,
-            "About Fasty",
-            12.0,
+            about_title,
+            title_x,
             13.5,
             with_opacity([0.85, 0.85, 0.90, 1.0], chrome_alpha),
             &mut fg_instances,
         );
 
-        // Draw topbar close button — vertically centered (28px box in 40px bar)
+        // Draw topbar close button — vertically centered (28px box in 40px bar).
+        // macOS: left side; other platforms: right side.
+        let about_close_x = if cfg!(target_os = "macos") {
+            4.0
+        } else {
+            viewport_width - 32.0
+        };
         if hover_close {
             bg_instances.push(CellInstance::new(
-                viewport_width - 32.0,
+                about_close_x,
                 6.0,
                 28.0,
                 28.0,
@@ -5427,7 +5492,7 @@ impl Pipeline {
         if let Some(entry) = &atlas.icon_close {
             let entry_w = 14.0f32;
             let entry_h = 14.0f32;
-            let glyph_x = (viewport_width - 32.0) + (28.0 - entry_w) / 2.0;
+            let glyph_x = about_close_x + (28.0 - entry_w) / 2.0;
             let glyph_y = 6.0 + (28.0 - entry_h) / 2.0; // close_y now 6.0 for vertical centering
             let (aw, ah) = atlas.atlas_size();
             let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);

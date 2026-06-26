@@ -1,6 +1,6 @@
 [package]
 name = "fasty"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 
 [lib]
@@ -55,6 +55,7 @@ wgpu = { version = "22", default-features = false, features = ["wgsl", "webgl"] 
 
 [target.'cfg(target_os = "macos")'.dependencies]
 wgpu = { version = "22", default-features = false, features = ["wgsl", "metal"] }
+objc2 = "0.5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 wgpu = { version = "22", default-features = false, features = ["wgsl", "dx12"] }

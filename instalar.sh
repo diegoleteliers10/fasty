@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Script de Instalación para Linux y macOS (Fasty)
+# Fasty installation script for Linux and macOS
 # ==============================================================================
-# Ejecutar directamente desde internet con:
+# Run directly from the internet with:
 # curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash
 # ==============================================================================
 
 set -euo pipefail
 
-# Procesar argumentos y variables de entorno
 USE_USER_DIR=false
 if [ "${FASTY_USER_INSTALL:-0}" = "1" ]; then
     USE_USER_DIR=true
@@ -23,14 +22,13 @@ for arg in "$@"; do
     esac
 done
 
-# CONFIGURACIÓN
 GITHUB_USER="diegoleteliers10"
 GITHUB_REPO="fasty"
 APP_NAME="fasty"
 
-echo "=== Iniciando instalación de $APP_NAME ==="
+echo "=== Starting $APP_NAME installation ==="
 
-# 1. Detección automática del Sistema Operativo y la Arquitectura
+# 1. Detect OS and architecture
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
 
@@ -39,7 +37,7 @@ case "$OS" in
         if [ "$ARCH" = "x86_64" ]; then
             TARGET="x86_64-unknown-linux-gnu"
         else
-            echo "❌ Error: La arquitectura Linux '$ARCH' no está soportada actualmente." >&2
+            echo "ERROR: Linux architecture '$ARCH' is not supported." >&2
             exit 1
         fi
         ;;
@@ -49,48 +47,52 @@ case "$OS" in
         elif [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then
             TARGET="aarch64-apple-darwin"
         else
-            echo "❌ Error: La arquitectura macOS '$ARCH' no está soportada." >&2
+            echo "ERROR: macOS architecture '$ARCH' is not supported." >&2
             exit 1
         fi
         ;;
     *)
-        echo "❌ Error: El sistema operativo '$OS' no es compatible con este script." >&2
+        echo "ERROR: OS '$OS' is not compatible with this script." >&2
         exit 1
         ;;
 esac
 
-echo "✅ Plataforma detectada: OS=$OS, Arch=$ARCH -> Target=$TARGET"
+echo "Detected platform: OS=$OS, Arch=$ARCH -> Target=$TARGET"
 
-# 2. Consultar la API pública de GitHub para obtener la última release
-echo "🔍 Consultando la última versión disponible en GitHub..."
+# 2. Query the GitHub API for the latest release
+echo "Fetching the latest version from GitHub..."
 API_URL="https://api.github.com/repos/$GITHUB_USER/$GITHUB_REPO/releases/latest"
 
-LATEST_TAG=$(curl -sSf "$API_URL" | grep '"tag_name":' | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')
+# Portable tag extraction: strip CR, then pull the value out of the
+# "tag_name" JSON field using POSIX character classes. BSD sed on macOS
+# does not support \s, which previously captured the whole line and
+# produced a malformed download URL.
+LATEST_TAG=$(curl -sSf "$API_URL" | tr -d '\r' | grep '"tag_name"' | head -n 1 \
+    | sed -E 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*$/\1/')
 
 if [ -z "$LATEST_TAG" ]; then
-    echo "❌ Error: No se pudo obtener la información de la última versión desde GitHub." >&2
+    echo "ERROR: Could not determine the latest version from GitHub." >&2
     exit 1
 fi
 
-echo "📦 Última versión encontrada: $LATEST_TAG"
+echo "Latest version found: $LATEST_TAG"
 
-# 3. Descargar el archivo .tar.gz correcto
+# 3. Download the correct .tar.gz asset
 ASSET_NAME="$APP_NAME-$TARGET.tar.gz"
 DOWNLOAD_URL="https://github.com/$GITHUB_USER/$GITHUB_REPO/releases/download/$LATEST_TAG/$ASSET_NAME"
 
 TEMP_DIR=$(mktemp -d -t install-$APP_NAME.XXXXXX)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
-echo "📥 Descargando $ASSET_NAME..."
+echo "Downloading $ASSET_NAME..."
 curl -sSL -o "$TEMP_DIR/$ASSET_NAME" "$DOWNLOAD_URL"
 
-# 4. Descomprimir el binario/app bundle
-echo "🔓 Descomprimiendo archivos..."
+# 4. Extract
+echo "Extracting files..."
 tar -xzf "$TEMP_DIR/$ASSET_NAME" -C "$TEMP_DIR"
 
-# 5. Instalación específica por Sistema Operativo
+# 5. OS-specific install
 if [ "$OS" = "darwin" ]; then
-    # --- macOS: Instalación en /Applications con soporte de Launcher/Launchpad ---
     if [ "$USE_USER_DIR" = true ]; then
         INSTALL_DIR="$HOME/Applications"
         BIN_DIR="$HOME/.local/bin"
@@ -100,18 +102,17 @@ if [ "$OS" = "darwin" ]; then
         INSTALL_DIR="/Applications"
         BIN_DIR="/usr/local/bin"
     fi
-    echo "🚀 Copiando Fasty.app a $INSTALL_DIR..."
-    
+    echo "Copying Fasty.app to $INSTALL_DIR..."
+
     if [ -w "$INSTALL_DIR" ]; then
         rm -rf "$INSTALL_DIR/Fasty.app"
         mv "$TEMP_DIR/Fasty.app" "$INSTALL_DIR/"
     else
-        echo "🔑 Se requieren privilegios de administrador (sudo) para escribir en $INSTALL_DIR."
+        echo "Administrator privileges (sudo) are required to write to $INSTALL_DIR."
         sudo rm -rf "$INSTALL_DIR/Fasty.app"
         sudo mv "$TEMP_DIR/Fasty.app" "$INSTALL_DIR/"
     fi
 
-    # Crear enlace simbólico en BIN_DIR para poder ejecutar 'fasty' desde terminal
     if [ ! -d "$BIN_DIR" ]; then
         if [ -w "$(dirname "$BIN_DIR")" ]; then
             mkdir -p "$BIN_DIR"
@@ -120,7 +121,7 @@ if [ "$OS" = "darwin" ]; then
         fi
     fi
 
-    echo "🔗 Creando enlace simbólico en $BIN_DIR/fasty..."
+    echo "Creating symlink at $BIN_DIR/fasty..."
     if [ -w "$BIN_DIR" ]; then
         rm -f "$BIN_DIR/fasty"
         ln -sf "$INSTALL_DIR/Fasty.app/Contents/MacOS/fasty" "$BIN_DIR/fasty"
@@ -129,11 +130,10 @@ if [ "$OS" = "darwin" ]; then
         sudo ln -sf "$INSTALL_DIR/Fasty.app/Contents/MacOS/fasty" "$BIN_DIR/fasty"
     fi
 
-    echo "🎉 ¡$APP_NAME instalado con éxito en $INSTALL_DIR/Fasty.app!"
-    echo "💡 Puedes iniciarlo desde tu Launchpad o escribiendo '$APP_NAME' en tu terminal."
+    echo "$APP_NAME installed successfully at $INSTALL_DIR/Fasty.app!"
+    echo "You can launch it from Launchpad or by typing '$APP_NAME' in your terminal."
 
 elif [ "$OS" = "linux" ]; then
-    # --- Linux: Mover binario y configurar lanzador de escritorio .desktop ---
     if [ "$USE_USER_DIR" = true ]; then
         BIN_DIR="$HOME/.local/bin"
         ICON_DIR="$HOME/.local/share/pixmaps"
@@ -146,9 +146,9 @@ elif [ "$OS" = "linux" ]; then
         ICON_DIR="/usr/local/share/pixmaps"
         DESKTOP_DIR="/usr/local/share/applications"
     fi
-    
+
     if [ ! -d "$BIN_DIR" ]; then
-        echo "📂 Creando el directorio $BIN_DIR..."
+        echo "Creating directory $BIN_DIR..."
         if [ -w "$(dirname "$BIN_DIR")" ]; then
             mkdir -p "$BIN_DIR"
         else
@@ -156,48 +156,41 @@ elif [ "$OS" = "linux" ]; then
         fi
     fi
 
-    echo "🚀 Reemplazando el binario en $BIN_DIR/$APP_NAME..."
-    # Reemplazo robusto en Linux:
-    #   1. rm -f  -> elimina la entrada de directorio del binario viejo.
-    #                Funciona aunque el binario esté en ejecución (sólo
-    #                remueve el dirent; el inodo sigue vivo mientras el
-    #                proceso lo tenga mapeado).
-    #   2. cp     -> crea un inodo NUEVO con el contenido nuevo. No
-    #                toca el inodo viejo, así que no hay ETXTBSY.
-    #   3. chmod  -> fija permisos del archivo recién creado.
-    # mv/rename(2) sobre un ejecutable en ejecución falla con ETXTBSY
-    # ("Text file busy") en Linux y deja el binario viejo en disco,
-    # por eso no usamos mv ni install (que internamente hace rename
-    # atómico sobre el destino).
+    echo "Replacing binary at $BIN_DIR/$APP_NAME..."
+    # Robust replacement on Linux:
+    #   1. rm -f  -> removes the directory entry of the old binary. Works
+    #      even while the binary is running (only removes the dirent; the
+    #      inode stays alive while a process maps it).
+    #   2. cp     -> creates a NEW inode with the new contents. Does not
+    #      touch the old inode, avoiding ETXTBSY.
+    #   3. chmod  -> sets permissions on the newly created file.
+    # mv/rename(2) on a running executable fails with ETXTBSY and leaves
+    # the old binary on disk, so we avoid mv and install (which internally
+    # does an atomic rename onto the destination).
     if [ -w "$BIN_DIR" ]; then
         rm -f "$BIN_DIR/$APP_NAME"
         cp -f "$TEMP_DIR/$APP_NAME" "$BIN_DIR/$APP_NAME"
         chmod 0755 "$BIN_DIR/$APP_NAME"
     else
-        echo "🔑 Se requieren privilegios de administrador (sudo) para escribir en $BIN_DIR."
+        echo "Administrator privileges (sudo) are required to write to $BIN_DIR."
         sudo rm -f "$BIN_DIR/$APP_NAME"
         sudo cp -f "$TEMP_DIR/$APP_NAME" "$BIN_DIR/$APP_NAME"
         sudo chmod 0755 "$BIN_DIR/$APP_NAME"
     fi
 
-    # Verifica que el binario en disco realmente fue reemplazado
-    # comparando hashes sha256. Si la copia falló (p.ej. cp no pudo
-    # escribir) NO marcamos el update como completado para que el
-    # usuario pueda reintentar.
+    # Verify the on-disk binary was actually replaced by comparing sha256.
     NEW_HASH=$(sha256sum "$TEMP_DIR/$APP_NAME" 2>/dev/null | awk '{print $1}')
     INSTALLED_HASH=$(sha256sum "$BIN_DIR/$APP_NAME" 2>/dev/null | awk '{print $1}')
     if [ -z "$NEW_HASH" ] || [ -z "$INSTALLED_HASH" ] || [ "$NEW_HASH" != "$INSTALLED_HASH" ]; then
-        echo "❌ Error: el binario en $BIN_DIR/$APP_NAME no coincide con el nuevo (copia fallida). Aborta." >&2
+        echo "ERROR: the binary at $BIN_DIR/$APP_NAME does not match the new one (copy failed). Aborting." >&2
         exit 1
     fi
 
     echo "$LATEST_TAG" > /tmp/fasty-update-done 2>/dev/null || true
 
-    # Configuración de icono PNG y archivo .desktop para menús del sistema
-    echo "🎨 Configurando icono y acceso directo de escritorio para Linux..."
+    echo "Setting up icon and desktop entry for Linux..."
     RAW_ICON_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/main/assets/fastyIcon.png"
 
-    # Descargar el icono PNG
     if [ -w "$ICON_DIR" ]; then
         curl -sSL -o "$ICON_DIR/fasty.png" "$RAW_ICON_URL"
     else
@@ -205,7 +198,6 @@ elif [ "$OS" = "linux" ]; then
         sudo curl -sSL -o "$ICON_DIR/fasty.png" "$RAW_ICON_URL"
     fi
 
-    # Crear lanzador .desktop
     DESKTOP_CONTENT="[Desktop Entry]
 Name=Fasty
 Comment=GPU-accelerated Terminal Emulator
@@ -223,13 +215,12 @@ Keywords=terminal;emulator;wgpu;"
         echo "$DESKTOP_CONTENT" | sudo tee "$DESKTOP_DIR/fasty.desktop" > /dev/null
     fi
 
-    echo "🎉 ¡$APP_NAME instalado con éxito en $BIN_DIR/$APP_NAME!"
-    echo "💡 Puedes ejecutarlo buscando '$APP_NAME' en tu menú o escribiéndolo en terminal."
+    echo "$APP_NAME installed successfully at $BIN_DIR/$APP_NAME!"
+    echo "You can launch it by searching '$APP_NAME' in your menu or typing it in a terminal."
 
-    # Schedule a self-restart: 3s after this script exits, kill the
-    # current fasty and relaunch it. The deferred subshell survives
-    # even when the parent pty (the shell that ran this script) is
-    # destroyed, so the new fasty comes up cleanly.
+    # Schedule a self-restart: 3s after this script exits, kill the current
+    # fasty and relaunch it. The deferred subshell survives even when the
+    # parent pty is destroyed, so the new fasty comes up cleanly.
     (
         sleep 3
         pkill -x fasty 2>/dev/null || true
