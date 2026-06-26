@@ -11,7 +11,7 @@ mod macos_impl {
     use objc2::encode::{Encode, Encoding, RefEncode};
     use objc2::runtime::{AnyObject, Bool};
     use objc2::{class, msg_send};
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use raw_window_handle::HasWindowHandle;
     use winit::window::Window;
 
     #[repr(C)]
@@ -84,7 +84,8 @@ mod macos_impl {
     }
 
     pub fn toggle_maximize(window: &Window, state: &mut MaximizeState) {
-        assert!(objc2::is_main_thread(), "AppKit calls must be on the main thread");
+        let is_main: Bool = unsafe { msg_send![class!(NSThread), isMainThread] };
+        assert!(is_main.as_bool(), "AppKit calls must be on the main thread");
         let Some(ns_window) = ns_window(window) else {
             return;
         };

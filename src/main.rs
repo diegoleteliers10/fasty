@@ -4255,6 +4255,7 @@ fn main() -> anyhow::Result<()> {
                                                     if let Some(menu_items) = w.get_context_menu_items() {
                                                         context_menu_classification = None;
                                                         context_menu_items = menu_items;
+                                                        context_menu_is_about = false;
                                                         context_menu_scroll_y = 0.0;
                                                         let (menu_w, menu_h) = get_context_menu_size(&context_menu_items);
                                                         context_menu_x = current_mouse_x;
