@@ -63,14 +63,31 @@ echo "Detected platform: OS=$OS, Arch=$ARCH -> Target=$TARGET"
 echo "Fetching the latest version from GitHub..."
 API_URL="https://api.github.com/repos/$GITHUB_USER/$GITHUB_REPO/releases/latest"
 
-# Portable tag extraction: strip CR, then pull the value out of the
-# "tag_name" JSON field using POSIX character classes. BSD sed on macOS
-# does not support \s, which previously captured the whole line and
-# produced a malformed download URL.
-LATEST_TAG=$(curl -sSf "$API_URL" | tr -d '\r' | grep '"tag_name"' | head -n 1 \
-    | sed -E 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*$/\1/')
+# Fetch the full JSON response once and store it
+API_RESPONSE=$(curl -sSfL "$API_URL")
 
-if [ -z "$LATEST_TAG" ]; then
+# Extract tag_name robustly — tries tools in order of reliability:
+#   1. jq          – most correct, handles any JSON formatting
+#   2. python3     – available on virtually all modern Linux/macOS systems
+#   3. python      – fallback for older systems
+#   4. sed/grep    – pure POSIX fallback; strips all whitespace so it works
+#                    on both compact (single-line) and pretty-printed JSON
+if command -v jq >/dev/null 2>&1; then
+    LATEST_TAG=$(printf '%s' "$API_RESPONSE" | jq -r '.tag_name')
+elif command -v python3 >/dev/null 2>&1; then
+    LATEST_TAG=$(printf '%s' "$API_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+elif command -v python >/dev/null 2>&1; then
+    LATEST_TAG=$(printf '%s' "$API_RESPONSE" | python -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+else
+    # Remove all whitespace, then extract the value of "tag_name":"..."
+    LATEST_TAG=$(printf '%s' "$API_RESPONSE" \
+        | tr -d ' \t\r\n' \
+        | grep -o '"tag_name":"[^"]*"' \
+        | head -1 \
+        | sed -E 's/"tag_name":"([^"]+)"/\1/')
+fi
+
+if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
     echo "ERROR: Could not determine the latest version from GitHub." >&2
     exit 1
 fi
@@ -85,7 +102,7 @@ TEMP_DIR=$(mktemp -d -t install-$APP_NAME.XXXXXX)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
 echo "Downloading $ASSET_NAME..."
-curl -sSL -o "$TEMP_DIR/$ASSET_NAME" "$DOWNLOAD_URL"
+curl -sSfL -o "$TEMP_DIR/$ASSET_NAME" "$DOWNLOAD_URL"
 
 # 4. Extract
 echo "Extracting files..."
@@ -147,6 +164,14 @@ elif [ "$OS" = "linux" ]; then
         DESKTOP_DIR="/usr/local/share/applications"
     fi
 
+    # Find the binary in case it's in a subfolder within the tar
+    SRC_BINARY=$(find "$TEMP_DIR" -maxdepth 2 -type f -name "$APP_NAME" | head -n 1)
+
+    if [ ! -f "$SRC_BINARY" ]; then
+        echo "ERROR: Could not find binary '$APP_NAME' in extracted files." >&2
+        exit 1
+    fi
+
     if [ ! -d "$BIN_DIR" ]; then
         echo "Creating directory $BIN_DIR..."
         if [ -w "$(dirname "$BIN_DIR")" ]; then
@@ -157,29 +182,19 @@ elif [ "$OS" = "linux" ]; then
     fi
 
     echo "Replacing binary at $BIN_DIR/$APP_NAME..."
-    # Robust replacement on Linux:
-    #   1. rm -f  -> removes the directory entry of the old binary. Works
-    #      even while the binary is running (only removes the dirent; the
-    #      inode stays alive while a process maps it).
-    #   2. cp     -> creates a NEW inode with the new contents. Does not
-    #      touch the old inode, avoiding ETXTBSY.
-    #   3. chmod  -> sets permissions on the newly created file.
-    # mv/rename(2) on a running executable fails with ETXTBSY and leaves
-    # the old binary on disk, so we avoid mv and install (which internally
-    # does an atomic rename onto the destination).
     if [ -w "$BIN_DIR" ]; then
         rm -f "$BIN_DIR/$APP_NAME"
-        cp -f "$TEMP_DIR/$APP_NAME" "$BIN_DIR/$APP_NAME"
+        cp -f "$SRC_BINARY" "$BIN_DIR/$APP_NAME"
         chmod 0755 "$BIN_DIR/$APP_NAME"
     else
         echo "Administrator privileges (sudo) are required to write to $BIN_DIR."
         sudo rm -f "$BIN_DIR/$APP_NAME"
-        sudo cp -f "$TEMP_DIR/$APP_NAME" "$BIN_DIR/$APP_NAME"
+        sudo cp -f "$SRC_BINARY" "$BIN_DIR/$APP_NAME"
         sudo chmod 0755 "$BIN_DIR/$APP_NAME"
     fi
 
     # Verify the on-disk binary was actually replaced by comparing sha256.
-    NEW_HASH=$(sha256sum "$TEMP_DIR/$APP_NAME" 2>/dev/null | awk '{print $1}')
+    NEW_HASH=$(sha256sum "$SRC_BINARY" 2>/dev/null | awk '{print $1}')
     INSTALLED_HASH=$(sha256sum "$BIN_DIR/$APP_NAME" 2>/dev/null | awk '{print $1}')
     if [ -z "$NEW_HASH" ] || [ -z "$INSTALLED_HASH" ] || [ "$NEW_HASH" != "$INSTALLED_HASH" ]; then
         echo "ERROR: the binary at $BIN_DIR/$APP_NAME does not match the new one (copy failed). Aborting." >&2
@@ -192,10 +207,10 @@ elif [ "$OS" = "linux" ]; then
     RAW_ICON_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/main/assets/fastyIcon.png"
 
     if [ -w "$ICON_DIR" ]; then
-        curl -sSL -o "$ICON_DIR/fasty.png" "$RAW_ICON_URL"
+        curl -sSfL -o "$ICON_DIR/fasty.png" "$RAW_ICON_URL"
     else
         sudo mkdir -p "$ICON_DIR"
-        sudo curl -sSL -o "$ICON_DIR/fasty.png" "$RAW_ICON_URL"
+        sudo curl -sSfL -o "$ICON_DIR/fasty.png" "$RAW_ICON_URL"
     fi
 
     DESKTOP_CONTENT="[Desktop Entry]
@@ -219,8 +234,8 @@ Keywords=terminal;emulator;wgpu;"
     echo "You can launch it by searching '$APP_NAME' in your menu or typing it in a terminal."
 
     # Schedule a self-restart: 3s after this script exits, kill the current
-    # fasty and relaunch it. The deferred subshell survives even when the
-    # parent pty is destroyed, so the new fasty comes up cleanly.
+    # fasty process and relaunch it. The deferred subshell survives even when
+    # the parent pty is destroyed, so the new fasty comes up cleanly.
     (
         sleep 3
         pkill -x fasty 2>/dev/null || true
