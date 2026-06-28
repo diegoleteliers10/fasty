@@ -923,8 +923,14 @@ impl Pipeline {
                         }));
                 }
 
+                let effective_bg = if cell.flags.contains(alacritty_terminal::term::cell::Flags::INVERSE) {
+                    cell.fg
+                } else {
+                    cell.bg
+                };
+
                 let is_default_bg = matches!(
-                    cell.bg,
+                    effective_bg,
                     alacritty_terminal::vte::ansi::Color::Named(
                         alacritty_terminal::vte::ansi::NamedColor::Background
                     )
@@ -976,7 +982,7 @@ impl Pipeline {
                         actual_cell_width
                     };
 
-                    let bg = cell_bg_to_f32(cell.bg);
+                    let bg = cell_bg_to_f32(effective_bg);
                     let bg_instance = CellInstance::new(
                         cell_x,
                         cell_y,
@@ -1187,7 +1193,12 @@ impl Pipeline {
                                     atlas.get_or_rasterize_glyph(info.glyph_id, device, queue)
                                 {
                                     if entry.width > 0.0 && entry.height > 0.0 {
-                                        let mut fg = cell_fg_to_f32(cell.fg, cell.flags);
+                                        let effective_fg = if cell.flags.contains(alacritty_terminal::term::cell::Flags::INVERSE) {
+                                            cell.bg
+                                        } else {
+                                            cell.fg
+                                        };
+                                        let mut fg = cell_fg_to_f32(effective_fg, cell.flags);
                                         if cell.c == '❯' {
                                             fg = [0.35, 0.75, 0.35, 1.0];
                                         }
@@ -6224,8 +6235,14 @@ fn render_single_char(
     queue: &wgpu::Queue,
 ) {
     if cell.c != ' ' && cell.c != '\0' {
+        let effective_fg = if cell.flags.contains(alacritty_terminal::term::cell::Flags::INVERSE) {
+            cell.bg
+        } else {
+            cell.fg
+        };
+
         if is_custom_block_drawing(cell.c) {
-            let fg = cell_fg_to_f32(cell.fg, cell.flags);
+            let fg = cell_fg_to_f32(effective_fg, cell.flags);
             let code = cell.c as u32;
             if (0x2500..=0x257F).contains(&code) {
                 let instances = render_box_drawing_instances(cell.c, cell_x, cell_y, actual_cell_width, actual_cell_height, fg);
@@ -6265,7 +6282,7 @@ fn render_single_char(
             }
         } else if let Some(entry) = atlas.get_or_rasterize(cell.c, device, queue) {
             if entry.width > 0.0 && entry.height > 0.0 {
-                let mut fg = cell_fg_to_f32(cell.fg, cell.flags);
+                let mut fg = cell_fg_to_f32(effective_fg, cell.flags);
                 if cell.c == '❯' {
                     fg = [0.35, 0.75, 0.35, 1.0];
                 }

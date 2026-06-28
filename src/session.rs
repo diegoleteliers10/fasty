@@ -38,8 +38,6 @@ impl Session {
             windows: vec![WindowSession {
                 tabs: self.legacy_tabs.clone(),
                 active_tab: self.legacy_active_tab,
-                position: None,
-                size: None,
             }],
             active_window: 0,
             legacy_tabs: self.legacy_tabs,
@@ -53,10 +51,6 @@ pub struct WindowSession {
     pub tabs: Vec<TabInfo>,
     #[serde(default)]
     pub active_tab: usize,
-    #[serde(default)]
-    pub position: Option<(i32, i32)>,
-    #[serde(default)]
-    pub size: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,10 +63,7 @@ pub struct TabInfo {
 }
 
 pub fn session_path() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default();
-    PathBuf::from(home).join(".config/fasty/session.json")
+    crate::paths::get().state_dir.join("session.json")
 }
 
 pub fn load() -> Option<Session> {

@@ -4,10 +4,7 @@ use std::path::PathBuf;
 use std::panic;
 
 fn crashes_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default();
-    PathBuf::from(home).join(".config/fasty/crashes")
+    crate::paths::get().state_dir.join("crashes")
 }
 
 pub fn install_hook() {

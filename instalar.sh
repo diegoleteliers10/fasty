@@ -8,27 +8,13 @@
 
 set -euo pipefail
 
-USE_USER_DIR=false
-if [ "${FASTY_USER_INSTALL:-0}" = "1" ]; then
-    USE_USER_DIR=true
-fi
-
-for arg in "$@"; do
-    case $arg in
-        --user)
-            USE_USER_DIR=true
-            shift
-            ;;
-    esac
-done
-
 GITHUB_USER="diegoleteliers10"
 GITHUB_REPO="fasty"
 APP_NAME="fasty"
 
 echo "=== Starting $APP_NAME installation ==="
 
-# 1. Detect OS and architecture
+# ── 1. Detect OS and architecture ─────────────────────────────────────────────
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
 
@@ -59,19 +45,33 @@ esac
 
 echo "Detected platform: OS=$OS, Arch=$ARCH -> Target=$TARGET"
 
-# 2. Query the GitHub API for the latest release
+# ── 2. Resolve XDG/platform directories ───────────────────────────────────────
+if [ "$OS" = "darwin" ]; then
+    CONFIG_DIR="$HOME/Library/Application Support/fasty"
+    DATA_DIR="$HOME/Library/Application Support/fasty"
+    STATE_DIR="$HOME/Library/Application Support/fasty"
+    CACHE_DIR="$HOME/Library/Caches/fasty"
+    if [ -w "/usr/local/bin" ]; then
+        BIN_DIR="/usr/local/bin"
+    else
+        BIN_DIR="$HOME/.local/bin"
+    fi
+else
+    CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fasty"
+    DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/fasty"
+    STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/fasty"
+    CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/fasty"
+    BIN_DIR="$HOME/.local/bin"
+fi
+
+# ── 3. Create directories ─────────────────────────────────────────────────────
+mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$STATE_DIR" "$CACHE_DIR" "$BIN_DIR"
+
+# ── 4. Query the GitHub API for the latest release ─────────────────────────────
 echo "Fetching the latest version from GitHub..."
 API_URL="https://api.github.com/repos/$GITHUB_USER/$GITHUB_REPO/releases/latest"
-
-# Fetch the full JSON response once and store it
 API_RESPONSE=$(curl -sSfL "$API_URL")
 
-# Extract tag_name robustly — tries tools in order of reliability:
-#   1. jq          – most correct, handles any JSON formatting
-#   2. python3     – available on virtually all modern Linux/macOS systems
-#   3. python      – fallback for older systems
-#   4. sed/grep    – pure POSIX fallback; strips all whitespace so it works
-#                    on both compact (single-line) and pretty-printed JSON
 if command -v jq >/dev/null 2>&1; then
     LATEST_TAG=$(printf '%s' "$API_RESPONSE" | jq -r '.tag_name')
 elif command -v python3 >/dev/null 2>&1; then
@@ -79,7 +79,6 @@ elif command -v python3 >/dev/null 2>&1; then
 elif command -v python >/dev/null 2>&1; then
     LATEST_TAG=$(printf '%s' "$API_RESPONSE" | python -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
 else
-    # Remove all whitespace, then extract the value of "tag_name":"..."
     LATEST_TAG=$(printf '%s' "$API_RESPONSE" \
         | tr -d ' \t\r\n' \
         | grep -o '"tag_name":"[^"]*"' \
@@ -94,7 +93,7 @@ fi
 
 echo "Latest version found: $LATEST_TAG"
 
-# 3. Download the correct .tar.gz asset
+# ── 5. Download the correct asset ──────────────────────────────────────────────
 ASSET_NAME="$APP_NAME-$TARGET.tar.gz"
 DOWNLOAD_URL="https://github.com/$GITHUB_USER/$GITHUB_REPO/releases/download/$LATEST_TAG/$ASSET_NAME"
 
@@ -104,23 +103,25 @@ trap 'rm -rf "$TEMP_DIR"' EXIT
 echo "Downloading $ASSET_NAME..."
 curl -sSfL -o "$TEMP_DIR/$ASSET_NAME" "$DOWNLOAD_URL"
 
-# 4. Extract
+# ── 6. Extract ─────────────────────────────────────────────────────────────────
 echo "Extracting files..."
 tar -xzf "$TEMP_DIR/$ASSET_NAME" -C "$TEMP_DIR"
 
-# 5. OS-specific install
-if [ "$OS" = "darwin" ]; then
-    if [ "$USE_USER_DIR" = true ]; then
-        INSTALL_DIR="$HOME/Applications"
-        BIN_DIR="$HOME/.local/bin"
-        mkdir -p "$INSTALL_DIR"
-        mkdir -p "$BIN_DIR"
-    else
-        INSTALL_DIR="/Applications"
-        BIN_DIR="/usr/local/bin"
+# ── 6.5. Copy default config if bundled ─────────────────────────────────────────
+if [ ! -f "$CONFIG_DIR/config.toml" ] && [ ! -f "$CONFIG_DIR/config.json" ]; then
+    if [ -f "$TEMP_DIR/config.toml" ]; then
+        echo "Copying default config.toml..."
+        cp "$TEMP_DIR/config.toml" "$CONFIG_DIR/config.toml"
+    elif [ -f "$TEMP_DIR/config.json" ]; then
+        echo "Copying default config.json..."
+        cp "$TEMP_DIR/config.json" "$CONFIG_DIR/config.json"
     fi
-    echo "Copying Fasty.app to $INSTALL_DIR..."
+fi
 
+# ── 7. Install binary ─────────────────────────────────────────────────────────
+if [ "$OS" = "darwin" ]; then
+    # macOS: install .app bundle + symlink
+    INSTALL_DIR="/Applications"
     if [ -w "$INSTALL_DIR" ]; then
         rm -rf "$INSTALL_DIR/Fasty.app"
         mv "$TEMP_DIR/Fasty.app" "$INSTALL_DIR/"
@@ -130,15 +131,6 @@ if [ "$OS" = "darwin" ]; then
         sudo mv "$TEMP_DIR/Fasty.app" "$INSTALL_DIR/"
     fi
 
-    if [ ! -d "$BIN_DIR" ]; then
-        if [ -w "$(dirname "$BIN_DIR")" ]; then
-            mkdir -p "$BIN_DIR"
-        else
-            sudo mkdir -p "$BIN_DIR"
-        fi
-    fi
-
-    echo "Creating symlink at $BIN_DIR/fasty..."
     if [ -w "$BIN_DIR" ]; then
         rm -f "$BIN_DIR/fasty"
         ln -sf "$INSTALL_DIR/Fasty.app/Contents/MacOS/fasty" "$BIN_DIR/fasty"
@@ -148,23 +140,8 @@ if [ "$OS" = "darwin" ]; then
     fi
 
     echo "$APP_NAME installed successfully at $INSTALL_DIR/Fasty.app!"
-    echo "You can launch it from Launchpad or by typing '$APP_NAME' in your terminal."
-
-elif [ "$OS" = "linux" ]; then
-    if [ "$USE_USER_DIR" = true ]; then
-        BIN_DIR="$HOME/.local/bin"
-        ICON_DIR="$HOME/.local/share/pixmaps"
-        DESKTOP_DIR="$HOME/.local/share/applications"
-        mkdir -p "$BIN_DIR"
-        mkdir -p "$ICON_DIR"
-        mkdir -p "$DESKTOP_DIR"
-    else
-        BIN_DIR="/usr/local/bin"
-        ICON_DIR="/usr/local/share/pixmaps"
-        DESKTOP_DIR="/usr/local/share/applications"
-    fi
-
-    # Find the binary in case it's in a subfolder within the tar
+else
+    # Linux: install binary directly
     SRC_BINARY=$(find "$TEMP_DIR" -maxdepth 2 -type f -name "$APP_NAME" | head -n 1)
 
     if [ ! -f "$SRC_BINARY" ]; then
@@ -172,16 +149,6 @@ elif [ "$OS" = "linux" ]; then
         exit 1
     fi
 
-    if [ ! -d "$BIN_DIR" ]; then
-        echo "Creating directory $BIN_DIR..."
-        if [ -w "$(dirname "$BIN_DIR")" ]; then
-            mkdir -p "$BIN_DIR"
-        else
-            sudo mkdir -p "$BIN_DIR"
-        fi
-    fi
-
-    echo "Replacing binary at $BIN_DIR/$APP_NAME..."
     if [ -w "$BIN_DIR" ]; then
         rm -f "$BIN_DIR/$APP_NAME"
         cp -f "$SRC_BINARY" "$BIN_DIR/$APP_NAME"
@@ -193,7 +160,7 @@ elif [ "$OS" = "linux" ]; then
         sudo chmod 0755 "$BIN_DIR/$APP_NAME"
     fi
 
-    # Verify the on-disk binary was actually replaced by comparing sha256.
+    # Verify the binary was copied correctly
     NEW_HASH=$(sha256sum "$SRC_BINARY" 2>/dev/null | awk '{print $1}')
     INSTALLED_HASH=$(sha256sum "$BIN_DIR/$APP_NAME" 2>/dev/null | awk '{print $1}')
     if [ -z "$NEW_HASH" ] || [ -z "$INSTALLED_HASH" ] || [ "$NEW_HASH" != "$INSTALLED_HASH" ]; then
@@ -201,11 +168,12 @@ elif [ "$OS" = "linux" ]; then
         exit 1
     fi
 
-    echo "$LATEST_TAG" > /tmp/fasty-update-done 2>/dev/null || true
+    # Set up icon and desktop entry
+    ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/pixmaps"
+    DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    mkdir -p "$ICON_DIR" "$DESKTOP_DIR"
 
-    echo "Setting up icon and desktop entry for Linux..."
     RAW_ICON_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/main/assets/fastyIcon.png"
-
     if [ -w "$ICON_DIR" ]; then
         curl -sSfL -o "$ICON_DIR/fasty.png" "$RAW_ICON_URL"
     else
@@ -233,9 +201,7 @@ Keywords=terminal;emulator;wgpu;"
     echo "$APP_NAME installed successfully at $BIN_DIR/$APP_NAME!"
     echo "You can launch it by searching '$APP_NAME' in your menu or typing it in a terminal."
 
-    # Schedule a self-restart: 3s after this script exits, kill the current
-    # fasty process and relaunch it. The deferred subshell survives even when
-    # the parent pty is destroyed, so the new fasty comes up cleanly.
+    # Schedule a self-restart
     (
         sleep 3
         pkill -x fasty 2>/dev/null || true
@@ -244,3 +210,22 @@ Keywords=terminal;emulator;wgpu;"
     ) &
     disown
 fi
+
+# ── 8. Check PATH ──────────────────────────────────────────────────────────────
+if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    echo ""
+    echo "WARNING: $BIN_DIR is not in your PATH."
+    echo "Add it by running one of the following:"
+    echo ""
+    echo "    bash  → add 'export PATH=\"$BIN_DIR:\$PATH\"' to ~/.bashrc"
+    echo "    zsh   → add 'export PATH=\"$BIN_DIR:\$PATH\"' to ~/.zshrc"
+    echo "    fish  → run: fish_add_path $BIN_DIR"
+fi
+
+# ── 9. Summary ─────────────────────────────────────────────────────────────────
+echo ""
+echo "    ✓ Binary    → $BIN_DIR/fasty"
+echo "    ✓ Config    → $CONFIG_DIR"
+echo "    ✓ Data      → $DATA_DIR"
+echo "    ✓ State     → $STATE_DIR"
+echo "    ✓ Cache     → $CACHE_DIR"

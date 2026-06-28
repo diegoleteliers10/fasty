@@ -43,6 +43,7 @@ rustybuzz = "0.12.1"
 notify-rust = "4"
 git2 = { version = "0.19", features = ["vendored-libgit2", "vendored-openssl"] }
 notify = "6"
+dirs = "6"
 
 [build-dependencies]
 winres = "0.1"

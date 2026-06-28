@@ -14,7 +14,19 @@ $BinaryName = "fasty.exe"
 
 Write-Host "=== Starting $AppName installation on Windows ===" -ForegroundColor Green
 
-# 1. Query the GitHub API for the latest release
+# ── 1. Resolve platform directories ────────────────────────────────────────────
+$ConfigDir = Join-Path $env:APPDATA     "fasty\config"
+$DataDir   = Join-Path $env:APPDATA     "fasty\data"
+$StateDir  = Join-Path $env:LOCALAPPDATA "fasty\state"
+$CacheDir  = Join-Path $env:LOCALAPPDATA "fasty\cache"
+$BinDir    = Join-Path $env:LOCALAPPDATA "fasty\bin"
+
+# ── 2. Create directories ──────────────────────────────────────────────────────
+foreach ($dir in @($ConfigDir, $DataDir, $StateDir, $CacheDir, $BinDir)) {
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+}
+
+# ── 3. Query the GitHub API for the latest release ─────────────────────────────
 Write-Host "Fetching the latest version from the GitHub API..." -ForegroundColor Cyan
 $ApiUrl = "https://api.github.com/repos/$GitHubUser/$GitHubRepo/releases/latest"
 
@@ -32,7 +44,7 @@ try {
 
 Write-Host "Latest version found: $LatestTag" -ForegroundColor Green
 
-# 2. Download the Windows .zip asset
+# ── 4. Download the Windows .zip asset ─────────────────────────────────────────
 $Target = "x86_64-pc-windows-msvc"
 $ZipName = "$AppName-$Target.zip"
 $DownloadUrl = "https://github.com/$GitHubUser/$GitHubRepo/releases/download/$LatestTag/$ZipName"
@@ -55,7 +67,7 @@ try {
     exit 1
 }
 
-# 3. Extract
+# ── 5. Extract ─────────────────────────────────────────────────────────────────
 Write-Host "Extracting files..." -ForegroundColor Cyan
 try {
     Expand-Archive -Path $ZipPath -DestinationPath $ExtractDir -Force
@@ -65,20 +77,13 @@ try {
     exit 1
 }
 
-# 4. Install into the user's local profile directory
-$InstallDir = Join-Path $env:USERPROFILE ".local\bin"
-if (-not (Test-Path $InstallDir)) {
-    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    Write-Host "Directory created: $InstallDir" -ForegroundColor Yellow
-}
-
+# ── 6. Install binary ─────────────────────────────────────────────────────────
 $ExeSourcePath = Join-Path $ExtractDir $BinaryName
-$ExeDestPath = Join-Path $InstallDir $BinaryName
+$ExeDestPath = Join-Path $BinDir $BinaryName
 
 Write-Host "Copying the binary to its final location..." -ForegroundColor Cyan
 try {
     if (Test-Path $ExeDestPath) {
-        # If the executable already exists, rename it to avoid locking issues (file in use)
         $OldExePath = "$ExeDestPath.old"
         if (Test-Path $OldExePath) {
             Remove-Item -Path $OldExePath -Force -ErrorAction SilentlyContinue
@@ -87,45 +92,60 @@ try {
     }
     Copy-Item -Path $ExeSourcePath -Destination $ExeDestPath -Force
 } catch {
-    Write-Error "ERROR: Failed to copy the executable to $InstallDir: $_"
+    Write-Error "ERROR: Failed to copy the executable to $BinDir: $_"
     $ProgressPreference = $oldProgressPreference
     exit 1
+}
+
+# Copy default config if bundled and not already present
+$DestConfigToml = Join-Path $ConfigDir "config.toml"
+$DestConfigJson = Join-Path $ConfigDir "config.json"
+if (-not (Test-Path $DestConfigToml) -and -not (Test-Path $DestConfigJson)) {
+    $SrcConfigToml = Join-Path $ExtractDir "config.toml"
+    $SrcConfigJson = Join-Path $ExtractDir "config.json"
+    if (Test-Path $SrcConfigToml) {
+        Write-Host "Copying default config.toml..." -ForegroundColor Cyan
+        Copy-Item -Path $SrcConfigToml -Destination $DestConfigToml -Force
+    } elseif (Test-Path $SrcConfigJson) {
+        Write-Host "Copying default config.json..." -ForegroundColor Cyan
+        Copy-Item -Path $SrcConfigJson -Destination $DestConfigJson -Force
+    }
 }
 
 $ProgressPreference = $oldProgressPreference
 
 Write-Host "$AppName installed successfully at $ExeDestPath!" -ForegroundColor Green
 
-# 5. Add the directory to the user PATH permanently (no administrator privileges)
+# ── 7. Add to user PATH permanently ────────────────────────────────────────────
 $UserPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::User)
 $PathList = $UserPath -split ";"
-$NormalizedInstallDir = $InstallDir.TrimEnd('\')
+$NormalizedBinDir = $BinDir.TrimEnd('\')
 
 $IsInPath = $false
 foreach ($p in $PathList) {
-    if ($p.Trim().TrimEnd('\') -eq $NormalizedInstallDir) {
+    if ($p.Trim().TrimEnd('\') -eq $NormalizedBinDir) {
         $IsInPath = $true
         break
     }
 }
 
 if (-not $IsInPath) {
-    Write-Host "Adding $InstallDir to your user PATH permanently..." -ForegroundColor Yellow
+    Write-Host "Adding $BinDir to your user PATH permanently..." -ForegroundColor Yellow
     $NewUserPath = $UserPath
     if (-not $NewUserPath.EndsWith(";")) {
         $NewUserPath += ";"
     }
-    $NewUserPath += $NormalizedInstallDir
+    $NewUserPath += $NormalizedBinDir
 
     [Environment]::SetEnvironmentVariable("Path", $NewUserPath, [EnvironmentVariableTarget]::User)
-    $env:Path += ";" + $NormalizedInstallDir
+    $env:Path += ";" + $NormalizedBinDir
 
-    Write-Host "The PATH has been updated permanently. Please restart your terminal or code editor for the change to take effect in new sessions." -ForegroundColor Yellow
+    Write-Host "The PATH has been updated. Please restart your terminal for the change to take effect." -ForegroundColor Yellow
 } else {
-    Write-Host "The directory $InstallDir is already in your PATH." -ForegroundColor Green
+    Write-Host "The directory $BinDir is already in your PATH." -ForegroundColor Green
 }
 
-# 6. Create a Start Menu shortcut so it appears as a system application
+# ── 8. Start Menu shortcut ─────────────────────────────────────────────────────
 Write-Host "Creating Start Menu shortcut..." -ForegroundColor Cyan
 try {
     $StartMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
@@ -134,7 +154,7 @@ try {
     $WshShell = New-Object -ComObject WScript.Shell
     $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
     $Shortcut.TargetPath = $ExeDestPath
-    $Shortcut.WorkingDirectory = $InstallDir
+    $Shortcut.WorkingDirectory = $BinDir
     $Shortcut.Description = "Fasty Terminal Emulator"
     $Shortcut.Save()
 
@@ -143,5 +163,15 @@ try {
     Write-Host "WARNING: Could not create the Start Menu shortcut." -ForegroundColor Yellow
 }
 
-# Final cleanup of the temp directory
+# ── 9. Final cleanup ───────────────────────────────────────────────────────────
 Remove-Item -Recurse -Force $TempDir -ErrorAction SilentlyContinue
+
+# ── 10. Summary ────────────────────────────────────────────────────────────────
+Write-Host ""
+Write-Host "✓ Binary  -> $BinDir\fasty.exe"
+Write-Host "✓ Config  -> $ConfigDir"
+Write-Host "✓ Data    -> $DataDir"
+Write-Host "✓ State   -> $StateDir"
+Write-Host "✓ Cache   -> $CacheDir"
+Write-Host ""
+Write-Host "Restart your terminal for PATH changes to take effect."

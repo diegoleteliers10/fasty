@@ -11,7 +11,9 @@ mod git;
 mod keybindings;
 mod macos_maximize;
 mod chrome_layout;
+mod paths;
 mod renderer;
+mod secondary_window;
 mod selection_classifier;
 mod session;
 mod snippets;
@@ -1432,9 +1434,15 @@ fn detect_tui_agent(shell_pid: Option<u32>) -> Option<String> {
     let children_path = format!("/proc/{}/task/{}/children", pid, pid);
     let children = std::fs::read_to_string(&children_path).ok()?;
     for child_pid_str in children.split_whitespace() {
-        let child_pid: u32 = child_pid_str.parse().ok()?;
+        let child_pid: u32 = match child_pid_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
         let cmdline_path = format!("/proc/{}/cmdline", child_pid);
-        let cmdline = std::fs::read(&cmdline_path).ok()?;
+        let cmdline = match std::fs::read(&cmdline_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
         let cmd_str = String::from_utf8_lossy(&cmdline);
         let first_arg = cmd_str.split('\0').next().unwrap_or("");
         let cmd_name = std::path::Path::new(first_arg)
@@ -1450,7 +1458,10 @@ fn detect_tui_agent(shell_pid: Option<u32>) -> Option<String> {
         let gc_path = format!("/proc/{}/task/{}/children", child_pid, child_pid);
         if let Ok(gc) = std::fs::read_to_string(&gc_path) {
             for gc_pid_str in gc.split_whitespace() {
-                let gc_pid: u32 = gc_pid_str.parse().ok()?;
+                let gc_pid: u32 = match gc_pid_str.parse() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
                 let gc_cmdline_path = format!("/proc/{}/cmdline", gc_pid);
                 if let Ok(gc_cmdline) = std::fs::read(&gc_cmdline_path) {
                     let gc_str = String::from_utf8_lossy(&gc_cmdline);
@@ -1462,6 +1473,31 @@ fn detect_tui_agent(shell_pid: Option<u32>) -> Option<String> {
                     for agent in TUI_AGENTS {
                         if gc_name == *agent {
                             return Some(agent.to_string());
+                        }
+                    }
+                    // Check great-grandchildren (needed for Node/Bun agents like claude
+                    // which may spawn: shell → node/bun → claude-worker)
+                    let ggc_path = format!("/proc/{}/task/{}/children", gc_pid, gc_pid);
+                    if let Ok(ggc) = std::fs::read_to_string(&ggc_path) {
+                        for ggc_pid_str in ggc.split_whitespace() {
+                            let ggc_pid: u32 = match ggc_pid_str.parse() {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+                            let ggc_cmdline_path = format!("/proc/{}/cmdline", ggc_pid);
+                            if let Ok(ggc_cmdline) = std::fs::read(&ggc_cmdline_path) {
+                                let ggc_str = String::from_utf8_lossy(&ggc_cmdline);
+                                let ggc_first = ggc_str.split('\0').next().unwrap_or("");
+                                let ggc_name = std::path::Path::new(ggc_first)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("");
+                                for agent in TUI_AGENTS {
+                                    if ggc_name == *agent {
+                                        return Some(agent.to_string());
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1489,6 +1525,7 @@ struct FastyArgs {
     command: Option<Vec<String>>,   // -e cmd arg1 arg2...
     working_dir: Option<String>,    // -d /path/to/dir
     title: Option<String>,          // --title "My Window"
+    paths: bool,                    // --paths
 }
 
 impl FastyArgs {
@@ -1502,6 +1539,7 @@ impl FastyArgs {
             command: None,
             working_dir: None,
             title: None,
+            paths: false,
         };
         let mut i = 0;
         while i < args.len() {
@@ -1517,13 +1555,21 @@ impl FastyArgs {
                     if i + 1 < args.len() {
                         result.working_dir = Some(args[i+1].clone());
                         i += 2;
+                    } else {
+                        i += 1;
                     }
                 }
                 "--title" => {
                     if i + 1 < args.len() {
                         result.title = Some(args[i+1].clone());
                         i += 2;
+                    } else {
+                        i += 1;
                     }
+                }
+                "--paths" => {
+                    result.paths = true;
+                    i += 1;
                 }
                 _ => { i += 1; }
             }
@@ -1551,6 +1597,8 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    paths::init()?;
+
     crash::install_hook();
 
     tracing_subscriber::fmt()
@@ -1565,6 +1613,15 @@ fn main() -> anyhow::Result<()> {
     keybindings::init_resolver(config.keybindings.clone());
 
     let fasty_args = FastyArgs::parse();
+
+    if fasty_args.paths {
+        let dirs = paths::get();
+        println!("config_dir: {}", dirs.config_dir.display());
+        println!("data_dir: {}", dirs.data_dir.display());
+        println!("state_dir: {}", dirs.state_dir.display());
+        println!("cache_dir: {}", dirs.cache_dir.display());
+        std::process::exit(0);
+    }
 
     // Resolve what to spawn
     let (executable, exec_args) = match &fasty_args.command {
@@ -1705,14 +1762,6 @@ fn main() -> anyhow::Result<()> {
             Some(s) if !s.windows.is_empty() => {
                 let active_idx = s.active_window.min(s.windows.len() - 1);
                 let first_window = &s.windows[active_idx];
-                if let Some((x, y)) = first_window.position {
-                    let _ = window_arc.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
-                }
-                if let Some((w, h)) = first_window.size {
-                    if w > 0 && h > 0 {
-                        let _ = window_arc.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
-                    }
-                }
                 let mut restored = Vec::new();
                 for tab_info in &first_window.tabs {
                     let tab_cwd = tab_info.cwd.as_ref().and_then(|p| p.to_str());
@@ -1841,8 +1890,7 @@ fn main() -> anyhow::Result<()> {
     let mut tab_ctx_hovered: Option<usize> = None;
 
     // Secondary settings window state
-    let mut settings_window: Option<Arc<winit::window::Window>> = None;
-    let mut settings_renderer: Option<Renderer<'static>> = None;
+    let mut settings_sw: Option<secondary_window::SecondaryWindow> = None;
     let mut settings_family = String::new();
     let mut settings_size = 14.0f32;
     let mut settings_scrollback = 3000usize;
@@ -1868,10 +1916,7 @@ fn main() -> anyhow::Result<()> {
     let mut s_mouse_y = 0.0f64;
 
     // Secondary about window state
-    let mut about_window: Option<Arc<winit::window::Window>> = None;
-    let mut about_renderer: Option<Renderer<'static>> = None;
-    let mut about_hover_close = false;
-    let mut about_mouse_y = 0.0f64;
+    let mut about: Option<secondary_window::SecondaryWindow> = None;
 
     let mut first_frame_rendered = false;
     let mut app_dirty = true;
@@ -1955,11 +2000,6 @@ fn main() -> anyhow::Result<()> {
                     let mut all_windows = vec![session::WindowSession {
                         tabs: saved,
                         active_tab: active_tab_index,
-                        position: window_for_redraw.outer_position().ok().map(|p| (p.x, p.y)),
-                        size: {
-                            let s = window_for_redraw.inner_size();
-                            Some((s.width, s.height))
-                        },
                     }];
                     for wc in popped_out_windows.values() {
                         let saved_tabs: Vec<session::TabInfo> = wc.tabs.iter().map(|t| {
@@ -1972,11 +2012,6 @@ fn main() -> anyhow::Result<()> {
                         all_windows.push(session::WindowSession {
                             tabs: saved_tabs,
                             active_tab: wc.active_tab_index,
-                            position: wc.window.outer_position().ok().map(|p| (p.x, p.y)),
-                            size: {
-                                let s = wc.window.inner_size();
-                                Some((s.width, s.height))
-                            },
                         });
                     }
                     let s = session::Session {
@@ -2117,8 +2152,8 @@ fn main() -> anyhow::Result<()> {
                                         if let Err(e) = renderer.lock().update_font(&config.font.family, config.font.size) {
                                             tracing::error!("config live-reload: font update failed: {e:?}");
                                         }
-                                        if let Some(ref mut sr) = settings_renderer {
-                                            let _ = sr.update_font(&config.font.family, 13.0);
+                                        if let Some(ref mut sr) = settings_sw {
+                                            let _ = sr.renderer.update_font(&config.font.family, 13.0);
                                         }
                                         let cell_w = renderer.lock().cell_width();
                                         let cell_h = renderer.lock().cell_height();
@@ -2148,21 +2183,21 @@ fn main() -> anyhow::Result<()> {
                                         tracing::info!("config: shell changed; applies to newly spawned tabs only");
                                     }
 
-                                    if settings_window.is_some() {
+                                    if settings_sw.is_some() {
                                         settings_family = config.font.family.clone();
                                         settings_size = config.font.size;
                                         settings_scrollback = config.scrollback.min(1000);
                                         settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
-                                        if let Some(ref mut sr) = settings_renderer {
-                                            sr.set_dirty(true);
+                                        if let Some(ref mut sr) = settings_sw {
+                                            sr.renderer.set_dirty(true);
                                         }
                                     }
 
                                     renderer.lock().grid_dirty = true;
                                     app_dirty = true;
                                     window_for_redraw.request_redraw();
-                                    if let Some(ref w) = settings_window {
-                                        w.request_redraw();
+                                    if let Some(ref sw) = settings_sw {
+                                        sw.window.request_redraw();
                                     }
                                 }
                             }
@@ -2285,6 +2320,19 @@ fn main() -> anyhow::Result<()> {
                                 tab.prompts.push(absolute_line);
                                 if tab.prompts.len() > 1000 {
                                     tab.prompts.remove(0);
+                                }
+                            }
+                            // If a TUI agent (like claude) left cursor hidden (ESC[?25l) without
+                            // restoring it (ESC[?25h), force cursor visible now that the shell
+                            // prompt is back. This fixes the permanent cursor disappearance
+                            // that happens with claude Code and similar TUI agents.
+                            {
+                                let term_guard = tab.terminal_state.lock();
+                                let mode = *term_guard.term().lock().mode();
+                                let show_cursor = mode.contains(alacritty_terminal::term::TermMode::SHOW_CURSOR);
+                                if !show_cursor {
+                                    tracing::info!("prompt started: SHOW_CURSOR was off, restoring cursor via ESC[?25h");
+                                    term_guard.write_to_pty(b"\x1b[?25h");
                                 }
                             }
                         }
@@ -2456,9 +2504,23 @@ fn main() -> anyhow::Result<()> {
                                     None => Some("fasty".to_string()),
                                 };
                                 if new_title != last_tui_title {
+                                    // TUI agent state changed
+                                    let agent_just_exited = last_tui_title.as_deref() != Some("fasty")
+                                        && new_agent.is_none();
                                     last_tui_title = new_title.clone();
                                     if let Some(ref t) = new_title {
                                         window_for_redraw.set_title(t);
+                                    }
+                                    // If a TUI agent just exited, check if it left cursor hidden.
+                                    // Agents like Claude may emit ESC[?25l but fail to restore it.
+                                    if agent_just_exited {
+                                        let term_guard = active_tab.terminal_state.lock();
+                                        let mode = *term_guard.term().lock().mode();
+                                        let show_cursor = mode.contains(alacritty_terminal::term::TermMode::SHOW_CURSOR);
+                                        if !show_cursor {
+                                            tracing::info!("TUI agent exited with cursor hidden — restoring via ESC[?25h");
+                                            term_guard.write_to_pty(b"\x1b[?25h");
+                                        }
                                     }
                                 }
                             }
@@ -2927,7 +2989,7 @@ fn main() -> anyhow::Result<()> {
                                                 }
                                                 CommandAction::OpenSettings => {
                                                     // Inlined open-settings logic; see Settings dialog topbar.
-                                                    if settings_window.is_none() {
+                                                    if settings_sw.is_none() {
                                                         match Config::load() {
                                                             Ok(fresh) => { config = fresh; }
                                                             Err(e) => {
@@ -2940,25 +3002,16 @@ fn main() -> anyhow::Result<()> {
                                                         settings_scrollback = config.scrollback.min(1000);
                                                         settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                                         settings_active_field = 0;
-                                                        let visible = !cfg!(target_os = "windows");
-                                                        if let Ok(window) = target.create_window(winit::window::WindowAttributes::default()
-                                                            .with_title("fasty Settings")
-                                                            .with_decorations(false)
-                                                            .with_transparent(true)
-                                                            .with_visible(visible)
-                                                            .with_inner_size(winit::dpi::LogicalSize::new(400.0, 260.0)))
-                                                        {
-                                                            let settings_window_arc = Arc::new(window);
-                                                            let sw_ref: &winit::window::Window = &*settings_window_arc;
-                                                            let sw_static: &'static winit::window::Window = unsafe { std::mem::transmute(sw_ref) };
-                                                            let (shared_instance, shared_device, shared_queue, format, alpha_mode) = {
-                                                                let r = renderer.lock();
-                                                                (r.instance.clone(), r.device.clone(), r.queue.clone(), r.config.format, r.config.alpha_mode)
-                                                            };
-                                                            if let Ok(renderer_obj) = Renderer::new_shared(sw_static, &config.font.family, 13.0, shared_instance, shared_device, shared_queue, format, alpha_mode) {
-                                                                settings_window_arc.focus_window();
-                                                                settings_window = Some(settings_window_arc);
-                                                                settings_renderer = Some(renderer_obj);
+                                                        match secondary_window::SecondaryWindow::create(
+                                                            target, "fasty Settings", 400.0, 260.0,
+                                                            &renderer, &config.font.family,
+                                                        ) {
+                                                            Ok(mut sw) => {
+                                                                sw.window.focus_window();
+                                                                settings_sw = Some(sw);
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::error!("Failed to create settings window: {:?}", e);
                                                             }
                                                         }
                                                     }
@@ -3426,7 +3479,7 @@ fn main() -> anyhow::Result<()> {
                                             return;
                                         }
                                         keybindings::Action::OpenSettings => {
-                                            if settings_window.is_none() {
+                                            if settings_sw.is_none() {
                                                 match Config::load() {
                                                     Ok(fresh) => { config = fresh; }
                                                     Err(e) => {
@@ -3443,54 +3496,33 @@ fn main() -> anyhow::Result<()> {
                                                 settings_scrollback = config.scrollback.min(1000);
                                                 settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                                 settings_active_field = 0;
-                                                let visible = !cfg!(target_os = "windows");
-                                                match target.create_window(winit::window::WindowAttributes::default()
-                                                    .with_title("fasty Settings")
-                                                    .with_decorations(false)
-                                                    .with_transparent(true)
-                                                    .with_visible(visible)
-                                                    .with_inner_size(winit::dpi::LogicalSize::new(400.0, 260.0)))
-                                                {
-                                                    Ok(window) => {
-                                                        let settings_window_arc = Arc::new(window);
-                                                        let sw_ref: &winit::window::Window = &*settings_window_arc;
-                                                        let sw_static: &'static winit::window::Window = unsafe { std::mem::transmute(sw_ref) };
-                                                        let (shared_instance, shared_device, shared_queue, format, alpha_mode) = {
-                                                            let r = renderer.lock();
-                                                            (r.instance.clone(), r.device.clone(), r.queue.clone(), r.config.format, r.config.alpha_mode)
-                                                        };
-                                                        match Renderer::new_shared(sw_static, &config.font.family, 13.0, shared_instance, shared_device, shared_queue, format, alpha_mode) {
-                                                            Ok(renderer_obj) => {
-                                                                #[cfg(target_os = "windows")]
-                                                                let mut renderer_obj = renderer_obj;
-                                                                #[cfg(target_os = "windows")]
-                                                                {
-                                                                    renderer_obj.set_dirty(true);
-                                                                    renderer_obj.render_settings(
-                                                                        &config.font.family,
-                                                                        config.font.size,
-                                                                        config.scrollback.min(1000),
-                                                                        0,
-                                                                        false, false, false, false, false, false, false, false,
-                                                                        &system_fonts,
-                                                                        0.0,
-                                                                        None,
-                                                                        &settings_theme,
-                                                                        &themes_list,
-                                                                        None,
-                                                                        0.0,
-                                                                        config.opacity,
-                                                                    );
-                                                                    settings_window_arc.set_visible(true);
-                                                                    settings_window_arc.focus_window();
-                                                                }
-                                                                settings_window = Some(settings_window_arc);
-                                                                settings_renderer = Some(renderer_obj);
-                                                            }
-                                                            Err(e) => {
-                                                                tracing::error!("Failed to create settings renderer: {:?}", e);
-                                                            }
+                                                match secondary_window::SecondaryWindow::create(
+                                                    target, "fasty Settings", 400.0, 260.0,
+                                                    &renderer, &config.font.family,
+                                                ) {
+                                                    Ok(mut sw) => {
+                                                        #[cfg(target_os = "windows")]
+                                                        {
+                                                            sw.renderer.set_dirty(true);
+                                                            sw.renderer.render_settings(
+                                                                &config.font.family,
+                                                                config.font.size,
+                                                                config.scrollback.min(1000),
+                                                                0,
+                                                                false, false, false, false, false, false, false, false,
+                                                                &system_fonts,
+                                                                0.0,
+                                                                None,
+                                                                &settings_theme,
+                                                                &themes_list,
+                                                                None,
+                                                                0.0,
+                                                                config.opacity,
+                                                            );
+                                                            sw.window.set_visible(true);
+                                                            sw.window.focus_window();
                                                         }
+                                                        settings_sw = Some(sw);
                                                     }
                                                     Err(e) => {
                                                         tracing::error!("Failed to create settings window: {:?}", e);
@@ -3917,49 +3949,31 @@ fn main() -> anyhow::Result<()> {
                                                          context_menu_visible = false;
                                                      }
                                                     crate::renderer::ContextMenuItem::About => {
-                                                          if about_window.is_none() {
-                                                              let visible = !cfg!(target_os = "windows");
-                                                              match target.create_window(winit::window::WindowAttributes::default()
-                                                                   .with_title("About Fasty")
-                                                                   .with_decorations(false)
-                                                                   .with_transparent(true)
-                                                                   .with_visible(visible)
-                                                                   .with_inner_size(winit::dpi::LogicalSize::new(300.0, 200.0)))
-                                                              {
-                                                                  Ok(window) => {
-                                                                      let about_window_arc = Arc::new(window);
-                                                                      let aw_ref: &winit::window::Window = &*about_window_arc;
-                                                                      let aw_static: &'static winit::window::Window = unsafe { std::mem::transmute(aw_ref) };
-                                                                      let (shared_instance, shared_device, shared_queue, format, alpha_mode) = {
-                                                                          let r = renderer.lock();
-                                                                          (r.instance.clone(), r.device.clone(), r.queue.clone(), r.config.format, r.config.alpha_mode)
-                                                                      };
-                                                                      match Renderer::new_shared(aw_static, &config.font.family, 13.0, shared_instance, shared_device, shared_queue, format, alpha_mode) {
-                                                                          Ok(renderer_obj) => {
-                                                                              #[cfg(target_os = "windows")]
-                                                                              let mut renderer_obj = renderer_obj;
-                                                                              #[cfg(target_os = "windows")]
-                                                                              {
-                                                                                  renderer_obj.set_dirty(true);
-                                                                                   renderer_obj.render_about(&get_current_version(), false, config.opacity);
-                                                                                  about_window_arc.set_visible(true);
-                                                                                  about_window_arc.focus_window();
-                                                                              }
-                                                                              about_window = Some(about_window_arc);
-                                                                              about_renderer = Some(renderer_obj);
-                                                                          }
-                                                                          Err(e) => {
-                                                                              tracing::error!("Failed to create about renderer: {:?}", e);
-                                                                          }
+                                                          if about.is_none() {
+                                                              match secondary_window::SecondaryWindow::create(
+                                                                  target,
+                                                                  "About Fasty",
+                                                                  300.0,
+                                                                  200.0,
+                                                                  &renderer,
+                                                                  &config.font.family,
+                                                              ) {
+                                                                  Ok(mut sw) => {
+                                                                      #[cfg(target_os = "windows")]
+                                                                      {
+                                                                          sw.renderer.set_dirty(true);
+                                                                          sw.renderer.render_about(&get_current_version(), false, config.opacity);
+                                                                          sw.window.set_visible(true);
+                                                                          sw.window.focus_window();
                                                                       }
+                                                                      about = Some(sw);
                                                                   }
                                                                   Err(e) => {
                                                                       tracing::error!("Failed to create about window: {:?}", e);
                                                                   }
                                                               }
                                                           } else {
-                                                              about_window = None;
-                                                              about_renderer = None;
+                                                              about = None;
                                                           }
                                                          context_menu_visible = false;
                                                          context_menu_open_time = None;
@@ -4392,7 +4406,7 @@ fn main() -> anyhow::Result<()> {
                                              window_for_redraw.set_minimized(true);
                                              return;
                                           } else if is_hovering_settings {
-                                               if settings_window.is_none() {
+                                               if settings_sw.is_none() {
                                                     match Config::load() {
                                                         Ok(fresh) => { config = fresh; }
                                                         Err(e) => {
@@ -4409,62 +4423,40 @@ fn main() -> anyhow::Result<()> {
                                                     settings_scrollback = config.scrollback.min(1000);
                                                     settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                                    settings_active_field = 0;
-                                                   let visible = !cfg!(target_os = "windows");
-                                                    match target.create_window(winit::window::WindowAttributes::default()
-                                                        .with_title("fasty Settings")
-                                                        .with_decorations(false)
-                                                        .with_transparent(true)
-                                                        .with_visible(visible)
-                                                        .with_inner_size(winit::dpi::LogicalSize::new(400.0, 260.0)))
-                                                   {
-                                                       Ok(window) => {
-                                                           let settings_window_arc = Arc::new(window);
-                                                           let sw_ref: &winit::window::Window = &*settings_window_arc;
-                                                           let sw_static: &'static winit::window::Window = unsafe { std::mem::transmute(sw_ref) };
-                                                           let (shared_instance, shared_device, shared_queue, format, alpha_mode) = {
-                                                               let r = renderer.lock();
-                                                               (r.instance.clone(), r.device.clone(), r.queue.clone(), r.config.format, r.config.alpha_mode)
-                                                           };
-                                                           match Renderer::new_shared(sw_static, &config.font.family, 13.0, shared_instance, shared_device, shared_queue, format, alpha_mode) {
-                                                               Ok(renderer_obj) => {
-                                                                   #[cfg(target_os = "windows")]
-                                                                   let mut renderer_obj = renderer_obj;
-                                                                   #[cfg(target_os = "windows")]
-                                                                   {
-                                                                       renderer_obj.set_dirty(true);
-                                                                        renderer_obj.render_settings(
-                                                                            &config.font.family,
-                                                                            config.font.size,
-                                                                            config.scrollback.min(1000),
-                                                                            0,
-                                                                            false, false, false, false, false, false, false, false,
-                                                                            &system_fonts,
-                                                                            0.0,
-                                                                            None,
-                                                                            &settings_theme,
-                                                                            &themes_list,
-                                                                            None,
-                                                                            0.0,
-                                                                            config.opacity,
-                                                                        );
-                                                                        settings_window_arc.set_visible(true);
-                                                                        settings_window_arc.focus_window();
-                                                                    }
-                                                                    settings_window = Some(settings_window_arc);
-                                                                    settings_renderer = Some(renderer_obj);
-                                                                }
-                                                                Err(e) => {
-                                                                    tracing::error!("Failed to create settings renderer: {:?}", e);
-                                                                }
-                                                            }
+                                                    match secondary_window::SecondaryWindow::create(
+                                                        target, "fasty Settings", 400.0, 260.0,
+                                                        &renderer, &config.font.family,
+                                                    ) {
+                                                        Ok(mut sw) => {
+                                                            #[cfg(target_os = "windows")]
+                                                            {
+                                                                sw.renderer.set_dirty(true);
+                                                                 sw.renderer.render_settings(
+                                                                     &config.font.family,
+                                                                     config.font.size,
+                                                                     config.scrollback.min(1000),
+                                                                     0,
+                                                                     false, false, false, false, false, false, false, false,
+                                                                     &system_fonts,
+                                                                     0.0,
+                                                                     None,
+                                                                     &settings_theme,
+                                                                     &themes_list,
+                                                                     None,
+                                                                     0.0,
+                                                                     config.opacity,
+                                                                 );
+                                                                 sw.window.set_visible(true);
+                                                                 sw.window.focus_window();
+                                                             }
+                                                             settings_sw = Some(sw);
                                                         }
                                                         Err(e) => {
                                                             tracing::error!("Failed to create settings window: {:?}", e);
                                                         }
                                                     }
                                                 } else {
-                                                    settings_window = None;
-                                                    settings_renderer = None;
+                                                    settings_sw = None;
                                                 }
                                                 app_dirty = true;
                                                 return;
@@ -5664,9 +5656,10 @@ fn main() -> anyhow::Result<()> {
                         }
                         _ => {}
                     }
-                } else if settings_window.as_ref().map_or(false, |sw| window_id == sw.id()) {
-                    if let Some(ref sw) = settings_window {
+                } else if settings_sw.as_ref().map_or(false, |sw| window_id == sw.window.id()) {
+                    if let Some(ref mut sw) = settings_sw {
                         // --- Settings Window Event Handler ---
+                        let mut close_settings = false;
                         macro_rules! apply_settings {
                             () => {
                                 let mut current_config = Config::load().unwrap_or_default();
@@ -5691,9 +5684,7 @@ fn main() -> anyhow::Result<()> {
                                 }
 
                                 // Apply font family update to the settings renderer as well, but at fixed font size 13.0
-                                if let Some(ref mut sr) = settings_renderer {
-                                    let _ = sr.update_font(&settings_family, 13.0);
-                                }
+                                let _ = sw.renderer.update_font(&settings_family, 13.0);
 
                                 // Apply new scrollback limit to all existing terminal state instances!
                                 for tab in &tabs {
@@ -5718,47 +5709,42 @@ fn main() -> anyhow::Result<()> {
 
                         match event {
                             WindowEvent::CloseRequested => {
-                                settings_window = None;
-                                settings_renderer = None;
+                                close_settings = true;
                                 app_dirty = true;
                             }
                             WindowEvent::Resized(size) => {
-                                if let Some(ref mut r) = settings_renderer {
-                                    r.resize(size.width, size.height);
-                                }
+                                sw.renderer.resize(size.width, size.height);
                             }
                             WindowEvent::RedrawRequested => {
-                                if let Some(ref mut r) = settings_renderer {
-                                     r.render_settings(
-                                        &settings_family,
-                                        settings_size,
-                                        settings_scrollback,
-                                        settings_active_field,
-                                        s_hover_close,
-                                        s_hover_family,
-                                        s_hover_size_minus,
-                                        s_hover_size_plus,
-                                        s_hover_scroll_minus,
-                                        s_hover_scroll_plus,
-                                        s_hover_theme,
-                                        s_hover_open_config,
-                                        &system_fonts,
-                                        settings_font_scroll_y,
-                                        settings_hovered_font_idx,
-                                        &settings_theme,
-                                        &themes_list,
-                                        settings_hovered_theme_idx,
-                                        settings_theme_scroll_y,
-                                        config.opacity,
-                                    );
-                                }
+                                 sw.renderer.render_settings(
+                                    &settings_family,
+                                    settings_size,
+                                    settings_scrollback,
+                                    settings_active_field,
+                                    s_hover_close,
+                                    s_hover_family,
+                                    s_hover_size_minus,
+                                    s_hover_size_plus,
+                                    s_hover_scroll_minus,
+                                    s_hover_scroll_plus,
+                                    s_hover_theme,
+                                    s_hover_open_config,
+                                    &system_fonts,
+                                    settings_font_scroll_y,
+                                    settings_hovered_font_idx,
+                                    &settings_theme,
+                                    &themes_list,
+                                    settings_hovered_theme_idx,
+                                    settings_theme_scroll_y,
+                                    config.opacity,
+                                );
                                 #[cfg(target_os = "windows")]
                                 {
-                                    sw.set_visible(true);
+                                    sw.window.set_visible(true);
                                 }
                             }
                             WindowEvent::CursorMoved { position, .. } => {
-                                let scale_factor = sw.scale_factor();
+                                let scale_factor = sw.window.scale_factor();
                                 s_mouse_x = position.x / scale_factor;
                                 s_mouse_y = position.y / scale_factor;
 
@@ -5773,7 +5759,7 @@ fn main() -> anyhow::Result<()> {
                                 let old_hovered_font_idx = settings_hovered_font_idx;
                                 let old_hovered_theme_idx = settings_hovered_theme_idx;
 
-                                let sw_width = sw.inner_size().width as f64 / scale_factor;
+                                let sw_width = sw.window.inner_size().width as f64 / scale_factor;
                                 s_hover_close = if cfg!(target_os = "macos") {
                                     s_mouse_y >= 4.0 && s_mouse_y <= 32.0 && s_mouse_x >= 4.0 && s_mouse_x < 32.0
                                 } else {
@@ -5832,10 +5818,8 @@ fn main() -> anyhow::Result<()> {
                                     || settings_hovered_theme_idx != old_hovered_theme_idx;
 
                                 if any_changed {
-                                    if let Some(ref mut r) = settings_renderer {
-                                        r.set_dirty(true);
-                                    }
-                                    sw.request_redraw();
+                                    sw.renderer.set_dirty(true);
+                                    sw.window.request_redraw();
                                 }
                             }
                             WindowEvent::MouseInput { state, button, .. } => {
@@ -5853,12 +5837,8 @@ fn main() -> anyhow::Result<()> {
                                             // Clicked outside — close dropdown and consume event
                                             settings_active_field = 0;
                                         }
-                                        if let Some(ref mut r) = settings_renderer {
-                                            r.set_dirty(true);
-                                        }
-                                        if let Some(ref w) = settings_window {
-                                            w.request_redraw();
-                                        }
+                                        sw.renderer.set_dirty(true);
+                                        sw.window.request_redraw();
                                         return;
                                     } else if settings_active_field == 2 {
                                         // Theme dropdown is open. Bounding box: x: 140..380, y: 198..198 + themes_list.len() * 22.0
@@ -5874,21 +5854,16 @@ fn main() -> anyhow::Result<()> {
                                             // Clicked outside — close dropdown and consume event
                                             settings_active_field = 0;
                                         }
-                                        if let Some(ref mut r) = settings_renderer {
-                                            r.set_dirty(true);
-                                        }
-                                        if let Some(ref w) = settings_window {
-                                            w.request_redraw();
-                                        }
+                                        sw.renderer.set_dirty(true);
+                                        sw.window.request_redraw();
                                         return;
                                     }
 
                                     if s_hover_close {
-                                        settings_window = None;
-                                        settings_renderer = None;
+                                        close_settings = true;
                                         app_dirty = true;
                                     } else if s_mouse_y <= 36.0 {
-                                        let _ = sw.drag_window();
+                                        let _ = sw.window.drag_window();
                                     } else if s_hover_family {
                                         if system_fonts.is_empty() {
                                             system_fonts = get_system_fonts();
@@ -5930,12 +5905,8 @@ fn main() -> anyhow::Result<()> {
                                     } else {
                                         settings_active_field = 0;
                                     }
-                                    if let Some(ref mut r) = settings_renderer {
-                                        r.set_dirty(true);
-                                    }
-                                    if let Some(ref w) = settings_window {
-                                        w.request_redraw();
-                                    }
+                                    sw.renderer.set_dirty(true);
+                                    sw.window.request_redraw();
                                 }
                             }
                             WindowEvent::MouseWheel { delta, .. } => {
@@ -5959,10 +5930,8 @@ fn main() -> anyhow::Result<()> {
                                     handled = true;
                                 }
                                 if handled {
-                                    if let Some(ref mut r) = settings_renderer {
-                                        r.set_dirty(true);
-                                    }
-                                    sw.request_redraw();
+                                    sw.renderer.set_dirty(true);
+                                    sw.window.request_redraw();
                                 }
                             }
                             WindowEvent::KeyboardInput { event, .. } => {
@@ -5983,10 +5952,8 @@ fn main() -> anyhow::Result<()> {
                                         }
                                         _ => {}
                                     }
-                                    if let Some(ref mut r) = settings_renderer {
-                                        r.set_dirty(true);
-                                    }
-                                    sw.request_redraw();
+                                    sw.renderer.set_dirty(true);
+                                    sw.window.request_redraw();
                                 }
                             }
                             WindowEvent::CursorLeft { .. } => {
@@ -5998,10 +5965,8 @@ fn main() -> anyhow::Result<()> {
                                 s_hover_scroll_plus = false;
                                 s_hover_theme = false;
                                 s_hover_open_config = false;
-                                if let Some(ref mut r) = settings_renderer {
-                                    r.set_dirty(true);
-                                }
-                                sw.request_redraw();
+                                sw.renderer.set_dirty(true);
+                                sw.window.request_redraw();
                             }
                             WindowEvent::Focused(focused) => {
                                 if !focused {
@@ -6013,84 +5978,28 @@ fn main() -> anyhow::Result<()> {
                                     s_hover_scroll_plus = false;
                                     s_hover_theme = false;
                                     s_hover_open_config = false;
-                                    if let Some(ref mut r) = settings_renderer {
-                                        r.set_dirty(true);
-                                    }
-                                    sw.request_redraw();
+                                    sw.renderer.set_dirty(true);
+                                    sw.window.request_redraw();
                                 }
                             }
                             _ => {}
                         }
+                        if close_settings {
+                            settings_sw = None;
+                        }
                     }
-                } else if about_window.as_ref().map_or(false, |aw| window_id == aw.id()) {
-                    if let Some(ref aw) = about_window {
-                        // --- About Window Event Handler ---
-                        match event {
-                            WindowEvent::CloseRequested => {
-                                about_window = None;
-                                about_renderer = None;
-                                app_dirty = true;
+                } else if about.as_ref().map_or(false, |aw| window_id == aw.window.id()) {
+                    if let Some(ref mut aw) = about {
+                        match aw.handle_event(&event, &mut app_dirty) {
+                            secondary_window::EventResult::Closed => {
+                                about = None;
                             }
-                            WindowEvent::Resized(size) => {
-                                if let Some(ref mut r) = about_renderer {
-                                    r.resize(size.width, size.height);
+                            secondary_window::EventResult::Consumed => {
+                                if let WindowEvent::RedrawRequested = event {
+                                    aw.renderer.render_about(&get_current_version(), aw.hover_close, config.opacity);
                                 }
                             }
-                            WindowEvent::RedrawRequested => {
-                                if let Some(ref mut r) = about_renderer {
-                                    r.set_dirty(true);
-                                    r.render_about(&get_current_version(), about_hover_close, config.opacity);
-                                }
-                            }
-                            WindowEvent::CursorMoved { position, .. } => {
-                                let scale_factor = aw.scale_factor();
-                                let m_x = position.x / scale_factor;
-                                let m_y = position.y / scale_factor;
-                                about_mouse_y = m_y;
-
-                                let old_hover_close = about_hover_close;
-                                let aw_width = aw.inner_size().width as f64 / scale_factor;
-                                about_hover_close = if cfg!(target_os = "macos") {
-                                    m_y >= 4.0 && m_y <= 32.0 && m_x >= 4.0 && m_x < 32.0
-                                } else {
-                                    m_y >= 4.0 && m_y <= 32.0 && m_x >= (aw_width - 32.0) && m_x < (aw_width - 4.0)
-                                };
-
-                                if about_hover_close != old_hover_close {
-                                    if let Some(ref mut r) = about_renderer {
-                                        r.set_dirty(true);
-                                    }
-                                    aw.request_redraw();
-                                }
-                            }
-                            WindowEvent::MouseInput { state, button, .. } => {
-                                if button == MouseButton::Left && state == ElementState::Pressed {
-                                    if about_hover_close {
-                                        about_window = None;
-                                        about_renderer = None;
-                                        app_dirty = true;
-                                    } else if about_mouse_y <= 36.0 {
-                                        let _ = aw.drag_window();
-                                    }
-                                }
-                            }
-                            WindowEvent::CursorLeft { .. } => {
-                                about_hover_close = false;
-                                if let Some(ref mut r) = about_renderer {
-                                    r.set_dirty(true);
-                                }
-                                aw.request_redraw();
-                            }
-                            WindowEvent::Focused(focused) => {
-                                if !focused {
-                                    about_hover_close = false;
-                                    if let Some(ref mut r) = about_renderer {
-                                        r.set_dirty(true);
-                                    }
-                                    aw.request_redraw();
-                                }
-                            }
-                            _ => {}
+                            secondary_window::EventResult::Ignored => {}
                         }
                     }
                 }
@@ -6262,19 +6171,8 @@ fn main() -> anyhow::Result<()> {
                             .with_title("fasty")
                             .with_decorations(false)
                             .with_transparent(true)
-                            .with_visible(true);
-                        if let Some((x, y)) = ws.position {
-                            attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
-                        }
-                        if let Some((w, h)) = ws.size {
-                            if w > 0 && h > 0 {
-                                attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(w, h));
-                            } else {
-                                attrs = attrs.with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0));
-                            }
-                        } else {
-                            attrs = attrs.with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0));
-                        }
+                            .with_visible(true)
+                            .with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0));
                         if let Ok(window) = target.create_window(attrs) {
                             let window_arc = Arc::new(window);
                             let w_ref: &winit::window::Window = &*window_arc;
@@ -6301,17 +6199,8 @@ fn main() -> anyhow::Result<()> {
                                 let actual_cell_h = r.cell_height();
                                 let w_size = window_arc.inner_size();
                                 let (w_width, w_height) = if w_size.width < 100 || w_size.height < 100 {
-                                    if let Some((w, h)) = ws.size {
-                                        if w > 0 && h > 0 {
-                                            (w, h)
-                                        } else {
-                                            let sf = window_arc.scale_factor() as f32;
-                                            ((800.0 * sf) as u32, (520.0 * sf) as u32)
-                                        }
-                                    } else {
-                                        let sf = window_arc.scale_factor() as f32;
-                                        ((800.0 * sf) as u32, (520.0 * sf) as u32)
-                                    }
+                                    let sf = window_arc.scale_factor() as f32;
+                                    ((800.0 * sf) as u32, (520.0 * sf) as u32)
                                 } else {
                                     (w_size.width, w_size.height)
                                 };
@@ -7060,40 +6949,46 @@ fn key_to_bytes(
                 }
                 NamedKey::Escape => vec![0x1B],
 
-                // Arrow keys
+                // Arrow keys — DECCKM: application cursor mode uses ESC O instead of ESC [
                 NamedKey::ArrowUp => {
+                    let prefix = if mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR) { 0x4F } else { 0x5B };
                     if ctrl_active {
-                        vec![0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x41] // \x1b[1;5A
+                        vec![0x1B, prefix, 0x31, 0x3B, 0x35, 0x41]
                     } else {
-                        vec![0x1B, 0x5B, 0x41] // \x1b[A
+                        vec![0x1B, prefix, 0x41]
                     }
                 }
                 NamedKey::ArrowDown => {
+                    let prefix = if mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR) { 0x4F } else { 0x5B };
                     if ctrl_active {
-                        vec![0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x42] // \x1b[1;5B
+                        vec![0x1B, prefix, 0x31, 0x3B, 0x35, 0x42]
                     } else {
-                        vec![0x1B, 0x5B, 0x42] // \x1b[B
+                        vec![0x1B, prefix, 0x42]
                     }
                 }
                 NamedKey::ArrowRight => {
+                    let prefix = if mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR) { 0x4F } else { 0x5B };
                     if ctrl_active {
-                        vec![0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x43] // \x1b[1;5C
+                        vec![0x1B, prefix, 0x31, 0x3B, 0x35, 0x43]
                     } else {
-                        vec![0x1B, 0x5B, 0x43] // \x1b[C
+                        vec![0x1B, prefix, 0x43]
                     }
                 }
                 NamedKey::ArrowLeft => {
+                    let prefix = if mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR) { 0x4F } else { 0x5B };
                     if ctrl_active {
-                        vec![0x1B, 0x5B, 0x31, 0x3B, 0x35, 0x44] // \x1b[1;5D
+                        vec![0x1B, prefix, 0x31, 0x3B, 0x35, 0x44]
                     } else {
-                        vec![0x1B, 0x5B, 0x44] // \x1b[D
+                        vec![0x1B, prefix, 0x44]
                     }
                 }
 
-                // Navigation
+                // Home/End — also affected by DECCKM
                 NamedKey::Home => {
                     if shift_active {
                         vec![0x1B, 0x5B, 0x31, 0x3B, 0x32, 0x48] // \x1b[1;2H
+                    } else if mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR) {
+                        vec![0x1B, 0x4F, 0x48] // \x1bOH
                     } else {
                         vec![0x1B, 0x5B, 0x48] // \x1b[H
                     }
@@ -7101,6 +6996,8 @@ fn key_to_bytes(
                 NamedKey::End => {
                     if shift_active {
                         vec![0x1B, 0x5B, 0x31, 0x3B, 0x32, 0x46] // \x1b[1;2F
+                    } else if mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR) {
+                        vec![0x1B, 0x4F, 0x46] // \x1bOF
                     } else {
                         vec![0x1B, 0x5B, 0x46] // \x1b[F
                     }

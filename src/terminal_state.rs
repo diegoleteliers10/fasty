@@ -89,7 +89,7 @@ impl TerminalState {
         let mut cmd = CommandBuilder::new(executable);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("TERM_PROGRAM", "ghostty");
+        cmd.env("TERM_PROGRAM", "fasty");
         if let Some(dir) = cwd {
             cmd.cwd(dir);
         }
@@ -260,6 +260,13 @@ impl TerminalState {
             let mut osc_buf: Vec<u8> = Vec::new();
             let mut cmd_start_time: Option<std::time::Instant> = None;
 
+            // Debug: capture PTY bytes to log if FASTY_PTY_DEBUG=1
+            let pty_debug = std::env::var("FASTY_PTY_DEBUG").ok().as_deref() == Some("1");
+            let pty_log_path = crate::paths::get().state_dir.join("fasty_pty_debug.log");
+            if pty_debug {
+                let _ = std::fs::write(&pty_log_path, "");  // truncate on start
+            }
+
             struct PendingNotification {
                 title: String,
                 body: String,
@@ -326,6 +333,30 @@ impl TerminalState {
                     Ok(n) => {
                         let mut term_locked = term_clone.lock();
                         let mut local_lines = 0;
+
+                        // Debug: write raw PTY bytes to log file
+                        if pty_debug {
+                            use std::io::Write as _;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&pty_log_path)
+                            {
+                                let ts = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis();
+                                let escaped: String = buf[..n].iter().map(|&b| {
+                                    match b {
+                                        0x1b => "ESC".to_string(),
+                                        0x07 => "BEL".to_string(),
+                                        b if b.is_ascii_graphic() || b == b' ' => format!("{}", b as char),
+                                        b => format!("\\x{:02x}", b),
+                                    }
+                                }).collect();
+                                let _ = writeln!(f, "[{}ms] PTY({} bytes): {}", ts, n, escaped);
+                            }
+                        }
 
                         for &byte in buf[..n].iter() {
                             if byte == 0x0A {

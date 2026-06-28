@@ -100,8 +100,7 @@ pub fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
 }
 
 fn themes_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
-    std::path::Path::new(&home).join(".config/fasty/themes")
+    crate::paths::get().config_dir.join("themes")
 }
 
 pub fn load_custom_themes() {
@@ -334,19 +333,12 @@ impl Default for FontConfig {
     }
 }
 
-fn home_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default();
-    PathBuf::from(home)
-}
-
 fn user_toml_path() -> PathBuf {
-    home_dir().join(".config/fasty/fasty.toml")
+    crate::paths::get().config_dir.join("fasty.toml")
 }
 
 fn user_legacy_json_path() -> PathBuf {
-    home_dir().join(".config/fasty/config.json")
+    crate::paths::get().config_dir.join("config.json")
 }
 
 fn candidate_toml_paths() -> Vec<PathBuf> {

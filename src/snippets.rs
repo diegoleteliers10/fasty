@@ -35,15 +35,8 @@ fn snippets_cell() -> &'static RwLock<HashMap<String, String>> {
     SNIPPETS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn home_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default();
-    PathBuf::from(home)
-}
-
 pub fn snippets_path() -> PathBuf {
-    home_dir().join(".config/fasty/snippets.toml")
+    crate::paths::get().config_dir.join("snippets.toml")
 }
 
 const BUNDLED: &str = include_str!("../snippets.bundled.toml");
