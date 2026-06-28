@@ -37,6 +37,46 @@ use winit::{
     keyboard::Key,
     window::CursorGrabMode,
 };
+// macOS only: titlebar flags so the system draws native traffic lights.
+#[cfg(target_os = "macos")]
+use winit::platform::macos::WindowAttributesExtMacOS;
+
+/// Applies per-platform chrome: macOS gets a transparent, full-size titlebar
+/// (native traffic lights); other platforms stay borderless.
+fn with_platform_chrome(attrs: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
+    #[cfg(target_os = "macos")]
+    {
+        attrs
+            .with_decorations(true)
+            .with_titlebar_transparent(true)
+            .with_title_hidden(true)
+            .with_fullsize_content_view(true)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        attrs.with_decorations(false)
+    }
+}
+
+/// Dialog attrs (Settings, About): platform chrome + fixed non-resizable size.
+fn dialog_window_attrs(title: &str, w: f64, h: f64, visible: bool) -> winit::window::WindowAttributes {
+    with_platform_chrome(
+        winit::window::WindowAttributes::default()
+            .with_title(title)
+            .with_transparent(true)
+            .with_visible(visible)
+            .with_resizable(false)
+            .with_inner_size(winit::dpi::LogicalSize::new(w, h)),
+    )
+}
+
+fn settings_window_attrs(visible: bool) -> winit::window::WindowAttributes {
+    dialog_window_attrs("fasty Settings", 400.0, 260.0, visible)
+}
+
+fn about_window_attrs(visible: bool) -> winit::window::WindowAttributes {
+    dialog_window_attrs("About Fasty", 300.0, 200.0, visible)
+}
 
 fn get_login_shell() -> String {
     #[cfg(target_os = "windows")]
@@ -1616,12 +1656,15 @@ fn main() -> anyhow::Result<()> {
         .with_visible(false)
         .with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0)))?;
 
+    // macOS + Linux: platform chrome via `with_platform_chrome`.
+    // Windows has its own block above (it uniquely hides until first show).
     #[cfg(not(target_os = "windows"))]
-    let window = event_loop.create_window(winit::window::WindowAttributes::default()
-        .with_title(&window_title)
-        .with_decorations(false)
-        .with_transparent(true)
-        .with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0)))?;
+    let window = event_loop.create_window(with_platform_chrome(
+        winit::window::WindowAttributes::default()
+            .with_title(&window_title)
+            .with_transparent(true)
+            .with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0)),
+    ))?;
 
     // Load and set the window icon at runtime for the taskbar/desktop bar
     if let Ok(icon_image) = image::load_from_memory(include_bytes!("../assets/fastyIcon.png")) {
@@ -2941,12 +2984,7 @@ fn main() -> anyhow::Result<()> {
                                                         settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                                         settings_active_field = 0;
                                                         let visible = !cfg!(target_os = "windows");
-                                                        if let Ok(window) = target.create_window(winit::window::WindowAttributes::default()
-                                                            .with_title("fasty Settings")
-                                                            .with_decorations(false)
-                                                            .with_transparent(true)
-                                                            .with_visible(visible)
-                                                            .with_inner_size(winit::dpi::LogicalSize::new(400.0, 260.0)))
+                                                        if let Ok(window) = target.create_window(settings_window_attrs(visible))
                                                         {
                                                             let settings_window_arc = Arc::new(window);
                                                             let sw_ref: &winit::window::Window = &*settings_window_arc;
@@ -3444,12 +3482,7 @@ fn main() -> anyhow::Result<()> {
                                                 settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                                 settings_active_field = 0;
                                                 let visible = !cfg!(target_os = "windows");
-                                                match target.create_window(winit::window::WindowAttributes::default()
-                                                    .with_title("fasty Settings")
-                                                    .with_decorations(false)
-                                                    .with_transparent(true)
-                                                    .with_visible(visible)
-                                                    .with_inner_size(winit::dpi::LogicalSize::new(400.0, 260.0)))
+                                                match target.create_window(settings_window_attrs(visible))
                                                 {
                                                     Ok(window) => {
                                                         let settings_window_arc = Arc::new(window);
@@ -3919,12 +3952,7 @@ fn main() -> anyhow::Result<()> {
                                                     crate::renderer::ContextMenuItem::About => {
                                                           if about_window.is_none() {
                                                               let visible = !cfg!(target_os = "windows");
-                                                              match target.create_window(winit::window::WindowAttributes::default()
-                                                                   .with_title("About Fasty")
-                                                                   .with_decorations(false)
-                                                                   .with_transparent(true)
-                                                                   .with_visible(visible)
-                                                                   .with_inner_size(winit::dpi::LogicalSize::new(300.0, 200.0)))
+                                                              match target.create_window(about_window_attrs(visible))
                                                               {
                                                                   Ok(window) => {
                                                                       let about_window_arc = Arc::new(window);
@@ -4366,8 +4394,7 @@ fn main() -> anyhow::Result<()> {
 
                                          let is_update_available = update_available.lock().is_some();
                                          if is_update_available {
-                                             let is_hovering_update = current_mouse_y >= 10.0 && current_mouse_y <= 30.0
-                                                 && current_mouse_x >= (v_width - 219.0) && current_mouse_x < (v_width - 149.0);
+                                             let is_hovering_update = chrome_layout::update_rect(vw_f).contains(current_mouse_x, current_mouse_y);
                                              if is_hovering_update {
                                                  trigger_update(
                                                      &update_available,
@@ -4410,12 +4437,7 @@ fn main() -> anyhow::Result<()> {
                                                     settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                                    settings_active_field = 0;
                                                    let visible = !cfg!(target_os = "windows");
-                                                    match target.create_window(winit::window::WindowAttributes::default()
-                                                        .with_title("fasty Settings")
-                                                        .with_decorations(false)
-                                                        .with_transparent(true)
-                                                        .with_visible(visible)
-                                                        .with_inner_size(winit::dpi::LogicalSize::new(400.0, 260.0)))
+                                                    match target.create_window(settings_window_attrs(visible))
                                                    {
                                                        Ok(window) => {
                                                            let settings_window_arc = Arc::new(window);
@@ -5181,8 +5203,7 @@ fn main() -> anyhow::Result<()> {
 
                                 let is_update_available = update_available.lock().is_some();
                                 if is_update_available {
-                                    hover_update = current_mouse_y >= 10.0 && current_mouse_y <= 30.0
-                                        && current_mouse_x >= (v_width - 219.0) && current_mouse_x < (v_width - 149.0);
+                                    hover_update = chrome_layout::update_rect(vw_f).contains(current_mouse_x, current_mouse_y);
                                 } else {
                                     hover_update = false;
                                 }
@@ -5775,7 +5796,7 @@ fn main() -> anyhow::Result<()> {
 
                                 let sw_width = sw.inner_size().width as f64 / scale_factor;
                                 s_hover_close = if cfg!(target_os = "macos") {
-                                    s_mouse_y >= 4.0 && s_mouse_y <= 32.0 && s_mouse_x >= 4.0 && s_mouse_x < 32.0
+                                    false // native close light owns this region
                                 } else {
                                     s_mouse_y >= 4.0 && s_mouse_y <= 32.0 && s_mouse_x >= (sw_width - 32.0) && s_mouse_x < (sw_width - 4.0)
                                 };
@@ -6051,7 +6072,7 @@ fn main() -> anyhow::Result<()> {
                                 let old_hover_close = about_hover_close;
                                 let aw_width = aw.inner_size().width as f64 / scale_factor;
                                 about_hover_close = if cfg!(target_os = "macos") {
-                                    m_y >= 4.0 && m_y <= 32.0 && m_x >= 4.0 && m_x < 32.0
+                                    false // native close light owns this region
                                 } else {
                                     m_y >= 4.0 && m_y <= 32.0 && m_x >= (aw_width - 32.0) && m_x < (aw_width - 4.0)
                                 };
@@ -6155,13 +6176,14 @@ fn main() -> anyhow::Result<()> {
                         } else {
                             (0, 0)
                         };
-                        let attrs = winit::window::WindowAttributes::default()
-                            .with_title(tab.custom_name.as_deref().unwrap_or("fasty"))
-                            .with_decorations(false)
-                            .with_transparent(true)
-                            .with_visible(true)
-                            .with_position(winit::dpi::PhysicalPosition::new(sx, sy))
-                            .with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0));
+                        let attrs = with_platform_chrome(
+                            winit::window::WindowAttributes::default()
+                                .with_title(tab.custom_name.as_deref().unwrap_or("fasty"))
+                                .with_transparent(true)
+                                .with_visible(true)
+                                .with_position(winit::dpi::PhysicalPosition::new(sx, sy))
+                                .with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0)),
+                        );
                         if let Ok(window) = target.create_window(attrs) {
                             let window_arc = Arc::new(window);
                             let w_ref: &winit::window::Window = &*window_arc;
@@ -6258,11 +6280,12 @@ fn main() -> anyhow::Result<()> {
                         if restored_tabs.is_empty() {
                             continue;
                         }
-                        let mut attrs = winit::window::WindowAttributes::default()
-                            .with_title("fasty")
-                            .with_decorations(false)
-                            .with_transparent(true)
-                            .with_visible(true);
+                        let mut attrs = with_platform_chrome(
+                            winit::window::WindowAttributes::default()
+                                .with_title("fasty")
+                                .with_transparent(true)
+                                .with_visible(true),
+                        );
                         if let Some((x, y)) = ws.position {
                             attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
                         }
