@@ -102,9 +102,12 @@ impl TerminalState {
 
         // Shell integration: write OSC 133 command markers so fastty can
         // detect command start/finish for duration tracking.
-        let integration_path = std::env::temp_dir().join("fastty_shell_integration.sh");
-        let integration_path_zsh = std::env::temp_dir().join("fastty_shell_integration.zsh");
-        let integration_path_fish = std::env::temp_dir().join("fastty_shell_integration.fish");
+        let integration_dir = crate::paths::get().cache_dir.join("shell_integration");
+        let _ = std::fs::create_dir_all(&integration_dir);
+
+        let integration_path = integration_dir.join("fastty_shell_integration.sh");
+        let integration_path_zsh = integration_dir.join("fastty_shell_integration.zsh");
+        let integration_path_fish = integration_dir.join("fastty_shell_integration.fish");
 
         // POSIX shell integration (bash)
         let _ = std::fs::write(
@@ -164,7 +167,7 @@ impl TerminalState {
             let user_bashrc = std::env::var("HOME")
                 .map(|h| format!("{}/.bashrc", h))
                 .unwrap_or_default();
-            let wrapper_path = std::env::temp_dir().join("fastty_bashrc");
+            let wrapper_path = integration_dir.join("fastty_bashrc");
             let _ = std::fs::write(
                 &wrapper_path,
                 format!(
@@ -184,7 +187,7 @@ impl TerminalState {
             let home = std::env::var("HOME").unwrap_or_default();
             let user_zshenv = format!("{}/.zshenv", home);
             let user_zshrc = format!("{}/.zshrc", home);
-            let zdotdir = std::env::temp_dir().join("fastty_zsh");
+            let zdotdir = integration_dir.join("fastty_zsh");
             let _ = std::fs::create_dir_all(&zdotdir);
             let _ = std::fs::write(
                 zdotdir.join(".zshenv"),
