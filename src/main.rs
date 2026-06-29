@@ -47,21 +47,35 @@ fn get_login_shell() -> String {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        if let Ok(content) = std::fs::read_to_string("/etc/passwd") {
-            let current_user = std::env::var("USER").unwrap_or_else(|_| "diegoleteliers".to_string());
-            for line in content.lines() {
-                if let Some(username) = line.split(':').next() {
-                    if username == current_user {
-                        if let Some(shell) = line.split(':').last() {
-                            if !shell.is_empty() {
-                                return shell.trim().to_string();
+        if let Ok(shell) = std::env::var("SHELL") {
+            if !shell.is_empty() {
+                return shell;
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(content) = std::fs::read_to_string("/etc/passwd") {
+                let current_user = std::env::var("USER").unwrap_or_else(|_| "diegoleteliers".to_string());
+                for line in content.lines() {
+                    if let Some(username) = line.split(':').next() {
+                        if username == current_user {
+                            if let Some(shell) = line.split(':').last() {
+                                if !shell.is_empty() {
+                                    return shell.trim().to_string();
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+
+        if cfg!(target_os = "macos") {
+            "/bin/zsh".to_string()
+        } else {
+            "/bin/bash".to_string()
+        }
     }
 }
 
