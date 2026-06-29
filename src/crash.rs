@@ -34,7 +34,7 @@ pub fn install_hook() {
 
         let mut f = fs::File::create(&path).ok();
         if let Some(ref mut f) = f {
-            let _ = writeln!(f, "Fasty Crash Report");
+            let _ = writeln!(f, "Fastty Crash Report");
             let _ = writeln!(f, "==================");
             let _ = writeln!(f, "Version: {}", env!("CARGO_PKG_VERSION"));
             let _ = writeln!(f, "OS: {} {}", std::env::consts::OS, std::env::consts::ARCH);
@@ -47,7 +47,7 @@ pub fn install_hook() {
             let _ = writeln!(f, "{backtrace}");
         }
 
-        eprintln!("fasty: crash saved to {}", path.display());
+        eprintln!("fastty: crash saved to {}", path.display());
 
         let _ = default_hook(info);
 
@@ -56,7 +56,7 @@ pub fn install_hook() {
                 let _ = std::process::Command::new(exe).spawn();
             }
         } else {
-            eprintln!("fasty: crash occurred within 5 seconds of startup, skipping auto-restart to prevent crash loop.");
+            eprintln!("fastty: crash occurred within 5 seconds of startup, skipping auto-restart to prevent crash loop.");
         }
     }));
 }

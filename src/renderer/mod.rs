@@ -265,7 +265,7 @@ impl<'a> Renderer<'a> {
         let (device, queue) = adapter
             .request_device(
                 &DeviceDescriptor {
-                    label: Some("fasty-renderer"),
+                    label: Some("fastty-renderer"),
                     required_features: Features::empty(),
                     required_limits: wgpu::Limits::default(),
                     memory_hints: if cfg!(target_os = "windows") {
@@ -467,11 +467,11 @@ impl<'a> Renderer<'a> {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("fasty-blank-present"),
+                label: Some("fastty-blank-present"),
             });
         {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("fasty-blank-pass"),
+                label: Some("fastty-blank-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -578,12 +578,12 @@ impl<'a> Renderer<'a> {
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("fasty-render-encoder"),
+            label: Some("fastty-render-encoder"),
         });
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("fasty-render-pass"),
+                label: Some("fastty-render-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,

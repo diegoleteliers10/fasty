@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Fasty installation script for Linux and macOS
+# Fastty installation script for Linux and macOS
 # ==============================================================================
 # Run directly from the internet with:
-# curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash
+# curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fastty/main/instalar.sh | bash
 # ==============================================================================
 
 set -euo pipefail
 
 GITHUB_USER="diegoleteliers10"
-GITHUB_REPO="fasty"
-APP_NAME="fasty"
+GITHUB_REPO="fastty"
+APP_NAME="fastty"
 
 echo "=== Starting $APP_NAME installation ==="
 
@@ -47,20 +47,20 @@ echo "Detected platform: OS=$OS, Arch=$ARCH -> Target=$TARGET"
 
 # ── 2. Resolve XDG/platform directories ───────────────────────────────────────
 if [ "$OS" = "darwin" ]; then
-    CONFIG_DIR="$HOME/Library/Application Support/fasty"
-    DATA_DIR="$HOME/Library/Application Support/fasty"
-    STATE_DIR="$HOME/Library/Application Support/fasty"
-    CACHE_DIR="$HOME/Library/Caches/fasty"
+    CONFIG_DIR="$HOME/Library/Application Support/fastty"
+    DATA_DIR="$HOME/Library/Application Support/fastty"
+    STATE_DIR="$HOME/Library/Application Support/fastty"
+    CACHE_DIR="$HOME/Library/Caches/fastty"
     if [ -w "/usr/local/bin" ]; then
         BIN_DIR="/usr/local/bin"
     else
         BIN_DIR="$HOME/.local/bin"
     fi
 else
-    CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fasty"
-    DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/fasty"
-    STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/fasty"
-    CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/fasty"
+    CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fastty"
+    DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/fastty"
+    STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/fastty"
+    CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/fastty"
     BIN_DIR="$HOME/.local/bin"
 fi
 
@@ -123,23 +123,23 @@ if [ "$OS" = "darwin" ]; then
     # macOS: install .app bundle + symlink
     INSTALL_DIR="/Applications"
     if [ -w "$INSTALL_DIR" ]; then
-        rm -rf "$INSTALL_DIR/Fasty.app"
-        mv "$TEMP_DIR/Fasty.app" "$INSTALL_DIR/"
+        rm -rf "$INSTALL_DIR/Fastty.app"
+        mv "$TEMP_DIR/Fastty.app" "$INSTALL_DIR/"
     else
         echo "Administrator privileges (sudo) are required to write to $INSTALL_DIR."
-        sudo rm -rf "$INSTALL_DIR/Fasty.app"
-        sudo mv "$TEMP_DIR/Fasty.app" "$INSTALL_DIR/"
+        sudo rm -rf "$INSTALL_DIR/Fastty.app"
+        sudo mv "$TEMP_DIR/Fastty.app" "$INSTALL_DIR/"
     fi
 
     if [ -w "$BIN_DIR" ]; then
-        rm -f "$BIN_DIR/fasty"
-        ln -sf "$INSTALL_DIR/Fasty.app/Contents/MacOS/fasty" "$BIN_DIR/fasty"
+        rm -f "$BIN_DIR/fastty"
+        ln -sf "$INSTALL_DIR/Fastty.app/Contents/MacOS/fastty" "$BIN_DIR/fastty"
     else
-        sudo rm -f "$BIN_DIR/fasty"
-        sudo ln -sf "$INSTALL_DIR/Fasty.app/Contents/MacOS/fasty" "$BIN_DIR/fasty"
+        sudo rm -f "$BIN_DIR/fastty"
+        sudo ln -sf "$INSTALL_DIR/Fastty.app/Contents/MacOS/fastty" "$BIN_DIR/fastty"
     fi
 
-    echo "$APP_NAME installed successfully at $INSTALL_DIR/Fasty.app!"
+    echo "$APP_NAME installed successfully at $INSTALL_DIR/Fastty.app!"
 else
     # Linux: install binary directly
     SRC_BINARY=$(find "$TEMP_DIR" -maxdepth 2 -type f -name "$APP_NAME" | head -n 1)
@@ -173,29 +173,29 @@ else
     DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
     mkdir -p "$ICON_DIR" "$DESKTOP_DIR"
 
-    RAW_ICON_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/main/assets/fastyIcon.png"
+    RAW_ICON_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/main/assets/fasttyIcon.png"
     if [ -w "$ICON_DIR" ]; then
-        curl -sSfL -o "$ICON_DIR/fasty.png" "$RAW_ICON_URL"
+        curl -sSfL -o "$ICON_DIR/fastty.png" "$RAW_ICON_URL"
     else
         sudo mkdir -p "$ICON_DIR"
-        sudo curl -sSfL -o "$ICON_DIR/fasty.png" "$RAW_ICON_URL"
+        sudo curl -sSfL -o "$ICON_DIR/fastty.png" "$RAW_ICON_URL"
     fi
 
     DESKTOP_CONTENT="[Desktop Entry]
-Name=Fasty
+Name=Fastty
 Comment=GPU-accelerated Terminal Emulator
 Exec=$BIN_DIR/$APP_NAME
-Icon=$ICON_DIR/fasty.png
+Icon=$ICON_DIR/fastty.png
 Terminal=false
 Type=Application
 Categories=System;TerminalEmulator;
 Keywords=terminal;emulator;wgpu;"
 
     if [ -w "$DESKTOP_DIR" ]; then
-        echo "$DESKTOP_CONTENT" > "$DESKTOP_DIR/fasty.desktop"
+        echo "$DESKTOP_CONTENT" > "$DESKTOP_DIR/fastty.desktop"
     else
         sudo mkdir -p "$DESKTOP_DIR"
-        echo "$DESKTOP_CONTENT" | sudo tee "$DESKTOP_DIR/fasty.desktop" > /dev/null
+        echo "$DESKTOP_CONTENT" | sudo tee "$DESKTOP_DIR/fastty.desktop" > /dev/null
     fi
 
     echo "$APP_NAME installed successfully at $BIN_DIR/$APP_NAME!"
@@ -204,7 +204,7 @@ Keywords=terminal;emulator;wgpu;"
     # Schedule a self-restart
     (
         sleep 3
-        pkill -x fasty 2>/dev/null || true
+        pkill -x fastty 2>/dev/null || true
         nohup "$BIN_DIR/$APP_NAME" >/dev/null 2>&1 &
         disown
     ) &
@@ -224,7 +224,7 @@ fi
 
 # ── 9. Summary ─────────────────────────────────────────────────────────────────
 echo ""
-echo "    ✓ Binary    → $BIN_DIR/fasty"
+echo "    ✓ Binary    → $BIN_DIR/fastty"
 echo "    ✓ Config    → $CONFIG_DIR"
 echo "    ✓ Data      → $DATA_DIR"
 echo "    ✓ State     → $STATE_DIR"

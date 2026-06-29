@@ -4893,7 +4893,7 @@ impl Pipeline {
 
         draw_text(
             atlas,
-            "Open fasty.toml",
+            "Open fastty.toml",
             168.0,
             216.0,
             with_opacity([0.9, 0.9, 0.95, 1.0], chrome_alpha),
@@ -5463,7 +5463,7 @@ impl Pipeline {
 
         // Draw title — vertically centered in the 40px topbar.
         // macOS: right-aligned (close button is on the left). Other platforms: left.
-        let about_title = "About Fasty";
+        let about_title = "About Fastty";
         let title_x = if cfg!(target_os = "macos") {
             viewport_width - 12.0 - get_text_width(atlas, about_title)
         } else {
@@ -5522,7 +5522,7 @@ impl Pipeline {
             ));
         }
 
-        // Draw Fasty App Icon in the center
+        // Draw Fastty App Icon in the center
         if let Some(entry) = &atlas.app_icon {
             let logo_w = 48.0f32;
             let logo_h = 48.0f32;
@@ -5545,8 +5545,8 @@ impl Pipeline {
             ));
         }
 
-        // Draw App Name: Fasty
-        let name_str = "Fasty";
+        // Draw App Name: Fastty
+        let name_str = "Fastty";
         let name_w = get_text_width(atlas, name_str);
         let name_x = (viewport_width - name_w) / 2.0;
         draw_text(
@@ -5800,7 +5800,7 @@ fn get_active_theme() -> Theme {
             bright_white: (0xFD, 0xF6, 0xE3),
         },
         _ => Theme {
-            // Fasty (Default) – crisp, high-clarity text colors
+            // Fastty (Default) – crisp, high-clarity text colors
             foreground: (0xE5, 0xE9, 0xF0),
             background: (0x0C, 0x0C, 0x0C),
             black: (0x3B, 0x42, 0x52),

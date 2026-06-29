@@ -169,7 +169,7 @@ fn get_cached_icons() -> &'static CachedIcons {
     static CACHE: std::sync::OnceLock<CachedIcons> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| {
         let app_icon = {
-            let img = image::load_from_memory(include_bytes!("../../assets/fastySmallIcon.png")).unwrap();
+            let img = image::load_from_memory(include_bytes!("../../assets/fasttySmallIcon.png")).unwrap();
             let scaled = img.resize(24, 24, image::imageops::FilterType::Lanczos3);
             let rgba = scaled.to_rgba8();
             let (w, h) = rgba.dimensions();

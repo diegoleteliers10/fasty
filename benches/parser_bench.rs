@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use fasty::parser::VtParser;
+use fastty::parser::VtParser;
 
 fn bench_parser_plain_text(c: &mut Criterion) {
     let mut parser = VtParser::new();
@@ -32,7 +32,7 @@ fn bench_parser_sgr_ansi(c: &mut Criterion) {
 fn bench_parser_complex(c: &mut Criterion) {
     let mut parser = VtParser::new();
     // Mixture of cursor movements, SGR, plain text, and line feeds
-    let data = "\x1b[2J\x1b[H\x1b[34m[fasty]\x1b[0m loading...\n\x1b[10;20Hprogress \x1b[32m[====>    ]\x1b[0m 50%\r".repeat(100);
+    let data = "\x1b[2J\x1b[H\x1b[34m[fastty]\x1b[0m loading...\n\x1b[10;20Hprogress \x1b[32m[====>    ]\x1b[0m 50%\r".repeat(100);
     let bytes = data.as_bytes();
 
     c.bench_function("parser_complex", |b| {

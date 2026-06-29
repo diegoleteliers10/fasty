@@ -1,6 +1,6 @@
 //! Persisted tab/window state across restarts.
 //!
-//! On graceful exit we write `~/.config/fasty/session.json`. On startup, if
+//! On graceful exit we write `~/.config/fastty/session.json`. On startup, if
 //! `config.session_restore` is true and the file parses, we restore each
 //! window and its tabs.
 //!

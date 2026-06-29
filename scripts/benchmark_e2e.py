@@ -12,8 +12,8 @@ RUNS = 3
 
 # Terminal definitions and their command line syntax to run a command and auto-close
 TERMINALS = {
-    "fasty (This Project)": {
-        "binary": "./target/release/fasty",
+    "fastty (This Project)": {
+        "binary": "./target/release/fastty",
         "cmd_args": lambda cmd: ["-e"] + cmd,
     },
     "Ghostty": {
@@ -59,13 +59,13 @@ def generate_payloads():
     temp_dir = tempfile.gettempdir()
     
     # 1. Plain text payload (100,000 lines)
-    plain_path = os.path.join(temp_dir, "fasty_bench_plain.txt")
+    plain_path = os.path.join(temp_dir, "fastty_bench_plain.txt")
     with open(plain_path, "w") as f:
         for i in range(100000):
             f.write(f"Line {i:06d}: This is a plain text line to measure standard terminal writing throughput.\n")
             
     # 2. ANSI/SGR color payload (50,000 lines of highly styled text)
-    ansi_path = os.path.join(temp_dir, "fasty_bench_ansi.txt")
+    ansi_path = os.path.join(temp_dir, "fastty_bench_ansi.txt")
     with open(ansi_path, "w") as f:
         for i in range(50000):
             # Rainbow/varying colors using SGR foreground & background formatting
@@ -129,9 +129,9 @@ def benchmark_terminal(term_name, term_config, test_cases):
             print(" Failed")
     return results
 
-def compile_fasty():
-    """Ensure fasty is compiled in release mode before benchmarking."""
-    print("Compiling fasty in --release mode...")
+def compile_fastty():
+    """Ensure fastty is compiled in release mode before benchmarking."""
+    print("Compiling fastty in --release mode...")
     try:
         subprocess.run(
             ["cargo", "build", "--release"],
@@ -139,20 +139,20 @@ def compile_fasty():
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT
         )
-        print("Fasty compiled successfully.")
+        print("Fastty compiled successfully.")
         return True
     except subprocess.CalledProcessError as e:
-        print("ERROR: Failed to compile fasty in release mode.", file=sys.stderr)
+        print("ERROR: Failed to compile fastty in release mode.", file=sys.stderr)
         print(e.output.decode(), file=sys.stderr)
         return False
 
 def main():
     print("=" * 60)
-    print("       FASTY TERMINAL EMULATOR E2E BENCHMARK RUNNER       ")
+    print("       FASTTY TERMINAL EMULATOR E2E BENCHMARK RUNNER       ")
     print("=" * 60)
     
-    # 1. Compile Fasty
-    if not compile_fasty():
+    # 1. Compile Fastty
+    if not compile_fastty():
         sys.exit(1)
         
     # 2. Check for installed terminals
@@ -164,7 +164,7 @@ def main():
             print(f"ℹ️ {name} not found. Skipping.")
             
     if not active_terminals:
-        print("❌ No terminals found to benchmark! (Did release compile of fasty fail?)")
+        print("❌ No terminals found to benchmark! (Did release compile of fastty fail?)")
         sys.exit(1)
         
     print(f"Detected {len(active_terminals)} terminals for evaluation.")

@@ -1,6 +1,6 @@
 //! User-customizable keybindings.
 //!
-//! Bindings live in `fasty.toml` under `[keybindings]` as a flat
+//! Bindings live in `fastty.toml` under `[keybindings]` as a flat
 //! `combo -> action` map (both strings). On startup and on every
 //! config reload we re-parse the map and merge on top of the defaults.
 

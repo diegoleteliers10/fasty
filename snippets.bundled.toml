@@ -1,4 +1,4 @@
-# Bundled snippets for fasty.
+# Bundled snippets for fastty.
 # Edit, delete, or add your own. This file is only created on first run;
 # your changes survive updates.
 #
@@ -12,7 +12,7 @@
 # always want to type something (e.g. commit message).
 #
 # Triggers expand on Tab. TUI apps (vim, fzf, htop) take precedence:
-# if fasty detects a full-screen app is running, Tab passes through.
+# if fastty detects a full-screen app is running, Tab passes through.
 
 [snippet]
 

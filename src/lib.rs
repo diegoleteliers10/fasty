@@ -1,4 +1,4 @@
-//! fasty library - winit/wgpu terminal emulator
+//! fastty library - winit/wgpu terminal emulator
 
 pub mod config;
 pub mod chrome_layout;

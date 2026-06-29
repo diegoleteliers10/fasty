@@ -8,7 +8,7 @@
 //!   - `${1:default}` for a placeholder with default text.
 //!   - `$0` marks the final cursor position (only one per snippet).
 //!
-//! File: `~/.config/fasty/snippets.toml`. On first run we write a bundled
+//! File: `~/.config/fastty/snippets.toml`. On first run we write a bundled
 //! set of defaults. User edits to that file are preserved across launches
 //! (we only seed it when it does not yet exist). The file is watched with
 //! `notify` for live reload — same mechanism as `config.rs`.
@@ -227,7 +227,7 @@ where
     let watched_file = path.clone();
     let watched_name = watched_file.file_name().map(|n| n.to_owned());
     std::thread::Builder::new()
-        .name("fasty-snippets-watch".into())
+        .name("fastty-snippets-watch".into())
         .spawn(move || {
             let _debouncer = debouncer;
             for batch in rx {

@@ -871,7 +871,7 @@ fn handle_popped_out_event(
             }
             if let Some(tab) = wc.tabs.get(active_idx) {
                 let mut tab_titles = Vec::new();
-                let mut active_tab_path = "fasty".to_string();
+                let mut active_tab_path = "fastty".to_string();
                 for (idx, t) in wc.tabs.iter().enumerate() {
                     let title = if let Some(ref name) = t.custom_name {
                         name.clone()
@@ -886,7 +886,7 @@ fn handle_popped_out_event(
                             };
                             let path_component = path_str.as_ref()
                                 .map(|p| get_last_path_component(p))
-                                .unwrap_or_else(|| "fasty".to_string());
+                                .unwrap_or_else(|| "fastty".to_string());
                             format!("{} - {}", agent_name, path_component)
                         } else {
                             let path_str = if let Some(pid) = t.terminal_state.lock().shell_pid() {
@@ -1521,14 +1521,14 @@ fn detect_git_status(cwd: &std::path::Path) -> Option<GitStatus> {
 
 
 #[derive(Debug)]
-struct FastyArgs {
+struct FasttyArgs {
     command: Option<Vec<String>>,   // -e cmd arg1 arg2...
     working_dir: Option<String>,    // -d /path/to/dir
     title: Option<String>,          // --title "My Window"
     paths: bool,                    // --paths
 }
 
-impl FastyArgs {
+impl FasttyArgs {
     fn parse() -> Self {
         let args: Vec<String> = std::env::args().skip(1).collect();
         Self::parse_from(args)
@@ -1581,11 +1581,11 @@ impl FastyArgs {
 fn main() -> anyhow::Result<()> {
     std::env::set_var("TERM", "xterm-256color");
     std::env::set_var("COLORTERM", "truecolor");
-    std::env::set_var("TERM_PROGRAM", "fasty");
+    std::env::set_var("TERM_PROGRAM", "fastty");
     let app_version = get_current_version();
     std::env::set_var("TERM_PROGRAM_VERSION", app_version.trim_start_matches('v'));
 
-    let _ = std::fs::remove_file("/tmp/fasty-update-done");
+    let _ = std::fs::remove_file("/tmp/fastty-update-done");
 
     #[cfg(target_os = "windows")]
     {
@@ -1602,7 +1602,7 @@ fn main() -> anyhow::Result<()> {
     crash::install_hook();
 
     tracing_subscriber::fmt()
-        .with_env_filter("warn,fasty=info")
+        .with_env_filter("warn,fastty=info")
         .init();
 
     let mut config = Config::load().unwrap_or_else(|e| {
@@ -1612,9 +1612,9 @@ fn main() -> anyhow::Result<()> {
     config::load_custom_themes();
     keybindings::init_resolver(config.keybindings.clone());
 
-    let fasty_args = FastyArgs::parse();
+    let fastty_args = FasttyArgs::parse();
 
-    if fasty_args.paths {
+    if fastty_args.paths {
         let dirs = paths::get();
         println!("config_dir: {}", dirs.config_dir.display());
         println!("data_dir: {}", dirs.data_dir.display());
@@ -1624,7 +1624,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Resolve what to spawn
-    let (executable, exec_args) = match &fasty_args.command {
+    let (executable, exec_args) = match &fastty_args.command {
         Some(cmd) => {
             // -e was passed — spawn command directly
             let exe = cmd[0].clone();
@@ -1643,19 +1643,19 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Resolve working directory
-    let cwd = fasty_args.working_dir.clone();
+    let cwd = fastty_args.working_dir.clone();
 
     // Window title
-    let window_title = fasty_args.title
+    let window_title = fastty_args.title
         .clone()
         .unwrap_or_else(|| {
-            match &fasty_args.command {
+            match &fastty_args.command {
                 Some(cmd) => cmd[0].clone(),  // "arch-update", "htop", etc
-                None => "fasty".to_string(),
+                None => "fastty".to_string(),
             }
         });
 
-    let auto_close = fasty_args.command.is_some();
+    let auto_close = fastty_args.command.is_some();
 
     // Resolve default shell for subsequent tabs
     let shell = if let Some(ref s) = config.shell {
@@ -1681,7 +1681,7 @@ fn main() -> anyhow::Result<()> {
         .with_inner_size(winit::dpi::LogicalSize::new(800.0, 520.0)))?;
 
     // Load and set the window icon at runtime for the taskbar/desktop bar
-    if let Ok(icon_image) = image::load_from_memory(include_bytes!("../assets/fastyIcon.png")) {
+    if let Ok(icon_image) = image::load_from_memory(include_bytes!("../assets/fasttyIcon.png")) {
         let icon_image = icon_image.into_rgba8();
         let (width, height) = icon_image.dimensions();
         let rgba = icon_image.into_raw();
@@ -1757,7 +1757,7 @@ fn main() -> anyhow::Result<()> {
     let mut bar_layout = build_bar_layout(&config);
     let mut bar_y: f32 = 0.0;
     let mut bar_h: f32 = BB_H;
-    let mut tabs = if config.session_restore && fasty_args.command.is_none() && fasty_args.working_dir.is_none() {
+    let mut tabs = if config.session_restore && fastty_args.command.is_none() && fastty_args.working_dir.is_none() {
         match session::load() {
             Some(s) if !s.windows.is_empty() => {
                 let active_idx = s.active_window.min(s.windows.len() - 1);
@@ -1959,8 +1959,8 @@ fn main() -> anyhow::Result<()> {
             let cmd_res = cmd
                 .arg("-s")
                 .arg("-H")
-                .arg("User-Agent: fasty")
-                .arg("https://api.github.com/repos/diegoleteliers10/fasty/releases/latest")
+                .arg("User-Agent: fastty")
+                .arg("https://api.github.com/repos/diegoleteliers10/fastty/releases/latest")
                 .output();
 
             if let Ok(output) = cmd_res {
@@ -2172,11 +2172,11 @@ fn main() -> anyhow::Result<()> {
                                     }
 
                                     if ligatures_changed {
-                                        tracing::info!("config: font.ligatures changed; restart fasty to apply");
+                                        tracing::info!("config: font.ligatures changed; restart fastty to apply");
                                     }
 
                                     if weight_changed {
-                                        tracing::info!("config: font.weight changed; restart fasty to apply");
+                                        tracing::info!("config: font.weight changed; restart fastty to apply");
                                     }
 
                                     if shell_changed {
@@ -2224,9 +2224,9 @@ fn main() -> anyhow::Result<()> {
                                 .unwrap_or_else(|| format!("Tab {}", active_tab_index + 1));
                             let body = format!("Terminal bell in {}", tab_title);
                             if let Err(e) = notify_rust::Notification::new()
-                                .summary("Fasty Bell Alert")
+                                .summary("Fastty Bell Alert")
                                 .body(&body)
-                                .appname("Fasty")
+                                .appname("Fastty")
                                 .show()
                             {
                                 tracing::warn!("Failed to send bell desktop notification: {:?}", e);
@@ -2295,9 +2295,9 @@ fn main() -> anyhow::Result<()> {
                             };
                             let body = format!("Finished in {}{}", duration_str, exit_str);
                             if let Err(e) = notify_rust::Notification::new()
-                                .summary("Fasty")
+                                .summary("Fastty")
                                 .body(&body)
-                                .appname("Fasty")
+                                .appname("Fastty")
                                 .show()
                             {
                                 tracing::warn!("Failed to send command finished notification: {:?}", e);
@@ -2308,7 +2308,7 @@ fn main() -> anyhow::Result<()> {
                         if let Err(e) = notify_rust::Notification::new()
                             .summary(&title)
                             .body(&body)
-                            .appname("Fasty")
+                            .appname("Fastty")
                             .show()
                         {
                             tracing::warn!("Failed to send desktop notification: {:?}", e);
@@ -2450,7 +2450,7 @@ fn main() -> anyhow::Result<()> {
                             bar_h = computed_bar_h;
 
                             let mut tab_titles = Vec::new();
-                            let mut active_tab_path = "fasty".to_string();
+                            let mut active_tab_path = "fastty".to_string();
                             for (idx, tab) in tabs.iter().enumerate() {
                                 let title = if let Some(ref name) = tab.custom_name {
                                     name.clone()
@@ -2465,7 +2465,7 @@ fn main() -> anyhow::Result<()> {
                                         };
                                         let path_component = path_str.as_ref()
                                             .map(|p| get_last_path_component(p))
-                                            .unwrap_or_else(|| "fasty".to_string());
+                                            .unwrap_or_else(|| "fastty".to_string());
                                         format!("{} - {}", agent_name, path_component)
                                     } else {
                                         let path_str = if let Some(pid) = tab.terminal_state.lock().shell_pid() {
@@ -2500,12 +2500,12 @@ fn main() -> anyhow::Result<()> {
                                 let shell_pid = active_tab.terminal_state.lock().shell_pid();
                                 let new_agent = detect_tui_agent(shell_pid);
                                 let new_title = match &new_agent {
-                                    Some(agent) => Some(format!("{} - fasty", agent)),
-                                    None => Some("fasty".to_string()),
+                                    Some(agent) => Some(format!("{} - fastty", agent)),
+                                    None => Some("fastty".to_string()),
                                 };
                                 if new_title != last_tui_title {
                                     // TUI agent state changed
-                                    let agent_just_exited = last_tui_title.as_deref() != Some("fasty")
+                                    let agent_just_exited = last_tui_title.as_deref() != Some("fastty")
                                         && new_agent.is_none();
                                     last_tui_title = new_title.clone();
                                     if let Some(ref t) = new_title {
@@ -3003,7 +3003,7 @@ fn main() -> anyhow::Result<()> {
                                                         settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                                         settings_active_field = 0;
                                                         match secondary_window::SecondaryWindow::create(
-                                                            target, "fasty Settings", 400.0, 260.0,
+                                                            target, "fastty Settings", 400.0, 260.0,
                                                             &renderer, &config.font.family,
                                                         ) {
                                                             Ok(mut sw) => {
@@ -3497,7 +3497,7 @@ fn main() -> anyhow::Result<()> {
                                                 settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                                 settings_active_field = 0;
                                                 match secondary_window::SecondaryWindow::create(
-                                                    target, "fasty Settings", 400.0, 260.0,
+                                                    target, "fastty Settings", 400.0, 260.0,
                                                     &renderer, &config.font.family,
                                                 ) {
                                                     Ok(mut sw) => {
@@ -3952,7 +3952,7 @@ fn main() -> anyhow::Result<()> {
                                                           if about.is_none() {
                                                               match secondary_window::SecondaryWindow::create(
                                                                   target,
-                                                                  "About Fasty",
+                                                                  "About Fastty",
                                                                   300.0,
                                                                   200.0,
                                                                   &renderer,
@@ -3999,7 +3999,7 @@ fn main() -> anyhow::Result<()> {
                                                                     clipboard.as_mut()
                                                                 }
                                                                 Err(_e) => {
-                                                                    eprintln!("fasty clipboard initialization failed: {:?}", _e);
+                                                                    eprintln!("fastty clipboard initialization failed: {:?}", _e);
                                                                     None
                                                                 }
                                                             }
@@ -4031,7 +4031,7 @@ fn main() -> anyhow::Result<()> {
                                                                     }
                                                                 }
                                                                 Err(e) => {
-                                                                    eprintln!("fasty clipboard get_text failed: {:?}", e);
+                                                                    eprintln!("fastty clipboard get_text failed: {:?}", e);
                                                                 }
                                                             }
                                                         }
@@ -4107,7 +4107,7 @@ fn main() -> anyhow::Result<()> {
                                                                         clipboard = Some(ctx);
                                                                     }
                                                                     Err(e) => {
-                                                                        eprintln!("fasty clipboard init failed: {:?}", e);
+                                                                        eprintln!("fastty clipboard init failed: {:?}", e);
                                                                     }
                                                                 }
                                                             }
@@ -4165,7 +4165,7 @@ fn main() -> anyhow::Result<()> {
                                                                 p.clone()
                                                             };
                                                             if let Err(e) = open_file_in_editor(std::path::Path::new(&resolved)) {
-                                                                eprintln!("fasty open_file_in_editor failed for '{}': {:?}", resolved, e);
+                                                                eprintln!("fastty open_file_in_editor failed for '{}': {:?}", resolved, e);
                                                             }
                                                         }
                                                         context_menu_visible = false;
@@ -4424,7 +4424,7 @@ fn main() -> anyhow::Result<()> {
                                                     settings_theme = config.theme.clone().unwrap_or_else(|| "default".to_string());
                                                    settings_active_field = 0;
                                                     match secondary_window::SecondaryWindow::create(
-                                                        target, "fasty Settings", 400.0, 260.0,
+                                                        target, "fastty Settings", 400.0, 260.0,
                                                         &renderer, &config.font.family,
                                                     ) {
                                                         Ok(mut sw) => {
@@ -6065,7 +6065,7 @@ fn main() -> anyhow::Result<()> {
                             (0, 0)
                         };
                         let attrs = winit::window::WindowAttributes::default()
-                            .with_title(tab.custom_name.as_deref().unwrap_or("fasty"))
+                            .with_title(tab.custom_name.as_deref().unwrap_or("fastty"))
                             .with_decorations(false)
                             .with_transparent(true)
                             .with_visible(true)
@@ -6168,7 +6168,7 @@ fn main() -> anyhow::Result<()> {
                             continue;
                         }
                         let mut attrs = winit::window::WindowAttributes::default()
-                            .with_title("fasty")
+                            .with_title("fastty")
                             .with_decorations(false)
                             .with_transparent(true)
                             .with_visible(true)
@@ -6290,7 +6290,7 @@ fn main() -> anyhow::Result<()> {
                     first_frame_rendered = true;
                     // Force render the first frame directly to commit the Wayland buffer and map the window!
                     let mut tab_titles = Vec::new();
-                    let mut active_tab_path = "fasty".to_string();
+                    let mut active_tab_path = "fastty".to_string();
                     for (idx, tab) in tabs.iter().enumerate() {
                         let path_str = if let Some(pid) = tab.terminal_state.lock().shell_pid() {
                             get_current_dir_shortened(pid)
@@ -6899,6 +6899,44 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn encode_cursor_key(
+    key_char: u8,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+    mode: alacritty_terminal::term::TermMode,
+) -> Vec<u8> {
+    let mut mod_val = 1;
+    if shift { mod_val += 1; }
+    if alt { mod_val += 2; }
+    if ctrl { mod_val += 4; }
+
+    if mod_val > 1 {
+        vec![0x1B, 0x5B, b'1', b';', b'0' + mod_val, key_char]
+    } else {
+        let prefix = if mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR) { 0x4F } else { 0x5B };
+        vec![0x1B, prefix, key_char]
+    }
+}
+
+fn encode_keypad_key(
+    key_code: u8,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+) -> Vec<u8> {
+    let mut mod_val = 1;
+    if shift { mod_val += 1; }
+    if alt { mod_val += 2; }
+    if ctrl { mod_val += 4; }
+
+    if mod_val > 1 {
+        vec![0x1B, 0x5B, key_code, b';', b'0' + mod_val, b'~']
+    } else {
+        vec![0x1B, 0x5B, key_code, b'~']
+    }
+}
+
 fn key_to_bytes(
     key: &Key,
     shift_active: bool,
@@ -6908,13 +6946,39 @@ fn key_to_bytes(
 ) -> Vec<u8> {
     match key {
         Key::Character(s) if !s.is_empty() => {
-            if alt_active && !ctrl_active {
-                // Alt + key (Meta key — prefix with Escape)
-                let mut bytes = vec![0x1B];
-                bytes.extend_from_slice(s.as_bytes());
-                bytes
+            let bytes = if ctrl_active {
+                if s.len() == 1 {
+                    let c = s.chars().next().unwrap();
+                    if (c as u32) < 32 {
+                        vec![c as u8]
+                    } else if c.is_ascii_alphabetic() {
+                        let base = c.to_ascii_lowercase() as u8;
+                        vec![base - b'a' + 1]
+                    } else {
+                        match c {
+                            '@' => vec![0x00],
+                            '[' => vec![0x1B],
+                            '\\' => vec![0x1C],
+                            ']' => vec![0x1D],
+                            '^' => vec![0x1E],
+                            '_' => vec![0x1F],
+                            '?' => vec![0x7F],
+                            _ => s.as_bytes().to_vec(),
+                        }
+                    }
+                } else {
+                    s.as_bytes().to_vec()
+                }
             } else {
                 s.as_bytes().to_vec()
+            };
+
+            if alt_active {
+                let mut alt_bytes = vec![0x1B];
+                alt_bytes.extend(bytes);
+                alt_bytes
+            } else {
+                bytes
             }
         }
         Key::Named(n) => {
@@ -6934,11 +6998,19 @@ fn key_to_bytes(
                         } else {
                             vec![0x1B, 0x0D] // \x1b\r (Esc + Enter / Alt+Enter)
                         }
+                    } else if ctrl_active {
+                        vec![0x0A] // Ctrl + Enter -> LF
                     } else {
                         vec![b'\r']
                     }
                 }
-                NamedKey::Space => vec![b' '],
+                NamedKey::Space => {
+                    if ctrl_active {
+                        vec![0x00]
+                    } else {
+                        vec![b' ']
+                    }
+                }
                 NamedKey::Backspace => vec![0x7F],
                 NamedKey::Tab => {
                     if shift_active {
@@ -6949,77 +7021,35 @@ fn key_to_bytes(
                 }
                 NamedKey::Escape => vec![0x1B],
 
-                // Arrow keys — DECCKM: application cursor mode uses ESC O instead of ESC [
-                NamedKey::ArrowUp => {
-                    let prefix = if mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR) { 0x4F } else { 0x5B };
-                    if ctrl_active {
-                        vec![0x1B, prefix, 0x31, 0x3B, 0x35, 0x41]
-                    } else {
-                        vec![0x1B, prefix, 0x41]
-                    }
-                }
-                NamedKey::ArrowDown => {
-                    let prefix = if mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR) { 0x4F } else { 0x5B };
-                    if ctrl_active {
-                        vec![0x1B, prefix, 0x31, 0x3B, 0x35, 0x42]
-                    } else {
-                        vec![0x1B, prefix, 0x42]
-                    }
-                }
-                NamedKey::ArrowRight => {
-                    let prefix = if mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR) { 0x4F } else { 0x5B };
-                    if ctrl_active {
-                        vec![0x1B, prefix, 0x31, 0x3B, 0x35, 0x43]
-                    } else {
-                        vec![0x1B, prefix, 0x43]
-                    }
-                }
-                NamedKey::ArrowLeft => {
-                    let prefix = if mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR) { 0x4F } else { 0x5B };
-                    if ctrl_active {
-                        vec![0x1B, prefix, 0x31, 0x3B, 0x35, 0x44]
-                    } else {
-                        vec![0x1B, prefix, 0x44]
-                    }
-                }
+                // Arrow keys
+                NamedKey::ArrowUp => encode_cursor_key(b'A', shift_active, alt_active, ctrl_active, mode),
+                NamedKey::ArrowDown => encode_cursor_key(b'B', shift_active, alt_active, ctrl_active, mode),
+                NamedKey::ArrowRight => encode_cursor_key(b'C', shift_active, alt_active, ctrl_active, mode),
+                NamedKey::ArrowLeft => encode_cursor_key(b'D', shift_active, alt_active, ctrl_active, mode),
 
-                // Home/End — also affected by DECCKM
-                NamedKey::Home => {
-                    if shift_active {
-                        vec![0x1B, 0x5B, 0x31, 0x3B, 0x32, 0x48] // \x1b[1;2H
-                    } else if mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR) {
-                        vec![0x1B, 0x4F, 0x48] // \x1bOH
-                    } else {
-                        vec![0x1B, 0x5B, 0x48] // \x1b[H
-                    }
-                }
-                NamedKey::End => {
-                    if shift_active {
-                        vec![0x1B, 0x5B, 0x31, 0x3B, 0x32, 0x46] // \x1b[1;2F
-                    } else if mode.contains(alacritty_terminal::term::TermMode::APP_CURSOR) {
-                        vec![0x1B, 0x4F, 0x46] // \x1bOF
-                    } else {
-                        vec![0x1B, 0x5B, 0x46] // \x1b[F
-                    }
-                }
-                NamedKey::PageUp => vec![0x1B, 0x5B, 0x35, 0x7E],   // \x1b[5~
-                NamedKey::PageDown => vec![0x1B, 0x5B, 0x36, 0x7E], // \x1b[6~
-                NamedKey::Insert => vec![0x1B, 0x5B, 0x32, 0x7E],   // \x1b[2~
-                NamedKey::Delete => vec![0x1B, 0x5B, 0x33, 0x7E],   // \x1b[3~
+                // Home/End
+                NamedKey::Home => encode_cursor_key(b'H', shift_active, alt_active, ctrl_active, mode),
+                NamedKey::End => encode_cursor_key(b'F', shift_active, alt_active, ctrl_active, mode),
+
+                // Keypad navigation
+                NamedKey::PageUp => encode_keypad_key(b'5', shift_active, alt_active, ctrl_active),
+                NamedKey::PageDown => encode_keypad_key(b'6', shift_active, alt_active, ctrl_active),
+                NamedKey::Insert => encode_keypad_key(b'2', shift_active, alt_active, ctrl_active),
+                NamedKey::Delete => encode_keypad_key(b'3', shift_active, alt_active, ctrl_active),
 
                 // Function keys
-                NamedKey::F1 => vec![0x1B, 0x4F, 0x50],  // \x1bOP
-                NamedKey::F2 => vec![0x1B, 0x4F, 0x51],  // \x1bOQ
-                NamedKey::F3 => vec![0x1B, 0x4F, 0x52],  // \x1bOR
-                NamedKey::F4 => vec![0x1B, 0x4F, 0x53],  // \x1bOS
-                NamedKey::F5 => vec![0x1B, 0x5B, 0x31, 0x35, 0x7E], // \x1b[15~
-                NamedKey::F6 => vec![0x1B, 0x5B, 0x31, 0x37, 0x7E], // \x1b[17~
-                NamedKey::F7 => vec![0x1B, 0x5B, 0x31, 0x38, 0x7E], // \x1b[18~
-                NamedKey::F8 => vec![0x1B, 0x5B, 0x31, 0x39, 0x7E], // \x1b[19~
-                NamedKey::F9 => vec![0x1B, 0x5B, 0x32, 0x30, 0x7E], // \x1b[20~
-                NamedKey::F10 => vec![0x1B, 0x5B, 0x32, 0x31, 0x7E], // \x1b[21~
-                NamedKey::F11 => vec![0x1B, 0x5B, 0x32, 0x33, 0x7E], // \x1b[23~
-                NamedKey::F12 => vec![0x1B, 0x5B, 0x32, 0x34, 0x7E], // \x1b[24~
+                NamedKey::F1 => vec![0x1B, 0x4F, 0x50],
+                NamedKey::F2 => vec![0x1B, 0x4F, 0x51],
+                NamedKey::F3 => vec![0x1B, 0x4F, 0x52],
+                NamedKey::F4 => vec![0x1B, 0x4F, 0x53],
+                NamedKey::F5 => vec![0x1B, 0x5B, 0x31, 0x35, 0x7E],
+                NamedKey::F6 => vec![0x1B, 0x5B, 0x31, 0x37, 0x7E],
+                NamedKey::F7 => vec![0x1B, 0x5B, 0x31, 0x38, 0x7E],
+                NamedKey::F8 => vec![0x1B, 0x5B, 0x31, 0x39, 0x7E],
+                NamedKey::F9 => vec![0x1B, 0x5B, 0x32, 0x30, 0x7E],
+                NamedKey::F10 => vec![0x1B, 0x5B, 0x32, 0x31, 0x7E],
+                NamedKey::F11 => vec![0x1B, 0x5B, 0x32, 0x33, 0x7E],
+                NamedKey::F12 => vec![0x1B, 0x5B, 0x32, 0x34, 0x7E],
 
                 _ => Vec::new(),
             }
@@ -7078,7 +7108,7 @@ fn copy_selection_to_clipboard(
                     clipboard.as_mut()
                 }
                 Err(e) => {
-                    eprintln!("fasty clipboard copy initialization failed: {:?}", e);
+                    eprintln!("fastty clipboard copy initialization failed: {:?}", e);
                     None
                 }
             }
@@ -7087,10 +7117,10 @@ fn copy_selection_to_clipboard(
         };
         if let Some(ctx) = ctx_opt {
             if let Err(e) = ctx.set_text(text) {
-                eprintln!("fasty clipboard copy set_text failed: {:?}", e);
+                eprintln!("fastty clipboard copy set_text failed: {:?}", e);
             }
         } else {
-            eprintln!("fasty clipboard copy not available");
+            eprintln!("fastty clipboard copy not available");
         }
     }
 }
@@ -7663,34 +7693,34 @@ fn trigger_update(
 ) {
     let completed = *update_completed.lock();
     if completed {
-        // Spawn the newly updated fasty binary in the background!
+        // Spawn the newly updated fastty binary in the background!
         #[cfg(target_os = "windows")]
         {
             let home = std::env::var("USERPROFILE").unwrap_or_default();
-            let fasty_path = std::path::Path::new(&home)
+            let fastty_path = std::path::Path::new(&home)
                 .join(".local")
                 .join("bin")
-                .join("fasty.exe");
-            let _ = no_window_cmd(&fasty_path.to_string_lossy()).spawn();
+                .join("fastty.exe");
+            let _ = no_window_cmd(&fastty_path.to_string_lossy()).spawn();
         }
 
         #[cfg(target_os = "macos")]
         {
             let _ = std::process::Command::new("open")
                 .arg("-a")
-                .arg("Fasty")
+                .arg("Fastty")
                 .spawn();
         }
 
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             // Linux
-            let binary_path = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin/fasty"));
+            let binary_path = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin/fastty"));
             let home = std::env::var("HOME").unwrap_or_default();
             let local_path = std::path::Path::new(&home)
                 .join(".local")
                 .join("bin")
-                .join("fasty");
+                .join("fastty");
             let spawn_path = if local_path.exists() {
                 local_path
             } else {
@@ -7723,7 +7753,7 @@ fn trigger_update(
             let mut success = false;
             if let Ok(mut child) = no_window_cmd("powershell")
                 .arg("-Command")
-                .arg("irm https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.ps1 | iex")
+                .arg("irm https://raw.githubusercontent.com/diegoleteliers10/fastty/main/instalar.ps1 | iex")
                 .spawn() {
                 if let Ok(status) = child.wait() {
                     success = status.success();
@@ -7742,7 +7772,7 @@ fn trigger_update(
     #[cfg(not(target_os = "windows"))]
     {
         if let Some(tab) = tabs.get(active_tab_index) {
-            let cmd = b"curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash -s -- --user\n";
+            let cmd = b"curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fastty/main/instalar.sh | bash -s -- --user\n";
             tab.terminal_state.lock().write_to_pty(cmd);
         }
 
@@ -7750,7 +7780,7 @@ fn trigger_update(
         let update_completed_clone = Arc::clone(update_completed);
         let window_clone = Arc::clone(window);
         std::thread::spawn(move || {
-            let marker = std::path::Path::new("/tmp/fasty-update-done");
+            let marker = std::path::Path::new("/tmp/fastty-update-done");
             for _ in 0..300u32 {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 if marker.exists() {
@@ -7798,15 +7828,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fasty_args_parsing() {
+    fn test_fastty_args_parsing() {
         // Test no args
-        let args = FastyArgs::parse_from(vec![]);
+        let args = FasttyArgs::parse_from(vec![]);
         assert!(args.command.is_none());
         assert!(args.working_dir.is_none());
         assert!(args.title.is_none());
 
         // Test title and directory
-        let args = FastyArgs::parse_from(vec![
+        let args = FasttyArgs::parse_from(vec![
             "--title".to_string(),
             "My Terminal".to_string(),
             "-d".to_string(),
@@ -7817,7 +7847,7 @@ mod tests {
         assert_eq!(args.title.as_deref(), Some("My Terminal"));
 
         // Test command with multiple args
-        let args = FastyArgs::parse_from(vec![
+        let args = FasttyArgs::parse_from(vec![
             "-e".to_string(),
             "nvim".to_string(),
             "src/main.rs".to_string(),
@@ -7830,7 +7860,7 @@ mod tests {
         assert!(args.title.is_none());
 
         // Test command mixed with other options (command consumes the rest)
-        let args = FastyArgs::parse_from(vec![
+        let args = FasttyArgs::parse_from(vec![
             "--title".to_string(),
             "My Dev Window".to_string(),
             "-d".to_string(),

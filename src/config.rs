@@ -1,9 +1,9 @@
-//! Configuration for fasty terminal emulator.
+//! Configuration for fastty terminal emulator.
 //!
-//! Primary source: `fasty.toml`. Search order:
-//!   1. `./fasty.toml` (cwd, portable)
-//!   2. `/etc/fasty/fasty.toml` (system-wide)
-//!   3. `~/.config/fasty/fasty.toml` (user)
+//! Primary source: `fastty.toml`. Search order:
+//!   1. `./fastty.toml` (cwd, portable)
+//!   2. `/etc/fastty/fastty.toml` (system-wide)
+//!   3. `~/.config/fastty/fastty.toml` (user)
 //!
 //! Legacy `config.json` from <= v0.2.7 is auto-migrated on first launch
 //! (user path only) and the original is renamed to `config.json.bak`.
@@ -334,7 +334,7 @@ impl Default for FontConfig {
 }
 
 fn user_toml_path() -> PathBuf {
-    crate::paths::get().config_dir.join("fasty.toml")
+    crate::paths::get().config_dir.join("fastty.toml")
 }
 
 fn user_legacy_json_path() -> PathBuf {
@@ -343,8 +343,8 @@ fn user_legacy_json_path() -> PathBuf {
 
 fn candidate_toml_paths() -> Vec<PathBuf> {
     vec![
-        PathBuf::from("fasty.toml"),
-        PathBuf::from("/etc/fasty/fasty.toml"),
+        PathBuf::from("fastty.toml"),
+        PathBuf::from("/etc/fastty/fastty.toml"),
         user_toml_path(),
     ]
 }
@@ -524,7 +524,7 @@ where
     let watched_file = file_path.clone();
     let watched_name = watched_file.file_name().map(|n| n.to_owned());
     std::thread::Builder::new()
-        .name("fasty-config-watch".into())
+        .name("fastty-config-watch".into())
         .spawn(move || {
             let _debouncer = debouncer;
             for batch in rx {

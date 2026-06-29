@@ -4,16 +4,16 @@ use std::sync::OnceLock;
 
 use anyhow::{Context, anyhow};
 
-pub struct FastyDirs {
+pub struct FasttyDirs {
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
     pub state_dir: PathBuf,
     pub cache_dir: PathBuf,
 }
 
-pub static FASTY_DIRS: OnceLock<FastyDirs> = OnceLock::new();
+pub static FASTTY_DIRS: OnceLock<FasttyDirs> = OnceLock::new();
 
-impl FastyDirs {
+impl FasttyDirs {
     pub fn new() -> anyhow::Result<Self> {
         let (config_dir, data_dir, state_dir, cache_dir) = if cfg!(target_os = "windows") {
             let app_data = dirs::config_dir()
@@ -21,10 +21,10 @@ impl FastyDirs {
             let local_app_data = dirs::data_local_dir()
                 .ok_or_else(|| anyhow!("dirs::data_local_dir returned None (unsupported platform)"))?;
             (
-                app_data.join("fasty").join("config"),
-                app_data.join("fasty").join("data"),
-                local_app_data.join("fasty").join("state"),
-                local_app_data.join("fasty").join("cache"),
+                app_data.join("fastty").join("config"),
+                app_data.join("fastty").join("data"),
+                local_app_data.join("fastty").join("state"),
+                local_app_data.join("fastty").join("cache"),
             )
         } else if cfg!(target_os = "macos") {
             let app_support = dirs::config_dir()
@@ -32,10 +32,10 @@ impl FastyDirs {
             let caches = dirs::cache_dir()
                 .ok_or_else(|| anyhow!("dirs::cache_dir returned None (unsupported platform)"))?;
             (
-                app_support.join("fasty"),
-                app_support.join("fasty"),
-                app_support.join("fasty"),
-                caches.join("fasty"),
+                app_support.join("fastty"),
+                app_support.join("fastty"),
+                app_support.join("fastty"),
+                caches.join("fastty"),
             )
         } else {
             // Linux and other Unix-like OS
@@ -53,10 +53,10 @@ impl FastyDirs {
             let cache = dirs::cache_dir()
                 .ok_or_else(|| anyhow!("dirs::cache_dir returned None (unsupported platform)"))?;
             (
-                config.join("fasty"),
-                data.join("fasty"),
-                state.join("fasty"),
-                cache.join("fasty"),
+                config.join("fastty"),
+                data.join("fastty"),
+                state.join("fastty"),
+                cache.join("fastty"),
             )
         };
 
@@ -80,11 +80,11 @@ impl FastyDirs {
     }
 }
 
-pub fn init() -> anyhow::Result<&'static FastyDirs> {
-    let dirs = FastyDirs::new()?;
-    Ok(FASTY_DIRS.get_or_init(|| dirs))
+pub fn init() -> anyhow::Result<&'static FasttyDirs> {
+    let dirs = FasttyDirs::new()?;
+    Ok(FASTTY_DIRS.get_or_init(|| dirs))
 }
 
-pub fn get() -> &'static FastyDirs {
-    FASTY_DIRS.get().expect("FASTY_DIRS not initialized; call paths::init() first")
+pub fn get() -> &'static FasttyDirs {
+    FASTTY_DIRS.get().expect("FASTTY_DIRS not initialized; call paths::init() first")
 }

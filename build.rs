@@ -2,12 +2,12 @@ fn main() {
     // Solo compilar y enlazar el recurso de icono si el sistema operativo objetivo es Windows
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut res = winres::WindowsResource::new();
-        res.set_icon("assets/fastyIcon.ico");
+        res.set_icon("assets/fasttyIcon.ico");
         res.set_manifest(r#"
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
 <assemblyIdentity
     type="win32"
-    name="fasty"
+    name="fastty"
     version="0.2.5.0"
     processorArchitecture="*"
 />

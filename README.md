@@ -1,16 +1,16 @@
-# Fasty
+# Fastty
 
 <div align="center">
-  <img src="assets/fastyIcon.png" alt="Fasty Logo" width="128" />
+  <img src="assets/fasttyIcon.png" alt="Fastty Logo" width="128" />
 </div>
 
 > GPU-accelerated terminal emulator built with Rust, winit, and wgpu
 
-Fasty leverages `wgpu` (the modern, cross-platform GPU API powering GPUI/Zed) for rendering instead of raw Vulkan/Metal implementations, presenting a minimal UI footprint with ultra-high performance. Inspired by [Ghostty](https://github.com/ghostty-org/ghostty).
+Fastty leverages `wgpu` (the modern, cross-platform GPU API powering GPUI/Zed) for rendering instead of raw Vulkan/Metal implementations, presenting a minimal UI footprint with ultra-high performance. Inspired by [Ghostty](https://github.com/ghostty-org/ghostty).
 
 ## Overview
 
-Fasty is a modern terminal emulator that combines GPU acceleration with a minimal feature set. It runs on Vulkan, Metal, DX12, and OpenGL ES through wgpu, providing consistent performance across platforms.
+Fastty is a modern terminal emulator that combines GPU acceleration with a minimal feature set. It runs on Vulkan, Metal, DX12, and OpenGL ES through wgpu, providing consistent performance across platforms.
 
 **Key characteristics:**
 - GPU-accelerated rendering with `<1%` CPU idle usage
@@ -26,26 +26,26 @@ Fasty is a modern terminal emulator that combines GPU acceleration with a minima
 
 **Linux & macOS:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash
+curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fastty/main/instalar.sh | bash
 ```
 
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.ps1 | iex
+irm https://raw.githubusercontent.com/diegoleteliers10/fastty/main/instalar.ps1 | iex
 ```
 
 ### Manual Install
 
-Download from [Releases](https://github.com/diegoleteliers10/fasty/releases).
+Download from [Releases](https://github.com/diegoleteliers10/fastty/releases).
 
 Extract and install:
 ```bash
 # Linux
 mkdir -p ~/.local/bin
-mv fasty ~/.local/bin/
+mv fastty ~/.local/bin/
 
 # macOS
-mv Fasty.app /Applications/
+mv Fastty.app /Applications/
 ```
 
 ### Build from Source
@@ -63,17 +63,17 @@ cargo build --release
 
 **Basic usage:**
 ```bash
-fasty                                    # Default shell
-fasty -e htop                            # Run command, auto-close on exit
-fasty -e ssh user@server                 # SSH session
-fasty -d ~/my-project -e bun run dev    # Dev server in specific directory
+fastty                                    # Default shell
+fastty -e htop                            # Run command, auto-close on exit
+fastty -e ssh user@server                 # SSH session
+fastty -d ~/my-project -e bun run dev    # Dev server in specific directory
 ```
 
 **Configuration:**
-Fasty reads `fasty.toml` from:
-1. `./fasty.toml` (portable)
-2. `/etc/fasty/fasty.toml` (system)
-3. `~/.config/fasty/fasty.toml` (user)
+Fastty reads `fastty.toml` from:
+1. `./fastty.toml` (portable)
+2. `/etc/fastty/fastty.toml` (system)
+3. `~/.config/fastty/fastty.toml` (user)
 
 ```toml
 shell = "/bin/bash"
@@ -126,7 +126,7 @@ ctrl+shift+p = "command_palette"
 **Themes:**
 Built-in themes available: `default`, `catppuccin`, `one-dark`, `solarized-dark`, `high-contrast`
 
-Custom themes as JSON in `~/.config/fasty/themes/`:
+Custom themes as JSON in `~/.config/fastty/themes/`:
 ```json
 {
   "background": "#1a1b26",
@@ -158,7 +158,7 @@ interval_ms = 10000
 Available widget types: `git`, `time`, `kube`, `aws`, `command`
 
 **Snippets:**
-Shell command expansion via Tab in `~/.config/fasty/snippets.toml`:
+Shell command expansion via Tab in `~/.config/fastty/snippets.toml`:
 ```toml
 "gst" = "git status"
 "gcm" = "git commit -m \"${1:message}\""
@@ -199,7 +199,7 @@ src/
 
 ## Performance
 
-Fasty achieves sub-1% CPU idle through:
+Fastty achieves sub-1% CPU idle through:
 - `winit`'s `ControlFlow::Wait` for event-driven sleeping
 - Blocking PTY read loop at OS kernel level
 - Micro-optimized cursor blink with GPU fast-path (48-byte buffer write)

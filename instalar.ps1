@@ -1,25 +1,25 @@
 # ==============================================================================
-# Fasty installation script for Windows (PowerShell)
+# Fastty installation script for Windows (PowerShell)
 # ==============================================================================
 # Run directly from PowerShell with:
-# irm https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.ps1 | iex
+# irm https://raw.githubusercontent.com/diegoleteliers10/fastty/main/instalar.ps1 | iex
 # ==============================================================================
 
 $GitHubUser = "diegoleteliers10"
-$GitHubRepo = "fasty"
-$AppName    = "fasty"
-$BinaryName = "fasty.exe"
+$GitHubRepo = "fastty"
+$AppName    = "fastty"
+$BinaryName = "fastty.exe"
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 Write-Host "=== Starting $AppName installation on Windows ===" -ForegroundColor Green
 
 # ── 1. Resolve platform directories ────────────────────────────────────────────
-$ConfigDir = Join-Path $env:APPDATA     "fasty\config"
-$DataDir   = Join-Path $env:APPDATA     "fasty\data"
-$StateDir  = Join-Path $env:LOCALAPPDATA "fasty\state"
-$CacheDir  = Join-Path $env:LOCALAPPDATA "fasty\cache"
-$BinDir    = Join-Path $env:LOCALAPPDATA "fasty\bin"
+$ConfigDir = Join-Path $env:APPDATA     "fastty\config"
+$DataDir   = Join-Path $env:APPDATA     "fastty\data"
+$StateDir  = Join-Path $env:LOCALAPPDATA "fastty\state"
+$CacheDir  = Join-Path $env:LOCALAPPDATA "fastty\cache"
+$BinDir    = Join-Path $env:LOCALAPPDATA "fastty\bin"
 
 # ── 2. Create directories ──────────────────────────────────────────────────────
 foreach ($dir in @($ConfigDir, $DataDir, $StateDir, $CacheDir, $BinDir)) {
@@ -149,13 +149,13 @@ if (-not $IsInPath) {
 Write-Host "Creating Start Menu shortcut..." -ForegroundColor Cyan
 try {
     $StartMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
-    $ShortcutPath = Join-Path $StartMenuDir "Fasty.lnk"
+    $ShortcutPath = Join-Path $StartMenuDir "Fastty.lnk"
 
     $WshShell = New-Object -ComObject WScript.Shell
     $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
     $Shortcut.TargetPath = $ExeDestPath
     $Shortcut.WorkingDirectory = $BinDir
-    $Shortcut.Description = "Fasty Terminal Emulator"
+    $Shortcut.Description = "Fastty Terminal Emulator"
     $Shortcut.Save()
 
     Write-Host "Start Menu shortcut created successfully." -ForegroundColor Green
@@ -168,7 +168,7 @@ Remove-Item -Recurse -Force $TempDir -ErrorAction SilentlyContinue
 
 # ── 10. Summary ────────────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "✓ Binary  -> $BinDir\fasty.exe"
+Write-Host "✓ Binary  -> $BinDir\fastty.exe"
 Write-Host "✓ Config  -> $ConfigDir"
 Write-Host "✓ Data    -> $DataDir"
 Write-Host "✓ State   -> $StateDir"
