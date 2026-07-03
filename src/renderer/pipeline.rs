@@ -2315,7 +2315,7 @@ impl Pipeline {
 
         // 3. Minimize button (─)
         let min_x = crate::chrome_layout::min_rect(viewport_width).x;
-        if hover_min && !cfg!(target_os = "macos") {
+        if hover_min {
             bg_instances.push(CellInstance::new(
                 min_x,
                 controls_y,
@@ -2366,7 +2366,7 @@ impl Pipeline {
 
         // 4. Maximize button (▢)
         let max_x = crate::chrome_layout::max_rect(viewport_width).x;
-        if hover_max && !cfg!(target_os = "macos") {
+        if hover_max {
             bg_instances.push(CellInstance::new(
                 max_x,
                 controls_y,
@@ -2417,7 +2417,7 @@ impl Pipeline {
 
         // 5. Close button (✕)
         let close_x = crate::chrome_layout::close_rect(viewport_width).x;
-        if hover_close && !cfg!(target_os = "macos") {
+        if hover_close {
             bg_instances.push(CellInstance::new(
                 close_x,
                 controls_y,

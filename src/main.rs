@@ -540,17 +540,10 @@ fn handle_popped_out_event(
                                 && wc.drag_current_y >= close_min_y && wc.drag_current_y <= close_max_y;
 
                             if is_close_click {
-                                wc.tabs.remove(clicked_tab_idx);
-                                if wc.tabs.is_empty() {
+                                if wc.close_tab(clicked_tab_idx) {
                                     popped.remove(&window_id);
                                     return;
                                 }
-                                if wc.active_tab_index >= wc.tabs.len() {
-                                    wc.active_tab_index = wc.tabs.len() - 1;
-                                }
-                                let (cols, rows) = resize_all_tabs(&wc.tabs, wc.window.inner_size().width, wc.window.inner_size().height, wc.cell_width, wc.cell_height);
-                                wc.shell_cols = cols;
-                                wc.shell_rows = rows;
                             } else {
                                 wc.dragging_tab = Some(clicked_tab_idx);
                                 wc.drag_start_x = wc.drag_current_x;
@@ -2121,9 +2114,59 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
-                    AppEvent::Exit => {
+                    AppEvent::Exit { shell_pid } => {
                         if auto_close {
                             target.exit();
+                        } else if let Some(pid) = shell_pid {
+                            // The shell in one tab died (e.g. user typed `exit`).
+                            // Close that tab; if it was the last tab in its
+                            // window, close the window (or the app for main).
+                            let found_in_main = tabs
+                                .iter()
+                                .position(|t| t.terminal_state.lock().shell_pid() == Some(pid));
+                            if let Some(idx) = found_in_main {
+                                tabs.remove(idx);
+                                if tabs.is_empty() {
+                                    target.exit();
+                                } else {
+                                    if active_tab_index >= tabs.len() {
+                                        active_tab_index = tabs.len() - 1;
+                                    }
+                                    let physical_size = window_for_redraw.inner_size();
+                                    let (cols, rows) = resize_all_tabs(
+                                        &tabs,
+                                        physical_size.width,
+                                        physical_size.height,
+                                        cell_width,
+                                        cell_height,
+                                    );
+                                    shell_cols = cols;
+                                    shell_rows = rows;
+                                    app_dirty = true;
+                                    renderer.lock().grid_dirty = true;
+                                    window_for_redraw.request_redraw();
+                                }
+                            } else {
+                                // Search popped-out windows.
+                                let mut close_wid = None;
+                                for (wid, wc) in popped_out_windows.iter_mut() {
+                                    if let Some(idx) = wc
+                                        .tabs
+                                        .iter()
+                                        .position(|t| {
+                                            t.terminal_state.lock().shell_pid() == Some(pid)
+                                        })
+                                    {
+                                        if wc.close_tab(idx) {
+                                            close_wid = Some(*wid);
+                                        }
+                                        break;
+                                    }
+                                }
+                                if let Some(wid) = close_wid {
+                                    popped_out_windows.remove(&wid);
+                                }
+                            }
                         }
                     }
                     AppEvent::ForceExit => {
