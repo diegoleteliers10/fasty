@@ -1607,7 +1607,7 @@ impl FasttyArgs {
     }
 }
 
-#[allow(deprecated)]
+#[allow(deprecated, unused_mut)]
 fn main() -> anyhow::Result<()> {
     std::env::set_var("TERM", "xterm-256color");
     std::env::set_var("COLORTERM", "truecolor");
@@ -3107,7 +3107,7 @@ fn main() -> anyhow::Result<()> {
                                                              &renderer,
                                                              &config.font.family,
                                                          ) {
-                                                             Ok(sw) => {
+                                                             Ok(mut sw) => {
                                                                  #[cfg(target_os = "windows")]
                                                                  {
                                                                      sw.show_and_focus();
@@ -3608,7 +3608,7 @@ fn main() -> anyhow::Result<()> {
                                                      &renderer,
                                                      &config.font.family,
                                                  ) {
-                                                     Ok(sw) => {
+                                                     Ok(mut sw) => {
                                                          #[cfg(target_os = "windows")]
                                                          {
                                                              sw.renderer.set_dirty(true);
@@ -4066,7 +4066,7 @@ fn main() -> anyhow::Result<()> {
                                                                    &renderer,
                                                                    &config.font.family,
                                                                ) {
-                                                                   Ok(sw) => {
+                                                                   Ok(mut sw) => {
                                                                        #[cfg(target_os = "windows")]
                                                                        {
                                                                            sw.renderer.set_dirty(true);
@@ -4538,7 +4538,7 @@ fn main() -> anyhow::Result<()> {
                                                          &renderer,
                                                          &config.font.family,
                                                      ) {
-                                                         Ok(sw) => {
+                                                         Ok(mut sw) => {
                                                              #[cfg(target_os = "windows")]
                                                              {
                                                                  sw.renderer.set_dirty(true);
@@ -7364,7 +7364,7 @@ fn open_url(url: &str) {
     #[cfg(target_os = "macos")]
     let cmd = "open";
     #[cfg(target_os = "windows")]
-    let cmd = "start";
+    let _cmd = "start";
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let cmd = "xdg-open";
 
@@ -7810,8 +7810,8 @@ fn trigger_update(
     update_completed: &Arc<parking_lot::Mutex<bool>>,
     window: &Arc<winit::window::Window>,
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
-    tabs: &Vec<Tab>,
-    active_tab_index: usize,
+    _tabs: &Vec<Tab>,
+    _active_tab_index: usize,
 ) {
     let completed = *update_completed.lock();
     if completed {
@@ -7893,7 +7893,7 @@ fn trigger_update(
 
     #[cfg(not(target_os = "windows"))]
     {
-        if let Some(tab) = tabs.get(active_tab_index) {
+        if let Some(tab) = _tabs.get(_active_tab_index) {
             let cmd = b"curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fastty/main/instalar.sh | bash -s -- --user\n";
             tab.terminal_state.lock().write_to_pty(cmd);
         }
