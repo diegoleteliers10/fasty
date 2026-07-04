@@ -95,4 +95,30 @@ impl WindowContext {
             scroll_velocity: 0.0,
         }
     }
+
+    /// Remove the tab at `idx`, clamp the active index, and resize the
+    /// remaining tabs. Returns `true` if the window is now empty (caller
+    /// should close it).
+    pub fn close_tab(&mut self, idx: usize) -> bool {
+        self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            return true;
+        }
+        if self.active_tab_index >= self.tabs.len() {
+            self.active_tab_index = self.tabs.len() - 1;
+        }
+        let inner = self.window.inner_size();
+        let (cols, rows) = crate::resize_all_tabs(
+            &self.tabs,
+            inner.width,
+            inner.height,
+            self.cell_width,
+            self.cell_height,
+        );
+        self.shell_cols = cols;
+        self.shell_rows = rows;
+        self.renderer.lock().grid_dirty = true;
+        self.window.request_redraw();
+        false
+    }
 }

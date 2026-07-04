@@ -35,21 +35,24 @@ mod macos_impl {
         size: NSSize,
     }
 
+    // NSPoint/NSSize/NSRect are aliases for CGPoint/CGSize/CGRect, so the
+    // runtime reports their type codes under the CG* names. objc2 0.5 verifies
+    // the declared encoding against the signature and panics on mismatch.
     unsafe impl Encode for NSPoint {
-        const ENCODING: Encoding = Encoding::Struct("_NSPoint", &[f64::ENCODING, f64::ENCODING]);
+        const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
     }
     unsafe impl RefEncode for NSPoint {
         const ENCODING_REF: Encoding = Encoding::Pointer(&Self::ENCODING);
     }
     unsafe impl Encode for NSSize {
-        const ENCODING: Encoding = Encoding::Struct("_NSSize", &[f64::ENCODING, f64::ENCODING]);
+        const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
     }
     unsafe impl RefEncode for NSSize {
         const ENCODING_REF: Encoding = Encoding::Pointer(&Self::ENCODING);
     }
     unsafe impl Encode for NSRect {
         const ENCODING: Encoding =
-            Encoding::Struct("_NSRect", &[NSPoint::ENCODING, NSSize::ENCODING]);
+            Encoding::Struct("CGRect", &[NSPoint::ENCODING, NSSize::ENCODING]);
     }
     unsafe impl RefEncode for NSRect {
         const ENCODING_REF: Encoding = Encoding::Pointer(&Self::ENCODING);
