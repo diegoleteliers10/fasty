@@ -3,13 +3,13 @@
 # Fastty installation script for Linux and macOS
 # ==============================================================================
 # Run directly from the internet with:
-# curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fastty/main/instalar.sh | bash
+# curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.sh | bash
 # ==============================================================================
 
 set -euo pipefail
 
 GITHUB_USER="diegoleteliers10"
-GITHUB_REPO="fastty"
+GITHUB_REPO="fasty"
 APP_NAME="fastty"
 
 echo "=== Starting $APP_NAME installation ==="
