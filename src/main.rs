@@ -3101,7 +3101,7 @@ fn main() -> anyhow::Result<()> {
                                                         settings_active_field = 0;
                                                         match secondary_window::SecondaryWindow::create(
                                                              target,
-                                                             "fasty Settings",
+                                                             "fastty Settings",
                                                              400.0,
                                                              260.0,
                                                              &renderer,
@@ -3602,7 +3602,7 @@ fn main() -> anyhow::Result<()> {
                                                 settings_active_field = 0;
                                                 match secondary_window::SecondaryWindow::create(
                                                      target,
-                                                     "fasty Settings",
+                                                     "fastty Settings",
                                                      400.0,
                                                      260.0,
                                                      &renderer,
@@ -4532,7 +4532,7 @@ fn main() -> anyhow::Result<()> {
                                                    settings_active_field = 0;
                                                     match secondary_window::SecondaryWindow::create(
                                                          target,
-                                                         "fasty Settings",
+                                                         "fastty Settings",
                                                          400.0,
                                                          260.0,
                                                          &renderer,

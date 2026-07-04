@@ -19,16 +19,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact_name: fasty-x86_64-unknown-linux-gnu.tar.gz
+            artifact_name: fastty-x86_64-unknown-linux-gnu.tar.gz
           - target: x86_64-apple-darwin
             os: macos-latest
-            artifact_name: fasty-x86_64-apple-darwin.tar.gz
+            artifact_name: fastty-x86_64-apple-darwin.tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact_name: fasty-aarch64-apple-darwin.tar.gz
+            artifact_name: fastty-aarch64-apple-darwin.tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact_name: fasty-x86_64-pc-windows-msvc.zip
+            artifact_name: fastty-x86_64-pc-windows-msvc.zip
 
     steps:
       - name: Checkout Source Code
@@ -53,36 +53,36 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/fasty dist/fasty
+          cp target/${{ matrix.target }}/release/fastty dist/fastty
           cd dist
-          tar -czf ../${{ matrix.artifact_name }} fasty
+          tar -czf ../${{ matrix.artifact_name }} fastty
           cd ..
 
       # Empaquetado para macOS (Creación del App Bundle profesional con su icono .icns)
       - name: Package Binary (macOS)
         if: runner.os == 'macOS'
         run: |
-          mkdir -p dist/Fasty.app/Contents/MacOS
-          mkdir -p dist/Fasty.app/Contents/Resources
+          mkdir -p dist/Fastty.app/Contents/MacOS
+          mkdir -p dist/Fastty.app/Contents/Resources
           
           # Copiar ejecutable e icono .icns
-          cp target/${{ matrix.target }}/release/fasty dist/Fasty.app/Contents/MacOS/fasty
-          cp assets/fastyIcon.icns dist/Fasty.app/Contents/Resources/AppIcon.icns
+          cp target/${{ matrix.target }}/release/fastty dist/Fastty.app/Contents/MacOS/fastty
+          cp assets/fasttyIcon.icns dist/Fastty.app/Contents/Resources/AppIcon.icns
           
           # Escribir el Info.plist de la app
-          cat <<EOF > dist/Fasty.app/Contents/Info.plist
+          cat <<EOF > dist/Fastty.app/Contents/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
               <key>CFBundleExecutable</key>
-              <string>fasty</string>
+              <string>fastty</string>
               <key>CFBundleIconFile</key>
               <string>AppIcon.icns</string>
               <key>CFBundleIdentifier</key>
-              <string>com.diegoleteliers10.fasty</string>
+              <string>com.diegoleteliers10.fastty</string>
               <key>CFBundleName</key>
-              <string>Fasty</string>
+              <string>Fastty</string>
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>
@@ -97,7 +97,7 @@ jobs:
           
           # Comprimir la estructura en .tar.gz
           cd dist
-          tar -czf ../${{ matrix.artifact_name }} Fasty.app
+          tar -czf ../${{ matrix.artifact_name }} Fastty.app
           cd ..
 
       # Empaquetado para Windows (Incrusta el icono automáticamente gracias a build.rs y winres)
@@ -106,8 +106,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist
-          Copy-Item -Path target\${{ matrix.target }}\release\fasty.exe -Destination dist\fasty.exe
-          Compress-Archive -Path dist\fasty.exe -DestinationPath ${{ matrix.artifact_name }}
+          Copy-Item -Path target\${{ matrix.target }}\release\fastty.exe -Destination dist\fastty.exe
+          Compress-Archive -Path dist\fastty.exe -DestinationPath ${{ matrix.artifact_name }}
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
