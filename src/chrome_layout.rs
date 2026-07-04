@@ -15,7 +15,7 @@
 const CELL: f32 = 28.0;
 const Y: f32 = 6.0;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
@@ -39,7 +39,9 @@ const fn macos() -> bool {
 
 pub fn close_rect(vw: f32) -> Rect {
     if macos() {
-        Rect::cell(8.0)
+        // System owns the traffic lights: zero-area so the hit-test never
+        // matches and the top-bar drag fallback covers the gaps.
+        Rect::default()
     } else {
         Rect::cell(vw - 36.0)
     }
@@ -47,7 +49,7 @@ pub fn close_rect(vw: f32) -> Rect {
 
 pub fn min_rect(vw: f32) -> Rect {
     if macos() {
-        Rect::cell(40.0)
+        Rect::default()
     } else {
         Rect::cell(vw - 100.0)
     }
@@ -55,14 +57,28 @@ pub fn min_rect(vw: f32) -> Rect {
 
 pub fn max_rect(vw: f32) -> Rect {
     if macos() {
-        Rect::cell(72.0)
+        Rect::default()
     } else {
         Rect::cell(vw - 68.0)
     }
 }
 
 pub fn settings_rect(vw: f32) -> Rect {
-    Rect::cell(vw - 137.0)
+    if macos() {
+        // Park the gear flush beside the icon (vw-137 was its slot while
+        // min/max/close clustered on the right; that leftover was the gap).
+        Rect::cell(vw - 64.0)
+    } else {
+        Rect::cell(vw - 137.0)
+    }
+}
+
+/// Update button: 70px wide, 12px left of the gear. Derived from
+/// `settings_rect` so draw and hit-test stay in sync.
+pub fn update_rect(vw: f32) -> Rect {
+    let s = settings_rect(vw);
+    // y = controls_y (1.0) + 4.0, matching the draw path's vertical offset.
+    Rect { x: s.x - 70.0 - 12.0, y: 5.0, w: 70.0, h: 20.0 }
 }
 
 pub fn icon_rect(vw: f32) -> Rect {
@@ -83,7 +99,8 @@ pub fn tab_start_x() -> f32 {
 
 pub fn drag_max_x(vw: f32) -> f32 {
     if macos() {
-        vw - 160.0
+        // 8px gap before the gear at vw-64.
+        vw - 72.0
     } else {
         vw - 141.0
     }

@@ -29,12 +29,14 @@ pub struct GitStatus {
     pub last_commit_hash: String, // first 7 chars
     pub last_commit_summary: String, // hash + commit subject line
     pub remote_url: Option<String>, // origin URL (e.g. https://github.com/user/repo)
+    #[allow(dead_code)]
     pub last_updated: std::time::Instant,
 }
 
 pub type GitInfo = GitStatus;
 
 impl GitStatus {
+    #[allow(dead_code)]
     pub fn is_clean(&self) -> bool {
         self.unstaged == 0 && self.staged == 0 && self.untracked == 0
     }
@@ -259,6 +261,7 @@ fn get_ahead_behind(repo: &git2::Repository, branch: &str) -> (usize, usize) {
     repo.graph_ahead_behind(local, remote).unwrap_or((0, 0))
 }
 
+#[allow(dead_code)]
 pub fn get_recent_commits(repo_path: &Path, limit: usize) -> Vec<String> {
     let repo = match git2::Repository::open(repo_path) {
         Ok(r) => r,

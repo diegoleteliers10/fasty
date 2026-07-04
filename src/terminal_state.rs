@@ -19,7 +19,7 @@ use crate::event_listener::EventListenerProxy;
 #[allow(dead_code)]
 pub enum AppEvent {
     Wakeup,
-    Exit,
+    Exit { shell_pid: Option<u32> },
     ForceExit,
     ConfigChanged,
     Bell,
@@ -330,7 +330,7 @@ impl TerminalState {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
-                        let _ = proxy_clone.send_event(AppEvent::Exit);
+                        let _ = proxy_clone.send_event(AppEvent::Exit { shell_pid });
                         break;
                     }
                     Ok(n) => {
@@ -431,7 +431,7 @@ impl TerminalState {
                         continue;
                     }
                     Err(_) => {
-                        let _ = proxy_clone.send_event(AppEvent::Exit);
+                        let _ = proxy_clone.send_event(AppEvent::Exit { shell_pid });
                         break;
                     }
                 }

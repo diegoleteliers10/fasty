@@ -2125,13 +2125,15 @@ impl Pipeline {
         let controls_y = 1.0f32; // centered vertically: (30 - 28)/2
         let _icon_scale = 15.0f32 / atlas.font_size();
 
-        // 0. Update button (if update is available)
-        let settings_x = viewport_width - 137.0f32;
+        // 0. Update button (if update is available). Geometry from `update_rect`,
+        // shared with the hit-test.
+        let settings_x = crate::chrome_layout::settings_rect(viewport_width).x;
         if update_available {
-            let update_btn_w = 70.0f32;
-            let update_btn_h = 20.0f32;
-            let update_x = settings_x - update_btn_w - 12.0;
-            let update_y = controls_y + 4.0;
+            let upd = crate::chrome_layout::update_rect(viewport_width);
+            let update_btn_w = upd.w;
+            let update_btn_h = upd.h;
+            let update_x = upd.x;
+            let update_y = upd.y;
 
             // Draw button background (rounded rect with border)
             let border_color = if hover_update {
@@ -2324,7 +2326,7 @@ impl Pipeline {
 
         // 3. Minimize button (─)
         let min_x = crate::chrome_layout::min_rect(viewport_width).x;
-        if hover_min && !cfg!(target_os = "macos") {
+        if hover_min {
             bg_instances.push(CellInstance::new(
                 min_x,
                 controls_y,
@@ -2340,13 +2342,9 @@ impl Pipeline {
             ));
         }
         {
-            let entry_opt = {
-                #[cfg(target_os = "macos")]
-                { atlas.mac_min.as_ref() }
-                #[cfg(not(target_os = "macos"))]
-                { atlas.icon_less.as_ref() }
-            };
-            if let Some(entry) = entry_opt {
+            // macOS draws native traffic lights: skip our glyph (compiled out).
+            #[cfg(not(target_os = "macos"))]
+            if let Some(entry) = atlas.icon_less.as_ref() {
                 let entry_w = 14.0f32;
                 let entry_h = 14.0f32;
                 let glyph_x = min_x + (28.0f32 - entry_w) / 2.0f32;
@@ -2379,7 +2377,7 @@ impl Pipeline {
 
         // 4. Maximize button (▢)
         let max_x = crate::chrome_layout::max_rect(viewport_width).x;
-        if hover_max && !cfg!(target_os = "macos") {
+        if hover_max {
             bg_instances.push(CellInstance::new(
                 max_x,
                 controls_y,
@@ -2395,13 +2393,9 @@ impl Pipeline {
             ));
         }
         {
-            let entry_opt = {
-                #[cfg(target_os = "macos")]
-                { atlas.mac_max.as_ref() }
-                #[cfg(not(target_os = "macos"))]
-                { atlas.icon_maximize.as_ref() }
-            };
-            if let Some(entry) = entry_opt {
+            // macOS draws native traffic lights: skip our glyph (compiled out).
+            #[cfg(not(target_os = "macos"))]
+            if let Some(entry) = atlas.icon_maximize.as_ref() {
                 let entry_w = 14.0f32;
                 let entry_h = 14.0f32;
                 let glyph_x = max_x + (28.0f32 - entry_w) / 2.0f32;
@@ -2434,7 +2428,7 @@ impl Pipeline {
 
         // 5. Close button (✕)
         let close_x = crate::chrome_layout::close_rect(viewport_width).x;
-        if hover_close && !cfg!(target_os = "macos") {
+        if hover_close {
             bg_instances.push(CellInstance::new(
                 close_x,
                 controls_y,
@@ -2453,13 +2447,9 @@ impl Pipeline {
             ));
         }
         {
-            let entry_opt = {
-                #[cfg(target_os = "macos")]
-                { atlas.mac_close.as_ref() }
-                #[cfg(not(target_os = "macos"))]
-                { atlas.icon_close.as_ref() }
-            };
-            if let Some(entry) = entry_opt {
+            // macOS draws native traffic lights: skip our glyph (compiled out).
+            #[cfg(not(target_os = "macos"))]
+            if let Some(entry) = atlas.icon_close.as_ref() {
                 let entry_w = 14.0f32;
                 let entry_h = 14.0f32;
                 let glyph_x = close_x + (28.0f32 - entry_w) / 2.0f32;
@@ -4444,49 +4434,47 @@ impl Pipeline {
             &mut fg_instances,
         );
 
-        // Draw topbar close button — vertically centered (28*scale box in 40*scale bar).
-        // macOS: left side; other platforms: right side.
-        let close_x = if cfg!(target_os = "macos") {
-            4.0 * scale
-        } else {
-            viewport_width - 32.0 * scale
-        };
-        let close_y = 6.0 * scale; // (40 - 28) / 2
-        if hover_close {
-            bg_instances.push(CellInstance::new(
-                close_x,
-                close_y,
-                28.0 * scale,
-                28.0 * scale,
-                with_opacity([0.85, 0.25, 0.25, 0.9], chrome_alpha),
-                [0.0, 0.0, 0.0, 0.0],
-                0.0,
-                0.0,
-                1.0,
-                1.0,
-                6.0 * scale, // Rounded rectangle
-            ));
-        }
-        if let Some(entry) = &atlas.icon_close {
-            let entry_w = 14.0f32 * scale;
-            let entry_h = 14.0f32 * scale;
-            let glyph_x = close_x + (28.0f32 * scale - entry_w) / 2.0;
-            let glyph_y = close_y + (28.0f32 * scale - entry_h) / 2.0;
-            let (aw, ah) = atlas.atlas_size();
-            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
-            fg_instances.push(CellInstance::new(
-                glyph_x,
-                glyph_y,
-                entry_w,
-                entry_h,
-                with_opacity([0.8, 0.8, 0.85, 1.0], chrome_alpha),
-                [0.0, 0.0, 0.0, 0.0],
-                uv_x,
-                uv_y,
-                uv_end_x - uv_x,
-                uv_end_y - uv_y,
-                0.0,
-            ));
+        // Draw topbar close button (right side). macOS draws the native close
+        // light, so nothing custom is drawn there.
+        if !cfg!(target_os = "macos") {
+            let close_x = viewport_width - 32.0 * scale;
+            let close_y = 6.0 * scale; // (40 - 28) / 2
+            if hover_close {
+                bg_instances.push(CellInstance::new(
+                    close_x,
+                    close_y,
+                    28.0 * scale,
+                    28.0 * scale,
+                    with_opacity([0.85, 0.25, 0.25, 0.9], chrome_alpha),
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
+                    6.0 * scale, // Rounded rectangle
+                ));
+            }
+            if let Some(entry) = &atlas.icon_close {
+                let entry_w = 14.0f32 * scale;
+                let entry_h = 14.0f32 * scale;
+                let glyph_x = close_x + (28.0f32 * scale - entry_w) / 2.0;
+                let glyph_y = close_y + (28.0f32 * scale - entry_h) / 2.0;
+                let (aw, ah) = atlas.atlas_size();
+                let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                fg_instances.push(CellInstance::new(
+                    glyph_x,
+                    glyph_y,
+                    entry_w,
+                    entry_h,
+                    with_opacity([0.8, 0.8, 0.85, 1.0], chrome_alpha),
+                    [0.0, 0.0, 0.0, 0.0],
+                    uv_x,
+                    uv_y,
+                    uv_end_x - uv_x,
+                    uv_end_y - uv_y,
+                    0.0,
+                ));
+            }
         }
 
         // Draw labels
@@ -5478,48 +5466,46 @@ impl Pipeline {
             &mut fg_instances,
         );
 
-        // Draw topbar close button — vertically centered (28px box in 40px bar).
-        // macOS: left side; other platforms: right side.
-        let about_close_x = if cfg!(target_os = "macos") {
-            4.0
-        } else {
-            viewport_width - 32.0
-        };
-        if hover_close {
-            bg_instances.push(CellInstance::new(
-                about_close_x,
-                6.0,
-                28.0,
-                28.0,
-                with_opacity([0.85, 0.25, 0.25, 0.9], chrome_alpha),
-                [0.0, 0.0, 0.0, 0.0],
-                0.0,
-                0.0,
-                1.0,
-                1.0,
-                6.0,
-            ));
-        }
-        if let Some(entry) = &atlas.icon_close {
-            let entry_w = 14.0f32;
-            let entry_h = 14.0f32;
-            let glyph_x = about_close_x + (28.0 - entry_w) / 2.0;
-            let glyph_y = 6.0 + (28.0 - entry_h) / 2.0; // close_y now 6.0 for vertical centering
-            let (aw, ah) = atlas.atlas_size();
-            let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
-            fg_instances.push(CellInstance::new(
-                glyph_x,
-                glyph_y,
-                entry_w,
-                entry_h,
-                with_opacity([0.8, 0.8, 0.85, 1.0], chrome_alpha),
-                [0.0, 0.0, 0.0, 0.0],
-                uv_x,
-                uv_y,
-                uv_end_x - uv_x,
-                uv_end_y - uv_y,
-                0.0,
-            ));
+        // Draw topbar close button (right side). macOS draws the native close
+        // light, so nothing custom is drawn there.
+        if !cfg!(target_os = "macos") {
+            let about_close_x = viewport_width - 32.0;
+            if hover_close {
+                bg_instances.push(CellInstance::new(
+                    about_close_x,
+                    6.0,
+                    28.0,
+                    28.0,
+                    with_opacity([0.85, 0.25, 0.25, 0.9], chrome_alpha),
+                    [0.0, 0.0, 0.0, 0.0],
+                    0.0,
+                    0.0,
+                    1.0,
+                    1.0,
+                    6.0,
+                ));
+            }
+            if let Some(entry) = &atlas.icon_close {
+                let entry_w = 14.0f32;
+                let entry_h = 14.0f32;
+                let glyph_x = about_close_x + (28.0 - entry_w) / 2.0;
+                let glyph_y = 6.0 + (28.0 - entry_h) / 2.0; // close_y now 6.0 for vertical centering
+                let (aw, ah) = atlas.atlas_size();
+                let [uv_x, uv_y, uv_end_x, uv_end_y] = entry.uv_coords(aw, ah);
+                fg_instances.push(CellInstance::new(
+                    glyph_x,
+                    glyph_y,
+                    entry_w,
+                    entry_h,
+                    with_opacity([0.8, 0.8, 0.85, 1.0], chrome_alpha),
+                    [0.0, 0.0, 0.0, 0.0],
+                    uv_x,
+                    uv_y,
+                    uv_end_x - uv_x,
+                    uv_end_y - uv_y,
+                    0.0,
+                ));
+            }
         }
 
         // Draw Fastty App Icon in the center
