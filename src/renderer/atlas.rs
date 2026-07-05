@@ -687,7 +687,7 @@ impl Atlas {
                     "/System/Library/Fonts/Supplemental/DejaVuSans.ttf".to_string(),
                     "/System/Library/Fonts/Supplemental/NotoSansSymbols-Regular.ttf".to_string(),
                     "/System/Library/Fonts/Supplemental/NotoSansSymbols2-Regular.ttf".to_string(),
-                    "/System/Library/Fonts/Supplemental/NotoColorEmoji.ttf".to_string(),
+                    "/System/Library/Fonts/Apple Color Emoji.ttc".to_string(),
                 ];
                 // User-installed fonts
                 if let Ok(home) = std::env::var("HOME") {
