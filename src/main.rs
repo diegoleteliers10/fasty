@@ -29,6 +29,7 @@ const SCROLL_DECELERATION: f32 = 0.88;
 const SCROLL_SNAP_THRESHOLD: f32 = 0.3;
 
 use config::Config;
+use chrome_layout::with_platform_chrome;
 use renderer::{Renderer, Selection, RenderReason};
 use selection_classifier::extract_token;
 use terminal_state::{TerminalState, AppEvent};
@@ -39,26 +40,7 @@ use winit::{
     keyboard::Key,
     window::CursorGrabMode,
 };
-// macOS only: titlebar flags so the system draws native traffic lights.
-#[cfg(target_os = "macos")]
-use winit::platform::macos::WindowAttributesExtMacOS;
-
-/// Applies per-platform chrome: macOS gets a transparent, full-size titlebar
-/// (native traffic lights); other platforms stay borderless.
-fn with_platform_chrome(attrs: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
-    #[cfg(target_os = "macos")]
-    {
-        attrs
-            .with_decorations(true)
-            .with_titlebar_transparent(true)
-            .with_title_hidden(true)
-            .with_fullsize_content_view(true)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        attrs.with_decorations(false)
-    }
-}
+// macOS only: titlebar flags live in chrome_layout::with_platform_chrome.
 
 
 

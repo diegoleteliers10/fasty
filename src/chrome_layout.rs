@@ -11,6 +11,30 @@
 //!   app icon top-left.
 //! - macOS: traffic-light buttons (close/min/max) on the LEFT, app icon + gear
 //!   on the RIGHT; tabs start further right to clear the lights.
+//!
+//! `with_platform_chrome` below also applies the per-OS `WindowAttributes`
+//! policy (decorations, transparent titlebar) for both the main and
+//! secondary windows.
+
+#[cfg(target_os = "macos")]
+use winit::platform::macos::WindowAttributesExtMacOS;
+
+/// Applies per-platform chrome: macOS gets a transparent, full-size titlebar
+/// (native traffic lights); other platforms stay borderless.
+pub fn with_platform_chrome(attrs: winit::window::WindowAttributes) -> winit::window::WindowAttributes {
+    #[cfg(target_os = "macos")]
+    {
+        attrs
+            .with_decorations(true)
+            .with_titlebar_transparent(true)
+            .with_title_hidden(true)
+            .with_fullsize_content_view(true)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        attrs.with_decorations(false)
+    }
+}
 
 const CELL: f32 = 28.0;
 const Y: f32 = 6.0;
