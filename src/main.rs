@@ -21,6 +21,8 @@ mod ssh;
 mod terminal_state;
 mod widgets;
 mod window_context;
+#[cfg(target_os = "macos")]
+mod font_discovery_macos;
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
