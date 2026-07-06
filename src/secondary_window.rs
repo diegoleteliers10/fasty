@@ -5,6 +5,7 @@ use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{self, WindowAttributes};
 
+use crate::chrome_layout::with_platform_chrome;
 use crate::renderer::Renderer;
 
 pub struct SecondaryWindow {
@@ -31,12 +32,13 @@ impl SecondaryWindow {
     ) -> Result<Self, anyhow::Error> {
         let visible = !cfg!(target_os = "windows");
         let window = target.create_window(
-            WindowAttributes::default()
-                .with_title(title)
-                .with_decorations(false)
-                .with_transparent(true)
-                .with_visible(visible)
-                .with_inner_size(LogicalSize::new(width, height)),
+            with_platform_chrome(
+                WindowAttributes::default()
+                    .with_title(title)
+                    .with_transparent(true)
+                    .with_visible(visible)
+                    .with_inner_size(LogicalSize::new(width, height)),
+            ),
         )?;
         let arc = Arc::new(window);
         let w_ref: &window::Window = &*arc;
