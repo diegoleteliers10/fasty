@@ -711,7 +711,6 @@ impl Pipeline {
         worktree_picker_query: &str,
         worktree_picker_selected: usize,
         worktree_filtered: &[String],
-        bell_flash_elapsed_ms: Option<f32>,
         _last_command_duration_ms: Option<u128>,
         _command_duration_display_secs: Option<f32>,
         _exit_code: Option<i32>,
@@ -4069,26 +4068,6 @@ impl Pipeline {
         }
 
         let mut ui_extra_instances_final = instances;
-
-        // Bell flash overlay — full-screen white flash for 150ms.
-        if let Some(elapsed_ms) = bell_flash_elapsed_ms {
-            if elapsed_ms < 150.0 {
-                let alpha = 1.0 - (elapsed_ms / 150.0);
-                ui_extra_instances_final.push(CellInstance::new(
-                    0.0,
-                    0.0,
-                    viewport_width,
-                    viewport_height,
-                    [1.0, 1.0, 1.0, alpha * 0.18],
-                    [0.0, 0.0, 0.0, 0.0],
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                ));
-            }
-        }
 
         // Hover tooltip — floating label for hyperlinks and URLs.
         let tooltip_text: Option<&str> = hovered_hyperlink.or(hovered_url_text);

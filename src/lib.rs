@@ -14,3 +14,5 @@ pub mod snippets;
 pub mod parser;
 pub mod terminal_state;
 pub mod widgets;
+#[cfg(target_os = "macos")]
+pub mod font_discovery_macos;

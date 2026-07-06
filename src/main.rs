@@ -1866,8 +1866,7 @@ fn main() -> anyhow::Result<()> {
     let mut last_scroll_event_time: Option<std::time::Instant> = None;
     let mut mouse_down_button: Option<winit::event::MouseButton> = None;
 
-    // Bell, command timing, and tooltip state
-    let mut bell_flash_time: Option<std::time::Instant> = None;
+    // Command timing and tooltip state
     let mut last_command_duration: Option<(u128, Option<i32>)> = None;
     let mut last_command_duration_display_time: Option<std::time::Instant> = None;
 
@@ -2293,10 +2292,6 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     AppEvent::Bell => {
-                        bell_flash_time = Some(std::time::Instant::now());
-                        renderer.lock().set_dirty(true);
-                        window_for_redraw.request_redraw();
-
                         if !window_focused || window_occluded {
                             let tab_title = tabs.get(active_tab_index)
                                 .and_then(|t| t.title_override.clone())
@@ -2612,7 +2607,6 @@ fn main() -> anyhow::Result<()> {
                             let last_activity_time_secs = active_tab.last_activity_time.saturating_duration_since(start_time).as_secs_f32();
                             let current_time = start_time.elapsed().as_secs_f32();
 
-                            let bell_flash_elapsed_ms = bell_flash_time.map(|t| t.elapsed().as_secs_f32() * 1000.0);
                             let (last_command_duration_ms, command_duration_display_secs, command_exit_code) =
                                 match (last_command_duration, last_command_duration_display_time) {
                                     (Some((ms, code)), Some(display_time)) => {
@@ -2785,7 +2779,6 @@ fn main() -> anyhow::Result<()> {
                                 worktree_picker_query: &worktree_picker_query,
                                 worktree_picker_selected,
                                 worktree_filtered: &worktree_filtered,
-                                bell_flash_elapsed_ms,
                                 last_command_duration_ms,
                                 command_duration_display_secs,
                                 exit_code: command_exit_code,
@@ -6429,7 +6422,6 @@ fn main() -> anyhow::Result<()> {
                     let last_activity_time_secs = active_tab.last_activity_time.saturating_duration_since(start_time).as_secs_f32();
                     let current_time = start_time.elapsed().as_secs_f32();
 
-                    let bell_flash_elapsed_ms = bell_flash_time.map(|t| t.elapsed().as_secs_f32() * 1000.0);
                     let (last_command_duration_ms, command_duration_display_secs, command_exit_code) =
                         match (last_command_duration, last_command_duration_display_time) {
                             (Some((ms, code)), Some(display_time)) => {
@@ -6577,7 +6569,6 @@ fn main() -> anyhow::Result<()> {
                         worktree_picker_query: &worktree_picker_query,
                         worktree_picker_selected,
                         worktree_filtered: &worktree_filtered,
-                        bell_flash_elapsed_ms,
                         last_command_duration_ms,
                         command_duration_display_secs,
                         exit_code: command_exit_code,

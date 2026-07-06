@@ -528,6 +528,13 @@ impl Atlas {
             &family_lower
         };
 
+        // 1. CoreText discovery -- queries the system font database.
+        if let Some(path) = crate::font_discovery_macos::resolve_font_path(target_family) {
+            return Ok(path.to_string_lossy().to_string());
+        }
+
+        // 2. Safety net: hardcoded paths (in case CoreText returns None
+        //    for edge cases or the font has no on-disk file).
         let paths = [
             "/System/Library/Fonts/Constants/Menlo.ttc",
             "/System/Library/Fonts/Menlo.ttc",
@@ -581,7 +588,8 @@ impl Atlas {
 
     fn is_color_font_path(path: &str) -> bool {
         let lower = path.to_lowercase();
-        lower.contains("coloremoji")
+        lower.contains("color emoji")
+            || lower.contains("coloremoji")
             || lower.contains("color-emoji")
             || lower.contains("notoemoji")
             || lower.contains("applecoloremoji")
@@ -673,28 +681,38 @@ impl Atlas {
 
             #[cfg(target_os = "macos")]
             let extra_paths: Vec<String> = {
-                let mut v = vec![
-                    // System-bundled fonts that cover Dingbats + Symbols
-                    "/System/Library/Fonts/AppleSymbols.ttf".to_string(),
-                    "/System/Library/Fonts/SFNS.ttf".to_string(),
-                    "/System/Library/Fonts/Helvetica.ttc".to_string(),
-                    "/System/Library/Fonts/HelveticaNeue.ttc".to_string(),
-                    "/System/Library/Fonts/ArialHB.ttc".to_string(),
-                    "/System/Library/Fonts/Arial Unicode.ttf".to_string(),
-                    "/Library/Fonts/Arial.ttf".to_string(),
-                    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf".to_string(),
-                    "/System/Library/Fonts/Supplemental/AppleGothic.ttf".to_string(),
-                    "/System/Library/Fonts/Supplemental/DejaVuSans.ttf".to_string(),
-                    "/System/Library/Fonts/Supplemental/NotoSansSymbols-Regular.ttf".to_string(),
-                    "/System/Library/Fonts/Supplemental/NotoSansSymbols2-Regular.ttf".to_string(),
-                    "/System/Library/Fonts/Apple Color Emoji.ttc".to_string(),
-                ];
-                // User-installed fonts
+                // CoreText cascade list: system-determined order including
+                // Apple Color Emoji at its correct position.
+                let mut v: Vec<String> = crate::font_discovery_macos::cascade_list()
+                    .into_iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect();
+
+                // User-installed fonts (CoreText cascade doesn't always include these).
                 if let Ok(home) = std::env::var("HOME") {
-                    v.push(format!("{}/Library/Fonts/NotoSansSymbols2-Regular.ttf", home));
-                    v.push(format!("{}/Library/Fonts/NotoSans-Regular.ttf", home));
-                    v.push(format!("{}/Library/Fonts/JetBrainsMonoNerdFont-Regular.ttf", home));
+                    let user_fonts = [
+                        format!("{}/Library/Fonts/NotoSansSymbols2-Regular.ttf", home),
+                        format!("{}/Library/Fonts/NotoSans-Regular.ttf", home),
+                        format!("{}/Library/Fonts/JetBrainsMonoNerdFont-Regular.ttf", home),
+                    ];
+                    for path in &user_fonts {
+                        if !v.contains(path) && std::path::Path::new(path).exists() {
+                            v.push(path.clone());
+                        }
+                    }
                 }
+
+                // Safety net: hardcoded paths not already in cascade.
+                let hardcoded = [
+                    "/System/Library/Fonts/AppleSymbols.ttf",
+                    "/System/Library/Fonts/Apple Color Emoji.ttc",
+                ];
+                for path in &hardcoded {
+                    if !v.contains(&path.to_string()) && std::path::Path::new(path).exists() {
+                        v.push(path.to_string());
+                    }
+                }
+
                 v
             };
 
@@ -1579,10 +1597,44 @@ pub fn is_block_element(ch: char) -> bool {
 
 pub fn is_emoji(ch: char) -> bool {
     matches!(ch as u32,
-        0x1F300..=0x1F9FF |  // Misc symbols and pictographs
-        0x1F000..=0x1F02F |  // Mahjong tiles
-        0x1F0A0..=0x1F0FF |  // Playing cards
-        0x1FA00..=0x1FA6F |  // Chess, other symbols
-        0x2600..=0x26FF      // Misc symbols
+        // Main emoji blocks
+        0x1F300..=0x1F9FF   |  // Misc Symbols and Pictographs + Emoticons + Supplemental
+        0x1FA70..=0x1FAFF   |  // Symbols and Pictographs Extended-A
+        0x1F000..=0x1F02F   |  // Mahjong Tiles
+        0x1F0A0..=0x1F0FF   |  // Playing Cards
+        0x1FA00..=0x1FA6F   |  // Chess Symbols / Geometric Shapes Extended
+        // Misc Symbols (covers zodiac, weather, sports, anchors, etc.)
+        0x2600..=0x26FF     |  // Misc Symbols
+        // Arrows (Dingbats 0x2700-0x27BF excluded -- text presentation default,
+        // used as prompt icons like ❯ ➜ that must render with foreground color)
+        0x2934..=0x2935     |  // Arrows (⤴⤵)
+        0x2B05..=0x2B07     |  // Arrows (⬅⬆⬇)
+        0x2B1B..=0x2B1C     |  // Squares (⬛⬜)
+        0x2B50              |  // Star (⭐)
+        0x2B55              |  // Circle (⭕)
+        // Media controls
+        0x231A..=0x231B     |  // Watch, Hourglass
+        0x23E9..=0x23F3     |  // Fast Forward, Rewind, etc
+        0x23CF              |  // Eject (⏏)
+        0x23F8..=0x23FA     |  // Pause, Stop, Record
+        // Geometric shapes
+        0x25AA..=0x25AB     |  // Small Squares (▪▫)
+        0x25B6              |  // Play Button (▶)
+        0x25C0              |  // Reverse Button (◀)
+        0x25FB..=0x25FF     |  // Medium Squares (◻◼◽◾◽)
+        // Regional indicators (flags)
+        0x1F1E0..=0x1F1FF   |  // Regional Indicator Symbols (flags)
+        // Misc
+        0x3030              |  // Wavy Dash (〰)
+        0x303D              |  // Part Alternation Mark (〽)
+        0x3297              |  // Circled Ideograph Congratulation (㊗)
+        0x3299              |  // Circled Ideograph Secret (㊙)
+        0x203C              |  // Double Exclamation Mark (⁉)
+        0x2049              |  // Exclamation Question Mark (⁉)
+        0x2122              |  // Trade Mark (™)
+        0x2139              |  // Information Source (ℹ)
+        0x2194..=0x2199     |  // Arrows (↔↗↘↙)
+        0x21A9..=0x21AA     |  // Arrows (⬅↪)
+        0x2328                // Keyboard (⌨)
     )
 }

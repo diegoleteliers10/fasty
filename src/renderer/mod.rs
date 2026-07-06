@@ -93,7 +93,7 @@ pub struct RenderInputs<'a> {
     pub worktree_picker_query: &'a str,
     pub worktree_picker_selected: usize,
     pub worktree_filtered: &'a [String],
-    pub bell_flash_elapsed_ms: Option<f32>,
+
     pub last_command_duration_ms: Option<u128>,
     pub command_duration_display_secs: Option<f32>,
     pub exit_code: Option<i32>,
@@ -174,7 +174,7 @@ impl<'a> Default for RenderInputs<'a> {
             worktree_picker_query: "",
             worktree_picker_selected: 0,
             worktree_filtered: &[],
-            bell_flash_elapsed_ms: None,
+
             last_command_duration_ms: None,
             command_duration_display_secs: None,
             exit_code: None,
@@ -684,7 +684,6 @@ impl<'a> Renderer<'a> {
                 inputs.worktree_picker_query,
                 inputs.worktree_picker_selected,
                 inputs.worktree_filtered,
-                inputs.bell_flash_elapsed_ms,
                 inputs.last_command_duration_ms,
                 inputs.command_duration_display_secs,
                 inputs.exit_code,
