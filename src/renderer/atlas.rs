@@ -1214,11 +1214,6 @@ impl Atlas {
         &self.primary_path
     }
 
-    #[allow(dead_code)]
-    pub fn primary_font_bytes(&self) -> Option<&[u8]> {
-        self.primary_font_bytes.as_deref()
-    }
-
     pub fn hb_face(&self) -> Option<&rustybuzz::Face<'static>> {
         self.hb_face.as_ref()
     }
@@ -1252,188 +1247,11 @@ impl Atlas {
         self.texture.as_ref()
     }
 
-    #[allow(dead_code)]
-    pub fn load_custom_image(
-        &mut self,
-        path: &str,
-        target_size: u32,
-        queue: &Queue,
-    ) -> anyhow::Result<AtlasEntry> {
-        let img = image::open(path).context("Failed to open image file")?;
-        let scaled = img.resize(target_size, target_size, image::imageops::FilterType::Lanczos3);
-        let rgba = scaled.to_rgba8();
-        let (w, h) = rgba.dimensions();
-        
-        if let Some(pos) = self.packer.alloc(w, h) {
-            let entry = AtlasEntry {
-                x: pos.0 as f32,
-                y: pos.1 as f32,
-                width: w as f32,
-                height: h as f32,
-                left: 0.0,
-                top: 0.0,
-                is_color: true,
-                is_block: false,
-            };
-            
-            queue.write_texture(
-                wgpu::ImageCopyTextureBase {
-                    texture: &self.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: pos.0,
-                        y: pos.1,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &rgba,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(w * 4),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-            );
-            Ok(entry)
-        } else {
-            anyhow::bail!("Failed to allocate space in atlas for custom image")
-        }
-    }
 
-    #[allow(dead_code)]
-    pub fn load_svg_icon(
-        &mut self,
-        path: &str,
-        target_size: u32,
-        queue: &Queue,
-    ) -> anyhow::Result<AtlasEntry> {
-        let svg_data = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read SVG file at {:?}", path))?;
-        
-        // Convert currentColor to white for stencil rendering
-        let svg_data = svg_data.replace("currentColor", "white");
 
-        let opt = usvg::Options::default();
-        let tree = Tree::from_str(&svg_data, &opt)
-            .context("Failed to parse SVG data")?;
 
-        let mut pixmap = tiny_skia::Pixmap::new(target_size, target_size)
-            .context("Failed to create tiny-skia pixmap")?;
 
-        // Fill with transparent
-        pixmap.fill(tiny_skia::Color::TRANSPARENT);
 
-        let size = tree.size();
-        let scale_x = target_size as f32 / size.width();
-        let scale_y = target_size as f32 / size.height();
-        let scale = scale_x.min(scale_y);
-        
-        let transform = tiny_skia::Transform::from_scale(scale, scale);
-
-        resvg::render(&tree, transform, &mut pixmap.as_mut());
-
-        let rgba = pixmap.data();
-        let w = target_size;
-        let h = target_size;
-
-        if let Some(pos) = self.packer.alloc(w, h) {
-            let entry = AtlasEntry {
-                x: pos.0 as f32,
-                y: pos.1 as f32,
-                width: w as f32,
-                height: h as f32,
-                left: 0.0,
-                top: 0.0,
-                is_color: false,
-                is_block: false,
-            };
-            
-            queue.write_texture(
-                wgpu::ImageCopyTextureBase {
-                    texture: &self.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: pos.0,
-                        y: pos.1,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                rgba,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(w * 4),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-            );
-            Ok(entry)
-        } else {
-            anyhow::bail!("Failed to allocate space in atlas for SVG icon")
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn load_custom_image_from_memory(
-        &mut self,
-        bytes: &[u8],
-        target_size: u32,
-        queue: &Queue,
-    ) -> anyhow::Result<AtlasEntry> {
-        let img = image::load_from_memory(bytes).context("Failed to parse image from memory")?;
-        let scaled = img.resize(target_size, target_size, image::imageops::FilterType::Lanczos3);
-        let rgba = scaled.to_rgba8();
-        let (w, h) = rgba.dimensions();
-        
-        if let Some(pos) = self.packer.alloc(w, h) {
-            let entry = AtlasEntry {
-                x: pos.0 as f32,
-                y: pos.1 as f32,
-                width: w as f32,
-                height: h as f32,
-                left: 0.0,
-                top: 0.0,
-                is_color: true,
-                is_block: false,
-            };
-            
-            queue.write_texture(
-                wgpu::ImageCopyTextureBase {
-                    texture: &self.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: pos.0,
-                        y: pos.1,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &rgba,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(w * 4),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-            );
-            Ok(entry)
-        } else {
-            anyhow::bail!("Failed to allocate space in atlas for custom image")
-        }
-    }
 
     pub fn load_raw_rgba_image(
         &mut self,
@@ -1484,77 +1302,7 @@ impl Atlas {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn load_svg_icon_from_memory(
-        &mut self,
-        svg_data: &str,
-        target_size: u32,
-        queue: &Queue,
-    ) -> anyhow::Result<AtlasEntry> {
-        let svg_data = svg_data.replace("currentColor", "white");
 
-        let opt = usvg::Options::default();
-        let tree = Tree::from_str(&svg_data, &opt)
-            .context("Failed to parse SVG data")?;
-
-        let mut pixmap = tiny_skia::Pixmap::new(target_size, target_size)
-            .context("Failed to create tiny-skia pixmap")?;
-
-        pixmap.fill(tiny_skia::Color::TRANSPARENT);
-
-        let size = tree.size();
-        let scale_x = target_size as f32 / size.width();
-        let scale_y = target_size as f32 / size.height();
-        let scale = scale_x.min(scale_y);
-        
-        let transform = tiny_skia::Transform::from_scale(scale, scale);
-
-        resvg::render(&tree, transform, &mut pixmap.as_mut());
-
-        let rgba = pixmap.data();
-        let w = target_size;
-        let h = target_size;
-
-        if let Some(pos) = self.packer.alloc(w, h) {
-            let entry = AtlasEntry {
-                x: pos.0 as f32,
-                y: pos.1 as f32,
-                width: w as f32,
-                height: h as f32,
-                left: 0.0,
-                top: 0.0,
-                is_color: false,
-                is_block: false,
-            };
-
-            queue.write_texture(
-                wgpu::ImageCopyTextureBase {
-                    texture: &self.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: pos.0,
-                        y: pos.1,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                rgba,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(w * 4),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-            );
-            Ok(entry)
-        } else {
-            anyhow::bail!("Failed to allocate space in atlas for SVG icon")
-        }
-    }
 }
 
 fn scale_rgba_bitmap(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
@@ -1581,13 +1329,6 @@ pub fn is_block_element(ch: char) -> bool {
 }
 
 include!(concat!(env!("OUT_DIR"), "/emoji_table.rs"));
-
-pub fn is_emoji_presentation(ch: char, zerowidth: Option<&[char]>) -> bool {
-    if is_emoji(ch) {
-        return true;
-    }
-    matches!(zerowidth, Some(zw) if zw.contains(&'\u{FE0F}'))
-}
 
 pub fn is_emoji(ch: char) -> bool {
     generated_is_emoji(ch as u32)

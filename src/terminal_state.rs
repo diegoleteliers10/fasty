@@ -86,7 +86,32 @@ impl TerminalState {
             })
             .expect("Failed to open PTY");
 
-        let mut cmd = CommandBuilder::new(executable);
+        // Determine the shell binary name (e.g. "zsh", "bash", "fish") so we can
+        // choose the right CommandBuilder constructor and integration strategy.
+        let shell_name = std::path::Path::new(&executable)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        // On macOS, when launched as a .app bundle from Finder/Dock/Spotlight,
+        // the process inherits a minimal launchd PATH instead of the full login-shell
+        // PATH. Using new_default_prog() for zsh activates portable-pty's argv0 `-`
+        // trick (e.g. `-zsh`), which makes the kernel treat the process as a login
+        // shell so /etc/zprofile (and path_helper) run correctly.
+        //
+        // Restriction: new_default_prog() panics if .arg()/.args() is called on it,
+        // so we only use it for the zsh-without-exec-args branch. bash and fish still
+        // use .args() for their --rcfile / -C wrappers and must stay on new().
+        let is_bare_shell = exec_args.is_empty();
+        let mut cmd = if is_bare_shell && shell_name == "zsh" {
+            let mut c = CommandBuilder::new_default_prog();
+            // Make sure SHELL is set to the actual zsh binary path so child
+            // processes (e.g. subshells) find the right executable.
+            c.env("SHELL", executable);
+            c
+        } else {
+            CommandBuilder::new(executable)
+        };
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "fastty");
@@ -157,10 +182,7 @@ impl TerminalState {
         );
 
         // Wrap the shell command to source the integration before launching.
-        let shell_name = std::path::Path::new(&executable)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        // shell_name was computed before the CommandBuilder block above.
 
         if shell_name == "bash" && exec_args.is_empty() {
             // Bash: create wrapper bashrc that sources integration + user's .bashrc
@@ -194,7 +216,16 @@ impl TerminalState {
             let _ = std::fs::write(
                 zdotdir.join(".zshenv"),
                 format!(
+                    // Source files in the same order a real zsh login shell would:
+                    //   /etc/zshenv  (already run by zsh itself before ZDOTDIR is checked)
+                    //   $ZDOTDIR/.zshenv  ← this file (run instead of ~/.zshenv)
+                    //   /etc/zprofile  ← macOS runs path_helper here; assembles PATH
+                    //                    from /etc/paths + /etc/paths.d/*
+                    //   ~/.zprofile   ← user login customizations (e.g. Homebrew eval)
+                    // Without sourcing /etc/zprofile explicitly the .app bundle would
+                    // start with only the minimal launchd PATH.
                     "[ -f {user_zshenv} ] && . {user_zshenv}\n\
+                     [ -f /etc/zprofile ] && . /etc/zprofile\n\
                      [ -f $HOME/.zprofile ] && . $HOME/.zprofile\n"
                 ),
             );

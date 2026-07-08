@@ -116,7 +116,6 @@ pub fn classify_at_point(
     classify_token(&token)
 }
 
-#[allow(dead_code)]
 pub fn extract_token(
     grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
     point: Point,
@@ -232,7 +231,6 @@ mod tests {
     }
 
     use alacritty_terminal::event::VoidListener;
-    use alacritty_terminal::grid::Dimensions;
     use alacritty_terminal::index::{Column, Line, Point};
     use alacritty_terminal::term::{Config, Term};
     use alacritty_terminal::term::test::TermSize;

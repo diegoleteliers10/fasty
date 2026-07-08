@@ -29,17 +29,13 @@ pub struct GitStatus {
     pub last_commit_hash: String, // first 7 chars
     pub last_commit_summary: String, // hash + commit subject line
     pub remote_url: Option<String>, // origin URL (e.g. https://github.com/user/repo)
-    #[allow(dead_code)]
-    pub last_updated: std::time::Instant,
+
 }
 
 pub type GitInfo = GitStatus;
 
 impl GitStatus {
-    #[allow(dead_code)]
-    pub fn is_clean(&self) -> bool {
-        self.unstaged == 0 && self.staged == 0 && self.untracked == 0
-    }
+
 }
 
 impl Default for GitStatus {
@@ -56,7 +52,6 @@ impl Default for GitStatus {
             last_commit_hash: String::new(),
             last_commit_summary: String::new(),
             remote_url: None,
-            last_updated: std::time::Instant::now(),
         }
     }
 }
@@ -245,7 +240,6 @@ pub fn fetch_git_info(repo_path: &Path) -> Option<GitInfo> {
         last_commit_hash: hash_short,
         last_commit_summary: format!("{} {}", &hash[..hash.len().min(7)], summary),
         remote_url,
-        last_updated: std::time::Instant::now(),
     })
 }
 
@@ -261,41 +255,7 @@ fn get_ahead_behind(repo: &git2::Repository, branch: &str) -> (usize, usize) {
     repo.graph_ahead_behind(local, remote).unwrap_or((0, 0))
 }
 
-#[allow(dead_code)]
-pub fn get_recent_commits(repo_path: &Path, limit: usize) -> Vec<String> {
-    let repo = match git2::Repository::open(repo_path) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
 
-    let mut revwalk = match repo.revwalk() {
-        Ok(rw) => rw,
-        Err(_) => return Vec::new(),
-    };
-
-    if let Err(_) = revwalk.push_head() {
-        return Vec::new();
-    }
-
-    let mut commits = Vec::new();
-    for (i, oid) in revwalk.enumerate() {
-        if i >= limit {
-            break;
-        }
-        let oid = match oid {
-            Ok(id) => id,
-            Err(_) => break,
-        };
-        let commit = match repo.find_commit(oid) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let hash = &oid.to_string()[..7];
-        let summary = commit.summary().unwrap_or("<no message>");
-        commits.push(format!("{} {}", hash, summary));
-    }
-    commits
-}
 
 pub struct GitWatcherManager {
     watchers: std::collections::HashMap<PathBuf, notify::RecommendedWatcher>,

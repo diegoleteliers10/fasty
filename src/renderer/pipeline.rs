@@ -15,6 +15,15 @@ fn with_opacity(mut color: [f32; 4], opacity: f32) -> [f32; 4] {
     color
 }
 
+pub struct RowCell {
+    pub c: char,
+    pub fg: alacritty_terminal::vte::ansi::Color,
+    pub bg: alacritty_terminal::vte::ansi::Color,
+    pub flags: alacritty_terminal::term::cell::Flags,
+    pub has_vs16: bool,
+    pub zw_chars: Vec<char>,
+}
+
 pub struct Pipeline {
     pipeline: RenderPipeline,
     instance_buffer: Buffer,
@@ -27,6 +36,9 @@ pub struct Pipeline {
     pub last_term_draw_count: usize,
     pub last_ui_draw_count: usize,
     pub cached_final_instances: Vec<CellInstance>,
+    row_cells: Vec<Vec<RowCell>>,
+    row_points: Vec<Vec<alacritty_terminal::index::Point>>,
+    row_hyperlinks: Vec<Vec<Option<std::sync::Arc<str>>>>,
 }
 
 const SHADER_SOURCE: &str = r#"
@@ -619,6 +631,9 @@ impl Pipeline {
             last_term_draw_count: 0,
             last_ui_draw_count: 0,
             cached_final_instances: Vec::new(),
+            row_cells: Vec::new(),
+            row_points: Vec::new(),
+            row_hyperlinks: Vec::new(),
         }
     }
 
@@ -895,12 +910,21 @@ impl Pipeline {
             let fg_instances = &mut term_fg_instances;
 
             let visible_rows_count = visible_rows.round() as usize;
-            let mut row_cells: Vec<Vec<&alacritty_terminal::term::cell::Cell>> =
-                vec![Vec::new(); visible_rows_count];
-            let mut row_points: Vec<Vec<alacritty_terminal::index::Point>> =
-                vec![Vec::new(); visible_rows_count];
-            let mut row_hyperlinks: Vec<Vec<Option<std::sync::Arc<str>>>> =
-                vec![Vec::new(); visible_rows_count];
+
+            if self.row_cells.len() != visible_rows_count {
+                self.row_cells.resize_with(visible_rows_count, Vec::new);
+                self.row_points.resize_with(visible_rows_count, Vec::new);
+                self.row_hyperlinks.resize_with(visible_rows_count, Vec::new);
+            }
+            for v in self.row_cells.iter_mut() {
+                v.clear();
+            }
+            for v in self.row_points.iter_mut() {
+                v.clear();
+            }
+            for v in self.row_hyperlinks.iter_mut() {
+                v.clear();
+            }
 
             // 1. Draw solid background, selection, and underline, and collect cells for layout
             for Indexed { cell, point } in content.display_iter {
@@ -908,9 +932,16 @@ impl Pipeline {
                 let row = (point.line.0 + content.display_offset as i32) as usize;
 
                 if row < visible_rows_count {
-                    row_cells[row].push(cell);
-                    row_points[row].push(point);
-                    row_hyperlinks[row]
+                    self.row_cells[row].push(RowCell {
+                        c: cell.c,
+                        fg: cell.fg,
+                        bg: cell.bg,
+                        flags: cell.flags,
+                        has_vs16: cell.zerowidth().map_or(false, |zw| zw.contains(&'\u{FE0F}')),
+                        zw_chars: cell.zerowidth().map(|zw| zw.to_vec()).unwrap_or_default(),
+                    });
+                    self.row_points[row].push(point);
+                    self.row_hyperlinks[row]
                         .push(cell.hyperlink().map(|h| {
                             let uri = h.uri().to_string();
                             if let Some(cached) = atlas.hyperlink_cache.get(&uri) {
@@ -1036,7 +1067,7 @@ impl Pipeline {
                 }
 
                 if !is_hovered_url {
-                    if let Some(Some(uri)) = row_hyperlinks.get(row).and_then(|r| r.get(col)) {
+                    if let Some(Some(uri)) = self.row_hyperlinks.get(row).and_then(|r| r.get(col)) {
                         let is_this_hovered = hovered_hyperlink == Some(uri.as_ref());
                         let underline_color = if is_this_hovered {
                             [66.0 / 255.0, 135.0 / 255.0, 245.0 / 255.0, 1.0]
@@ -1091,7 +1122,7 @@ impl Pipeline {
                 let mut row_text = String::with_capacity(256);
                 let mut col_map = Vec::with_capacity(256);
                 for row in 0..visible_rows_count {
-                    let cells = &row_cells[row];
+                    let cells = &self.row_cells[row];
                     if cells.is_empty() {
                         continue;
                     }
@@ -1100,10 +1131,8 @@ impl Pipeline {
                     row_text.clear();
                     for cell in cells.iter() {
                         row_text.push(cell.c);
-                        if let Some(zw) = cell.zerowidth() {
-                            for &c in zw {
-                                row_text.push(c);
-                            }
+                        for &c in &cell.zw_chars {
+                            row_text.push(c);
                         }
                     }
 
@@ -1117,10 +1146,8 @@ impl Pipeline {
                     col_map.clear();
                     for (idx, cell) in cells.iter().enumerate() {
                         let mut char_len = cell.c.len_utf8();
-                        if let Some(zw) = cell.zerowidth() {
-                            for &c in zw {
-                                char_len += c.len_utf8();
-                            }
+                        for &c in &cell.zw_chars {
+                            char_len += c.len_utf8();
                         }
                         for _ in 0..char_len {
                             col_map.push(idx);
@@ -1152,7 +1179,7 @@ impl Pipeline {
             }
 
             for row in 0..visible_rows_count {
-                let cells = &row_cells[row];
+                let cells = &self.row_cells[row];
                 if cells.is_empty() {
                     continue;
                 }
@@ -1184,7 +1211,7 @@ impl Pipeline {
                         let cell = &cells[start_col];
 
                         if cell.c != ' ' && cell.c != '\0' {
-                            let is_emoji_or_block_or_wide = crate::renderer::is_emoji_presentation(cell.c, cell.zerowidth())
+                            let is_emoji_or_block_or_wide = crate::renderer::is_emoji(cell.c) || cell.has_vs16
                                 || is_custom_block_drawing(cell.c)
                                 || crate::renderer::is_block_element(cell.c)
                                 || cell
@@ -6325,7 +6352,7 @@ fn draw_sextant_cell(
 }
 
 fn render_single_char(
-    cell: &alacritty_terminal::term::cell::Cell,
+    cell: &RowCell,
     cell_x: f32,
     cell_y: f32,
     actual_cell_width: f32,

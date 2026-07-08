@@ -11,7 +11,6 @@ pub use atlas::Atlas;
 pub use atlas::RowShapingResult;
 pub use atlas::is_block_element;
 pub use atlas::is_emoji;
-pub use atlas::is_emoji_presentation;
  pub use cell::CellInstance;
  pub use pipeline::Pipeline;
 
