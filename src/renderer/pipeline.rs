@@ -1197,7 +1197,9 @@ impl Pipeline {
                                 + padding_top;
                             let actual_cell_height = next_cell_y - cell_y;
 
-                            if !is_emoji_or_block_or_wide {
+                            let mut glyph_rendered = false;
+
+                            if !is_emoji_or_block_or_wide && info.glyph_id != 0 {
                                 if let Some(entry) =
                                     atlas.get_or_rasterize_glyph(info.glyph_id, device, queue)
                                 {
@@ -1288,9 +1290,12 @@ impl Pipeline {
                                             is_color_val,
                                         );
                                         fg_instances.push(text_instance);
+                                        glyph_rendered = true;
                                     }
                                 }
-                            } else {
+                            }
+
+                            if !glyph_rendered {
                                 for sub_col in start_col..end_col {
                                     let sub_cell = &cells[sub_col];
                                     if sub_cell.c != ' ' && sub_cell.c != '\0' {

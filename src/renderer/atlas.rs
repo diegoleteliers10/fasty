@@ -1182,6 +1182,9 @@ impl Atlas {
         device: &Device,
         queue: &Queue,
     ) -> Option<AtlasEntry> {
+        if glyph_id == 0 {
+            return None;
+        }
         if let Some(entry) = self.entries.get(&GlyphKey::GlyphId(glyph_id)) {
             return Some(*entry);
         }
