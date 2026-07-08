@@ -61,6 +61,8 @@ struct ShelfPacker {
 }
 
 impl ShelfPacker {
+    const GLYPH_PADDING: u32 = 2;
+
     fn new(width: u32, height: u32) -> Self {
         Self {
             width,
@@ -72,21 +74,24 @@ impl ShelfPacker {
     }
 
     fn alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
-        if self.cursor_x + w > self.width {
+        let padded_w = w + Self::GLYPH_PADDING;
+        let padded_h = h + Self::GLYPH_PADDING;
+
+        if self.cursor_x + padded_w > self.width {
             self.cursor_x = 0;
             self.cursor_y += self.row_height;
             self.row_height = 0;
         }
 
-        if self.cursor_y + h > self.height {
+        if self.cursor_y + padded_h > self.height {
             return None;
         }
 
-        let x = self.cursor_x;
-        let y = self.cursor_y;
+        let x = self.cursor_x + Self::GLYPH_PADDING / 2;
+        let y = self.cursor_y + Self::GLYPH_PADDING / 2;
 
-        self.cursor_x += w;
-        self.row_height = self.row_height.max(h);
+        self.cursor_x += padded_w;
+        self.row_height = self.row_height.max(padded_h);
 
         Some((x, y))
     }
@@ -871,14 +876,10 @@ impl Atlas {
         }
 
         // 3. Allocate and upload
-        let padding = 1u32;
-        let alloc_w = final_w + padding * 2;
-        let alloc_h = final_h + padding * 2;
-
-        if let Some(pos) = self.packer.alloc(alloc_w, alloc_h) {
+        if let Some(pos) = self.packer.alloc(final_w, final_h) {
             let entry = AtlasEntry {
-                x: (pos.0 + padding) as f32,
-                y: (pos.1 + padding) as f32,
+                x: pos.0 as f32,
+                y: pos.1 as f32,
                 width: final_w as f32,
                 height: final_h as f32,
                 left: if is_block_char {
@@ -902,8 +903,8 @@ impl Atlas {
                     texture: &self.texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d {
-                        x: pos.0 + padding,
-                        y: pos.1 + padding,
+                        x: pos.0,
+                        y: pos.1,
                         z: 0,
                     },
                     aspect: wgpu::TextureAspect::All,
@@ -1259,14 +1260,10 @@ impl Atlas {
         let rgba = scaled.to_rgba8();
         let (w, h) = rgba.dimensions();
         
-        let padding = 1;
-        let alloc_w = w + padding * 2;
-        let alloc_h = h + padding * 2;
-        
-        if let Some(pos) = self.packer.alloc(alloc_w, alloc_h) {
+        if let Some(pos) = self.packer.alloc(w, h) {
             let entry = AtlasEntry {
-                x: (pos.0 + padding) as f32,
-                y: (pos.1 + padding) as f32,
+                x: pos.0 as f32,
+                y: pos.1 as f32,
                 width: w as f32,
                 height: h as f32,
                 left: 0.0,
@@ -1280,8 +1277,8 @@ impl Atlas {
                     texture: &self.texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d {
-                        x: pos.0 + padding,
-                        y: pos.1 + padding,
+                        x: pos.0,
+                        y: pos.1,
                         z: 0,
                     },
                     aspect: wgpu::TextureAspect::All,
@@ -1340,29 +1337,25 @@ impl Atlas {
         let w = target_size;
         let h = target_size;
 
-        let padding = 1;
-        let alloc_w = w + padding * 2;
-        let alloc_h = h + padding * 2;
-
-        if let Some(pos) = self.packer.alloc(alloc_w, alloc_h) {
+        if let Some(pos) = self.packer.alloc(w, h) {
             let entry = AtlasEntry {
-                x: (pos.0 + padding) as f32,
-                y: (pos.1 + padding) as f32,
+                x: pos.0 as f32,
+                y: pos.1 as f32,
                 width: w as f32,
                 height: h as f32,
                 left: 0.0,
                 top: 0.0,
-                is_color: false, // We use it as stencil (is_color = false)
+                is_color: false,
                 is_block: false,
             };
-
+            
             queue.write_texture(
                 wgpu::ImageCopyTextureBase {
                     texture: &self.texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d {
-                        x: pos.0 + padding,
-                        y: pos.1 + padding,
+                        x: pos.0,
+                        y: pos.1,
                         z: 0,
                     },
                     aspect: wgpu::TextureAspect::All,
@@ -1397,14 +1390,10 @@ impl Atlas {
         let rgba = scaled.to_rgba8();
         let (w, h) = rgba.dimensions();
         
-        let padding = 1;
-        let alloc_w = w + padding * 2;
-        let alloc_h = h + padding * 2;
-        
-        if let Some(pos) = self.packer.alloc(alloc_w, alloc_h) {
+        if let Some(pos) = self.packer.alloc(w, h) {
             let entry = AtlasEntry {
-                x: (pos.0 + padding) as f32,
-                y: (pos.1 + padding) as f32,
+                x: pos.0 as f32,
+                y: pos.1 as f32,
                 width: w as f32,
                 height: h as f32,
                 left: 0.0,
@@ -1418,8 +1407,8 @@ impl Atlas {
                     texture: &self.texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d {
-                        x: pos.0 + padding,
-                        y: pos.1 + padding,
+                        x: pos.0,
+                        y: pos.1,
                         z: 0,
                     },
                     aspect: wgpu::TextureAspect::All,
@@ -1450,14 +1439,10 @@ impl Atlas {
         is_color: bool,
         queue: &Queue,
     ) -> anyhow::Result<AtlasEntry> {
-        let padding = 1;
-        let alloc_w = w + padding * 2;
-        let alloc_h = h + padding * 2;
-        
-        if let Some(pos) = self.packer.alloc(alloc_w, alloc_h) {
+        if let Some(pos) = self.packer.alloc(w, h) {
             let entry = AtlasEntry {
-                x: (pos.0 + padding) as f32,
-                y: (pos.1 + padding) as f32,
+                x: pos.0 as f32,
+                y: pos.1 as f32,
                 width: w as f32,
                 height: h as f32,
                 left: 0.0,
@@ -1471,8 +1456,8 @@ impl Atlas {
                     texture: &self.texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d {
-                        x: pos.0 + padding,
-                        y: pos.1 + padding,
+                        x: pos.0,
+                        y: pos.1,
                         z: 0,
                     },
                     aspect: wgpu::TextureAspect::All,
@@ -1526,14 +1511,10 @@ impl Atlas {
         let w = target_size;
         let h = target_size;
 
-        let padding = 1;
-        let alloc_w = w + padding * 2;
-        let alloc_h = h + padding * 2;
-
-        if let Some(pos) = self.packer.alloc(alloc_w, alloc_h) {
+        if let Some(pos) = self.packer.alloc(w, h) {
             let entry = AtlasEntry {
-                x: (pos.0 + padding) as f32,
-                y: (pos.1 + padding) as f32,
+                x: pos.0 as f32,
+                y: pos.1 as f32,
                 width: w as f32,
                 height: h as f32,
                 left: 0.0,
@@ -1547,8 +1528,8 @@ impl Atlas {
                     texture: &self.texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d {
-                        x: pos.0 + padding,
-                        y: pos.1 + padding,
+                        x: pos.0,
+                        y: pos.1,
                         z: 0,
                     },
                     aspect: wgpu::TextureAspect::All,
@@ -1595,46 +1576,15 @@ pub fn is_block_element(ch: char) -> bool {
     )
 }
 
+include!(concat!(env!("OUT_DIR"), "/emoji_table.rs"));
+
+pub fn is_emoji_presentation(ch: char, zerowidth: Option<&[char]>) -> bool {
+    if is_emoji(ch) {
+        return true;
+    }
+    matches!(zerowidth, Some(zw) if zw.contains(&'\u{FE0F}'))
+}
+
 pub fn is_emoji(ch: char) -> bool {
-    matches!(ch as u32,
-        // Main emoji blocks
-        0x1F300..=0x1F9FF   |  // Misc Symbols and Pictographs + Emoticons + Supplemental
-        0x1FA70..=0x1FAFF   |  // Symbols and Pictographs Extended-A
-        0x1F000..=0x1F02F   |  // Mahjong Tiles
-        0x1F0A0..=0x1F0FF   |  // Playing Cards
-        0x1FA00..=0x1FA6F   |  // Chess Symbols / Geometric Shapes Extended
-        // Misc Symbols (covers zodiac, weather, sports, anchors, etc.)
-        0x2600..=0x26FF     |  // Misc Symbols
-        // Arrows (Dingbats 0x2700-0x27BF excluded -- text presentation default,
-        // used as prompt icons like ❯ ➜ that must render with foreground color)
-        0x2934..=0x2935     |  // Arrows (⤴⤵)
-        0x2B05..=0x2B07     |  // Arrows (⬅⬆⬇)
-        0x2B1B..=0x2B1C     |  // Squares (⬛⬜)
-        0x2B50              |  // Star (⭐)
-        0x2B55              |  // Circle (⭕)
-        // Media controls
-        0x231A..=0x231B     |  // Watch, Hourglass
-        0x23E9..=0x23F3     |  // Fast Forward, Rewind, etc
-        0x23CF              |  // Eject (⏏)
-        0x23F8..=0x23FA     |  // Pause, Stop, Record
-        // Geometric shapes
-        0x25AA..=0x25AB     |  // Small Squares (▪▫)
-        0x25B6              |  // Play Button (▶)
-        0x25C0              |  // Reverse Button (◀)
-        0x25FB..=0x25FF     |  // Medium Squares (◻◼◽◾◽)
-        // Regional indicators (flags)
-        0x1F1E0..=0x1F1FF   |  // Regional Indicator Symbols (flags)
-        // Misc
-        0x3030              |  // Wavy Dash (〰)
-        0x303D              |  // Part Alternation Mark (〽)
-        0x3297              |  // Circled Ideograph Congratulation (㊗)
-        0x3299              |  // Circled Ideograph Secret (㊙)
-        0x203C              |  // Double Exclamation Mark (⁉)
-        0x2049              |  // Exclamation Question Mark (⁉)
-        0x2122              |  // Trade Mark (™)
-        0x2139              |  // Information Source (ℹ)
-        0x2194..=0x2199     |  // Arrows (↔↗↘↙)
-        0x21A9..=0x21AA     |  // Arrows (⬅↪)
-        0x2328                // Keyboard (⌨)
-    )
+    generated_is_emoji(ch as u32)
 }

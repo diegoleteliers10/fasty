@@ -1094,10 +1094,15 @@ impl Pipeline {
                         continue;
                     }
 
-                    // 1. Build row text
+                    // 1. Build row text including zero-width characters (ZWJ, VS16, combining marks)
                     row_text.clear();
                     for cell in cells.iter() {
                         row_text.push(cell.c);
+                        if let Some(zw) = cell.zerowidth() {
+                            for &c in zw {
+                                row_text.push(c);
+                            }
+                        }
                     }
 
                     // 2. Check cache
@@ -1109,7 +1114,12 @@ impl Pipeline {
                     // 3. Cache miss: construct col_map and shape
                     let mut col_map = Vec::new();
                     for (idx, cell) in cells.iter().enumerate() {
-                        let char_len = cell.c.len_utf8();
+                        let mut char_len = cell.c.len_utf8();
+                        if let Some(zw) = cell.zerowidth() {
+                            for &c in zw {
+                                char_len += c.len_utf8();
+                            }
+                        }
                         for _ in 0..char_len {
                             col_map.push(idx);
                         }
@@ -1171,7 +1181,7 @@ impl Pipeline {
                         let cell = &cells[start_col];
 
                         if cell.c != ' ' && cell.c != '\0' {
-                            let is_emoji_or_block_or_wide = crate::renderer::is_emoji(cell.c)
+                            let is_emoji_or_block_or_wide = crate::renderer::is_emoji_presentation(cell.c, cell.zerowidth())
                                 || is_custom_block_drawing(cell.c)
                                 || crate::renderer::is_block_element(cell.c)
                                 || cell
@@ -5860,7 +5870,48 @@ fn index_to_ansi_color(idx: usize) -> (u8, u8, u8) {
 }
 
 pub fn is_custom_block_drawing(ch: char) -> bool {
-    matches!(ch as u32, 0x2500..=0x259F)
+    matches!(ch as u32,
+        0x2500..=0x259F |
+        0x2800..=0x28FF |
+        0x1FB00..=0x1FBFF
+    )
+}
+
+pub fn decode_braille(ch: char) -> Option<[bool; 8]> {
+    let code = ch as u32;
+    if !(0x2800..=0x28FF).contains(&code) {
+        return None;
+    }
+    let mask = (code - 0x2800) as u8;
+    Some([
+        mask & 0b0000_0001 != 0,
+        mask & 0b0000_0010 != 0,
+        mask & 0b0000_0100 != 0,
+        mask & 0b0100_0000 != 0,
+        mask & 0b0000_1000 != 0,
+        mask & 0b0001_0000 != 0,
+        mask & 0b0010_0000 != 0,
+        mask & 0b1000_0000 != 0,
+    ])
+}
+
+include!(concat!(env!("OUT_DIR"), "/sextant_table.rs"));
+
+pub fn decode_sextant(ch: char) -> Option<[bool; 6]> {
+    let code = ch as u32;
+    if !(0x1FB00..=0x1FB3B).contains(&code) {
+        return None;
+    }
+    let idx = (code - 0x1FB00) as usize;
+    let mask = SEXTANT_MASK_TABLE[idx];
+    Some([
+        mask & 0x01 != 0,
+        mask & 0x02 != 0,
+        mask & 0x04 != 0,
+        mask & 0x08 != 0,
+        mask & 0x10 != 0,
+        mask & 0x20 != 0,
+    ])
 }
 
 pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
@@ -6188,6 +6239,83 @@ fn render_box_drawing_instances(
     instances
 }
 
+fn draw_braille_cell(
+    cell_x: f32,
+    cell_y: f32,
+    cell_width: f32,
+    cell_height: f32,
+    dots: [bool; 8],
+    fg_color: [f32; 4],
+    instances: &mut Vec<CellInstance>,
+) {
+    let dot_r = (cell_width.min(cell_height) * 0.12).round().max(1.0);
+    let col_w = cell_width / 2.0;
+    let row_h = cell_height / 4.0;
+    let positions = [
+        (col_w * 0.0, row_h * 0.0),
+        (col_w * 1.0, row_h * 0.0),
+        (col_w * 0.0, row_h * 1.0),
+        (col_w * 0.0, row_h * 3.0),
+        (col_w * 1.0, row_h * 1.0),
+        (col_w * 1.0, row_h * 2.0),
+        (col_w * 0.0, row_h * 2.0),
+        (col_w * 1.0, row_h * 3.0),
+    ];
+    for (i, &active) in dots.iter().enumerate() {
+        if !active {
+            continue;
+        }
+        let (cx, cy) = positions[i];
+        let px = (cell_x + cx - dot_r).round();
+        let py = (cell_y + cy - dot_r).round();
+        let d = dot_r * 2.0;
+        instances.push(CellInstance::new(
+            px, py, d, d,
+            fg_color,
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            dot_r,
+        ));
+    }
+}
+
+fn draw_sextant_cell(
+    cell_x: f32,
+    cell_y: f32,
+    cell_width: f32,
+    cell_height: f32,
+    sextant: [bool; 6],
+    fg_color: [f32; 4],
+    instances: &mut Vec<CellInstance>,
+) {
+    let col_w = cell_width / 2.0;
+    let row_h = cell_height / 3.0;
+    let rects = [
+        (0.0, 0.0, col_w, row_h),
+        (col_w, 0.0, col_w, row_h),
+        (0.0, row_h, col_w, row_h),
+        (col_w, row_h, col_w, row_h),
+        (0.0, row_h * 2.0, col_w, row_h),
+        (col_w, row_h * 2.0, col_w, row_h),
+    ];
+    for (i, &active) in sextant.iter().enumerate() {
+        if !active {
+            continue;
+        }
+        let (rx, ry, rw, rh) = rects[i];
+        instances.push(CellInstance::new(
+            (cell_x + rx).round(),
+            (cell_y + ry).round(),
+            rw.ceil(),
+            rh.ceil(),
+            fg_color,
+            [0.0, 0.0, 0.0, 0.0],
+            0.0, 0.0, 1.0, 1.0,
+            0.0,
+        ));
+    }
+}
+
 fn render_single_char(
     cell: &alacritty_terminal::term::cell::Cell,
     cell_x: f32,
@@ -6209,7 +6337,12 @@ fn render_single_char(
         if is_custom_block_drawing(cell.c) {
             let fg = cell_fg_to_f32(effective_fg, cell.flags);
             let code = cell.c as u32;
-            if (0x2500..=0x257F).contains(&code) {
+
+            if let Some(dots) = decode_braille(cell.c) {
+                draw_braille_cell(cell_x, cell_y, actual_cell_width, actual_cell_height, dots, fg, fg_instances);
+            } else if let Some(sextant) = decode_sextant(cell.c) {
+                draw_sextant_cell(cell_x, cell_y, actual_cell_width, actual_cell_height, sextant, fg, fg_instances);
+            } else if (0x2500..=0x257F).contains(&code) {
                 let instances = render_box_drawing_instances(cell.c, cell_x, cell_y, actual_cell_width, actual_cell_height, fg);
                 fg_instances.extend(instances);
             } else {

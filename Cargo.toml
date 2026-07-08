@@ -32,7 +32,6 @@ seahash = "4"
 anyhow = "1"
 parking_lot = "0.12"
 raw-window-handle = "0.6"
-unicode-width = "0.1"
 rustix = { version = "0.38", features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
