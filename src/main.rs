@@ -192,7 +192,10 @@ fn create_new_tab(
 }
 
 fn get_padding_top(_tab_count: usize) -> f32 {
-    58.0
+    // Must match the hardcoded `padding_top` in renderer/pipeline.rs (line ~797).
+    // If these diverge, mouse hit-testing (clicks, selection, hover URLs) lands
+    // on the wrong row relative to the visually rendered cells.
+    48.0
 }
 
 fn mark_grid_dirty(renderer: &Arc<parking_lot::Mutex<Renderer>>, app_dirty: &mut bool) {
