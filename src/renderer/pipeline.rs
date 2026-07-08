@@ -1,6 +1,7 @@
 //! Render pipeline for terminal cells.
 
 use std::mem;
+use std::rc::Rc;
 
 use alacritty_terminal::grid::Indexed;
 use bytemuck::cast_slice;
@@ -1088,6 +1089,7 @@ impl Pipeline {
 
             if use_ligatures {
                 let mut row_text = String::with_capacity(256);
+                let mut col_map = Vec::with_capacity(256);
                 for row in 0..visible_rows_count {
                     let cells = &row_cells[row];
                     if cells.is_empty() {
@@ -1107,12 +1109,12 @@ impl Pipeline {
 
                     // 2. Check cache
                     if let Some(cached) = atlas.shaping_cache.get(&row_text) {
-                        row_shaping[row] = Some(cached.clone());
+                        row_shaping[row] = Some(Rc::clone(cached));
                         continue;
                     }
 
                     // 3. Cache miss: construct col_map and shape
-                    let mut col_map = Vec::new();
+                    col_map.clear();
                     for (idx, cell) in cells.iter().enumerate() {
                         let mut char_len = cell.c.len_utf8();
                         if let Some(zw) = cell.zerowidth() {
@@ -1136,13 +1138,14 @@ impl Pipeline {
                         if !glyph_infos.is_empty() {
                             let result = RowShapingResult {
                                 glyph_infos,
-                                col_map,
+                                col_map: mem::take(&mut col_map),
                             };
+                            let rc = Rc::new(result);
                             if atlas.shaping_cache.len() >= 500 {
                                 atlas.shaping_cache.clear();
                             }
-                            atlas.shaping_cache.insert(row_text.clone(), result.clone());
-                            row_shaping[row] = Some(result);
+                            atlas.shaping_cache.insert(row_text.clone(), Rc::clone(&rc));
+                            row_shaping[row] = Some(rc);
                         }
                     }
                 }

@@ -4,6 +4,7 @@
 //! Uses FreeType for high-quality antialiased/hinted text rendering and color emoji support.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use anyhow::Context;
 use wgpu::{Device, Queue, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages};
 use freetype::Library;
@@ -116,7 +117,7 @@ pub struct Atlas {
     primary_path: String,
     primary_font_bytes: Option<Vec<u8>>,
     hb_face: Option<rustybuzz::Face<'static>>,
-    pub shaping_cache: HashMap<String, RowShapingResult>,
+    pub shaping_cache: HashMap<String, Rc<RowShapingResult>>,
     pub hyperlink_cache: HashMap<String, std::sync::Arc<str>>,
     fallback_paths: Vec<String>,
     fallback_glyph: Option<AtlasEntry>,
