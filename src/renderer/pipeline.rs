@@ -947,6 +947,9 @@ impl Pipeline {
                             if let Some(cached) = atlas.hyperlink_cache.get(&uri) {
                                 cached.clone()
                             } else {
+                                if atlas.hyperlink_cache.len() >= 500 {
+                                    atlas.hyperlink_cache.clear();
+                                }
                                 let arc: std::sync::Arc<str> = std::sync::Arc::from(uri.as_str());
                                 atlas.hyperlink_cache.insert(uri, arc.clone());
                                 arc

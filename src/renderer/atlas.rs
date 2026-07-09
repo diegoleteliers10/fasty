@@ -115,7 +115,7 @@ pub struct Atlas {
     entries: HashMap<GlyphKey, AtlasEntry>,
     packer: ShelfPacker,
     primary_path: String,
-    primary_font_bytes: Option<Vec<u8>>,
+    primary_font_bytes: Option<std::sync::Arc<[u8]>>,
     hb_face: Option<rustybuzz::Face<'static>>,
     pub shaping_cache: HashMap<String, Rc<RowShapingResult>>,
     pub hyperlink_cache: HashMap<String, std::sync::Arc<str>>,
@@ -224,8 +224,8 @@ impl Atlas {
             primary_path: self.primary_path.clone(),
             primary_font_bytes: self.primary_font_bytes.clone(),
             hb_face,
-            shaping_cache: self.shaping_cache.clone(),
-            hyperlink_cache: self.hyperlink_cache.clone(),
+            shaping_cache: HashMap::new(),
+            hyperlink_cache: HashMap::new(),
             fallback_paths: self.fallback_paths.clone(),
             fallback_glyph: self.fallback_glyph.clone(),
             cell_width: self.cell_width,
@@ -350,7 +350,7 @@ impl Atlas {
             },
         );
 
-        let primary_font_bytes = std::fs::read(&primary_path).ok();
+        let primary_font_bytes = std::fs::read(&primary_path).ok().map(std::sync::Arc::from);
 
         let mut hb_face = None;
         if let Some(bytes) = &primary_font_bytes {
