@@ -16,3 +16,5 @@ pub mod terminal_state;
 pub mod widgets;
 #[cfg(target_os = "macos")]
 pub mod font_discovery_macos;
+#[cfg(target_os = "macos")]
+pub mod macos_metal_layer;

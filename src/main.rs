@@ -11,7 +11,7 @@ mod git;
 mod keybindings;
 mod macos_maximize;
 #[cfg(target_os = "macos")]
-mod macos_metal_layer;
+use fastty::macos_metal_layer;
 mod chrome_layout;
 mod paths;
 mod renderer;
