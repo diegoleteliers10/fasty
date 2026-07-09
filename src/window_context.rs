@@ -45,7 +45,9 @@ pub struct WindowContext {
     pub shift_held: bool,
     pub alt_held: bool,
     pub scroll_velocity: f32,
+    pub last_resize_present: Option<std::time::Instant>,
 }
+
 
 impl WindowContext {
     pub fn new(
@@ -93,6 +95,7 @@ impl WindowContext {
             shift_held: false,
             alt_held: false,
             scroll_velocity: 0.0,
+            last_resize_present: None,
         }
     }
 

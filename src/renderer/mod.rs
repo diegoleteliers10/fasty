@@ -213,6 +213,8 @@ pub struct Renderer<'a> {
     pub update_in_progress: bool,
     pub update_completed: bool,
     pub hover_update: bool,
+    /// When true, use low-latency present mode during resize to avoid VBlank stalls.
+    pub sync_present: bool,
 }
 
 impl<'a> Renderer<'a> {
@@ -311,6 +313,11 @@ impl<'a> Renderer<'a> {
         };
         surface.configure(&device, &config);
 
+        // macOS: enable synchronised Metal presentation so frames and window
+        // geometry updates arrive at the compositor atomically during resize.
+        #[cfg(target_os = "macos")]
+        crate::macos_metal_layer::enable_presents_with_transaction(window);
+
         let scale_factor = window.scale_factor() as f32;
         let atlas = Atlas::new(&device, &queue, ATLAS_SIZE, ATLAS_SIZE, font_family, font_size, scale_factor)?;
         let ui_atlas = Atlas::new(&device, &queue, ATLAS_SIZE, ATLAS_SIZE, font_family, 12.0, scale_factor)?;
@@ -336,6 +343,7 @@ impl<'a> Renderer<'a> {
             update_in_progress: false,
             update_completed: false,
             hover_update: false,
+            sync_present: false,
         })
     }
 
@@ -364,6 +372,10 @@ impl<'a> Renderer<'a> {
         };
         surface.configure(&device, &config);
 
+        // macOS: enable synchronised Metal presentation (same as new()).
+        #[cfg(target_os = "macos")]
+        crate::macos_metal_layer::enable_presents_with_transaction(window);
+
         let scale_factor = window.scale_factor() as f32;
         let atlas = Atlas::new(&device, &queue, ATLAS_SIZE, ATLAS_SIZE, font_family, font_size, scale_factor)?;
         let ui_atlas = Atlas::new(&device, &queue, ATLAS_SIZE, ATLAS_SIZE, font_family, 12.0, scale_factor)?;
@@ -389,6 +401,7 @@ impl<'a> Renderer<'a> {
             update_in_progress: false,
             update_completed: false,
             hover_update: false,
+            sync_present: false,
         })
     }
 
@@ -417,6 +430,10 @@ impl<'a> Renderer<'a> {
         };
         surface.configure(&device, &config);
 
+        // macOS: enable synchronised Metal presentation (same as new()).
+        #[cfg(target_os = "macos")]
+        crate::macos_metal_layer::enable_presents_with_transaction(window);
+
         let (cell_width, cell_height) = atlas.cell_size();
         let pipeline = Pipeline::new(&device, &atlas, &ui_atlas, format);
 
@@ -438,6 +455,7 @@ impl<'a> Renderer<'a> {
             update_in_progress: false,
             update_completed: false,
             hover_update: false,
+            sync_present: false,
         })
     }
 
@@ -447,9 +465,27 @@ impl<'a> Renderer<'a> {
         }
         self.config.width = width;
         self.config.height = height;
+        // Durante resize usar baja latencia para no esperar VBlank.
+        self.config.present_mode = if self.sync_present {
+            wgpu::PresentMode::AutoNoVsync
+        } else {
+            wgpu::PresentMode::Fifo
+        };
         self.surface.configure(&self.device, &self.config);
         self.dirty = true;
         self.grid_dirty = true;
+    }
+
+    /// Restaurar VSync (Fifo) después del resize.
+    pub fn restore_vsync(&mut self) {
+        if self.config.present_mode != wgpu::PresentMode::Fifo {
+            self.config.present_mode = wgpu::PresentMode::Fifo;
+            self.surface.configure(&self.device, &self.config);
+        }
+    }
+
+    pub fn set_sync_present(&mut self, v: bool) {
+        self.sync_present = v;
     }
 
     /// Present a single transparent-cleared frame. Used by windows that have
@@ -458,8 +494,19 @@ impl<'a> Renderer<'a> {
     /// be mapped by the compositor.
     pub fn present_blank(&mut self) {
         let frame = match self.surface.get_current_texture() {
-            Ok(f) => f,
-            Err(_) => return,
+            Ok(frame) => frame,
+            Err(wgpu::SurfaceError::Timeout) => {
+                tracing::debug!("Frame acquire timeout, skipping frame");
+                return;
+            }
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                self.surface.configure(&self.device, &self.config);
+                return;
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                tracing::error!("GPU out of memory, cannot continue");
+                return;
+            }
         };
         let view = frame
             .texture
@@ -569,8 +616,16 @@ impl<'a> Renderer<'a> {
 
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
-            Err(e) => {
-                tracing::error!("Failed to get current texture: {}", e);
+            Err(wgpu::SurfaceError::Timeout) => {
+                tracing::debug!("Frame acquire timeout, skipping frame");
+                return;
+            }
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                self.surface.configure(&self.device, &self.config);
+                return;
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                tracing::error!("GPU out of memory, cannot continue");
                 return;
             }
         };
@@ -695,6 +750,10 @@ impl<'a> Renderer<'a> {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+        #[cfg(target_os = "macos")]
+        if self.sync_present {
+            self.device.poll(wgpu::Maintain::Wait);
+        }
         frame.present();
         self.dirty = false;
     }
@@ -728,8 +787,16 @@ impl<'a> Renderer<'a> {
 
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
-            Err(e) => {
-                tracing::error!("Failed to get current texture: {}", e);
+            Err(wgpu::SurfaceError::Timeout) => {
+                tracing::debug!("Frame acquire timeout, skipping frame");
+                return;
+            }
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                self.surface.configure(&self.device, &self.config);
+                return;
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                tracing::error!("GPU out of memory, cannot continue");
                 return;
             }
         };
@@ -786,6 +853,10 @@ impl<'a> Renderer<'a> {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+        #[cfg(target_os = "macos")]
+        if self.sync_present {
+            self.device.poll(wgpu::Maintain::Wait);
+        }
         frame.present();
         self.dirty = false;
     }
@@ -802,8 +873,16 @@ impl<'a> Renderer<'a> {
 
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
-            Err(e) => {
-                tracing::error!("Failed to get current texture: {}", e);
+            Err(wgpu::SurfaceError::Timeout) => {
+                tracing::debug!("Frame acquire timeout, skipping frame");
+                return;
+            }
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                self.surface.configure(&self.device, &self.config);
+                return;
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                tracing::error!("GPU out of memory, cannot continue");
                 return;
             }
         };
@@ -843,6 +922,10 @@ impl<'a> Renderer<'a> {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+        #[cfg(target_os = "macos")]
+        if self.sync_present {
+            self.device.poll(wgpu::Maintain::Wait);
+        }
         frame.present();
         self.dirty = false;
     }

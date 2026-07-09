@@ -10,6 +10,8 @@ mod event_listener;
 mod git;
 mod keybindings;
 mod macos_maximize;
+#[cfg(target_os = "macos")]
+mod macos_metal_layer;
 mod chrome_layout;
 mod paths;
 mod renderer;
@@ -260,6 +262,7 @@ fn handle_popped_out_event(
     pending_new_window_from_drag: &mut bool,
     main_mouse_x: f64,
     shell: &str,
+    target: &winit::event_loop::ActiveEventLoop,
 ) {
     match event {
         WindowEvent::CloseRequested => {
@@ -734,12 +737,46 @@ fn handle_popped_out_event(
             let cell_h = wc.cell_height.max(1.0);
             let cols = (((size.width as f32 - PADDING_LEFT * 2.0) / cell_w).floor().max(1.0)) as usize;
             let rows = (((size.height as f32 - (padding_top + padding_bottom)) / cell_h).floor().max(1.0)) as usize;
-            
-            wc.shell_cols = cols;
-            wc.shell_rows = rows;
-            wc.pending_term_resize = Some((cols, rows));
-            wc.pending_surface_resize = Some((size.width, size.height));
-            wc.window.request_redraw();
+
+            let size_changed = cols != wc.shell_cols || rows != wc.shell_rows;
+            if size_changed {
+                wc.shell_cols = cols;
+                wc.shell_rows = rows;
+                wc.pending_term_resize = Some((cols, rows));
+            }
+
+            let should_present_now = wc.last_resize_present
+                .map(|t| t.elapsed() >= std::time::Duration::from_millis(8))
+                .unwrap_or(true);
+
+            // Enable low-latency present mode during the resize drag so the
+            // GPU doesn't stall waiting for VBlank on resize frames.
+            wc.renderer.lock().set_sync_present(true);
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            {
+                if should_present_now {
+                    wc.renderer.lock().resize(size.width, size.height);
+                    wc.pending_surface_resize = None;
+                    wc.last_resize_present = Some(std::time::Instant::now());
+                } else {
+                    wc.pending_surface_resize = Some((size.width, size.height));
+                }
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            {
+                wc.pending_surface_resize = Some((size.width, size.height));
+            }
+
+            // Poll during resize so the event loop doesn't sleep.
+            target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+
+            if should_present_now {
+                wc.window.request_redraw();
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                {
+                    wc.last_resize_present = Some(std::time::Instant::now());
+                }
+            }
         }
         WindowEvent::ScaleFactorChanged { .. } => {
             let Some(wc) = popped.get_mut(&window_id) else { return; };
@@ -882,8 +919,25 @@ fn handle_popped_out_event(
                     t.terminal_state.lock().resize(cols, rows);
                 }
             }
+            // `pending_surface_resize` is normally None here (consumed in
+            // `Resized`). This fallback handles the edge case of a zero-size
+            // resize being deferred.
+            #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+            let popped_is_resize_frame = wc.pending_surface_resize.is_some();
             if let Some((w, h)) = wc.pending_surface_resize.take() {
                 wc.renderer.lock().resize(w, h);
+            }
+            // macOS: open a CATransaction for resize frames.
+            #[cfg(target_os = "macos")]
+            if popped_is_resize_frame {
+                macos_metal_layer::begin_transaction();
+            }
+            // Restore VSync once all pending resize work is done so we stop
+            // blocking on device.poll(Wait) and return to Fifo for idle frames.
+            if wc.pending_surface_resize.is_none() && wc.pending_term_resize.is_none() {
+                let mut r = wc.renderer.lock();
+                r.restore_vsync();
+                r.set_sync_present(false);
             }
             if let Some(tab) = wc.tabs.get(active_idx) {
                 let mut tab_titles = Vec::new();
@@ -1027,6 +1081,13 @@ fn handle_popped_out_event(
                 r.set_dirty(true);
                 r.grid_dirty = true;
                 r.render(renderer::RenderReason::GridChanged, term_ref, tab.cursor_visible, inputs);
+                // macOS: commit the CATransaction that was opened in the
+                // Resized handler so geometry and pixels arrive at the
+                // compositor atomically.  On non-macOS this compiles to nothing.
+                #[cfg(target_os = "macos")]
+                if popped_is_resize_frame {
+                    macos_metal_layer::commit_transaction();
+                }
             }
         }
         _ => {}
@@ -1716,8 +1777,18 @@ fn main() -> anyhow::Result<()> {
     let mut cell_width = renderer.cell_width();
     let mut cell_height = renderer.cell_height();
 
-
-
+    // Hint al OS para que el resize salte en incrementos de celda.
+    // Soportado en macOS (NSWindow.contentResizeIncrements) y X11.
+    // En Wayland/Windows no tiene efecto pero tampoco daña.
+    // Disabled cell-snapping to make window resize completely smooth and continuous (not snappy/step-like).
+    // #[cfg(any(target_os = "macos", target_os = "linux"))]
+    // {
+    //     let cw = cell_width as u32;
+    //     let ch = cell_height as u32;
+    //     if cw > 0 && ch > 0 {
+    //         let _ = window_arc.set_resize_increments(Some(winit::dpi::PhysicalSize::new(cw, ch)));
+    //     }
+    // }
 
     let viewport_width = renderer.config.width as f32;
     const PADDING_LEFT: f32 = 10.0;
@@ -1947,6 +2018,7 @@ fn main() -> anyhow::Result<()> {
     // avoids N × surface.configure() stalls when N resize events fire
     // between two frames.
     let mut pending_surface_resize: Option<(u32, u32)> = None;
+    let mut last_resize_present: Option<std::time::Instant> = None;
     // Deferred terminal resize: same idea — term.resize() does expensive
     // text reflow when cols change, so we collapse N resize events into 1.
     let mut pending_term_resize: Option<(usize, usize)> = None;
@@ -2439,6 +2511,7 @@ fn main() -> anyhow::Result<()> {
                             &mut pending_new_window_from_drag,
                             current_mouse_x,
                             &shell,
+                            target,
                         );
                         return;
                     }
@@ -2460,26 +2533,66 @@ fn main() -> anyhow::Result<()> {
                             let cols = (((physical_size.width as f32 - PADDING_LEFT * 2.0) / cell_w).floor().max(1.0)) as usize;
                             let rows = (((physical_size.height as f32 - (padding_top + padding_bottom)) / cell_h).floor().max(1.0)) as usize;
 
-                            shell_cols = cols;
-                            shell_rows = rows;
+                            let size_changed = cols != shell_cols || rows != shell_rows;
+                            if size_changed {
+                                shell_cols = cols;
+                                shell_rows = rows;
 
-                            // Defer terminal reflow + PTY resize to render time.
-                            // Width changes trigger expensive text reflow in
-                            // alacritty — collapsing N events into 1 per frame.
-                            pending_term_resize = Some((cols, rows));
+                                // Defer terminal reflow + PTY resize to render time.
+                                // Width changes trigger expensive text reflow in
+                                // alacritty — collapsing N events into 1 per frame.
+                                pending_term_resize = Some((cols, rows));
+                                // Background tabs catch up on the next frame
+                                pending_bg_resize = true;
+                            }
 
-                            // Defer surface.configure() to render time.
-                            // During rapid resize events (hundreds per second on
-                            // Wayland), only the last size matters because we
-                            // render once per frame.
-                            pending_surface_resize = Some((physical_size.width, physical_size.height));
                             app_dirty = true;
-                            // Background tabs catch up on the next frame
-                            pending_bg_resize = true;
-                            // Bypass the 16ms frame_time gate in AboutToWait
-                            // so the resize renders on the very next event loop
-                            // tick instead of waiting up to one full frame.
-                            window_for_redraw.request_redraw();
+
+                            // Apply surface.configure() synchronously here so the GPU
+                            // surface is already at the new size when RedrawRequested
+                            // fires in the same tick.  This is the universal fix for the
+                            // "truncated" / stretched-frame artefact during live resize on
+                            // Windows (WM_ENTERSIZEMOVE modal loop), X11, and macOS:
+                            // without this, surface.configure() was deferred to
+                            // RedrawRequested which may not run until after the OS has
+                            // already composited the old frame into the new window rect.
+                            let should_present_now = last_resize_present
+                                .map(|t| t.elapsed() >= std::time::Duration::from_millis(8))
+                                .unwrap_or(true);
+
+                            if physical_size.width > 0 && physical_size.height > 0 {
+                                // Activar presentación sincrónica durante el resize para eliminar frame-stretch.
+                                renderer.lock().set_sync_present(true);
+                                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                                {
+                                    if should_present_now {
+                                        renderer.lock().resize(physical_size.width, physical_size.height);
+                                        pending_surface_resize = None;
+                                        last_resize_present = Some(std::time::Instant::now());
+                                    } else {
+                                        pending_surface_resize = Some((physical_size.width, physical_size.height));
+                                    }
+                                }
+                                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                                {
+                                    pending_surface_resize = Some((physical_size.width, physical_size.height));
+                                }
+                            } else {
+                                pending_surface_resize = Some((physical_size.width, physical_size.height));
+                            }
+
+                            // Switch to Poll during the resize drag so the event loop
+                            // does not sleep between rapid Resized events and the
+                            // matching RedrawRequested gets processed immediately.
+                            target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+
+                            if should_present_now {
+                                window_for_redraw.request_redraw();
+                                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                                {
+                                    last_resize_present = Some(std::time::Instant::now());
+                                }
+                            }
                         }
                         WindowEvent::RedrawRequested => {
                             // Flush pending background tab resizes from
@@ -2496,14 +2609,44 @@ fn main() -> anyhow::Result<()> {
                             let was_rendered = first_frame_rendered;
                             first_frame_rendered = true;
 
+                            // `pending_surface_resize` is normally consumed in
+                            // `Resized` now (synchronous path).  The fallback
+                            // here handles the rare case where width/height were
+                            // zero at `Resized` time (minimised window, etc.).
                             // Apply deferred resizes BEFORE acquiring the
                             // terminal state lock below — otherwise the
                             // non-reentrant parking_lot::Mutex deadlocks.
                             if let Some((cols, rows)) = pending_term_resize.take() {
                                 tabs[active_tab_index].terminal_state.lock().resize(cols, rows);
                             }
+                            // Track whether we are rendering a resize frame so we
+                            // can wrap it in a CATransaction on macOS.
+                            #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+                            let is_resize_frame = pending_surface_resize.is_some();
                             if let Some((w, h)) = pending_surface_resize.take() {
                                 renderer.lock().resize(w, h);
+                            }
+                            // Restore VSync once all resize work is consumed so we
+                            // stop calling device.poll(Wait) on every frame.
+                            // pending_surface_resize and pending_term_resize are both
+                            // None at this point on the normal path.
+                            if pending_surface_resize.is_none() && pending_term_resize.is_none() {
+                                let mut r = renderer.lock();
+                                r.restore_vsync();
+                                r.set_sync_present(false);
+                            }
+                            // macOS: open a CATransaction around resize frames so
+                            // geometry and GPU pixels reach the compositor atomically.
+                            #[cfg(target_os = "macos")]
+                            if is_resize_frame {
+                                macos_metal_layer::begin_transaction();
+                            }
+
+                            // Si ya no hay resize pendiente, restaurar VSync y desactivar sync_present.
+                            if !pending_bg_resize && pending_surface_resize.is_none() && pending_term_resize.is_none() {
+                                let mut r = renderer.lock();
+                                r.restore_vsync();
+                                r.set_sync_present(false);
                             }
 
                             let r_cfg = renderer.lock();
@@ -2794,6 +2937,13 @@ fn main() -> anyhow::Result<()> {
                             };
                             r.render(next_render_reason, term_ref, active_tab.cursor_visible, inputs);
                             drop(r);
+                            // macOS: commit the CATransaction opened earlier for this
+                            // resize frame so the new GPU frame and the new window
+                            // geometry arrive at the compositor in the same transaction.
+                            #[cfg(target_os = "macos")]
+                            if is_resize_frame {
+                                macos_metal_layer::commit_transaction();
+                            }
 
                             #[cfg(target_os = "windows")]
                             {
@@ -6211,6 +6361,16 @@ fn main() -> anyhow::Result<()> {
                                  );
                                  let id = wc.window.id();
                                  popped_out_windows.insert(id, wc);
+                                                                   // // Snap resize to whole character cells (macOS / X11).
+                                  // #[cfg(any(target_os = "macos", target_os = "linux"))]
+                                  // if let Some(wc) = popped_out_windows.get(&id) {
+                                  // let cw = actual_cell_w as u32;
+                                  // let ch = actual_cell_h as u32;
+                                  // if cw > 0 && ch > 0 {
+                                  // let _ = wc.window.set_resize_increments(
+                                  // Some(winit::dpi::PhysicalSize::new(cw, ch)));
+                                  // }
+                                  // }
                                  if let Some(wc) = popped_out_windows.get(&id) {
                                      #[cfg(target_os = "windows")]
                                      wc.window.set_visible(true);
@@ -6325,6 +6485,7 @@ fn main() -> anyhow::Result<()> {
                                 );
                                 let id = wc.window.id();
                                 popped_out_windows.insert(id, wc);
+                                // Disabled cell-snapping to make window resize completely smooth and continuous (not snappy/step-like).
                                 if let Some(wc) = popped_out_windows.get(&id) {
                                     #[cfg(target_os = "windows")]
                                     wc.window.set_visible(true);
@@ -6986,7 +7147,12 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                if let Some(wakeup) = next_wakeup {
+                // During live resize, keep polling so that the RedrawRequested
+                // for the new window size is processed immediately on the next
+                // event loop tick rather than waiting for the OS to wake the loop.
+                if pending_bg_resize {
+                    target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                } else if let Some(wakeup) = next_wakeup {
                     target.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(wakeup));
                 } else {
                     target.set_control_flow(winit::event_loop::ControlFlow::Wait);
