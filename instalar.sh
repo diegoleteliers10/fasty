@@ -20,7 +20,7 @@ ARCH="$(uname -m)"
 
 case "$OS" in
     linux)
-        if [ "$ARCH" = "x86_64" ]; then
+        if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
             TARGET="x86_64-unknown-linux-gnu"
         else
             echo "ERROR: Linux architecture '$ARCH' is not supported." >&2
@@ -45,7 +45,7 @@ esac
 
 echo "Detected platform: OS=$OS, Arch=$ARCH -> Target=$TARGET"
 
-# ── 2. Resolve XDG/platform directories ───────────────────────────────────────
+# ── 2. Resolve platform directories ───────────────────────────────────────────
 if [ "$OS" = "darwin" ]; then
     CONFIG_DIR="$HOME/Library/Application Support/fastty"
     DATA_DIR="$HOME/Library/Application Support/fastty"
@@ -67,8 +67,8 @@ fi
 # ── 3. Create directories ─────────────────────────────────────────────────────
 mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$STATE_DIR" "$CACHE_DIR" "$BIN_DIR"
 
-# ── 4. Query the GitHub API for the latest release ─────────────────────────────
-echo "Fetching the latest version from GitHub..."
+# ── 4. Query GitHub API for the latest release ────────────────────────────────
+echo "Fetching latest version from GitHub..."
 API_URL="https://api.github.com/repos/$GITHUB_USER/$GITHUB_REPO/releases/latest"
 API_RESPONSE=$(curl -sSfL "$API_URL")
 
@@ -87,13 +87,13 @@ else
 fi
 
 if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
-    echo "ERROR: Could not determine the latest version from GitHub." >&2
+    echo "ERROR: Could not determine latest release version from GitHub." >&2
     exit 1
 fi
 
 echo "Latest version found: $LATEST_TAG"
 
-# ── 5. Download the correct asset ──────────────────────────────────────────────
+# ── 5. Download asset ─────────────────────────────────────────────────────────
 ASSET_NAME="$APP_NAME-$TARGET.tar.gz"
 DOWNLOAD_URL="https://github.com/$GITHUB_USER/$GITHUB_REPO/releases/download/$LATEST_TAG/$ASSET_NAME"
 
@@ -104,33 +104,63 @@ echo "Downloading $ASSET_NAME..."
 curl -sSfL -o "$TEMP_DIR/$ASSET_NAME" "$DOWNLOAD_URL"
 
 # ── 6. Extract ─────────────────────────────────────────────────────────────────
-echo "Extracting files..."
+echo "Extracting archive..."
 tar -xzf "$TEMP_DIR/$ASSET_NAME" -C "$TEMP_DIR"
 
-# ── 6.5. Copy default config if bundled ─────────────────────────────────────────
-if [ ! -f "$CONFIG_DIR/config.toml" ] && [ ! -f "$CONFIG_DIR/config.json" ]; then
-    if [ -f "$TEMP_DIR/config.toml" ]; then
-        echo "Copying default config.toml..."
-        cp "$TEMP_DIR/config.toml" "$CONFIG_DIR/config.toml"
-    elif [ -f "$TEMP_DIR/config.json" ]; then
-        echo "Copying default config.json..."
-        cp "$TEMP_DIR/config.json" "$CONFIG_DIR/config.json"
+# ── 6.5. Initialize default configuration if absent ───────────────────────────
+CONFIG_FILE="$CONFIG_DIR/fastty.toml"
+LEGACY_CONFIG="$CONFIG_DIR/config.toml"
+
+if [ ! -f "$CONFIG_FILE" ] && [ ! -f "$LEGACY_CONFIG" ] && [ ! -f "$CONFIG_DIR/config.json" ]; then
+    if [ -f "$TEMP_DIR/fastty.toml" ]; then
+        echo "Copying default fastty.toml..."
+        cp "$TEMP_DIR/fastty.toml" "$CONFIG_FILE"
+    elif [ -f "$TEMP_DIR/config.toml" ]; then
+        echo "Copying default fastty.toml..."
+        cp "$TEMP_DIR/config.toml" "$CONFIG_FILE"
+    else
+        echo "Generating default fastty.toml..."
+        cat << 'EOF' > "$CONFIG_FILE"
+# fastty configuration file
+theme = "default"
+opacity = 1.0
+scrollback = 1000
+session_restore = true
+copy_on_select = false
+notify_on_command_finish = true
+
+[font]
+family = "monospace"
+size = 14.0
+weight = 400.0
+ligatures = true
+
+[bottombar]
+enabled = true
+layout = "balanced"
+left_widgets = ["git_branch", "git_status"]
+right_widgets = ["cwd", "duration", "exit_code"]
+
+[keybindings]
+EOF
     fi
 fi
 
-# ── 7. Install binary ─────────────────────────────────────────────────────────
+# ── 7. Install binary and platform integrations ────────────────────────────────
 if [ "$OS" = "darwin" ]; then
-    # macOS: install .app bundle + symlink
     INSTALL_DIR="/Applications"
-    if [ -w "$INSTALL_DIR" ]; then
-        rm -rf "$INSTALL_DIR/Fastty.app"
-        mv "$TEMP_DIR/Fastty.app" "$INSTALL_DIR/"
-    else
-        echo "Administrator privileges (sudo) are required to write to $INSTALL_DIR."
-        sudo rm -rf "$INSTALL_DIR/Fastty.app"
-        sudo mv "$TEMP_DIR/Fastty.app" "$INSTALL_DIR/"
+    if [ -d "$TEMP_DIR/Fastty.app" ]; then
+        if [ -w "$INSTALL_DIR" ]; then
+            rm -rf "$INSTALL_DIR/Fastty.app"
+            mv "$TEMP_DIR/Fastty.app" "$INSTALL_DIR/"
+        else
+            echo "Administrator privileges required to write to $INSTALL_DIR:"
+            sudo rm -rf "$INSTALL_DIR/Fastty.app"
+            sudo mv "$TEMP_DIR/Fastty.app" "$INSTALL_DIR/"
+        fi
     fi
 
+    # Symlink to bin directory
     if [ -w "$BIN_DIR" ]; then
         rm -f "$BIN_DIR/fastty"
         ln -sf "$INSTALL_DIR/Fastty.app/Contents/MacOS/fastty" "$BIN_DIR/fastty"
@@ -139,13 +169,17 @@ if [ "$OS" = "darwin" ]; then
         sudo ln -sf "$INSTALL_DIR/Fastty.app/Contents/MacOS/fastty" "$BIN_DIR/fastty"
     fi
 
-    echo "$APP_NAME installed successfully at $INSTALL_DIR/Fastty.app!"
+    # Remove macOS quarantine bit and refresh LaunchServices
+    xattr -dr com.apple.quarantine "$INSTALL_DIR/Fastty.app" 2>/dev/null || true
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$INSTALL_DIR/Fastty.app" 2>/dev/null || true
+
+    echo "$APP_NAME installed successfully at $INSTALL_DIR/Fastty.app"
 else
-    # Linux: install binary directly
+    # Linux: locate binary and install
     SRC_BINARY=$(find "$TEMP_DIR" -maxdepth 2 -type f -name "$APP_NAME" | head -n 1)
 
     if [ ! -f "$SRC_BINARY" ]; then
-        echo "ERROR: Could not find binary '$APP_NAME' in extracted files." >&2
+        echo "ERROR: Binary '$APP_NAME' was not found in the extracted files." >&2
         exit 1
     fi
 
@@ -154,78 +188,84 @@ else
         cp -f "$SRC_BINARY" "$BIN_DIR/$APP_NAME"
         chmod 0755 "$BIN_DIR/$APP_NAME"
     else
-        echo "Administrator privileges (sudo) are required to write to $BIN_DIR."
+        echo "Administrator privileges required to write to $BIN_DIR:"
         sudo rm -f "$BIN_DIR/$APP_NAME"
         sudo cp -f "$SRC_BINARY" "$BIN_DIR/$APP_NAME"
         sudo chmod 0755 "$BIN_DIR/$APP_NAME"
     fi
 
-    # Verify the binary was copied correctly
-    NEW_HASH=$(sha256sum "$SRC_BINARY" 2>/dev/null | awk '{print $1}')
-    INSTALLED_HASH=$(sha256sum "$BIN_DIR/$APP_NAME" 2>/dev/null | awk '{print $1}')
-    if [ -z "$NEW_HASH" ] || [ -z "$INSTALLED_HASH" ] || [ "$NEW_HASH" != "$INSTALLED_HASH" ]; then
-        echo "ERROR: the binary at $BIN_DIR/$APP_NAME does not match the new one (copy failed). Aborting." >&2
-        exit 1
-    fi
-
-    # Set up icon and desktop entry
-    ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/pixmaps"
+    # Set up desktop icon and application launcher
+    ICON_HICOLOR_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/512x512/apps"
+    ICON_PIXMAP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/pixmaps"
     DESKTOP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-    mkdir -p "$ICON_DIR" "$DESKTOP_DIR"
+    mkdir -p "$ICON_HICOLOR_DIR" "$ICON_PIXMAP_DIR" "$DESKTOP_DIR"
 
     RAW_ICON_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/main/assets/fasttyIcon.png"
-    if [ -w "$ICON_DIR" ]; then
-        curl -sSfL -o "$ICON_DIR/fastty.png" "$RAW_ICON_URL"
-    else
-        sudo mkdir -p "$ICON_DIR"
-        sudo curl -sSfL -o "$ICON_DIR/fastty.png" "$RAW_ICON_URL"
-    fi
+    curl -sSfL -o "$ICON_HICOLOR_DIR/fastty.png" "$RAW_ICON_URL" 2>/dev/null || true
+    cp -f "$ICON_HICOLOR_DIR/fastty.png" "$ICON_PIXMAP_DIR/fastty.png" 2>/dev/null || true
 
-    DESKTOP_CONTENT="[Desktop Entry]
+    cat << EOF > "$DESKTOP_DIR/fastty.desktop"
+[Desktop Entry]
 Name=Fastty
-Comment=GPU-accelerated Terminal Emulator
-Exec=$BIN_DIR/$APP_NAME
-Icon=$ICON_DIR/fastty.png
+GenericName=Terminal Emulator
+Comment=Fast GPU-accelerated Terminal Emulator
+Exec=$BIN_DIR/$APP_NAME %U
+Icon=fastty
 Terminal=false
 Type=Application
-Categories=System;TerminalEmulator;
-Keywords=terminal;emulator;wgpu;"
+Categories=System;TerminalEmulator;Utility;
+Keywords=shell;prompt;command;commandline;terminal;emulator;
+StartupWMClass=fastty
+Actions=NewWindow;
 
-    if [ -w "$DESKTOP_DIR" ]; then
-        echo "$DESKTOP_CONTENT" > "$DESKTOP_DIR/fastty.desktop"
-    else
-        sudo mkdir -p "$DESKTOP_DIR"
-        echo "$DESKTOP_CONTENT" | sudo tee "$DESKTOP_DIR/fastty.desktop" > /dev/null
-    fi
+[Desktop Action NewWindow]
+Name=New Window
+Exec=$BIN_DIR/$APP_NAME
+EOF
 
-    echo "$APP_NAME installed successfully at $BIN_DIR/$APP_NAME!"
-    echo "You can launch it by searching '$APP_NAME' in your menu or typing it in a terminal."
+    chmod 0644 "$DESKTOP_DIR/fastty.desktop"
+    update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+    gtk-update-icon-cache -f -t "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null || true
 
-    # Schedule a self-restart
-    (
-        sleep 3
-        pkill -x fastty 2>/dev/null || true
-        nohup "$BIN_DIR/$APP_NAME" >/dev/null 2>&1 &
-        disown
-    ) &
-    disown
+    echo "$APP_NAME installed successfully at $BIN_DIR/$APP_NAME"
 fi
 
-# ── 8. Check PATH ──────────────────────────────────────────────────────────────
+# ── 8. Shell and PATH Configuration Check ─────────────────────────────────────
+USER_SHELL="$(basename "${SHELL:-bash}")"
+
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     echo ""
-    echo "WARNING: $BIN_DIR is not in your PATH."
-    echo "Add it by running one of the following:"
-    echo ""
-    echo "    bash  → add 'export PATH=\"$BIN_DIR:\$PATH\"' to ~/.bashrc"
-    echo "    zsh   → add 'export PATH=\"$BIN_DIR:\$PATH\"' to ~/.zshrc"
-    echo "    fish  → run: fish_add_path $BIN_DIR"
+    echo "NOTICE: $BIN_DIR is not in your current PATH."
+    case "$USER_SHELL" in
+        fish)
+            if command -v fish_add_path >/dev/null 2>&1; then
+                fish_add_path "$BIN_DIR" 2>/dev/null || true
+                echo "Added $BIN_DIR to fish universal path automatically."
+            else
+                echo "Add to ~/.config/fish/config.fish:  set -gx PATH $BIN_DIR \$PATH"
+            fi
+            ;;
+        zsh)
+            echo "Add to ~/.zshrc:  export PATH=\"$BIN_DIR:\$PATH\""
+            ;;
+        bash)
+            echo "Add to ~/.bashrc:  export PATH=\"$BIN_DIR:\$PATH\""
+            ;;
+        nu|nushell)
+            echo "Add to ~/.config/nushell/config.nu:  \$env.PATH = (\$env.PATH | split row (char esep) | prepend '$BIN_DIR')"
+            ;;
+        *)
+            echo "Add '$BIN_DIR' to your shell's PATH configuration."
+            ;;
+    esac
 fi
 
-# ── 9. Summary ─────────────────────────────────────────────────────────────────
+# ── 9. Summary ────────────────────────────────────────────────────────────────
 echo ""
-echo "    ✓ Binary    → $BIN_DIR/fastty"
+echo "=== Fastty installation complete ==="
+echo "    ✓ Binary    → $BIN_DIR/$APP_NAME"
 echo "    ✓ Config    → $CONFIG_DIR"
 echo "    ✓ Data      → $DATA_DIR"
 echo "    ✓ State     → $STATE_DIR"
 echo "    ✓ Cache     → $CACHE_DIR"
+echo ""

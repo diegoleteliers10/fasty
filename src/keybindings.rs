@@ -91,6 +91,9 @@ pub enum Action {
     WorktreePicker,
     PrevPrompt,
     NextPrompt,
+    ClearScrollback,
+    ToggleFullscreen,
+    Quit,
 }
 
 pub struct KeyBindingResolver {
@@ -105,35 +108,84 @@ impl KeyBindingResolver {
                 b.insert(c, a);
             }
         };
-        insert("ctrl+shift+t", Action::NewTab);
-        insert("ctrl+shift+w", Action::CloseTab);
-        insert("ctrl+shift+n", Action::NewWindow);
-        insert("ctrl+shift+c", Action::Copy);
-        insert("ctrl+shift+v", Action::Paste);
-        insert("ctrl+f", Action::OpenSearch);
-        insert("ctrl+shift+s", Action::OpenSettings);
-        insert("ctrl+shift+r", Action::ReloadConfig);
-        insert("ctrl+shift+p", Action::CommandPalette);
-        insert("ctrl+shift+o", Action::SshManager);
-        insert("ctrl+shift+j", Action::ProjectJumper);
-        insert("ctrl+alt+w", Action::WorktreePicker);
-        insert("f5", Action::ReloadConfig);
-        insert("f10", Action::ReloadConfig);
-        insert("ctrl+equal", Action::IncreaseFontSize);
-        insert("ctrl+plus", Action::IncreaseFontSize);
-        insert("ctrl+shift+plus", Action::IncreaseFontSize);
-        insert("ctrl+shift+equal", Action::IncreaseFontSize);
-        insert("ctrl+minus", Action::DecreaseFontSize);
-        insert("ctrl+0", Action::ResetFontSize);
-        insert("ctrl+tab", Action::NextTab);
-        insert("ctrl+page_down", Action::NextTab);
-        insert("ctrl+shift+tab", Action::PrevTab);
-        insert("ctrl+page_up", Action::PrevTab);
-        insert("ctrl+shift+up", Action::PrevPrompt);
-        insert("ctrl+shift+h", Action::PrevPrompt);
-        insert("ctrl+shift+down", Action::NextPrompt);
-        for n in 1..=9u8 {
-            insert(&format!("alt+{n}"), Action::SelectTab(n));
+
+        if cfg!(target_os = "macos") {
+            insert("super+c", Action::Copy);
+            insert("super+v", Action::Paste);
+            insert("super+t", Action::NewTab);
+            insert("super+w", Action::CloseTab);
+            insert("super+n", Action::NewWindow);
+            insert("super+f", Action::OpenSearch);
+            insert("super+s", Action::OpenSettings);
+            insert("super+comma", Action::OpenSettings);
+            insert("super+r", Action::ReloadConfig);
+            insert("super+p", Action::CommandPalette);
+            insert("super+o", Action::SshManager);
+            insert("super+j", Action::ProjectJumper);
+            insert("super+alt+w", Action::WorktreePicker);
+            insert("super+k", Action::ClearScrollback);
+            insert("ctrl+super+f", Action::ToggleFullscreen);
+            insert("f11", Action::ToggleFullscreen);
+            insert("super+q", Action::Quit);
+            insert("super+equal", Action::IncreaseFontSize);
+            insert("super+plus", Action::IncreaseFontSize);
+            insert("super+shift+plus", Action::IncreaseFontSize);
+            insert("super+shift+equal", Action::IncreaseFontSize);
+            insert("super+minus", Action::DecreaseFontSize);
+            insert("super+0", Action::ResetFontSize);
+            insert("super+shift+]", Action::NextTab);
+            insert("super+shift+[", Action::PrevTab);
+            insert("ctrl+tab", Action::NextTab);
+            insert("ctrl+shift+tab", Action::PrevTab);
+            insert("super+shift+up", Action::PrevPrompt);
+            insert("super+shift+h", Action::PrevPrompt);
+            insert("super+shift+down", Action::NextPrompt);
+            for n in 1..=9u8 {
+                insert(&format!("super+{n}"), Action::SelectTab(n));
+                insert(&format!("alt+{n}"), Action::SelectTab(n));
+            }
+            insert("ctrl+shift+c", Action::Copy);
+            insert("ctrl+shift+v", Action::Paste);
+            insert("shift+insert", Action::Paste);
+            insert("ctrl+shift+t", Action::NewTab);
+            insert("ctrl+shift+w", Action::CloseTab);
+        } else {
+            insert("ctrl+shift+t", Action::NewTab);
+            insert("ctrl+shift+w", Action::CloseTab);
+            insert("ctrl+shift+n", Action::NewWindow);
+            insert("ctrl+shift+c", Action::Copy);
+            insert("ctrl+shift+v", Action::Paste);
+            insert("shift+insert", Action::Paste);
+            insert("ctrl+f", Action::OpenSearch);
+            insert("ctrl+comma", Action::OpenSettings);
+            insert("ctrl+shift+s", Action::OpenSettings);
+            insert("ctrl+shift+r", Action::ReloadConfig);
+            insert("ctrl+shift+p", Action::CommandPalette);
+            insert("ctrl+shift+o", Action::SshManager);
+            insert("ctrl+shift+j", Action::ProjectJumper);
+            insert("ctrl+alt+w", Action::WorktreePicker);
+            insert("ctrl+shift+k", Action::ClearScrollback);
+            insert("f11", Action::ToggleFullscreen);
+            insert("alt+f4", Action::Quit);
+            insert("ctrl+q", Action::Quit);
+            insert("f5", Action::ReloadConfig);
+            insert("f10", Action::ReloadConfig);
+            insert("ctrl+equal", Action::IncreaseFontSize);
+            insert("ctrl+plus", Action::IncreaseFontSize);
+            insert("ctrl+shift+plus", Action::IncreaseFontSize);
+            insert("ctrl+shift+equal", Action::IncreaseFontSize);
+            insert("ctrl+minus", Action::DecreaseFontSize);
+            insert("ctrl+0", Action::ResetFontSize);
+            insert("ctrl+tab", Action::NextTab);
+            insert("ctrl+page_down", Action::NextTab);
+            insert("ctrl+shift+tab", Action::PrevTab);
+            insert("ctrl+page_up", Action::PrevTab);
+            insert("ctrl+shift+up", Action::PrevPrompt);
+            insert("ctrl+shift+h", Action::PrevPrompt);
+            insert("ctrl+shift+down", Action::NextPrompt);
+            for n in 1..=9u8 {
+                insert(&format!("alt+{n}"), Action::SelectTab(n));
+            }
         }
         Self { bindings: b }
     }
@@ -141,11 +193,9 @@ impl KeyBindingResolver {
     pub fn apply_user(&mut self, user: HashMap<String, String>) {
         for (combo_str, action_str) in user {
             let Some(combo) = parse_combo(&combo_str) else {
-                tracing::warn!("keybindings: cannot parse combo {:?}", combo_str);
                 continue;
             };
             let Some(action) = parse_action(&action_str) else {
-                tracing::warn!("keybindings: unknown action {:?} (combo={:?})", action_str, combo_str);
                 continue;
             };
             self.bindings.insert(combo, action);
@@ -210,6 +260,7 @@ fn parse_key(s: &str) -> Option<NamedKey> {
         "plus" => Some(NamedKey::Char('+')),
         "minus" => Some(NamedKey::Char('-')),
         "equal" | "equals" => Some(NamedKey::Char('=')),
+        "comma" => Some(NamedKey::Char(',')),
         _ => None,
     }
 }
@@ -238,6 +289,9 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "prev_tab" => Some(Action::PrevTab),
         "prev_prompt" => Some(Action::PrevPrompt),
         "next_prompt" => Some(Action::NextPrompt),
+        "clear_scrollback" => Some(Action::ClearScrollback),
+        "toggle_fullscreen" => Some(Action::ToggleFullscreen),
+        "quit" => Some(Action::Quit),
         _ => None,
     }
 }
@@ -251,43 +305,47 @@ pub fn init_resolver(user: HashMap<String, String>) {
     *lock.write() = r;
 }
 
-pub fn combo_from_event(
-    event: &winit::event::KeyEvent,
+pub fn combo_from_key(
+    key_str: &str,
     ctrl: bool,
     shift: bool,
     alt: bool,
+    logo: bool,
 ) -> Option<KeyCombo> {
-    use winit::keyboard::{Key, NamedKey as WNamed};
-    let key = match &event.logical_key {
-        Key::Character(s) => NamedKey::Char(s.chars().next()?.to_ascii_lowercase()),
-        Key::Named(WNamed::F1) => NamedKey::F1,
-        Key::Named(WNamed::F2) => NamedKey::F2,
-        Key::Named(WNamed::F3) => NamedKey::F3,
-        Key::Named(WNamed::F4) => NamedKey::F4,
-        Key::Named(WNamed::F5) => NamedKey::F5,
-        Key::Named(WNamed::F6) => NamedKey::F6,
-        Key::Named(WNamed::F7) => NamedKey::F7,
-        Key::Named(WNamed::F8) => NamedKey::F8,
-        Key::Named(WNamed::F9) => NamedKey::F9,
-        Key::Named(WNamed::F10) => NamedKey::F10,
-        Key::Named(WNamed::F11) => NamedKey::F11,
-        Key::Named(WNamed::F12) => NamedKey::F12,
-        Key::Named(WNamed::ArrowUp) => NamedKey::Up,
-        Key::Named(WNamed::ArrowDown) => NamedKey::Down,
-        Key::Named(WNamed::ArrowLeft) => NamedKey::Left,
-        Key::Named(WNamed::ArrowRight) => NamedKey::Right,
-        Key::Named(WNamed::Enter) => NamedKey::Return,
-        Key::Named(WNamed::Tab) => NamedKey::Tab,
-        Key::Named(WNamed::Escape) => NamedKey::Escape,
-        Key::Named(WNamed::Backspace) => NamedKey::Backspace,
-        Key::Named(WNamed::Delete) => NamedKey::Delete,
-        Key::Named(WNamed::Insert) => NamedKey::Insert,
-        Key::Named(WNamed::Home) => NamedKey::Home,
-        Key::Named(WNamed::End) => NamedKey::End,
-        Key::Named(WNamed::PageUp) => NamedKey::PageUp,
-        Key::Named(WNamed::PageDown) => NamedKey::PageDown,
-        Key::Named(WNamed::Space) => NamedKey::Space,
+    let lower = key_str.to_lowercase();
+    let key = match lower.as_str() {
+        "f1" => NamedKey::F1,
+        "f2" => NamedKey::F2,
+        "f3" => NamedKey::F3,
+        "f4" => NamedKey::F4,
+        "f5" => NamedKey::F5,
+        "f6" => NamedKey::F6,
+        "f7" => NamedKey::F7,
+        "f8" => NamedKey::F8,
+        "f9" => NamedKey::F9,
+        "f10" => NamedKey::F10,
+        "f11" => NamedKey::F11,
+        "f12" => NamedKey::F12,
+        "up" | "arrowup" => NamedKey::Up,
+        "down" | "arrowdown" => NamedKey::Down,
+        "left" | "arrowleft" => NamedKey::Left,
+        "right" | "arrowright" => NamedKey::Right,
+        "enter" | "return" => NamedKey::Return,
+        "tab" => NamedKey::Tab,
+        "escape" | "esc" => NamedKey::Escape,
+        "backspace" => NamedKey::Backspace,
+        "delete" => NamedKey::Delete,
+        "insert" => NamedKey::Insert,
+        "home" => NamedKey::Home,
+        "end" => NamedKey::End,
+        "pageup" => NamedKey::PageUp,
+        "pagedown" => NamedKey::PageDown,
+        "space" => NamedKey::Space,
+        "+" => NamedKey::Plus,
+        "-" => NamedKey::Minus,
+        "=" => NamedKey::Equal,
+        s if s.chars().count() == 1 => NamedKey::Char(s.chars().next()?),
         _ => return None,
     };
-    Some(KeyCombo { ctrl, shift, alt, logo: false, key })
+    Some(KeyCombo { ctrl, shift, alt, logo, key })
 }

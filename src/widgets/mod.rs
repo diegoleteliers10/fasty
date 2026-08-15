@@ -55,6 +55,27 @@ pub enum ClickAction {
     ShowActionsMenu,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ContextMenuItem {
+    Copy,
+    Paste,
+    Separator,
+    NewTab,
+    CloseTab,
+    About,
+    OpenLink,
+    CopyWord,
+    CopyLine,
+    CdHere,
+    OpenInEditor,
+    OpenEmail,
+    MoveToNewWindow,
+    CopyHex,
+    GithubActionInfo { label: String, status: String, url: Option<String> },
+    CommandItem { label: String, command: String, cwd: String },
+}
+
 /// A single bottombar widget.
 #[allow(dead_code)]
 pub trait Widget: Send {
@@ -78,7 +99,7 @@ pub trait Widget: Send {
     /// Click handler. Default: nothing.
     fn on_click(&mut self, _ctx: &WidgetContext) -> ClickAction { ClickAction::None }
     /// Get custom context menu items for this widget (e.g. for ClickAction::ShowActionsMenu).
-    fn get_context_menu_items(&self) -> Option<Vec<crate::renderer::ContextMenuItem>> { None }
+    fn get_context_menu_items(&self) -> Option<Vec<ContextMenuItem>> { None }
 }
 
 /// Axis-aligned pixel rectangle.

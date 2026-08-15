@@ -11,7 +11,7 @@ fn main() {
 <assemblyIdentity
     type="win32"
     name="fastty"
-    version="0.2.5.0"
+    version="0.6.0.0"
     processorArchitecture="*"
 />
 <application xmlns="urn:schemas-microsoft-com:asm.v3">

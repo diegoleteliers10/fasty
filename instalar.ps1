@@ -5,8 +5,9 @@
 # irm https://raw.githubusercontent.com/diegoleteliers10/fastty/main/instalar.ps1 | iex
 # ==============================================================================
 
+$ErrorActionPreference = 'Stop'
 $GitHubUser = "diegoleteliers10"
-$GitHubRepo = "fastty"
+$GitHubRepo = "fasty"
 $AppName    = "fastty"
 $BinaryName = "fastty.exe"
 
@@ -14,7 +15,14 @@ $BinaryName = "fastty.exe"
 
 Write-Host "=== Starting $AppName installation on Windows ===" -ForegroundColor Green
 
-# ── 1. Resolve platform directories ────────────────────────────────────────────
+# ── 1. Resolve platform architecture and directories ──────────────────────────
+$Arch = $env:PROCESSOR_ARCHITECTURE
+if ($Arch -eq "ARM64") {
+    $Target = "aarch64-pc-windows-msvc"
+} else {
+    $Target = "x86_64-pc-windows-msvc"
+}
+
 $ConfigDir = Join-Path $env:APPDATA     "fastty\config"
 $DataDir   = Join-Path $env:APPDATA     "fastty\data"
 $StateDir  = Join-Path $env:LOCALAPPDATA "fastty\state"
@@ -23,11 +31,13 @@ $BinDir    = Join-Path $env:LOCALAPPDATA "fastty\bin"
 
 # ── 2. Create directories ──────────────────────────────────────────────────────
 foreach ($dir in @($ConfigDir, $DataDir, $StateDir, $CacheDir, $BinDir)) {
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    if (-not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    }
 }
 
-# ── 3. Query the GitHub API for the latest release ─────────────────────────────
-Write-Host "Fetching the latest version from the GitHub API..." -ForegroundColor Cyan
+# ── 3. Query GitHub API for latest release ────────────────────────────────────
+Write-Host "Fetching latest release version from GitHub API..." -ForegroundColor Cyan
 $ApiUrl = "https://api.github.com/repos/$GitHubUser/$GitHubRepo/releases/latest"
 
 try {
@@ -37,15 +47,14 @@ try {
     $Response = Invoke-RestMethod -Uri $ApiUrl -Method Get
     $LatestTag = $Response.tag_name
 } catch {
-    Write-Error "ERROR: Could not fetch the latest version from the GitHub API. Check your connection or the repository."
+    Write-Error "ERROR: Could not fetch the latest version from GitHub ($ApiUrl)."
     $ProgressPreference = $oldProgressPreference
     exit 1
 }
 
-Write-Host "Latest version found: $LatestTag" -ForegroundColor Green
+Write-Host "Latest version found: $LatestTag (Target: $Target)" -ForegroundColor Green
 
-# ── 4. Download the Windows .zip asset ─────────────────────────────────────────
-$Target = "x86_64-pc-windows-msvc"
+# ── 4. Download Windows archive asset ─────────────────────────────────────────
 $ZipName = "$AppName-$Target.zip"
 $DownloadUrl = "https://github.com/$GitHubUser/$GitHubRepo/releases/download/$LatestTag/$ZipName"
 
@@ -62,12 +71,12 @@ Write-Host "Downloading $ZipName..." -ForegroundColor Cyan
 try {
     Invoke-WebRequest -Uri $DownloadUrl -OutFile $ZipPath -UseBasicParsing
 } catch {
-    Write-Error "ERROR: Failed to download the file from $DownloadUrl"
+    Write-Error "ERROR: Failed to download the release asset from $DownloadUrl"
     $ProgressPreference = $oldProgressPreference
     exit 1
 }
 
-# ── 5. Extract ─────────────────────────────────────────────────────────────────
+# ── 5. Extract files ───────────────────────────────────────────────────────────
 Write-Host "Extracting files..." -ForegroundColor Cyan
 try {
     Expand-Archive -Path $ZipPath -DestinationPath $ExtractDir -Force
@@ -77,11 +86,19 @@ try {
     exit 1
 }
 
-# ── 6. Install binary ─────────────────────────────────────────────────────────
+# ── 6. Install executable binary ──────────────────────────────────────────────
 $ExeSourcePath = Join-Path $ExtractDir $BinaryName
+if (-not (Test-Path $ExeSourcePath)) {
+    # If nested in a folder
+    $Found = Get-ChildItem -Path $ExtractDir -Filter $BinaryName -Recurse | Select-Object -First 1
+    if ($Found) {
+        $ExeSourcePath = $Found.FullName
+    }
+}
+
 $ExeDestPath = Join-Path $BinDir $BinaryName
 
-Write-Host "Copying the binary to its final location..." -ForegroundColor Cyan
+Write-Host "Installing executable to $ExeDestPath..." -ForegroundColor Cyan
 try {
     if (Test-Path $ExeDestPath) {
         $OldExePath = "$ExeDestPath.old"
@@ -92,61 +109,96 @@ try {
     }
     Copy-Item -Path $ExeSourcePath -Destination $ExeDestPath -Force
 } catch {
-    Write-Error "ERROR: Failed to copy the executable to $BinDir: $_"
+    Write-Error "ERROR: Failed to copy executable to $BinDir: $_"
     $ProgressPreference = $oldProgressPreference
     exit 1
 }
 
-# Copy default config if bundled and not already present
-$DestConfigToml = Join-Path $ConfigDir "config.toml"
+# ── 6.5. Download Application Icon (.ico) ──────────────────────────────────────
+$IconUrl = "https://raw.githubusercontent.com/$GitHubUser/$GITHUBRepo/main/assets/fasttyIcon.ico"
+$IconDestPath = Join-Path $DataDir "fastty.ico"
+try {
+    Invoke-WebRequest -Uri $IconUrl -OutFile $IconDestPath -UseBasicParsing -ErrorAction SilentlyContinue
+    Copy-Item -Path $IconDestPath -Destination (Join-Path $BinDir "fastty.ico") -Force -ErrorAction SilentlyContinue
+} catch {}
+
+# ── 6.6. Initialize default configuration if absent ───────────────────────────
+$DestConfigToml = Join-Path $ConfigDir "fastty.toml"
 $DestConfigJson = Join-Path $ConfigDir "config.json"
-if (-not (Test-Path $DestConfigToml) -and -not (Test-Path $DestConfigJson)) {
-    $SrcConfigToml = Join-Path $ExtractDir "config.toml"
-    $SrcConfigJson = Join-Path $ExtractDir "config.json"
+$LegacyConfigToml = Join-Path $ConfigDir "config.toml"
+
+if (-not (Test-Path $DestConfigToml) -and -not (Test-Path $LegacyConfigToml) -and -not (Test-Path $DestConfigJson)) {
+    $SrcConfigToml = Join-Path $ExtractDir "fastty.toml"
     if (Test-Path $SrcConfigToml) {
-        Write-Host "Copying default config.toml..." -ForegroundColor Cyan
         Copy-Item -Path $SrcConfigToml -Destination $DestConfigToml -Force
-    } elseif (Test-Path $SrcConfigJson) {
-        Write-Host "Copying default config.json..." -ForegroundColor Cyan
-        Copy-Item -Path $SrcConfigJson -Destination $DestConfigJson -Force
+    } else {
+        $DefaultConfigContent = @'
+# fastty configuration file
+theme = "default"
+opacity = 1.0
+scrollback = 1000
+session_restore = true
+copy_on_select = false
+notify_on_command_finish = true
+
+[font]
+family = "Cascadia Code"
+size = 14.0
+weight = 400.0
+ligatures = true
+
+[bottombar]
+enabled = true
+layout = "balanced"
+left_widgets = ["git_branch", "git_status"]
+right_widgets = ["cwd", "duration", "exit_code"]
+
+[keybindings]
+'@
+        Set-Content -Path $DestConfigToml -Value $DefaultConfigContent -Encoding UTF8
     }
 }
 
 $ProgressPreference = $oldProgressPreference
 
-Write-Host "$AppName installed successfully at $ExeDestPath!" -ForegroundColor Green
+# ── 7. Register Windows App Path (Win+R / Start execution) ─────────────────────
+try {
+    $AppPathsKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\fastty.exe"
+    if (-not (Test-Path $AppPathsKey)) {
+        New-Item -Path $AppPathsKey -Force | Out-Null
+    }
+    Set-ItemProperty -Path $AppPathsKey -Name "(Default)" -Value $ExeDestPath
+    Set-ItemProperty -Path $AppPathsKey -Name "Path" -Value $BinDir
+} catch {}
 
-# ── 7. Add to user PATH permanently ────────────────────────────────────────────
+# ── 8. Add to user PATH permanently ────────────────────────────────────────────
 $UserPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::User)
-$PathList = $UserPath -split ";"
 $NormalizedBinDir = $BinDir.TrimEnd('\')
 
 $IsInPath = $false
-foreach ($p in $PathList) {
-    if ($p.Trim().TrimEnd('\') -eq $NormalizedBinDir) {
-        $IsInPath = $true
-        break
+if ($UserPath) {
+    $PathList = $UserPath -split ";"
+    foreach ($p in $PathList) {
+        if ($p.Trim().TrimEnd('\') -eq $NormalizedBinDir) {
+            $IsInPath = $true
+            break
+        }
     }
 }
 
 if (-not $IsInPath) {
-    Write-Host "Adding $BinDir to your user PATH permanently..." -ForegroundColor Yellow
+    Write-Host "Adding $BinDir to User PATH..." -ForegroundColor Yellow
     $NewUserPath = $UserPath
-    if (-not $NewUserPath.EndsWith(";")) {
+    if ($NewUserPath -and -not $NewUserPath.EndsWith(";")) {
         $NewUserPath += ";"
     }
     $NewUserPath += $NormalizedBinDir
 
     [Environment]::SetEnvironmentVariable("Path", $NewUserPath, [EnvironmentVariableTarget]::User)
     $env:Path += ";" + $NormalizedBinDir
-
-    Write-Host "The PATH has been updated. Please restart your terminal for the change to take effect." -ForegroundColor Yellow
-} else {
-    Write-Host "The directory $BinDir is already in your PATH." -ForegroundColor Green
 }
 
-# ── 8. Start Menu shortcut ─────────────────────────────────────────────────────
-Write-Host "Creating Start Menu shortcut..." -ForegroundColor Cyan
+# ── 9. Start Menu shortcut ─────────────────────────────────────────────────────
 try {
     $StartMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
     $ShortcutPath = Join-Path $StartMenuDir "Fastty.lnk"
@@ -154,24 +206,28 @@ try {
     $WshShell = New-Object -ComObject WScript.Shell
     $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
     $Shortcut.TargetPath = $ExeDestPath
-    $Shortcut.WorkingDirectory = $BinDir
+    $Shortcut.WorkingDirectory = $HOME
+    if (Test-Path $IconDestPath) {
+        $Shortcut.IconLocation = "$IconDestPath,0"
+    } else {
+        $Shortcut.IconLocation = "$ExeDestPath,0"
+    }
     $Shortcut.Description = "Fastty Terminal Emulator"
     $Shortcut.Save()
 
-    Write-Host "Start Menu shortcut created successfully." -ForegroundColor Green
-} catch {
-    Write-Host "WARNING: Could not create the Start Menu shortcut." -ForegroundColor Yellow
-}
+    Write-Host "Start Menu shortcut registered." -ForegroundColor Green
+} catch {}
 
-# ── 9. Final cleanup ───────────────────────────────────────────────────────────
+# ── 10. Final cleanup ──────────────────────────────────────────────────────────
 Remove-Item -Recurse -Force $TempDir -ErrorAction SilentlyContinue
 
-# ── 10. Summary ────────────────────────────────────────────────────────────────
+# ── 11. Summary ────────────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "✓ Binary  -> $BinDir\fastty.exe"
-Write-Host "✓ Config  -> $ConfigDir"
-Write-Host "✓ Data    -> $DataDir"
-Write-Host "✓ State   -> $StateDir"
-Write-Host "✓ Cache   -> $CacheDir"
+Write-Host "=== Fastty installation complete ===" -ForegroundColor Green
+Write-Host "    ✓ Binary  -> $ExeDestPath"
+Write-Host "    ✓ Config  -> $ConfigDir"
+Write-Host "    ✓ Data    -> $DataDir"
+Write-Host "    ✓ State   -> $StateDir"
+Write-Host "    ✓ Cache   -> $CacheDir"
 Write-Host ""
-Write-Host "Restart your terminal for PATH changes to take effect."
+Write-Host "You can now launch Fastty by typing 'fastty' in terminal or Win+R."

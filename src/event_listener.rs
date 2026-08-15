@@ -1,12 +1,11 @@
 //! Custom EventListener for alacritty_terminal that forwards PtyWrite events
-//! and emits OSC-derived events (clipboard, cwd) via the proxy channel.
+//! and emits OSC-derived events (clipboard, cwd) via the event sender.
 
 use alacritty_terminal::event::{Event, EventListener};
 use std::io::Write;
 use std::sync::Arc;
 use parking_lot::Mutex;
 use crate::terminal_state::AppEvent;
-use winit::event_loop::EventLoopProxy;
 
 /// Base64 encoder for OSC 52 clipboard responses.
 pub fn base64_encode(input: &str) -> String {
@@ -44,10 +43,33 @@ pub fn clipboard_helper() -> Option<arboard::Clipboard> {
     arboard::Clipboard::new().ok()
 }
 
+pub type EventCallback = Arc<dyn Fn(AppEvent) + Send + Sync>;
+
+#[derive(Clone)]
+pub enum EventSender {
+    Callback(EventCallback),
+    None,
+}
+
+impl EventSender {
+    pub fn send(&self, event: AppEvent) {
+        match self {
+            Self::Callback(cb) => cb(event),
+            Self::None => {}
+        }
+    }
+}
+
+impl Default for EventSender {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 #[derive(Clone)]
 pub struct EventListenerProxy {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    app_proxy: Option<EventLoopProxy<AppEvent>>,
+    app_sender: EventSender,
 }
 
 unsafe impl Send for EventListenerProxy {}
@@ -55,11 +77,14 @@ unsafe impl Sync for EventListenerProxy {}
 
 impl EventListenerProxy {
     pub fn from_arc(writer: Arc<Mutex<Box<dyn Write + Send>>>) -> Self {
-        Self { writer, app_proxy: None }
+        Self {
+            writer,
+            app_sender: EventSender::None,
+        }
     }
 
-    pub fn set_app_proxy(&mut self, proxy: EventLoopProxy<AppEvent>) {
-        self.app_proxy = Some(proxy);
+    pub fn set_event_sender(&mut self, sender: EventSender) {
+        self.app_sender = sender;
     }
 }
 
@@ -73,7 +98,6 @@ impl EventListener for EventListenerProxy {
                 }
             }
             Event::Bell => {
-                // Audible bell: write BEL to /dev/console for system beep
                 #[cfg(target_os = "linux")]
                 {
                     use std::io::Write;
@@ -84,18 +108,14 @@ impl EventListener for EventListenerProxy {
                         let _ = console.write_all(&[0x07]);
                     }
                 }
-                if let Some(p) = &self.app_proxy {
-                    let _ = p.send_event(AppEvent::Bell);
-                }
+                self.app_sender.send(AppEvent::Bell);
             }
             Event::ClipboardStore(_ty, text) => {
-                // Write directly to system clipboard
                 if let Some(mut ctx) = clipboard_helper() {
                     let _ = ctx.set_text(text);
                 }
             }
             Event::ClipboardLoad(_ty, cb) => {
-                // Respond with system clipboard contents
                 if let Some(mut ctx) = clipboard_helper() {
                     if let Ok(text) = ctx.get_text() {
                         cb(&base64_encode(&text));
@@ -107,9 +127,7 @@ impl EventListener for EventListenerProxy {
                 }
             }
             Event::Title(title) => {
-                if let Some(p) = &self.app_proxy {
-                    let _ = p.send_event(AppEvent::TitleChanged(title));
-                }
+                self.app_sender.send(AppEvent::TitleChanged(title));
             }
             _ => {}
         }

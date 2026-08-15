@@ -122,10 +122,9 @@ pub fn extract_token(
     shell_cols: usize,
 ) -> Option<(String, usize, usize)> {
     let line_idx = point.line.0;
-    if line_idx < 0 {
-        return None;
-    }
-    if line_idx as usize >= grid.total_lines() {
+    let screen_lines = grid.screen_lines() as i32;
+    let history_size = grid.history_size() as i32;
+    if screen_lines == 0 || line_idx < -history_size || line_idx >= screen_lines {
         return None;
     }
     let row = &grid[alacritty_terminal::index::Line(line_idx)];

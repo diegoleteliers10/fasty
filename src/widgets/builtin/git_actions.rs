@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::widgets::{Align, ClickAction, Segment, Widget, WidgetContext};
+use crate::widgets::{Align, ClickAction, ContextMenuItem, Segment, Widget, WidgetContext};
 
 const DEFAULT_INTERVAL_MS: u64 = 15000;
 
@@ -315,14 +315,14 @@ impl Widget for GitActionsWidget {
         }
     }
 
-    fn get_context_menu_items(&self) -> Option<Vec<crate::renderer::ContextMenuItem>> {
+    fn get_context_menu_items(&self) -> Option<Vec<ContextMenuItem>> {
         let guard = self.state.lock().unwrap();
         let summary = guard.as_ref()?;
         
         let mut items = Vec::new();
         let run_url = summary.jobs.first().map(|j| j.url.clone());
         
-        items.push(crate::renderer::ContextMenuItem::GithubActionInfo {
+        items.push(ContextMenuItem::GithubActionInfo {
             label: "GitHub Actions Run".to_string(),
             status: if summary.in_progress {
                 "in_progress".to_string()
@@ -334,17 +334,17 @@ impl Widget for GitActionsWidget {
             url: run_url,
         });
         
-        items.push(crate::renderer::ContextMenuItem::Separator);
+        items.push(ContextMenuItem::Separator);
         
         let total_steps: usize = summary.jobs.iter().map(|j| j.steps.len()).sum();
         let show_all = total_steps <= 15;
         
         for (job_idx, job) in summary.jobs.iter().enumerate() {
             if job_idx > 0 {
-                items.push(crate::renderer::ContextMenuItem::Separator);
+                items.push(ContextMenuItem::Separator);
             }
             
-            items.push(crate::renderer::ContextMenuItem::GithubActionInfo {
+            items.push(ContextMenuItem::GithubActionInfo {
                 label: format!("📦 Job: {}", job.name),
                 status: job.conclusion.clone().unwrap_or_else(|| job.status.clone()),
                 url: Some(job.url.clone()),
@@ -358,7 +358,7 @@ impl Widget for GitActionsWidget {
                 }
                 
                 if show_all || !is_success {
-                    items.push(crate::renderer::ContextMenuItem::GithubActionInfo {
+                    items.push(ContextMenuItem::GithubActionInfo {
                         label: format!("  ↳ {}", step.name),
                         status: step.conclusion.clone().unwrap_or_else(|| step.status.clone()),
                         url: Some(job.url.clone()),
@@ -367,7 +367,7 @@ impl Widget for GitActionsWidget {
             }
             
             if !show_all && succeeded_count > 0 {
-                items.push(crate::renderer::ContextMenuItem::GithubActionInfo {
+                items.push(ContextMenuItem::GithubActionInfo {
                     label: format!("  ↳ ... ({} steps succeeded)", succeeded_count),
                     status: "success".to_string(),
                     url: Some(job.url.clone()),

@@ -34,7 +34,7 @@ pub enum AppEvent {
     ShowToast { message: String, duration_ms: u64 },
     ForcePollWidgets,
     GitStatusUpdated {
-        window_id: Option<winit::window::WindowId>,
+        window_id: Option<usize>,
         tab_idx: usize,
         status: Option<crate::git::GitStatus>,
     },
@@ -65,7 +65,7 @@ impl TerminalState {
         cell_height: f32,
         viewport_width: f32,
         viewport_height: f32,
-        proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+        sender: crate::event_listener::EventSender,
     ) -> anyhow::Result<Self> {
         let cell_w = (cell_width as usize).max(1);
         let cell_h = (cell_height as usize).max(1);
@@ -88,7 +88,7 @@ impl TerminalState {
 
         // Determine the shell binary name (e.g. "zsh", "bash", "fish") so we can
         // choose the right CommandBuilder constructor and integration strategy.
-        let shell_name = std::path::Path::new(&executable)
+        let _shell_name = std::path::Path::new(&executable)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
@@ -102,16 +102,7 @@ impl TerminalState {
         // Restriction: new_default_prog() panics if .arg()/.args() is called on it,
         // so we only use it for the zsh-without-exec-args branch. bash and fish still
         // use .args() for their --rcfile / -C wrappers and must stay on new().
-        let is_bare_shell = exec_args.is_empty();
-        let mut cmd = if is_bare_shell && shell_name == "zsh" {
-            let mut c = CommandBuilder::new_default_prog();
-            // Make sure SHELL is set to the actual zsh binary path so child
-            // processes (e.g. subshells) find the right executable.
-            c.env("SHELL", executable);
-            c
-        } else {
-            CommandBuilder::new(executable)
-        };
+        let mut cmd = CommandBuilder::new(executable);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "fastty");
@@ -127,126 +118,128 @@ impl TerminalState {
 
         // Shell integration: write OSC 133 command markers so fastty can
         // detect command start/finish for duration tracking.
+        //
+        // The integration scripts are identical for every tab and never change
+        // between releases, so materialise them at most once per process. This
+        // avoids redundant filesystem writes on every `create_new_tab` call —
+        // which matters at startup when a saved session is restored and many
+        // tabs are created back-to-back.
+        static INTEGRATION_WRITTEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         let integration_dir = crate::paths::get().cache_dir.join("shell_integration");
-        let _ = std::fs::create_dir_all(&integration_dir);
-
         let integration_path = integration_dir.join("fastty_shell_integration.sh");
         let integration_path_zsh = integration_dir.join("fastty_shell_integration.zsh");
         let integration_path_fish = integration_dir.join("fastty_shell_integration.fish");
+        let zdotdir = integration_dir.join("fastty_zsh");
+        INTEGRATION_WRITTEN.get_or_init(|| {
+            let _ = std::fs::create_dir_all(&integration_dir);
+            let _ = std::fs::create_dir_all(&zdotdir);
 
-        // POSIX shell integration (bash)
-        let _ = std::fs::write(
-            &integration_path,
-            "# fastty shell integration — OSC 133 command markers\n\
-             __fastty_cmd_start() {\n\
-             \techo -ne \"\\e]133;B\\e\\\\\"\n\
-             }\n\
-             __fastty_prompt() {\n\
-             \techo -ne \"\\e]133;D;$?\\e\\\\\"\n\
-             \techo -ne \"\\e]133;A\\e\\\\\"\n\
-             }\n\
-             PROMPT_COMMAND=\"__fastty_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"\n\
-             trap '__fastty_cmd_start' DEBUG\n",
-        );
-
-        // Zsh shell integration: precmd/preexec hooks appended via add-zsh-hook
-        // so user-defined hooks in ~/.zshrc are preserved, not overwritten.
-        let _ = std::fs::write(
-            &integration_path_zsh,
-            "# fastty shell integration — OSC 133 command markers\n\
-             autoload -Uz add-zsh-hook\n\
-             __fastty_preexec() {\n\
-             \techo -ne \"\\e]133;B\\e\\\\\"\n\
-             }\n\
-             __fastty_precmd() {\n\
-             \techo -ne \"\\e]133;D;$?\\e\\\\\"\n\
-             \techo -ne \"\\e]133;A\\e\\\\\"\n\
-             }\n\
-             add-zsh-hook preexec __fastty_preexec\n\
-             add-zsh-hook precmd __fastty_precmd\n",
-        );
-
-        // Fish shell integration
-        let _ = std::fs::write(
-            &integration_path_fish,
-            "# fastty shell integration — OSC 133 command markers\n\
-             function __fastty_cmd_start --on-event fish_preexec\n\
-             \techo -ne \"\\e]133;B\\e\\\\\"\n\
-             end\n\
-             function __fastty_cmd_end --on-event fish_postexec\n\
-             \techo -ne \"\\e]133;D;$status\\e\\\\\"\n\
-             end\n\
-             function __fastty_prompt --on-event fish_prompt\n\
-             \techo -ne \"\\e]133;A\\e\\\\\"\n\
-             end\n",
-        );
-
-        // Wrap the shell command to source the integration before launching.
-        // shell_name was computed before the CommandBuilder block above.
-
-        if shell_name == "bash" && exec_args.is_empty() {
-            // Bash: create wrapper bashrc that sources integration + user's .bashrc
-            let user_bashrc = std::env::var("HOME")
-                .map(|h| format!("{}/.bashrc", h))
-                .unwrap_or_default();
-            let wrapper_path = integration_dir.join("fastty_bashrc");
+            // POSIX shell integration (bash)
             let _ = std::fs::write(
-                &wrapper_path,
+                &integration_path,
+                "# fastty shell integration — OSC 133 command markers\n\
+                 __fastty_cmd_start() {\n\
+                 \techo -ne \"\\e]133;B\\e\\\\\"\n\
+                 }\n\
+                 __fastty_prompt() {\n\
+                 \techo -ne \"\\e]133;D;$?\\e\\\\\"\n\
+                 \techo -ne \"\\e]133;A\\e\\\\\"\n\
+                 }\n\
+                 PROMPT_COMMAND=\"__fastty_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"\n\
+                 trap '__fastty_cmd_start' DEBUG\n",
+            );
+
+            // Zsh shell integration: precmd/preexec hooks appended via add-zsh-hook
+            // so user-defined hooks in ~/.zshrc are preserved, not overwritten.
+            let _ = std::fs::write(
+                &integration_path_zsh,
+                "# fastty shell integration — OSC 133 command markers\n\
+                 autoload -Uz add-zsh-hook\n\
+                 __fastty_preexec() {\n\
+                 \techo -ne \"\\e]133;B\\e\\\\\"\n\
+                 }\n\
+                 __fastty_precmd() {\n\
+                 \techo -ne \"\\e]133;D;$?\\e\\\\\"\n\
+                 \techo -ne \"\\e]133;A\\e\\\\\"\n\
+                 }\n\
+                 add-zsh-hook preexec __fastty_preexec\n\
+                 add-zsh-hook precmd __fastty_precmd\n",
+            );
+
+            // Fish shell integration
+            let _ = std::fs::write(
+                &integration_path_fish,
+                "# fastty shell integration — OSC 133 command markers\n\
+                 function __fastty_cmd_start --on-event fish_preexec\n\
+                 \techo -ne \"\\e]133;B\\e\\\\\"\n\
+                 end\n\
+                 function __fastty_cmd_end --on-event fish_postexec\n\
+                 \techo -ne \"\\e]133;D;$status\\e\\\\\"\n\
+                 end\n\
+                 function __fastty_prompt --on-event fish_prompt\n\
+                 \techo -ne \"\\e]133;A\\e\\\\\"\n\
+                 end\n",
+            );
+
+            // Bash wrapper
+            let wrapper_path_bash = integration_dir.join("fastty_bashrc");
+            let _ = std::fs::write(
+                &wrapper_path_bash,
                 format!(
                     "# Auto-generated by fastty — shell integration wrapper\n\
-                     [ -f $HOME/.bash_profile ] && . $HOME/.bash_profile\n\
-                     [ -f {} ] && . {}\n\
-                     [ -f $HOME/.profile ] && . $HOME/.profile\n\
-                     . {}\n",
-                    user_bashrc,
-                    user_bashrc,
+                     [ -f \"$HOME/.bash_profile\" ] && . \"$HOME/.bash_profile\"\n\
+                     [ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\n\
+                     [ -f \"$HOME/.profile\" ] && . \"$HOME/.profile\"\n\
+                     . \"{}\"\n",
                     integration_path.display(),
                 ),
             );
-            cmd.args(&["--rcfile", wrapper_path.to_str().unwrap_or("")]);
-        } else if shell_name == "zsh" && exec_args.is_empty() {
-            // Zsh: redirect ZDOTDIR to a wrapper dir that still sources the
-            // user's ~/.zshenv and ~/.zshrc (zsh reads both from $ZDOTDIR,
-            // so overriding it would otherwise skip the user's config).
-            let home = std::env::var("HOME").unwrap_or_default();
-            let user_zshenv = format!("{}/.zshenv", home);
-            let user_zshrc = format!("{}/.zshrc", home);
-            let zdotdir = integration_dir.join("fastty_zsh");
-            let _ = std::fs::create_dir_all(&zdotdir);
+
+            // Zsh wrappers
             let _ = std::fs::write(
                 zdotdir.join(".zshenv"),
-                format!(
-                    // Source files in the same order a real zsh login shell would:
-                    //   /etc/zshenv  (already run by zsh itself before ZDOTDIR is checked)
-                    //   $ZDOTDIR/.zshenv  ← this file (run instead of ~/.zshenv)
-                    //   /etc/zprofile  ← macOS runs path_helper here; assembles PATH
-                    //                    from /etc/paths + /etc/paths.d/*
-                    //   ~/.zprofile   ← user login customizations (e.g. Homebrew eval)
-                    // Without sourcing /etc/zprofile explicitly the .app bundle would
-                    // start with only the minimal launchd PATH.
-                    "[ -f {user_zshenv} ] && . {user_zshenv}\n\
-                     [ -f /etc/zprofile ] && . /etc/zprofile\n\
-                     [ -f $HOME/.zprofile ] && . $HOME/.zprofile\n"
-                ),
+                "# Auto-generated by fastty\n\
+                 [ -f \"$HOME/.zshenv\" ] && . \"$HOME/.zshenv\"\n",
+            );
+            let _ = std::fs::write(
+                zdotdir.join(".zprofile"),
+                "# Auto-generated by fastty\n\
+                 [ -f \"$HOME/.zprofile\" ] && . \"$HOME/.zprofile\"\n",
             );
             let _ = std::fs::write(
                 zdotdir.join(".zshrc"),
                 format!(
-                    "[ -f {user_zshrc} ] && . {user_zshrc}\n. {}\n",
+                    "# Auto-generated by fastty\n\
+                     [ -f \"$HOME/.zshrc\" ] && . \"$HOME/.zshrc\"\n\
+                     . \"{}\"\n\
+                     if [ -n \"$FASTTY_ORIG_ZDOTDIR\" ]; then\n\
+                     \texport ZDOTDIR=\"$FASTTY_ORIG_ZDOTDIR\"\n\
+                     else\n\
+                     \tunset ZDOTDIR\n\
+                     fi\n",
                     integration_path_zsh.display(),
                 ),
             );
-            cmd.env("ZDOTDIR", zdotdir);
-        } else if shell_name == "fish" && exec_args.is_empty() {
-            // Fish: use -C to source integration on startup
-            let source_cmd = format!("source {}", integration_path_fish.display());
-            cmd.args(&["-C", &source_cmd]);
-        } else {
+            let _ = std::fs::write(
+                zdotdir.join(".zlogin"),
+                "# Auto-generated by fastty\n\
+                 [ -f \"$HOME/.zlogin\" ] && . \"$HOME/.zlogin\"\n",
+            );
+        });
+
+        // Wrap the shell command to source the integration before launching.
+        if !exec_args.is_empty() {
             cmd.args(exec_args);
         }
 
-        let child = pair.slave.spawn_command(cmd)?;
-        let shell_pid = child.process_id();
+        let no_spawn = std::env::var("FASTTY_NO_SPAWN").is_ok();
+        let child = if no_spawn {
+            None
+        } else {
+            Some(pair.slave.spawn_command(cmd)?)
+        };
+        let shell_pid = child.as_ref().and_then(|c| c.process_id());
+        let reader_shell_pid = shell_pid;
 
         drop(pair.slave);
 
@@ -264,23 +257,21 @@ impl TerminalState {
             Arc::new(ParkingMutex::new(writer_boxed));
 
         let mut event_listener = EventListenerProxy::from_arc(writer_arc.clone());
-        event_listener.set_app_proxy(proxy.clone());
+        event_listener.set_event_sender(sender.clone());
         let term = Arc::new(ParkingMutex::new(alacritty_terminal::term::Term::new(
             config,
             &size,
             event_listener,
         )));
 
-        // Write echo command directly in main thread (already done above)
-        // Remove duplicate write in thread
-
         let render_generation = Arc::new(AtomicU64::new(0));
         let render_gen_clone = Arc::clone(&render_generation);
         let term_clone = Arc::clone(&term);
-        let proxy_clone = proxy.clone();
+        let sender_clone = sender.clone();
         let total_lines_pushed = Arc::new(AtomicU64::new(0));
         let total_lines_pushed_clone = Arc::clone(&total_lines_pushed);
         let writer_clone = Arc::clone(&writer_arc);
+        if !std::env::var("FASTTY_NO_READER").is_ok() {
         thread::spawn(move || {
             use std::io::Read;
 
@@ -299,6 +290,19 @@ impl TerminalState {
             let mut osc_buf: Vec<u8> = Vec::new();
             let mut cmd_start_time: Option<std::time::Instant> = None;
 
+            // CSI detection state: tracks ESC [ <params> J to detect clear-screen
+            // sequences (\x1b[2J) and clear history on the main screen.
+            #[derive(Clone, Copy, Debug, PartialEq)]
+            enum CsiDetect {
+                None,
+                Esc,
+                Params,
+            }
+            let mut csi_detect = CsiDetect::None;
+            let mut csi_param_val: u32 = 0;
+            let mut csi_digit_acc: u32 = 0;
+            let mut clear_history_flag = false;
+
             // Debug: capture PTY bytes to log if FASTTY_PTY_DEBUG=1
             let pty_debug = std::env::var("FASTTY_PTY_DEBUG").ok().as_deref() == Some("1");
             let pty_log_path = crate::paths::get().state_dir.join("fastty_pty_debug.log");
@@ -316,6 +320,55 @@ impl TerminalState {
                 match cmd {
                     OscCommand::NotificationQuery { id } => {
                         let resp = format!("\x1b]99;i={}:p=OK;\x1b\\", id);
+                        let mut w = writer_clone.lock();
+                        let _ = w.write_all(resp.as_bytes());
+                        let _ = w.flush();
+                    }
+                    OscCommand::ColorQuery { code } => {
+                        let theme_name = crate::config::ACTIVE_THEME.read().clone();
+                        let theme = crate::ui::theme::Theme::from_name(&theme_name);
+                        let hsla = match code {
+                            10 => theme.foreground,
+                            11 => theme.background,
+                            12 => theme.cursor,
+                            _ => theme.foreground,
+                        };
+                        let rgba: gpui::Rgba = hsla.into();
+                        let r = (rgba.r * 255.0).clamp(0.0, 255.0) as u8;
+                        let g = (rgba.g * 255.0).clamp(0.0, 255.0) as u8;
+                        let b = (rgba.b * 255.0).clamp(0.0, 255.0) as u8;
+                        let resp = format!("\x1b]{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\", code, r, r, g, g, b, b);
+                        let mut w = writer_clone.lock();
+                        let _ = w.write_all(resp.as_bytes());
+                        let _ = w.flush();
+                    }
+                    OscCommand::PaletteQuery { index } => {
+                        let theme_name = crate::config::ACTIVE_THEME.read().clone();
+                        let theme = crate::ui::theme::Theme::from_name(&theme_name);
+                        let hsla = match index {
+                            0 => theme.black,
+                            1 => theme.red,
+                            2 => theme.green,
+                            3 => theme.yellow,
+                            4 => theme.blue,
+                            5 => theme.magenta,
+                            6 => theme.cyan,
+                            7 => theme.white,
+                            8 => theme.bright_black,
+                            9 => theme.bright_red,
+                            10 => theme.bright_green,
+                            11 => theme.bright_yellow,
+                            12 => theme.bright_blue,
+                            13 => theme.bright_magenta,
+                            14 => theme.bright_cyan,
+                            15 => theme.bright_white,
+                            _ => theme.foreground,
+                        };
+                        let rgba: gpui::Rgba = hsla.into();
+                        let r = (rgba.r * 255.0).clamp(0.0, 255.0) as u8;
+                        let g = (rgba.g * 255.0).clamp(0.0, 255.0) as u8;
+                        let b = (rgba.b * 255.0).clamp(0.0, 255.0) as u8;
+                        let resp = format!("\x1b]4;{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\", index, r, r, g, g, b, b);
                         let mut w = writer_clone.lock();
                         let _ = w.write_all(resp.as_bytes());
                         let _ = w.flush();
@@ -340,7 +393,7 @@ impl TerminalState {
                                     };
                                     dispatch_osc_action(
                                         &OscCommand::Notification { title, body: finished.body },
-                                        &proxy_clone,
+                                        &sender_clone,
                                         cursor_line,
                                         base,
                                         screen_lines,
@@ -350,7 +403,7 @@ impl TerminalState {
                         } else {
                             dispatch_osc_action(
                                 &OscCommand::Notification { title: "Fastty".to_string(), body: payload },
-                                &proxy_clone,
+                                &sender_clone,
                                 cursor_line,
                                 base,
                                 screen_lines,
@@ -358,7 +411,7 @@ impl TerminalState {
                         }
                     }
                     _ => {
-                        dispatch_osc_action(&cmd, &proxy_clone, cursor_line, base, screen_lines);
+                        dispatch_osc_action(&cmd, &sender_clone, cursor_line, base, screen_lines);
                     }
                 }
             };
@@ -366,7 +419,7 @@ impl TerminalState {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
-                        let _ = proxy_clone.send_event(AppEvent::Exit { shell_pid });
+                        sender_clone.send(AppEvent::Exit { shell_pid: reader_shell_pid });
                         break;
                     }
                     Ok(n) => {
@@ -455,24 +508,69 @@ impl TerminalState {
                                     }
                                 }
                             }
+
+                            // CSI detection: track ESC [ <params> J to detect clear-screen
+                            // (\x1b[2J) so we can wipe scrollback history on the main screen.
+                            match csi_detect {
+                                CsiDetect::None => {
+                                    if byte == 0x1b {
+                                        csi_detect = CsiDetect::Esc;
+                                    }
+                                }
+                                CsiDetect::Esc => {
+                                    if byte == b'[' {
+                                        csi_detect = CsiDetect::Params;
+                                        csi_param_val = 0;
+                                        csi_digit_acc = 0;
+                                    } else {
+                                        csi_detect = CsiDetect::None;
+                                    }
+                                }
+                                CsiDetect::Params => {
+                                    if byte >= b'0' && byte <= b'9' {
+                                        csi_digit_acc = csi_digit_acc.saturating_mul(10).saturating_add((byte - b'0') as u32);
+                                    } else if byte == b';' {
+                                        csi_param_val = csi_digit_acc;
+                                        csi_digit_acc = 0;
+                                    } else {
+                                        // Final character — check for J (erase display)
+                                        let param = if csi_param_val > 0 { csi_param_val } else { csi_digit_acc };
+                                        if byte == b'J' && param == 2 {
+                                            clear_history_flag = true;
+                                        }
+                                        csi_detect = CsiDetect::None;
+                                    }
+                                }
+                            }
+                        }
+                        // After the byte loop: clear scrollback history if we detected
+                        // \x1b[2J (EraseDisplay::All) on the main screen.
+                        if clear_history_flag {
+                            use alacritty_terminal::term::TermMode;
+                            let mode = *term_locked.mode();
+                            if !mode.contains(TermMode::ALT_SCREEN) {
+                                term_locked.grid_mut().clear_history();
+                            }
+                            clear_history_flag = false;
                         }
                         drop(term_locked);
 
                         total_lines_pushed_clone.fetch_add(local_lines, Ordering::Relaxed);
 
                         render_gen_clone.fetch_add(1, Ordering::Relaxed);
-                        let _ = proxy_clone.send_event(AppEvent::Wakeup);
+                        sender_clone.send(AppEvent::Wakeup);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
                         continue;
                     }
                     Err(_) => {
-                        let _ = proxy_clone.send_event(AppEvent::Exit { shell_pid });
+                        sender_clone.send(AppEvent::Exit { shell_pid: reader_shell_pid });
                         break;
                     }
                 }
             }
         });
+        }
 
         Ok(Self {
             term,
@@ -488,6 +586,11 @@ impl TerminalState {
         self.shell_pid
     }
 
+    pub fn get_current_working_directory(&self) -> Option<std::path::PathBuf> {
+        let pid = self.shell_pid?;
+        get_process_cwd(pid)
+    }
+
     pub fn write_to_pty(&self, bytes: &[u8]) {
         let mut w = self.writer.lock();
         let _ = w.write_all(bytes);
@@ -499,11 +602,73 @@ impl TerminalState {
         term.grid_mut().update_history(scrollback.min(3000));
     }
 
-    pub fn resize(&mut self, cols: usize, rows: usize) {
+    pub fn is_mouse_mode_enabled(&self) -> bool {
+        let term = self.term.lock();
+        let mode = *term.mode();
+        mode.intersects(
+            alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
+                | alacritty_terminal::term::TermMode::MOUSE_DRAG
+                | alacritty_terminal::term::TermMode::MOUSE_MOTION
+                | alacritty_terminal::term::TermMode::SGR_MOUSE
+                | alacritty_terminal::term::TermMode::UTF8_MOUSE,
+        )
+    }
+
+    pub fn send_mouse_event(&self, button: u8, col: usize, row: usize, pressed: bool) {
+        let term = self.term.lock();
+        let mode = *term.mode();
+        let is_mouse_active = mode.intersects(
+            alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
+                | alacritty_terminal::term::TermMode::MOUSE_DRAG
+                | alacritty_terminal::term::TermMode::MOUSE_MOTION
+                | alacritty_terminal::term::TermMode::SGR_MOUSE
+                | alacritty_terminal::term::TermMode::UTF8_MOUSE,
+        );
+        let sgr = mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE);
+        drop(term);
+
+        if !is_mouse_active {
+            return;
+        }
+
+        let col_1 = col.max(1);
+        let row_1 = row.max(1);
+
+        if sgr {
+            // SGR 1006 format: \x1b[<{button};{col};{row}{M/m}
+            let flag = if pressed { 'M' } else { 'm' };
+            let seq = format!("\x1b[<{};{};{}{}", button, col_1, row_1, flag);
+            self.write_to_pty(seq.as_bytes());
+        } else {
+            // Normal X10/1000 format: \x1b[M{btn + 32}{col + 32}{row + 32}
+            let b_byte = if pressed { button } else { 3 };
+            let cb = (b_byte + 32).min(255);
+            let cx = ((col_1 as u8).saturating_add(32)).min(255);
+            let cy = ((row_1 as u8).saturating_add(32)).min(255);
+            let seq = [0x1b, b'[', b'M', cb, cx, cy];
+            self.write_to_pty(&seq);
+        }
+    }
+
+    pub fn dimensions(&self) -> (usize, usize) {
+        let term = self.term.lock();
+        (term.grid().columns(), term.grid().screen_lines())
+    }
+
+    pub fn resize(&self, cols: usize, rows: usize) {
+        self.resize_with_pixels(cols, rows, (cols as u16) * 8, (rows as u16) * 16);
+    }
+
+    pub fn resize_with_pixels(&self, cols: usize, rows: usize, pixel_width: u16, pixel_height: u16) {
         if cols == 0 || rows == 0 {
             return;
         }
         let mut term = self.term.lock();
+        let cur_cols = term.grid().columns();
+        let cur_rows = term.grid().screen_lines();
+        if cur_cols == cols && cur_rows == rows {
+            return;
+        }
         let size = TermSize::new(cols, rows);
         term.resize(size);
         drop(term);
@@ -511,8 +676,8 @@ impl TerminalState {
         self.master.lock().resize(PtySize {
             rows: rows as u16,
             cols: cols as u16,
-            pixel_width: 0,
-            pixel_height: 0,
+            pixel_width,
+            pixel_height,
         }).ok();
 
         self.render_generation.fetch_add(1, Ordering::Relaxed);
@@ -522,6 +687,47 @@ impl TerminalState {
         let mut term = self.term.lock();
         use alacritty_terminal::grid::Scroll;
         term.scroll_display(Scroll::Delta(delta as i32));
+        self.render_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn scroll_to_offset(&self, offset: usize) {
+        let mut term = self.term.lock();
+        use alacritty_terminal::grid::Scroll;
+        let cur_offset = term.grid().display_offset();
+        let delta = (offset as isize) - (cur_offset as isize);
+        if delta != 0 {
+            term.scroll_display(Scroll::Delta(delta as i32));
+            self.render_generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn scroll_to_bottom(&self) {
+        let mut term = self.term.lock();
+        use alacritty_terminal::grid::Scroll;
+        term.scroll_display(Scroll::Bottom);
+        self.render_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn scroll_to_top(&self) {
+        let mut term = self.term.lock();
+        use alacritty_terminal::grid::Scroll;
+        term.scroll_display(Scroll::Top);
+        self.render_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn scroll_page(&self, pages: i32) {
+        let mut term = self.term.lock();
+        use alacritty_terminal::grid::Scroll;
+        if pages > 0 {
+            for _ in 0..pages {
+                term.scroll_display(Scroll::PageDown);
+            }
+        } else {
+            for _ in 0..(-pages) {
+                term.scroll_display(Scroll::PageUp);
+            }
+        }
+        self.render_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn display_offset(&self) -> usize {
@@ -536,6 +742,43 @@ impl TerminalState {
     }
 
 
+
+    pub fn search_matches(&self, query: &str) -> Vec<usize> {
+        if query.trim().is_empty() {
+            return Vec::new();
+        }
+        use alacritty_terminal::index::Line;
+        let query_lower = query.to_lowercase();
+        let term = self.term.lock();
+        let grid = term.grid();
+        let history = grid.history_size();
+        let screen_lines = grid.screen_lines();
+        if screen_lines == 0 {
+            return Vec::new();
+        }
+        let mut matches = Vec::new();
+
+        for line_i in -(history as i32)..(screen_lines as i32) {
+            let row = &grid[Line(line_i)];
+            let mut line_str = String::new();
+            for cell in row.into_iter() {
+                let c = cell.c;
+                if c != '\0' {
+                    line_str.push(c);
+                }
+            }
+            if line_str.to_lowercase().contains(&query_lower) {
+                let offset = if line_i < 0 {
+                    (-line_i) as usize
+                } else {
+                    0
+                };
+                matches.push(offset);
+            }
+        }
+        matches.dedup();
+        matches
+    }
 
     pub fn render_generation(&self) -> u64 {
         self.render_generation.load(Ordering::Relaxed)
@@ -626,8 +869,10 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 enum OscCommand {
     Cwd(String),
+    SetTitle(String),
     CommandStarted,
     CommandFinished { duration_ms: u128, exit_code: Option<i32> },
     PromptStarted,
@@ -639,6 +884,10 @@ enum OscCommand {
         done: bool,
         payload: String,
     },
+    ColorQuery { code: u8 },
+    PaletteQuery { index: u8 },
+    ResetPalette,
+    ResetColor { code: u8 },
 }
 
 fn parse_osc(
@@ -650,6 +899,25 @@ fn parse_osc(
     let payload = &buf[semicolon + 1..];
 
     match code {
+        b"0" | b"1" | b"2" => {
+            if let Ok(title) = std::str::from_utf8(payload) {
+                Some(OscCommand::SetTitle(title.to_string()))
+            } else {
+                None
+            }
+        }
+        b"4" => {
+            let s = std::str::from_utf8(payload).ok()?;
+            let parts: Vec<&str> = s.split(';').collect();
+            if parts.len() >= 2 {
+                if let Ok(index) = parts[0].parse::<u8>() {
+                    if parts[1] == "?" {
+                        return Some(OscCommand::PaletteQuery { index });
+                    }
+                }
+            }
+            None
+        }
         b"7" => {
             if let Ok(s) = std::str::from_utf8(payload) {
                 Some(OscCommand::Cwd(s.to_string()))
@@ -663,6 +931,19 @@ fn parse_osc(
                     title: "Fastty".to_string(),
                     body: msg.to_string(),
                 })
+            } else {
+                None
+            }
+        }
+        b"10" | b"11" | b"12" => {
+            let code_num = match code {
+                b"10" => 10,
+                b"11" => 11,
+                b"12" => 12,
+                _ => 10,
+            };
+            if payload == b"?" {
+                Some(OscCommand::ColorQuery { code: code_num })
             } else {
                 None
             }
@@ -718,6 +999,18 @@ fn parse_osc(
                 done,
                 payload: decoded_payload,
             })
+        }
+        b"104" => {
+            Some(OscCommand::ResetPalette)
+        }
+        b"110" | b"111" | b"112" => {
+            let code_num = match code {
+                b"110" => 10,
+                b"111" => 11,
+                b"112" => 12,
+                _ => 10,
+            };
+            Some(OscCommand::ResetColor { code: code_num })
         }
         b"777" => {
             if payload.starts_with(b"notify;") {
@@ -788,7 +1081,7 @@ fn parse_osc(
 
 fn dispatch_osc_action(
     cmd: &OscCommand,
-    proxy: &winit::event_loop::EventLoopProxy<AppEvent>,
+    sender: &crate::event_listener::EventSender,
     cursor_line: i32,
     absolute_base: u64,
     screen_lines: i32,
@@ -796,14 +1089,17 @@ fn dispatch_osc_action(
     match cmd {
         OscCommand::Cwd(path) => {
             if let Some(p) = file_url_to_path(path.as_bytes()) {
-                let _ = proxy.send_event(AppEvent::CwdChanged(p));
+                sender.send(AppEvent::CwdChanged(p));
             }
         }
+        OscCommand::SetTitle(title) => {
+            sender.send(AppEvent::TitleChanged(title.clone()));
+        }
         OscCommand::CommandStarted => {
-            let _ = proxy.send_event(AppEvent::CommandStarted);
+            sender.send(AppEvent::CommandStarted);
         }
         OscCommand::CommandFinished { duration_ms, exit_code } => {
-            let _ = proxy.send_event(AppEvent::CommandFinished {
+            sender.send(AppEvent::CommandFinished {
                 duration_ms: *duration_ms,
                 exit_code: *exit_code,
             });
@@ -811,16 +1107,84 @@ fn dispatch_osc_action(
         OscCommand::PromptStarted => {
             let scrolled = (absolute_base as i32 - screen_lines).max(0);
             let absolute_line = scrolled + cursor_line;
-            let _ = proxy.send_event(AppEvent::PromptStarted {
+            sender.send(AppEvent::PromptStarted {
                 absolute_line: absolute_line.max(0) as u64,
             });
         }
         OscCommand::Notification { title, body } => {
-            let _ = proxy.send_event(AppEvent::Notification {
+            sender.send(AppEvent::Notification {
                 title: title.clone(),
                 body: body.clone(),
             });
         }
-        OscCommand::NotificationQuery { .. } | OscCommand::NotificationFragment { .. } => {}
+        OscCommand::NotificationQuery { .. }
+        | OscCommand::NotificationFragment { .. }
+        | OscCommand::ColorQuery { .. }
+        | OscCommand::PaletteQuery { .. }
+        | OscCommand::ResetPalette
+        | OscCommand::ResetColor { .. } => {}
     }
+}
+
+#[cfg(target_os = "macos")]
+fn get_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    use std::ffi::CStr;
+    use std::os::raw::{c_int, c_void};
+
+    #[repr(C)]
+    struct VnodeInfoPath {
+        _vip_vi: [u8; 152],
+        vip_path: [libc::c_char; 1024],
+    }
+
+    #[repr(C)]
+    struct ProcVnodePathInfo {
+        pvi_cdir: VnodeInfoPath,
+        pvi_rdir: VnodeInfoPath,
+    }
+
+    extern "C" {
+        fn proc_pidinfo(
+            pid: c_int,
+            flavor: c_int,
+            arg: u64,
+            buffer: *mut c_void,
+            buffersize: c_int,
+        ) -> c_int;
+    }
+
+    const PROC_PIDVNODEPATHINFO: c_int = 9;
+
+    let mut path_info = std::mem::MaybeUninit::<ProcVnodePathInfo>::uninit();
+    let size = std::mem::size_of::<ProcVnodePathInfo>() as c_int;
+    let res = unsafe {
+        proc_pidinfo(
+            pid as c_int,
+            PROC_PIDVNODEPATHINFO,
+            0,
+            path_info.as_mut_ptr() as *mut c_void,
+            size,
+        )
+    };
+
+    if res == size {
+        let path_info = unsafe { path_info.assume_init() };
+        let c_str = unsafe { CStr::from_ptr(path_info.pvi_cdir.vip_path.as_ptr()) };
+        if let Ok(path_str) = c_str.to_str() {
+            if !path_str.is_empty() {
+                return Some(std::path::PathBuf::from(path_str));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn get_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    std::fs::read_link(format!("/proc/{}/cwd", pid)).ok()
+}
+
+#[cfg(target_os = "windows")]
+fn get_process_cwd(_pid: u32) -> Option<std::path::PathBuf> {
+    None
 }

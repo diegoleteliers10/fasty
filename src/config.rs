@@ -117,9 +117,8 @@ pub fn load_custom_themes() {
                 None => continue,
             };
             if let Ok(content) = std::fs::read_to_string(&path) {
-                match serde_json::from_str::<ThemeFile>(&content) {
-                    Ok(theme) => { map.insert(name, theme); }
-                    Err(e) => tracing::warn!("Failed to parse theme {:?}: {:?}", path, e),
+                if let Ok(theme) = serde_json::from_str::<ThemeFile>(&content) {
+                    map.insert(name, theme);
                 }
             }
         }
@@ -189,6 +188,8 @@ pub struct Config {
     pub keybindings: std::collections::HashMap<String, String>,
     #[serde(default = "default_session_restore")]
     pub session_restore: bool,
+    #[serde(default)]
+    pub copy_on_select: bool,
     #[serde(default = "default_opacity")]
     pub opacity: f32,
     #[serde(default = "default_notify_on_command_finish")]
@@ -315,6 +316,7 @@ impl Default for Config {
             theme: default_theme(),
             keybindings: std::collections::HashMap::new(),
             session_restore: default_session_restore(),
+            copy_on_select: false,
             opacity: default_opacity(),
             notify_on_command_finish: default_notify_on_command_finish(),
             bottombar: BottombarConfig::default(),
@@ -337,6 +339,10 @@ fn user_toml_path() -> PathBuf {
     crate::paths::get().config_dir.join("fastty.toml")
 }
 
+fn user_config_toml_path() -> PathBuf {
+    crate::paths::get().config_dir.join("config.toml")
+}
+
 fn user_legacy_json_path() -> PathBuf {
     crate::paths::get().config_dir.join("config.json")
 }
@@ -344,8 +350,11 @@ fn user_legacy_json_path() -> PathBuf {
 fn candidate_toml_paths() -> Vec<PathBuf> {
     vec![
         PathBuf::from("fastty.toml"),
+        PathBuf::from("config.toml"),
         PathBuf::from("/etc/fastty/fastty.toml"),
+        PathBuf::from("/etc/fastty/config.toml"),
         user_toml_path(),
+        user_config_toml_path(),
     ]
 }
 
@@ -415,10 +424,6 @@ fn migrate_legacy_json_to_toml(toml_path: &Path, json_path: &Path) -> anyhow::Re
         PathBuf::from(p)
     };
     std::fs::rename(json_path, &bak)?;
-    tracing::info!(
-        "config: migrated {} -> {} (backup: {})",
-        json_path.display(), toml_path.display(), bak.display()
-    );
     Ok(())
 }
 
@@ -427,9 +432,7 @@ impl Config {
         let target = user_toml_path();
         let legacy = user_legacy_json_path();
         if !target.exists() && legacy.exists() {
-            if let Err(e) = migrate_legacy_json_to_toml(&target, &legacy) {
-                tracing::warn!("config: legacy migration failed ({e:?}); leaving {} in place", legacy.display());
-            }
+            let _ = migrate_legacy_json_to_toml(&target, &legacy);
         }
 
         let mut any_existed = false;
@@ -440,7 +443,6 @@ impl Config {
             let content = match std::fs::read_to_string(&path) {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!("config: cannot read {}: {e}", path.display());
                     last_err = Some(anyhow::anyhow!("read {}: {e}", path.display()));
                     continue;
                 }
@@ -454,7 +456,6 @@ impl Config {
                     return Ok(cfg);
                 }
                 Err(e) => {
-                    tracing::warn!("config: parse error in {}: {e}; trying next path", path.display());
                     last_err = Some(anyhow::anyhow!("parse {}: {e}", path.display()));
                 }
             }
@@ -474,10 +475,7 @@ impl Config {
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let mut doc: DocumentMut = match std::fs::read_to_string(path) {
-            Ok(s) => s.parse::<DocumentMut>().unwrap_or_else(|e| {
-                tracing::warn!("config: existing file unparseable, rewriting fresh: {e}");
-                DocumentMut::new()
-            }),
+            Ok(s) => s.parse::<DocumentMut>().unwrap_or_else(|_| DocumentMut::new()),
             Err(_) => DocumentMut::new(),
         };
         apply_to_doc(&mut doc, self);
@@ -500,6 +498,14 @@ impl Config {
         }
         Self::config_path()
     }
+
+    pub fn save_default(&self) -> anyhow::Result<()> {
+        let path = Self::get_active_config_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        self.save(&path)
+    }
 }
 
 pub fn start_config_watcher<F>(file_path: PathBuf, on_change: F) -> anyhow::Result<()>
@@ -515,7 +521,6 @@ where
     if !parent.exists() {
         std::fs::create_dir_all(&parent)?;
     }
-    tracing::info!("config-watch: watching dir {} (target: {})", parent.display(), file_path.display());
 
     let (tx, rx) = std::sync::mpsc::channel();
     let mut debouncer = new_debouncer(WATCH_DEBOUNCE, tx)?;
@@ -530,10 +535,7 @@ where
             for batch in rx {
                 let events = match batch {
                     Ok(ev) => ev,
-                    Err(e) => {
-                        tracing::warn!("config-watch: debouncer error: {e:?}");
-                        continue;
-                    }
+                    Err(_) => continue,
                 };
                 let touches_file = events.iter().any(|e| {
                     e.path.file_name() == watched_name.as_deref()
@@ -545,10 +547,8 @@ where
                 };
                 let h = content_hash(&content);
                 if h == last_applied_hash() {
-                    tracing::debug!("config-watch: hash matches, skipping");
                     continue;
                 }
-                tracing::info!("config-watch: change detected for {}", watched_file.display());
                 on_change();
             }
         })?;

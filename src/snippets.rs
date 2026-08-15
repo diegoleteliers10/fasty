@@ -66,10 +66,7 @@ fn seed_defaults_if_missing() {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match atomic_write(&path, BUNDLED.as_bytes()) {
-        Ok(_) => tracing::info!("snippets: seeded defaults at {}", path.display()),
-        Err(e) => tracing::warn!("snippets: could not seed defaults: {e}"),
-    }
+    let _ = atomic_write(&path, BUNDLED.as_bytes());
 }
 
 pub fn load() {
@@ -77,15 +74,12 @@ pub fn load() {
     let path = snippets_path();
     let mut map: HashMap<String, String> = HashMap::new();
     if let Ok(content) = std::fs::read_to_string(&path) {
-        match toml_edit::de::from_str::<SnippetFile>(&content) {
-            Ok(file) => {
-                for (k, v) in file.snippet {
-                    if !k.is_empty() && !v.is_empty() {
-                        map.insert(k, v);
-                    }
+        if let Ok(file) = toml_edit::de::from_str::<SnippetFile>(&content) {
+            for (k, v) in file.snippet {
+                if !k.is_empty() && !v.is_empty() {
+                    map.insert(k, v);
                 }
             }
-            Err(e) => tracing::warn!("snippets: parse error in {}: {e}", path.display()),
         }
     }
     *snippets_cell().write() = map;
@@ -218,7 +212,6 @@ where
     if !parent.exists() {
         std::fs::create_dir_all(&parent)?;
     }
-    tracing::info!("snippets-watch: watching dir {} (target: {})", parent.display(), path.display());
 
     let (tx, rx) = std::sync::mpsc::channel();
     let mut debouncer = new_debouncer(WATCH_DEBOUNCE, tx)?;
@@ -233,14 +226,10 @@ where
             for batch in rx {
                 let events = match batch {
                     Ok(ev) => ev,
-                    Err(e) => {
-                        tracing::warn!("snippets-watch: debouncer error: {e:?}");
-                        continue;
-                    }
+                    Err(_) => continue,
                 };
                 let touches_file = events.iter().any(|e| e.path.file_name() == watched_name.as_deref());
                 if !touches_file { continue; }
-                tracing::info!("snippets-watch: change detected for {}", watched_file.display());
                 on_change();
             }
         })?;

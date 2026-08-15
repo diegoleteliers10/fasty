@@ -7,5 +7,6 @@ target/
 #claude
 .claude
 
-
-
+.DS_Store
+*.log
+run.log

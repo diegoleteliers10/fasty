@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::widgets::{Align, ClickAction, Segment, Widget, WidgetContext};
+use crate::widgets::{Align, ClickAction, ContextMenuItem, Segment, Widget, WidgetContext};
 
 const DEFAULT_INTERVAL_MS: u64 = 1500;
 
@@ -119,7 +119,7 @@ impl Widget for GitWidget {
         })
     }
 
-    fn get_context_menu_items(&self) -> Option<Vec<crate::renderer::ContextMenuItem>> {
+    fn get_context_menu_items(&self) -> Option<Vec<ContextMenuItem>> {
         let cwd_str = self.pending_cwd.as_ref()?.to_string_lossy().into_owned();
         let mut items = Vec::new();
 
@@ -132,7 +132,7 @@ impl Widget for GitWidget {
                 crate::git::SyncStatus::Diverged => ("\u{26A1} Diverged from remote".to_string(), "failure".to_string()),
                 crate::git::SyncStatus::Unknown => ("\u{2014} No remote tracked".to_string(), "skipped".to_string()),
             };
-            items.push(crate::renderer::ContextMenuItem::GithubActionInfo {
+            items.push(ContextMenuItem::GithubActionInfo {
                 label,
                 status,
                 url: None,
@@ -145,7 +145,7 @@ impl Widget for GitWidget {
                 } else {
                     gs.last_commit_summary.clone()
                 };
-                items.push(crate::renderer::ContextMenuItem::GithubActionInfo {
+                items.push(ContextMenuItem::GithubActionInfo {
                     label: format!("\u{1F50F} {}", truncated),
                     status: "skipped".to_string(),
                     url: None,
@@ -162,14 +162,14 @@ impl Widget for GitWidget {
                         .trim_start_matches("github.com/")
                         .trim_end_matches(".git");
 
-                    items.push(crate::renderer::ContextMenuItem::GithubActionInfo {
+                    items.push(ContextMenuItem::GithubActionInfo {
                         label: "\u{2692} GitHub Actions".to_string(),
                         status: "skipped".to_string(),
                         url: Some(format!("https://github.com/{}/actions", repo_path)),
                     });
 
                     // Repository link
-                    items.push(crate::renderer::ContextMenuItem::GithubActionInfo {
+                    items.push(ContextMenuItem::GithubActionInfo {
                         label: "\u{1F517} Open Repository".to_string(),
                         status: "skipped".to_string(),
                         url: Some(remote_url.clone()),
@@ -177,54 +177,54 @@ impl Widget for GitWidget {
                 }
             }
 
-            items.push(crate::renderer::ContextMenuItem::Separator);
+            items.push(ContextMenuItem::Separator);
         }
 
         // Sync actions
-        items.push(crate::renderer::ContextMenuItem::CommandItem {
+        items.push(ContextMenuItem::CommandItem {
             label: "\u{2B07} Pull  [git pull]".to_string(),
             command: "git pull".to_string(),
             cwd: cwd_str.clone(),
         });
-        items.push(crate::renderer::ContextMenuItem::CommandItem {
+        items.push(ContextMenuItem::CommandItem {
             label: "\u{2B06} Push  [git push]".to_string(),
             command: "git push".to_string(),
             cwd: cwd_str.clone(),
         });
-        items.push(crate::renderer::ContextMenuItem::CommandItem {
+        items.push(ContextMenuItem::CommandItem {
             label: "\u{21BA} Fetch [git fetch]".to_string(),
             command: "git fetch".to_string(),
             cwd: cwd_str.clone(),
         });
 
         // Additional git commands
-        items.push(crate::renderer::ContextMenuItem::Separator);
+        items.push(ContextMenuItem::Separator);
 
-        items.push(crate::renderer::ContextMenuItem::CommandItem {
+        items.push(ContextMenuItem::CommandItem {
             label: "\u{1F4CB} Status [git status]".to_string(),
             command: "git status".to_string(),
             cwd: cwd_str.clone(),
         });
 
-        items.push(crate::renderer::ContextMenuItem::CommandItem {
+        items.push(ContextMenuItem::CommandItem {
             label: "\u{1F4C5} Log (5) [git log]".to_string(),
             command: "git log --oneline -5".to_string(),
             cwd: cwd_str.clone(),
         });
 
-        items.push(crate::renderer::ContextMenuItem::CommandItem {
+        items.push(ContextMenuItem::CommandItem {
             label: "\u{1F4DD} Diff [git diff]".to_string(),
             command: "git diff".to_string(),
             cwd: cwd_str.clone(),
         });
 
-        items.push(crate::renderer::ContextMenuItem::CommandItem {
+        items.push(ContextMenuItem::CommandItem {
             label: "\u{2795} Stage All [git add]".to_string(),
             command: "git add .".to_string(),
             cwd: cwd_str.clone(),
         });
 
-        items.push(crate::renderer::ContextMenuItem::CommandItem {
+        items.push(ContextMenuItem::CommandItem {
             label: "\u{1F4BE} Commit [git commit]".to_string(),
             command: "git commit".to_string(),
             cwd: cwd_str,

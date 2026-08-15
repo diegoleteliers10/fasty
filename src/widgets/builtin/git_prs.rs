@@ -1,8 +1,7 @@
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::widgets::{Align, ClickAction, Segment, Widget, WidgetContext};
-use crate::renderer::ContextMenuItem;
+use crate::widgets::{Align, ClickAction, ContextMenuItem, Segment, Widget, WidgetContext};
 
 const DEFAULT_INTERVAL_MS: u64 = 60_000; // 60 seconds (since GitHub API is queried)
 

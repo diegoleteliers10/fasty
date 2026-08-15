@@ -13,6 +13,10 @@ pub struct SecondaryWindow {
     pub renderer: Renderer<'static>,
     pub hover_close: bool,
     pub mouse_y: f64,
+    /// Whether set_visible(true) has already been called on this window.
+    /// We defer this until the first RedrawRequested so that the GPU frame
+    /// is already committed when the window appears — no blank/flash.
+    pub shown: bool,
 }
 
 pub enum EventResult {
@@ -30,13 +34,12 @@ impl SecondaryWindow {
         main_renderer: &parking_lot::Mutex<Renderer<'_>>,
         font_family: &str,
     ) -> Result<Self, anyhow::Error> {
-        let visible = !cfg!(target_os = "windows");
         let window = target.create_window(
             with_platform_chrome(
                 WindowAttributes::default()
                     .with_title(title)
                     .with_transparent(true)
-                    .with_visible(visible)
+                    .with_visible(false)   // stay hidden until first frame
                     .with_inner_size(LogicalSize::new(width, height)),
             ),
         )?;
@@ -71,14 +74,15 @@ impl SecondaryWindow {
             renderer,
             hover_close: false,
             mouse_y: 0.0,
+            shown: false,
         })
     }
 
-    #[cfg(target_os = "windows")]
     pub fn show_and_focus(&mut self) {
         self.renderer.set_dirty(true);
         self.window.set_visible(true);
         self.window.focus_window();
+        self.window.request_redraw();
     }
 
     pub fn handle_event(

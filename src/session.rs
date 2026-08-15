@@ -77,8 +77,7 @@ pub fn load() -> Option<Session> {
     let content = std::fs::read_to_string(&path).ok()?;
     let s: Session = match serde_json::from_str(&content) {
         Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("session: failed to parse {}: {e}", path.display());
+        Err(_) => {
             return None;
         }
     };

@@ -1,7 +1,7 @@
 //! Git status types and worktree helpers shared between main and renderer.
 
 use std::path::{Path, PathBuf};
-use winit::event_loop::EventLoopProxy;
+use crate::event_listener::EventSender;
 use crate::terminal_state::AppEvent;
 use notify::Watcher;
 
@@ -170,7 +170,7 @@ pub fn create_worktree(toplevel: &Path, new_branch: &str) -> Option<PathBuf> {
 }
 
 pub fn fetch_git_info(repo_path: &Path) -> Option<GitInfo> {
-    let repo = git2::Repository::open(repo_path).ok()?;
+    let repo = git2::Repository::discover(repo_path).ok()?;
 
     // Branch name + detached HEAD detection
     let head = repo.head().ok()?;
@@ -259,14 +259,14 @@ fn get_ahead_behind(repo: &git2::Repository, branch: &str) -> (usize, usize) {
 
 pub struct GitWatcherManager {
     watchers: std::collections::HashMap<PathBuf, notify::RecommendedWatcher>,
-    proxy: EventLoopProxy<AppEvent>,
+    sender: EventSender,
 }
 
 impl GitWatcherManager {
-    pub fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
+    pub fn new(sender: EventSender) -> Self {
         Self {
             watchers: std::collections::HashMap::new(),
-            proxy,
+            sender,
         }
     }
 
@@ -298,7 +298,7 @@ impl GitWatcherManager {
             );
         }
 
-        let proxy_clone = self.proxy.clone();
+        let sender_clone = self.sender.clone();
         let repo_path_clone = repo_path.clone();
 
         std::thread::spawn(move || {
@@ -308,7 +308,7 @@ impl GitWatcherManager {
                     std::thread::sleep(std::time::Duration::from_millis(300));
                     while rx.try_recv().is_ok() {}
 
-                    let _ = proxy_clone.send_event(AppEvent::GitRepoChanged {
+                    sender_clone.send(AppEvent::GitRepoChanged {
                         repo_path: repo_path_clone.clone(),
                     });
                 } else {

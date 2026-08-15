@@ -86,5 +86,76 @@ pub fn init() -> anyhow::Result<&'static FasttyDirs> {
 }
 
 pub fn get() -> &'static FasttyDirs {
-    FASTTY_DIRS.get().expect("FASTTY_DIRS not initialized; call paths::init() first")
+    FASTTY_DIRS.get_or_init(|| FasttyDirs::new().expect("failed to initialize fastty paths"))
+}
+
+pub fn default_system_shell() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(shell) = std::env::var("SHELL") {
+            if !shell.is_empty() && (std::path::Path::new(&shell).exists() || shell.ends_with(".exe")) {
+                return shell;
+            }
+        }
+        if let Ok(comspec) = std::env::var("COMSPEC") {
+            if std::path::Path::new(&comspec).exists() {
+                // If COMSPEC points to cmd.exe, prefer powershell if available, otherwise comspec
+                if let Ok(sys_root) = std::env::var("SystemRoot") {
+                    let ps_path = std::path::PathBuf::from(sys_root)
+                        .join("System32")
+                        .join("WindowsPowerShell")
+                        .join("v1.0")
+                        .join("powershell.exe");
+                    if ps_path.exists() {
+                        return ps_path.to_string_lossy().into_owned();
+                    }
+                }
+                return comspec;
+            }
+        }
+        "powershell.exe".to_string()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(shell) = std::env::var("SHELL") {
+            if !shell.is_empty() && std::path::Path::new(&shell).exists() {
+                return shell;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if std::path::Path::new("/bin/zsh").exists() {
+                return "/bin/zsh".to_string();
+            }
+            if std::path::Path::new("/bin/bash").exists() {
+                return "/bin/bash".to_string();
+            }
+            "/bin/sh".to_string()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if std::path::Path::new("/bin/bash").exists() {
+                return "/bin/bash".to_string();
+            }
+            if std::path::Path::new("/usr/bin/bash").exists() {
+                return "/usr/bin/bash".to_string();
+            }
+            if std::path::Path::new("/bin/zsh").exists() {
+                return "/bin/zsh".to_string();
+            }
+            if std::path::Path::new("/usr/bin/zsh").exists() {
+                return "/usr/bin/zsh".to_string();
+            }
+            if std::path::Path::new("/bin/fish").exists() {
+                return "/bin/fish".to_string();
+            }
+            if std::path::Path::new("/usr/bin/fish").exists() {
+                return "/usr/bin/fish".to_string();
+            }
+            if std::path::Path::new("/bin/sh").exists() {
+                return "/bin/sh".to_string();
+            }
+            "sh".to_string()
+        }
+    }
 }
