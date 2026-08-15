@@ -537,10 +537,10 @@ pub fn open_path_or_url(target: impl AsRef<std::ffi::OsStr>) {
     }
 }
 
-fn get_font_cell_metrics(family: &str, size: f32) -> (f32, f32) {
+fn get_font_cell_metrics(_family: &str, size: f32) -> (f32, f32) {
     #[cfg(target_os = "macos")]
     {
-        crate::font_discovery_macos::measure_font_metrics(family, size)
+        crate::font_discovery_macos::measure_font_metrics(_family, size)
     }
     #[cfg(not(target_os = "macos"))]
     {
