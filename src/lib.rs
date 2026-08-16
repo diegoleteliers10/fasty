@@ -12,6 +12,7 @@ pub mod ssh;
 pub mod parser;
 pub mod terminal_state;
 pub mod ui;
+pub mod updater;
 pub mod widgets;
 #[cfg(target_os = "macos")]
 pub mod font_discovery_macos;

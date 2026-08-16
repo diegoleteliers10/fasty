@@ -698,6 +698,10 @@ pub struct RootView {
     pub is_dragging_scrollbar: bool,
     pub scrollbar_drag_start_y: f32,
     pub scrollbar_drag_start_offset: usize,
+    pub update_available: Option<crate::updater::ReleaseInfo>,
+    pub is_updating: bool,
+    pub update_status: Option<String>,
+    pub is_update_modal_open: bool,
 }
 
 impl RootView {
@@ -843,7 +847,27 @@ impl RootView {
             is_dragging_scrollbar: false,
             scrollbar_drag_start_y: 0.0,
             scrollbar_drag_start_offset: 0,
+            update_available: None,
+            is_updating: false,
+            update_status: None,
+            is_update_modal_open: false,
         };
+
+        // Background update check
+        let (update_tx, update_rx) = async_channel::unbounded::<Option<crate::updater::ReleaseInfo>>();
+        std::thread::spawn(move || {
+            let res = crate::updater::check_for_update_sync();
+            let _ = update_tx.send_blocking(res);
+        });
+
+        cx.spawn_in(_window, async move |this, cx| {
+            if let Ok(Some(release)) = update_rx.recv().await {
+                let _ = this.update_in(cx, |this, _window, cx| {
+                    this.update_available = Some(release);
+                    cx.notify();
+                });
+            }
+        }).detach();
 
         if restored_tabs.is_empty() {
             view.create_tab(_window, cx);
@@ -1074,6 +1098,46 @@ impl RootView {
             self.persist_session();
             cx.notify();
         }
+    }
+
+    pub fn trigger_apply_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_updating {
+            return;
+        }
+        let Some(release) = self.update_available.clone() else {
+            return;
+        };
+
+        self.is_updating = true;
+        self.update_status = Some(format!("Downloading Fastty v{}...", release.version));
+        cx.notify();
+
+        let (result_tx, result_rx) = async_channel::unbounded::<Result<(), String>>();
+        let rel_clone = release.clone();
+        std::thread::spawn(move || {
+            let res = crate::updater::apply_update_sync(&rel_clone).map_err(|e| e.to_string());
+            let _ = result_tx.send_blocking(res);
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(res) = result_rx.recv().await {
+                let _ = this.update_in(cx, |this, _window, cx| {
+                    this.is_updating = false;
+                    match res {
+                        Ok(()) => {
+                            this.update_status = Some(format!("Fastty v{} installed successfully!\nPlease restart Fastty to use the new version.", release.version));
+                            this.is_update_modal_open = true;
+                            this.update_available = None;
+                        }
+                        Err(e) => {
+                            this.update_status = Some(format!("Update failed: {}", e));
+                            this.is_update_modal_open = true;
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        }).detach();
     }
 
     pub fn toggle_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1779,7 +1843,7 @@ impl RootView {
         }
 
         // 6. Dismiss open static overlays on Escape
-        if (self.is_settings_open || self.is_about_open || self.is_context_menu_open || self.is_git_menu_open || self.is_tab_context_menu_open)
+        if (self.is_settings_open || self.is_about_open || self.is_context_menu_open || self.is_git_menu_open || self.is_tab_context_menu_open || self.is_update_modal_open)
             && (key_lower == "escape" || key_lower == "esc")
         {
             self.is_settings_open = false;
@@ -1787,6 +1851,7 @@ impl RootView {
             self.is_context_menu_open = false;
             self.is_git_menu_open = false;
             self.is_tab_context_menu_open = false;
+            self.is_update_modal_open = false;
             cx.notify();
             return;
         }
@@ -2761,6 +2826,10 @@ impl Render for RootView {
             .text_color(theme.foreground)
             .child(
                 TabBar::new(tab_items, theme)
+                    .update_available(self.update_available.as_ref().map(|u| u.version.clone()), self.is_updating)
+                    .on_update(cx.listener(|this, _ev, window, cx| {
+                        this.trigger_apply_update(window, cx);
+                    }))
                     .on_select_tab(cx.listener(|this, &tab_id, _window, cx| {
                         this.select_tab(tab_id, cx);
                     }))
@@ -4832,6 +4901,93 @@ impl Render for RootView {
                                         theme,
                                     ))
                                 }),
+                        ),
+                )
+            })
+            .when(self.is_update_modal_open, |this| {
+                let status_msg = self.update_status.clone().unwrap_or_default();
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                            this.is_update_modal_open = false;
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .w(px(360.))
+                                .p(px(16.))
+                                .rounded(px(10.))
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.border)
+                                .shadow_xl()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .pb(px(6.))
+                                        .border_b_1()
+                                        .border_color(theme.border)
+                                        .child(
+                                            div()
+                                                .text_size(px(13.))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(theme.foreground)
+                                                .child("Fastty Updater"),
+                                        )
+                                        .child(
+                                            div()
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                    this.is_update_modal_open = false;
+                                                    cx.notify();
+                                                }))
+                                                .child(render_icon(IconType::X, theme.accent, 12.0)),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(theme.foreground)
+                                        .child(status_msg),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .justify_end()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .px(px(12.))
+                                                .py(px(5.))
+                                                .rounded(px(5.))
+                                                .bg(theme.accent)
+                                                .text_color(theme.black)
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_size(px(11.))
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                    this.is_update_modal_open = false;
+                                                    cx.notify();
+                                                }))
+                                                .child("OK"),
+                                        ),
+                                ),
                         ),
                 )
             })

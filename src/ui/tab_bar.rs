@@ -23,6 +23,9 @@ pub struct TabBar {
     on_new_tab: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_open_settings: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_logo_context_menu: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>,
+    update_available: Option<String>,
+    is_updating: bool,
+    on_update: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 }
 
 impl TabBar {
@@ -37,6 +40,9 @@ impl TabBar {
             on_new_tab: None,
             on_open_settings: None,
             on_logo_context_menu: None,
+            update_available: None,
+            is_updating: false,
+            on_update: None,
         }
     }
 
@@ -93,6 +99,20 @@ impl TabBar {
         handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_logo_context_menu = Some(Box::new(handler));
+        self
+    }
+
+    pub fn update_available(mut self, version: Option<String>, is_updating: bool) -> Self {
+        self.update_available = version;
+        self.is_updating = is_updating;
+        self
+    }
+
+    pub fn on_update(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_update = Some(Box::new(handler));
         self
     }
 }
@@ -246,7 +266,7 @@ impl RenderOnce for TabBar {
             )
             // Flexible spacer pushing right controls to the far right
             .child(div().flex_1())
-            // Right group: Settings button + Logo icon (no background)
+            // Right group: Update button (if available) + Settings button + Logo icon (no background)
             .child(
                 div()
                     .flex()
@@ -254,6 +274,34 @@ impl RenderOnce for TabBar {
                     .items_center()
                     .gap_2()
                     .pr(px(6.))
+                    .when_some(self.update_available, |this, version| {
+                        this.child(
+                            div()
+                                .id("update-btn")
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_center()
+                                .gap_1()
+                                .px(px(6.))
+                                .h(px(22.))
+                                .rounded(px(5.))
+                                .bg(theme.green.opacity(0.15))
+                                .border_1()
+                                .border_color(theme.green.opacity(0.4))
+                                .hover(move |s| s.bg(theme.green.opacity(0.25)).border_color(theme.green))
+                                .cursor(CursorStyle::PointingHand)
+                                .when_some(self.on_update, |el, on_click| el.on_click(on_click))
+                                .child(super::icons::render_icon(icons::common::IconType::Download, theme.green, 12.0))
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme.green)
+                                        .child(if self.is_updating { "Updating...".to_string() } else { format!("v{}", version) }),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .id("settings-btn")

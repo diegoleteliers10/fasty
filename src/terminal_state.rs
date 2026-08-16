@@ -113,7 +113,20 @@ impl TerminalState {
             cmd.env("LANG", lang);
         }
         if let Ok(path) = std::env::var("PATH") {
-            cmd.env("PATH", path);
+            #[cfg(target_os = "macos")]
+            {
+                let mut full_path = path;
+                for p in ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin"] {
+                    if !full_path.split(':').any(|segment| segment == p) && std::path::Path::new(p).exists() {
+                        full_path = format!("{}:{}", p, full_path);
+                    }
+                }
+                cmd.env("PATH", full_path);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                cmd.env("PATH", path);
+            }
         }
 
         // Shell integration: write OSC 133 command markers so fastty can
@@ -230,6 +243,17 @@ impl TerminalState {
         // Wrap the shell command to source the integration before launching.
         if !exec_args.is_empty() {
             cmd.args(exec_args);
+        } else {
+            #[cfg(unix)]
+            {
+                let shell_name = std::path::Path::new(&executable)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                if matches!(shell_name, "zsh" | "bash" | "fish" | "sh" | "dash" | "ksh") {
+                    cmd.arg("-l");
+                }
+            }
         }
 
         let no_spawn = std::env::var("FASTTY_NO_SPAWN").is_ok();
