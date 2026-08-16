@@ -702,6 +702,7 @@ pub struct RootView {
     pub is_updating: bool,
     pub update_status: Option<String>,
     pub is_update_modal_open: bool,
+    pub pressed_mouse_button: Option<MouseButton>,
 }
 
 impl RootView {
@@ -852,6 +853,7 @@ impl RootView {
             is_updating: false,
             update_status: None,
             is_update_modal_open: false,
+            pressed_mouse_button: None,
         };
 
         // Background update check
@@ -2307,6 +2309,8 @@ impl RootView {
         let col = ((local_x / cell_w).floor() as usize) + 1;
         let row = ((local_y / line_h).floor() as usize) + 1;
 
+        self.pressed_mouse_button = Some(event.button);
+
         if terminal.is_mouse_mode_enabled() {
             let btn = match event.button {
                 MouseButton::Left => 0,
@@ -2314,7 +2318,15 @@ impl RootView {
                 MouseButton::Right => 2,
                 _ => 0,
             };
-            terminal.send_mouse_event(btn, col, row, true);
+            terminal.send_mouse_button_with_mods(
+                btn,
+                col,
+                row,
+                true,
+                event.modifiers.shift,
+                event.modifiers.alt,
+                event.modifiers.control,
+            );
             return;
         }
 
@@ -2388,6 +2400,26 @@ impl RootView {
         let (cell_w, line_h) = self.measure_cell_metrics(_window);
         let local_x = (event.position.x.to_f64() as f32 - 12.0).max(0.0);
         let local_y = (event.position.y.to_f64() as f32 - 38.0).max(0.0);
+
+        if terminal.is_mouse_mode_enabled() {
+            let left = self.pressed_mouse_button == Some(MouseButton::Left);
+            let middle = self.pressed_mouse_button == Some(MouseButton::Middle);
+            let right = self.pressed_mouse_button == Some(MouseButton::Right);
+            let col = ((local_x / cell_w).floor() as usize) + 1;
+            let row = ((local_y / line_h).floor() as usize) + 1;
+            terminal.send_mouse_motion(
+                col,
+                row,
+                left,
+                middle,
+                right,
+                event.modifiers.shift,
+                event.modifiers.alt,
+                event.modifiers.control,
+            );
+            return;
+        }
+
         let history_size = terminal.history_size();
         let viewport_size = _window.viewport_size();
         let avail_h = (viewport_size.height.to_f64() as f32 - 54.0 - 12.0).max(100.0);
@@ -2450,6 +2482,7 @@ impl RootView {
     }
 
     fn handle_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.pressed_mouse_button = None;
         self.is_dragging_scrollbar = false;
         if self.is_selecting {
             self.is_selecting = false;
@@ -2476,7 +2509,15 @@ impl RootView {
                         MouseButton::Right => 2,
                         _ => 0,
                     };
-                    terminal.send_mouse_event(btn, col, row, false);
+                    terminal.send_mouse_button_with_mods(
+                        btn,
+                        col,
+                        row,
+                        false,
+                        event.modifiers.shift,
+                        event.modifiers.alt,
+                        event.modifiers.control,
+                    );
                 }
             }
         }
@@ -2499,14 +2540,21 @@ impl RootView {
         if delta_y.abs() > 0.5 {
             self.last_scroll_activity = std::time::Instant::now();
             if terminal.is_mouse_mode_enabled() {
-                let font_size = self.font_size;
-                let (cell_w, line_h) = get_font_cell_metrics(self.font_family.as_ref(), font_size);
+                let (cell_w, line_h) = self.measure_cell_metrics(_window);
                 let local_x = (event.position.x.to_f64() as f32 - 12.0).max(0.0);
                 let local_y = (event.position.y.to_f64() as f32 - 38.0).max(0.0);
                 let col = ((local_x / cell_w).floor() as usize) + 1;
                 let row = ((local_y / line_h).floor() as usize) + 1;
                 let btn = if delta_y > 0.0 { 64 } else { 65 };
-                terminal.send_mouse_event(btn, col, row, true);
+                terminal.send_mouse_button_with_mods(
+                    btn,
+                    col,
+                    row,
+                    true,
+                    event.modifiers.shift,
+                    event.modifiers.alt,
+                    event.modifiers.control,
+                );
             } else {
                 let lines = (delta_y / 15.0).round() as isize;
                 if lines != 0 {

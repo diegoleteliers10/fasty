@@ -632,21 +632,30 @@ impl TerminalState {
         mode.intersects(
             alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
                 | alacritty_terminal::term::TermMode::MOUSE_DRAG
-                | alacritty_terminal::term::TermMode::MOUSE_MOTION
-                | alacritty_terminal::term::TermMode::SGR_MOUSE
-                | alacritty_terminal::term::TermMode::UTF8_MOUSE,
+                | alacritty_terminal::term::TermMode::MOUSE_MOTION,
         )
     }
 
     pub fn send_mouse_event(&self, button: u8, col: usize, row: usize, pressed: bool) {
+        self.send_mouse_button_with_mods(button, col, row, pressed, false, false, false);
+    }
+
+    pub fn send_mouse_button_with_mods(
+        &self,
+        button: u8,
+        col: usize,
+        row: usize,
+        pressed: bool,
+        shift: bool,
+        alt: bool,
+        control: bool,
+    ) {
         let term = self.term.lock();
         let mode = *term.mode();
         let is_mouse_active = mode.intersects(
             alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
                 | alacritty_terminal::term::TermMode::MOUSE_DRAG
-                | alacritty_terminal::term::TermMode::MOUSE_MOTION
-                | alacritty_terminal::term::TermMode::SGR_MOUSE
-                | alacritty_terminal::term::TermMode::UTF8_MOUSE,
+                | alacritty_terminal::term::TermMode::MOUSE_MOTION,
         );
         let sgr = mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE);
         drop(term);
@@ -655,18 +664,99 @@ impl TerminalState {
             return;
         }
 
+        let mut btn_code = button;
+        if shift {
+            btn_code |= 4;
+        }
+        if alt {
+            btn_code |= 8;
+        }
+        if control {
+            btn_code |= 16;
+        }
+
         let col_1 = col.max(1);
         let row_1 = row.max(1);
 
         if sgr {
             // SGR 1006 format: \x1b[<{button};{col};{row}{M/m}
             let flag = if pressed { 'M' } else { 'm' };
-            let seq = format!("\x1b[<{};{};{}{}", button, col_1, row_1, flag);
+            let seq = format!("\x1b[<{};{};{}{}", btn_code, col_1, row_1, flag);
             self.write_to_pty(seq.as_bytes());
         } else {
             // Normal X10/1000 format: \x1b[M{btn + 32}{col + 32}{row + 32}
-            let b_byte = if pressed { button } else { 3 };
-            let cb = (b_byte + 32).min(255);
+            let b_byte = if pressed { btn_code } else { 3 };
+            let cb = (b_byte.saturating_add(32)).min(255);
+            let cx = ((col_1 as u8).saturating_add(32)).min(255);
+            let cy = ((row_1 as u8).saturating_add(32)).min(255);
+            let seq = [0x1b, b'[', b'M', cb, cx, cy];
+            self.write_to_pty(&seq);
+        }
+    }
+
+    pub fn send_mouse_motion(
+        &self,
+        col: usize,
+        row: usize,
+        left_down: bool,
+        middle_down: bool,
+        right_down: bool,
+        shift: bool,
+        alt: bool,
+        control: bool,
+    ) {
+        let term = self.term.lock();
+        let mode = *term.mode();
+        let is_mouse_active = mode.intersects(
+            alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
+                | alacritty_terminal::term::TermMode::MOUSE_DRAG
+                | alacritty_terminal::term::TermMode::MOUSE_MOTION,
+        );
+        let sgr = mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE);
+        let motion_any = mode.contains(alacritty_terminal::term::TermMode::MOUSE_MOTION);
+        let motion_drag = mode.contains(alacritty_terminal::term::TermMode::MOUSE_DRAG);
+        drop(term);
+
+        if !is_mouse_active {
+            return;
+        }
+
+        let is_dragging = left_down || middle_down || right_down;
+        if is_dragging && !motion_drag && !motion_any {
+            return;
+        }
+        if !is_dragging && !motion_any {
+            return;
+        }
+
+        let mut btn_code: u8 = if left_down {
+            0 + 32
+        } else if middle_down {
+            1 + 32
+        } else if right_down {
+            2 + 32
+        } else {
+            3 + 32 // 35 = motion without button
+        };
+
+        if shift {
+            btn_code |= 4;
+        }
+        if alt {
+            btn_code |= 8;
+        }
+        if control {
+            btn_code |= 16;
+        }
+
+        let col_1 = col.max(1);
+        let row_1 = row.max(1);
+
+        if sgr {
+            let seq = format!("\x1b[<{};{};{}M", btn_code, col_1, row_1);
+            self.write_to_pty(seq.as_bytes());
+        } else {
+            let cb = (btn_code.saturating_add(32)).min(255);
             let cx = ((col_1 as u8).saturating_add(32)).min(255);
             let cy = ((row_1 as u8).saturating_add(32)).min(255);
             let seq = [0x1b, b'[', b'M', cb, cx, cy];
