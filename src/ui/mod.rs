@@ -1,5 +1,6 @@
 pub mod button;
 pub mod icons;
+pub mod ime;
 pub mod root_view;
 pub mod status_bar;
 pub mod tab_bar;

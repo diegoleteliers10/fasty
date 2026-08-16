@@ -196,6 +196,12 @@ pub struct Config {
     pub notify_on_command_finish: bool,
     #[serde(default)]
     pub bottombar: BottombarConfig,
+    /// Treat the Option key as Alt (send `ESC` + key) instead of letting
+    /// macOS compose the layout character. Mirrors zed's `option_as_meta`
+    /// and ghostty's `macos-option-as-alt`; default is false so Option
+    /// keys produce the real character (e.g. `~` via option+n on Latam).
+    #[serde(default = "default_option_as_meta")]
+    pub option_as_meta: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -306,6 +312,7 @@ fn default_font_ligatures() -> bool { true }
 fn default_session_restore() -> bool { true }
 fn default_opacity() -> f32 { 1.0 }
 fn default_notify_on_command_finish() -> bool { true }
+fn default_option_as_meta() -> bool { false }
 
 impl Default for Config {
     fn default() -> Self {
@@ -320,6 +327,7 @@ impl Default for Config {
             opacity: default_opacity(),
             notify_on_command_finish: default_notify_on_command_finish(),
             bottombar: BottombarConfig::default(),
+            option_as_meta: default_option_as_meta(),
         }
     }
 }
@@ -385,6 +393,7 @@ fn ensure_table(doc: &mut DocumentMut, key: &str) {
 fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
     doc["scrollback"] = value(c.scrollback as i64);
     doc["opacity"] = value(c.opacity as f64);
+    doc["option_as_meta"] = value(c.option_as_meta);
     match &c.shell {
         Some(s) => doc["shell"] = value(s.as_str()),
         None => { doc.as_table_mut().remove("shell"); }

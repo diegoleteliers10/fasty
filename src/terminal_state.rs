@@ -738,6 +738,11 @@ impl TerminalState {
         )
     }
 
+    pub fn is_bracketed_paste_enabled(&self) -> bool {
+        let term = self.term.lock();
+        term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
+    }
+
     pub fn send_mouse_event(&self, button: u8, col: usize, row: usize, pressed: bool) {
         self.send_mouse_button_with_mods(button, col, row, pressed, false, false, false);
     }

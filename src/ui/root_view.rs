@@ -782,6 +782,7 @@ pub struct RootView {
     pub update_status: Option<String>,
     pub is_update_modal_open: bool,
     pub pressed_mouse_button: Option<MouseButton>,
+    pub(crate) ime_marked_text: Option<String>,
 }
 
 impl RootView {
@@ -937,6 +938,7 @@ impl RootView {
             update_status: None,
             is_update_modal_open: false,
             pressed_mouse_button: None,
+            ime_marked_text: None,
         };
 
         // Background update check
@@ -1544,6 +1546,14 @@ impl RootView {
     }
 
     fn handle_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.any_input_overlay_open() && super::ime::defers_to_ime(event, self.config.option_as_meta) {
+            return;
+        }
+        self.process_key_down(event, _window, cx);
+        cx.stop_propagation();
+    }
+
+    fn process_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let key = &event.keystroke.key;
         let key_lower = key.to_lowercase();
         let modifiers = &event.keystroke.modifiers;
@@ -2083,8 +2093,12 @@ impl RootView {
         }
 
         // 8. Jump to Tab 1-9 (⌘1-9 on macOS; Alt+1-9 or Ctrl+Shift+1-9 on Linux/Windows)
-        let tab_jump: Option<usize> = if cfg!(target_os = "macos") && modifiers.platform {
-            key.parse::<usize>().ok()
+        let tab_jump: Option<usize> = if cfg!(target_os = "macos") {
+            if modifiers.platform {
+                key.parse::<usize>().ok()
+            } else {
+                None
+            }
         } else if modifiers.alt || (modifiers.control && modifiers.shift) {
             key.parse::<usize>().ok()
         } else {
@@ -2166,7 +2180,15 @@ impl RootView {
         if is_paste {
             if let Some(mut clip) = crate::event_listener::clipboard_helper() {
                 if let Ok(text) = clip.get_text() {
-                    terminal.write_to_pty(text.as_bytes());
+                    if terminal.is_bracketed_paste_enabled() {
+                        let mut buf = Vec::with_capacity(text.len() + 12);
+                        buf.extend_from_slice(b"\x1b[200~");
+                        buf.extend_from_slice(text.as_bytes());
+                        buf.extend_from_slice(b"\x1b[201~");
+                        terminal.write_to_pty(&buf);
+                    } else {
+                        terminal.write_to_pty(text.as_bytes());
+                    }
                     cx.notify();
                     return;
                 }
@@ -2243,9 +2265,14 @@ impl RootView {
                 "d" => Some(b"\x1bd".to_vec()),
                 "backspace" => Some(b"\x17".to_vec()),
                 _ => {
-                    if let Some(ref ch) = event.keystroke.key_char {
+                    if key.chars().count() == 1 {
+                        let base = if modifiers.shift {
+                            key.to_ascii_uppercase()
+                        } else {
+                            key.to_string()
+                        };
                         let mut b = vec![0x1b];
-                        b.extend_from_slice(ch.as_bytes());
+                        b.extend_from_slice(base.as_bytes());
                         Some(b)
                     } else {
                         None
@@ -2373,6 +2400,55 @@ impl RootView {
 
         if let Some(bytes) = bytes_to_send {
             terminal.write_to_pty(&bytes);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn any_input_overlay_open(&self) -> bool {
+        self.is_rename_tab_open
+            || self.is_command_palette_open
+            || self.is_ssh_manager_open
+            || self.is_search_open
+            || self.is_worktree_picker_open
+            || self.is_project_jumper_open
+            || self.is_settings_open
+            || self.is_about_open
+            || self.is_update_modal_open
+    }
+
+    pub fn ime_commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.ime_marked_text = None;
+        if self.any_input_overlay_open() {
+            cx.notify();
+            return;
+        }
+        let terminal = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|tab| tab.terminal.clone());
+        let Some(terminal) = terminal else {
+            return;
+        };
+        self.last_cursor_activity = std::time::Instant::now();
+        self.cursor_blink_visible = true;
+        if terminal.display_offset() > 0 {
+            terminal.scroll_to_bottom();
+        }
+        if self.selection.is_some() {
+            self.selection = None;
+        }
+        self.typed_prompt_buf.push_str(text);
+        terminal.write_to_pty(text.as_bytes());
+        cx.notify();
+    }
+
+    pub fn ime_set_marked_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.ime_marked_text = Some(text.to_string());
+        cx.notify();
+    }
+
+    pub fn ime_clear_marked_text(&mut self, cx: &mut Context<Self>) {
+        if self.ime_marked_text.take().is_some() {
             cx.notify();
         }
     }
@@ -3074,6 +3150,7 @@ impl Render for RootView {
                     .font_features(enable_terminal_ligatures())
                     .overflow_hidden()
                     .when_some(scrollbar_thumb, |this, thumb| this.child(thumb))
+                    .child(super::ime::registration(cx.entity(), self.focus_handle.clone()))
                     .children({
                         let selection_range = self.selection;
                         let search_open = self.is_search_open && !self.search_query.is_empty();
