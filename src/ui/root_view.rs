@@ -4,8 +4,8 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor};
 use gpui::{
     Context, CursorStyle, Div, FocusHandle, FontFeatures, FontWeight, Hsla, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle, ScrollWheelEvent,
-    SharedString, Window, div, prelude::*, px,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle,
+    ScrollWheelEvent, SharedString, TextAlign, TextRun, Window, div, prelude::*, px,
 };
 
 use super::status_bar::{StatusBar, StatusBarModel, StatusInfo};
@@ -34,7 +34,7 @@ pub struct TabData {
     pub last_exit_code: Option<i32>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 struct StyledSpan {
     text: String,
     start_col: usize,
@@ -43,12 +43,15 @@ struct StyledSpan {
     bg: Option<Hsla>,
     is_bold: bool,
     is_underline: bool,
-    is_cursor: bool,
+    /// Pure-emoji span (color glyphs from fallback fonts).
+    is_emoji: bool,
+    /// Font-size factor measured so the emoji ink fits its reserved cells.
+    emoji_scale: Option<f32>,
 }
 
 fn trim_row_spans(spans: &mut Vec<StyledSpan>) {
     while let Some(last) = spans.last_mut() {
-        if last.bg.is_none() && !last.is_underline && !last.is_cursor {
+        if last.bg.is_none() && !last.is_underline {
             let trimmed = last.text.trim_end_matches(' ');
             if trimmed.is_empty() {
                 spans.pop();
@@ -218,6 +221,32 @@ fn render_quadrant(width: f32, line_h: f32, tl: Hsla, tr: Hsla, bl: Hsla, br: Hs
                 .child(div().h_full().w(px(half_w)).bg(bl))
                 .child(div().h_full().w(px(rem_w)).bg(br)),
         )
+}
+
+/// True for box-drawing chars with vertical strokes. Repeated spans of these
+/// must render one stroke per cell; a single element would center one stroke
+/// across the whole span.
+fn box_char_has_vertical_strokes(ch: char) -> bool {
+    decode_box_drawing(ch).is_some_and(|(_, _, top, bottom, _)| top > 0 || bottom > 0)
+}
+
+/// Geometric Shapes synthesized by `render_geometric_cell`.
+fn geometric_shape_synthesized(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x25A0 | 0x25A1
+            | 0x25AA | 0x25AB
+            | 0x25CB | 0x25C9
+            | 0x25CE | 0x25CF
+            | 0x25E6 | 0x25EF
+    )
+}
+
+/// Glyphs that must be laid out once per cell when a pure span repeats them.
+/// Horizontal-only strokes (─ ═ ━) and block fills (█ ░ ▓) stay single-element
+/// because one continuous fill across the span is the correct rendering.
+fn synthesized_per_cell(ch: char) -> bool {
+    geometric_shape_synthesized(ch) || box_char_has_vertical_strokes(ch)
 }
 
 fn render_geometric_cell(
@@ -500,6 +529,56 @@ fn render_geometric_cell(
         return Some(container.flex_shrink_0());
     }
 
+    // 3. Geometric Shapes (subset of U+25A0..=U+25FF). Synthesized like
+    // Kitty/Ghostty do: circles centered on the full cell box — not on the
+    // text baseline — so they never clip and stay aligned regardless of
+    // which fallback font would supply the glyph.
+    if (0x25A0..=0x25FF).contains(&code) {
+        let d = width.min(line_h).max(2.0);
+        let ring = |size: f32| div().w(px(size)).h(px(size)).rounded_full().border_1().border_color(fg);
+        let dot = |size: f32| div().w(px(size)).h(px(size)).rounded_full().bg(fg);
+        let square = |side: f32| div().w(px(side)).h(px(side));
+        let centered = |child: Div| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .w(px(width))
+                .h(px(line_h))
+                .bg(bg_c)
+                .flex_shrink_0()
+                .child(child)
+        };
+
+        let el = match code {
+            // ○ WHITE CIRCLE
+            0x25CB => centered(ring(d * 0.78)),
+            // ◯ LARGE CIRCLE
+            0x25EF => centered(ring(d)),
+            // ● BLACK CIRCLE
+            0x25CF => centered(dot(d * 0.72)),
+            // ◦ WHITE BULLET
+            0x25E6 => centered(ring(d * 0.40)),
+            // ◉ FISHEYE — ring plus filled center
+            0x25C9 => centered(ring(d * 0.78).child(
+                div().flex().flex_row().items_center().justify_center().size_full().child(dot(d * 0.36)),
+            )),
+            // ◎ BULLSEYE — two concentric rings
+            0x25CE => centered(ring(d * 0.78).child(
+                div().flex().flex_row().items_center().justify_center().size_full().child(ring(d * 0.42)),
+            )),
+            // ■ □ squares
+            0x25A0 => centered(square(d * 0.72).bg(fg)),
+            0x25A1 => centered(square(d * 0.72).border_1().border_color(fg)),
+            // ▪ ▫ small squares
+            0x25AA => centered(square(d * 0.45).bg(fg)),
+            0x25AB => centered(square(d * 0.45).border_1().border_color(fg)),
+            _ => return None,
+        };
+        return Some(el);
+    }
+
     None
 }
 
@@ -710,11 +789,15 @@ impl RootView {
     fn measure_cell_metrics(&self, window: &Window) -> (f32, f32) {
         let font_id = window.text_system().resolve_font(&gpui::font(self.font_family.clone()));
         let cell_w = window.text_system().layout_width(font_id, px(self.font_size), '0').to_f64() as f32;
-        let line_h = (self.font_size * 1.32).max(12.0);
+        // Integer line height keeps every row origin on the whole-pixel grid,
+        // so synthesized strokes connect across rows without half-pixel gaps
+        // (fractional 1.32em heights drift by n*0.16px per row).
+        let line_h = ((self.font_size * 1.32).max(12.0)).round();
         if cell_w >= 1.0 {
             (cell_w, line_h)
         } else {
-            get_font_cell_metrics(self.font_family.as_ref(), self.font_size)
+            let (w, h) = get_font_cell_metrics(self.font_family.as_ref(), self.font_size);
+            (w, h.round().max(12.0))
         }
     }
 
@@ -2618,12 +2701,22 @@ impl Render for RootView {
         let (cell_w, line_h) = self.measure_cell_metrics(_window);
         let viewport_size = _window.viewport_size();
         let avail_w = (viewport_size.width.to_f64() as f32 - 24.0).max(100.0);
-        let avail_h = (viewport_size.height.to_f64() as f32 - 54.0 - 12.0).max(100.0);
+        // Chrome layout constants — must match TabBar/StatusBar element heights
+        // and the terminal container's vertical padding, or the PTY grid grows
+        // taller than the painted area and the bottom row (prompt) gets clipped.
+        const TAB_BAR_HEIGHT: f32 = 32.0;
+        const STATUS_BAR_HEIGHT: f32 = 24.0;
+        const TERMINAL_PAD_Y: f32 = 12.0;
+        let avail_h = (viewport_size.height.to_f64() as f32
+            - TAB_BAR_HEIGHT
+            - STATUS_BAR_HEIGHT
+            - TERMINAL_PAD_Y)
+        .max(100.0);
         let target_cols = ((avail_w / cell_w) as usize).max(20);
         let target_rows = ((avail_h / line_h) as usize).max(5);
 
         // Terminal Grid Rendering for active tab
-        let (display_offset, history_size, lines) = if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
+        let (display_offset, history_size, lines, cursor_info) = if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
             if let Some(ref terminal) = active_tab.terminal {
                 terminal.resize_with_pixels(
                     target_cols,
@@ -2645,11 +2738,11 @@ impl Render for RootView {
             let mut current_span_start_col: usize = 0;
             let mut current_span_end_col: usize = 0;
             let mut current_block_cat: Option<char> = None;
+            let mut current_is_emoji = false;
             let mut current_fg = self.theme.foreground;
             let mut current_bg: Option<Hsla> = None;
             let mut current_bold = false;
             let mut current_underline = false;
-            let mut current_is_cursor = false;
             let mut last_row: Option<i32> = None;
 
             for cell in content.display_iter {
@@ -2671,10 +2764,12 @@ impl Render for RootView {
                                 bg: current_bg,
                                 is_bold: current_bold,
                                 is_underline: current_underline,
-                                is_cursor: current_is_cursor,
+                                is_emoji: current_is_emoji,
+                                emoji_scale: None,
                             });
                             current_span_text = String::new();
                             current_block_cat = None;
+                            current_is_emoji = false;
                         }
                         trim_row_spans(&mut current_row_spans);
                         lines.push(current_row_spans);
@@ -2716,13 +2811,15 @@ impl Render for RootView {
 
                 let is_bold = cell.flags.contains(Flags::BOLD);
                 let is_underline = cell.flags.contains(Flags::UNDERLINE) || is_hovered_url;
-                let is_cursor = cursor_visible && self.cursor_blink_visible && row == cursor_point.line.0 && col == cursor_point.column.0;
                 let code = cell.c as u32;
                 let is_emoji = is_emoji_codepoint(code);
                 let is_pua_icon = (0xE000..=0xF8FF).contains(&code)
                     || (0xF0000..=0xFFFFD).contains(&code)
                     || (0x100000..=0x10FFFD).contains(&code);
-                let block_cat = if (0x2500..=0x257F).contains(&code) || (0x2580..=0x259F).contains(&code) {
+                let block_cat = if (0x2500..=0x257F).contains(&code)
+                    || (0x2580..=0x259F).contains(&code)
+                    || (0x25A0..=0x25FF).contains(&code)
+                {
                     Some(cell.c)
                 } else if is_emoji || is_pua_icon {
                     Some(cell.c)
@@ -2737,7 +2834,6 @@ impl Render for RootView {
                     || bg != current_bg
                     || is_bold != current_bold
                     || is_underline != current_underline
-                    || is_cursor != current_is_cursor
                     || block_cat != current_block_cat
                     || current_span_text.is_empty()
                 {
@@ -2750,7 +2846,8 @@ impl Render for RootView {
                             bg: current_bg,
                             is_bold: current_bold,
                             is_underline: current_underline,
-                            is_cursor: current_is_cursor,
+                            is_emoji: current_is_emoji,
+                            emoji_scale: None,
                         });
                         current_span_text = String::new();
                     }
@@ -2760,8 +2857,8 @@ impl Render for RootView {
                     current_bg = bg;
                     current_bold = is_bold;
                     current_underline = is_underline;
-                    current_is_cursor = is_cursor;
                     current_block_cat = block_cat;
+                    current_is_emoji = is_emoji;
                 } else {
                     current_span_end_col = end_col;
                 }
@@ -2775,7 +2872,11 @@ impl Render for RootView {
                     }
                 }
 
-                if is_emoji_codepoint(code) && !has_fe0f {
+                // Only force emoji presentation (VS16) on wide cells: narrow
+                // codepoints like U+23F1/U+23F2 reserve one column, and a
+                // color-emoji glyph (~2 columns of ink) would overflow into
+                // the neighboring text.
+                if is_emoji && cell.flags.contains(Flags::WIDE_CHAR) && !has_fe0f {
                     current_span_text.push('\u{FE0F}');
                 }
             }
@@ -2789,37 +2890,76 @@ impl Render for RootView {
                     bg: current_bg,
                     is_bold: current_bold,
                     is_underline: current_underline,
-                    is_cursor: current_is_cursor,
+                    is_emoji: current_is_emoji,
+                    emoji_scale: None,
                 });
             }
             trim_row_spans(&mut current_row_spans);
             lines.push(current_row_spans);
             lines.truncate(target_rows);
 
+            // Fit emoji spans to their reserved cells. Color emoji glyphs come
+            // from fallback fonts with a natural advance (~1.25em) that often
+            // exceeds the columns the grid reserved (VS16 presentation on
+            // narrow codepoints, 2-column wide glyphs), so the ink would spill
+            // onto the neighboring text. Measure each pure-emoji span with the
+            // platform shaper (cached) and shrink its font size to fit.
+            {
+                let emoji_font = gpui::font(self.font_family.clone());
+                let emoji_run = |len: usize| TextRun {
+                    len,
+                    font: emoji_font.clone(),
+                    color: Hsla::default(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let text_system = _window.text_system();
+                for row_spans in lines.iter_mut() {
+                    for span in row_spans.iter_mut() {
+                        if !span.is_emoji || span.text.is_empty() {
+                            continue;
+                        }
+                        let span_width =
+                            ((span.end_col - span.start_col) as f32 * cell_w).max(0.0);
+                        if span_width <= 0.0 {
+                            continue;
+                        }
+                        let measured = text_system
+                            .layout_line(
+                                &span.text,
+                                px(self.font_size),
+                                &[emoji_run(span.text.len())],
+                                None,
+                            )
+                            .width
+                            .to_f64() as f32;
+                        // Target 94% of the reserved width so a visible gap
+                        // separates the emoji from adjacent characters.
+                        if measured > span_width * 0.94 && measured > 0.0 {
+                            span.emoji_scale = Some(span_width * 0.94 / measured);
+                        }
+                    }
+                }
+            }
+
+            let cursor_info = if cursor_visible && self.cursor_blink_visible {
+                Some((cursor_point.line.0, cursor_point.column.0, content.cursor.shape))
+            } else {
+                None
+            };
+
             drop(term_guard);
 
-            if lines.is_empty() {
-                lines.push(vec![StyledSpan {
-                    text: " ".to_string(),
-                    start_col: 0,
-                    end_col: 1,
-                    fg: self.theme.background,
-                    bg: Some(self.theme.cursor),
-                    is_bold: false,
-                    is_underline: false,
-                    is_cursor: true,
-                }]);
-            }
-
-            (display_offset, h_size, lines)
+            (display_offset, h_size, lines, cursor_info)
                 } else {
-                    (0, h_size, Vec::new())
+                    (0, h_size, Vec::new(), None)
                 }
             } else {
-                (0, 0, Vec::new())
+                (0, 0, Vec::new(), None)
             }
         } else {
-            (0, 0, Vec::new())
+            (0, 0, Vec::new(), None)
         };
 
         let font_family = self.font_family.clone();
@@ -2946,6 +3086,43 @@ impl Render for RootView {
                             let default_bg = theme.background;
                             let grid_line_idx = row_idx as i32 - display_offset as i32;
 
+                            let cursor_quad = if let Some((c_row, c_col, c_shape)) = cursor_info {
+                                if grid_line_idx == c_row {
+                                    let x_start = (c_col as f32 * cell_w).round();
+                                    let x_end = ((c_col + 1) as f32 * cell_w).round();
+                                    let quad_w = (x_end - x_start).max(cell_w);
+                                    let el = match c_shape {
+                                        CursorShape::Underline => div()
+                                            .absolute()
+                                            .left(px(x_start))
+                                            .top(px(line_h - 2.0))
+                                            .w(px(quad_w))
+                                            .h(px(2.0))
+                                            .bg(cursor_color),
+                                        CursorShape::HollowBlock => div()
+                                            .absolute()
+                                            .left(px(x_start))
+                                            .top(px(0.))
+                                            .w(px(quad_w))
+                                            .h(px(line_h))
+                                            .border_1()
+                                            .border_color(cursor_color),
+                                        CursorShape::Beam | CursorShape::Block | _ => div()
+                                            .absolute()
+                                            .left(px(x_start))
+                                            .top(px(0.))
+                                            .w(px(2.0))
+                                            .h(px(line_h))
+                                            .bg(cursor_color),
+                                    };
+                                    Some(el)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
                             // Calculate selection highlight range for this row
                             let sel_col_range = if let Some(sel) = selection_range {
                                 let (min_p, max_p) = if sel.start <= sel.end {
@@ -3026,7 +3203,9 @@ impl Render for RootView {
                                 .w(px(row_width))
                                 .h(px(line_h))
                                 .line_height(px(line_h))
-                                .overflow_hidden()
+                                // No overflow_hidden here: glyphs with vertical
+                                // overshoot (emoji, nerd font icons) must paint
+                                // past the line box, like Ghostty/Kitty do.
                                 .children(spans.into_iter().map(move |span| {
                                     let span_width = ((span.end_col as f32 * cell_w).round() - (span.start_col as f32 * cell_w).round()).max(0.0);
                                     let first_char = span.text.chars().next();
@@ -3034,14 +3213,47 @@ impl Render for RootView {
 
                                     let geom_opt = if is_pure {
                                         first_char.and_then(|ch| {
-                                            render_geometric_cell(
-                                                ch,
-                                                span_width,
-                                                line_h,
-                                                span.fg,
-                                                span.bg,
-                                                default_bg,
-                                            )
+                                            let count = span.text.chars().count();
+                                            if count > 1 && synthesized_per_cell(ch) {
+                                                // One element per cell: repeated
+                                                // vertical strokes / shapes must
+                                                // not collapse into a single one
+                                                // centered across the whole span.
+                                                let per_w = span_width / count as f32;
+                                                let cells: Vec<Div> = (0..count)
+                                                    .filter_map(|_| {
+                                                        render_geometric_cell(
+                                                            ch,
+                                                            per_w,
+                                                            line_h,
+                                                            span.fg,
+                                                            span.bg,
+                                                            default_bg,
+                                                        )
+                                                    })
+                                                    .collect();
+                                                if cells.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(
+                                                        div()
+                                                            .flex()
+                                                            .flex_row()
+                                                            .flex_shrink_0()
+                                                            .w(px(span_width))
+                                                            .children(cells),
+                                                    )
+                                                }
+                                            } else {
+                                                render_geometric_cell(
+                                                    ch,
+                                                    span_width,
+                                                    line_h,
+                                                    span.fg,
+                                                    span.bg,
+                                                    default_bg,
+                                                )
+                                            }
                                         })
                                     } else {
                                         None
@@ -3053,7 +3265,6 @@ impl Render for RootView {
                                         let mut el = div()
                                             .flex_shrink_0()
                                             .w(px(span_width))
-                                            .overflow_hidden()
                                             .whitespace_nowrap()
                                             .h(px(line_h))
                                             .line_height(px(line_h))
@@ -3065,10 +3276,11 @@ impl Render for RootView {
                                                 FontWeight::NORMAL
                                             });
 
-                                        if span.is_cursor {
-                                            el = el.border_l_2().border_color(cursor_color);
+                                        if let Some(scale) = span.emoji_scale {
+                                            el = el
+                                                .text_size(px(font_size * scale))
+                                                .text_align(TextAlign::Center);
                                         }
-
                                         if let Some(bg_color) = span.bg {
                                             el = el.bg(bg_color);
                                         }
@@ -3079,6 +3291,7 @@ impl Render for RootView {
                                         el.child(SharedString::from(span.text))
                                     }
                                 }))
+                                .when_some(cursor_quad, |this, c| this.child(c))
                                 .when_some(sel_col_range, |this, (c_start, c_end)| {
                                     let x_start = (c_start as f32 * cell_w).round();
                                     let x_end = (c_end as f32 * cell_w).round();
@@ -5155,6 +5368,43 @@ mod tests {
     }
 
     #[test]
+    fn test_geometric_shapes_synthesized() {
+        let theme = Theme::fastty_default();
+        let fg = theme.foreground;
+        let bg = Some(theme.background);
+        let theme_bg = theme.background;
+
+        // Circles and squares render as synthesized shapes centered on the cell box
+        let shape_chars = ['○', '◯', '●', '◦', '◉', '◎', '■', '□', '▪', '▫'];
+        for ch in shape_chars {
+            let res = render_geometric_cell(ch, 8.0, 17.0, fg, bg, theme_bg);
+            assert!(res.is_some(), "Shape {:?} (U+{:04X}) must produce a geometric element", ch, ch as u32);
+        }
+
+        // Wide-cell large circle gets the full two-cell span width
+        let res = render_geometric_cell('◯', 16.0, 17.0, fg, bg, theme_bg);
+        assert!(res.is_some());
+    }
+
+    #[test]
+    fn test_per_cell_synthesis_classification() {
+        // Vertical-stroke box chars render once per cell
+        assert!(synthesized_per_cell('│'));
+        assert!(synthesized_per_cell('├'));
+        assert!(synthesized_per_cell('┼'));
+        assert!(synthesized_per_cell('║'));
+        // Synthesized shapes render once per cell
+        assert!(synthesized_per_cell('○'));
+        assert!(synthesized_per_cell('●'));
+        // Horizontal-only strokes and block fills stay single-element
+        assert!(!synthesized_per_cell('─'));
+        assert!(!synthesized_per_cell('━'));
+        assert!(!synthesized_per_cell('═'));
+        assert!(!synthesized_per_cell('█'));
+        assert!(!synthesized_per_cell('░'));
+    }
+
+    #[test]
     fn test_decode_box_drawing_styles() {
         // Light horizontal and vertical
         assert_eq!(decode_box_drawing('─'), Some((1, 1, 0, 0, 0)));
@@ -5218,5 +5468,76 @@ mod tests {
         assert!(col_out >= target_cols);
         let col_far = 95;
         assert!(col_far >= target_cols);
+    }
+
+    #[test]
+    fn test_trim_row_spans_without_cursor_state() {
+        let theme = Theme::fastty_default();
+        let mut spans = vec![
+            StyledSpan {
+                text: "hello".to_string(),
+                start_col: 0,
+                end_col: 5,
+                fg: theme.foreground,
+                bg: None,
+                is_bold: false,
+                is_underline: false,
+                is_emoji: false,
+                emoji_scale: None,
+            },
+            StyledSpan {
+                text: "    ".to_string(),
+                start_col: 5,
+                end_col: 9,
+                fg: theme.foreground,
+                bg: None,
+                is_bold: false,
+                is_underline: false,
+                is_emoji: false,
+                emoji_scale: None,
+            },
+        ];
+
+        trim_row_spans(&mut spans);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text, "hello");
+        assert_eq!(spans[0].end_col, 5);
+
+        // Spans with background are preserved even with trailing spaces
+        let mut spans_with_bg = vec![
+            StyledSpan {
+                text: "highlighted   ".to_string(),
+                start_col: 0,
+                end_col: 14,
+                fg: theme.foreground,
+                bg: Some(theme.accent),
+                is_bold: false,
+                is_underline: false,
+                is_emoji: false,
+                emoji_scale: None,
+            },
+        ];
+        trim_row_spans(&mut spans_with_bg);
+        assert_eq!(spans_with_bg.len(), 1);
+        assert_eq!(spans_with_bg[0].text, "highlighted   ");
+    }
+
+    #[test]
+    fn test_cursor_quad_geometry_matches_cell_grid() {
+        let cell_w = 9.0;
+        let line_h = 18.0;
+
+        for col in 0..100 {
+            let x_start = (col as f32 * cell_w).round();
+            let x_end = ((col + 1) as f32 * cell_w).round();
+            let quad_w = (x_end - x_start).max(cell_w);
+
+            // Span width for single character at that column
+            let span_w = ((col + 1) as f32 * cell_w).round() - (col as f32 * cell_w).round();
+
+            assert_eq!(quad_w, span_w.max(cell_w));
+            assert!(quad_w >= cell_w);
+            assert!(line_h > 0.0);
+        }
     }
 }

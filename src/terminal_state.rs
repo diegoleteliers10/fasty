@@ -45,6 +45,118 @@ pub enum AppEvent {
 
 
 
+/// Events derived from raw PTY byte-stream CSI scanning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CsiEvent {
+    /// Plain `CSI 2J` — callers clear main-screen scrollback.
+    ClearHistory,
+    /// `CSI ? ... 2026 ... h` — Synchronized Output frame begins.
+    SyncOutputBegin,
+    /// `CSI ? ... 2026 ... l` — Synchronized Output frame ends.
+    SyncOutputEnd,
+}
+
+/// Byte-level watcher for the CSI sequences fastty handles outside the
+/// alacritty model: scrollback wipe on plain `CSI 2J`, and Synchronized
+/// Output (DEC private mode 2026), which alacritty_terminal 0.24 accepts as
+/// a silent no-op. TUI frameworks (ratatui, bubbletea, Ink) wrap each frame
+/// in `?2026h`/`?2026l`, so the frontend must suppress repaints between the
+/// two to avoid painting half-built frames.
+#[derive(Debug)]
+pub struct CsiWatcher {
+    state: CsiState,
+    private: bool,
+    params: [u32; 8],
+    param_count: usize,
+    digit_acc: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CsiState {
+    Ground,
+    Esc,
+    Params,
+}
+
+impl CsiWatcher {
+    pub fn new() -> Self {
+        Self {
+            state: CsiState::Ground,
+            private: false,
+            params: [0; 8],
+            param_count: 0,
+            digit_acc: 0,
+        }
+    }
+
+    pub fn feed(&mut self, byte: u8) -> Option<CsiEvent> {
+        match self.state {
+            CsiState::Ground => {
+                if byte == 0x1b {
+                    self.state = CsiState::Esc;
+                }
+                None
+            }
+            CsiState::Esc => {
+                if byte == b'[' {
+                    self.state = CsiState::Params;
+                    self.private = false;
+                    self.params = [0; 8];
+                    self.param_count = 0;
+                    self.digit_acc = 0;
+                    None
+                } else {
+                    self.state = CsiState::Ground;
+                    None
+                }
+            }
+            CsiState::Params => {
+                if byte.is_ascii_digit() {
+                    self.digit_acc = self
+                        .digit_acc
+                        .saturating_mul(10)
+                        .saturating_add((byte - b'0') as u32);
+                    None
+                } else if byte == b'?' && self.param_count == 0 && self.digit_acc == 0 {
+                    self.private = true;
+                    None
+                } else if byte == b';' || byte == b':' {
+                    self.push_param();
+                    None
+                } else {
+                    self.push_param();
+                    let params = &self.params[..self.param_count];
+                    let event = if byte == b'J' && !self.private && params.contains(&2) {
+                        Some(CsiEvent::ClearHistory)
+                    } else if self.private && byte == b'h' && params.contains(&2026) {
+                        Some(CsiEvent::SyncOutputBegin)
+                    } else if self.private && byte == b'l' && params.contains(&2026) {
+                        Some(CsiEvent::SyncOutputEnd)
+                    } else {
+                        None
+                    };
+                    self.state = CsiState::Ground;
+                    event
+                }
+            }
+        }
+    }
+
+    fn push_param(&mut self) {
+        if self.param_count < self.params.len() {
+            self.params[self.param_count] = self.digit_acc;
+            self.param_count += 1;
+        }
+        self.digit_acc = 0;
+    }
+}
+
+impl Default for CsiWatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct TerminalState {
     term: Arc<ParkingMutex<alacritty_terminal::term::Term<EventListenerProxy>>>,
     render_generation: Arc<AtomicU64>,
@@ -314,18 +426,16 @@ impl TerminalState {
             let mut osc_buf: Vec<u8> = Vec::new();
             let mut cmd_start_time: Option<std::time::Instant> = None;
 
-            // CSI detection state: tracks ESC [ <params> J to detect clear-screen
-            // sequences (\x1b[2J) and clear history on the main screen.
-            #[derive(Clone, Copy, Debug, PartialEq)]
-            enum CsiDetect {
-                None,
-                Esc,
-                Params,
-            }
-            let mut csi_detect = CsiDetect::None;
-            let mut csi_param_val: u32 = 0;
-            let mut csi_digit_acc: u32 = 0;
+            // CSI detection: see `CsiWatcher` (module level). The watcher
+            // emits events for `CSI 2J` scrollback wipes and for Synchronized
+            // Output mode 2026, which alacritty_terminal 0.24 ignores.
+            let mut csi_watcher = CsiWatcher::new();
             let mut clear_history_flag = false;
+
+            const SYNC_OUTPUT_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_millis(150);
+            let mut sync_output_active = false;
+            let mut sync_started: Option<std::time::Instant> = None;
 
             // Debug: capture PTY bytes to log if FASTTY_PTY_DEBUG=1
             let pty_debug = std::env::var("FASTTY_PTY_DEBUG").ok().as_deref() == Some("1");
@@ -533,38 +643,19 @@ impl TerminalState {
                                 }
                             }
 
-                            // CSI detection: track ESC [ <params> J to detect clear-screen
-                            // (\x1b[2J) so we can wipe scrollback history on the main screen.
-                            match csi_detect {
-                                CsiDetect::None => {
-                                    if byte == 0x1b {
-                                        csi_detect = CsiDetect::Esc;
-                                    }
+                            // CSI detection: dispatch watcher events for
+                            // scrollback wipes and Synchronized Output.
+                            match csi_watcher.feed(byte) {
+                                Some(CsiEvent::ClearHistory) => clear_history_flag = true,
+                                Some(CsiEvent::SyncOutputBegin) => {
+                                    sync_output_active = true;
+                                    sync_started = Some(std::time::Instant::now());
                                 }
-                                CsiDetect::Esc => {
-                                    if byte == b'[' {
-                                        csi_detect = CsiDetect::Params;
-                                        csi_param_val = 0;
-                                        csi_digit_acc = 0;
-                                    } else {
-                                        csi_detect = CsiDetect::None;
-                                    }
+                                Some(CsiEvent::SyncOutputEnd) => {
+                                    sync_output_active = false;
+                                    sync_started = None;
                                 }
-                                CsiDetect::Params => {
-                                    if byte >= b'0' && byte <= b'9' {
-                                        csi_digit_acc = csi_digit_acc.saturating_mul(10).saturating_add((byte - b'0') as u32);
-                                    } else if byte == b';' {
-                                        csi_param_val = csi_digit_acc;
-                                        csi_digit_acc = 0;
-                                    } else {
-                                        // Final character — check for J (erase display)
-                                        let param = if csi_param_val > 0 { csi_param_val } else { csi_digit_acc };
-                                        if byte == b'J' && param == 2 {
-                                            clear_history_flag = true;
-                                        }
-                                        csi_detect = CsiDetect::None;
-                                    }
-                                }
+                                None => {}
                             }
                         }
                         // After the byte loop: clear scrollback history if we detected
@@ -581,8 +672,19 @@ impl TerminalState {
 
                         total_lines_pushed_clone.fetch_add(local_lines, Ordering::Relaxed);
 
-                        render_gen_clone.fetch_add(1, Ordering::Relaxed);
-                        sender_clone.send(AppEvent::Wakeup);
+                        // Synchronized Output: if the app still holds mode 2026
+                        // set and the safety deadline passed, release it so a
+                        // crashed app can never freeze the screen.
+                        if sync_output_active
+                            && sync_started.is_some_and(|t| t.elapsed() >= SYNC_OUTPUT_TIMEOUT)
+                        {
+                            sync_output_active = false;
+                            sync_started = None;
+                        }
+                        if !sync_output_active {
+                            render_gen_clone.fetch_add(1, Ordering::Relaxed);
+                            sender_clone.send(AppEvent::Wakeup);
+                        }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
                         continue;
@@ -1301,4 +1403,62 @@ fn get_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
 #[cfg(target_os = "windows")]
 fn get_process_cwd(_pid: u32) -> Option<std::path::PathBuf> {
     None
+}
+#[cfg(test)]
+mod tests {
+    use super::CsiEvent::{self, *};
+    use super::CsiWatcher;
+
+    fn run(bytes: &[u8]) -> Vec<CsiEvent> {
+        let mut w = CsiWatcher::new();
+        bytes.iter().filter_map(|&b| w.feed(b)).collect()
+    }
+
+    #[test]
+    fn detects_synchronized_output_set_and_reset() {
+        assert_eq!(run(b"\x1b[?2026h"), vec![SyncOutputBegin]);
+        assert_eq!(run(b"\x1b[?2026l"), vec![SyncOutputEnd]);
+    }
+
+    #[test]
+    fn detects_2026_combined_with_other_private_modes() {
+        assert_eq!(run(b"\x1b[?1049;2026h"), vec![SyncOutputBegin]);
+        assert_eq!(run(b"\x1b[?2026;1049l"), vec![SyncOutputEnd]);
+    }
+
+    #[test]
+    fn detects_2026_across_split_chunks() {
+        let mut w = CsiWatcher::new();
+        assert_eq!(w.feed(0x1b), None);
+        assert_eq!(w.feed(b'['), None);
+        assert_eq!(w.feed(b'?'), None);
+        assert_eq!(w.feed(b'2'), None);
+        assert_eq!(w.feed(b'0'), None);
+        assert_eq!(w.feed(b'2'), None);
+        assert_eq!(w.feed(b'6'), None);
+        assert_eq!(w.feed(b'h'), Some(SyncOutputBegin));
+    }
+
+    #[test]
+    fn plain_2j_clears_history_but_private_2j_does_not() {
+        assert_eq!(run(b"\x1b[2J"), vec![ClearHistory]);
+        assert_eq!(run(b"\x1b[?2J"), Vec::<CsiEvent>::new());
+        assert_eq!(run(b"\x1b[3J"), Vec::<CsiEvent>::new());
+    }
+
+    #[test]
+    fn other_private_modes_are_ignored() {
+        assert_eq!(
+            run(b"\x1b[?1049h\x1b[?25l\x1b[?1000;1006h"),
+            Vec::<CsiEvent>::new()
+        );
+    }
+
+    #[test]
+    fn plain_text_emits_nothing() {
+        assert_eq!(
+            run(b"hello \x1b]0;title\x07 world"),
+            Vec::<CsiEvent>::new()
+        );
+    }
 }
