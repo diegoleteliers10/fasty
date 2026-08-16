@@ -726,6 +726,7 @@ impl RootView {
 
         let status_bar_model = StatusBarModel::new(&loaded_config, theme);
         let focus_handle = cx.focus_handle();
+        _window.focus(&focus_handle, cx);
 
         let font_size = loaded_config.font.size;
         let font_family: SharedString = if loaded_config.font.family.is_empty() || loaded_config.font.family == "monospace" {
@@ -2169,8 +2170,13 @@ impl RootView {
         } else {
             match key_lower.as_str() {
                 "enter" | "return" => {
-                    self.typed_prompt_buf.clear();
-                    Some(b"\r".to_vec())
+                    if modifiers.shift {
+                        self.typed_prompt_buf.push('\n');
+                        Some(b"\n".to_vec())
+                    } else {
+                        self.typed_prompt_buf.clear();
+                        Some(b"\r".to_vec())
+                    }
                 }
                 "backspace" => {
                     self.typed_prompt_buf.pop();
@@ -3597,12 +3603,13 @@ impl Render for RootView {
                 let mut backdrop_bg = theme.black;
                 backdrop_bg.a = 0.65;
 
+                let pkg_ver = env!("CARGO_PKG_VERSION");
                 let platform_desc = if cfg!(target_os = "macos") {
-                    format!("v0.5.8 • macOS ({})", std::env::consts::ARCH)
+                    format!("v{} • macOS ({})", pkg_ver, std::env::consts::ARCH)
                 } else if cfg!(target_os = "windows") {
-                    format!("v0.5.8 • Windows ({})", std::env::consts::ARCH)
+                    format!("v{} • Windows ({})", pkg_ver, std::env::consts::ARCH)
                 } else {
-                    format!("v0.5.8 • Linux ({})", std::env::consts::ARCH)
+                    format!("v{} • Linux ({})", pkg_ver, std::env::consts::ARCH)
                 };
 
                 let renderer_desc = if cfg!(target_os = "macos") {
