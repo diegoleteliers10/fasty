@@ -16,6 +16,10 @@ fn main() {
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(move |cx: &mut App| {
             cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.on_window_closed(|_cx, window_id| {
+                fastty::session::persist_window(window_id);
+            })
+            .detach();
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("ctrl-q", Quit, None),

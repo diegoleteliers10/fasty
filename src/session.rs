@@ -8,8 +8,35 @@
 //! older `tabs: Vec<TabInfo>` field is still accepted and migrated to one
 //! window on load.
 
+use gpui::WindowId;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// Latest session snapshot per open window. `on_window_closed` reads the
+/// snapshot of the window that was just closed and writes it to disk, so the
+/// path of the last window closed survives a restart even when several windows
+/// are open at once.
+static WINDOW_SNAPSHOTS: OnceLock<parking_lot::Mutex<HashMap<WindowId, Session>>> = OnceLock::new();
+
+fn window_snapshots() -> &'static parking_lot::Mutex<HashMap<WindowId, Session>> {
+    WINDOW_SNAPSHOTS.get_or_init(Default::default)
+}
+
+/// Remember the latest state of `window_id` so it can be persisted when the
+/// window is closed and the `RootView` is no longer accessible.
+pub fn register_window(window_id: WindowId, session: Session) {
+    window_snapshots().lock().insert(window_id, session);
+}
+
+/// Persist the state of the window that was just closed.
+pub fn persist_window(window_id: WindowId) {
+    let snapshot = window_snapshots().lock().get(&window_id).cloned();
+    if let Some(session) = snapshot {
+        let _ = save(&session);
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {

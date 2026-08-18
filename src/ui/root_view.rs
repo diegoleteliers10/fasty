@@ -740,6 +740,7 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
 
 pub struct RootView {
     config: Config,
+    window_id: gpui::WindowId,
     theme: Theme,
     tabs: Vec<TabData>,
     active_tab_idx: usize,
@@ -900,6 +901,7 @@ impl RootView {
 
         let mut view = Self {
             config: loaded_config,
+            window_id: _window.window_handle().window_id(),
             theme,
             tabs: Vec::new(),
             active_tab_idx: 0,
@@ -1033,6 +1035,7 @@ impl RootView {
             legacy_tabs: Vec::new(),
             legacy_active_tab: 0,
         };
+        crate::session::register_window(self.window_id, session.clone());
         let _ = crate::session::save(&session);
     }
 
@@ -2883,15 +2886,32 @@ impl Render for RootView {
             })
             .collect();
 
-        let (active_cwd, active_git, fallback_info) = if let Some(active_tab) = self.tabs.get_mut(self.active_tab_idx) {
-            if let Some(ref term) = active_tab.terminal {
-                if let Some(proc_cwd) = term.get_current_working_directory() {
-                    let changed = active_tab.cwd.as_ref().map_or(true, |c| c != &proc_cwd);
-                    if changed {
-                        active_tab.cwd = Some(proc_cwd);
+        let cwd_changed = {
+            let active_tab = self.tabs.get_mut(self.active_tab_idx);
+            if let Some(active_tab) = active_tab {
+                if let Some(ref term) = active_tab.terminal {
+                    if let Some(proc_cwd) = term.get_current_working_directory() {
+                        if active_tab.cwd.as_ref().map_or(true, |c| c != &proc_cwd) {
+                            active_tab.cwd = Some(proc_cwd);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
                     }
+                } else {
+                    false
                 }
+            } else {
+                false
             }
+        };
+        if cwd_changed {
+            self.persist_session();
+        }
+
+        let (active_cwd, active_git, fallback_info) = if let Some(active_tab) = self.tabs.get_mut(self.active_tab_idx) {
             if active_tab.git_checked_cwd.as_ref() != active_tab.cwd.as_ref() {
                 active_tab.git_checked_cwd = active_tab.cwd.clone();
                 if let Some(ref cwd) = active_tab.cwd {
