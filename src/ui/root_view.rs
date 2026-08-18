@@ -3,9 +3,10 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor};
 use gpui::{
-    Context, CursorStyle, Div, FocusHandle, FontFeatures, FontWeight, Hsla, KeyDownEvent,
+    Bounds, Context, CursorStyle, Div, FocusHandle, FontFeatures, FontWeight, Hsla, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle,
-    ScrollWheelEvent, SharedString, TextRun, Window, div, prelude::*, px,
+    ScrollWheelEvent, SharedString, TextRun, TitlebarOptions, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 
 use super::status_bar::{StatusBar, StatusBarModel, StatusInfo};
@@ -712,6 +713,7 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
     let is_mac = cfg!(target_os = "macos");
     vec![
         PaletteCommand { id: "new_tab", icon: IconType::Plus, title: "New Tab", category: "Terminal", shortcut: Some(if is_mac { "⌘T" } else { "Ctrl+Shift+T" }) },
+        PaletteCommand { id: "new_window", icon: IconType::ExternalLink, title: "New Window", category: "Window", shortcut: Some(if is_mac { "⌘⇧N" } else { "Ctrl+Shift+N" }) },
         PaletteCommand { id: "rename_tab", icon: IconType::Pencil, title: "Rename Active Tab", category: "Terminal", shortcut: Some(if is_mac { "⌘⇧R" } else { "Ctrl+Shift+R" }) },
         PaletteCommand { id: "close_tab", icon: IconType::X, title: "Close Active Tab", category: "Terminal", shortcut: Some(if is_mac { "⌘W" } else { "Ctrl+Shift+W" }) },
         PaletteCommand { id: "search", icon: IconType::Search, title: "Search in Buffer", category: "Terminal", shortcut: Some(if is_mac { "⌘F" } else { "Ctrl+Shift+F" }) },
@@ -815,7 +817,11 @@ impl RootView {
         }
     }
 
-    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::with_options(window, crate::cli::CliOptions::default(), cx)
+    }
+
+    pub fn with_options(_window: &mut Window, cli_opts: crate::cli::CliOptions, cx: &mut Context<Self>) -> Self {
         config::load_custom_themes();
         crate::snippets::load();
         let loaded_config = Config::load().unwrap_or_default();
@@ -970,7 +976,23 @@ impl RootView {
             }
         }).detach();
 
-        if restored_tabs.is_empty() {
+        if cli_opts.command.is_some() || cli_opts.working_dir.is_some() || cli_opts.title.is_some() {
+            let shell = cli_opts.command.unwrap_or_else(|| {
+                view.config
+                    .shell
+                    .clone()
+                    .or_else(|| std::env::var("SHELL").ok())
+                    .unwrap_or_else(crate::paths::default_system_shell)
+            });
+            view.create_tab_with_cmd_and_cwd(
+                &shell,
+                &cli_opts.args,
+                cli_opts.working_dir.as_deref(),
+                cli_opts.title,
+                _window,
+                cx,
+            );
+        } else if restored_tabs.is_empty() {
             view.create_tab(_window, cx);
         } else {
             let shell = view
@@ -1380,6 +1402,32 @@ impl RootView {
         self.is_command_palette_open = false;
         match cmd_id {
             "new_tab" => self.create_tab(_window, cx),
+            "new_window" => {
+                let cwd = self.tabs.get(self.active_tab_idx).and_then(|t| t.cwd.clone());
+                let cli_opts = crate::cli::CliOptions {
+                    working_dir: cwd,
+                    ..Default::default()
+                };
+                let bounds = Bounds::centered(None, size(px(960.), px(640.)), &*cx);
+                cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        window_min_size: Some(size(px(640.), px(420.))),
+                        window_background: WindowBackgroundAppearance::Blurred,
+                        app_id: Some("com.fastty.app".into()),
+                        titlebar: Some(TitlebarOptions {
+                            title: Some("Fastty".into()),
+                            appears_transparent: true,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    |w, cx| {
+                        w.set_background_appearance(WindowBackgroundAppearance::Blurred);
+                        cx.new(|cx| RootView::with_options(w, cli_opts, cx))
+                    },
+                ).ok();
+            }
             "rename_tab" => self.open_rename_tab(self.active_tab_idx, cx),
             "close_tab" => {
                 if let Some(tab) = self.tabs.get(self.active_tab_idx) {
@@ -1973,6 +2021,17 @@ impl RootView {
         };
         if is_command_palette {
             self.toggle_command_palette(_window, cx);
+            return;
+        }
+
+        // New Window Trigger (⌘⇧N on macOS; Ctrl+Shift+N on Linux/Windows)
+        let is_new_window = if cfg!(target_os = "macos") {
+            modifiers.platform && modifiers.shift && key_lower == "n"
+        } else {
+            modifiers.control && modifiers.shift && key_lower == "n"
+        };
+        if is_new_window {
+            self.execute_palette_command("new_window", _window, cx);
             return;
         }
 
@@ -3753,6 +3812,44 @@ impl Render for RootView {
                                 let cwd = this.tabs.iter().find(|t| t.id == target_tab_id).and_then(|t| t.cwd.clone());
                                 let shell = this.config.shell.clone().or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(crate::paths::default_system_shell);
                                 this.create_tab_with_cmd_and_cwd(&shell, &[], cwd.as_deref(), None, window, cx);
+                            }),
+                            theme,
+                        ))
+                        .child(render_context_menu_item(
+                            IconType::ExternalLink,
+                            "Move to New Window",
+                            None,
+                            cx.listener(move |this, _ev, window, cx| {
+                                this.is_tab_context_menu_open = false;
+                                let cwd = this.tabs.iter().find(|t| t.id == target_tab_id).and_then(|t| t.cwd.clone());
+                                let title = this.tabs.iter().find(|t| t.id == target_tab_id).map(|t| t.title.clone());
+                                let cli_opts = crate::cli::CliOptions {
+                                    working_dir: cwd,
+                                    title,
+                                    ..Default::default()
+                                };
+                                let bounds = Bounds::centered(None, size(px(960.), px(640.)), &*cx);
+                                cx.open_window(
+                                    WindowOptions {
+                                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                                        window_min_size: Some(size(px(640.), px(420.))),
+                                        window_background: WindowBackgroundAppearance::Blurred,
+                                        app_id: Some("com.fastty.app".into()),
+                                        titlebar: Some(TitlebarOptions {
+                                            title: Some("Fastty".into()),
+                                            appears_transparent: true,
+                                            ..Default::default()
+                                        }),
+                                        ..Default::default()
+                                    },
+                                    |w, cx| {
+                                        w.set_background_appearance(WindowBackgroundAppearance::Blurred);
+                                        cx.new(|cx| RootView::with_options(w, cli_opts, cx))
+                                    },
+                                ).ok();
+                                if this.tabs.len() > 1 {
+                                    this.close_tab(target_tab_id, window, cx);
+                                }
                             }),
                             theme,
                         ))

@@ -3,15 +3,18 @@ use gpui::{
     WindowBackgroundAppearance, WindowBounds, WindowOptions, actions, prelude::*, px, size,
 };
 use gpui_platform::application;
+use fastty::cli::CliOptions;
 use fastty::ui::RootView;
 
 actions!(fastty, [Quit]);
 
 fn main() {
     let _ = fastty::paths::init();
+    let cli_opts = CliOptions::parse();
+
     application()
         .with_quit_mode(QuitMode::LastWindowClosed)
-        .run(|cx: &mut App| {
+        .run(move |cx: &mut App| {
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
@@ -22,12 +25,12 @@ fn main() {
                 Quit,
             )])]);
 
-            open_main_window(cx);
+            open_main_window(cx, cli_opts);
             cx.activate(true);
         });
 }
 
-fn open_main_window(cx: &mut App) {
+fn open_main_window(cx: &mut App, cli_opts: CliOptions) {
     let bounds = Bounds::centered(None, size(px(960.), px(640.)), cx);
 
     cx.open_window(
@@ -45,7 +48,7 @@ fn open_main_window(cx: &mut App) {
         },
         |window, cx| {
             window.set_background_appearance(WindowBackgroundAppearance::Blurred);
-            cx.new(|cx| RootView::new(window, cx))
+            cx.new(|cx| RootView::with_options(window, cli_opts, cx))
         },
     )
     .expect("failed to open Fastty window");

@@ -1,5 +1,6 @@
 //! fastty library - GPUI terminal emulator
 
+pub mod cli;
 pub mod config;
 pub mod event_listener;
 pub mod git;
