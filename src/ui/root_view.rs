@@ -5,7 +5,7 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor}
 use gpui::{
     Context, CursorStyle, Div, FocusHandle, FontFeatures, FontWeight, Hsla, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle,
-    ScrollWheelEvent, SharedString, TextAlign, TextRun, Window, div, prelude::*, px,
+    ScrollWheelEvent, SharedString, TextRun, Window, div, prelude::*, px,
 };
 
 use super::status_bar::{StatusBar, StatusBarModel, StatusInfo};
@@ -35,18 +35,22 @@ pub struct TabData {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct StyledSpan {
-    text: String,
-    start_col: usize,
-    end_col: usize,
-    fg: Hsla,
-    bg: Option<Hsla>,
-    is_bold: bool,
-    is_underline: bool,
+pub struct StyledSpan {
+    pub text: String,
+    pub start_col: usize,
+    pub end_col: usize,
+    pub fg: Hsla,
+    pub bg: Option<Hsla>,
+    pub is_bold: bool,
+    pub is_underline: bool,
     /// Pure-emoji span (color glyphs from fallback fonts).
-    is_emoji: bool,
+    pub is_emoji: bool,
     /// Font-size factor measured so the emoji ink fits its reserved cells.
-    emoji_scale: Option<f32>,
+    pub emoji_scale: Option<f32>,
+    /// Terminal column for each char in `text` (including zerowidth chars,
+    /// which share the column of their base cell). Used by search highlight
+    /// to compute exact pixel positions without floating-point interpolation.
+    pub char_cols: Vec<usize>,
 }
 
 fn trim_row_spans(spans: &mut Vec<StyledSpan>) {
@@ -56,8 +60,11 @@ fn trim_row_spans(spans: &mut Vec<StyledSpan>) {
             if trimmed.is_empty() {
                 spans.pop();
             } else {
-                let diff = last.text.len() - trimmed.len();
-                last.end_col = last.end_col.saturating_sub(diff);
+                // Count trailing spaces as columns (1 col per space, always ASCII).
+                let trimmed_char_len = trimmed.chars().count();
+                let total_char_len = last.text.chars().count();
+                let trailing_spaces = total_char_len - trimmed_char_len;
+                last.end_col = last.end_col.saturating_sub(trailing_spaces);
                 last.text = trimmed.to_string();
                 break;
             }
@@ -66,6 +73,7 @@ fn trim_row_spans(spans: &mut Vec<StyledSpan>) {
         }
     }
 }
+
 
 pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
     let code = ch as u32;
@@ -192,6 +200,7 @@ pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
     })
 }
 
+#[allow(dead_code)]
 fn render_quadrant(width: f32, line_h: f32, tl: Hsla, tr: Hsla, bl: Hsla, br: Hsla) -> Div {
     let half_w = (width / 2.0).floor().max(1.0);
     let rem_w = (width - half_w).max(1.0);
@@ -226,11 +235,13 @@ fn render_quadrant(width: f32, line_h: f32, tl: Hsla, tr: Hsla, bl: Hsla, br: Hs
 /// True for box-drawing chars with vertical strokes. Repeated spans of these
 /// must render one stroke per cell; a single element would center one stroke
 /// across the whole span.
+#[allow(dead_code)]
 fn box_char_has_vertical_strokes(ch: char) -> bool {
     decode_box_drawing(ch).is_some_and(|(_, _, top, bottom, _)| top > 0 || bottom > 0)
 }
 
 /// Geometric Shapes synthesized by `render_geometric_cell`.
+#[allow(dead_code)]
 fn geometric_shape_synthesized(ch: char) -> bool {
     matches!(
         ch as u32,
@@ -245,10 +256,12 @@ fn geometric_shape_synthesized(ch: char) -> bool {
 /// Glyphs that must be laid out once per cell when a pure span repeats them.
 /// Horizontal-only strokes (─ ═ ━) and block fills (█ ░ ▓) stay single-element
 /// because one continuous fill across the span is the correct rendering.
+#[allow(dead_code)]
 fn synthesized_per_cell(ch: char) -> bool {
     geometric_shape_synthesized(ch) || box_char_has_vertical_strokes(ch)
 }
 
+#[allow(dead_code)]
 fn render_geometric_cell(
     ch: char,
     width: f32,
@@ -2820,6 +2833,7 @@ impl Render for RootView {
             let mut current_bold = false;
             let mut current_underline = false;
             let mut last_row: Option<i32> = None;
+            let mut current_span_char_cols: Vec<usize> = Vec::new();
 
             for cell in content.display_iter {
                 let row = cell.point.line.0;
@@ -2842,8 +2856,10 @@ impl Render for RootView {
                                 is_underline: current_underline,
                                 is_emoji: current_is_emoji,
                                 emoji_scale: None,
+                                char_cols: current_span_char_cols,
                             });
                             current_span_text = String::new();
+                            current_span_char_cols = Vec::new();
                             current_block_cat = None;
                             current_is_emoji = false;
                         }
@@ -2924,8 +2940,10 @@ impl Render for RootView {
                             is_underline: current_underline,
                             is_emoji: current_is_emoji,
                             emoji_scale: None,
+                            char_cols: current_span_char_cols,
                         });
                         current_span_text = String::new();
+                        current_span_char_cols = Vec::new();
                     }
                     current_span_start_col = col;
                     current_span_end_col = end_col;
@@ -2939,11 +2957,15 @@ impl Render for RootView {
                     current_span_end_col = end_col;
                 }
 
+                // Base character: its column is the cell's actual column.
+                current_span_char_cols.push(col);
                 current_span_text.push(cell.c);
 
                 let has_fe0f = cell.zerowidth().map_or(false, |zw| zw.contains(&'\u{FE0F}'));
                 if let Some(zerowidth) = cell.zerowidth() {
                     for &zw in zerowidth {
+                        // Zerowidth chars share the column of their base cell.
+                        current_span_char_cols.push(col);
                         current_span_text.push(zw);
                     }
                 }
@@ -2953,6 +2975,7 @@ impl Render for RootView {
                 // color-emoji glyph (~2 columns of ink) would overflow into
                 // the neighboring text.
                 if is_emoji && cell.flags.contains(Flags::WIDE_CHAR) && !has_fe0f {
+                    current_span_char_cols.push(col);
                     current_span_text.push('\u{FE0F}');
                 }
             }
@@ -2968,6 +2991,7 @@ impl Render for RootView {
                     is_underline: current_underline,
                     is_emoji: current_is_emoji,
                     emoji_scale: None,
+                    char_cols: current_span_char_cols,
                 });
             }
             trim_row_spans(&mut current_row_spans);
@@ -3145,13 +3169,13 @@ impl Render for RootView {
                     .px(px(12.))
                     .py(px(6.))
                     .bg(self.theme.main_bg)
-                    .font_family(font_family)
+                    .font_family(font_family.clone())
                     .text_size(px(font_size))
                     .font_features(enable_terminal_ligatures())
                     .overflow_hidden()
                     .when_some(scrollbar_thumb, |this, thumb| this.child(thumb))
                     .child(super::ime::registration(cx.entity(), self.focus_handle.clone()))
-                    .children({
+                    .child({
                         let selection_range = self.selection;
                         let search_open = self.is_search_open && !self.search_query.is_empty();
                         let search_query_str = self.search_query.to_lowercase();
@@ -3159,92 +3183,21 @@ impl Render for RootView {
                         let num_lines = lines.len();
                         let row_width = (target_cols as f32 * cell_w).round();
 
-                        lines.into_iter().enumerate().map(move |(row_idx, spans)| {
-                            let default_bg = theme.background;
-                            let grid_line_idx = row_idx as i32 - display_offset as i32;
-
-                            let cursor_quad = if let Some((c_row, c_col, c_shape)) = cursor_info {
-                                if grid_line_idx == c_row {
-                                    let x_start = (c_col as f32 * cell_w).round();
-                                    let x_end = ((c_col + 1) as f32 * cell_w).round();
-                                    let quad_w = (x_end - x_start).max(cell_w);
-                                    let el = match c_shape {
-                                        CursorShape::Underline => div()
-                                            .absolute()
-                                            .left(px(x_start))
-                                            .top(px(line_h - 2.0))
-                                            .w(px(quad_w))
-                                            .h(px(2.0))
-                                            .bg(cursor_color),
-                                        CursorShape::HollowBlock => div()
-                                            .absolute()
-                                            .left(px(x_start))
-                                            .top(px(0.))
-                                            .w(px(quad_w))
-                                            .h(px(line_h))
-                                            .border_1()
-                                            .border_color(cursor_color),
-                                        CursorShape::Beam | CursorShape::Block | _ => div()
-                                            .absolute()
-                                            .left(px(x_start))
-                                            .top(px(0.))
-                                            .w(px(2.0))
-                                            .h(px(line_h))
-                                            .bg(cursor_color),
-                                    };
-                                    Some(el)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-
-                            // Calculate selection highlight range for this row
-                            let sel_col_range = if let Some(sel) = selection_range {
-                                let (min_p, max_p) = if sel.start <= sel.end {
-                                    (sel.start, sel.end)
-                                } else {
-                                    (sel.end, sel.start)
-                                };
-                                if grid_line_idx < min_p.line.0 || grid_line_idx > max_p.line.0 {
-                                    None
-                                } else if min_p.line.0 == max_p.line.0 {
-                                    Some((min_p.column.0, max_p.column.0 + 1))
-                                } else if grid_line_idx == min_p.line.0 {
-                                    Some((min_p.column.0, 300))
-                                } else if grid_line_idx == max_p.line.0 {
-                                    Some((0, max_p.column.0 + 1))
-                                } else {
-                                    Some((0, 300))
-                                }
-                            } else {
-                                None
-                            };
-
-                            // Search match highlights on this row
-                            let mut search_highlights = Vec::new();
-                            if search_open && !search_query_str.is_empty() {
+                        let mut all_search_highlights = Vec::with_capacity(num_lines);
+                        if search_open && !search_query_str.is_empty() {
+                            for (row_idx, spans) in lines.iter().enumerate() {
+                                let mut row_highlights = Vec::new();
                                 let mut full_line = String::new();
                                 let mut char_to_col: Vec<usize> = Vec::new();
                                 let mut char_to_end_col: Vec<usize> = Vec::new();
 
-                                for s in &spans {
-                                    let span_cols = s.end_col.saturating_sub(s.start_col);
-                                    let char_count = s.text.chars().count();
-                                    if char_count > 0 {
-                                        let cols_per_char = (span_cols as f32 / char_count as f32).max(1.0);
-                                        for (i, c) in s.text.chars().enumerate() {
-                                            full_line.push(c);
-                                            let col_start = s.start_col + (i as f32 * cols_per_char).round() as usize;
-                                            let col_end = if i + 1 == char_count {
-                                                s.end_col
-                                            } else {
-                                                s.start_col + ((i + 1) as f32 * cols_per_char).round() as usize
-                                            };
-                                            char_to_col.push(col_start);
-                                            char_to_end_col.push(col_end);
-                                        }
+                                for s in spans {
+                                    for (i, c) in s.text.chars().enumerate() {
+                                        full_line.push(c);
+                                        let col_start = s.char_cols.get(i).copied().unwrap_or(s.start_col);
+                                        let col_end = s.char_cols.get(i + 1).copied().unwrap_or(s.end_col);
+                                        char_to_col.push(col_start);
+                                        char_to_end_col.push(col_end);
                                     }
                                 }
 
@@ -3265,142 +3218,31 @@ impl Render for RootView {
                                         let is_active = active_search_offset.map_or(false, |off| {
                                             off == (display_offset + (num_lines.saturating_sub(1 + row_idx)))
                                         });
-                                        search_highlights.push((col_start, col_len, is_active));
+                                        row_highlights.push((col_start, col_len, is_active));
                                     }
                                     start_b = match_end_b;
                                     if search_query_str.is_empty() { break; }
                                 }
+                                all_search_highlights.push(row_highlights);
                             }
+                        } else {
+                            all_search_highlights.resize(num_lines, Vec::new());
+                        }
 
-                            div()
-                                .relative()
-                                .flex()
-                                .flex_row()
-                                .items_start()
-                                .w(px(row_width))
-                                .h(px(line_h))
-                                .line_height(px(line_h))
-                                // No overflow_hidden here: glyphs with vertical
-                                // overshoot (emoji, nerd font icons) must paint
-                                // past the line box, like Ghostty/Kitty do.
-                                .children(spans.into_iter().map(move |span| {
-                                    let span_width = ((span.end_col as f32 * cell_w).round() - (span.start_col as f32 * cell_w).round()).max(0.0);
-                                    let first_char = span.text.chars().next();
-                                    let is_pure = first_char.map_or(false, |fc| span.text.chars().all(|c| c == fc));
-
-                                    let geom_opt = if is_pure {
-                                        first_char.and_then(|ch| {
-                                            let count = span.text.chars().count();
-                                            if count > 1 && synthesized_per_cell(ch) {
-                                                // One element per cell: repeated
-                                                // vertical strokes / shapes must
-                                                // not collapse into a single one
-                                                // centered across the whole span.
-                                                let per_w = span_width / count as f32;
-                                                let cells: Vec<Div> = (0..count)
-                                                    .filter_map(|_| {
-                                                        render_geometric_cell(
-                                                            ch,
-                                                            per_w,
-                                                            line_h,
-                                                            span.fg,
-                                                            span.bg,
-                                                            default_bg,
-                                                        )
-                                                    })
-                                                    .collect();
-                                                if cells.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(
-                                                        div()
-                                                            .flex()
-                                                            .flex_row()
-                                                            .flex_shrink_0()
-                                                            .w(px(span_width))
-                                                            .children(cells),
-                                                    )
-                                                }
-                                            } else {
-                                                render_geometric_cell(
-                                                    ch,
-                                                    span_width,
-                                                    line_h,
-                                                    span.fg,
-                                                    span.bg,
-                                                    default_bg,
-                                                )
-                                            }
-                                        })
-                                    } else {
-                                        None
-                                    };
-
-                                    if let Some(geom) = geom_opt {
-                                        geom
-                                    } else {
-                                        let mut el = div()
-                                            .flex_shrink_0()
-                                            .w(px(span_width))
-                                            .whitespace_nowrap()
-                                            .h(px(line_h))
-                                            .line_height(px(line_h))
-                                            .text_color(span.fg)
-                                            .font_features(enable_terminal_ligatures())
-                                            .font_weight(if span.is_bold {
-                                                FontWeight::BOLD
-                                            } else {
-                                                FontWeight::NORMAL
-                                            });
-
-                                        if let Some(scale) = span.emoji_scale {
-                                            el = el
-                                                .text_size(px(font_size * scale))
-                                                .text_align(TextAlign::Center);
-                                        }
-                                        if let Some(bg_color) = span.bg {
-                                            el = el.bg(bg_color);
-                                        }
-                                        if span.is_underline {
-                                            el = el.underline();
-                                        }
-
-                                        el.child(SharedString::from(span.text))
-                                    }
-                                }))
-                                .when_some(cursor_quad, |this, c| this.child(c))
-                                .when_some(sel_col_range, |this, (c_start, c_end)| {
-                                    let x_start = (c_start as f32 * cell_w).round();
-                                    let x_end = (c_end as f32 * cell_w).round();
-                                    let quad_w = (x_end - x_start).max(0.0);
-                                    this.child(
-                                        div()
-                                            .absolute()
-                                            .left(px(x_start))
-                                            .top(px(0.))
-                                            .w(px(quad_w))
-                                            .h(px(line_h))
-                                            .bg(theme.accent.opacity(0.35))
-                                            .rounded(px(2.))
-                                    )
-                                })
-                                .children(search_highlights.into_iter().map(move |(m_col, m_len, is_active)| {
-                                    let x_start = (m_col as f32 * cell_w).round();
-                                    let x_end = ((m_col + m_len) as f32 * cell_w).round();
-                                    let quad_w = (x_end - x_start).max(cell_w);
-
-                                    div()
-                                        .absolute()
-                                        .left(px(x_start))
-                                        .top(px(0.))
-                                        .w(px(quad_w))
-                                        .h(px(line_h))
-                                        .bg(if is_active { theme.accent.opacity(0.70) } else { theme.yellow.opacity(0.40) })
-                                        .border_b_2()
-                                        .border_color(if is_active { theme.accent } else { theme.yellow })
-                                        .rounded(px(2.))
-                                }))
-                        })
+                        crate::ui::terminal_grid_element::TerminalGridElement {
+                            lines,
+                            cell_w,
+                            line_h,
+                            row_width,
+                            cursor_info,
+                            selection_range,
+                            search_highlights: all_search_highlights,
+                            theme: theme.clone(),
+                            cursor_color,
+                            font_family: font_family.clone(),
+                            font_size,
+                            display_offset,
+                        }
                     }),
             )
             .child(
@@ -4351,6 +4193,12 @@ impl Render for RootView {
                                                             .bg(if is_selected { theme.accent } else { theme.surface })
                                                             .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
                                                             .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                                                if this.command_palette_selected != idx {
+                                                                    this.command_palette_selected = idx;
+                                                                    cx.notify();
+                                                                }
+                                                            }))
                                                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
                                                                 this.execute_palette_command(cmd_id, window, cx);
                                                             }))
@@ -4378,7 +4226,7 @@ impl Render for RootView {
                                                                     .child(
                                                                         div()
                                                                             .text_size(px(10.))
-                                                                            .text_color(if is_selected { theme.black } else { theme.muted })
+                                                                            .text_color(if is_selected { theme.black.opacity(0.85) } else { theme.muted })
                                                                             .child(cmd.category),
                                                                     )
                                                                     .when_some(cmd.shortcut, |this, sc| {
@@ -4387,10 +4235,10 @@ impl Render for RootView {
                                                                                 .px(px(4.))
                                                                                 .py(px(1.))
                                                                                 .rounded(px(3.))
-                                                                                .bg(if is_selected { theme.hover } else { theme.surface_raised })
+                                                                                .bg(if is_selected { theme.black } else { theme.surface_raised })
                                                                                 .text_size(px(10.))
-                                                                                .font_weight(FontWeight::MEDIUM)
-                                                                                .text_color(if is_selected { theme.black } else { theme.muted })
+                                                                                .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                                                                .text_color(if is_selected { theme.accent } else { theme.muted })
                                                                                 .child(sc),
                                                                         )
                                                                     }),
@@ -4533,6 +4381,12 @@ impl Render for RootView {
                                                             .bg(if is_selected { theme.accent } else { theme.surface })
                                                             .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
                                                             .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                                                if this.ssh_manager_selected != idx {
+                                                                    this.ssh_manager_selected = idx;
+                                                                    cx.notify();
+                                                                }
+                                                            }))
                                                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
                                                                 this.is_ssh_manager_open = false;
                                                                 let title = format!("ssh: {}", host_clone.name);
@@ -4552,7 +4406,7 @@ impl Render for RootView {
                                                                     .child(
                                                                         div()
                                                                             .text_size(px(10.5))
-                                                                            .text_color(if is_selected { theme.black } else { theme.muted })
+                                                                            .text_color(if is_selected { theme.black.opacity(0.85) } else { theme.muted })
                                                                             .child(format!("{}@{}", host.user, host.hostname)),
                                                                     ),
                                                             )
@@ -4561,9 +4415,10 @@ impl Render for RootView {
                                                                     .px(px(6.))
                                                                     .py(px(2.))
                                                                     .rounded(px(3.))
-                                                                    .bg(if is_selected { theme.hover } else { theme.surface_raised })
+                                                                    .bg(if is_selected { theme.black } else { theme.surface_raised })
                                                                     .text_size(px(10.))
-                                                                    .text_color(if is_selected { theme.black } else { theme.muted })
+                                                                    .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                                                    .text_color(if is_selected { theme.accent } else { theme.muted })
                                                                     .child(format!("port {}", host.port)),
                                                             )
                                                     })
@@ -4836,6 +4691,12 @@ impl Render for RootView {
                                                             .bg(if is_selected { theme.accent } else { theme.surface })
                                                             .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
                                                             .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                                                if this.worktree_picker_selected != idx {
+                                                                    this.worktree_picker_selected = idx;
+                                                                    cx.notify();
+                                                                }
+                                                            }))
                                                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
                                                                 let shell = this.config.shell.clone().or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(crate::paths::default_system_shell);
                                                                 let title = wt_clone.short_branch().to_string();
@@ -4857,7 +4718,7 @@ impl Render for RootView {
                                                                     .child(
                                                                         div()
                                                                             .text_size(px(10.5))
-                                                                            .text_color(if is_selected { theme.black } else { theme.muted })
+                                                                            .text_color(if is_selected { theme.black.opacity(0.85) } else { theme.muted })
                                                                             .child(wt.path.to_string_lossy().to_string()),
                                                                     ),
                                                             )
@@ -4866,9 +4727,10 @@ impl Render for RootView {
                                                                     .px(px(6.))
                                                                     .py(px(2.))
                                                                     .rounded(px(3.))
-                                                                    .bg(if is_selected { theme.hover } else { theme.surface_raised })
+                                                                    .bg(if is_selected { theme.black } else { theme.surface_raised })
                                                                     .text_size(px(10.))
-                                                                    .text_color(if is_selected { theme.black } else { theme.muted })
+                                                                    .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                                                    .text_color(if is_selected { theme.accent } else { theme.muted })
                                                                     .child(wt.short_commit().to_string()),
                                                             )
                                                     })
@@ -5010,6 +4872,12 @@ impl Render for RootView {
                                                             .bg(if is_selected { theme.accent } else { theme.surface })
                                                             .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
                                                             .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                                                if this.project_jumper_selected != idx {
+                                                                    this.project_jumper_selected = idx;
+                                                                    cx.notify();
+                                                                }
+                                                            }))
                                                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
                                                                 this.is_project_jumper_open = false;
                                                                 this.select_tab(tab_id, cx);
@@ -5028,7 +4896,7 @@ impl Render for RootView {
                                                                     .child(
                                                                         div()
                                                                             .text_size(px(10.5))
-                                                                            .text_color(if is_selected { theme.black } else { theme.muted })
+                                                                            .text_color(if is_selected { theme.black.opacity(0.85) } else { theme.muted })
                                                                             .child(cwd_str.unwrap_or_else(|| "~".to_string())),
                                                                     ),
                                                             )
@@ -5037,9 +4905,10 @@ impl Render for RootView {
                                                                     .px(px(6.))
                                                                     .py(px(2.))
                                                                     .rounded(px(3.))
-                                                                    .bg(if is_selected { theme.hover } else { theme.surface_raised })
+                                                                    .bg(if is_selected { theme.black } else { theme.surface_raised })
                                                                     .text_size(px(10.))
-                                                                    .text_color(if is_selected { theme.black } else { theme.muted })
+                                                                    .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                                                    .text_color(if is_selected { theme.accent } else { theme.muted })
                                                                     .child(branch_str.map(|b| format!("🌿 {}", b)).unwrap_or_else(|| "Tab".to_string())),
                                                             )
                                                     })
@@ -5561,6 +5430,7 @@ mod tests {
                 is_underline: false,
                 is_emoji: false,
                 emoji_scale: None,
+                char_cols: vec![0, 1, 2, 3, 4],
             },
             StyledSpan {
                 text: "    ".to_string(),
@@ -5572,6 +5442,7 @@ mod tests {
                 is_underline: false,
                 is_emoji: false,
                 emoji_scale: None,
+                char_cols: vec![5, 6, 7, 8],
             },
         ];
 
@@ -5592,6 +5463,7 @@ mod tests {
                 is_underline: false,
                 is_emoji: false,
                 emoji_scale: None,
+                char_cols: (0..14).collect(),
             },
         ];
         trim_row_spans(&mut spans_with_bg);

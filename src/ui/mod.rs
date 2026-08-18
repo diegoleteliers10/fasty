@@ -4,6 +4,7 @@ pub mod ime;
 pub mod root_view;
 pub mod status_bar;
 pub mod tab_bar;
+pub mod terminal_grid_element;
 pub mod theme;
 
 pub use button::{Button, ButtonVariant};
