@@ -164,6 +164,7 @@ pub struct TerminalState {
     master: Arc<ParkingMutex<Box<dyn MasterPty + Send>>>,
     shell_pid: Option<u32>,
     pub total_lines_pushed: Arc<AtomicU64>,
+    event_listener: EventListenerProxy,
 }
 
 impl TerminalState {
@@ -392,18 +393,18 @@ impl TerminalState {
         let writer_arc: Arc<ParkingMutex<Box<dyn Write + Send>>> =
             Arc::new(ParkingMutex::new(writer_boxed));
 
-        let mut event_listener = EventListenerProxy::from_arc(writer_arc.clone());
+        let event_listener = EventListenerProxy::from_arc(writer_arc.clone());
         event_listener.set_event_sender(sender.clone());
         let term = Arc::new(ParkingMutex::new(alacritty_terminal::term::Term::new(
             config,
             &size,
-            event_listener,
+            event_listener.clone(),
         )));
 
         let render_generation = Arc::new(AtomicU64::new(0));
         let render_gen_clone = Arc::clone(&render_generation);
         let term_clone = Arc::clone(&term);
-        let sender_clone = sender.clone();
+        let event_listener_clone = event_listener.clone();
         let total_lines_pushed = Arc::new(AtomicU64::new(0));
         let total_lines_pushed_clone = Arc::clone(&total_lines_pushed);
         let writer_clone = Arc::clone(&writer_arc);
@@ -527,7 +528,7 @@ impl TerminalState {
                                     };
                                     dispatch_osc_action(
                                         &OscCommand::Notification { title, body: finished.body },
-                                        &sender_clone,
+                                        &event_listener_clone,
                                         cursor_line,
                                         base,
                                         screen_lines,
@@ -537,7 +538,7 @@ impl TerminalState {
                         } else {
                             dispatch_osc_action(
                                 &OscCommand::Notification { title: "Fastty".to_string(), body: payload },
-                                &sender_clone,
+                                &event_listener_clone,
                                 cursor_line,
                                 base,
                                 screen_lines,
@@ -545,7 +546,7 @@ impl TerminalState {
                         }
                     }
                     _ => {
-                        dispatch_osc_action(&cmd, &sender_clone, cursor_line, base, screen_lines);
+                        dispatch_osc_action(&cmd, &event_listener_clone, cursor_line, base, screen_lines);
                     }
                 }
             };
@@ -553,7 +554,7 @@ impl TerminalState {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
-                        sender_clone.send(AppEvent::Exit { shell_pid: reader_shell_pid });
+                        event_listener_clone.send_app_event(AppEvent::Exit { shell_pid: reader_shell_pid });
                         break;
                     }
                     Ok(n) => {
@@ -683,14 +684,14 @@ impl TerminalState {
                         }
                         if !sync_output_active {
                             render_gen_clone.fetch_add(1, Ordering::Relaxed);
-                            sender_clone.send(AppEvent::Wakeup);
+                            event_listener_clone.send_app_event(AppEvent::Wakeup);
                         }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
                         continue;
                     }
                     Err(_) => {
-                        sender_clone.send(AppEvent::Exit { shell_pid: reader_shell_pid });
+                        event_listener_clone.send_app_event(AppEvent::Exit { shell_pid: reader_shell_pid });
                         break;
                     }
                 }
@@ -705,11 +706,16 @@ impl TerminalState {
             master: master_arc,
             shell_pid,
             total_lines_pushed,
+            event_listener,
         })
     }
 
     pub fn shell_pid(&self) -> Option<u32> {
         self.shell_pid
+    }
+
+    pub fn set_event_sender(&self, sender: crate::event_listener::EventSender) {
+        self.event_listener.set_event_sender(sender);
     }
 
     pub fn get_current_working_directory(&self) -> Option<std::path::PathBuf> {
@@ -1302,7 +1308,7 @@ fn parse_osc(
 
 fn dispatch_osc_action(
     cmd: &OscCommand,
-    sender: &crate::event_listener::EventSender,
+    sender: &crate::event_listener::EventListenerProxy,
     cursor_line: i32,
     absolute_base: u64,
     screen_lines: i32,
@@ -1310,17 +1316,17 @@ fn dispatch_osc_action(
     match cmd {
         OscCommand::Cwd(path) => {
             if let Some(p) = file_url_to_path(path.as_bytes()) {
-                sender.send(AppEvent::CwdChanged(p));
+                sender.send_app_event(AppEvent::CwdChanged(p));
             }
         }
         OscCommand::SetTitle(title) => {
-            sender.send(AppEvent::TitleChanged(title.clone()));
+            sender.send_app_event(AppEvent::TitleChanged(title.clone()));
         }
         OscCommand::CommandStarted => {
-            sender.send(AppEvent::CommandStarted);
+            sender.send_app_event(AppEvent::CommandStarted);
         }
         OscCommand::CommandFinished { duration_ms, exit_code } => {
-            sender.send(AppEvent::CommandFinished {
+            sender.send_app_event(AppEvent::CommandFinished {
                 duration_ms: *duration_ms,
                 exit_code: *exit_code,
             });
@@ -1328,12 +1334,12 @@ fn dispatch_osc_action(
         OscCommand::PromptStarted => {
             let scrolled = (absolute_base as i32 - screen_lines).max(0);
             let absolute_line = scrolled + cursor_line;
-            sender.send(AppEvent::PromptStarted {
+            sender.send_app_event(AppEvent::PromptStarted {
                 absolute_line: absolute_line.max(0) as u64,
             });
         }
         OscCommand::Notification { title, body } => {
-            sender.send(AppEvent::Notification {
+            sender.send_app_event(AppEvent::Notification {
                 title: title.clone(),
                 body: body.clone(),
             });

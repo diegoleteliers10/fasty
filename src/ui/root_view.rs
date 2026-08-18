@@ -1181,6 +1181,76 @@ impl RootView {
         cx.notify();
     }
 
+    pub fn with_initial_tab(window: &mut Window, cli_opts: crate::cli::CliOptions, tab_data: TabData, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::with_options(window, cli_opts, cx);
+        view.tabs.clear();
+        view.next_tab_id = 1;
+        view.attach_tab(tab_data, window, cx);
+        view
+    }
+
+    pub fn attach_tab(
+        &mut self,
+        mut tab_data: TabData,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_id = self.next_tab_id;
+        self.next_tab_id += 1;
+        tab_data.id = tab_id;
+
+        let (event_tx, event_rx) = async_channel::unbounded::<AppEvent>();
+        let event_sender = EventSender::Callback(Arc::new(move |event| {
+            let _ = event_tx.send_blocking(event);
+        }));
+
+        if let Some(terminal) = &tab_data.terminal {
+            terminal.set_event_sender(event_sender);
+        }
+
+        self.tabs.push(tab_data);
+        self.active_tab_idx = self.tabs.len() - 1;
+        self.persist_session();
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(event) = event_rx.recv().await {
+                while let Ok(AppEvent::Wakeup) = event_rx.try_recv() {}
+
+                let res = this.update_in(cx, |this, _window, cx| {
+                    match event {
+                        AppEvent::Wakeup => {
+                            cx.notify();
+                        }
+                        AppEvent::TitleChanged(title) => {
+                            if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
+                                tab.title = title;
+                            }
+                            this.persist_session();
+                            cx.notify();
+                        }
+                        AppEvent::CwdChanged(cwd) => {
+                            if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
+                                let p = std::path::PathBuf::from(&cwd);
+                                tab.git_status = crate::git::fetch_git_info(&p);
+                                tab.cwd = Some(p);
+                            }
+                            this.persist_session();
+                            cx.notify();
+                        }
+                        _ => {
+                            cx.notify();
+                        }
+                    }
+                });
+                if res.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     pub fn create_tab_with_cmd(
         &mut self,
         cmd: &str,
@@ -3819,36 +3889,46 @@ impl Render for RootView {
                             IconType::ExternalLink,
                             "Move to New Window",
                             None,
-                            cx.listener(move |this, _ev, window, cx| {
+                            cx.listener(move |this, _ev, _window, cx| {
                                 this.is_tab_context_menu_open = false;
-                                let cwd = this.tabs.iter().find(|t| t.id == target_tab_id).and_then(|t| t.cwd.clone());
-                                let title = this.tabs.iter().find(|t| t.id == target_tab_id).map(|t| t.title.clone());
-                                let cli_opts = crate::cli::CliOptions {
-                                    working_dir: cwd,
-                                    title,
-                                    ..Default::default()
-                                };
-                                let bounds = Bounds::centered(None, size(px(960.), px(640.)), &*cx);
-                                cx.open_window(
-                                    WindowOptions {
-                                        window_bounds: Some(WindowBounds::Windowed(bounds)),
-                                        window_min_size: Some(size(px(640.), px(420.))),
-                                        window_background: WindowBackgroundAppearance::Blurred,
-                                        app_id: Some("com.fastty.app".into()),
-                                        titlebar: Some(TitlebarOptions {
-                                            title: Some("Fastty".into()),
-                                            appears_transparent: true,
-                                            ..Default::default()
-                                        }),
+                                if this.tabs.len() <= 1 {
+                                    return;
+                                }
+                                let tab_idx_opt = this.tabs.iter().position(|t| t.id == target_tab_id);
+                                if let Some(idx) = tab_idx_opt {
+                                    let tab_data = this.tabs.remove(idx);
+                                    if this.active_tab_idx >= this.tabs.len() {
+                                        this.active_tab_idx = this.tabs.len().saturating_sub(1);
+                                    }
+                                    this.persist_session();
+                                    cx.notify();
+
+                                    let cwd = tab_data.cwd.clone();
+                                    let title = Some(tab_data.title.clone());
+                                    let cli_opts = crate::cli::CliOptions {
+                                        working_dir: cwd,
+                                        title,
                                         ..Default::default()
-                                    },
-                                    |w, cx| {
-                                        w.set_background_appearance(WindowBackgroundAppearance::Blurred);
-                                        cx.new(|cx| RootView::with_options(w, cli_opts, cx))
-                                    },
-                                ).ok();
-                                if this.tabs.len() > 1 {
-                                    this.close_tab(target_tab_id, window, cx);
+                                    };
+                                    let bounds = Bounds::centered(None, size(px(960.), px(640.)), &*cx);
+                                    cx.open_window(
+                                        WindowOptions {
+                                            window_bounds: Some(WindowBounds::Windowed(bounds)),
+                                            window_min_size: Some(size(px(640.), px(420.))),
+                                            window_background: WindowBackgroundAppearance::Blurred,
+                                            app_id: Some("com.fastty.app".into()),
+                                            titlebar: Some(TitlebarOptions {
+                                                title: Some("Fastty".into()),
+                                                appears_transparent: true,
+                                                ..Default::default()
+                                            }),
+                                            ..Default::default()
+                                        },
+                                        |w, cx| {
+                                            w.set_background_appearance(WindowBackgroundAppearance::Blurred);
+                                            cx.new(|cx| RootView::with_initial_tab(w, cli_opts, tab_data, cx))
+                                        },
+                                    ).ok();
                                 }
                             }),
                             theme,

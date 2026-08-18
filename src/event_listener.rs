@@ -69,7 +69,7 @@ impl Default for EventSender {
 #[derive(Clone)]
 pub struct EventListenerProxy {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    app_sender: EventSender,
+    app_sender: Arc<Mutex<EventSender>>,
 }
 
 unsafe impl Send for EventListenerProxy {}
@@ -79,12 +79,16 @@ impl EventListenerProxy {
     pub fn from_arc(writer: Arc<Mutex<Box<dyn Write + Send>>>) -> Self {
         Self {
             writer,
-            app_sender: EventSender::None,
+            app_sender: Arc::new(Mutex::new(EventSender::None)),
         }
     }
 
-    pub fn set_event_sender(&mut self, sender: EventSender) {
-        self.app_sender = sender;
+    pub fn set_event_sender(&self, sender: EventSender) {
+        *self.app_sender.lock() = sender;
+    }
+
+    pub fn send_app_event(&self, event: AppEvent) {
+        self.app_sender.lock().send(event);
     }
 }
 
@@ -108,7 +112,7 @@ impl EventListener for EventListenerProxy {
                         let _ = console.write_all(&[0x07]);
                     }
                 }
-                self.app_sender.send(AppEvent::Bell);
+                self.app_sender.lock().send(AppEvent::Bell);
             }
             Event::ClipboardStore(_ty, text) => {
                 if let Some(mut ctx) = clipboard_helper() {
@@ -127,7 +131,7 @@ impl EventListener for EventListenerProxy {
                 }
             }
             Event::Title(title) => {
-                self.app_sender.send(AppEvent::TitleChanged(title));
+                self.app_sender.lock().send(AppEvent::TitleChanged(title));
             }
             _ => {}
         }
