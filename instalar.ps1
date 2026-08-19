@@ -2,7 +2,7 @@
 # Fastty installation script for Windows (PowerShell)
 # ==============================================================================
 # Run directly from PowerShell with:
-# irm https://raw.githubusercontent.com/diegoleteliers10/fastty/main/instalar.ps1 | iex
+# irm https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.ps1 | iex
 # ==============================================================================
 
 $ErrorActionPreference = 'Stop'
@@ -109,7 +109,7 @@ try {
     }
     Copy-Item -Path $ExeSourcePath -Destination $ExeDestPath -Force
 } catch {
-    Write-Error "ERROR: Failed to copy executable to $BinDir: $_"
+    Write-Error "ERROR: Failed to copy executable to ${BinDir}: $_"
     $ProgressPreference = $oldProgressPreference
     exit 1
 }

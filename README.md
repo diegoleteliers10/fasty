@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instala
 
 #### Windows (PowerShell)
 ```powershell
-irm https://raw.githubusercontent.com/diegoleteliers10/fastty/main/instalar.ps1 | iex
+irm https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.ps1 | iex
 ```
 
 ---

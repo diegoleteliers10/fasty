@@ -147,8 +147,12 @@ impl RenderOnce for StatusBar {
 
                     if is_git_seg {
                         if let Some(cb) = git_cb {
+                            let cb_left = cb.clone();
                             el = el
                                 .cursor(gpui::CursorStyle::PointingHand)
+                                .on_mouse_down(gpui::MouseButton::Left, move |ev, win, app| {
+                                    cb_left(ev, win, app);
+                                })
                                 .on_mouse_down(gpui::MouseButton::Right, move |ev, win, app| {
                                     cb(ev, win, app);
                                 });
@@ -184,9 +188,14 @@ impl RenderOnce for StatusBar {
                     );
 
                 if let Some(cb) = git_cb {
-                    el = el.on_mouse_down(gpui::MouseButton::Right, move |ev, win, app| {
-                        cb(ev, win, app);
-                    });
+                    let cb_left = cb.clone();
+                    el = el
+                        .on_mouse_down(gpui::MouseButton::Left, move |ev, win, app| {
+                            cb_left(ev, win, app);
+                        })
+                        .on_mouse_down(gpui::MouseButton::Right, move |ev, win, app| {
+                            cb(ev, win, app);
+                        });
                 }
                 items.push(el);
             }

@@ -31,6 +31,7 @@ pub struct TabData {
     pub cwd: Option<std::path::PathBuf>,
     pub git_status: Option<GitStatus>,
     pub git_checked_cwd: Option<std::path::PathBuf>,
+    pub git_last_poll: Option<std::time::Instant>,
     pub last_duration_ms: Option<u128>,
     pub last_exit_code: Option<i32>,
 }
@@ -775,6 +776,7 @@ pub struct RootView {
     pub project_jumper_query: String,
     pub project_jumper_selected: usize,
     pub is_git_menu_open: bool,
+    pub is_git_branch_sub_open: bool,
     pub git_menu_pos: Option<(f32, f32)>,
     pub command_palette_scroll_handle: ScrollHandle,
     pub ssh_manager_scroll_handle: ScrollHandle,
@@ -790,6 +792,7 @@ pub struct RootView {
     pub cursor_blink_visible: bool,
     pub last_cursor_activity: std::time::Instant,
     pub last_scroll_activity: std::time::Instant,
+    pub scroll_accum: f32,
     pub is_dragging_scrollbar: bool,
     pub scrollbar_drag_start_y: f32,
     pub scrollbar_drag_start_offset: usize,
@@ -936,6 +939,7 @@ impl RootView {
             project_jumper_query: String::new(),
             project_jumper_selected: 0,
             is_git_menu_open: false,
+            is_git_branch_sub_open: false,
             git_menu_pos: None,
             command_palette_scroll_handle: ScrollHandle::new(),
             ssh_manager_scroll_handle: ScrollHandle::new(),
@@ -951,6 +955,7 @@ impl RootView {
             cursor_blink_visible: true,
             last_cursor_activity: std::time::Instant::now(),
             last_scroll_activity: std::time::Instant::now() - std::time::Duration::from_secs(10),
+            scroll_accum: 0.0,
             is_dragging_scrollbar: false,
             scrollbar_drag_start_y: 0.0,
             scrollbar_drag_start_offset: 0,
@@ -1138,9 +1143,31 @@ impl RootView {
                             if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
                                 let p = std::path::PathBuf::from(&cwd);
                                 tab.git_status = crate::git::fetch_git_info(&p);
+                                tab.git_checked_cwd = Some(p.clone());
+                                tab.git_last_poll = Some(std::time::Instant::now());
                                 tab.cwd = Some(p);
                             }
                             this.persist_session();
+                            cx.notify();
+                        }
+                        AppEvent::CommandFinished { duration_ms, exit_code } => {
+                            if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
+                                tab.last_duration_ms = Some(duration_ms);
+                                tab.last_exit_code = exit_code;
+                                if let Some(ref cwd) = tab.cwd {
+                                    tab.git_status = crate::git::fetch_git_info(cwd);
+                                    tab.git_last_poll = Some(std::time::Instant::now());
+                                }
+                            }
+                            cx.notify();
+                        }
+                        AppEvent::PromptStarted { .. } => {
+                            if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
+                                if let Some(ref cwd) = tab.cwd {
+                                    tab.git_status = crate::git::fetch_git_info(cwd);
+                                    tab.git_last_poll = Some(std::time::Instant::now());
+                                }
+                            }
                             cx.notify();
                         }
                         _ => {
@@ -1175,6 +1202,7 @@ impl RootView {
             cwd: initial_cwd.clone(),
             git_status: initial_git,
             git_checked_cwd: initial_cwd,
+            git_last_poll: Some(std::time::Instant::now()),
             last_duration_ms: None,
             last_exit_code: None,
         });
@@ -1236,9 +1264,31 @@ impl RootView {
                             if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
                                 let p = std::path::PathBuf::from(&cwd);
                                 tab.git_status = crate::git::fetch_git_info(&p);
+                                tab.git_checked_cwd = Some(p.clone());
+                                tab.git_last_poll = Some(std::time::Instant::now());
                                 tab.cwd = Some(p);
                             }
                             this.persist_session();
+                            cx.notify();
+                        }
+                        AppEvent::CommandFinished { duration_ms, exit_code } => {
+                            if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
+                                tab.last_duration_ms = Some(duration_ms);
+                                tab.last_exit_code = exit_code;
+                                if let Some(ref cwd) = tab.cwd {
+                                    tab.git_status = crate::git::fetch_git_info(cwd);
+                                    tab.git_last_poll = Some(std::time::Instant::now());
+                                }
+                            }
+                            cx.notify();
+                        }
+                        AppEvent::PromptStarted { .. } => {
+                            if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
+                                if let Some(ref cwd) = tab.cwd {
+                                    tab.git_status = crate::git::fetch_git_info(cwd);
+                                    tab.git_last_poll = Some(std::time::Instant::now());
+                                }
+                            }
                             cx.notify();
                         }
                         _ => {
@@ -2080,6 +2130,7 @@ impl RootView {
             self.is_about_open = false;
             self.is_context_menu_open = false;
             self.is_git_menu_open = false;
+            self.is_git_branch_sub_open = false;
             self.is_tab_context_menu_open = false;
             self.is_update_modal_open = false;
             cx.notify();
@@ -2737,10 +2788,33 @@ impl RootView {
         );
 
         if self.is_selecting {
+            let raw_y = event.position.y.to_f64() as f32;
+            let top_edge = 38.0;
+            let bottom_edge = 38.0 + avail_h;
+
+            if raw_y < top_edge {
+                // Dragging above the visible viewport: scroll up into history
+                let overflow_px = top_edge - raw_y;
+                let scroll_lines = ((overflow_px / line_h).ceil() as isize).clamp(1, 10);
+                terminal.scroll(scroll_lines);
+            } else if raw_y > bottom_edge {
+                // Dragging below the visible viewport: scroll down towards bottom
+                let overflow_px = raw_y - bottom_edge;
+                let scroll_lines = -(((overflow_px / line_h).ceil() as isize).clamp(1, 10));
+                terminal.scroll(scroll_lines);
+            }
+
+            let new_display_offset = terminal.display_offset();
+            let updated_grid_row = (((local_y / line_h).floor() as i32) - (new_display_offset as i32)).clamp(-(history_size as i32), screen_rows - 1);
+            let updated_point = alacritty_terminal::index::Point::new(
+                alacritty_terminal::index::Line(updated_grid_row),
+                alacritty_terminal::index::Column(grid_col),
+            );
+
             if let Some(start_p) = self.selection_start {
                 self.selection = Some(Selection {
                     start: start_p,
-                    end: current_point,
+                    end: updated_point,
                 });
                 cx.notify();
             }
@@ -2836,19 +2910,22 @@ impl RootView {
             return;
         };
 
+        let (_, line_h) = self.measure_cell_metrics(_window);
+        let px_per_line = if line_h > 0.0 { line_h } else { 18.0 };
+
         let delta_y = match event.delta {
             gpui::ScrollDelta::Pixels(p) => p.y.as_f32(),
-            gpui::ScrollDelta::Lines(l) => l.y * 20.0,
+            gpui::ScrollDelta::Lines(l) => l.y * px_per_line * 3.0,
         };
 
-        if delta_y.abs() > 0.5 {
+        if delta_y.abs() > 0.1 {
             self.last_scroll_activity = std::time::Instant::now();
             if terminal.is_mouse_mode_enabled() {
-                let (cell_w, line_h) = self.measure_cell_metrics(_window);
+                let (cell_w, _) = self.measure_cell_metrics(_window);
                 let local_x = (event.position.x.to_f64() as f32 - 12.0).max(0.0);
                 let local_y = (event.position.y.to_f64() as f32 - 38.0).max(0.0);
                 let col = ((local_x / cell_w).floor() as usize) + 1;
-                let row = ((local_y / line_h).floor() as usize) + 1;
+                let row = ((local_y / px_per_line).floor() as usize) + 1;
                 let btn = if delta_y > 0.0 { 64 } else { 65 };
                 terminal.send_mouse_button_with_mods(
                     btn,
@@ -2860,10 +2937,35 @@ impl RootView {
                     event.modifiers.control,
                 );
             } else {
-                let lines = (delta_y / 15.0).round() as isize;
+                let display_offset = terminal.display_offset();
+                let history_size = terminal.history_size();
+
+                // If already at the bottom and trying to scroll down, stop immediately
+                if display_offset == 0 && delta_y < 0.0 {
+                    self.scroll_accum = 0.0;
+                    return;
+                }
+                // If already at the top of history and trying to scroll up, stop immediately
+                if display_offset >= history_size && delta_y > 0.0 {
+                    self.scroll_accum = 0.0;
+                    return;
+                }
+
+                self.scroll_accum += delta_y;
+                let lines = (self.scroll_accum / px_per_line) as isize;
                 if lines != 0 {
-                    terminal.scroll(lines);
-                    cx.notify();
+                    self.scroll_accum -= (lines as f32) * px_per_line;
+
+                    let new_offset = (display_offset as isize + lines).clamp(0, history_size as isize) as usize;
+                    if new_offset != display_offset {
+                        terminal.scroll_to_offset(new_offset);
+                        cx.notify();
+                    }
+
+                    // Clear remainder when reaching boundary
+                    if new_offset == 0 || new_offset == history_size {
+                        self.scroll_accum = 0.0;
+                    }
                 }
             }
         }
@@ -2912,8 +3014,13 @@ impl Render for RootView {
         }
 
         let (active_cwd, active_git, fallback_info) = if let Some(active_tab) = self.tabs.get_mut(self.active_tab_idx) {
-            if active_tab.git_checked_cwd.as_ref() != active_tab.cwd.as_ref() {
+            let now = std::time::Instant::now();
+            let should_poll = active_tab.git_checked_cwd.as_ref() != active_tab.cwd.as_ref()
+                || active_tab.git_last_poll.map_or(true, |last| now.duration_since(last) >= std::time::Duration::from_secs(2));
+
+            if should_poll {
                 active_tab.git_checked_cwd = active_tab.cwd.clone();
+                active_tab.git_last_poll = Some(now);
                 if let Some(ref cwd) = active_tab.cwd {
                     active_tab.git_status = crate::git::fetch_git_info(cwd);
                 } else {
@@ -5275,10 +5382,21 @@ impl Render for RootView {
                                 ))
                                 .child(render_context_menu_item(
                                     IconType::GitBranch,
+                                    "Change Branch",
+                                    Some("▶"),
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        this.is_git_branch_sub_open = !this.is_git_branch_sub_open;
+                                        cx.notify();
+                                    }),
+                                    theme,
+                                ))
+                                .child(render_context_menu_item(
+                                    IconType::GitBranch,
                                     "Git Worktree Picker",
                                     Some(if cfg!(target_os = "macos") { "⌘⌥W" } else { "Ctrl+Alt+W" }),
                                     cx.listener(|this, _ev, window, cx| {
                                         this.is_git_menu_open = false;
+                                        this.is_git_branch_sub_open = false;
                                         this.toggle_worktree_picker(window, cx);
                                     }),
                                     theme,
@@ -5291,6 +5409,7 @@ impl Render for RootView {
                                         let b_name = branch_name.clone();
                                         cx.listener(move |this, _ev, _window, cx| {
                                             this.is_git_menu_open = false;
+                                            this.is_git_branch_sub_open = false;
                                             if let Some(mut clip) = crate::event_listener::clipboard_helper() {
                                                 let _ = clip.set_text(b_name.clone());
                                             }
@@ -5306,13 +5425,135 @@ impl Render for RootView {
                                         None,
                                         cx.listener(move |this, _ev, _window, cx| {
                                             this.is_git_menu_open = false;
+                                            this.is_git_branch_sub_open = false;
                                             open_path_or_url(&url);
                                             cx.notify();
                                         }),
                                         theme,
                                     ))
                                 }),
-                        ),
+                        )
+                        .when(self.is_git_branch_sub_open, |parent| {
+                            let active_cwd = self.tabs.get(self.active_tab_idx).and_then(|t| t.cwd.as_deref());
+                            let branches = active_cwd.map(crate::git::list_local_branches).unwrap_or_default();
+                            let current_branch = branch_name.clone();
+
+                            parent.child(
+                                div()
+                                    .id("git-branch-submenu-popup")
+                                    .absolute()
+                                    .bottom(px(32.))
+                                    .left(px(258.))
+                                    .w(px(210.))
+                                    .max_h(px(320.))
+                                    .overflow_y_scroll()
+                                    .p(px(6.))
+                                    .rounded(px(8.))
+                                    .bg(theme.surface)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .shadow_xl()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .child(
+                                        div()
+                                            .px(px(8.))
+                                            .py(px(4.))
+                                            .border_b_1()
+                                            .border_color(theme.border)
+                                            .text_size(px(10.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(theme.muted)
+                                            .child("LOCAL BRANCHES"),
+                                    )
+                                    .children(
+                                        if branches.is_empty() {
+                                            vec![
+                                                div()
+                                                    .px(px(8.))
+                                                    .py(px(6.))
+                                                    .text_size(px(11.))
+                                                    .text_color(theme.muted)
+                                                    .child("No branches found")
+                                                    .into_any_element()
+                                            ]
+                                        } else {
+                                            branches
+                                                .into_iter()
+                                                .map(|b| {
+                                                    let is_current = b == current_branch;
+                                                    let target_branch = b.clone();
+                                                    let target_branch_cb = b.clone();
+                                                    let hover_bg = theme.hover;
+                                                    let active_bg = theme.surface_raised;
+
+                                                    div()
+                                                        .id(SharedString::from(format!("branch-item-{}", target_branch)))
+                                                        .flex()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .w_full()
+                                                        .px(px(8.))
+                                                        .py(px(5.5))
+                                                        .rounded(px(6.))
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .hover(move |s| s.bg(hover_bg))
+                                                        .active(move |s| s.bg(active_bg))
+                                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                                            this.is_git_menu_open = false;
+                                                            this.is_git_branch_sub_open = false;
+                                                            if !is_current {
+                                                                if let Some(tab) = this.tabs.get(this.active_tab_idx) {
+                                                                    if let Some(ref term) = tab.terminal {
+                                                                        term.write_to_pty(format!("git checkout {}\r", target_branch_cb).as_bytes());
+                                                                    }
+                                                                }
+                                                            }
+                                                            cx.notify();
+                                                        }))
+                                                        .child(
+                                                            div()
+                                                                .flex()
+                                                                .flex_row()
+                                                                .items_center()
+                                                                .gap_2()
+                                                                .child(render_icon(
+                                                                    IconType::GitBranch,
+                                                                    if is_current { theme.green } else { theme.accent },
+                                                                    12.0,
+                                                                ))
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(12.))
+                                                                        .font_weight(if is_current { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                                                        .text_color(if is_current { theme.green } else { theme.foreground })
+                                                                        .child(target_branch),
+                                                                ),
+                                                        )
+                                                        .when(is_current, |el| {
+                                                            el.child(
+                                                                div()
+                                                                    .text_size(px(10.))
+                                                                    .font_weight(FontWeight::BOLD)
+                                                                    .text_color(theme.green)
+                                                                    .child("✓"),
+                                                            )
+                                                        })
+                                                        .into_any_element()
+                                                })
+                                                .collect()
+                                        }
+                                    ),
+                            )
+                        }),
                 )
             })
             .when(self.is_update_modal_open, |this| {

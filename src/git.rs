@@ -146,6 +146,23 @@ pub fn list_worktrees(cwd: &Path) -> Vec<Worktree> {
     }
 }
 
+pub fn list_local_branches(cwd: &Path) -> Vec<String> {
+    let Ok(repo) = git2::Repository::discover(cwd) else {
+        return Vec::new();
+    };
+    let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for item in branches.flatten() {
+        if let Ok(Some(name)) = item.0.name() {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    names
+}
+
 /// Sanitize a branch name for use as a directory suffix: replace `/` with `-`,
 /// drop characters that are awkward in paths.
 pub fn sanitize_branch_for_path(branch: &str) -> String {
