@@ -5,7 +5,7 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor}
 use gpui::{
     Bounds, Context, CursorStyle, Div, FocusHandle, FontFeatures, FontWeight, Hsla, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle,
-    ScrollWheelEvent, SharedString, TextRun, TitlebarOptions, Window, WindowBackgroundAppearance,
+    ScrollWheelEvent, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
     WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 
@@ -15,6 +15,7 @@ use super::theme::{Theme, rgb_to_hsla};
 use crate::config::{self, Config};
 use crate::event_listener::EventSender;
 use crate::git::GitStatus;
+use crate::pane_tree::{Direction, PaneNode, PaneTree, SplitDirection, TerminalPane};
 use crate::terminal_state::{AppEvent, TerminalState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +26,7 @@ pub struct Selection {
 
 pub struct TabData {
     pub id: usize,
+    pub pane_tree: PaneTree,
     pub title: String,
     pub custom_title: Option<String>,
     pub terminal: Option<Arc<TerminalState>>,
@@ -716,7 +718,7 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
         PaletteCommand { id: "new_tab", icon: IconType::Plus, title: "New Tab", category: "Terminal", shortcut: Some(if is_mac { "⌘T" } else { "Ctrl+Shift+T" }) },
         PaletteCommand { id: "new_window", icon: IconType::ExternalLink, title: "New Window", category: "Window", shortcut: Some(if is_mac { "⌘⇧N" } else { "Ctrl+Shift+N" }) },
         PaletteCommand { id: "rename_tab", icon: IconType::Pencil, title: "Rename Active Tab", category: "Terminal", shortcut: Some(if is_mac { "⌘⇧R" } else { "Ctrl+Shift+R" }) },
-        PaletteCommand { id: "close_tab", icon: IconType::X, title: "Close Active Tab", category: "Terminal", shortcut: Some(if is_mac { "⌘W" } else { "Ctrl+Shift+W" }) },
+        PaletteCommand { id: "close_tab", icon: IconType::X, title: "Close Active Tab", category: "Terminal", shortcut: Some(if is_mac { "⌘⇧W" } else { "Ctrl+Shift+Q" }) },
         PaletteCommand { id: "search", icon: IconType::Search, title: "Search in Buffer", category: "Terminal", shortcut: Some(if is_mac { "⌘F" } else { "Ctrl+Shift+F" }) },
         PaletteCommand { id: "clear", icon: IconType::Trash2, title: "Clear Scrollback", category: "Terminal", shortcut: Some(if is_mac { "⌘K" } else { "Ctrl+Shift+K" }) },
         PaletteCommand { id: "worktree", icon: IconType::GitPullRequest, title: "Git Worktree Picker", category: "Git", shortcut: Some(if is_mac { "⌘⌥W" } else { "Ctrl+Alt+W" }) },
@@ -735,6 +737,15 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
         PaletteCommand { id: "theme_high_contrast", icon: IconType::Palette, title: "Theme: Switch to High Contrast", category: "Theme", shortcut: None },
         PaletteCommand { id: "open_config", icon: IconType::FolderOpen, title: "Open Config Folder", category: "Preferences", shortcut: None },
         PaletteCommand { id: "edit_config", icon: IconType::FileCode, title: "Edit config.toml", category: "Preferences", shortcut: None },
+        PaletteCommand { id: "split_right", icon: IconType::Plus, title: "Split Pane Right", category: "Panes", shortcut: Some(if is_mac { "⌘D" } else { "Ctrl+Shift+E" }) },
+        PaletteCommand { id: "split_down", icon: IconType::Plus, title: "Split Pane Down", category: "Panes", shortcut: Some(if is_mac { "⌘⇧D" } else { "Ctrl+Shift+O" }) },
+        PaletteCommand { id: "split_left", icon: IconType::Plus, title: "Split Pane Left", category: "Panes", shortcut: None },
+        PaletteCommand { id: "split_top", icon: IconType::Plus, title: "Split Pane Top", category: "Panes", shortcut: None },
+        PaletteCommand { id: "focus_left", icon: IconType::ChevronLeft, title: "Focus Pane Left", category: "Panes", shortcut: Some(if is_mac { "⌥⌘←" } else { "Alt+←" }) },
+        PaletteCommand { id: "focus_right", icon: IconType::ChevronRight, title: "Focus Pane Right", category: "Panes", shortcut: Some(if is_mac { "⌥⌘→" } else { "Alt+→" }) },
+        PaletteCommand { id: "focus_top", icon: IconType::ChevronUp, title: "Focus Pane Top", category: "Panes", shortcut: Some(if is_mac { "⌥⌘↑" } else { "Alt+↑" }) },
+        PaletteCommand { id: "focus_down", icon: IconType::ChevronDown, title: "Focus Pane Down", category: "Panes", shortcut: Some(if is_mac { "⌥⌘↓" } else { "Alt+↓" }) },
+        PaletteCommand { id: "close_pane", icon: IconType::X, title: "Close Active Pane", category: "Panes", shortcut: Some(if is_mac { "⌘W" } else { "Ctrl+Shift+W" }) },
         PaletteCommand { id: "quit", icon: IconType::LogOut, title: "Quit Fastty", category: "Application", shortcut: Some(if is_mac { "⌘Q" } else { "Alt+F4" }) },
     ]
 }
@@ -746,6 +757,7 @@ pub struct RootView {
     tabs: Vec<TabData>,
     active_tab_idx: usize,
     next_tab_id: usize,
+    pub next_pane_id: usize,
     focus_handle: FocusHandle,
     font_size: f32,
     font_family: SharedString,
@@ -759,6 +771,9 @@ pub struct RootView {
     pub is_tab_context_menu_open: bool,
     pub tab_context_menu_tab_id: usize,
     pub tab_context_menu_pos: (f32, f32),
+    pub is_pane_context_menu_open: bool,
+    pub pane_context_menu_pane_id: usize,
+    pub pane_context_menu_pos: (f32, f32),
     pub is_command_palette_open: bool,
     pub command_palette_query: String,
     pub command_palette_selected: usize,
@@ -794,6 +809,8 @@ pub struct RootView {
     pub last_scroll_activity: std::time::Instant,
     pub scroll_accum: f32,
     pub is_dragging_scrollbar: bool,
+    pub dragging_scrollbar_pane_id: Option<usize>,
+    pub last_scrolled_pane_id: Option<usize>,
     pub scrollbar_drag_start_y: f32,
     pub scrollbar_drag_start_offset: usize,
     pub update_available: Option<crate::updater::ReleaseInfo>,
@@ -909,6 +926,7 @@ impl RootView {
             tabs: Vec::new(),
             active_tab_idx: 0,
             next_tab_id: 1,
+            next_pane_id: 1,
             focus_handle,
             font_size,
             font_family,
@@ -922,6 +940,9 @@ impl RootView {
             is_tab_context_menu_open: false,
             tab_context_menu_tab_id: 0,
             tab_context_menu_pos: (0.0, 0.0),
+            is_pane_context_menu_open: false,
+            pane_context_menu_pane_id: 0,
+            pane_context_menu_pos: (0.0, 0.0),
             is_command_palette_open: false,
             command_palette_query: String::new(),
             command_palette_selected: 0,
@@ -957,6 +978,8 @@ impl RootView {
             last_scroll_activity: std::time::Instant::now() - std::time::Duration::from_secs(10),
             scroll_accum: 0.0,
             is_dragging_scrollbar: false,
+            dragging_scrollbar_pane_id: None,
+            last_scrolled_pane_id: None,
             scrollbar_drag_start_y: 0.0,
             scrollbar_drag_start_offset: 0,
             update_available: None,
@@ -1087,20 +1110,20 @@ impl RootView {
         }
     }
 
-    pub fn create_tab_with_cmd_and_cwd(
+    pub fn spawn_terminal_pane(
         &mut self,
         cmd: &str,
         args: &[String],
         cwd: Option<&std::path::Path>,
         title_override: Option<String>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let tab_id = self.next_tab_id;
-        self.next_tab_id += 1;
+    ) -> TerminalPane {
+        let pane_id = self.next_pane_id;
+        self.next_pane_id += 1;
 
         let font_config = self.config.font.clone();
-        let (cell_w, line_h) = self.measure_cell_metrics(_window);
+        let (cell_w, line_h) = self.measure_cell_metrics(window);
 
         let (event_tx, event_rx) = async_channel::unbounded::<AppEvent>();
         let event_sender = EventSender::Callback(Arc::new(move |event| {
@@ -1123,7 +1146,7 @@ impl RootView {
 
         let terminal_arc = Arc::new(terminal);
 
-        cx.spawn_in(_window, async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = event_rx.recv().await {
                 while let Ok(AppEvent::Wakeup) = event_rx.try_recv() {}
 
@@ -1133,39 +1156,68 @@ impl RootView {
                             cx.notify();
                         }
                         AppEvent::TitleChanged(title) => {
-                            if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
-                                tab.title = title;
+                            for tab in &mut this.tabs {
+                                if let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) {
+                                    pane.title = title.clone();
+                                    if tab.pane_tree.active_pane_id == pane_id {
+                                        tab.title = title.clone();
+                                    }
+                                }
                             }
                             this.persist_session();
                             cx.notify();
                         }
                         AppEvent::CwdChanged(cwd) => {
-                            if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
-                                let p = std::path::PathBuf::from(&cwd);
-                                tab.git_status = crate::git::fetch_git_info(&p);
-                                tab.git_checked_cwd = Some(p.clone());
-                                tab.git_last_poll = Some(std::time::Instant::now());
-                                tab.cwd = Some(p);
+                            let p = std::path::PathBuf::from(&cwd);
+                            let git = crate::git::fetch_git_info(&p);
+                            let now = std::time::Instant::now();
+                            for tab in &mut this.tabs {
+                                if let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) {
+                                    pane.git_status = git.clone();
+                                    pane.git_checked_cwd = Some(p.clone());
+                                    pane.git_last_poll = Some(now);
+                                    pane.cwd = Some(p.clone());
+                                    if tab.pane_tree.active_pane_id == pane_id {
+                                        tab.git_status = git.clone();
+                                        tab.git_checked_cwd = Some(p.clone());
+                                        tab.git_last_poll = Some(now);
+                                        tab.cwd = Some(p.clone());
+                                    }
+                                }
                             }
                             this.persist_session();
                             cx.notify();
                         }
                         AppEvent::CommandFinished { duration_ms, exit_code } => {
-                            if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
-                                tab.last_duration_ms = Some(duration_ms);
-                                tab.last_exit_code = exit_code;
-                                if let Some(ref cwd) = tab.cwd {
-                                    tab.git_status = crate::git::fetch_git_info(cwd);
-                                    tab.git_last_poll = Some(std::time::Instant::now());
+                            for tab in &mut this.tabs {
+                                let is_active = tab.pane_tree.active_pane_id == pane_id;
+                                if let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) {
+                                    pane.last_duration_ms = Some(duration_ms);
+                                    pane.last_exit_code = exit_code;
+                                    if let Some(ref cwd) = pane.cwd {
+                                        pane.git_status = crate::git::fetch_git_info(cwd);
+                                        pane.git_last_poll = Some(std::time::Instant::now());
+                                    }
+                                    if is_active {
+                                        tab.last_duration_ms = Some(duration_ms);
+                                        tab.last_exit_code = exit_code;
+                                        tab.git_status = pane.git_status.clone();
+                                    }
                                 }
                             }
                             cx.notify();
                         }
                         AppEvent::PromptStarted { .. } => {
-                            if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
-                                if let Some(ref cwd) = tab.cwd {
-                                    tab.git_status = crate::git::fetch_git_info(cwd);
-                                    tab.git_last_poll = Some(std::time::Instant::now());
+                            for tab in &mut this.tabs {
+                                let is_active = tab.pane_tree.active_pane_id == pane_id;
+                                if let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) {
+                                    if let Some(ref cwd) = pane.cwd {
+                                        pane.git_status = crate::git::fetch_git_info(cwd);
+                                        pane.git_last_poll = Some(std::time::Instant::now());
+                                    }
+                                    if is_active {
+                                        tab.git_status = pane.git_status.clone();
+                                    }
                                 }
                             }
                             cx.notify();
@@ -1192,16 +1244,51 @@ impl RootView {
             .map(|n| n.trim_end_matches(".exe"))
             .filter(|n| !n.is_empty())
             .unwrap_or("fastty");
-        let tab_title = title_override.unwrap_or_else(|| default_shell_name.to_string());
+        let pane_title = title_override.unwrap_or_else(|| default_shell_name.to_string());
 
-        self.tabs.push(TabData {
-            id: tab_id,
-            title: tab_title,
-            custom_title: None,
+        TerminalPane {
+            id: pane_id,
             terminal: Some(terminal_arc),
+            title: pane_title,
+            custom_title: None,
             cwd: initial_cwd.clone(),
             git_status: initial_git,
             git_checked_cwd: initial_cwd,
+            git_last_poll: Some(std::time::Instant::now()),
+            last_duration_ms: None,
+            last_exit_code: None,
+            last_bounds: None,
+        }
+    }
+
+    pub fn create_tab_with_cmd_and_cwd(
+        &mut self,
+        cmd: &str,
+        args: &[String],
+        cwd: Option<&std::path::Path>,
+        title_override: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_id = self.next_tab_id;
+        self.next_tab_id += 1;
+
+        let pane = self.spawn_terminal_pane(cmd, args, cwd, title_override, window, cx);
+        let pane_title = pane.title.clone();
+        let pane_cwd = pane.cwd.clone();
+        let pane_git = pane.git_status.clone();
+        let pane_term = pane.terminal.clone();
+        let pane_tree = PaneTree::new(pane);
+
+        self.tabs.push(TabData {
+            id: tab_id,
+            pane_tree,
+            title: pane_title,
+            custom_title: None,
+            terminal: pane_term,
+            cwd: pane_cwd.clone(),
+            git_status: pane_git,
+            git_checked_cwd: pane_cwd,
             git_last_poll: Some(std::time::Instant::now()),
             last_duration_ms: None,
             last_exit_code: None,
@@ -1210,6 +1297,71 @@ impl RootView {
         self.active_tab_idx = self.tabs.len() - 1;
         self.persist_session();
         cx.notify();
+    }
+
+    pub fn split_active_pane(
+        &mut self,
+        direction: Direction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_tab) = self.tabs.get(self.active_tab_idx) else { return; };
+        let current_cwd = active_tab.pane_tree.active_pane().and_then(|p| p.cwd.clone()).or_else(|| active_tab.cwd.clone());
+        let default_shell = self.config.shell.clone().or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(crate::paths::default_system_shell);
+        let new_pane = self.spawn_terminal_pane(&default_shell, &[], current_cwd.as_deref(), None, window, cx);
+        if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
+            tab.pane_tree.split_active_pane(new_pane, direction);
+            if let Some(pane) = tab.pane_tree.active_pane() {
+                tab.terminal = pane.terminal.clone();
+                tab.cwd = pane.cwd.clone();
+                tab.git_status = pane.git_status.clone();
+            }
+        }
+        self.persist_session();
+        cx.notify();
+    }
+
+    pub fn focus_pane_in_direction(
+        &mut self,
+        direction: Direction,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
+            if let Some(_target_id) = tab.pane_tree.focus_direction(direction) {
+                if let Some(pane) = tab.pane_tree.active_pane() {
+                    tab.terminal = pane.terminal.clone();
+                    tab.cwd = pane.cwd.clone();
+                    tab.git_status = pane.git_status.clone();
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn close_active_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_is_single_pane = self.tabs.get(self.active_tab_idx).map_or(false, |t| t.pane_tree.pane_count() <= 1);
+        if tab_is_single_pane {
+            if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                let tab_id = tab.id;
+                self.close_tab(tab_id, window, cx);
+            }
+        } else {
+            if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
+                let active_id = tab.pane_tree.active_pane_id;
+                tab.pane_tree.close_pane(active_id);
+                if let Some(pane) = tab.pane_tree.active_pane() {
+                    tab.terminal = pane.terminal.clone();
+                    tab.cwd = pane.cwd.clone();
+                    tab.git_status = pane.git_status.clone();
+                }
+            }
+            self.persist_session();
+            cx.notify();
+        }
     }
 
     pub fn with_initial_tab(window: &mut Window, cli_opts: crate::cli::CliOptions, tab_data: TabData, cx: &mut Context<Self>) -> Self {
@@ -1327,6 +1479,11 @@ impl RootView {
 
     pub fn select_tab(&mut self, tab_id: usize, cx: &mut Context<Self>) {
         if let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) {
+            if self.active_tab_idx != idx {
+                self.selection = None;
+                self.is_selecting = false;
+                self.selection_start = None;
+            }
             self.active_tab_idx = idx;
             self.persist_session();
             cx.notify();
@@ -1334,6 +1491,9 @@ impl RootView {
     }
 
     pub fn close_tab(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.selection = None;
+        self.is_selecting = false;
+        self.selection_start = None;
         if let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) {
             self.tabs.remove(idx);
             if self.tabs.is_empty() {
@@ -1404,6 +1564,7 @@ impl RootView {
             self.is_settings_open = false;
             self.is_about_open = false;
             self.is_tab_context_menu_open = false;
+            self.is_pane_context_menu_open = false;
             self.is_command_palette_open = false;
             self.is_ssh_manager_open = false;
             self.is_search_open = false;
@@ -1417,6 +1578,22 @@ impl RootView {
         self.tab_context_menu_pos = (x, y);
         self.is_settings_open = false;
         self.is_context_menu_open = false;
+        self.is_pane_context_menu_open = false;
+        self.is_about_open = false;
+        self.is_command_palette_open = false;
+        self.is_ssh_manager_open = false;
+        self.is_search_open = false;
+        self.is_git_menu_open = false;
+        cx.notify();
+    }
+
+    pub fn open_pane_context_menu(&mut self, pane_id: usize, x: f32, y: f32, cx: &mut Context<Self>) {
+        self.is_pane_context_menu_open = true;
+        self.pane_context_menu_pane_id = pane_id;
+        self.pane_context_menu_pos = (x, y);
+        self.is_settings_open = false;
+        self.is_context_menu_open = false;
+        self.is_tab_context_menu_open = false;
         self.is_about_open = false;
         self.is_command_palette_open = false;
         self.is_ssh_manager_open = false;
@@ -1601,6 +1778,15 @@ impl RootView {
                 Self::open_settings_file();
                 cx.notify();
             }
+            "split_right" => self.split_active_pane(Direction::Right, _window, cx),
+            "split_down" => self.split_active_pane(Direction::Down, _window, cx),
+            "split_left" => self.split_active_pane(Direction::Left, _window, cx),
+            "split_top" => self.split_active_pane(Direction::Top, _window, cx),
+            "focus_left" => self.focus_pane_in_direction(Direction::Left, cx),
+            "focus_right" => self.focus_pane_in_direction(Direction::Right, cx),
+            "focus_top" | "focus_up" => self.focus_pane_in_direction(Direction::Top, cx),
+            "focus_down" => self.focus_pane_in_direction(Direction::Down, cx),
+            "close_pane" => self.close_active_pane(_window, cx),
             "quit" => cx.quit(),
             _ => {}
         }
@@ -2123,7 +2309,7 @@ impl RootView {
         }
 
         // 6. Dismiss open static overlays on Escape
-        if (self.is_settings_open || self.is_about_open || self.is_context_menu_open || self.is_git_menu_open || self.is_tab_context_menu_open || self.is_update_modal_open)
+        if (self.is_settings_open || self.is_about_open || self.is_context_menu_open || self.is_git_menu_open || self.is_tab_context_menu_open || self.is_pane_context_menu_open || self.is_update_modal_open)
             && (key_lower == "escape" || key_lower == "esc")
         {
             self.is_settings_open = false;
@@ -2132,6 +2318,7 @@ impl RootView {
             self.is_git_menu_open = false;
             self.is_git_branch_sub_open = false;
             self.is_tab_context_menu_open = false;
+            self.is_pane_context_menu_open = false;
             self.is_update_modal_open = false;
             cx.notify();
             return;
@@ -2246,11 +2433,86 @@ impl RootView {
             return;
         }
 
-        // 5. Close Tab (⌘W on macOS; Ctrl+Shift+W on Linux/Windows)
-        let is_close_tab = if cfg!(target_os = "macos") {
-            modifiers.platform && key_lower == "w"
+        // 4c. Split Right (⌘D on macOS; Ctrl+Shift+E on Linux/Windows)
+        let is_split_right = if cfg!(target_os = "macos") {
+            modifiers.platform && !modifiers.shift && key_lower == "d"
+        } else {
+            modifiers.control && modifiers.shift && key_lower == "e"
+        };
+        if is_split_right {
+            self.split_active_pane(Direction::Right, _window, cx);
+            return;
+        }
+
+        // 4d. Split Down (⌘⇧D on macOS; Ctrl+Shift+O on Linux/Windows)
+        let is_split_down = if cfg!(target_os = "macos") {
+            modifiers.platform && modifiers.shift && key_lower == "d"
+        } else {
+            modifiers.control && modifiers.shift && key_lower == "o"
+        };
+        if is_split_down {
+            self.split_active_pane(Direction::Down, _window, cx);
+            return;
+        }
+
+        // 4e. Focus Panes (⌥⌘←↑→↓ on macOS; Alt+←↑→↓ on Linux/Windows)
+        let is_focus_left = if cfg!(target_os = "macos") {
+            modifiers.platform && modifiers.alt && (key_lower == "left" || key_lower == "arrowleft")
+        } else {
+            modifiers.alt && (key_lower == "left" || key_lower == "arrowleft")
+        };
+        if is_focus_left {
+            self.focus_pane_in_direction(Direction::Left, cx);
+            return;
+        }
+
+        let is_focus_right = if cfg!(target_os = "macos") {
+            modifiers.platform && modifiers.alt && (key_lower == "right" || key_lower == "arrowright")
+        } else {
+            modifiers.alt && (key_lower == "right" || key_lower == "arrowright")
+        };
+        if is_focus_right {
+            self.focus_pane_in_direction(Direction::Right, cx);
+            return;
+        }
+
+        let is_focus_top = if cfg!(target_os = "macos") {
+            modifiers.platform && modifiers.alt && (key_lower == "up" || key_lower == "arrowup")
+        } else {
+            modifiers.alt && (key_lower == "up" || key_lower == "arrowup")
+        };
+        if is_focus_top {
+            self.focus_pane_in_direction(Direction::Top, cx);
+            return;
+        }
+
+        let is_focus_down = if cfg!(target_os = "macos") {
+            modifiers.platform && modifiers.alt && (key_lower == "down" || key_lower == "arrowdown")
+        } else {
+            modifiers.alt && (key_lower == "down" || key_lower == "arrowdown")
+        };
+        if is_focus_down {
+            self.focus_pane_in_direction(Direction::Down, cx);
+            return;
+        }
+
+        // 5. Close Active Pane (⌘W on macOS; Ctrl+Shift+W on Linux/Windows)
+        let is_close_pane = if cfg!(target_os = "macos") {
+            modifiers.platform && !modifiers.shift && key_lower == "w"
         } else {
             modifiers.control && modifiers.shift && key_lower == "w"
+        };
+        if is_close_pane {
+            self.close_active_pane(_window, cx);
+            return;
+        }
+
+        // 5b. Close Active Tab explicitly (⌘⇧W on macOS; Ctrl+Shift+Q / Ctrl+Alt+W on Linux/Windows)
+        let is_close_tab = if cfg!(target_os = "macos") {
+            modifiers.platform && modifiers.shift && key_lower == "w"
+        } else {
+            (modifiers.control && modifiers.shift && key_lower == "q")
+                || (modifiers.control && modifiers.alt && key_lower == "w")
         };
         if is_close_tab {
             if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
@@ -2266,6 +2528,9 @@ impl RootView {
             || (cfg!(target_os = "macos") && modifiers.platform && modifiers.shift && (key == "]" || key == "}"));
         if is_next_tab {
             if !self.tabs.is_empty() {
+                self.selection = None;
+                self.is_selecting = false;
+                self.selection_start = None;
                 self.active_tab_idx = (self.active_tab_idx + 1) % self.tabs.len();
                 cx.notify();
             }
@@ -2278,6 +2543,9 @@ impl RootView {
             || (cfg!(target_os = "macos") && modifiers.platform && modifiers.shift && (key == "[" || key == "{"));
         if is_prev_tab {
             if !self.tabs.is_empty() {
+                self.selection = None;
+                self.is_selecting = false;
+                self.selection_start = None;
                 self.active_tab_idx = if self.active_tab_idx == 0 {
                     self.tabs.len() - 1
                 } else {
@@ -2304,6 +2572,9 @@ impl RootView {
             if (1..=9).contains(&digit) {
                 let target = digit - 1;
                 if target < self.tabs.len() {
+                    self.selection = None;
+                    self.is_selecting = false;
+                    self.selection_start = None;
                     self.active_tab_idx = target;
                     cx.notify();
                     return;
@@ -2659,8 +2930,8 @@ impl RootView {
         };
 
         let (cell_w, line_h) = self.measure_cell_metrics(window);
-        let local_x = (event.position.x.to_f64() as f32 - 12.0).max(0.0);
-        let local_y = (event.position.y.to_f64() as f32 - 38.0).max(0.0);
+        let local_x = (event.position.x.to_f64() as f32 - 1.0).max(0.0);
+        let local_y = (event.position.y.to_f64() as f32 - 32.0).max(0.0);
         let col = ((local_x / cell_w).floor() as usize) + 1;
         let row = ((local_y / line_h).floor() as usize) + 1;
 
@@ -2703,7 +2974,7 @@ impl RootView {
             // Start Text Selection
             let history_size = terminal.history_size();
             let viewport_size = window.viewport_size();
-            let avail_h = (viewport_size.height.to_f64() as f32 - 54.0 - 12.0).max(100.0);
+            let avail_h = (viewport_size.height.to_f64() as f32 - 56.0).max(100.0);
             if local_y > avail_h {
                 return;
             }
@@ -2719,30 +2990,41 @@ impl RootView {
             self.selection_start = Some(start_point);
             self.selection = None;
             cx.notify();
+        } else if event.button == MouseButton::Right {
+            let active_pane_id = active_tab.pane_tree.active_pane_id;
+            let x = event.position.x.to_f64() as f32;
+            let y = event.position.y.to_f64() as f32;
+            self.open_pane_context_menu(active_pane_id, x, y, cx);
         }
     }
 
     fn handle_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.is_dragging_scrollbar {
             self.last_scroll_activity = std::time::Instant::now();
+            let (_, line_h) = self.measure_cell_metrics(_window);
             let cur_y = event.position.y.to_f64() as f32;
             let delta_y = cur_y - self.scrollbar_drag_start_y;
+            let target_pane_id = self.dragging_scrollbar_pane_id;
             if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
-                if let Some(ref term) = active_tab.terminal {
-                    let history_size = term.history_size();
-                    if history_size > 0 {
-                        let (_, line_h) = self.measure_cell_metrics(_window);
-                        let viewport_size = _window.viewport_size();
-                        let avail_h = (viewport_size.height.to_f64() as f32 - 54.0 - 12.0).max(100.0);
-                        let target_rows = ((avail_h / line_h) as usize).max(5);
-                        let track_h = avail_h;
-                        let total_rows = (history_size + target_rows) as f32;
-                        let thumb_h = (track_h * (target_rows as f32 / total_rows)).clamp(24.0, track_h);
-                        let scrollable_track = (track_h - thumb_h).max(1.0);
-                        let offset_delta = (delta_y / scrollable_track) * history_size as f32;
-                        let new_offset = (self.scrollbar_drag_start_offset as f32 - offset_delta).round().clamp(0.0, history_size as f32) as usize;
-                        term.scroll_to_offset(new_offset);
-                        cx.notify();
+                let pane = if let Some(pid) = target_pane_id {
+                    active_tab.pane_tree.find_pane(pid)
+                } else {
+                    active_tab.pane_tree.active_pane()
+                };
+                if let Some(pane) = pane {
+                    if let Some(ref term) = pane.terminal {
+                        let history_size = term.history_size();
+                        if history_size > 0 {
+                            let track_h = pane.last_bounds.map_or(300.0, |b| b.size.height.to_f64() as f32).max(50.0);
+                            let target_rows = ((track_h / line_h) as usize).max(5);
+                            let total_rows = (history_size + target_rows) as f32;
+                            let thumb_h = (track_h * (target_rows as f32 / total_rows)).clamp(24.0, track_h);
+                            let scrollable_track = (track_h - thumb_h).max(1.0);
+                            let offset_delta = (delta_y / scrollable_track) * history_size as f32;
+                            let new_offset = (self.scrollbar_drag_start_offset as f32 - offset_delta).round().clamp(0.0, history_size as f32) as usize;
+                            term.scroll_to_offset(new_offset);
+                            cx.notify();
+                        }
                     }
                 }
             }
@@ -2753,8 +3035,8 @@ impl RootView {
         let Some(ref terminal) = active_tab.terminal else { return; };
 
         let (cell_w, line_h) = self.measure_cell_metrics(_window);
-        let local_x = (event.position.x.to_f64() as f32 - 12.0).max(0.0);
-        let local_y = (event.position.y.to_f64() as f32 - 38.0).max(0.0);
+        let local_x = (event.position.x.to_f64() as f32 - 1.0).max(0.0);
+        let local_y = (event.position.y.to_f64() as f32 - 32.0).max(0.0);
 
         if terminal.is_mouse_mode_enabled() {
             let left = self.pressed_mouse_button == Some(MouseButton::Left);
@@ -2775,9 +3057,10 @@ impl RootView {
             return;
         }
 
+
         let history_size = terminal.history_size();
         let viewport_size = _window.viewport_size();
-        let avail_h = (viewport_size.height.to_f64() as f32 - 54.0 - 12.0).max(100.0);
+        let avail_h = (viewport_size.height.to_f64() as f32 - 56.0).max(100.0);
         let screen_rows = ((avail_h / line_h) as i32).max(1);
         let display_offset = terminal.display_offset();
         let grid_col = ((local_x / cell_w).floor() as usize).max(0);
@@ -2789,8 +3072,8 @@ impl RootView {
 
         if self.is_selecting {
             let raw_y = event.position.y.to_f64() as f32;
-            let top_edge = 38.0;
-            let bottom_edge = 38.0 + avail_h;
+            let top_edge = 32.0;
+            let bottom_edge = 32.0 + avail_h;
 
             if raw_y < top_edge {
                 // Dragging above the visible viewport: scroll up into history
@@ -2812,10 +3095,12 @@ impl RootView {
             );
 
             if let Some(start_p) = self.selection_start {
-                self.selection = Some(Selection {
-                    start: start_p,
-                    end: updated_point,
-                });
+                let (start, end) = if start_p <= updated_point {
+                    (start_p, updated_point)
+                } else {
+                    (updated_point, start_p)
+                };
+                self.selection = Some(Selection { start, end });
                 cx.notify();
             }
             return;
@@ -2862,6 +3147,7 @@ impl RootView {
     fn handle_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.pressed_mouse_button = None;
         self.is_dragging_scrollbar = false;
+        self.dragging_scrollbar_pane_id = None;
         if self.is_selecting {
             self.is_selecting = false;
             if self.config.copy_on_select {
@@ -2877,8 +3163,8 @@ impl RootView {
             if let Some(ref terminal) = active_tab.terminal {
                 if terminal.is_mouse_mode_enabled() {
                     let (cell_w, line_h) = self.measure_cell_metrics(_window);
-                    let local_x = (event.position.x.to_f64() as f32 - 12.0).max(0.0);
-                    let local_y = (event.position.y.to_f64() as f32 - 38.0).max(0.0);
+                    let local_x = (event.position.x.to_f64() as f32 - 1.0).max(0.0);
+                    let local_y = (event.position.y.to_f64() as f32 - 32.0).max(0.0);
                     let col = ((local_x / cell_w).floor() as usize) + 1;
                     let row = ((local_y / line_h).floor() as usize) + 1;
                     let btn = match event.button {
@@ -2906,7 +3192,22 @@ impl RootView {
             return;
         };
 
-        let Some(ref terminal) = active_tab.terminal else {
+        let mouse_x = event.position.x.to_f64() as f32;
+        let mouse_y = event.position.y.to_f64() as f32;
+
+        let target_pane = active_tab.pane_tree.all_panes().into_iter().find(|p| {
+            if let Some(b) = p.last_bounds {
+                let bx = b.origin.x.to_f64() as f32;
+                let by = b.origin.y.to_f64() as f32;
+                let bw = b.size.width.to_f64() as f32;
+                let bh = b.size.height.to_f64() as f32;
+                mouse_x >= bx && mouse_x <= bx + bw && mouse_y >= by && mouse_y <= by + bh
+            } else {
+                false
+            }
+        }).or_else(|| active_tab.pane_tree.active_pane());
+        let target_pane_id = target_pane.map(|p| p.id);
+        let Some(terminal) = target_pane.and_then(|p| p.terminal.as_ref()) else {
             return;
         };
 
@@ -2920,10 +3221,11 @@ impl RootView {
 
         if delta_y.abs() > 0.1 {
             self.last_scroll_activity = std::time::Instant::now();
+            self.last_scrolled_pane_id = target_pane_id;
             if terminal.is_mouse_mode_enabled() {
                 let (cell_w, _) = self.measure_cell_metrics(_window);
-                let local_x = (event.position.x.to_f64() as f32 - 12.0).max(0.0);
-                let local_y = (event.position.y.to_f64() as f32 - 38.0).max(0.0);
+                let local_x = (event.position.x.to_f64() as f32 - 1.0).max(0.0);
+                let local_y = (event.position.y.to_f64() as f32 - 32.0).max(0.0);
                 let col = ((local_x / cell_w).floor() as usize) + 1;
                 let row = ((local_y / px_per_line).floor() as usize) + 1;
                 let btn = if delta_y > 0.0 { 64 } else { 65 };
@@ -2967,6 +3269,429 @@ impl RootView {
                         self.scroll_accum = 0.0;
                     }
                 }
+            }
+        }
+    }
+
+    fn render_pane_tree_node(
+        &self,
+        node: &PaneNode,
+        avail_w: f32,
+        avail_h: f32,
+        cell_w: f32,
+        line_h: f32,
+        active_pane_id: usize,
+        pane_count: usize,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = self.theme;
+        let font_family = self.font_family.clone();
+        let font_size = self.font_size;
+
+        match node {
+            PaneNode::Leaf(pane) => {
+                let is_active = pane.id == active_pane_id;
+                let pane_id = pane.id;
+                let target_cols = ((avail_w / cell_w) as usize).max(20);
+                let target_rows = ((avail_h / line_h) as usize).max(5);
+
+                let grid_el = if let Some(ref terminal) = pane.terminal {
+                    terminal.resize_with_pixels(
+                        target_cols,
+                        target_rows,
+                        (target_cols as f32 * cell_w).round() as u16,
+                        (target_rows as f32 * line_h).round() as u16,
+                    );
+                    let term = terminal.term();
+                    if let Some(term_guard) = term.try_lock() {
+                        let content = term_guard.renderable_content();
+                        let cursor_point = content.cursor.point;
+                        let cursor_visible = content.cursor.shape != CursorShape::Hidden;
+                        let display_offset = term_guard.grid().display_offset();
+
+                        let mut lines: Vec<Vec<StyledSpan>> = Vec::new();
+                        let mut current_row_spans: Vec<StyledSpan> = Vec::new();
+                        let mut current_span_text = String::new();
+                        let mut current_span_start_col: usize = 0;
+                        let mut current_span_end_col: usize = 0;
+                        let mut current_block_cat: Option<char> = None;
+                        let mut current_is_emoji = false;
+                        let mut current_fg = theme.foreground;
+                        let mut current_bg: Option<Hsla> = None;
+                        let mut current_bold = false;
+                        let mut current_underline = false;
+                        let mut last_row: Option<i32> = None;
+                        let mut current_span_char_cols: Vec<usize> = Vec::new();
+
+                        for cell in content.display_iter {
+                            let row = cell.point.line.0;
+                            let col = cell.point.column.0;
+
+                            if col >= target_cols {
+                                continue;
+                            }
+
+                            if let Some(prev) = last_row {
+                                if row != prev {
+                                    if !current_span_text.is_empty() {
+                                        current_row_spans.push(StyledSpan {
+                                            text: current_span_text,
+                                            start_col: current_span_start_col,
+                                            end_col: current_span_end_col,
+                                            fg: current_fg,
+                                            bg: current_bg,
+                                            is_bold: current_bold,
+                                            is_underline: current_underline,
+                                            is_emoji: current_is_emoji,
+                                            emoji_scale: None,
+                                            char_cols: current_span_char_cols,
+                                        });
+                                        current_span_text = String::new();
+                                        current_span_char_cols = Vec::new();
+                                        current_block_cat = None;
+                                        current_is_emoji = false;
+                                    }
+                                    trim_row_spans(&mut current_row_spans);
+                                    lines.push(current_row_spans);
+                                    current_row_spans = Vec::new();
+
+                                    let mut r = prev + 1;
+                                    while r < row {
+                                        lines.push(Vec::new());
+                                        r += 1;
+                                    }
+
+                                    last_row = Some(row);
+                                }
+                            } else {
+                                last_row = Some(row);
+                            }
+
+                            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                                continue;
+                            }
+
+                            let is_hovered_url = if let Some((h_row, h_start, h_end)) = self.hovered_url_range {
+                                row == h_row && col >= h_start && col < h_end
+                            } else {
+                                false
+                            };
+
+                            let (effective_fg, effective_bg) = if cell.flags.contains(Flags::INVERSE) {
+                                (cell.bg, cell.fg)
+                            } else {
+                                (cell.fg, cell.bg)
+                            };
+                            let fg = self.convert_color(effective_fg, true);
+                            let bg = match effective_bg {
+                                AnsiColor::Named(NamedColor::Background) => None,
+                                _ => Some(self.convert_color(effective_bg, false)),
+                            };
+
+                            let is_bold = cell.flags.contains(Flags::BOLD);
+                            let is_underline = cell.flags.contains(Flags::UNDERLINE) || is_hovered_url;
+                            let code = cell.c as u32;
+                            let is_emoji = is_emoji_codepoint(code);
+                            let is_pua_icon = (0xE000..=0xF8FF).contains(&code)
+                                || (0xF0000..=0xFFFFD).contains(&code)
+                                || (0x100000..=0x10FFFD).contains(&code);
+                            let block_cat = if (0x2500..=0x257F).contains(&code)
+                                || (0x2580..=0x259F).contains(&code)
+                                || (0x25A0..=0x25FF).contains(&code)
+                            {
+                                Some(cell.c)
+                            } else if is_emoji || is_pua_icon {
+                                Some(cell.c)
+                            } else {
+                                None
+                            };
+
+                            let cell_cols = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+                            let end_col = (col + cell_cols).min(target_cols);
+
+                            if fg != current_fg
+                                || bg != current_bg
+                                || is_bold != current_bold
+                                || is_underline != current_underline
+                                || block_cat != current_block_cat
+                                || current_span_text.is_empty()
+                            {
+                                if !current_span_text.is_empty() {
+                                    current_row_spans.push(StyledSpan {
+                                        text: current_span_text,
+                                        start_col: current_span_start_col,
+                                        end_col: current_span_end_col,
+                                        fg: current_fg,
+                                        bg: current_bg,
+                                        is_bold: current_bold,
+                                        is_underline: current_underline,
+                                        is_emoji: current_is_emoji,
+                                        emoji_scale: None,
+                                        char_cols: current_span_char_cols,
+                                    });
+                                    current_span_text = String::new();
+                                    current_span_char_cols = Vec::new();
+                                }
+                                current_fg = fg;
+                                current_bg = bg;
+                                current_bold = is_bold;
+                                current_underline = is_underline;
+                                current_block_cat = block_cat;
+                                current_is_emoji = is_emoji;
+                                current_span_start_col = col;
+                            }
+                            current_span_text.push(cell.c);
+                            current_span_char_cols.push(col);
+                            current_span_end_col = end_col;
+                        }
+
+                        if !current_span_text.is_empty() {
+                            current_row_spans.push(StyledSpan {
+                                text: current_span_text,
+                                start_col: current_span_start_col,
+                                end_col: current_span_end_col,
+                                fg: current_fg,
+                                bg: current_bg,
+                                is_bold: current_bold,
+                                is_underline: current_underline,
+                                is_emoji: current_is_emoji,
+                                emoji_scale: None,
+                                char_cols: current_span_char_cols,
+                            });
+                        }
+                        trim_row_spans(&mut current_row_spans);
+                        lines.push(current_row_spans);
+
+                        let cursor_color = theme.cursor;
+
+                        let cursor_info = if cursor_visible && is_active && self.cursor_blink_visible {
+                            Some((cursor_point.line.0, cursor_point.column.0, content.cursor.shape))
+                        } else {
+                            None
+                        };
+
+                        let selection_range = if is_active { self.selection } else { None };
+                        let search_open = is_active && self.is_search_open && !self.search_query.is_empty();
+                        let search_query_str = self.search_query.to_lowercase();
+                        let active_search_offset = self.search_matches.get(self.search_match_idx).copied();
+                        let num_lines = lines.len();
+                        let row_width = (target_cols as f32 * cell_w).round();
+
+                        let mut all_search_highlights = Vec::with_capacity(num_lines);
+                        if search_open && !search_query_str.is_empty() {
+                            for (row_idx, spans) in lines.iter().enumerate() {
+                                let mut row_highlights = Vec::new();
+                                let mut full_line = String::new();
+                                let mut char_to_col: Vec<usize> = Vec::new();
+                                let mut char_to_end_col: Vec<usize> = Vec::new();
+
+                                for s in spans {
+                                    for (i, c) in s.text.chars().enumerate() {
+                                        full_line.push(c);
+                                        let col_start = s.char_cols.get(i).copied().unwrap_or(s.start_col);
+                                        let col_end = s.char_cols.get(i + 1).copied().unwrap_or(s.end_col);
+                                        char_to_col.push(col_start);
+                                        char_to_end_col.push(col_end);
+                                    }
+                                }
+
+                                let line_lower = full_line.to_lowercase();
+                                let mut start_b = 0;
+                                while let Some(found_b) = line_lower[start_b..].find(&search_query_str) {
+                                    let match_start_b = start_b + found_b;
+                                    let match_end_b = match_start_b + search_query_str.len();
+                                    let match_start_char = line_lower[..match_start_b].chars().count();
+                                    let match_end_char = line_lower[..match_end_b].chars().count();
+
+                                    if match_start_char < char_to_col.len() && match_end_char > 0 {
+                                        let col_start = char_to_col[match_start_char];
+                                        let last_char_idx = (match_end_char - 1).min(char_to_end_col.len() - 1);
+                                        let col_end = char_to_end_col[last_char_idx];
+                                        let col_len = col_end.saturating_sub(col_start).max(1);
+
+                                        let is_active_match = active_search_offset.map_or(false, |off| {
+                                            off == (display_offset + (num_lines.saturating_sub(1 + row_idx)))
+                                        });
+                                        row_highlights.push((col_start, col_len, is_active_match));
+                                    }
+                                    start_b = match_end_b;
+                                    if search_query_str.is_empty() { break; }
+                                }
+                                all_search_highlights.push(row_highlights);
+                            }
+                        } else {
+                            all_search_highlights.resize(num_lines, Vec::new());
+                        }
+
+                        Some(crate::ui::terminal_grid_element::TerminalGridElement {
+                            lines,
+                            cell_w,
+                            line_h,
+                            row_width,
+                            cursor_info,
+                            selection_range,
+                            search_highlights: all_search_highlights,
+                            theme: theme.clone(),
+                            cursor_color,
+                            font_family: font_family.clone(),
+                            font_size,
+                            display_offset,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let (history_size, display_offset) = if let Some(ref terminal) = pane.terminal {
+                    (terminal.history_size(), terminal.display_offset())
+                } else {
+                    (0, 0)
+                };
+
+                let pane_scrollbar_thumb = if history_size > 0 {
+                    let elapsed_ms = self.last_scroll_activity.elapsed().as_millis();
+                    let is_this_dragging = self.is_dragging_scrollbar && self.dragging_scrollbar_pane_id == Some(pane.id);
+                    let is_this_scrolling = self.last_scrolled_pane_id == Some(pane.id) && elapsed_ms < 1500;
+                    if is_this_dragging || is_this_scrolling {
+                        let alpha_mult = if is_this_dragging || (self.last_scrolled_pane_id == Some(pane.id) && elapsed_ms < 700) {
+                            1.0
+                        } else {
+                            let t = (elapsed_ms - 700) as f32 / 800.0;
+                            (1.0 - t).clamp(0.0, 1.0)
+                        };
+
+                        let track_h = avail_h;
+                        let total_rows = (history_size + target_rows) as f32;
+                        let thumb_h = (track_h * (target_rows as f32 / total_rows)).clamp(24.0, track_h);
+                        let progress = 1.0 - (display_offset as f32 / history_size as f32).clamp(0.0, 1.0);
+                        let thumb_top = ((track_h - thumb_h) * progress).clamp(0.0, track_h - thumb_h);
+
+                        let mut thumb_bg = theme.muted;
+                        thumb_bg.a = 0.45 * alpha_mult;
+                        let mut thumb_hover_bg = theme.muted_strong;
+                        thumb_hover_bg.a = 0.85 * alpha_mult;
+
+                        Some(
+                            div()
+                                .absolute()
+                                .right(px(2.))
+                                .top(px(thumb_top))
+                                .w(px(5.))
+                                .h(px(thumb_h))
+                                .rounded_full()
+                                .bg(thumb_bg)
+                                .hover(move |s| s.bg(thumb_hover_bg))
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                                    this.is_dragging_scrollbar = true;
+                                    this.dragging_scrollbar_pane_id = Some(pane_id);
+                                    this.last_scrolled_pane_id = Some(pane_id);
+                                    this.scrollbar_drag_start_y = ev.position.y.to_f64() as f32;
+                                    this.scrollbar_drag_start_offset = display_offset;
+                                    this.last_scroll_activity = std::time::Instant::now();
+                                    cx.notify();
+                                }))
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                div()
+                    .size_full()
+                    .relative()
+                    .overflow_hidden()
+                    .when(pane_count > 1 && is_active, |d| d.border_1().border_color(theme.accent))
+                    .when(pane_count > 1 && !is_active, |d| d.border_1().border_color(theme.border))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                        if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
+                            tab.pane_tree.active_pane_id = pane_id;
+                            if let Some(p) = tab.pane_tree.active_pane() {
+                                tab.terminal = p.terminal.clone();
+                                tab.cwd = p.cwd.clone();
+                                tab.git_status = p.git_status.clone();
+                            }
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                        if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
+                            tab.pane_tree.active_pane_id = pane_id;
+                            if let Some(p) = tab.pane_tree.active_pane() {
+                                tab.terminal = p.terminal.clone();
+                                tab.cwd = p.cwd.clone();
+                                tab.git_status = p.git_status.clone();
+                            }
+                            let mouse_mode = tab.terminal.as_ref().map_or(false, |t| t.is_mouse_mode_enabled());
+                            if !mouse_mode || ev.modifiers.shift {
+                                let x = ev.position.x.to_f64() as f32;
+                                let y = ev.position.y.to_f64() as f32;
+                                this.open_pane_context_menu(pane_id, x, y, cx);
+                            }
+                        }
+                    }))
+                    .when_some(grid_el, |d, el| d.child(el))
+                    .when_some(pane_scrollbar_thumb, |d, thumb| d.child(thumb))
+            }
+            PaneNode::Split { direction, ratio, first, second } => {
+                let mut container = div().size_full().flex();
+                container = match direction {
+                    SplitDirection::Horizontal => container.flex_row(),
+                    SplitDirection::Vertical => container.flex_col(),
+                };
+
+                let (w1, h1, w2, h2) = match direction {
+                    SplitDirection::Horizontal => {
+                        (avail_w * *ratio, avail_h, avail_w * (1.0 - *ratio), avail_h)
+                    }
+                    SplitDirection::Vertical => {
+                        (avail_w, avail_h * *ratio, avail_w, avail_h * (1.0 - *ratio))
+                    }
+                };
+
+                let divider = match direction {
+                    SplitDirection::Horizontal => div().w(px(1.0)).h_full().bg(theme.border).flex_shrink_0(),
+                    SplitDirection::Vertical => div().h(px(1.0)).w_full().bg(theme.border).flex_shrink_0(),
+                };
+
+                container
+                    .child(
+                        div()
+                            .flex_basis(gpui::relative(*ratio))
+                            .size_full()
+                            .overflow_hidden()
+                            .child(self.render_pane_tree_node(
+                                first,
+                                w1,
+                                h1,
+                                cell_w,
+                                line_h,
+                                active_pane_id,
+                                pane_count,
+                                cx,
+                            )),
+                    )
+                    .child(divider)
+                    .child(
+                        div()
+                            .flex_basis(gpui::relative(1.0 - *ratio))
+                            .size_full()
+                            .overflow_hidden()
+                            .child(self.render_pane_tree_node(
+                                second,
+                                w2,
+                                h2,
+                                cell_w,
+                                line_h,
+                                active_pane_id,
+                                pane_count,
+                                cx,
+                            )),
+                    )
             }
         }
     }
@@ -3045,327 +3770,37 @@ impl Render for RootView {
 
         let (cell_w, line_h) = self.measure_cell_metrics(_window);
         let viewport_size = _window.viewport_size();
-        let avail_w = (viewport_size.width.to_f64() as f32 - 24.0).max(100.0);
+        let avail_w = (viewport_size.width.to_f64() as f32 - 1.0).max(100.0);
         // Chrome layout constants — must match TabBar/StatusBar element heights
-        // and the terminal container's vertical padding, or the PTY grid grows
-        // taller than the painted area and the bottom row (prompt) gets clipped.
         const TAB_BAR_HEIGHT: f32 = 32.0;
         const STATUS_BAR_HEIGHT: f32 = 24.0;
-        const TERMINAL_PAD_Y: f32 = 12.0;
         let avail_h = (viewport_size.height.to_f64() as f32
             - TAB_BAR_HEIGHT
-            - STATUS_BAR_HEIGHT
-            - TERMINAL_PAD_Y)
+            - STATUS_BAR_HEIGHT)
         .max(100.0);
-        let target_cols = ((avail_w / cell_w) as usize).max(20);
-        let target_rows = ((avail_h / line_h) as usize).max(5);
-
-        // Terminal Grid Rendering for active tab
-        let (display_offset, history_size, lines, cursor_info) = if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
-            if let Some(ref terminal) = active_tab.terminal {
-                terminal.resize_with_pixels(
-                    target_cols,
-                    target_rows,
-                    (target_cols as f32 * cell_w).round() as u16,
-                    (target_rows as f32 * line_h).round() as u16,
-                );
-                let h_size = terminal.history_size();
-                let term = terminal.term();
-                if let Some(term_guard) = term.try_lock() {
-                    let content = term_guard.renderable_content();
-                    let cursor_point = content.cursor.point;
-                    let cursor_visible = content.cursor.shape != CursorShape::Hidden;
-                    let display_offset = term_guard.grid().display_offset();
-
-            let mut lines: Vec<Vec<StyledSpan>> = Vec::new();
-            let mut current_row_spans: Vec<StyledSpan> = Vec::new();
-            let mut current_span_text = String::new();
-            let mut current_span_start_col: usize = 0;
-            let mut current_span_end_col: usize = 0;
-            let mut current_block_cat: Option<char> = None;
-            let mut current_is_emoji = false;
-            let mut current_fg = self.theme.foreground;
-            let mut current_bg: Option<Hsla> = None;
-            let mut current_bold = false;
-            let mut current_underline = false;
-            let mut last_row: Option<i32> = None;
-            let mut current_span_char_cols: Vec<usize> = Vec::new();
-
-            for cell in content.display_iter {
-                let row = cell.point.line.0;
-                let col = cell.point.column.0;
-
-                if col >= target_cols {
-                    continue;
-                }
-
-                if let Some(prev) = last_row {
-                    if row != prev {
-                        if !current_span_text.is_empty() {
-                            current_row_spans.push(StyledSpan {
-                                text: current_span_text,
-                                start_col: current_span_start_col,
-                                end_col: current_span_end_col,
-                                fg: current_fg,
-                                bg: current_bg,
-                                is_bold: current_bold,
-                                is_underline: current_underline,
-                                is_emoji: current_is_emoji,
-                                emoji_scale: None,
-                                char_cols: current_span_char_cols,
-                            });
-                            current_span_text = String::new();
-                            current_span_char_cols = Vec::new();
-                            current_block_cat = None;
-                            current_is_emoji = false;
-                        }
-                        trim_row_spans(&mut current_row_spans);
-                        lines.push(current_row_spans);
-                        current_row_spans = Vec::new();
-
-                        let mut r = prev + 1;
-                        while r < row {
-                            lines.push(Vec::new());
-                            r += 1;
-                        }
-
-                        last_row = Some(row);
-                    }
-                } else {
-                    last_row = Some(row);
-                }
-
-                // Wide char spacer is the second column of a double-width glyph; skip
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    continue;
-                }
-
-                let is_hovered_url = if let Some((h_row, h_start, h_end)) = self.hovered_url_range {
-                    row == h_row && col >= h_start && col < h_end
-                } else {
-                    false
-                };
-
-                let (effective_fg, effective_bg) = if cell.flags.contains(Flags::INVERSE) {
-                    (cell.bg, cell.fg)
-                } else {
-                    (cell.fg, cell.bg)
-                };
-                let fg = self.convert_color(effective_fg, true);
-                let bg = match effective_bg {
-                    AnsiColor::Named(NamedColor::Background) => None,
-                    _ => Some(self.convert_color(effective_bg, false)),
-                };
-
-                let is_bold = cell.flags.contains(Flags::BOLD);
-                let is_underline = cell.flags.contains(Flags::UNDERLINE) || is_hovered_url;
-                let code = cell.c as u32;
-                let is_emoji = is_emoji_codepoint(code);
-                let is_pua_icon = (0xE000..=0xF8FF).contains(&code)
-                    || (0xF0000..=0xFFFFD).contains(&code)
-                    || (0x100000..=0x10FFFD).contains(&code);
-                let block_cat = if (0x2500..=0x257F).contains(&code)
-                    || (0x2580..=0x259F).contains(&code)
-                    || (0x25A0..=0x25FF).contains(&code)
-                {
-                    Some(cell.c)
-                } else if is_emoji || is_pua_icon {
-                    Some(cell.c)
-                } else {
-                    None
-                };
-
-                let cell_cols = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
-                let end_col = (col + cell_cols).min(target_cols);
-
-                if fg != current_fg
-                    || bg != current_bg
-                    || is_bold != current_bold
-                    || is_underline != current_underline
-                    || block_cat != current_block_cat
-                    || current_span_text.is_empty()
-                {
-                    if !current_span_text.is_empty() {
-                        current_row_spans.push(StyledSpan {
-                            text: current_span_text,
-                            start_col: current_span_start_col,
-                            end_col: current_span_end_col,
-                            fg: current_fg,
-                            bg: current_bg,
-                            is_bold: current_bold,
-                            is_underline: current_underline,
-                            is_emoji: current_is_emoji,
-                            emoji_scale: None,
-                            char_cols: current_span_char_cols,
-                        });
-                        current_span_text = String::new();
-                        current_span_char_cols = Vec::new();
-                    }
-                    current_span_start_col = col;
-                    current_span_end_col = end_col;
-                    current_fg = fg;
-                    current_bg = bg;
-                    current_bold = is_bold;
-                    current_underline = is_underline;
-                    current_block_cat = block_cat;
-                    current_is_emoji = is_emoji;
-                } else {
-                    current_span_end_col = end_col;
-                }
-
-                // Base character: its column is the cell's actual column.
-                current_span_char_cols.push(col);
-                current_span_text.push(cell.c);
-
-                let has_fe0f = cell.zerowidth().map_or(false, |zw| zw.contains(&'\u{FE0F}'));
-                if let Some(zerowidth) = cell.zerowidth() {
-                    for &zw in zerowidth {
-                        // Zerowidth chars share the column of their base cell.
-                        current_span_char_cols.push(col);
-                        current_span_text.push(zw);
-                    }
-                }
-
-                // Only force emoji presentation (VS16) on wide cells: narrow
-                // codepoints like U+23F1/U+23F2 reserve one column, and a
-                // color-emoji glyph (~2 columns of ink) would overflow into
-                // the neighboring text.
-                if is_emoji && cell.flags.contains(Flags::WIDE_CHAR) && !has_fe0f {
-                    current_span_char_cols.push(col);
-                    current_span_text.push('\u{FE0F}');
-                }
-            }
-
-            if !current_span_text.is_empty() {
-                current_row_spans.push(StyledSpan {
-                    text: current_span_text,
-                    start_col: current_span_start_col,
-                    end_col: current_span_end_col,
-                    fg: current_fg,
-                    bg: current_bg,
-                    is_bold: current_bold,
-                    is_underline: current_underline,
-                    is_emoji: current_is_emoji,
-                    emoji_scale: None,
-                    char_cols: current_span_char_cols,
-                });
-            }
-            trim_row_spans(&mut current_row_spans);
-            lines.push(current_row_spans);
-            lines.truncate(target_rows);
-
-            // Fit emoji spans to their reserved cells. Color emoji glyphs come
-            // from fallback fonts with a natural advance (~1.25em) that often
-            // exceeds the columns the grid reserved (VS16 presentation on
-            // narrow codepoints, 2-column wide glyphs), so the ink would spill
-            // onto the neighboring text. Measure each pure-emoji span with the
-            // platform shaper (cached) and shrink its font size to fit.
-            {
-                let emoji_font = gpui::font(self.font_family.clone());
-                let emoji_run = |len: usize| TextRun {
-                    len,
-                    font: emoji_font.clone(),
-                    color: Hsla::default(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let text_system = _window.text_system();
-                for row_spans in lines.iter_mut() {
-                    for span in row_spans.iter_mut() {
-                        if !span.is_emoji || span.text.is_empty() {
-                            continue;
-                        }
-                        let span_width =
-                            ((span.end_col - span.start_col) as f32 * cell_w).max(0.0);
-                        if span_width <= 0.0 {
-                            continue;
-                        }
-                        let measured = text_system
-                            .layout_line(
-                                &span.text,
-                                px(self.font_size),
-                                &[emoji_run(span.text.len())],
-                                None,
-                            )
-                            .width
-                            .to_f64() as f32;
-                        // Target 94% of the reserved width so a visible gap
-                        // separates the emoji from adjacent characters.
-                        if measured > span_width * 0.94 && measured > 0.0 {
-                            span.emoji_scale = Some(span_width * 0.94 / measured);
-                        }
-                    }
-                }
-            }
-
-            let cursor_info = if cursor_visible && self.cursor_blink_visible {
-                Some((cursor_point.line.0, cursor_point.column.0, content.cursor.shape))
-            } else {
-                None
-            };
-
-            drop(term_guard);
-
-            (display_offset, h_size, lines, cursor_info)
-                } else {
-                    (0, h_size, Vec::new(), None)
-                }
-            } else {
-                (0, 0, Vec::new(), None)
-            }
-        } else {
-            (0, 0, Vec::new(), None)
-        };
 
         let font_family = self.font_family.clone();
         let font_size = self.font_size;
-        let cursor_color = self.theme.cursor;
-        let scrollbar_thumb = if history_size > 0 {
-            let elapsed_ms = self.last_scroll_activity.elapsed().as_millis();
-            if self.is_dragging_scrollbar || elapsed_ms < 1500 {
-                let alpha_mult = if self.is_dragging_scrollbar || elapsed_ms < 700 {
-                    1.0
-                } else {
-                    let t = (elapsed_ms - 700) as f32 / 800.0;
-                    (1.0 - t).clamp(0.0, 1.0)
-                };
 
-                let track_h = avail_h;
-                let total_rows = (history_size + target_rows) as f32;
-                let thumb_h = (track_h * (target_rows as f32 / total_rows)).clamp(24.0, track_h);
-                let progress = 1.0 - (display_offset as f32 / history_size as f32).clamp(0.0, 1.0);
-                let thumb_top = ((track_h - thumb_h) * progress).clamp(0.0, track_h - thumb_h);
+        if let Some(active_tab) = self.tabs.get_mut(self.active_tab_idx) {
+            active_tab.pane_tree.update_layout_bounds(0.0, 0.0, avail_w, avail_h);
+        }
 
-                let mut thumb_bg = self.theme.muted;
-                thumb_bg.a = 0.45 * alpha_mult;
-                let mut thumb_hover_bg = self.theme.muted_strong;
-                thumb_hover_bg.a = 0.85 * alpha_mult;
-
-                Some(
-                    div()
-                        .absolute()
-                        .right(px(4.))
-                        .top(px(thumb_top + 6.0))
-                        .w(px(5.))
-                        .h(px(thumb_h))
-                        .rounded_full()
-                        .bg(thumb_bg)
-                        .hover(move |s| s.bg(thumb_hover_bg))
-                        .cursor(CursorStyle::PointingHand)
-                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
-                            this.is_dragging_scrollbar = true;
-                            this.scrollbar_drag_start_y = ev.position.y.to_f64() as f32;
-                            this.scrollbar_drag_start_offset = display_offset;
-                            this.last_scroll_activity = std::time::Instant::now();
-                            cx.notify();
-                        }))
-                )
-            } else {
-                None
-            }
+        let terminal_area = if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
+            let active_pane_id = active_tab.pane_tree.active_pane_id;
+            let pane_count = active_tab.pane_tree.pane_count();
+            self.render_pane_tree_node(
+                &active_tab.pane_tree.root,
+                avail_w,
+                avail_h,
+                cell_w,
+                line_h,
+                active_pane_id,
+                pane_count,
+                cx,
+            )
         } else {
-            None
+            div().size_full()
         };
 
         div()
@@ -3422,84 +3857,14 @@ impl Render for RootView {
                     .flex_1()
                     .flex_col()
                     .w_full()
-                    .px(px(12.))
-                    .py(px(6.))
+                    .pl(px(1.))
                     .bg(self.theme.main_bg)
                     .font_family(font_family.clone())
                     .text_size(px(font_size))
                     .font_features(enable_terminal_ligatures())
                     .overflow_hidden()
-                    .when_some(scrollbar_thumb, |this, thumb| this.child(thumb))
                     .child(super::ime::registration(cx.entity(), self.focus_handle.clone()))
-                    .child({
-                        let selection_range = self.selection;
-                        let search_open = self.is_search_open && !self.search_query.is_empty();
-                        let search_query_str = self.search_query.to_lowercase();
-                        let active_search_offset = self.search_matches.get(self.search_match_idx).copied();
-                        let num_lines = lines.len();
-                        let row_width = (target_cols as f32 * cell_w).round();
-
-                        let mut all_search_highlights = Vec::with_capacity(num_lines);
-                        if search_open && !search_query_str.is_empty() {
-                            for (row_idx, spans) in lines.iter().enumerate() {
-                                let mut row_highlights = Vec::new();
-                                let mut full_line = String::new();
-                                let mut char_to_col: Vec<usize> = Vec::new();
-                                let mut char_to_end_col: Vec<usize> = Vec::new();
-
-                                for s in spans {
-                                    for (i, c) in s.text.chars().enumerate() {
-                                        full_line.push(c);
-                                        let col_start = s.char_cols.get(i).copied().unwrap_or(s.start_col);
-                                        let col_end = s.char_cols.get(i + 1).copied().unwrap_or(s.end_col);
-                                        char_to_col.push(col_start);
-                                        char_to_end_col.push(col_end);
-                                    }
-                                }
-
-                                let line_lower = full_line.to_lowercase();
-                                let mut start_b = 0;
-                                while let Some(found_b) = line_lower[start_b..].find(&search_query_str) {
-                                    let match_start_b = start_b + found_b;
-                                    let match_end_b = match_start_b + search_query_str.len();
-                                    let match_start_char = line_lower[..match_start_b].chars().count();
-                                    let match_end_char = line_lower[..match_end_b].chars().count();
-
-                                    if match_start_char < char_to_col.len() && match_end_char > 0 {
-                                        let col_start = char_to_col[match_start_char];
-                                        let last_char_idx = (match_end_char - 1).min(char_to_end_col.len() - 1);
-                                        let col_end = char_to_end_col[last_char_idx];
-                                        let col_len = col_end.saturating_sub(col_start).max(1);
-
-                                        let is_active = active_search_offset.map_or(false, |off| {
-                                            off == (display_offset + (num_lines.saturating_sub(1 + row_idx)))
-                                        });
-                                        row_highlights.push((col_start, col_len, is_active));
-                                    }
-                                    start_b = match_end_b;
-                                    if search_query_str.is_empty() { break; }
-                                }
-                                all_search_highlights.push(row_highlights);
-                            }
-                        } else {
-                            all_search_highlights.resize(num_lines, Vec::new());
-                        }
-
-                        crate::ui::terminal_grid_element::TerminalGridElement {
-                            lines,
-                            cell_w,
-                            line_h,
-                            row_width,
-                            cursor_info,
-                            selection_range,
-                            search_highlights: all_search_highlights,
-                            theme: theme.clone(),
-                            cursor_color,
-                            font_family: font_family.clone(),
-                            font_size,
-                            display_offset,
-                        }
-                    }),
+                    .child(terminal_area),
             )
             .child(
                 StatusBar::new(left_segs, right_segs, fallback_info, theme)
@@ -4078,6 +4443,219 @@ impl Render for RootView {
                             cx.listener(move |this, _ev, window, cx| {
                                 this.is_tab_context_menu_open = false;
                                 this.close_other_tabs(target_tab_id, window, cx);
+                            }),
+                            theme,
+                        )),
+                )
+            })
+            // Terminal / Pane Right-Click Context Menu Overlay
+            .when(self.is_pane_context_menu_open, |this| {
+                let (menu_x, menu_y) = self.pane_context_menu_pos;
+                let sc_copy = if cfg!(target_os = "macos") { "⌘C" } else { "Ctrl+Shift+C" };
+                let sc_paste = if cfg!(target_os = "macos") { "⌘V" } else { "Ctrl+Shift+V" };
+                let sc_split_right = if cfg!(target_os = "macos") { "⌘D" } else { "Ctrl+Shift+E" };
+                let sc_split_down = if cfg!(target_os = "macos") { "⌘⇧D" } else { "Ctrl+Shift+O" };
+                let sc_close_pane = if cfg!(target_os = "macos") { "⌘W" } else { "Ctrl+Shift+W" };
+                let sc_close_tab = if cfg!(target_os = "macos") { "⌘⇧W" } else { "Ctrl+Shift+Q" };
+                let sc_rename = if cfg!(target_os = "macos") { "⌘⇧R" } else { "Ctrl+Shift+R" };
+                let sc_clear = if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl+Shift+K" };
+                let sc_search = if cfg!(target_os = "macos") { "⌘F" } else { "Ctrl+Shift+F" };
+                let has_selection = self.selection.is_some();
+                let menu_w: f32 = 220.0;
+                let menu_h: f32 = if has_selection { 390.0 } else { 360.0 };
+                let vp = _window.viewport_size();
+                let vp_w = vp.width.to_f64() as f32;
+                let vp_h = vp.height.to_f64() as f32;
+                let popup_x = if menu_x + menu_w > vp_w - 8.0 {
+                    (vp_w - menu_w - 8.0).max(8.0)
+                } else {
+                    menu_x.max(8.0)
+                };
+                let popup_y = if menu_y + menu_h > vp_h - 28.0 {
+                    (menu_y - menu_h).max(36.0)
+                } else {
+                    menu_y.max(36.0)
+                };
+
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                            this.is_pane_context_menu_open = false;
+                            cx.notify();
+                        }))
+                        .on_mouse_down(MouseButton::Right, cx.listener(|this, _ev, _window, cx| {
+                            this.is_pane_context_menu_open = false;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id("pane-context-menu-popup")
+                        .absolute()
+                        .top(px(popup_y))
+                        .left(px(popup_x))
+                        .w(px(220.))
+                        .p(px(4.))
+                        .rounded(px(8.))
+                        .bg(theme.surface)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_xl()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .when(has_selection, |d| {
+                            d.child(render_context_menu_item(
+                                IconType::Plus,
+                                "Copy",
+                                Some(sc_copy),
+                                cx.listener(|this, _ev, _window, cx| {
+                                    this.is_pane_context_menu_open = false;
+                                    if let Some(text) = this.get_selected_text() {
+                                        if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                                            let _ = clip.set_text(text);
+                                        }
+                                    }
+                                    cx.notify();
+                                }),
+                                theme,
+                            ))
+                        })
+                        .child(render_context_menu_item(
+                            IconType::Plus,
+                            "Paste",
+                            Some(sc_paste),
+                            cx.listener(|this, _ev, _window, cx| {
+                                this.is_pane_context_menu_open = false;
+                                if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
+                                    if let Some(ref terminal) = active_tab.terminal {
+                                        if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                                            if let Ok(text) = clip.get_text() {
+                                                if terminal.is_bracketed_paste_enabled() {
+                                                    let mut buf = Vec::with_capacity(text.len() + 12);
+                                                    buf.extend_from_slice(b"\x1b[200~");
+                                                    buf.extend_from_slice(text.as_bytes());
+                                                    buf.extend_from_slice(b"\x1b[201~");
+                                                    terminal.write_to_pty(&buf);
+                                                } else {
+                                                    terminal.write_to_pty(text.as_bytes());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                cx.notify();
+                            }),
+                            theme,
+                        ))
+                        .child(render_context_menu_divider(theme))
+                        .child(render_context_menu_item(
+                            IconType::Plus,
+                            "Split Pane Right",
+                            Some(sc_split_right),
+                            cx.listener(|this, _ev, window, cx| {
+                                this.is_pane_context_menu_open = false;
+                                this.split_active_pane(Direction::Right, window, cx);
+                            }),
+                            theme,
+                        ))
+                        .child(render_context_menu_item(
+                            IconType::Plus,
+                            "Split Pane Down",
+                            Some(sc_split_down),
+                            cx.listener(|this, _ev, window, cx| {
+                                this.is_pane_context_menu_open = false;
+                                this.split_active_pane(Direction::Down, window, cx);
+                            }),
+                            theme,
+                        ))
+                        .child(render_context_menu_item(
+                            IconType::Plus,
+                            "Split Pane Left",
+                            None,
+                            cx.listener(|this, _ev, window, cx| {
+                                this.is_pane_context_menu_open = false;
+                                this.split_active_pane(Direction::Left, window, cx);
+                            }),
+                            theme,
+                        ))
+                        .child(render_context_menu_item(
+                            IconType::Plus,
+                            "Split Pane Top",
+                            None,
+                            cx.listener(|this, _ev, window, cx| {
+                                this.is_pane_context_menu_open = false;
+                                this.split_active_pane(Direction::Top, window, cx);
+                            }),
+                            theme,
+                        ))
+                        .child(render_context_menu_divider(theme))
+                        .child(render_context_menu_item(
+                            IconType::Pencil,
+                            "Change Tab Name...",
+                            Some(sc_rename),
+                            cx.listener(|this, _ev, _window, cx| {
+                                this.is_pane_context_menu_open = false;
+                                let idx = this.active_tab_idx;
+                                this.open_rename_tab(idx, cx);
+                            }),
+                            theme,
+                        ))
+                        .child(render_context_menu_item(
+                            IconType::Search,
+                            "Find in Buffer...",
+                            Some(sc_search),
+                            cx.listener(|this, _ev, window, cx| {
+                                this.is_pane_context_menu_open = false;
+                                this.toggle_search(window, cx);
+                            }),
+                            theme,
+                        ))
+                        .child(render_context_menu_item(
+                            IconType::Trash2,
+                            "Clear / Reset Terminal",
+                            Some(sc_clear),
+                            cx.listener(|this, _ev, _window, cx| {
+                                this.is_pane_context_menu_open = false;
+                                if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
+                                    if let Some(ref term) = active_tab.terminal {
+                                        term.scroll_to_bottom();
+                                        term.write_to_pty(b"\x0c");
+                                    }
+                                }
+                                cx.notify();
+                            }),
+                            theme,
+                        ))
+                        .child(render_context_menu_divider(theme))
+                        .child(render_context_menu_item(
+                            IconType::X,
+                            "Close Pane",
+                            Some(sc_close_pane),
+                            cx.listener(|this, _ev, window, cx| {
+                                this.is_pane_context_menu_open = false;
+                                this.close_active_pane(window, cx);
+                            }),
+                            theme,
+                        ))
+                        .child(render_context_menu_item(
+                            IconType::Trash2,
+                            "Close Tab",
+                            Some(sc_close_tab),
+                            cx.listener(|this, _ev, window, cx| {
+                                this.is_pane_context_menu_open = false;
+                                if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
+                                    let tab_id = active_tab.id;
+                                    this.close_tab(tab_id, window, cx);
+                                }
                             }),
                             theme,
                         )),

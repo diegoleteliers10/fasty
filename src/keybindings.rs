@@ -93,6 +93,15 @@ pub enum Action {
     NextPrompt,
     ClearScrollback,
     ToggleFullscreen,
+    SplitRight,
+    SplitDown,
+    SplitLeft,
+    SplitTop,
+    FocusRight,
+    FocusDown,
+    FocusLeft,
+    FocusTop,
+    ClosePane,
     Quit,
 }
 
@@ -113,7 +122,8 @@ impl KeyBindingResolver {
             insert("super+c", Action::Copy);
             insert("super+v", Action::Paste);
             insert("super+t", Action::NewTab);
-            insert("super+w", Action::CloseTab);
+            insert("super+w", Action::ClosePane);
+            insert("super+shift+w", Action::CloseTab);
             insert("super+n", Action::NewWindow);
             insert("super+f", Action::OpenSearch);
             insert("super+s", Action::OpenSettings);
@@ -148,14 +158,27 @@ impl KeyBindingResolver {
             insert("ctrl+shift+v", Action::Paste);
             insert("shift+insert", Action::Paste);
             insert("ctrl+shift+t", Action::NewTab);
-            insert("ctrl+shift+w", Action::CloseTab);
+            insert("ctrl+shift+w", Action::ClosePane);
+            insert("super+d", Action::SplitRight);
+            insert("super+shift+d", Action::SplitDown);
+            insert("super+alt+left", Action::FocusLeft);
+            insert("super+alt+right", Action::FocusRight);
+            insert("super+alt+up", Action::FocusTop);
+            insert("super+alt+down", Action::FocusDown);
         } else {
             insert("ctrl+shift+t", Action::NewTab);
-            insert("ctrl+shift+w", Action::CloseTab);
+            insert("ctrl+shift+w", Action::ClosePane);
+            insert("ctrl+shift+q", Action::CloseTab);
             insert("ctrl+shift+n", Action::NewWindow);
             insert("ctrl+shift+c", Action::Copy);
             insert("ctrl+shift+v", Action::Paste);
             insert("shift+insert", Action::Paste);
+            insert("ctrl+shift+e", Action::SplitRight);
+            insert("ctrl+shift+o", Action::SplitDown);
+            insert("alt+left", Action::FocusLeft);
+            insert("alt+right", Action::FocusRight);
+            insert("alt+up", Action::FocusTop);
+            insert("alt+down", Action::FocusDown);
             insert("ctrl+f", Action::OpenSearch);
             insert("ctrl+comma", Action::OpenSettings);
             insert("ctrl+shift+s", Action::OpenSettings);
@@ -291,6 +314,15 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "next_prompt" => Some(Action::NextPrompt),
         "clear_scrollback" => Some(Action::ClearScrollback),
         "toggle_fullscreen" => Some(Action::ToggleFullscreen),
+        "split_right" => Some(Action::SplitRight),
+        "split_down" => Some(Action::SplitDown),
+        "split_left" => Some(Action::SplitLeft),
+        "split_top" => Some(Action::SplitTop),
+        "focus_right" => Some(Action::FocusRight),
+        "focus_down" => Some(Action::FocusDown),
+        "focus_left" => Some(Action::FocusLeft),
+        "focus_top" => Some(Action::FocusTop),
+        "close_pane" => Some(Action::ClosePane),
         "quit" => Some(Action::Quit),
         _ => None,
     }
