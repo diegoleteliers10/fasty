@@ -800,7 +800,9 @@ pub struct RootView {
     pub typed_prompt_buf: String,
     pub selection: Option<Selection>,
     pub is_selecting: bool,
+    pub has_selection_dragged: bool,
     pub selection_start: Option<alacritty_terminal::index::Point>,
+    pub selection_mouse_pos: Option<(f32, f32)>,
     pub hovered_url: Option<String>,
     pub hovered_url_range: Option<(i32, usize, usize)>,
     pub current_theme_name: String,
@@ -878,6 +880,12 @@ impl RootView {
                 cx.background_executor().timer(std::time::Duration::from_millis(35)).await;
                 let res = this.update_in(cx, |this, _window, cx| {
                     let mut needs_notify = false;
+
+                    // Selection auto-scroll while dragging outside/near viewport bounds
+                    if this.is_selecting && this.selection_mouse_pos.is_some() {
+                        this.update_selection_from_mouse(_window, cx);
+                        needs_notify = true;
+                    }
 
                     // Scroll fade active window
                     let elapsed = this.last_scroll_activity.elapsed();
@@ -969,7 +977,9 @@ impl RootView {
             typed_prompt_buf: String::new(),
             selection: None,
             is_selecting: false,
+            has_selection_dragged: false,
             selection_start: None,
+            selection_mouse_pos: None,
             hovered_url: None,
             hovered_url_range: None,
             current_theme_name: theme_name,
@@ -3027,8 +3037,10 @@ impl RootView {
                 alacritty_terminal::index::Column(grid_col),
             );
             self.is_selecting = true;
+            self.has_selection_dragged = false;
             self.selection_start = Some(start_point);
             self.selection = None;
+            self.selection_mouse_pos = Some((event.position.x.to_f64() as f32, event.position.y.to_f64() as f32));
             cx.notify();
         } else if event.button == MouseButton::Right {
             let active_pane_id = active_tab.pane_tree.active_pane_id;
@@ -3097,6 +3109,29 @@ impl RootView {
             return;
         }
 
+        if self.is_selecting {
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.is_selecting = false;
+                self.has_selection_dragged = false;
+                self.selection_mouse_pos = None;
+                self.pressed_mouse_button = None;
+                if self.config.copy_on_select {
+                    if let Some(text) = self.get_selected_text() {
+                        if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                            let _ = clip.set_text(text);
+                        }
+                    }
+                }
+                cx.notify();
+                return;
+            }
+            let raw_x = event.position.x.to_f64() as f32;
+            let raw_y = event.position.y.to_f64() as f32;
+            self.selection_mouse_pos = Some((raw_x, raw_y));
+            self.has_selection_dragged = true;
+            self.update_selection_from_mouse(_window, cx);
+            return;
+        }
 
         let history_size = terminal.history_size();
         let viewport_size = _window.viewport_size();
@@ -3109,42 +3144,6 @@ impl RootView {
             alacritty_terminal::index::Line(grid_row),
             alacritty_terminal::index::Column(grid_col),
         );
-
-        if self.is_selecting {
-            let raw_y = event.position.y.to_f64() as f32;
-            let top_edge = 32.0;
-            let bottom_edge = 32.0 + avail_h;
-
-            if raw_y < top_edge {
-                // Dragging above the visible viewport: scroll up into history
-                let overflow_px = top_edge - raw_y;
-                let scroll_lines = ((overflow_px / line_h).ceil() as isize).clamp(1, 10);
-                terminal.scroll(scroll_lines);
-            } else if raw_y > bottom_edge {
-                // Dragging below the visible viewport: scroll down towards bottom
-                let overflow_px = raw_y - bottom_edge;
-                let scroll_lines = -(((overflow_px / line_h).ceil() as isize).clamp(1, 10));
-                terminal.scroll(scroll_lines);
-            }
-
-            let new_display_offset = terminal.display_offset();
-            let updated_grid_row = (((local_y / line_h).floor() as i32) - (new_display_offset as i32)).clamp(-(history_size as i32), screen_rows - 1);
-            let updated_point = alacritty_terminal::index::Point::new(
-                alacritty_terminal::index::Line(updated_grid_row),
-                alacritty_terminal::index::Column(grid_col),
-            );
-
-            if let Some(start_p) = self.selection_start {
-                let (start, end) = if start_p <= updated_point {
-                    (start_p, updated_point)
-                } else {
-                    (updated_point, start_p)
-                };
-                self.selection = Some(Selection { start, end });
-                cx.notify();
-            }
-            return;
-        }
 
         // URL / OSC 8 Hyperlink Hover detection
         if let Some(term_guard) = terminal.term().try_lock() {
@@ -3197,6 +3196,8 @@ impl RootView {
         self.pressed_mouse_button = None;
         self.is_dragging_scrollbar = false;
         self.dragging_scrollbar_pane_id = None;
+        self.selection_mouse_pos = None;
+        self.has_selection_dragged = false;
         if self.is_selecting {
             self.is_selecting = false;
             if self.config.copy_on_select {
@@ -3232,6 +3233,87 @@ impl RootView {
                         event.modifiers.control,
                     );
                 }
+            }
+        }
+    }
+
+    fn update_selection_from_mouse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_selecting || !self.has_selection_dragged {
+            return;
+        }
+        let Some((raw_x, raw_y)) = self.selection_mouse_pos else { return; };
+        let Some(active_tab) = self.tabs.get(self.active_tab_idx) else { return; };
+        let active_pane = active_tab.pane_tree.active_pane();
+        let Some(terminal) = active_pane.as_ref().and_then(|p| p.terminal.as_ref()).or_else(|| active_tab.terminal.as_ref()) else { return; };
+
+        let (cell_w, line_h) = self.measure_cell_metrics(window);
+        let px_per_line = if line_h > 0.0 { line_h } else { 18.0 };
+        let cell_width = if cell_w > 0.0 { cell_w } else { 9.0 };
+
+        let top_edge = 32.0;
+        let v = window.viewport_size();
+        let avail_h = (v.height.to_f64() as f32 - 56.0).max(100.0);
+        let avail_w = v.width.to_f64() as f32;
+        let bottom_edge = top_edge + avail_h;
+
+        let screen_rows = ((avail_h / px_per_line) as i32).max(1);
+        let screen_cols = ((avail_w / cell_width) as usize).max(1);
+        let history_size = terminal.history_size();
+
+        // Autoscroll triggers when cursor is dragged near/into top or bottom edges (or beyond)
+        let top_scroll_zone = top_edge + px_per_line * 2.0;
+        let bottom_scroll_zone = bottom_edge - px_per_line * 2.0;
+
+        if raw_y < top_scroll_zone {
+            let dist = (top_scroll_zone - raw_y).max(0.0);
+            let lines = ((dist / px_per_line).ceil() as isize).clamp(1, 8);
+            terminal.scroll(lines);
+            self.last_scroll_activity = std::time::Instant::now();
+        } else if raw_y > bottom_scroll_zone {
+            let dist = (raw_y - bottom_scroll_zone).max(0.0);
+            let lines = -(((dist / px_per_line).ceil() as isize).clamp(1, 8));
+            terminal.scroll(lines);
+            self.last_scroll_activity = std::time::Instant::now();
+        }
+
+        let new_display_offset = terminal.display_offset();
+
+        let updated_grid_row = if raw_y < top_edge {
+            -(new_display_offset as i32)
+        } else if raw_y > bottom_edge {
+            (screen_rows - 1) - (new_display_offset as i32)
+        } else {
+            let rel_y = (raw_y - top_edge).clamp(0.0, avail_h - 1.0);
+            let row_in_screen = (rel_y / px_per_line).floor() as i32;
+            row_in_screen - (new_display_offset as i32)
+        }.clamp(-(history_size as i32), screen_rows - 1);
+
+        let local_x = (raw_x - 1.0).max(0.0);
+        let updated_col = if raw_y < top_edge && raw_x < 5.0 {
+            0
+        } else {
+            ((local_x / cell_width).floor() as usize).min(screen_cols.saturating_sub(1))
+        };
+
+        let updated_point = alacritty_terminal::index::Point::new(
+            alacritty_terminal::index::Line(updated_grid_row),
+            alacritty_terminal::index::Column(updated_col),
+        );
+
+        if let Some(start_p) = self.selection_start {
+            if start_p == updated_point {
+                if self.selection.is_some() {
+                    self.selection = None;
+                    cx.notify();
+                }
+            } else {
+                let (start, end) = if start_p <= updated_point {
+                    (start_p, updated_point)
+                } else {
+                    (updated_point, start_p)
+                };
+                self.selection = Some(Selection { start, end });
+                cx.notify();
             }
         }
     }
@@ -3858,6 +3940,8 @@ impl Render for RootView {
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
+            .on_mouse_move(cx.listener(Self::handle_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
             .child(
                 TabBar::new(tab_items, theme)
                     .update_available(self.update_available.as_ref().map(|u| u.version.clone()), self.is_updating)
