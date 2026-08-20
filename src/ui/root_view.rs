@@ -1222,6 +1222,13 @@ impl RootView {
                             }
                             cx.notify();
                         }
+                        AppEvent::Notification { title, body } => {
+                            let summary = if title.is_empty() { "Fastty" } else { &title };
+                            let _ = notify_rust::Notification::new()
+                                .summary(summary)
+                                .body(&body)
+                                .show();
+                        }
                         _ => {
                             cx.notify();
                         }
@@ -1442,6 +1449,13 @@ impl RootView {
                                 }
                             }
                             cx.notify();
+                        }
+                        AppEvent::Notification { title, body } => {
+                            let summary = if title.is_empty() { "Fastty" } else { &title };
+                            let _ = notify_rust::Notification::new()
+                                .summary(summary)
+                                .body(&body)
+                                .show();
                         }
                         _ => {
                             cx.notify();
@@ -2444,11 +2458,11 @@ impl RootView {
             return;
         }
 
-        // 4d. Split Down (⌘⇧D on macOS; Ctrl+Shift+O on Linux/Windows)
+        // 4d. Split Down (⌘⇧D on macOS; Ctrl+Shift+B on Linux/Windows)
         let is_split_down = if cfg!(target_os = "macos") {
             modifiers.platform && modifiers.shift && key_lower == "d"
         } else {
-            modifiers.control && modifiers.shift && key_lower == "o"
+            modifiers.control && modifiers.shift && key_lower == "b"
         };
         if is_split_down {
             self.split_active_pane(Direction::Down, _window, cx);
@@ -2633,6 +2647,32 @@ impl RootView {
         };
         if is_clear_scroll {
             terminal.scroll_to_bottom();
+            cx.notify();
+            return;
+        }
+
+        // 12b. Prev Prompt (⌘⇧↑ / ⌘⇧H on macOS; Ctrl+Shift+↑ / Ctrl+Shift+H on Linux/Windows)
+        let is_prev_prompt = if cfg!(target_os = "macos") {
+            modifiers.platform && modifiers.shift && (key_lower == "up" || key_lower == "arrowup" || key_lower == "h")
+        } else {
+            modifiers.control && modifiers.shift && (key_lower == "up" || key_lower == "arrowup" || key_lower == "h")
+        };
+        if is_prev_prompt {
+            terminal.scroll_to_prev_prompt();
+            self.last_scroll_activity = std::time::Instant::now();
+            cx.notify();
+            return;
+        }
+
+        // 12c. Next Prompt (⌘⇧↓ on macOS; Ctrl+Shift+↓ on Linux/Windows)
+        let is_next_prompt = if cfg!(target_os = "macos") {
+            modifiers.platform && modifiers.shift && (key_lower == "down" || key_lower == "arrowdown")
+        } else {
+            modifiers.control && modifiers.shift && (key_lower == "down" || key_lower == "arrowdown")
+        };
+        if is_next_prompt {
+            terminal.scroll_to_next_prompt();
+            self.last_scroll_activity = std::time::Instant::now();
             cx.notify();
             return;
         }
@@ -3106,10 +3146,19 @@ impl RootView {
             return;
         }
 
-        // URL Hover detection
+        // URL / OSC 8 Hyperlink Hover detection
         if let Some(term_guard) = terminal.term().try_lock() {
             let grid = term_guard.grid();
             let cols = grid.columns();
+            // 1. Explicit OSC 8 hyperlink check
+            if let Some((url, start_c, end_c)) = crate::selection_classifier::extract_hyperlink(grid, current_point, cols) {
+                self.hovered_url = Some(url);
+                self.hovered_url_range = Some((grid_row, start_c, end_c));
+                cx.notify();
+                return;
+            }
+
+            // 2. Pattern-based URL / path / email classifier fallback
             if let Some((token, start_c, end_c)) = crate::selection_classifier::extract_token(grid, current_point, cols) {
                 if let Some(classification) = crate::selection_classifier::classify_token(&token) {
                     match classification {
@@ -3389,7 +3438,7 @@ impl RootView {
                             };
 
                             let is_bold = cell.flags.contains(Flags::BOLD);
-                            let is_underline = cell.flags.contains(Flags::UNDERLINE) || is_hovered_url;
+                            let is_underline = cell.flags.contains(Flags::UNDERLINE) || is_hovered_url || cell.hyperlink().is_some();
                             let code = cell.c as u32;
                             let is_emoji = is_emoji_codepoint(code);
                             let is_pua_icon = (0xE000..=0xF8FF).contains(&code)

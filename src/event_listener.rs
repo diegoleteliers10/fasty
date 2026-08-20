@@ -133,6 +133,42 @@ impl EventListener for EventListenerProxy {
             Event::Title(title) => {
                 self.app_sender.lock().send(AppEvent::TitleChanged(title));
             }
+            Event::ColorRequest(index, format) => {
+                let theme_name = crate::config::ACTIVE_THEME.read().clone();
+                let theme = crate::ui::theme::Theme::from_name(&theme_name);
+                let hsla = match index {
+                    0 => theme.black,
+                    1 => theme.red,
+                    2 => theme.green,
+                    3 => theme.yellow,
+                    4 => theme.blue,
+                    5 => theme.magenta,
+                    6 => theme.cyan,
+                    7 => theme.white,
+                    8 => theme.bright_black,
+                    9 => theme.bright_red,
+                    10 => theme.bright_green,
+                    11 => theme.bright_yellow,
+                    12 => theme.bright_blue,
+                    13 => theme.bright_magenta,
+                    14 => theme.bright_cyan,
+                    15 => theme.bright_white,
+                    256 => theme.foreground,
+                    257 => theme.background,
+                    258 => theme.cursor,
+                    _ => theme.foreground,
+                };
+                let rgba: gpui::Rgba = hsla.into();
+                let r = (rgba.r * 255.0).clamp(0.0, 255.0) as u8;
+                let g = (rgba.g * 255.0).clamp(0.0, 255.0) as u8;
+                let b = (rgba.b * 255.0).clamp(0.0, 255.0) as u8;
+                let rgb = alacritty_terminal::vte::ansi::Rgb { r, g, b };
+                let response = format(rgb);
+                let mut w = self.writer.lock();
+                if w.write_all(response.as_bytes()).is_ok() {
+                    let _ = w.flush();
+                }
+            }
             _ => {}
         }
     }

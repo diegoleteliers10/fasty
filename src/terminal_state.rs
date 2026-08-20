@@ -164,6 +164,7 @@ pub struct TerminalState {
     master: Arc<ParkingMutex<Box<dyn MasterPty + Send>>>,
     shell_pid: Option<u32>,
     pub total_lines_pushed: Arc<AtomicU64>,
+    pub prompt_lines: Arc<ParkingMutex<Vec<u64>>>,
     event_listener: EventListenerProxy,
 }
 
@@ -407,6 +408,8 @@ impl TerminalState {
         let event_listener_clone = event_listener.clone();
         let total_lines_pushed = Arc::new(AtomicU64::new(0));
         let total_lines_pushed_clone = Arc::clone(&total_lines_pushed);
+        let prompt_lines = Arc::new(ParkingMutex::new(Vec::new()));
+        let prompt_lines_clone = Arc::clone(&prompt_lines);
         let writer_clone = Arc::clone(&writer_arc);
         if !std::env::var("FASTTY_NO_READER").is_ok() {
         thread::spawn(move || {
@@ -453,6 +456,21 @@ impl TerminalState {
 
             let mut handle_cmd = |cmd: OscCommand, cursor_line: i32, screen_lines: i32, base: u64| {
                 match cmd {
+                    OscCommand::PromptStarted => {
+                        let scrolled = (base as i64 - screen_lines as i64).max(0);
+                        let absolute_line = (scrolled + cursor_line as i64).max(0) as u64;
+                        {
+                            let mut p = prompt_lines_clone.lock();
+                            if p.last().copied() != Some(absolute_line) {
+                                p.push(absolute_line);
+                                if p.len() > 500 {
+                                    let excess = p.len() - 500;
+                                    p.drain(0..excess);
+                                }
+                            }
+                        }
+                        dispatch_osc_action(&OscCommand::PromptStarted, &event_listener_clone, cursor_line, base, screen_lines);
+                    }
                     OscCommand::NotificationQuery { id } => {
                         let resp = format!("\x1b]99;i={}:p=OK;\x1b\\", id);
                         let mut w = writer_clone.lock();
@@ -619,7 +637,7 @@ impl TerminalState {
                                         osc_state = OscParseState::OscEsc;
                                     } else {
                                         osc_buf.push(byte);
-                                        if osc_buf.len() > 4096 {
+                                        if osc_buf.len() > 131072 {
                                             osc_state = OscParseState::Normal;
                                         }
                                     }
@@ -637,7 +655,7 @@ impl TerminalState {
                                         osc_buf.push(0x1b);
                                         osc_buf.push(byte);
                                         osc_state = OscParseState::Osc;
-                                        if osc_buf.len() > 4096 {
+                                        if osc_buf.len() > 131072 {
                                             osc_state = OscParseState::Normal;
                                         }
                                     }
@@ -706,6 +724,7 @@ impl TerminalState {
             master: master_arc,
             shell_pid,
             total_lines_pushed,
+            prompt_lines,
             event_listener,
         })
     }
@@ -962,6 +981,46 @@ impl TerminalState {
         term.grid().display_offset()
     }
 
+    pub fn scroll_to_prev_prompt(&self) {
+        let cur_offset = self.display_offset() as u64;
+        let total_pushed = self.total_lines_pushed.load(Ordering::Relaxed);
+        let prompts = self.prompt_lines.lock();
+        let mut candidates: Vec<u64> = prompts
+            .iter()
+            .map(|&line| total_pushed.saturating_sub(line))
+            .filter(|&offset| offset > cur_offset + 1)
+            .collect();
+        candidates.sort_unstable();
+        if let Some(&target) = candidates.first() {
+            self.scroll_to_offset(target as usize);
+        } else if let Some(&min_line) = prompts.first() {
+            let target = total_pushed.saturating_sub(min_line);
+            if target > cur_offset {
+                self.scroll_to_offset(target as usize);
+            }
+        }
+    }
+
+    pub fn scroll_to_next_prompt(&self) {
+        let cur_offset = self.display_offset() as u64;
+        if cur_offset == 0 {
+            return;
+        }
+        let total_pushed = self.total_lines_pushed.load(Ordering::Relaxed);
+        let prompts = self.prompt_lines.lock();
+        let mut candidates: Vec<u64> = prompts
+            .iter()
+            .map(|&line| total_pushed.saturating_sub(line))
+            .filter(|&offset| offset + 1 < cur_offset)
+            .collect();
+        candidates.sort_unstable_by(|a, b| b.cmp(a));
+        if let Some(&target) = candidates.first() {
+            self.scroll_to_offset(target as usize);
+        } else {
+            self.scroll_to_bottom();
+        }
+    }
+
     pub fn history_size(&self) -> usize {
         use alacritty_terminal::grid::Dimensions;
         let term = self.term.lock();
@@ -1016,25 +1075,26 @@ impl TerminalState {
     }
 }
 
-/// Decode a `file://` URL to a local filesystem path.
-/// Accepts both `file:///abs/path` and `file://hostname/abs/path` forms.
+/// Decode a `file://` URL or plain directory path to a local filesystem path.
+/// Accepts `file:///abs/path`, `file://hostname/abs/path`, and raw `/path` or `C:\path` forms.
 fn file_url_to_path(buf: &[u8]) -> Option<std::path::PathBuf> {
     let s = std::str::from_utf8(buf).ok()?;
-    let path = s.strip_prefix("file://")?;
-    // Reject host-qualified URLs like `file://localhost/abs`
-    let path = if let Some(slash_idx) = path.find('/') {
-        let prefix = &path[..slash_idx];
-        // If the "host" part contains a dot, colon, or looks like a real hostname, reject it
-        if prefix.contains('.') || prefix.contains(':') || (!prefix.is_empty() && prefix != "localhost") {
-            return None;
-        }
-        &path[slash_idx..]
+    if let Some(path) = s.strip_prefix("file://") {
+        let path = if let Some(slash_idx) = path.find('/') {
+            &path[slash_idx..]
+        } else {
+            path
+        };
+        let decoded = percent_decode(path);
+        Some(std::path::PathBuf::from(decoded))
     } else {
-        path
-    };
-    // URL-decode minimal: %20 -> space, etc.
-    let decoded = percent_decode(path);
-    Some(std::path::PathBuf::from(decoded))
+        let trimmed = s.trim();
+        if !trimmed.is_empty() && (trimmed.starts_with('/') || trimmed.starts_with('~') || (trimmed.len() >= 2 && trimmed.chars().nth(1) == Some(':'))) {
+            Some(std::path::PathBuf::from(trimmed))
+        } else {
+            None
+        }
+    }
 }
 
 /// Minimal percent-decode for file:// paths.
@@ -1141,11 +1201,15 @@ fn parse_osc(
                     if parts[1] == "?" {
                         return Some(OscCommand::PaletteQuery { index });
                     }
+                } else if parts[0] == "?" {
+                    if let Ok(index) = parts[1].parse::<u8>() {
+                        return Some(OscCommand::PaletteQuery { index });
+                    }
                 }
             }
             None
         }
-        b"7" => {
+        b"6" | b"7" | b"176" => {
             if let Ok(s) = std::str::from_utf8(payload) {
                 Some(OscCommand::Cwd(s.to_string()))
             } else {
@@ -1169,7 +1233,7 @@ fn parse_osc(
                 b"12" => 12,
                 _ => 10,
             };
-            if payload == b"?" {
+            if payload.starts_with(b"?") || payload == b"?" {
                 Some(OscCommand::ColorQuery { code: code_num })
             } else {
                 None
@@ -1272,6 +1336,12 @@ fn parse_osc(
                     *cmd_start_time = Some(std::time::Instant::now());
                     Some(OscCommand::CommandStarted)
                 }
+                b"C" => {
+                    if cmd_start_time.is_none() {
+                        *cmd_start_time = Some(std::time::Instant::now());
+                    }
+                    Some(OscCommand::CommandStarted)
+                }
                 b"D" => {
                     if let Some(start) = cmd_start_time.take() {
                         let duration_ms = start.elapsed().as_millis();
@@ -1300,6 +1370,65 @@ fn parse_osc(
                         None
                     }
                 }
+            }
+        }
+        b"633" => {
+            match payload {
+                b"A" => {
+                    Some(OscCommand::PromptStarted)
+                }
+                b"B" => {
+                    *cmd_start_time = Some(std::time::Instant::now());
+                    Some(OscCommand::CommandStarted)
+                }
+                b"C" => {
+                    if cmd_start_time.is_none() {
+                        *cmd_start_time = Some(std::time::Instant::now());
+                    }
+                    Some(OscCommand::CommandStarted)
+                }
+                b"D" => {
+                    if let Some(start) = cmd_start_time.take() {
+                        let duration_ms = start.elapsed().as_millis();
+                        Some(OscCommand::CommandFinished {
+                            duration_ms,
+                            exit_code: None,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => {
+                    if payload.starts_with(b"D;") {
+                        let exit_str = std::str::from_utf8(&payload[2..]).unwrap_or("0");
+                        let exit_code: Option<i32> = exit_str.parse().ok();
+                        if let Some(start) = cmd_start_time.take() {
+                            let duration_ms = start.elapsed().as_millis();
+                            Some(OscCommand::CommandFinished {
+                                duration_ms,
+                                exit_code,
+                            })
+                        } else {
+                            None
+                        }
+                    } else if payload.starts_with(b"P;Cwd=") {
+                        let cwd_str = std::str::from_utf8(&payload[6..]).ok()?;
+                        Some(OscCommand::Cwd(cwd_str.to_string()))
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+        b"1337" => {
+            if let Ok(s) = std::str::from_utf8(payload) {
+                if let Some(dir) = s.strip_prefix("CurrentDir=") {
+                    Some(OscCommand::Cwd(dir.to_string()))
+                } else {
+                    None
+                }
+            } else {
+                None
             }
         }
         _ => None,
@@ -1471,5 +1600,58 @@ mod tests {
             run(b"hello \x1b]0;title\x07 world"),
             Vec::<CsiEvent>::new()
         );
+    }
+
+    #[test]
+    fn test_osc_parsing() {
+        use super::parse_osc;
+        let mut cmd_start = None;
+
+        // OSC 0/1/2 - Title
+        let cmd = parse_osc(b"0;My Terminal", &mut cmd_start).unwrap();
+        assert!(matches!(cmd, super::OscCommand::SetTitle(t) if t == "My Terminal"));
+
+        // OSC 6, 7, 176 - CWD
+        let cmd = parse_osc(b"7;file:///Users/foo/project", &mut cmd_start).unwrap();
+        assert!(matches!(cmd, super::OscCommand::Cwd(p) if p == "file:///Users/foo/project"));
+
+        let cmd = parse_osc(b"6;file:///tmp", &mut cmd_start).unwrap();
+        assert!(matches!(cmd, super::OscCommand::Cwd(p) if p == "file:///tmp"));
+
+        let cmd = parse_osc(b"176;file:///var", &mut cmd_start).unwrap();
+        assert!(matches!(cmd, super::OscCommand::Cwd(p) if p == "file:///var"));
+
+        // OSC 1337 CurrentDir
+        let cmd = parse_osc(b"1337;CurrentDir=/home/user", &mut cmd_start).unwrap();
+        assert!(matches!(cmd, super::OscCommand::Cwd(p) if p == "/home/user"));
+
+        // OSC 133 - Shell Integration
+        let cmd = parse_osc(b"133;A", &mut cmd_start).unwrap();
+        assert!(matches!(cmd, super::OscCommand::PromptStarted));
+
+        let cmd = parse_osc(b"133;B", &mut cmd_start).unwrap();
+        assert!(matches!(cmd, super::OscCommand::CommandStarted));
+        assert!(cmd_start.is_some());
+
+        let cmd = parse_osc(b"133;D;0", &mut cmd_start).unwrap();
+        assert!(matches!(cmd, super::OscCommand::CommandFinished { exit_code: Some(0), .. }));
+
+        // OSC 633 - VS Code Shell Integration
+        let cmd = parse_osc(b"633;A", &mut cmd_start).unwrap();
+        assert!(matches!(cmd, super::OscCommand::PromptStarted));
+
+        let cmd = parse_osc(b"633;P;Cwd=/opt/app", &mut cmd_start).unwrap();
+        assert!(matches!(cmd, super::OscCommand::Cwd(p) if p == "/opt/app"));
+
+        // OSC 10/11/12 - Color Query
+        let cmd = parse_osc(b"10;?", &mut cmd_start).unwrap();
+        assert!(matches!(cmd, super::OscCommand::ColorQuery { code: 10 }));
+
+        let cmd = parse_osc(b"11;?", &mut cmd_start).unwrap();
+        assert!(matches!(cmd, super::OscCommand::ColorQuery { code: 11 }));
+
+        // OSC 4 - Palette Query
+        let cmd = parse_osc(b"4;2;?", &mut cmd_start).unwrap();
+        assert!(matches!(cmd, super::OscCommand::PaletteQuery { index: 2 }));
     }
 }

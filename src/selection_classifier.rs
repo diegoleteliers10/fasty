@@ -157,6 +157,50 @@ pub fn extract_token(
     Some((chars[start..end].iter().collect(), start, end))
 }
 
+pub fn extract_hyperlink(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    point: Point,
+    shell_cols: usize,
+) -> Option<(String, usize, usize)> {
+    let line_idx = point.line.0;
+    let screen_lines = grid.screen_lines() as i32;
+    let history_size = grid.history_size() as i32;
+    if screen_lines == 0 || line_idx < -history_size || line_idx >= screen_lines {
+        return None;
+    }
+    let row = &grid[alacritty_terminal::index::Line(line_idx)];
+    let shell_cols = shell_cols.min(grid.columns());
+    if shell_cols == 0 {
+        return None;
+    }
+    let col = point.column.0.min(shell_cols - 1);
+    let cell = &row[alacritty_terminal::index::Column(col)];
+    let hyperlink = cell.hyperlink()?;
+    let uri = hyperlink.uri().to_string();
+
+    let mut start = col;
+    while start > 0 {
+        if let Some(h) = row[alacritty_terminal::index::Column(start - 1)].hyperlink() {
+            if h.uri() == uri {
+                start -= 1;
+                continue;
+            }
+        }
+        break;
+    }
+    let mut end = col + 1;
+    while end < shell_cols {
+        if let Some(h) = row[alacritty_terminal::index::Column(end)].hyperlink() {
+            if h.uri() == uri {
+                end += 1;
+                continue;
+            }
+        }
+        break;
+    }
+    Some((uri, start, end))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

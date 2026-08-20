@@ -1,3 +1,7 @@
+// Suppress the console window on Windows; without this attribute a CMD/PowerShell
+// window appears behind the app on every launch.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use gpui::{
     App, Bounds, KeyBinding, Menu, MenuItem, QuitMode, TitlebarOptions,
     WindowBackgroundAppearance, WindowBounds, WindowOptions, actions, prelude::*, px, size,

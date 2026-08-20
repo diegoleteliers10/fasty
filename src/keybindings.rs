@@ -174,7 +174,7 @@ impl KeyBindingResolver {
             insert("ctrl+shift+v", Action::Paste);
             insert("shift+insert", Action::Paste);
             insert("ctrl+shift+e", Action::SplitRight);
-            insert("ctrl+shift+o", Action::SplitDown);
+            insert("ctrl+shift+b", Action::SplitDown);
             insert("alt+left", Action::FocusLeft);
             insert("alt+right", Action::FocusRight);
             insert("alt+up", Action::FocusTop);
