@@ -27,13 +27,14 @@ pub fn defers_to_ime(event: &KeyDownEvent, option_as_meta: bool) -> bool {
     let Some(key_char) = keystroke.key_char.as_deref() else {
         return false;
     };
-    if keystroke.modifiers.control
+    let is_alt_gr = keystroke.modifiers.control && keystroke.modifiers.alt;
+    if (keystroke.modifiers.control && !is_alt_gr)
         || keystroke.modifiers.function
         || keystroke.modifiers.platform
     {
         return false;
     }
-    if keystroke.modifiers.alt && option_as_meta {
+    if keystroke.modifiers.alt && !is_alt_gr && option_as_meta {
         return false;
     }
     !key_char.is_empty() && key_char.chars().all(|c| !c.is_control())

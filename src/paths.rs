@@ -97,6 +97,24 @@ pub fn default_system_shell() -> String {
                 return shell;
             }
         }
+        // Prefer PowerShell Core 7 (pwsh.exe) which starts significantly faster than Windows PowerShell 5.1
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                let pwsh = dir.join("pwsh.exe");
+                if pwsh.exists() {
+                    return pwsh.to_string_lossy().into_owned();
+                }
+            }
+        }
+        if let Ok(program_files) = std::env::var("ProgramFiles") {
+            let pwsh = std::path::PathBuf::from(program_files)
+                .join("PowerShell")
+                .join("7")
+                .join("pwsh.exe");
+            if pwsh.exists() {
+                return pwsh.to_string_lossy().into_owned();
+            }
+        }
         if let Ok(comspec) = std::env::var("COMSPEC") {
             if std::path::Path::new(&comspec).exists() {
                 // If COMSPEC points to cmd.exe, prefer powershell if available, otherwise comspec

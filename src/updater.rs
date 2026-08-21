@@ -69,10 +69,14 @@ pub fn check_for_update_sync() -> Option<ReleaseInfo> {
     let current_version = env!("CARGO_PKG_VERSION");
     let api_url = "https://api.github.com/repos/diegoleteliers10/fasty/releases/latest";
 
-    let output = std::process::Command::new("curl")
-        .args(["-sSfL", "--max-time", "6", "-H", "User-Agent: fastty", api_url])
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-sSfL", "--max-time", "6", "-H", "User-Agent: fastty", api_url]);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let output = cmd.output().ok()?;
 
     if !output.status.success() {
         return None;
@@ -120,9 +124,14 @@ pub fn apply_update_sync(release: &ReleaseInfo) -> anyhow::Result<()> {
     let archive_path = temp_dir.join(&release.asset_name);
 
     // 1. Download archive
-    let status = std::process::Command::new("curl")
-        .args(["-sSfL", "-o", archive_path.to_str().unwrap(), &release.download_url])
-        .status()?;
+    let mut curl_cmd = std::process::Command::new("curl");
+    curl_cmd.args(["-sSfL", "-o", archive_path.to_str().unwrap(), &release.download_url]);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        curl_cmd.creation_flags(0x08000000);
+    }
+    let status = curl_cmd.status()?;
 
     if !status.success() {
         anyhow::bail!("Failed to download update asset from {}", release.download_url);
@@ -212,22 +221,24 @@ pub fn apply_update_sync(release: &ReleaseInfo) -> anyhow::Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        let ext_status = std::process::Command::new("tar")
-            .args(["-xf", archive_path.to_str().unwrap(), "-C", temp_dir.to_str().unwrap()])
-            .status()
-            .or_else(|_| {
-                std::process::Command::new("powershell")
-                    .args([
-                        "-NoProfile",
-                        "-Command",
-                        &format!(
-                            "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
-                            archive_path.display(),
-                            temp_dir.display()
-                        ),
-                    ])
-                    .status()
-            })?;
+        use std::os::windows::process::CommandExt;
+        let mut tar_cmd = std::process::Command::new("tar");
+        tar_cmd.args(["-xf", archive_path.to_str().unwrap(), "-C", temp_dir.to_str().unwrap()]);
+        tar_cmd.creation_flags(0x08000000);
+        let ext_status = tar_cmd.status().or_else(|_| {
+            let mut ps_cmd = std::process::Command::new("powershell");
+            ps_cmd.args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+                    archive_path.display(),
+                    temp_dir.display()
+                ),
+            ]);
+            ps_cmd.creation_flags(0x08000000);
+            ps_cmd.status()
+        })?;
 
         if !ext_status.success() {
             anyhow::bail!("Failed to extract zip archive");

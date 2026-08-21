@@ -114,7 +114,9 @@ fn shell_command(cmd: &str) -> std::process::Command {
 
 #[cfg(target_os = "windows")]
 fn shell_command(cmd: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
     let mut c = std::process::Command::new("cmd");
     c.arg("/C").arg(cmd);
+    c.creation_flags(0x08000000);
     c
 }

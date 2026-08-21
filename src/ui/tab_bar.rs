@@ -202,12 +202,20 @@ impl RenderOnce for TabBar {
         #[cfg(not(target_os = "macos"))]
         {
             div()
+                .id("tab-bar-top-container")
                 .flex()
                 .flex_row()
                 .items_center()
                 .h(px(32.))
                 .w_full()
                 .bg(theme.tab_bar_bg)
+                .on_mouse_down(MouseButton::Left, |ev, window, _cx| {
+                    if ev.click_count == 2 {
+                        window.zoom_window();
+                    } else {
+                        window.start_window_move();
+                    }
+                })
                 .child(
                     div()
                         .flex()
@@ -252,10 +260,15 @@ impl RenderOnce for TabBar {
                 )
                 .child(
                     div()
+                        .id("tab-bar-drag-spacer")
                         .flex_1()
                         .h_full()
-                        .on_mouse_down(MouseButton::Left, |_ev, window, _cx| {
-                            window.start_window_move();
+                        .on_mouse_down(MouseButton::Left, |ev, window, _cx| {
+                            if ev.click_count == 2 {
+                                window.zoom_window();
+                            } else {
+                                window.start_window_move();
+                            }
                         }),
                 )
                 .child(

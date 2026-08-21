@@ -625,7 +625,11 @@ pub fn open_path_or_url(target: impl AsRef<std::ffi::OsStr>) {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("cmd").args(["/C", "start", ""]).arg(target).spawn();
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "start", ""]).arg(target);
+        cmd.creation_flags(0x08000000);
+        let _ = cmd.spawn();
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -845,6 +849,15 @@ impl RootView {
     }
 
     pub fn with_options(_window: &mut Window, cli_opts: crate::cli::CliOptions, cx: &mut Context<Self>) -> Self {
+        Self::with_options_internal(_window, cli_opts, None, cx)
+    }
+
+    pub fn with_options_internal(
+        _window: &mut Window,
+        cli_opts: crate::cli::CliOptions,
+        initial_tab: Option<TabData>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         config::load_custom_themes();
         crate::snippets::load();
         let loaded_config = Config::load().unwrap_or_default();
@@ -915,7 +928,7 @@ impl RootView {
         .detach();
 
         let mut restored_tabs = Vec::new();
-        if loaded_config.session_restore {
+        if initial_tab.is_none() && loaded_config.session_restore {
             if let Some(session) = crate::session::load() {
                 if let Some(win) = session.windows.first() {
                     for tab_info in &win.tabs {
@@ -1016,7 +1029,9 @@ impl RootView {
             }
         }).detach();
 
-        if cli_opts.command.is_some() || cli_opts.working_dir.is_some() || cli_opts.title.is_some() {
+        if let Some(tab_data) = initial_tab {
+            view.attach_tab(tab_data, _window, cx);
+        } else if cli_opts.command.is_some() || cli_opts.working_dir.is_some() || cli_opts.title.is_some() {
             let shell = cli_opts.command.unwrap_or_else(|| {
                 view.config
                     .shell
@@ -1150,11 +1165,12 @@ impl RootView {
             line_h,
             960.0,
             640.0,
-            event_sender,
+            event_sender.clone(),
         )
         .expect("Failed to initialize terminal state");
 
         let terminal_arc = Arc::new(terminal);
+        let event_sender_loop = event_sender.clone();
 
         cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = event_rx.recv().await {
@@ -1179,16 +1195,13 @@ impl RootView {
                         }
                         AppEvent::CwdChanged(cwd) => {
                             let p = std::path::PathBuf::from(&cwd);
-                            let git = crate::git::fetch_git_info(&p);
                             let now = std::time::Instant::now();
                             for tab in &mut this.tabs {
                                 if let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) {
-                                    pane.git_status = git.clone();
                                     pane.git_checked_cwd = Some(p.clone());
                                     pane.git_last_poll = Some(now);
                                     pane.cwd = Some(p.clone());
                                     if tab.pane_tree.active_pane_id == pane_id {
-                                        tab.git_status = git.clone();
                                         tab.git_checked_cwd = Some(p.clone());
                                         tab.git_last_poll = Some(now);
                                         tab.cwd = Some(p.clone());
@@ -1197,36 +1210,61 @@ impl RootView {
                             }
                             this.persist_session();
                             cx.notify();
+
+                            let sender_bg = event_sender_loop.clone();
+                            let p_bg = p.clone();
+                            std::thread::spawn(move || {
+                                if let Some(git) = crate::git::fetch_git_info(&p_bg) {
+                                    sender_bg.send(AppEvent::GitStatusUpdated {
+                                        window_id: None,
+                                        tab_idx: pane_id,
+                                        status: Some(git),
+                                    });
+                                }
+                            });
                         }
                         AppEvent::CommandFinished { duration_ms, exit_code } => {
+                            let mut cwd_to_poll = None;
                             for tab in &mut this.tabs {
                                 let is_active = tab.pane_tree.active_pane_id == pane_id;
                                 if let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) {
                                     pane.last_duration_ms = Some(duration_ms);
                                     pane.last_exit_code = exit_code;
                                     if let Some(ref cwd) = pane.cwd {
-                                        pane.git_status = crate::git::fetch_git_info(cwd);
-                                        pane.git_last_poll = Some(std::time::Instant::now());
+                                        cwd_to_poll = Some(cwd.clone());
                                     }
                                     if is_active {
                                         tab.last_duration_ms = Some(duration_ms);
                                         tab.last_exit_code = exit_code;
-                                        tab.git_status = pane.git_status.clone();
                                     }
                                 }
                             }
                             cx.notify();
+
+                            if let Some(cwd) = cwd_to_poll {
+                                let sender_bg = event_sender_loop.clone();
+                                std::thread::spawn(move || {
+                                    if let Some(git) = crate::git::fetch_git_info(&cwd) {
+                                        sender_bg.send(AppEvent::GitStatusUpdated {
+                                            window_id: None,
+                                            tab_idx: pane_id,
+                                            status: Some(git),
+                                        });
+                                    }
+                                });
+                            }
                         }
                         AppEvent::PromptStarted { .. } => {
+                            cx.notify();
+                        }
+                        AppEvent::GitStatusUpdated { tab_idx, status, .. } => {
                             for tab in &mut this.tabs {
-                                let is_active = tab.pane_tree.active_pane_id == pane_id;
-                                if let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) {
-                                    if let Some(ref cwd) = pane.cwd {
-                                        pane.git_status = crate::git::fetch_git_info(cwd);
-                                        pane.git_last_poll = Some(std::time::Instant::now());
-                                    }
-                                    if is_active {
-                                        tab.git_status = pane.git_status.clone();
+                                if let Some(pane) = tab.pane_tree.find_pane_mut(tab_idx) {
+                                    pane.git_status = status.clone();
+                                    pane.git_last_poll = Some(std::time::Instant::now());
+                                    if tab.pane_tree.active_pane_id == tab_idx {
+                                        tab.git_status = status.clone();
+                                        tab.git_last_poll = Some(std::time::Instant::now());
                                     }
                                 }
                             }
@@ -1254,7 +1292,6 @@ impl RootView {
         let initial_cwd = cwd
             .map(|p| p.to_path_buf())
             .or_else(dirs::home_dir);
-        let initial_git = initial_cwd.as_ref().and_then(|p| crate::git::fetch_git_info(p));
         let default_shell_name = std::path::Path::new(cmd)
             .file_name()
             .and_then(|n| n.to_str())
@@ -1263,13 +1300,27 @@ impl RootView {
             .unwrap_or("fastty");
         let pane_title = title_override.unwrap_or_else(|| default_shell_name.to_string());
 
+        if let Some(ref p) = initial_cwd {
+            let sender_bg = event_sender.clone();
+            let p_bg = p.clone();
+            std::thread::spawn(move || {
+                if let Some(git) = crate::git::fetch_git_info(&p_bg) {
+                    sender_bg.send(AppEvent::GitStatusUpdated {
+                        window_id: None,
+                        tab_idx: pane_id,
+                        status: Some(git),
+                    });
+                }
+            });
+        }
+
         TerminalPane {
             id: pane_id,
             terminal: Some(terminal_arc),
             title: pane_title,
             custom_title: None,
             cwd: initial_cwd.clone(),
-            git_status: initial_git,
+            git_status: None,
             git_checked_cwd: initial_cwd,
             git_last_poll: Some(std::time::Instant::now()),
             last_duration_ms: None,
@@ -1382,11 +1433,7 @@ impl RootView {
     }
 
     pub fn with_initial_tab(window: &mut Window, cli_opts: crate::cli::CliOptions, tab_data: TabData, cx: &mut Context<Self>) -> Self {
-        let mut view = Self::with_options(window, cli_opts, cx);
-        view.tabs.clear();
-        view.next_tab_id = 1;
-        view.attach_tab(tab_data, window, cx);
-        view
+        Self::with_options_internal(window, cli_opts, Some(tab_data), cx)
     }
 
     pub fn attach_tab(
@@ -1405,7 +1452,12 @@ impl RootView {
         }));
 
         if let Some(terminal) = &tab_data.terminal {
-            terminal.set_event_sender(event_sender);
+            terminal.set_event_sender(event_sender.clone());
+        }
+        for pane in tab_data.pane_tree.all_panes_mut() {
+            if let Some(ref term) = pane.terminal {
+                term.set_event_sender(event_sender.clone());
+            }
         }
 
         self.tabs.push(tab_data);
@@ -1430,33 +1482,59 @@ impl RootView {
                             cx.notify();
                         }
                         AppEvent::CwdChanged(cwd) => {
+                            let p = std::path::PathBuf::from(&cwd);
+                            let now = std::time::Instant::now();
                             if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
-                                let p = std::path::PathBuf::from(&cwd);
-                                tab.git_status = crate::git::fetch_git_info(&p);
                                 tab.git_checked_cwd = Some(p.clone());
-                                tab.git_last_poll = Some(std::time::Instant::now());
-                                tab.cwd = Some(p);
+                                tab.git_last_poll = Some(now);
+                                tab.cwd = Some(p.clone());
                             }
                             this.persist_session();
                             cx.notify();
+
+                            let sender_bg = event_sender.clone();
+                            let p_bg = p.clone();
+                            std::thread::spawn(move || {
+                                if let Some(git) = crate::git::fetch_git_info(&p_bg) {
+                                    sender_bg.send(AppEvent::GitStatusUpdated {
+                                        window_id: None,
+                                        tab_idx: tab_id,
+                                        status: Some(git),
+                                    });
+                                }
+                            });
                         }
                         AppEvent::CommandFinished { duration_ms, exit_code } => {
+                            let mut cwd_to_poll = None;
                             if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
                                 tab.last_duration_ms = Some(duration_ms);
                                 tab.last_exit_code = exit_code;
                                 if let Some(ref cwd) = tab.cwd {
-                                    tab.git_status = crate::git::fetch_git_info(cwd);
-                                    tab.git_last_poll = Some(std::time::Instant::now());
+                                    cwd_to_poll = Some(cwd.clone());
                                 }
                             }
                             cx.notify();
+
+                            if let Some(cwd) = cwd_to_poll {
+                                let sender_bg = event_sender.clone();
+                                std::thread::spawn(move || {
+                                    if let Some(git) = crate::git::fetch_git_info(&cwd) {
+                                        sender_bg.send(AppEvent::GitStatusUpdated {
+                                            window_id: None,
+                                            tab_idx: tab_id,
+                                            status: Some(git),
+                                        });
+                                    }
+                                });
+                            }
                         }
                         AppEvent::PromptStarted { .. } => {
-                            if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
-                                if let Some(ref cwd) = tab.cwd {
-                                    tab.git_status = crate::git::fetch_git_info(cwd);
-                                    tab.git_last_poll = Some(std::time::Instant::now());
-                                }
+                            cx.notify();
+                        }
+                        AppEvent::GitStatusUpdated { tab_idx, status, .. } => {
+                            if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_idx) {
+                                tab.git_status = status.clone();
+                                tab.git_last_poll = Some(std::time::Instant::now());
                             }
                             cx.notify();
                         }
@@ -1952,6 +2030,13 @@ impl RootView {
         let key_lower = key.to_lowercase();
         let modifiers = &event.keystroke.modifiers;
 
+        if key_lower.starts_with("dead") || key_lower == "dead" {
+            return;
+        }
+
+        let is_alt_gr = modifiers.control && modifiers.alt;
+        let is_ctrl = modifiers.control && !is_alt_gr;
+
         // 0. Rename Tab Modal Keyboard Handler
         if self.is_rename_tab_open {
             if key_lower == "escape" || key_lower == "esc" {
@@ -1969,12 +2054,12 @@ impl RootView {
                 return;
             }
             if let Some(ref ch) = event.keystroke.key_char {
-                if !modifiers.platform && !modifiers.control {
+                if !modifiers.platform && !is_ctrl {
                     self.rename_tab_input.push_str(ch);
                     cx.notify();
                     return;
                 }
-            } else if key.len() == 1 && !modifiers.platform && !modifiers.control {
+            } else if key.len() == 1 && !modifiers.platform && !is_ctrl {
                 self.rename_tab_input.push_str(key);
                 cx.notify();
                 return;
@@ -2032,14 +2117,14 @@ impl RootView {
                 return;
             }
             if let Some(ref ch) = event.keystroke.key_char {
-                if !modifiers.platform && !modifiers.control {
+                if !modifiers.platform && !is_ctrl {
                     self.command_palette_query.push_str(ch);
                     self.command_palette_selected = 0;
                     self.command_palette_scroll_handle.scroll_to_item(0);
                     cx.notify();
                     return;
                 }
-            } else if key.len() == 1 && !modifiers.platform && !modifiers.control {
+            } else if key.len() == 1 && !modifiers.platform && !is_ctrl {
                 self.command_palette_query.push_str(key);
                 self.command_palette_selected = 0;
                 self.command_palette_scroll_handle.scroll_to_item(0);
@@ -2101,14 +2186,14 @@ impl RootView {
                 return;
             }
             if let Some(ref ch) = event.keystroke.key_char {
-                if !modifiers.platform && !modifiers.control {
+                if !modifiers.platform && !is_ctrl {
                     self.ssh_manager_query.push_str(ch);
                     self.ssh_manager_selected = 0;
                     self.ssh_manager_scroll_handle.scroll_to_item(0);
                     cx.notify();
                     return;
                 }
-            } else if key.len() == 1 && !modifiers.platform && !modifiers.control {
+            } else if key.len() == 1 && !modifiers.platform && !is_ctrl {
                 self.ssh_manager_query.push_str(key);
                 self.ssh_manager_selected = 0;
                 self.ssh_manager_scroll_handle.scroll_to_item(0);
@@ -2158,10 +2243,10 @@ impl RootView {
                     }
                     let mut char_to_add = None;
                     if let Some(ref ch) = event.keystroke.key_char {
-                        if !modifiers.platform && !modifiers.control {
+                        if !modifiers.platform && !is_ctrl {
                             char_to_add = Some(ch.clone());
                         }
-                    } else if key.len() == 1 && !modifiers.platform && !modifiers.control {
+                    } else if key.len() == 1 && !modifiers.platform && !is_ctrl {
                         char_to_add = Some(key.clone());
                     }
                     if let Some(ch) = char_to_add {
@@ -2234,14 +2319,14 @@ impl RootView {
                 return;
             }
             if let Some(ref ch) = event.keystroke.key_char {
-                if !modifiers.platform && !modifiers.control {
+                if !modifiers.platform && !is_ctrl {
                     self.worktree_picker_query.push_str(ch);
                     self.worktree_picker_selected = 0;
                     self.worktree_picker_scroll_handle.scroll_to_item(0);
                     cx.notify();
                     return;
                 }
-            } else if key.len() == 1 && !modifiers.platform && !modifiers.control {
+            } else if key.len() == 1 && !modifiers.platform && !is_ctrl {
                 self.worktree_picker_query.push_str(key);
                 self.worktree_picker_selected = 0;
                 self.worktree_picker_scroll_handle.scroll_to_item(0);
@@ -2315,14 +2400,14 @@ impl RootView {
                 return;
             }
             if let Some(ref ch) = event.keystroke.key_char {
-                if !modifiers.platform && !modifiers.control {
+                if !modifiers.platform && !is_ctrl {
                     self.project_jumper_query.push_str(ch);
                     self.project_jumper_selected = 0;
                     self.project_jumper_scroll_handle.scroll_to_item(0);
                     cx.notify();
                     return;
                 }
-            } else if key.len() == 1 && !modifiers.platform && !modifiers.control {
+            } else if key.len() == 1 && !modifiers.platform && !is_ctrl {
                 self.project_jumper_query.push_str(key);
                 self.project_jumper_selected = 0;
                 self.project_jumper_scroll_handle.scroll_to_item(0);
@@ -2352,7 +2437,7 @@ impl RootView {
         let is_command_palette = if cfg!(target_os = "macos") {
             modifiers.platform && key_lower == "p"
         } else {
-            modifiers.control && modifiers.shift && key_lower == "p"
+            is_ctrl && modifiers.shift && key_lower == "p"
         };
         if is_command_palette {
             self.toggle_command_palette(_window, cx);
@@ -2363,7 +2448,7 @@ impl RootView {
         let is_new_window = if cfg!(target_os = "macos") {
             modifiers.platform && modifiers.shift && key_lower == "n"
         } else {
-            modifiers.control && modifiers.shift && key_lower == "n"
+            is_ctrl && modifiers.shift && key_lower == "n"
         };
         if is_new_window {
             self.execute_palette_command("new_window", _window, cx);
@@ -2374,7 +2459,7 @@ impl RootView {
         let is_ssh_mgr = if cfg!(target_os = "macos") {
             modifiers.platform && key_lower == "o"
         } else {
-            modifiers.control && modifiers.shift && key_lower == "o"
+            is_ctrl && modifiers.shift && key_lower == "o"
         };
         if is_ssh_mgr {
             self.toggle_ssh_manager(_window, cx);
@@ -2385,7 +2470,7 @@ impl RootView {
         let is_worktree_trigger = if cfg!(target_os = "macos") {
             modifiers.platform && modifiers.alt && key_lower == "w"
         } else {
-            modifiers.control && modifiers.alt && key_lower == "w"
+            modifiers.control && modifiers.alt && key_lower == "w" && !is_alt_gr
         };
         if is_worktree_trigger {
             self.toggle_worktree_picker(_window, cx);
@@ -2396,7 +2481,7 @@ impl RootView {
         let is_jumper_trigger = if cfg!(target_os = "macos") {
             modifiers.platform && key_lower == "j"
         } else {
-            modifiers.control && modifiers.shift && key_lower == "j"
+            is_ctrl && modifiers.shift && key_lower == "j"
         };
         if is_jumper_trigger {
             self.toggle_project_jumper(_window, cx);
@@ -2407,8 +2492,8 @@ impl RootView {
         let is_search_trigger = if cfg!(target_os = "macos") {
             modifiers.platform && key_lower == "f"
         } else {
-            (modifiers.control && modifiers.shift && key_lower == "f")
-                || (modifiers.control && key_lower == "f")
+            (is_ctrl && modifiers.shift && key_lower == "f")
+                || (is_ctrl && key_lower == "f")
         };
         if is_search_trigger {
             self.toggle_search(_window, cx);
@@ -2419,8 +2504,8 @@ impl RootView {
         let is_settings = if cfg!(target_os = "macos") {
             modifiers.platform && (key == "," || key_lower == "s" || key_lower == "comma")
         } else {
-            (modifiers.control && (key == "," || key_lower == "comma"))
-                || (modifiers.control && modifiers.shift && key_lower == "s")
+            (is_ctrl && (key == "," || key_lower == "comma"))
+                || (is_ctrl && modifiers.shift && key_lower == "s")
         };
         if is_settings {
             self.toggle_settings(_window, cx);
@@ -2439,7 +2524,7 @@ impl RootView {
         let is_new_tab = if cfg!(target_os = "macos") {
             modifiers.platform && key_lower == "t"
         } else {
-            modifiers.control && modifiers.shift && key_lower == "t"
+            is_ctrl && modifiers.shift && key_lower == "t"
         };
         if is_new_tab {
             self.create_tab(_window, cx);
@@ -2450,7 +2535,7 @@ impl RootView {
         let is_rename_tab = if cfg!(target_os = "macos") {
             modifiers.platform && modifiers.shift && key_lower == "r"
         } else {
-            modifiers.control && modifiers.shift && key_lower == "r"
+            is_ctrl && modifiers.shift && key_lower == "r"
         };
         if is_rename_tab {
             self.open_rename_tab(self.active_tab_idx, cx);
@@ -2461,7 +2546,7 @@ impl RootView {
         let is_split_right = if cfg!(target_os = "macos") {
             modifiers.platform && !modifiers.shift && key_lower == "d"
         } else {
-            modifiers.control && modifiers.shift && key_lower == "e"
+            is_ctrl && modifiers.shift && key_lower == "e"
         };
         if is_split_right {
             self.split_active_pane(Direction::Right, _window, cx);
@@ -2472,7 +2557,7 @@ impl RootView {
         let is_split_down = if cfg!(target_os = "macos") {
             modifiers.platform && modifiers.shift && key_lower == "d"
         } else {
-            modifiers.control && modifiers.shift && key_lower == "b"
+            is_ctrl && modifiers.shift && key_lower == "b"
         };
         if is_split_down {
             self.split_active_pane(Direction::Down, _window, cx);
@@ -2483,7 +2568,7 @@ impl RootView {
         let is_focus_left = if cfg!(target_os = "macos") {
             modifiers.platform && modifiers.alt && (key_lower == "left" || key_lower == "arrowleft")
         } else {
-            modifiers.alt && (key_lower == "left" || key_lower == "arrowleft")
+            modifiers.alt && !is_alt_gr && (key_lower == "left" || key_lower == "arrowleft")
         };
         if is_focus_left {
             self.focus_pane_in_direction(Direction::Left, cx);
@@ -2493,7 +2578,7 @@ impl RootView {
         let is_focus_right = if cfg!(target_os = "macos") {
             modifiers.platform && modifiers.alt && (key_lower == "right" || key_lower == "arrowright")
         } else {
-            modifiers.alt && (key_lower == "right" || key_lower == "arrowright")
+            modifiers.alt && !is_alt_gr && (key_lower == "right" || key_lower == "arrowright")
         };
         if is_focus_right {
             self.focus_pane_in_direction(Direction::Right, cx);
@@ -2503,7 +2588,7 @@ impl RootView {
         let is_focus_top = if cfg!(target_os = "macos") {
             modifiers.platform && modifiers.alt && (key_lower == "up" || key_lower == "arrowup")
         } else {
-            modifiers.alt && (key_lower == "up" || key_lower == "arrowup")
+            modifiers.alt && !is_alt_gr && (key_lower == "up" || key_lower == "arrowup")
         };
         if is_focus_top {
             self.focus_pane_in_direction(Direction::Top, cx);
@@ -2513,7 +2598,7 @@ impl RootView {
         let is_focus_down = if cfg!(target_os = "macos") {
             modifiers.platform && modifiers.alt && (key_lower == "down" || key_lower == "arrowdown")
         } else {
-            modifiers.alt && (key_lower == "down" || key_lower == "arrowdown")
+            modifiers.alt && !is_alt_gr && (key_lower == "down" || key_lower == "arrowdown")
         };
         if is_focus_down {
             self.focus_pane_in_direction(Direction::Down, cx);
@@ -2524,19 +2609,18 @@ impl RootView {
         let is_close_pane = if cfg!(target_os = "macos") {
             modifiers.platform && !modifiers.shift && key_lower == "w"
         } else {
-            modifiers.control && modifiers.shift && key_lower == "w"
+            is_ctrl && modifiers.shift && key_lower == "w"
         };
         if is_close_pane {
             self.close_active_pane(_window, cx);
             return;
         }
 
-        // 5b. Close Active Tab explicitly (⌘⇧W on macOS; Ctrl+Shift+Q / Ctrl+Alt+W on Linux/Windows)
+        // 5b. Close Active Tab explicitly (⌘⇧W on macOS; Ctrl+Shift+Q on Linux/Windows)
         let is_close_tab = if cfg!(target_os = "macos") {
             modifiers.platform && modifiers.shift && key_lower == "w"
         } else {
-            (modifiers.control && modifiers.shift && key_lower == "q")
-                || (modifiers.control && modifiers.alt && key_lower == "w")
+            is_ctrl && modifiers.shift && key_lower == "q"
         };
         if is_close_tab {
             if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
@@ -2547,8 +2631,8 @@ impl RootView {
         }
 
         // 6. Next Tab (Ctrl+Tab, Ctrl+PageDown on all OS; ⌘Shift+] on macOS)
-        let is_next_tab = (modifiers.control && !modifiers.shift && key_lower == "tab")
-            || (modifiers.control && key_lower == "pagedown")
+        let is_next_tab = (is_ctrl && !modifiers.shift && key_lower == "tab")
+            || (is_ctrl && key_lower == "pagedown")
             || (cfg!(target_os = "macos") && modifiers.platform && modifiers.shift && (key == "]" || key == "}"));
         if is_next_tab {
             if !self.tabs.is_empty() {
@@ -2562,8 +2646,8 @@ impl RootView {
         }
 
         // 7. Prev Tab (Ctrl+Shift+Tab, Ctrl+PageUp on all OS; ⌘Shift+[ on macOS)
-        let is_prev_tab = (modifiers.control && modifiers.shift && key_lower == "tab")
-            || (modifiers.control && key_lower == "pageup")
+        let is_prev_tab = (is_ctrl && modifiers.shift && key_lower == "tab")
+            || (is_ctrl && key_lower == "pageup")
             || (cfg!(target_os = "macos") && modifiers.platform && modifiers.shift && (key == "[" || key == "{"));
         if is_prev_tab {
             if !self.tabs.is_empty() {
@@ -2587,7 +2671,7 @@ impl RootView {
             } else {
                 None
             }
-        } else if modifiers.alt || (modifiers.control && modifiers.shift) {
+        } else if (modifiers.alt && !is_alt_gr) || (is_ctrl && modifiers.shift) {
             key.parse::<usize>().ok()
         } else {
             None
@@ -2610,7 +2694,7 @@ impl RootView {
         let is_zoom_in = if cfg!(target_os = "macos") {
             modifiers.platform && (key == "=" || key == "+" || key_lower == "equal" || key_lower == "plus")
         } else {
-            modifiers.control && (key == "=" || key == "+" || key_lower == "equal" || key_lower == "plus")
+            is_ctrl && (key == "=" || key == "+" || key_lower == "equal" || key_lower == "plus")
         };
         if is_zoom_in {
             self.adjust_font_size(1.0, cx);
@@ -2621,7 +2705,7 @@ impl RootView {
         let is_zoom_out = if cfg!(target_os = "macos") {
             modifiers.platform && (key == "-" || key == "_" || key_lower == "minus")
         } else {
-            modifiers.control && (key == "-" || key == "_" || key_lower == "minus")
+            is_ctrl && (key == "-" || key == "_" || key_lower == "minus")
         };
         if is_zoom_out {
             self.adjust_font_size(-1.0, cx);
@@ -2632,7 +2716,7 @@ impl RootView {
         let is_zoom_reset = if cfg!(target_os = "macos") {
             modifiers.platform && key == "0"
         } else {
-            modifiers.control && key == "0"
+            is_ctrl && key == "0"
         };
         if is_zoom_reset {
             self.font_size = 13.0;
@@ -2653,7 +2737,7 @@ impl RootView {
         let is_clear_scroll = if cfg!(target_os = "macos") {
             modifiers.platform && key_lower == "k"
         } else {
-            modifiers.control && modifiers.shift && key_lower == "k"
+            is_ctrl && modifiers.shift && key_lower == "k"
         };
         if is_clear_scroll {
             terminal.scroll_to_bottom();
@@ -2665,7 +2749,7 @@ impl RootView {
         let is_prev_prompt = if cfg!(target_os = "macos") {
             modifiers.platform && modifiers.shift && (key_lower == "up" || key_lower == "arrowup" || key_lower == "h")
         } else {
-            modifiers.control && modifiers.shift && (key_lower == "up" || key_lower == "arrowup" || key_lower == "h")
+            is_ctrl && modifiers.shift && (key_lower == "up" || key_lower == "arrowup" || key_lower == "h")
         };
         if is_prev_prompt {
             terminal.scroll_to_prev_prompt();
@@ -2678,7 +2762,7 @@ impl RootView {
         let is_next_prompt = if cfg!(target_os = "macos") {
             modifiers.platform && modifiers.shift && (key_lower == "down" || key_lower == "arrowdown")
         } else {
-            modifiers.control && modifiers.shift && (key_lower == "down" || key_lower == "arrowdown")
+            is_ctrl && modifiers.shift && (key_lower == "down" || key_lower == "arrowdown")
         };
         if is_next_prompt {
             terminal.scroll_to_next_prompt();
@@ -2691,7 +2775,7 @@ impl RootView {
         let is_paste = if cfg!(target_os = "macos") {
             modifiers.platform && key_lower == "v"
         } else {
-            (modifiers.control && modifiers.shift && key_lower == "v")
+            (is_ctrl && modifiers.shift && key_lower == "v")
                 || (modifiers.shift && key_lower == "insert")
         };
         if is_paste {
@@ -2716,7 +2800,7 @@ impl RootView {
         let is_copy = if cfg!(target_os = "macos") {
             modifiers.platform && key_lower == "c"
         } else {
-            modifiers.control && modifiers.shift && key_lower == "c"
+            is_ctrl && modifiers.shift && key_lower == "c"
         };
         if is_copy {
             if let Some(text) = self.get_selected_text() {
@@ -2741,7 +2825,17 @@ impl RootView {
             cx.notify();
         }
 
-        let bytes_to_send: Option<Vec<u8>> = if modifiers.control {
+        let bytes_to_send: Option<Vec<u8>> = if is_alt_gr {
+            if let Some(ref ch) = event.keystroke.key_char {
+                self.typed_prompt_buf.push_str(ch);
+                Some(ch.as_bytes().to_vec())
+            } else if key.len() == 1 {
+                self.typed_prompt_buf.push_str(key);
+                Some(key.as_bytes().to_vec())
+            } else {
+                None
+            }
+        } else if is_ctrl {
             match key_lower.as_str() {
                 "c" => {
                     self.typed_prompt_buf.clear();
@@ -4028,7 +4122,8 @@ impl Render for RootView {
                             div()
                                 .absolute()
                                 .top(px(44.))
-                                .right(px(12.))
+                                .when(cfg!(target_os = "macos"), |d| d.right(px(12.)))
+                                .when(!cfg!(target_os = "macos"), |d| d.left(px(12.)))
                                 .w(px(310.))
                                 .p(px(14.))
                                 .rounded(px(10.))
@@ -4313,7 +4408,8 @@ impl Render for RootView {
                         .id("logo-context-menu-popup")
                         .absolute()
                         .top(px(34.))
-                        .right(px(6.))
+                        .when(cfg!(target_os = "macos"), |d| d.right(px(6.)))
+                        .when(!cfg!(target_os = "macos"), |d| d.left(px(6.)))
                         .w(px(220.))
                         .p(px(4.))
                         .rounded(px(8.))
