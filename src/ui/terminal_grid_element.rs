@@ -6,6 +6,16 @@ use alacritty_terminal::vte::ansi::CursorShape;
 
 use crate::ui::root_view::{Selection, StyledSpan};
 
+#[derive(Clone, Debug)]
+pub struct VisibleImage {
+    pub row: i64,
+    pub col: usize,
+    pub cols: usize,
+    pub rows: usize,
+    pub z_index: i32,
+    pub image: std::sync::Arc<gpui::RenderImage>,
+}
+
 pub struct TerminalGridElement {
     pub lines: Vec<Vec<StyledSpan>>,
     pub cell_w: f32,
@@ -14,6 +24,7 @@ pub struct TerminalGridElement {
     pub cursor_info: Option<(i32, usize, CursorShape)>,
     pub selection_range: Option<Selection>,
     pub search_highlights: Vec<Vec<(usize, usize, bool)>>,
+    pub visible_images: Vec<VisibleImage>,
     pub theme: crate::ui::theme::Theme,
     pub cursor_color: gpui::Hsla,
     pub font_family: gpui::SharedString,
@@ -82,11 +93,27 @@ impl Element for TerminalGridElement {
         let emoji_font = gpui::font(self.font_family.clone());
         let normal_font = gpui::font(self.font_family.clone());
 
+        // 1. Background Pass: Render negative z-index images beneath cell backgrounds
+        for img in self.visible_images.iter().filter(|i| i.z_index < 0) {
+            let img_x = origin.x + px(img.col as f32 * self.cell_w);
+            let img_y = origin.y + px(img.row as f32 * self.line_h);
+            let img_w = img.cols as f32 * self.cell_w;
+            let img_h = img.rows as f32 * self.line_h;
+            let img_bounds = Bounds::new(
+                point(img_x, img_y),
+                size(px(img_w), px(img_h)),
+            );
+            let mask = bounds.intersect(&img_bounds);
+            if mask.size.width > px(0.0) && mask.size.height > px(0.0) {
+                let _ = window.paint_image(img_bounds, mask, gpui::Corners::default(), img.image.clone(), 0, false);
+            }
+        }
+
         for (row_idx, spans) in self.lines.iter().enumerate() {
             let grid_line_idx = row_idx as i32 - self.display_offset as i32;
             let y = origin.y + px((row_idx as f32 * self.line_h).floor());
 
-            // 1. Cell Backgrounds (Pass 1: under all highlights and text)
+            // 1. Cell Backgrounds
             for span in spans {
                 if let Some(bg) = span.bg {
                     let x_start = (span.start_col as f32 * self.cell_w).floor();
@@ -100,14 +127,9 @@ impl Element for TerminalGridElement {
                 }
             }
 
-            // 2. Selection (Pass 2)
+            // 2. Selection
             if let Some(sel) = self.selection_range {
-                let (min_p, max_p) = if sel.start <= sel.end {
-                    (sel.start, sel.end)
-                } else {
-                    (sel.end, sel.start)
-                };
-
+                let (min_p, max_p) = if sel.start <= sel.end { (sel.start, sel.end) } else { (sel.end, sel.start) };
                 let sel_col_range = if grid_line_idx < min_p.line.0 || grid_line_idx > max_p.line.0 {
                     None
                 } else if min_p.line.0 == max_p.line.0 {
@@ -132,7 +154,7 @@ impl Element for TerminalGridElement {
                 }
             }
 
-            // 3. Search Highlights (Pass 2)
+            // 3. Search Highlights
             if let Some(search_row) = self.search_highlights.get(row_idx) {
                 for &(m_col, m_len, is_active) in search_row {
                     let x_start = (m_col as f32 * self.cell_w).floor();
@@ -156,7 +178,7 @@ impl Element for TerminalGridElement {
                 }
             }
 
-            // 4. Text and Geometric Glyphs (Pass 3)
+            // 4. Text and Geometric Glyphs
             let default_bg = self.theme.background;
 
             for span in spans {
@@ -168,11 +190,9 @@ impl Element for TerminalGridElement {
                         self.font_size
                     };
 
-                    // Check if this span contains block or box-drawing characters
                     let has_geometric = span.text.chars().any(is_geometric_codepoint);
 
                     if has_geometric {
-                        // Render per-character: geometric chars as exact seamless quads, others via text shaper
                         let mut text_run_buf = String::new();
                         let mut text_run_start_col = span.start_col;
 
@@ -187,7 +207,6 @@ impl Element for TerminalGridElement {
                             );
 
                             if paint_geometric_char(c, cell_bounds, span.fg, span.bg, default_bg, window) {
-                                // Flush any preceding accumulated text
                                 if !text_run_buf.is_empty() {
                                     paint_text_run(
                                         &text_run_buf,
@@ -236,7 +255,6 @@ impl Element for TerminalGridElement {
                             );
                         }
                     } else {
-                        // Standard text span: fast path through text system
                         paint_text_run(
                             &span.text,
                             span.start_col,
@@ -257,8 +275,7 @@ impl Element for TerminalGridElement {
                     }
                 }
             }
-
-            // 5. Cursor (Pass 4: on top of everything)
+            // 5. Cursor (Pass 4: exact cell-aligned cursor rendering)
             if let Some((c_row, c_col, c_shape)) = self.cursor_info {
                 if grid_line_idx == c_row {
                     let x_start = (c_col as f32 * self.cell_w).floor();
@@ -288,7 +305,14 @@ impl Element for TerminalGridElement {
                             };
                             window.paint_quad(q);
                         }
-                        CursorShape::Beam | CursorShape::Block | _ => {
+                        CursorShape::Block => {
+                            let b = Bounds::new(
+                                point(origin.x + px(x_start), y),
+                                size(px(quad_w), px(self.line_h)),
+                            );
+                            window.paint_quad(fill(b, self.cursor_color.opacity(0.80)));
+                        }
+                        CursorShape::Beam | _ => {
                             // Beam `|` (2px width)
                             let b = Bounds::new(
                                 point(origin.x + px(x_start), y),
@@ -298,6 +322,22 @@ impl Element for TerminalGridElement {
                         }
                     }
                 }
+            }
+        }
+
+        // 6. Positive & Inline Images (Pass 5: on top of backgrounds/selection)
+        for img in self.visible_images.iter().filter(|i| i.z_index >= 0) {
+            let img_x = origin.x + px(img.col as f32 * self.cell_w);
+            let img_y = origin.y + px(img.row as f32 * self.line_h);
+            let img_w = img.cols as f32 * self.cell_w;
+            let img_h = img.rows as f32 * self.line_h;
+            let img_bounds = Bounds::new(
+                point(img_x, img_y),
+                size(px(img_w), px(img_h)),
+            );
+            let mask = bounds.intersect(&img_bounds);
+            if mask.size.width > px(0.0) && mask.size.height > px(0.0) {
+                let _ = window.paint_image(img_bounds, mask, gpui::Corners::default(), img.image.clone(), 0, false);
             }
         }
     }

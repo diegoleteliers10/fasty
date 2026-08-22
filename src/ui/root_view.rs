@@ -910,9 +910,13 @@ impl RootView {
                     blink_counter += 1;
                     if blink_counter >= 15 {
                         blink_counter = 0;
-                        if this.last_cursor_activity.elapsed() >= std::time::Duration::from_millis(500) {
-                            this.cursor_blink_visible = !this.cursor_blink_visible;
-                            needs_notify = true;
+                        if this.config.cursor.blink {
+                            if this.last_cursor_activity.elapsed() >= std::time::Duration::from_millis(500) {
+                                this.cursor_blink_visible = !this.cursor_blink_visible;
+                                needs_notify = true;
+                            }
+                        } else {
+                            this.cursor_blink_visible = true;
                         }
                     }
 
@@ -3689,11 +3693,41 @@ impl RootView {
 
                         let cursor_color = theme.cursor;
 
+                        let effective_shape = if content.cursor.shape == CursorShape::Block {
+                            self.config.cursor.shape.into()
+                        } else {
+                            content.cursor.shape
+                        };
+
                         let cursor_info = if cursor_visible && is_active && self.cursor_blink_visible {
-                            Some((cursor_point.line.0, cursor_point.column.0, content.cursor.shape))
+                            Some((cursor_point.line.0, cursor_point.column.0, effective_shape))
                         } else {
                             None
                         };
+
+                        let mut visible_images = Vec::new();
+                        let total_pushed = terminal.total_lines_pushed.load(std::sync::atomic::Ordering::Relaxed);
+                        let screen_rows = lines.len();
+                        let viewport_start_abs = (total_pushed + screen_rows as u64).saturating_sub(display_offset as u64 + screen_rows as u64);
+                        let viewport_end_abs = viewport_start_abs + screen_rows as u64;
+
+                        let store = terminal.image_store.lock();
+                        for placement in &store.placements {
+                            let p_start = placement.absolute_line;
+                            let p_end = placement.absolute_line + placement.rows as u64;
+                            if p_end > viewport_start_abs && p_start < viewport_end_abs {
+                                let screen_row = (p_start as i64) - (viewport_start_abs as i64);
+                                visible_images.push(crate::ui::terminal_grid_element::VisibleImage {
+                                    row: screen_row,
+                                    col: placement.col,
+                                    cols: placement.cols,
+                                    rows: placement.rows,
+                                    z_index: placement.z_index,
+                                    image: placement.image.clone(),
+                                });
+                            }
+                        }
+                        drop(store);
 
                         let selection_range = if is_active { self.selection } else { None };
                         let search_open = is_active && self.is_search_open && !self.search_query.is_empty();
@@ -3756,6 +3790,7 @@ impl RootView {
                             cursor_info,
                             selection_range,
                             search_highlights: all_search_highlights,
+                            visible_images,
                             theme: theme.clone(),
                             cursor_color,
                             font_family: font_family.clone(),

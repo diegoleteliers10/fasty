@@ -157,6 +157,52 @@ impl Default for CsiWatcher {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ImagePlacement {
+    pub placement_id: u32,
+    pub image_id: u32,
+    pub absolute_line: u64,
+    pub col: usize,
+    pub cols: usize,
+    pub rows: usize,
+    pub z_index: i32,
+    pub image: Arc<gpui::RenderImage>,
+}
+
+#[derive(Default)]
+pub struct ImageStore {
+    pub images: std::collections::HashMap<u32, Arc<gpui::RenderImage>>,
+    pub placements: Vec<ImagePlacement>,
+}
+
+impl ImageStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_image(&mut self, id: u32, img: Arc<gpui::RenderImage>) {
+        self.images.insert(id, img);
+    }
+
+    pub fn add_placement(&mut self, placement: ImagePlacement) {
+        self.placements.push(placement);
+    }
+
+    pub fn delete_all(&mut self) {
+        self.images.clear();
+        self.placements.clear();
+    }
+
+    pub fn delete_by_id(&mut self, id: u32) {
+        self.images.remove(&id);
+        self.placements.retain(|p| p.image_id != id);
+    }
+
+    pub fn delete_by_placement(&mut self, p_id: u32) {
+        self.placements.retain(|p| p.placement_id != p_id);
+    }
+}
+
 pub struct TerminalState {
     term: Arc<ParkingMutex<alacritty_terminal::term::Term<EventListenerProxy>>>,
     render_generation: Arc<AtomicU64>,
@@ -165,6 +211,7 @@ pub struct TerminalState {
     shell_pid: Option<u32>,
     pub total_lines_pushed: Arc<AtomicU64>,
     pub prompt_lines: Arc<ParkingMutex<Vec<u64>>>,
+    pub image_store: Arc<ParkingMutex<ImageStore>>,
     event_listener: EventListenerProxy,
 }
 
@@ -410,6 +457,10 @@ impl TerminalState {
         let total_lines_pushed_clone = Arc::clone(&total_lines_pushed);
         let prompt_lines = Arc::new(ParkingMutex::new(Vec::new()));
         let prompt_lines_clone = Arc::clone(&prompt_lines);
+        let image_store = Arc::new(ParkingMutex::new(ImageStore::new()));
+        let image_store_clone = Arc::clone(&image_store);
+        let next_image_id = Arc::new(AtomicU64::new(1));
+        let next_image_id_clone = Arc::clone(&next_image_id);
         let writer_clone = Arc::clone(&writer_arc);
         if !std::env::var("FASTTY_NO_READER").is_ok() {
         thread::spawn(move || {
@@ -419,15 +470,19 @@ impl TerminalState {
             let mut parser: Processor<StdSyncHandler> = Processor::new();
 
             #[derive(Clone, Copy, Debug, PartialEq)]
-            enum OscParseState {
+            enum SequenceParseState {
                 Normal,
                 Esc,
                 Osc,
                 OscEsc,
+                Apc,
+                ApcEsc,
             }
 
-            let mut osc_state = OscParseState::Normal;
+            let mut seq_state = SequenceParseState::Normal;
             let mut osc_buf: Vec<u8> = Vec::new();
+            let mut apc_buf: Vec<u8> = Vec::new();
+            let mut kitty_reassembler = crate::parser::kitty_graphics::KittyReassembler::new();
             let mut cmd_start_time: Option<std::time::Instant> = None;
 
             // CSI detection: see `CsiWatcher` (module level). The watcher
@@ -569,6 +624,130 @@ impl TerminalState {
                 }
             };
 
+            let mut handle_apc = |apc_data: &[u8],
+                                  cursor_line: i32,
+                                  cursor_col: usize,
+                                  base: u64,
+                                  term_locked: &mut alacritty_terminal::Term<EventListenerProxy>,
+                                  parser: &mut alacritty_terminal::vte::ansi::Processor| -> u64 {
+                if !apc_data.starts_with(b"G") {
+                    return 0;
+                }
+                let body = &apc_data[1..];
+                let semicolon_pos = body.iter().position(|&b| b == b';');
+                let (header, payload_b64) = match semicolon_pos {
+                    Some(pos) => (&body[..pos], &body[pos + 1..]),
+                    None => (body, &[][..]),
+                };
+
+                let mut added_lines = 0u64;
+
+                if let Some(ctrl) = crate::parser::kitty_graphics::parse_kitty_control(header) {
+                    match ctrl.action {
+                        crate::parser::kitty_graphics::KittyAction::Query => {
+                            let id = ctrl.image_id.unwrap_or(0);
+                            let resp = format!("\x1b_Gi={};OK\x1b\\", id);
+                            let mut w = writer_clone.lock();
+                            let _ = w.write_all(resp.as_bytes());
+                            let _ = w.flush();
+                        }
+                        crate::parser::kitty_graphics::KittyAction::Delete => {
+                            let mut store = image_store_clone.lock();
+                            match ctrl.delete_action {
+                                Some(crate::parser::kitty_graphics::KittyDeleteAction::All) => {
+                                    store.delete_all();
+                                }
+                                Some(crate::parser::kitty_graphics::KittyDeleteAction::ById(id)) => {
+                                    store.delete_by_id(id);
+                                }
+                                Some(crate::parser::kitty_graphics::KittyDeleteAction::ByPlacement(p_id)) => {
+                                    store.delete_by_placement(p_id);
+                                }
+                                _ => {
+                                    store.delete_all();
+                                }
+                            }
+                        }
+                        crate::parser::kitty_graphics::KittyAction::Put => {
+                            if let Some(id) = ctrl.image_id {
+                                let mut store = image_store_clone.lock();
+                                if let Some(img) = store.images.get(&id).cloned() {
+                                    let abs_line = (base as i64 + cursor_line as i64).max(0) as u64;
+                                    let cols = ctrl.columns.unwrap_or(10);
+                                    let rows = ctrl.rows.unwrap_or(5);
+                                    store.add_placement(ImagePlacement {
+                                        placement_id: ctrl.placement_id.unwrap_or(0),
+                                        image_id: id,
+                                        absolute_line: abs_line,
+                                        col: cursor_col,
+                                        cols,
+                                        rows,
+                                        z_index: ctrl.z_index,
+                                        image: img,
+                                    });
+                                }
+                            }
+                        }
+                        crate::parser::kitty_graphics::KittyAction::TransmitAndDisplay
+                        | crate::parser::kitty_graphics::KittyAction::ImmediateDisplay => {
+                            if let Some((final_ctrl, mut raw_bytes)) = kitty_reassembler.push_chunk(ctrl.clone(), payload_b64) {
+                                // If transmission is file-based (t=f or t=t), read bytes from filesystem path
+                                if (final_ctrl.transmission == crate::parser::kitty_graphics::KittyTransmission::File
+                                    || final_ctrl.transmission == crate::parser::kitty_graphics::KittyTransmission::TempFile)
+                                    && !raw_bytes.is_empty()
+                                {
+                                    if let Ok(path_str) = std::str::from_utf8(&raw_bytes) {
+                                        let trimmed = path_str.trim();
+                                        if let Ok(file_content) = std::fs::read(trimmed) {
+                                            raw_bytes = file_content;
+                                        }
+                                    }
+                                }
+
+                                if let Ok((render_img, img_w, img_h)) = crate::parser::kitty_graphics::decode_image_data(
+                                    final_ctrl.format,
+                                    final_ctrl.width_px,
+                                    final_ctrl.height_px,
+                                    &raw_bytes,
+                                ) {
+                                    let img_id = final_ctrl.image_id.unwrap_or_else(|| next_image_id_clone.fetch_add(1, Ordering::Relaxed) as u32);
+                                    let mut store = image_store_clone.lock();
+                                    store.add_image(img_id, render_img.clone());
+
+                                    let abs_line = (base as i64 + cursor_line as i64).max(0) as u64;
+                                    let cw = if cell_width > 0.0 { cell_width } else { 9.0 };
+                                    let ch = if cell_height > 0.0 { cell_height } else { 18.0 };
+                                    let cols = final_ctrl.columns.unwrap_or_else(|| {
+                                        ((img_w as f32) / cw).ceil().max(1.0) as usize
+                                    });
+                                    let rows = final_ctrl.rows.unwrap_or_else(|| {
+                                        ((img_h as f32) / ch).ceil().max(1.0) as usize
+                                    });
+                                    store.add_placement(ImagePlacement {
+                                        placement_id: final_ctrl.placement_id.unwrap_or(0),
+                                        image_id: img_id,
+                                        absolute_line: abs_line,
+                                        col: cursor_col,
+                                        cols,
+                                        rows,
+                                        z_index: final_ctrl.z_index,
+                                        image: render_img,
+                                    });
+
+                                    if final_ctrl.cursor_movement && rows > 0 {
+                                        for _ in 0..rows {
+                                            parser.advance(&mut *term_locked, 0x0A);
+                                        }
+                                        added_lines = rows as u64;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                added_lines
+            };
+
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
@@ -610,21 +789,24 @@ impl TerminalState {
 
                             parser.advance(&mut *term_locked, byte);
 
-                            match osc_state {
-                                OscParseState::Normal => {
+                            match seq_state {
+                                SequenceParseState::Normal => {
                                     if byte == 0x1b {
-                                        osc_state = OscParseState::Esc;
+                                        seq_state = SequenceParseState::Esc;
                                     }
                                 }
-                                OscParseState::Esc => {
+                                SequenceParseState::Esc => {
                                     if byte == b']' {
-                                        osc_state = OscParseState::Osc;
+                                        seq_state = SequenceParseState::Osc;
                                         osc_buf.clear();
+                                    } else if byte == b'_' {
+                                        seq_state = SequenceParseState::Apc;
+                                        apc_buf.clear();
                                     } else {
-                                        osc_state = OscParseState::Normal;
+                                        seq_state = SequenceParseState::Normal;
                                     }
                                 }
-                                OscParseState::Osc => {
+                                SequenceParseState::Osc => {
                                     if byte == 0x07 {
                                         if let Some(cmd) = parse_osc(&osc_buf, &mut cmd_start_time) {
                                             let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
@@ -632,17 +814,17 @@ impl TerminalState {
                                             let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
                                             handle_cmd(cmd, cursor_line, screen_lines, base);
                                         }
-                                        osc_state = OscParseState::Normal;
+                                        seq_state = SequenceParseState::Normal;
                                     } else if byte == 0x1b {
-                                        osc_state = OscParseState::OscEsc;
+                                        seq_state = SequenceParseState::OscEsc;
                                     } else {
                                         osc_buf.push(byte);
                                         if osc_buf.len() > 131072 {
-                                            osc_state = OscParseState::Normal;
+                                            seq_state = SequenceParseState::Normal;
                                         }
                                     }
                                 }
-                                OscParseState::OscEsc => {
+                                SequenceParseState::OscEsc => {
                                     if byte == b'\\' {
                                         if let Some(cmd) = parse_osc(&osc_buf, &mut cmd_start_time) {
                                             let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
@@ -650,13 +832,47 @@ impl TerminalState {
                                             let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
                                             handle_cmd(cmd, cursor_line, screen_lines, base);
                                         }
-                                        osc_state = OscParseState::Normal;
+                                        seq_state = SequenceParseState::Normal;
                                     } else {
                                         osc_buf.push(0x1b);
                                         osc_buf.push(byte);
-                                        osc_state = OscParseState::Osc;
+                                        seq_state = SequenceParseState::Osc;
                                         if osc_buf.len() > 131072 {
-                                            osc_state = OscParseState::Normal;
+                                            seq_state = SequenceParseState::Normal;
+                                        }
+                                    }
+                                }
+                                SequenceParseState::Apc => {
+                                    if byte == 0x07 {
+                                        let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
+                                        let cursor_col = term_locked.grid().cursor.point.column.0;
+                                        let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
+                                        let added = handle_apc(&apc_buf, cursor_line, cursor_col, base, &mut *term_locked, &mut parser);
+                                        local_lines += added;
+                                        seq_state = SequenceParseState::Normal;
+                                    } else if byte == 0x1b {
+                                        seq_state = SequenceParseState::ApcEsc;
+                                    } else {
+                                        apc_buf.push(byte);
+                                        if apc_buf.len() > 16 * 1024 * 1024 {
+                                            seq_state = SequenceParseState::Normal;
+                                        }
+                                    }
+                                }
+                                SequenceParseState::ApcEsc => {
+                                    if byte == b'\\' {
+                                        let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
+                                        let cursor_col = term_locked.grid().cursor.point.column.0;
+                                        let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
+                                        let added = handle_apc(&apc_buf, cursor_line, cursor_col, base, &mut *term_locked, &mut parser);
+                                        local_lines += added;
+                                        seq_state = SequenceParseState::Normal;
+                                    } else {
+                                        apc_buf.push(0x1b);
+                                        apc_buf.push(byte);
+                                        seq_state = SequenceParseState::Apc;
+                                        if apc_buf.len() > 16 * 1024 * 1024 {
+                                            seq_state = SequenceParseState::Normal;
                                         }
                                     }
                                 }
@@ -684,6 +900,7 @@ impl TerminalState {
                             let mode = *term_locked.mode();
                             if !mode.contains(TermMode::ALT_SCREEN) {
                                 term_locked.grid_mut().clear_history();
+                                image_store_clone.lock().placements.clear();
                             }
                             clear_history_flag = false;
                         }
@@ -725,6 +942,7 @@ impl TerminalState {
             shell_pid,
             total_lines_pushed,
             prompt_lines,
+            image_store,
             event_listener,
         })
     }

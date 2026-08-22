@@ -196,6 +196,8 @@ pub struct Config {
     pub notify_on_command_finish: bool,
     #[serde(default)]
     pub bottombar: BottombarConfig,
+    #[serde(default)]
+    pub cursor: CursorConfig,
     /// Treat the Option key as Alt (send `ESC` + key) instead of letting
     /// macOS compose the layout character. Mirrors zed's `option_as_meta`
     /// and ghostty's `macos-option-as-alt`; default is false so Option
@@ -291,6 +293,58 @@ impl From<AlignSpec> for crate::widgets::Align {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorShapeConfig {
+    Block,
+    Beam,
+    Underline,
+    HollowBlock,
+}
+
+impl Default for CursorShapeConfig {
+    fn default() -> Self {
+        CursorShapeConfig::Beam
+    }
+}
+
+impl From<CursorShapeConfig> for alacritty_terminal::vte::ansi::CursorShape {
+    fn from(c: CursorShapeConfig) -> Self {
+        match c {
+            CursorShapeConfig::Block => alacritty_terminal::vte::ansi::CursorShape::Block,
+            CursorShapeConfig::Beam => alacritty_terminal::vte::ansi::CursorShape::Beam,
+            CursorShapeConfig::Underline => alacritty_terminal::vte::ansi::CursorShape::Underline,
+            CursorShapeConfig::HollowBlock => alacritty_terminal::vte::ansi::CursorShape::HollowBlock,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorConfig {
+    #[serde(default)]
+    pub shape: CursorShapeConfig,
+    #[serde(default = "default_true")]
+    pub blink: bool,
+    #[serde(default = "default_true")]
+    pub smooth: bool,
+    #[serde(default = "default_cursor_anim_duration")]
+    pub animation_duration_ms: u64,
+}
+
+fn default_true() -> bool { true }
+fn default_cursor_anim_duration() -> u64 { 80 }
+
+impl Default for CursorConfig {
+    fn default() -> Self {
+        Self {
+            shape: CursorShapeConfig::default(),
+            blink: true,
+            smooth: true,
+            animation_duration_ms: default_cursor_anim_duration(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FontConfig {
     #[serde(default = "default_font_family")]
@@ -327,6 +381,7 @@ impl Default for Config {
             opacity: default_opacity(),
             notify_on_command_finish: default_notify_on_command_finish(),
             bottombar: BottombarConfig::default(),
+            cursor: CursorConfig::default(),
             option_as_meta: default_option_as_meta(),
         }
     }
@@ -344,11 +399,11 @@ impl Default for FontConfig {
 }
 
 fn user_toml_path() -> PathBuf {
-    crate::paths::get().config_dir.join("fastty.toml")
+    crate::paths::get().config_dir.join("config.toml")
 }
 
-fn user_config_toml_path() -> PathBuf {
-    crate::paths::get().config_dir.join("config.toml")
+fn user_fastty_toml_path() -> PathBuf {
+    crate::paths::get().config_dir.join("fastty.toml")
 }
 
 fn user_legacy_json_path() -> PathBuf {
@@ -357,12 +412,12 @@ fn user_legacy_json_path() -> PathBuf {
 
 fn candidate_toml_paths() -> Vec<PathBuf> {
     vec![
-        PathBuf::from("fastty.toml"),
         PathBuf::from("config.toml"),
-        PathBuf::from("/etc/fastty/fastty.toml"),
+        PathBuf::from("fastty.toml"),
         PathBuf::from("/etc/fastty/config.toml"),
+        PathBuf::from("/etc/fastty/fastty.toml"),
         user_toml_path(),
-        user_config_toml_path(),
+        user_fastty_toml_path(),
     ]
 }
 
@@ -408,6 +463,19 @@ fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
         font["size"] = value(c.font.size as f64);
         font["weight"] = value(c.font.weight as f64);
         font["ligatures"] = value(c.font.ligatures);
+    }
+    ensure_table(doc, "cursor");
+    if let Some(cursor) = doc["cursor"].as_table_mut() {
+        let shape_str = match c.cursor.shape {
+            CursorShapeConfig::Block => "block",
+            CursorShapeConfig::Beam => "beam",
+            CursorShapeConfig::Underline => "underline",
+            CursorShapeConfig::HollowBlock => "hollow_block",
+        };
+        cursor["shape"] = value(shape_str);
+        cursor["blink"] = value(c.cursor.blink);
+        cursor["smooth"] = value(c.cursor.smooth);
+        cursor["animation_duration_ms"] = value(c.cursor.animation_duration_ms as i64);
     }
     ensure_table(doc, "keybindings");
 }
@@ -563,4 +631,26 @@ where
         })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cursor_config_toml_parsing() {
+        let toml_str = r#"
+            theme = "catppuccin"
+            [cursor]
+            shape = "beam"
+            blink = false
+            smooth = true
+            animation_duration_ms = 120
+        "#;
+        let cfg: Config = toml_edit::de::from_str(toml_str).unwrap();
+        assert_eq!(cfg.cursor.shape, CursorShapeConfig::Beam);
+        assert_eq!(cfg.cursor.blink, false);
+        assert_eq!(cfg.cursor.smooth, true);
+        assert_eq!(cfg.cursor.animation_duration_ms, 120);
+    }
 }
