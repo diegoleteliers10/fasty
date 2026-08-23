@@ -12,11 +12,22 @@ use serde::{Deserialize, Serialize};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 pub static ACTIVE_THEME: RwLock<String> = RwLock::new(String::new());
+
+static CONFIG_VERSION: AtomicU64 = AtomicU64::new(1);
+
+pub fn current_config_version() -> u64 {
+    CONFIG_VERSION.load(Ordering::Relaxed)
+}
+
+pub fn increment_config_version() {
+    CONFIG_VERSION.fetch_add(1, Ordering::SeqCst);
+}
 
 static LAST_APPLIED_HASH: RwLock<u64> = RwLock::new(0);
 
@@ -581,7 +592,9 @@ impl Config {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        self.save(&path)
+        let res = self.save(&path);
+        increment_config_version();
+        res
     }
 }
 

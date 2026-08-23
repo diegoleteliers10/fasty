@@ -21,7 +21,6 @@ pub struct TabBar {
     on_rename_tab: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
     on_tab_context_menu: Option<Box<dyn Fn(&(usize, f32, f32), &mut Window, &mut App) + 'static>>,
     on_new_tab: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
-    on_open_settings: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_logo_context_menu: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>,
     update_available: Option<String>,
     is_updating: bool,
@@ -38,7 +37,6 @@ impl TabBar {
             on_rename_tab: None,
             on_tab_context_menu: None,
             on_new_tab: None,
-            on_open_settings: None,
             on_logo_context_menu: None,
             update_available: None,
             is_updating: false,
@@ -83,14 +81,6 @@ impl TabBar {
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_new_tab = Some(Box::new(handler));
-        self
-    }
-
-    pub fn on_open_settings(
-        mut self,
-        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        self.on_open_settings = Some(Box::new(handler));
         self
     }
 
@@ -174,12 +164,6 @@ impl RenderOnce for TabBar {
                                 self.on_update,
                             ))
                         })
-                        .child(render_settings_btn(
-                            theme,
-                            self.on_open_settings,
-                            btn_default_bg,
-                            btn_hover_bg,
-                        ))
                         .child(
                             div()
                                 .id("fastty-logo")
@@ -188,7 +172,8 @@ impl RenderOnce for TabBar {
                                 .justify_center()
                                 .w(px(22.))
                                 .h(px(22.))
-                                .on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                                     if let Some(ref cb) = on_logo_context {
                                         cb(ev, window, cx);
                                     }
@@ -198,7 +183,7 @@ impl RenderOnce for TabBar {
                 );
         }
 
-        // Windows / Linux: [logo][settings][tabs...+][drag spacer][update?][min][max][X]
+        // Windows / Linux: [logo][tabs...+][drag spacer][update?][min][max][X]
         #[cfg(not(target_os = "macos"))]
         {
             div()
@@ -231,19 +216,14 @@ impl RenderOnce for TabBar {
                                 .justify_center()
                                 .w(px(22.))
                                 .h(px(22.))
-                                .on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                                     if let Some(ref cb) = on_logo_context {
                                         cb(ev, window, cx);
                                     }
                                 })
                                 .child(super::icons::render_app_logo(15.0)),
                         )
-                        .child(render_settings_btn(
-                            theme,
-                            self.on_open_settings,
-                            btn_default_bg,
-                            btn_hover_bg,
-                        ))
                         .when(show_tabs, |this| {
                             this.child(render_tab_strip(
                                 self.tabs,
@@ -428,30 +408,6 @@ fn render_tab_strip(
         )
 }
 
-fn render_settings_btn(
-    theme: Theme,
-    on_open_settings: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
-    btn_default_bg: gpui::Hsla,
-    btn_hover_bg: gpui::Hsla,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id("settings-btn")
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(px(22.))
-        .h(px(22.))
-        .rounded(px(5.))
-        .bg(btn_default_bg)
-        .hover(move |s| s.bg(btn_hover_bg))
-        .cursor(CursorStyle::PointingHand)
-        .when_some(on_open_settings, |this, on_click| this.on_click(on_click))
-        .child(super::icons::render_icon(
-            icons::common::IconType::Settings,
-            theme.accent,
-            13.0,
-        ))
-}
 
 fn render_update_btn(
     version: String,

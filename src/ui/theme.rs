@@ -324,13 +324,11 @@ impl Theme {
 
     pub fn with_opacity(mut self, opacity: f32) -> Self {
         self.opacity = opacity.clamp(0.1, 1.0);
-        if self.opacity < 1.0 {
-            self.background.a = self.opacity;
-            self.main_bg.a = self.opacity;
-            self.tab_bar_bg.a = self.opacity;
-            self.status_bar_bg.a = self.opacity;
-            self.sidebar_bg.a = self.opacity;
-        }
+        self.background.a = self.opacity;
+        self.main_bg.a = self.opacity;
+        self.tab_bar_bg.a = self.opacity;
+        self.status_bar_bg.a = self.opacity;
+        self.sidebar_bg.a = self.opacity;
         self
     }
 
