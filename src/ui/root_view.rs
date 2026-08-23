@@ -2784,16 +2784,8 @@ impl RootView {
         };
         if is_paste {
             if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                if let Ok(text) = clip.get_text() {
-                    if terminal.is_bracketed_paste_enabled() {
-                        let mut buf = Vec::with_capacity(text.len() + 12);
-                        buf.extend_from_slice(b"\x1b[200~");
-                        buf.extend_from_slice(text.as_bytes());
-                        buf.extend_from_slice(b"\x1b[201~");
-                        terminal.write_to_pty(&buf);
-                    } else {
-                        terminal.write_to_pty(text.as_bytes());
-                    }
+                if let Some(content) = crate::paste::get_clipboard_paste_content(&mut clip) {
+                    crate::paste::paste_text_to_terminal(terminal, &content);
                     cx.notify();
                     return;
                 }
@@ -4115,6 +4107,14 @@ impl Render for RootView {
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
                     .on_mouse_up(MouseButton::Right, cx.listener(Self::handle_mouse_up))
                     .on_mouse_up(MouseButton::Middle, cx.listener(Self::handle_mouse_up))
+                    .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _window, cx| {
+                        if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
+                            if let Some(ref terminal) = active_tab.terminal {
+                                crate::paste::handle_dropped_paths(terminal, paths.paths());
+                                cx.notify();
+                            }
+                        }
+                    }))
                     .flex()
                     .flex_1()
                     .flex_col()
@@ -4802,16 +4802,8 @@ impl Render for RootView {
                                 if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
                                     if let Some(ref terminal) = active_tab.terminal {
                                         if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                                            if let Ok(text) = clip.get_text() {
-                                                if terminal.is_bracketed_paste_enabled() {
-                                                    let mut buf = Vec::with_capacity(text.len() + 12);
-                                                    buf.extend_from_slice(b"\x1b[200~");
-                                                    buf.extend_from_slice(text.as_bytes());
-                                                    buf.extend_from_slice(b"\x1b[201~");
-                                                    terminal.write_to_pty(&buf);
-                                                } else {
-                                                    terminal.write_to_pty(text.as_bytes());
-                                                }
+                                            if let Some(content) = crate::paste::get_clipboard_paste_content(&mut clip) {
+                                                crate::paste::paste_text_to_terminal(terminal, &content);
                                             }
                                         }
                                     }

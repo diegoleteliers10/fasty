@@ -12,6 +12,7 @@ pub mod snippets;
 pub mod ssh;
 pub mod parser;
 pub mod pane_tree;
+pub mod paste;
 pub mod terminal_state;
 pub mod ui;
 pub mod updater;
