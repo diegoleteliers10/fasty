@@ -234,6 +234,22 @@ impl PaneNode {
             }
         }
     }
+
+    pub fn set_split_ratio_by_path(&mut self, path: &[usize], new_ratio: f32) -> bool {
+        match self {
+            PaneNode::Leaf(_) => false,
+            PaneNode::Split { ratio, first, second, .. } => {
+                if path.is_empty() {
+                    *ratio = new_ratio.clamp(0.05, 0.95);
+                    true
+                } else if path[0] == 0 {
+                    first.set_split_ratio_by_path(&path[1..], new_ratio)
+                } else {
+                    second.set_split_ratio_by_path(&path[1..], new_ratio)
+                }
+            }
+        }
+    }
 }
 
 pub struct PaneTree {
@@ -378,6 +394,10 @@ impl PaneTree {
         self.root.adjust_ratio_for_target(self.active_pane_id, direction, delta)
     }
 
+    pub fn set_split_ratio_by_path(&mut self, path: &[usize], new_ratio: f32) -> bool {
+        self.root.set_split_ratio_by_path(path, new_ratio)
+    }
+
     pub fn update_layout_bounds(&mut self, x: f32, y: f32, w: f32, h: f32) {
         self.root.update_bounds(x, y, w, h);
     }
@@ -407,5 +427,46 @@ impl PaneNode {
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_pane(id: usize) -> TerminalPane {
+        TerminalPane {
+            id,
+            terminal: None,
+            title: format!("Pane {}", id),
+            custom_title: None,
+            cwd: None,
+            git_status: None,
+            git_checked_cwd: None,
+            git_last_poll: None,
+            last_duration_ms: None,
+            last_exit_code: None,
+            last_bounds: None,
+        }
+    }
+
+    #[test]
+    fn test_set_split_ratio_by_path() {
+        let mut tree = PaneTree::new(dummy_pane(1));
+        tree.split_active_pane(dummy_pane(2), Direction::Right);
+        assert_eq!(tree.pane_count(), 2);
+
+        // Root split ratio adjustment
+        assert!(tree.set_split_ratio_by_path(&[], 0.7));
+        if let PaneNode::Split { ratio, .. } = &tree.root {
+            assert!((ratio - 0.7).abs() < 1e-4);
+        } else {
+            panic!("Expected split root");
+        }
+
+        // Sub-split
+        tree.split_active_pane(dummy_pane(3), Direction::Down);
+        assert_eq!(tree.pane_count(), 3);
+        assert!(tree.set_split_ratio_by_path(&[1], 0.35));
     }
 }

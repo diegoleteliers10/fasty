@@ -93,6 +93,7 @@ pub enum Action {
     NextPrompt,
     ClearScrollback,
     ToggleFullscreen,
+    ToggleTabSidebar,
     SplitRight,
     SplitDown,
     SplitLeft,
@@ -124,6 +125,7 @@ impl KeyBindingResolver {
             insert("super+t", Action::NewTab);
             insert("super+w", Action::ClosePane);
             insert("super+shift+w", Action::CloseTab);
+            insert("super+b", Action::ToggleTabSidebar);
             insert("super+n", Action::NewWindow);
             insert("super+f", Action::OpenSearch);
             insert("super+s", Action::OpenSettings);
@@ -169,12 +171,14 @@ impl KeyBindingResolver {
             insert("ctrl+shift+t", Action::NewTab);
             insert("ctrl+shift+w", Action::ClosePane);
             insert("ctrl+shift+q", Action::CloseTab);
+            insert("ctrl+b", Action::ToggleTabSidebar);
+            insert("ctrl+shift+b", Action::ToggleTabSidebar);
             insert("ctrl+shift+n", Action::NewWindow);
             insert("ctrl+shift+c", Action::Copy);
             insert("ctrl+shift+v", Action::Paste);
             insert("shift+insert", Action::Paste);
             insert("ctrl+shift+e", Action::SplitRight);
-            insert("ctrl+shift+b", Action::SplitDown);
+            insert("ctrl+shift+d", Action::SplitDown);
             insert("alt+left", Action::FocusLeft);
             insert("alt+right", Action::FocusRight);
             insert("alt+up", Action::FocusTop);
@@ -314,6 +318,7 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "next_prompt" => Some(Action::NextPrompt),
         "clear_scrollback" => Some(Action::ClearScrollback),
         "toggle_fullscreen" => Some(Action::ToggleFullscreen),
+        "toggle_tab_sidebar" => Some(Action::ToggleTabSidebar),
         "split_right" => Some(Action::SplitRight),
         "split_down" => Some(Action::SplitDown),
         "split_left" => Some(Action::SplitLeft),

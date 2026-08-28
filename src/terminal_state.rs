@@ -960,6 +960,22 @@ impl TerminalState {
         get_process_cwd(pid)
     }
 
+    pub fn is_process_running(&self) -> bool {
+        let Some(pid) = self.shell_pid else { return false; };
+        #[cfg(target_os = "macos")]
+        {
+            has_active_child_process_macos(pid)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            has_active_child_process_linux(pid)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            false
+        }
+    }
+
     pub fn write_to_pty(&self, bytes: &[u8]) {
         let mut w = self.writer.lock();
         let _ = w.write_all(bytes);
@@ -1436,9 +1452,20 @@ fn parse_osc(
         }
         b"9" => {
             if let Ok(msg) = std::str::from_utf8(payload) {
+                let (title, body) = if let Some(idx) = msg.find(';') {
+                    let t = msg[..idx].trim();
+                    let b = msg[idx + 1..].trim();
+                    if t.is_empty() {
+                        ("Fastty", b)
+                    } else {
+                        (t, b)
+                    }
+                } else {
+                    ("Fastty", msg.trim())
+                };
                 Some(OscCommand::Notification {
-                    title: "Fastty".to_string(),
-                    body: msg.to_string(),
+                    title: title.to_string(),
+                    body: body.to_string(),
                 })
             } else {
                 None
@@ -1753,23 +1780,81 @@ fn get_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     None
 }
 
+#[cfg(target_os = "macos")]
+fn has_active_child_process_macos(shell_pid: u32) -> bool {
+    use std::os::raw::{c_int, c_uint, c_void};
+
+    extern "C" {
+        fn proc_listpids(
+            proc_type: c_uint,
+            proc_type_arg: c_uint,
+            buffer: *mut c_void,
+            buffersize: c_int,
+        ) -> c_int;
+    }
+    const PROC_PPID_ONLY: c_uint = 6;
+
+    let mut pids = [0i32; 64];
+    let res = unsafe {
+        proc_listpids(
+            PROC_PPID_ONLY,
+            shell_pid as c_uint,
+            pids.as_mut_ptr() as *mut c_void,
+            std::mem::size_of_val(&pids) as c_int,
+        )
+    };
+    if res > 0 {
+        let count = (res as usize) / std::mem::size_of::<i32>();
+        for &p in &pids[..count] {
+            if p > 0 && p != (shell_pid as i32) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(target_os = "linux")]
 fn get_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     std::fs::read_link(format!("/proc/{}/cwd", pid)).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn has_active_child_process_linux(shell_pid: u32) -> bool {
+    if let Ok(content) = std::fs::read_to_string(format!("/proc/{}/task/{}/children", shell_pid, shell_pid)) {
+        return !content.trim().is_empty();
+    }
+    false
 }
 
 #[cfg(target_os = "windows")]
 fn get_process_cwd(_pid: u32) -> Option<std::path::PathBuf> {
     None
 }
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use super::CsiEvent::{self, *};
     use super::CsiWatcher;
 
     fn run(bytes: &[u8]) -> Vec<CsiEvent> {
         let mut w = CsiWatcher::new();
         bytes.iter().filter_map(|&b| w.feed(b)).collect()
+    }
+
+    #[test]
+    fn test_child_process_detection() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .expect("failed to spawn sleep");
+        let parent_pid = std::process::id();
+        #[cfg(target_os = "macos")]
+        {
+            assert!(has_active_child_process_macos(parent_pid));
+        }
+        let _ = child.kill();
     }
 
     #[test]

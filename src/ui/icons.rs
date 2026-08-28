@@ -85,4 +85,41 @@ pub fn render_app_logo(size_px: f32) -> impl IntoElement {
         .flex_shrink_0()
 }
 
+pub fn render_sidebar_icon(color: Hsla, size_px: f32) -> impl IntoElement {
+    svg()
+        .data(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/></svg>"#
+        )
+        .text_color(color)
+        .w(px(size_px))
+        .h(px(size_px))
+        .flex_shrink_0()
+}
+
+pub fn render_spinner(color: Hsla, size_px: f32) -> impl IntoElement {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let frame = ((now_ms / 100) % 8) as usize;
+
+    static SPINNER_FRAMES: [&[u8]; 8] = [
+        br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 3a9 9 0 0 1 9 9"/></svg>"#,
+        br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18.36 5.64a9 9 0 0 1 2.64 8.72"/></svg>"#,
+        br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 12a9 9 0 0 1-9 9"/></svg>"#,
+        br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18.36 18.36a9 9 0 0 1-8.72 2.64"/></svg>"#,
+        br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 21a9 9 0 0 1-9-9"/></svg>"#,
+        br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M5.64 18.36a9 9 0 0 1-2.64-8.72"/></svg>"#,
+        br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M3 12a9 9 0 0 1 9-9"/></svg>"#,
+        br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M5.64 5.64a9 9 0 0 1 8.72-2.64"/></svg>"#,
+    ];
+
+    svg()
+        .data(SPINNER_FRAMES[frame])
+        .text_color(color)
+        .w(px(size_px))
+        .h(px(size_px))
+        .flex_shrink_0()
+}
+
 

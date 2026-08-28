@@ -12,5 +12,5 @@ pub use button::{Button, ButtonVariant};
 pub use root_view::RootView;
 pub use settings_view::SettingsView;
 pub use status_bar::StatusBar;
-pub use tab_bar::TabBar;
+pub use tab_bar::{TabBar, TabSidebar};
 pub use theme::Theme;

@@ -153,19 +153,80 @@ pub fn save_clipboard_image(image_data: arboard::ImageData) -> Result<PathBuf, S
     Ok(file_path)
 }
 
+#[cfg(target_os = "macos")]
+fn try_macos_clipboard_fallback() -> Option<String> {
+    let base_temp = std::env::temp_dir().join("fastty_clipboard");
+    let _ = std::fs::create_dir_all(&base_temp);
+    prune_old_temp_images(&base_temp);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_path = base_temp.join(format!("fastty_clip_{}_{}.png", timestamp, count));
+
+    let script = format!(
+        r#"
+        try
+            set pngData to (the clipboard as «class PNGf»)
+            set f to open for access POSIX file "{}" with write permission
+            set eof f to 0
+            write pngData to f
+            close access f
+            return "ok"
+        on error
+            try
+                set f to (the clipboard as «class furl»)
+                return POSIX path of f
+            end try
+        end try
+        "#,
+        file_path.display()
+    );
+
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let res = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if res == "ok" && file_path.exists() && file_path.metadata().map_or(false, |m| m.len() > 0) {
+            return Some(format_path_for_shell(&file_path));
+        } else if !res.is_empty() && res != "ok" {
+            let path = PathBuf::from(&res);
+            if path.exists() {
+                return Some(format_path_for_shell(&path));
+            }
+        }
+    }
+    None
+}
+
 /// Reads paste content from system clipboard (text or image).
 pub fn get_clipboard_paste_content(clip: &mut arboard::Clipboard) -> Option<String> {
-    // 1. Try reading text first
+    // 1. Check for image data from clipboard first
+    if let Ok(image_data) = clip.get_image() {
+        if let Ok(saved_path) = save_clipboard_image(image_data) {
+            return Some(format_path_for_shell(&saved_path));
+        }
+    }
+
+    // 2. Check for text content
     if let Ok(text) = clip.get_text() {
-        if !text.is_empty() {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
             return Some(parse_file_uris_or_text(&text));
         }
     }
 
-    // 2. If no text or text is empty, check for image data
-    if let Ok(image_data) = clip.get_image() {
-        if let Ok(saved_path) = save_clipboard_image(image_data) {
-            return Some(format_path_for_shell(&saved_path));
+    // 3. Fallback on macOS for native clipboard types (Finder files, Apple screenshot PNGs)
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(content) = try_macos_clipboard_fallback() {
+            return Some(content);
         }
     }
 

@@ -11,9 +11,9 @@ use gpui::{
 
 use super::settings_view::SettingsView;
 use super::status_bar::{StatusBar, StatusBarModel, StatusInfo};
-use super::tab_bar::{TabBar, TabItem};
+use super::tab_bar::{TabBar, TabItem, TabSidebar};
 use super::theme::{Theme, rgb_to_hsla};
-use crate::config::{self, Config};
+use crate::config::{self, Config, TabLayout};
 use crate::event_listener::EventSender;
 use crate::git::GitStatus;
 use crate::pane_tree::{Direction, PaneNode, PaneTree, SplitDirection, TerminalPane};
@@ -705,6 +705,28 @@ pub(crate) fn available_system_fonts() -> Vec<String> {
     }
 }
 
+pub fn send_system_notification(title: &str, body: &str) {
+    let summary = if title.is_empty() { "Fastty" } else { title };
+    let res = notify_rust::Notification::new()
+        .appname("Fastty")
+        .summary(summary)
+        .body(body)
+        .show();
+
+    if res.is_err() {
+        #[cfg(target_os = "macos")]
+        {
+            let escaped_title = summary.replace('\\', "\\\\").replace('"', "\\\"");
+            let escaped_body = body.replace('\\', "\\\\").replace('"', "\\\"");
+            let script = format!(r#"display notification "{}" with title "{}""#, escaped_body, escaped_title);
+            let _ = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(script)
+                .spawn();
+        }
+    }
+}
+
 use icons::common::IconType;
 use super::icons::{render_app_logo, render_icon};
 
@@ -751,6 +773,9 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
         PaletteCommand { id: "focus_top", icon: IconType::ChevronUp, title: "Focus Pane Top", category: "Panes", shortcut: Some(if is_mac { "⌥⌘↑" } else { "Alt+↑" }) },
         PaletteCommand { id: "focus_down", icon: IconType::ChevronDown, title: "Focus Pane Down", category: "Panes", shortcut: Some(if is_mac { "⌥⌘↓" } else { "Alt+↓" }) },
         PaletteCommand { id: "close_pane", icon: IconType::X, title: "Close Active Pane", category: "Panes", shortcut: Some(if is_mac { "⌘W" } else { "Ctrl+Shift+W" }) },
+        PaletteCommand { id: "toggle_tab_sidebar", icon: IconType::Folder, title: "Toggle Tabs Sidebar", category: "View", shortcut: Some(if is_mac { "⌘B" } else { "Ctrl+B" }) },
+        PaletteCommand { id: "layout_horizontal", icon: IconType::Folder, title: "Tabs Layout: Horizontal Top Bar", category: "View", shortcut: None },
+        PaletteCommand { id: "layout_vertical", icon: IconType::Folder, title: "Tabs Layout: Vertical Sidebar", category: "View", shortcut: None },
         PaletteCommand { id: "quit", icon: IconType::LogOut, title: "Quit Fastty", category: "Application", shortcut: Some(if is_mac { "⌘Q" } else { "Alt+F4" }) },
     ]
 }
@@ -767,6 +792,10 @@ pub struct RootView {
     font_size: f32,
     font_family: SharedString,
     status_bar_model: StatusBarModel,
+    pub tab_layout: TabLayout,
+    pub sidebar_open: bool,
+    pub sidebar_anim_progress: f32,
+    pub sidebar_scroll_handle: ScrollHandle,
     pub is_settings_open: bool,
     pub is_context_menu_open: bool,
     pub is_about_open: bool,
@@ -827,9 +856,22 @@ pub struct RootView {
     pub pressed_mouse_button: Option<MouseButton>,
     pub(crate) ime_marked_text: Option<String>,
     pub last_config_version: u64,
+    pub is_dragging_pane_split: bool,
+    pub dragging_split_path: Vec<usize>,
+    pub dragging_split_direction: SplitDirection,
+    pub dragging_split_bounds: (f32, f32, f32, f32),
 }
 
 impl RootView {
+    #[inline]
+    pub fn current_sidebar_width(&self) -> f32 {
+        if self.tab_layout == TabLayout::Vertical || self.sidebar_anim_progress > 0.001 {
+            (210.0 * self.sidebar_anim_progress).round()
+        } else {
+            0.0
+        }
+    }
+
     #[inline]
     fn measure_cell_metrics(&self, window: &Window) -> (f32, f32) {
         let font_id = window.text_system().resolve_font(&gpui::font(self.font_family.clone()));
@@ -954,6 +996,10 @@ impl RootView {
             }
         }
 
+        let tab_layout = loaded_config.tab_layout;
+        let sidebar_open = tab_layout == TabLayout::Vertical;
+        let sidebar_anim_progress = if sidebar_open { 1.0 } else { 0.0 };
+
         let mut view = Self {
             config: loaded_config,
             window_id: _window.window_handle().window_id(),
@@ -966,6 +1012,10 @@ impl RootView {
             font_size,
             font_family,
             status_bar_model,
+            tab_layout,
+            sidebar_open,
+            sidebar_anim_progress,
+            sidebar_scroll_handle: ScrollHandle::new(),
             is_settings_open: false,
             is_context_menu_open: false,
             is_about_open: false,
@@ -1026,6 +1076,10 @@ impl RootView {
             pressed_mouse_button: None,
             ime_marked_text: None,
             last_config_version: crate::config::current_config_version(),
+            is_dragging_pane_split: false,
+            dragging_split_path: Vec::new(),
+            dragging_split_direction: SplitDirection::Horizontal,
+            dragging_split_bounds: (0.0, 0.0, 0.0, 0.0),
         };
 
         // Background update check
@@ -1286,11 +1340,7 @@ impl RootView {
                             cx.notify();
                         }
                         AppEvent::Notification { title, body } => {
-                            let summary = if title.is_empty() { "Fastty" } else { &title };
-                            let _ = notify_rust::Notification::new()
-                                .summary(summary)
-                                .body(&body)
-                                .show();
+                            send_system_notification(&title, &body);
                         }
                         _ => {
                             cx.notify();
@@ -1554,11 +1604,7 @@ impl RootView {
                             cx.notify();
                         }
                         AppEvent::Notification { title, body } => {
-                            let summary = if title.is_empty() { "Fastty" } else { &title };
-                            let _ = notify_rust::Notification::new()
-                                .summary(summary)
-                                .body(&body)
-                                .show();
+                            send_system_notification(&title, &body);
                         }
                         _ => {
                             cx.notify();
@@ -1942,9 +1988,77 @@ impl RootView {
             "focus_top" | "focus_up" => self.focus_pane_in_direction(Direction::Top, cx),
             "focus_down" => self.focus_pane_in_direction(Direction::Down, cx),
             "close_pane" => self.close_active_pane(_window, cx),
+            "toggle_tab_sidebar" => self.toggle_tab_sidebar(_window, cx),
+            "layout_horizontal" => self.set_tab_layout_mode(TabLayout::Horizontal, _window, cx),
+            "layout_vertical" => self.set_tab_layout_mode(TabLayout::Vertical, _window, cx),
             "quit" => cx.quit(),
             _ => {}
         }
+    }
+
+    pub fn toggle_tab_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_layout == TabLayout::Horizontal {
+            self.tab_layout = TabLayout::Vertical;
+            self.config.tab_layout = TabLayout::Vertical;
+            let _ = self.config.save_default();
+            crate::config::increment_config_version();
+            self.sidebar_open = true;
+        } else {
+            self.sidebar_open = !self.sidebar_open;
+        }
+        self.trigger_sidebar_animation(window, cx);
+        cx.notify();
+    }
+
+    pub fn set_tab_layout_mode(&mut self, layout: TabLayout, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_layout == layout {
+            return;
+        }
+        self.tab_layout = layout;
+        self.config.tab_layout = layout;
+        let _ = self.config.save_default();
+        crate::config::increment_config_version();
+        if self.tab_layout == TabLayout::Vertical {
+            self.sidebar_open = true;
+        }
+        self.trigger_sidebar_animation(window, cx);
+        cx.notify();
+    }
+
+    pub fn trigger_sidebar_animation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let target = if self.tab_layout == TabLayout::Vertical && self.sidebar_open {
+            1.0f32
+        } else {
+            0.0f32
+        };
+
+        if (self.sidebar_anim_progress - target).abs() < 0.001 {
+            return;
+        }
+
+        cx.spawn_in(window, async move |this, cx| {
+            let start_time = std::time::Instant::now();
+            let duration = std::time::Duration::from_millis(160);
+            let initial = this.update_in(cx, |this, _window, _cx| this.sidebar_anim_progress).unwrap_or(0.0);
+
+            loop {
+                let elapsed = start_time.elapsed();
+                let t = (elapsed.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0);
+                let eased = 1.0 - (1.0 - t).powi(3);
+                let current = initial + (target - initial) * eased;
+                let done = t >= 1.0;
+
+                let res = this.update_in(cx, |this, _window, cx| {
+                    this.sidebar_anim_progress = if done { target } else { current };
+                    cx.notify();
+                });
+
+                if res.is_err() || done {
+                    break;
+                }
+                cx.background_executor().timer(std::time::Duration::from_millis(8)).await;
+            }
+        }).detach();
     }
 
     pub fn reload_config(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1971,6 +2085,13 @@ impl RootView {
         };
         self.font_family = new_family;
         self.status_bar_model = StatusBarModel::new(&loaded_config, self.theme);
+        if self.tab_layout != loaded_config.tab_layout {
+            self.tab_layout = loaded_config.tab_layout;
+            if self.tab_layout == TabLayout::Vertical {
+                self.sidebar_open = true;
+            }
+            self.trigger_sidebar_animation(_window, cx);
+        }
         self.config = loaded_config;
         cx.notify();
     }
@@ -2634,11 +2755,22 @@ impl RootView {
             return;
         }
 
-        // 4d. Split Down (⌘⇧D on macOS; Ctrl+Shift+B on Linux/Windows)
+        // Toggle Tab Sidebar (⌘B on macOS; Ctrl+B on Linux/Windows)
+        let is_toggle_sidebar = if cfg!(target_os = "macos") {
+            modifiers.platform && !modifiers.shift && key_lower == "b"
+        } else {
+            is_ctrl && !modifiers.shift && key_lower == "b"
+        };
+        if is_toggle_sidebar {
+            self.toggle_tab_sidebar(_window, cx);
+            return;
+        }
+
+        // 4d. Split Down (⌘⇧D on macOS; Ctrl+Shift+D on Linux/Windows)
         let is_split_down = if cfg!(target_os = "macos") {
             modifiers.platform && modifiers.shift && key_lower == "d"
         } else {
-            is_ctrl && modifiers.shift && key_lower == "b"
+            is_ctrl && modifiers.shift && key_lower == "d"
         };
         if is_split_down {
             self.split_active_pane(Direction::Down, _window, cx);
@@ -3147,7 +3279,8 @@ impl RootView {
         };
 
         let (cell_w, line_h) = self.measure_cell_metrics(window);
-        let local_x = (event.position.x.to_f64() as f32 - 1.0).max(0.0);
+        let sidebar_w = self.current_sidebar_width();
+        let local_x = (event.position.x.to_f64() as f32 - sidebar_w - 1.0).max(0.0);
         let local_y = (event.position.y.to_f64() as f32 - 32.0).max(0.0);
         let col = ((local_x / cell_w).floor() as usize) + 1;
         let row = ((local_y / line_h).floor() as usize) + 1;
@@ -3218,6 +3351,33 @@ impl RootView {
     }
 
     fn handle_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_dragging_pane_split {
+            let cur_x = event.position.x.to_f64() as f32;
+            let cur_y = event.position.y.to_f64() as f32;
+            let (bx, by, bw, bh) = self.dragging_split_bounds;
+            let new_ratio = match self.dragging_split_direction {
+                SplitDirection::Horizontal => {
+                    if bw > 20.0 {
+                        ((cur_x - bx) / bw).clamp(0.05, 0.95)
+                    } else {
+                        0.5
+                    }
+                }
+                SplitDirection::Vertical => {
+                    if bh > 20.0 {
+                        ((cur_y - by) / bh).clamp(0.05, 0.95)
+                    } else {
+                        0.5
+                    }
+                }
+            };
+            if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
+                tab.pane_tree.set_split_ratio_by_path(&self.dragging_split_path, new_ratio);
+                cx.notify();
+            }
+            return;
+        }
+
         if self.is_dragging_scrollbar {
             self.last_scroll_activity = std::time::Instant::now();
             let (_, line_h) = self.measure_cell_metrics(_window);
@@ -3254,7 +3414,8 @@ impl RootView {
         let Some(ref terminal) = active_tab.terminal else { return; };
 
         let (cell_w, line_h) = self.measure_cell_metrics(_window);
-        let local_x = (event.position.x.to_f64() as f32 - 1.0).max(0.0);
+        let sidebar_w = self.current_sidebar_width();
+        let local_x = (event.position.x.to_f64() as f32 - sidebar_w - 1.0).max(0.0);
         let local_y = (event.position.y.to_f64() as f32 - 32.0).max(0.0);
 
         if terminal.is_mouse_mode_enabled() {
@@ -3363,6 +3524,8 @@ impl RootView {
         self.pressed_mouse_button = None;
         self.is_dragging_scrollbar = false;
         self.dragging_scrollbar_pane_id = None;
+        self.is_dragging_pane_split = false;
+        self.dragging_split_path.clear();
         self.selection_mouse_pos = None;
         self.has_selection_dragged = false;
         if self.is_selecting {
@@ -3380,7 +3543,8 @@ impl RootView {
             if let Some(ref terminal) = active_tab.terminal {
                 if terminal.is_mouse_mode_enabled() {
                     let (cell_w, line_h) = self.measure_cell_metrics(_window);
-                    let local_x = (event.position.x.to_f64() as f32 - 1.0).max(0.0);
+                    let sidebar_w = self.current_sidebar_width();
+                    let local_x = (event.position.x.to_f64() as f32 - sidebar_w - 1.0).max(0.0);
                     let local_y = (event.position.y.to_f64() as f32 - 32.0).max(0.0);
                     let col = ((local_x / cell_w).floor() as usize) + 1;
                     let row = ((local_y / line_h).floor() as usize) + 1;
@@ -3420,7 +3584,8 @@ impl RootView {
         let top_edge = 32.0;
         let v = window.viewport_size();
         let avail_h = (v.height.to_f64() as f32 - 56.0).max(100.0);
-        let avail_w = v.width.to_f64() as f32;
+        let sidebar_w = self.current_sidebar_width();
+        let avail_w = (v.width.to_f64() as f32 - sidebar_w).max(100.0);
         let bottom_edge = top_edge + avail_h;
 
         let screen_rows = ((avail_h / px_per_line) as i32).max(1);
@@ -3455,7 +3620,7 @@ impl RootView {
             row_in_screen - (new_display_offset as i32)
         }.clamp(-(history_size as i32), screen_rows - 1);
 
-        let local_x = (raw_x - 1.0).max(0.0);
+        let local_x = (raw_x - sidebar_w - 1.0).max(0.0);
         let updated_col = if raw_y < top_edge && raw_x < 5.0 {
             0
         } else {
@@ -3522,7 +3687,8 @@ impl RootView {
             self.last_scrolled_pane_id = target_pane_id;
             if terminal.is_mouse_mode_enabled() {
                 let (cell_w, _) = self.measure_cell_metrics(_window);
-                let local_x = (event.position.x.to_f64() as f32 - 1.0).max(0.0);
+                let sidebar_w = self.current_sidebar_width();
+                let local_x = (event.position.x.to_f64() as f32 - sidebar_w - 1.0).max(0.0);
                 let local_y = (event.position.y.to_f64() as f32 - 32.0).max(0.0);
                 let col = ((local_x / cell_w).floor() as usize) + 1;
                 let row = ((local_y / px_per_line).floor() as usize) + 1;
@@ -3574,6 +3740,9 @@ impl RootView {
     fn render_pane_tree_node(
         &self,
         node: &PaneNode,
+        path: Vec<usize>,
+        container_x: f32,
+        container_y: f32,
         avail_w: f32,
         avail_h: f32,
         cell_w: f32,
@@ -3973,19 +4142,83 @@ impl RootView {
                     SplitDirection::Vertical => container.flex_col(),
                 };
 
-                let (w1, h1, w2, h2) = match direction {
+                let (w1, h1, w2, h2, first_x, first_y, second_x, second_y) = match direction {
                     SplitDirection::Horizontal => {
-                        (avail_w * *ratio, avail_h, avail_w * (1.0 - *ratio), avail_h)
+                        let w1 = avail_w * *ratio;
+                        let w2 = avail_w * (1.0 - *ratio);
+                        (w1, avail_h, w2, avail_h, container_x, container_y, container_x + w1, container_y)
                     }
                     SplitDirection::Vertical => {
-                        (avail_w, avail_h * *ratio, avail_w, avail_h * (1.0 - *ratio))
+                        let h1 = avail_h * *ratio;
+                        let h2 = avail_h * (1.0 - *ratio);
+                        (avail_w, h1, avail_w, h2, container_x, container_y, container_x, container_y + h1)
                     }
                 };
 
+                let is_dragging_this = self.is_dragging_pane_split && self.dragging_split_path == path;
+                let divider_line_color = if is_dragging_this { theme.accent } else { theme.border };
+                let split_path_clone = path.clone();
+                let dir_val = *direction;
+
                 let divider = match direction {
-                    SplitDirection::Horizontal => div().w(px(1.0)).h_full().bg(theme.border).flex_shrink_0(),
-                    SplitDirection::Vertical => div().h(px(1.0)).w_full().bg(theme.border).flex_shrink_0(),
+                    SplitDirection::Horizontal => {
+                        div()
+                            .id(SharedString::from(format!("h-split-divider-{:?}", path)))
+                            .relative()
+                            .w(px(7.))
+                            .h_full()
+                            .mx(px(-3.))
+                            .cursor(CursorStyle::ResizeColumn)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(move |s| s.bg(gpui::transparent_black()))
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                this.is_dragging_pane_split = true;
+                                this.dragging_split_path = split_path_clone.clone();
+                                this.dragging_split_direction = dir_val;
+                                this.dragging_split_bounds = (container_x, container_y, avail_w, avail_h);
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .w(px(1.))
+                                    .h_full()
+                                    .bg(divider_line_color)
+                            )
+                    }
+                    SplitDirection::Vertical => {
+                        div()
+                            .id(SharedString::from(format!("v-split-divider-{:?}", path)))
+                            .relative()
+                            .h(px(7.))
+                            .w_full()
+                            .my(px(-3.))
+                            .cursor(CursorStyle::ResizeRow)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(move |s| s.bg(gpui::transparent_black()))
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                this.is_dragging_pane_split = true;
+                                this.dragging_split_path = split_path_clone.clone();
+                                this.dragging_split_direction = dir_val;
+                                this.dragging_split_bounds = (container_x, container_y, avail_w, avail_h);
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .h(px(1.))
+                                    .w_full()
+                                    .bg(divider_line_color)
+                            )
+                    }
                 };
+
+                let mut path_first = path.clone();
+                path_first.push(0);
+                let mut path_second = path;
+                path_second.push(1);
 
                 container
                     .child(
@@ -3995,6 +4228,9 @@ impl RootView {
                             .overflow_hidden()
                             .child(self.render_pane_tree_node(
                                 first,
+                                path_first,
+                                first_x,
+                                first_y,
                                 w1,
                                 h1,
                                 cell_w,
@@ -4012,6 +4248,9 @@ impl RootView {
                             .overflow_hidden()
                             .child(self.render_pane_tree_node(
                                 second,
+                                path_second,
+                                second_x,
+                                second_y,
                                 w2,
                                 h2,
                                 cell_w,
@@ -4099,7 +4338,8 @@ impl Render for RootView {
 
         let (cell_w, line_h) = self.measure_cell_metrics(_window);
         let viewport_size = _window.viewport_size();
-        let avail_w = (viewport_size.width.to_f64() as f32 - 1.0).max(100.0);
+        let sidebar_w = self.current_sidebar_width();
+        let avail_w = (viewport_size.width.to_f64() as f32 - 1.0 - sidebar_w).max(100.0);
         // Chrome layout constants — must match TabBar/StatusBar element heights
         const TAB_BAR_HEIGHT: f32 = 32.0;
         const STATUS_BAR_HEIGHT: f32 = 24.0;
@@ -4112,7 +4352,7 @@ impl Render for RootView {
         let font_size = self.font_size;
 
         if let Some(active_tab) = self.tabs.get_mut(self.active_tab_idx) {
-            active_tab.pane_tree.update_layout_bounds(0.0, 0.0, avail_w, avail_h);
+            active_tab.pane_tree.update_layout_bounds(sidebar_w, TAB_BAR_HEIGHT, avail_w, avail_h);
         }
 
         let terminal_area = if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
@@ -4120,6 +4360,9 @@ impl Render for RootView {
             let pane_count = active_tab.pane_tree.pane_count();
             self.render_pane_tree_node(
                 &active_tab.pane_tree.root,
+                Vec::new(),
+                sidebar_w,
+                TAB_BAR_HEIGHT,
                 avail_w,
                 avail_h,
                 cell_w,
@@ -4140,8 +4383,21 @@ impl Render for RootView {
             .text_color(theme.foreground)
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
+            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _window, cx| {
+                if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
+                    if let Some(ref terminal) = active_tab.terminal {
+                        crate::paste::handle_dropped_paths(terminal, paths.paths());
+                        cx.notify();
+                    }
+                }
+            }))
             .child(
-                TabBar::new(tab_items, theme)
+                TabBar::new(tab_items.clone(), theme)
+                    .layout(self.tab_layout)
+                    .sidebar_open(self.sidebar_open)
+                    .on_toggle_sidebar(cx.listener(|this, _ev, window, cx| {
+                        this.toggle_tab_sidebar(window, cx);
+                    }))
                     .update_available(self.update_available.as_ref().map(|u| u.version.clone()), self.is_updating)
                     .on_update(cx.listener(|this, _ev, window, cx| {
                         this.trigger_apply_update(window, cx);
@@ -4169,38 +4425,71 @@ impl Render for RootView {
             )
             .child(
                 div()
-                    .relative()
-                    .track_focus(&self.focus_handle)
-                    .key_context("RootView")
-                    .on_key_down(cx.listener(Self::handle_key_down))
-                    .on_scroll_wheel(cx.listener(Self::handle_scroll))
-                    .on_mouse_move(cx.listener(Self::handle_mouse_move))
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
-                    .on_mouse_down(MouseButton::Right, cx.listener(Self::handle_mouse_down))
-                    .on_mouse_down(MouseButton::Middle, cx.listener(Self::handle_mouse_down))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
-                    .on_mouse_up(MouseButton::Right, cx.listener(Self::handle_mouse_up))
-                    .on_mouse_up(MouseButton::Middle, cx.listener(Self::handle_mouse_up))
-                    .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _window, cx| {
-                        if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
-                            if let Some(ref terminal) = active_tab.terminal {
-                                crate::paste::handle_dropped_paths(terminal, paths.paths());
-                                cx.notify();
-                            }
-                        }
-                    }))
                     .flex()
+                    .flex_row()
                     .flex_1()
-                    .flex_col()
                     .w_full()
-                    .pl(px(1.))
-                    .bg(self.theme.main_bg)
-                    .font_family(font_family.clone())
-                    .text_size(px(font_size))
-                    .font_features(enable_terminal_ligatures())
                     .overflow_hidden()
-                    .child(super::ime::registration(cx.entity(), self.focus_handle.clone()))
-                    .child(terminal_area),
+                    .when(self.tab_layout == TabLayout::Vertical || self.sidebar_anim_progress > 0.001, |this| {
+                        this.child(
+                            TabSidebar::new(tab_items.clone(), theme, self.sidebar_anim_progress, self.sidebar_scroll_handle.clone())
+                                .on_select_tab(cx.listener(|this, &tab_id, _window, cx| {
+                                    this.select_tab(tab_id, cx);
+                                }))
+                                .on_close_tab(cx.listener(|this, &tab_id, window, cx| {
+                                    this.close_tab(tab_id, window, cx);
+                                }))
+                                .on_rename_tab(cx.listener(|this, &tab_id, _window, cx| {
+                                    if let Some(pos) = this.tabs.iter().position(|t| t.id == tab_id) {
+                                        this.open_rename_tab(pos, cx);
+                                    }
+                                }))
+                                .on_tab_context_menu(cx.listener(|this, &(tab_id, x, y), _window, cx| {
+                                    this.open_tab_context_menu(tab_id, x, y, cx);
+                                }))
+                                .on_new_tab(cx.listener(|this, _ev, window, cx| {
+                                    this.create_tab(window, cx);
+                                }))
+                                .on_toggle_sidebar(cx.listener(|this, _ev, window, cx| {
+                                    this.toggle_tab_sidebar(window, cx);
+                                }))
+                        )
+                    })
+                    .child(
+                        div()
+                            .relative()
+                            .track_focus(&self.focus_handle)
+                            .key_context("RootView")
+                            .on_key_down(cx.listener(Self::handle_key_down))
+                            .on_scroll_wheel(cx.listener(Self::handle_scroll))
+                            .on_mouse_move(cx.listener(Self::handle_mouse_move))
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
+                            .on_mouse_down(MouseButton::Right, cx.listener(Self::handle_mouse_down))
+                            .on_mouse_down(MouseButton::Middle, cx.listener(Self::handle_mouse_down))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
+                            .on_mouse_up(MouseButton::Right, cx.listener(Self::handle_mouse_up))
+                            .on_mouse_up(MouseButton::Middle, cx.listener(Self::handle_mouse_up))
+                            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _window, cx| {
+                                if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
+                                    if let Some(ref terminal) = active_tab.terminal {
+                                        crate::paste::handle_dropped_paths(terminal, paths.paths());
+                                        cx.notify();
+                                    }
+                                }
+                            }))
+                            .flex()
+                            .flex_1()
+                            .flex_col()
+                            .h_full()
+                            .pl(px(1.))
+                            .bg(self.theme.main_bg)
+                            .font_family(font_family.clone())
+                            .text_size(px(font_size))
+                            .font_features(enable_terminal_ligatures())
+                            .overflow_hidden()
+                            .child(super::ime::registration(cx.entity(), self.focus_handle.clone()))
+                            .child(terminal_area),
+                    )
             )
             .child(
                 StatusBar::new(left_segs, right_segs, fallback_info, theme)

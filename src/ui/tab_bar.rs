@@ -1,7 +1,8 @@
 use gpui::{
     App, ClickEvent, CursorStyle, FontWeight, IntoElement, MouseButton, MouseDownEvent, RenderOnce,
-    SharedString, Window, div, prelude::*, px,
+    ScrollHandle, SharedString, Window, div, prelude::*, px,
 };
+use crate::config::TabLayout;
 use super::theme::Theme;
 
 #[derive(Clone, Debug)]
@@ -16,12 +17,15 @@ pub struct TabItem {
 pub struct TabBar {
     tabs: Vec<TabItem>,
     theme: Theme,
+    layout: TabLayout,
+    sidebar_open: bool,
     on_select_tab: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
     on_close_tab: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
     on_rename_tab: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
     on_tab_context_menu: Option<Box<dyn Fn(&(usize, f32, f32), &mut Window, &mut App) + 'static>>,
     on_new_tab: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_logo_context_menu: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>,
+    on_toggle_sidebar: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     update_available: Option<String>,
     is_updating: bool,
     on_update: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
@@ -32,16 +36,37 @@ impl TabBar {
         Self {
             tabs,
             theme,
+            layout: TabLayout::Horizontal,
+            sidebar_open: true,
             on_select_tab: None,
             on_close_tab: None,
             on_rename_tab: None,
             on_tab_context_menu: None,
             on_new_tab: None,
             on_logo_context_menu: None,
+            on_toggle_sidebar: None,
             update_available: None,
             is_updating: false,
             on_update: None,
         }
+    }
+
+    pub fn layout(mut self, layout: TabLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    pub fn sidebar_open(mut self, open: bool) -> Self {
+        self.sidebar_open = open;
+        self
+    }
+
+    pub fn on_toggle_sidebar(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_toggle_sidebar = Some(Box::new(handler));
+        self
     }
 
     pub fn on_select_tab(
@@ -118,7 +143,8 @@ impl RenderOnce for TabBar {
         let btn_hover_bg = theme.hover;
         let btn_default_bg = theme.surface;
 
-        let show_tabs = self.tabs.len() > 1;
+        let is_vertical = self.layout == TabLayout::Vertical;
+        let show_tabs = !is_vertical && self.tabs.len() > 1;
 
         // macOS: traffic lights are OS-owned on the left.
         // Logo + gear live on the right. Tabs start at ~76 px.
@@ -135,6 +161,26 @@ impl RenderOnce for TabBar {
                 .bg(theme.tab_bar_bg)
                 .px(px(8.))
                 .pl(left_padding)
+                .when(is_vertical, |this| {
+                    this.child(
+                        div()
+                            .id("mac-sidebar-toggle-btn")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(24.))
+                            .h(px(22.))
+                            .rounded(px(4.))
+                            .bg(if self.sidebar_open { theme.surface_raised } else { theme.surface })
+                            .hover(move |s| s.bg(btn_hover_bg))
+                            .cursor(CursorStyle::PointingHand)
+                            .when_some(self.on_toggle_sidebar, |this, on_click| this.on_click(on_click))
+                            .child(super::icons::render_sidebar_icon(
+                                if self.sidebar_open { theme.accent } else { theme.muted_strong },
+                                13.0,
+                            )),
+                    )
+                })
                 .when(show_tabs, |this| {
                     this.child(render_tab_strip(
                         self.tabs,
@@ -148,7 +194,19 @@ impl RenderOnce for TabBar {
                         btn_default_bg,
                     ))
                 })
-                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("mac-tab-bar-drag-spacer")
+                        .flex_1()
+                        .h_full()
+                        .on_mouse_down(MouseButton::Left, |ev, window, _cx| {
+                            if ev.click_count == 2 {
+                                window.zoom_window();
+                            } else {
+                                window.start_window_move();
+                            }
+                        }),
+                )
                 .child(
                     div()
                         .flex()
@@ -194,13 +252,6 @@ impl RenderOnce for TabBar {
                 .h(px(32.))
                 .w_full()
                 .bg(theme.tab_bar_bg)
-                .on_mouse_down(MouseButton::Left, |ev, window, _cx| {
-                    if ev.click_count == 2 {
-                        window.zoom_window();
-                    } else {
-                        window.start_window_move();
-                    }
-                })
                 .child(
                     div()
                         .flex()
@@ -224,6 +275,26 @@ impl RenderOnce for TabBar {
                                 })
                                 .child(super::icons::render_app_logo(15.0)),
                         )
+                        .when(is_vertical, |this| {
+                            this.child(
+                                div()
+                                    .id("win-sidebar-toggle-btn")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(24.))
+                                    .h(px(22.))
+                                    .rounded(px(4.))
+                                    .bg(if self.sidebar_open { theme.surface_raised } else { theme.surface })
+                                    .hover(move |s| s.bg(btn_hover_bg))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .when_some(self.on_toggle_sidebar, |this, on_click| this.on_click(on_click))
+                                    .child(super::icons::render_sidebar_icon(
+                                        if self.sidebar_open { theme.accent } else { theme.muted_strong },
+                                        13.0,
+                                    )),
+                            )
+                        })
                         .when(show_tabs, |this| {
                             this.child(render_tab_strip(
                                 self.tabs,
@@ -279,6 +350,276 @@ impl RenderOnce for TabBar {
                         .child(render_close_btn(theme)),
                 )
         }
+    }
+}
+
+#[derive(IntoElement)]
+pub struct TabSidebar {
+    tabs: Vec<TabItem>,
+    theme: Theme,
+    anim_progress: f32,
+    scroll_handle: ScrollHandle,
+    on_select_tab: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
+    on_close_tab: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
+    on_rename_tab: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
+    on_tab_context_menu: Option<Box<dyn Fn(&(usize, f32, f32), &mut Window, &mut App) + 'static>>,
+    on_new_tab: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    on_toggle_sidebar: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+}
+
+impl TabSidebar {
+    pub fn new(tabs: Vec<TabItem>, theme: Theme, anim_progress: f32, scroll_handle: ScrollHandle) -> Self {
+        Self {
+            tabs,
+            theme,
+            anim_progress,
+            scroll_handle,
+            on_select_tab: None,
+            on_close_tab: None,
+            on_rename_tab: None,
+            on_tab_context_menu: None,
+            on_new_tab: None,
+            on_toggle_sidebar: None,
+        }
+    }
+
+    pub fn on_select_tab(
+        mut self,
+        handler: impl Fn(&usize, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_select_tab = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_close_tab(
+        mut self,
+        handler: impl Fn(&usize, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_close_tab = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_rename_tab(
+        mut self,
+        handler: impl Fn(&usize, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_rename_tab = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_tab_context_menu(
+        mut self,
+        handler: impl Fn(&(usize, f32, f32), &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_tab_context_menu = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_new_tab(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_new_tab = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_toggle_sidebar(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_toggle_sidebar = Some(Box::new(handler));
+        self
+    }
+}
+
+impl RenderOnce for TabSidebar {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let theme = self.theme;
+        let anim = self.anim_progress.clamp(0.0, 1.0);
+        let current_w = (210.0 * anim).round();
+
+        if current_w <= 0.5 {
+            return div().id("vertical-tab-sidebar-collapsed").w(px(0.0)).h_full().overflow_hidden();
+        }
+
+        let on_select = self.on_select_tab.map(std::rc::Rc::new);
+        let on_close = self.on_close_tab.map(std::rc::Rc::new);
+        let on_rename = self.on_rename_tab.map(std::rc::Rc::new);
+        let on_tab_context = self.on_tab_context_menu.map(std::rc::Rc::new);
+        let btn_hover_bg = theme.hover;
+        let tab_count = self.tabs.len();
+
+        div()
+            .id("vertical-tab-sidebar")
+            .w(px(current_w))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(theme.tab_bar_bg)
+            .border_r_1()
+            .border_color(theme.border)
+            .overflow_hidden()
+            .flex_shrink_0()
+            .child(
+                div()
+                    .w(px(210.0))
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        // Sidebar Header
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .h(px(34.))
+                            .px(px(10.))
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(theme.muted_strong)
+                                            .child("TABS"),
+                                    )
+                                    .child(
+                                        div()
+                                            .px(px(5.))
+                                            .py(px(1.))
+                                            .rounded(px(4.))
+                                            .bg(theme.surface_raised)
+                                            .text_size(px(9.5))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(theme.muted)
+                                            .child(format!("{tab_count}")),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("sidebar-new-tab-btn")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(22.))
+                                    .h(px(22.))
+                                    .rounded(px(4.))
+                                    .bg(theme.surface)
+                                    .hover(move |s| s.bg(btn_hover_bg))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .when_some(self.on_new_tab, |this, on_click| this.on_click(on_click))
+                                    .child(super::icons::render_icon(
+                                        icons::common::IconType::Plus,
+                                        theme.accent,
+                                        12.0,
+                                    )),
+                            ),
+                    )
+                    .child(
+                        // Vertical tabs scrollable list
+                        div()
+                            .id("vertical-tabs-scroll-list")
+                            .track_scroll(&self.scroll_handle)
+                            .flex_1()
+                            .overflow_y_scroll()
+                            .p(px(6.))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .children(self.tabs.into_iter().map(|tab| {
+                                let tab_id = tab.id;
+                                let is_active = tab.active;
+                                let on_select_clone = on_select.clone();
+                                let on_close_clone = on_close.clone();
+                                let on_rename_clone = on_rename.clone();
+                                let on_tab_context_clone = on_tab_context.clone();
+
+                                let (bg, fg) = if is_active {
+                                    (theme.surface_raised, theme.foreground)
+                                } else {
+                                    (gpui::transparent_black(), theme.muted_strong)
+                                };
+
+                                div()
+                                    .id(SharedString::from(format!("vert-tab-{}", tab_id)))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .h(px(30.))
+                                    .px(px(8.))
+                                    .rounded(px(6.))
+                                    .bg(bg)
+                                    .hover(move |s| if !is_active { s.bg(btn_hover_bg) } else { s })
+                                    .text_size(px(11.5))
+                                    .font_weight(if is_active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                                    .text_color(fg)
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                                        if ev.click_count >= 2 {
+                                            if let Some(ref rcb) = on_rename_clone {
+                                                rcb(&tab_id, window, cx);
+                                            }
+                                        } else if let Some(ref cb) = on_select_clone {
+                                            cb(&tab_id, window, cx);
+                                        }
+                                    })
+                                    .on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+                                        if let Some(ref cm_cb) = on_tab_context_clone {
+                                            let x = ev.position.x.to_f64() as f32;
+                                            let y = ev.position.y.to_f64() as f32;
+                                            cm_cb(&(tab_id, x, y), window, cx);
+                                        }
+                                    })
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_2()
+                                            .overflow_hidden()
+                                            .flex_1()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .overflow_hidden()
+                                                    .text_ellipsis()
+                                                    .child(SharedString::from(tab.title)),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("vert-tab-close-{}", tab_id)))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .w(px(16.))
+                                            .h(px(16.))
+                                            .rounded(px(3.))
+                                            .hover(move |s| s.bg(btn_hover_bg))
+                                            .text_size(px(10.))
+                                            .text_color(theme.muted)
+                                            .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                                if let Some(ref cb) = on_close_clone {
+                                                    cb(&tab_id, window, cx);
+                                                }
+                                            })
+                                            .child(super::icons::render_icon(
+                                                icons::common::IconType::X,
+                                                theme.muted,
+                                                10.0,
+                                            )),
+                                    )
+                            })),
+                    ),
+            )
     }
 }
 
@@ -352,16 +693,9 @@ fn render_tab_strip(
                 })
                 .child(
                     div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
                         .overflow_hidden()
-                        .child(
-                            div()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .child(SharedString::from(tab.title)),
-                        ),
+                        .text_ellipsis()
+                        .child(SharedString::from(tab.title)),
                 )
                 .child(
                     div()

@@ -1,6 +1,6 @@
 use gpui::{
     Context, CursorStyle, FontWeight, KeyDownEvent, MouseButton, Render, ScrollHandle,
-    Window, WindowHandle, div, prelude::*, px,
+    SharedString, Window, WindowHandle, div, prelude::*, px,
 };
 use icons::common::IconType;
 use parking_lot::Mutex;
@@ -11,6 +11,51 @@ use crate::ui::theme::Theme;
 
 pub static SETTINGS_WINDOW_HANDLE: Mutex<Option<WindowHandle<SettingsView>>> = Mutex::new(None);
 
+#[derive(Clone)]
+pub struct ThemeCardInfo {
+    pub name: String,
+    pub label: String,
+    pub bg_color: gpui::Hsla,
+    pub surf_color: gpui::Hsla,
+    pub acc_color: gpui::Hsla,
+}
+
+fn filter_programming_fonts(all_fonts: Vec<String>, current_font: &str) -> Vec<String> {
+    let coding_keywords = [
+        "mono", "code", "typewriter", "console", "courier", "hack", "menlo", "monaco",
+        "consolas", "inconsolata", "fira", "jetbrains", "cascadia", "meslo", "source", "dejavu",
+    ];
+
+    let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    if !current_font.is_empty() {
+        result.push(current_font.to_string());
+        seen.insert(current_font.to_lowercase());
+    }
+
+    for font in all_fonts {
+        let lower = font.to_lowercase();
+        let matches = coding_keywords.iter().any(|k| lower.contains(k));
+        if matches && !seen.contains(&lower) {
+            seen.insert(lower);
+            result.push(font);
+        }
+    }
+
+    if result.is_empty() {
+        result = vec![
+            "Menlo".to_string(),
+            "Monaco".to_string(),
+            "Courier New".to_string(),
+            "Fira Code".to_string(),
+            "JetBrains Mono".to_string(),
+        ];
+    }
+
+    result
+}
+
 pub struct SettingsView {
     pub config: Config,
     pub theme: Theme,
@@ -20,10 +65,11 @@ pub struct SettingsView {
     pub opacity: f32,
     pub cursor_blink: bool,
     pub copy_on_select: bool,
+    pub tab_layout: crate::config::TabLayout,
     pub focus_handle: gpui::FocusHandle,
-    pub font_scroll_handle: ScrollHandle,
     pub window_scroll_handle: ScrollHandle,
     pub system_fonts: Vec<String>,
+    pub theme_cards: Vec<ThemeCardInfo>,
 }
 
 impl SettingsView {
@@ -32,6 +78,7 @@ impl SettingsView {
         let loaded_config = Config::load().unwrap_or_default();
         let theme_name = loaded_config.theme.as_deref().unwrap_or("default").to_string();
         let theme = Theme::from_name(&theme_name).with_opacity(loaded_config.opacity);
+        let tab_layout = loaded_config.tab_layout;
 
         let font_size = loaded_config.font.size;
         let font_family = if loaded_config.font.family.is_empty() || loaded_config.font.family == "monospace" {
@@ -53,21 +100,45 @@ impl SettingsView {
 
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
-        let system_fonts = available_system_fonts();
+        let raw_fonts = available_system_fonts();
+        let system_fonts = filter_programming_fonts(raw_fonts, &font_family);
+
+        let theme_cards: Vec<ThemeCardInfo> = crate::config::all_theme_names()
+            .into_iter()
+            .map(|name| {
+                let t = Theme::from_name(&name);
+                let label = match name.as_str() {
+                    "default" => "Fastty Default".to_string(),
+                    "catppuccin" => "Catppuccin Mocha".to_string(),
+                    "one-dark" => "One Dark Pro".to_string(),
+                    "solarized-dark" => "Solarized Dark".to_string(),
+                    "high-contrast" => "High Contrast".to_string(),
+                    other => other.to_string(),
+                };
+                ThemeCardInfo {
+                    name,
+                    label,
+                    bg_color: t.background,
+                    surf_color: t.surface_raised,
+                    acc_color: t.accent,
+                }
+            })
+            .collect();
 
         Self {
             opacity: loaded_config.opacity,
             cursor_blink: loaded_config.cursor.blink,
             copy_on_select: loaded_config.copy_on_select,
+            tab_layout,
             config: loaded_config,
             theme,
             current_theme_name: theme_name,
             font_size,
             font_family,
             focus_handle,
-            font_scroll_handle: ScrollHandle::new(),
             window_scroll_handle: ScrollHandle::new(),
             system_fonts,
+            theme_cards,
         }
     }
 
@@ -128,6 +199,14 @@ impl SettingsView {
         cx.notify();
     }
 
+    pub fn set_tab_layout(&mut self, layout: crate::config::TabLayout, cx: &mut Context<Self>) {
+        self.tab_layout = layout;
+        self.config.tab_layout = layout;
+        let _ = self.config.save_default();
+        crate::config::increment_config_version();
+        cx.notify();
+    }
+
     pub fn open_settings_file() {
         let path = crate::config::Config::get_active_config_path();
         if let Some(parent) = path.parent() {
@@ -148,6 +227,29 @@ impl SettingsView {
     }
 }
 
+fn render_toggle_switch(is_on: bool, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(if is_on { "toggle-on" } else { "toggle-off" })
+        .flex()
+        .items_center()
+        .w(px(38.))
+        .h(px(22.))
+        .rounded_full()
+        .bg(if is_on { theme.accent } else { theme.surface })
+        .border_1()
+        .border_color(if is_on { theme.accent } else { theme.border })
+        .p(px(2.))
+        .cursor(CursorStyle::PointingHand)
+        .child(
+            div()
+                .w(px(16.))
+                .h(px(16.))
+                .rounded_full()
+                .bg(if is_on { theme.black } else { theme.muted })
+                .when(is_on, |this| this.ml(px(16.))),
+        )
+}
+
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
@@ -166,58 +268,94 @@ impl Render for SettingsView {
             // Topbar
             .child(
                 div()
+                    .id("settings-topbar")
                     .flex()
                     .flex_row()
                     .items_center()
                     .justify_between()
-                    .h(px(38.))
+                    .h(px(32.))
                     .w_full()
                     .bg(theme.tab_bar_bg)
                     .border_b_1()
                     .border_color(theme.border)
-                    .when(cfg!(target_os = "macos"), |d| d.pl(px(76.)).pr(px(14.)))
-                    .when(!cfg!(target_os = "macos"), |d| d.px(px(12.)))
-                    .on_mouse_down(MouseButton::Left, |ev, window, _cx| {
-                        if ev.click_count == 2 {
-                            window.zoom_window();
-                        } else {
-                            window.start_window_move();
-                        }
-                    })
+                    .when(cfg!(target_os = "macos"), |d| d.pl(px(76.)).pr(px(12.)))
+                    .when(!cfg!(target_os = "macos"), |d| d.pl(px(10.)).pr(px(8.)))
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(render_app_logo(16.0))
+                            .when(!cfg!(target_os = "macos"), |this| {
+                                this.child(render_app_logo(15.0))
+                            })
                             .child(
                                 div()
-                                    .text_size(px(13.))
+                                    .text_size(px(12.))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(theme.foreground)
                                     .child("Settings"),
+                            )
+                            .child(
+                                div()
+                                    .px(px(5.))
+                                    .py(px(1.))
+                                    .rounded(px(4.))
+                                    .bg(theme.surface_raised)
+                                    .text_size(px(9.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.muted)
+                                    .child("v0.7.1"),
                             ),
                     )
-                    .when(!cfg!(target_os = "macos"), |this| {
-                        this.child(
-                            div()
-                                .id("settings-win-close")
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .w(px(28.))
-                                .h(px(22.))
-                                .rounded(px(4.))
-                                .hover(move |s| s.bg(gpui::Hsla { h: 0.0, s: 0.7, l: 0.45, a: 1.0 }))
-                                .cursor(CursorStyle::PointingHand)
-                                .on_mouse_down(MouseButton::Left, |_ev, window, _cx| {
-                                    *SETTINGS_WINDOW_HANDLE.lock() = None;
-                                    window.remove_window();
-                                })
-                                .child(render_icon(IconType::X, theme.foreground, 10.0)),
-                        )
-                    }),
+                    .child(
+                        div()
+                            .id("settings-drag-spacer")
+                            .flex_1()
+                            .h_full()
+                            .on_mouse_down(MouseButton::Left, |ev, window, _cx| {
+                                if ev.click_count == 2 {
+                                    window.zoom_window();
+                                } else {
+                                    window.start_window_move();
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2p5()
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(theme.muted)
+                                    .child("Press Esc to close"),
+                            )
+                            .when(cfg!(target_os = "macos"), |this| {
+                                this.child(render_app_logo(15.0))
+                            })
+                            .when(!cfg!(target_os = "macos"), |this| {
+                                this.child(
+                                    div()
+                                        .id("settings-win-close")
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .w(px(26.))
+                                        .h(px(22.))
+                                        .rounded(px(4.))
+                                        .hover(move |s| s.bg(gpui::Hsla { h: 0.0, s: 0.7, l: 0.45, a: 1.0 }))
+                                        .cursor(CursorStyle::PointingHand)
+                                        .on_mouse_down(MouseButton::Left, |_ev, window, _cx| {
+                                            *SETTINGS_WINDOW_HANDLE.lock() = None;
+                                            window.remove_window();
+                                        })
+                                        .child(render_icon(IconType::X, theme.foreground, 10.0)),
+                                )
+                            }),
+                    ),
             )
             // Scrollable Content
             .child(
@@ -226,223 +364,399 @@ impl Render for SettingsView {
                     .track_scroll(&self.window_scroll_handle)
                     .flex_1()
                     .overflow_y_scroll()
-                    .p(px(20.))
+                    .p(px(24.))
                     .flex()
                     .flex_col()
-                    .gap_5()
-                    // 1. Theme Section
+                    .gap_6()
+                    // 1. Tab Bar Layout Card Section
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(theme.muted_strong)
-                                    .child("THEME"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .flex_wrap()
-                                    .gap_1p5()
-                                    .children(
-                                        crate::config::all_theme_names().into_iter().map(|name| {
-                                            let is_active = self.current_theme_name == name;
-                                            let theme_name_str = name.clone();
-                                            let label = match name.as_str() {
-                                                "default" => "Default".to_string(),
-                                                "catppuccin" => "Catppuccin".to_string(),
-                                                "one-dark" => "One Dark".to_string(),
-                                                "solarized-dark" => "Solarized".to_string(),
-                                                "high-contrast" => "High Contrast".to_string(),
-                                                other => other.to_string(),
-                                            };
-                                            div()
-                                                .px(px(10.))
-                                                .py(px(5.))
-                                                .rounded(px(6.))
-                                                .bg(if is_active { theme.accent } else { theme.surface_raised })
-                                                .border_1()
-                                                .border_color(if is_active { theme.accent } else { theme.border })
-                                                .text_color(if is_active { theme.black } else { theme.foreground })
-                                                .text_size(px(11.5))
-                                                .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::NORMAL })
-                                                .cursor(CursorStyle::PointingHand)
-                                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                                    this.set_theme(&theme_name_str, cx);
-                                                }))
-                                                .child(label)
-                                        }),
-                                    ),
-                            ),
-                    )
-                    // 2. Font Size Section
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .p(px(12.))
-                            .rounded(px(8.))
-                            .bg(theme.surface_raised)
-                            .border_1()
-                            .border_color(theme.border)
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(theme.muted_strong)
-                                            .child("FONT SIZE"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .text_color(theme.muted)
-                                            .child("Terminal buffer font size in pixels"),
-                                    ),
-                            )
+                            .gap_2p5()
                             .child(
                                 div()
                                     .flex()
                                     .flex_row()
                                     .items_center()
                                     .gap_2()
-                                    .child(
-                                        div()
-                                            .w(px(26.))
-                                            .h(px(26.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded(px(5.))
-                                            .bg(theme.surface)
-                                            .hover(|s| s.bg(theme.hover))
-                                            .border_1()
-                                            .border_color(theme.border)
-                                            .text_color(theme.foreground)
-                                            .font_weight(FontWeight::BOLD)
-                                            .cursor(CursorStyle::PointingHand)
-                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                this.adjust_font_size(-1.0, cx);
-                                            }))
-                                            .child("−"),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w(px(40.))
-                                            .flex()
-                                            .justify_center()
-                                            .text_size(px(13.))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(theme.foreground)
-                                            .child(format!("{:.0}px", self.font_size)),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(26.))
-                                            .h(px(26.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded(px(5.))
-                                            .bg(theme.surface)
-                                            .hover(|s| s.bg(theme.hover))
-                                            .border_1()
-                                            .border_color(theme.border)
-                                            .text_color(theme.foreground)
-                                            .font_weight(FontWeight::BOLD)
-                                            .cursor(CursorStyle::PointingHand)
-                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                this.adjust_font_size(1.0, cx);
-                                            }))
-                                            .child("+"),
-                                    ),
-                            ),
-                    )
-                    // 3. Font Family Section
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
+                                    .child(render_icon(IconType::Folder, theme.accent, 12.0))
                                     .child(
                                         div()
                                             .text_size(px(11.))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(theme.muted_strong)
-                                            .child("FONT FAMILY"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(theme.accent)
-                                            .child(self.font_family.clone()),
+                                            .child("TAB BAR LAYOUT"),
                                     ),
                             )
                             .child(
                                 div()
-                                    .id("settings-font-family-list")
-                                    .track_scroll(&self.font_scroll_handle)
                                     .flex()
-                                    .flex_col()
-                                    .max_h(px(160.))
-                                    .overflow_y_scroll()
-                                    .p(px(4.))
-                                    .rounded(px(8.))
-                                    .bg(theme.surface_raised)
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .gap_1()
-                                    .on_scroll_wheel(|_ev, _window, cx| {
-                                        cx.stop_propagation();
-                                    })
-                                    .children(
-                                        self.system_fonts
-                                            .iter()
-                                            .map(|font_name| {
-                                                let is_active = self.font_family == *font_name;
-                                                let name_clone = font_name.clone();
+                                    .flex_row()
+                                    .gap_3()
+                                    .child({
+                                        let is_active = self.tab_layout == crate::config::TabLayout::Horizontal;
+                                        div()
+                                            .id("layout-horizontal-btn")
+                                            .flex_1()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .p(px(12.))
+                                            .rounded(px(8.))
+                                            .bg(if is_active { theme.surface_raised } else { theme.surface })
+                                            .border_1()
+                                            .border_color(if is_active { theme.accent } else { theme.border })
+                                            .hover(move |s| s.bg(theme.surface_raised))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                this.set_tab_layout(crate::config::TabLayout::Horizontal, cx);
+                                            }))
+                                            .child(
                                                 div()
                                                     .flex()
                                                     .flex_row()
                                                     .items_center()
                                                     .justify_between()
-                                                    .px(px(10.))
-                                                    .py(px(5.))
-                                                    .rounded(px(5.))
-                                                    .bg(if is_active { theme.accent } else { theme.surface })
-                                                    .hover(|s| if !is_active { s.bg(theme.hover) } else { s })
-                                                    .text_color(if is_active { theme.black } else { theme.foreground })
-                                                    .text_size(px(11.5))
-                                                    .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::NORMAL })
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                                        this.set_font_family(&name_clone, cx);
-                                                    }))
                                                     .child(
                                                         div()
-                                                            .flex_1()
-                                                            .overflow_hidden()
-                                                            .child(font_name.clone()),
+                                                            .text_size(px(12.))
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .text_color(if is_active { theme.foreground } else { theme.muted_strong })
+                                                            .child("Horizontal (Top Bar)"),
                                                     )
-                                                    .when(is_active, |el| el.child(render_icon(IconType::Check, theme.black, 12.0)))
-                                            }),
+                                                    .when(is_active, |this| {
+                                                        this.child(render_icon(IconType::Check, theme.accent, 13.0))
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .text_color(theme.muted)
+                                                    .child("Tabs rendered horizontally at window top"),
+                                            )
+                                    })
+                                    .child({
+                                        let is_active = self.tab_layout == crate::config::TabLayout::Vertical;
+                                        div()
+                                            .id("layout-vertical-btn")
+                                            .flex_1()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .p(px(12.))
+                                            .rounded(px(8.))
+                                            .bg(if is_active { theme.surface_raised } else { theme.surface })
+                                            .border_1()
+                                            .border_color(if is_active { theme.accent } else { theme.border })
+                                            .hover(move |s| s.bg(theme.surface_raised))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                this.set_tab_layout(crate::config::TabLayout::Vertical, cx);
+                                            }))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .flex_row()
+                                                            .items_center()
+                                                            .gap_2()
+                                                            .child(super::icons::render_sidebar_icon(if is_active { theme.accent } else { theme.muted_strong }, 13.0))
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(12.))
+                                                                    .font_weight(FontWeight::BOLD)
+                                                                    .text_color(if is_active { theme.foreground } else { theme.muted_strong })
+                                                                    .child("Vertical (Sidebar)"),
+                                                            ),
+                                                    )
+                                                    .when(is_active, |this| {
+                                                        this.child(render_icon(IconType::Check, theme.accent, 13.0))
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .text_color(theme.muted)
+                                                    .child("Zed-style animated collapsible tab sidebar"),
+                                            )
+                                    }),
+                            ),
+                    )
+                    // 2. Theme Section with Swatches
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2p5()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(render_icon(IconType::Palette, theme.accent, 12.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(theme.muted_strong)
+                                            .child("COLOR THEME"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .flex_wrap()
+                                    .gap_2()
+                                    .children(
+                                        self.theme_cards.iter().map(|card| {
+                                            let is_active = self.current_theme_name == card.name;
+                                            let theme_name_str = card.name.clone();
+                                            let bg_color = card.bg_color;
+                                            let surf_color = card.surf_color;
+                                            let acc_color = card.acc_color;
+                                            let label = card.label.clone();
+                                            div()
+                                                .id(SharedString::from(format!("theme-card-{}", card.name)))
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .justify_between()
+                                                .px(px(12.))
+                                                .py(px(8.))
+                                                .rounded(px(8.))
+                                                .bg(if is_active { theme.surface_raised } else { theme.surface })
+                                                .border_1()
+                                                .border_color(if is_active { theme.accent } else { theme.border })
+                                                .hover(move |s| s.bg(theme.surface_raised))
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                                    this.set_theme(&theme_name_str, cx);
+                                                }))
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap_2p5()
+                                                        .child(
+                                                            div()
+                                                                .flex()
+                                                                .flex_row()
+                                                                .items_center()
+                                                                .gap_1()
+                                                                .p(px(2.))
+                                                                .rounded(px(4.))
+                                                                .bg(bg_color)
+                                                                .border_1()
+                                                                .border_color(surf_color)
+                                                                .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(bg_color))
+                                                                .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(surf_color))
+                                                                .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(acc_color)),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(11.5))
+                                                                .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                                                .text_color(if is_active { theme.foreground } else { theme.muted_strong })
+                                                                .child(label),
+                                                        ),
+                                                )
+                                                .when(is_active, |this| {
+                                                    this.child(render_icon(IconType::Check, theme.accent, 12.0))
+                                                })
+                                        }),
+                                    ),
+                            ),
+                    )
+                    // 3. Typography Card (Font Size & Font Family)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2p5()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(render_icon(IconType::FileCode, theme.accent, 12.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(theme.muted_strong)
+                                            .child("TYPOGRAPHY"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_3()
+                                    .p(px(14.))
+                                    .rounded(px(8.))
+                                    .bg(theme.surface_raised)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    // Font Size Stepper
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .justify_between()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(12.))
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .text_color(theme.foreground)
+                                                            .child("Font Size"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(11.))
+                                                            .text_color(theme.muted)
+                                                            .child("Terminal buffer grid cell size"),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .w(px(28.))
+                                                            .h(px(28.))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .rounded(px(6.))
+                                                            .bg(theme.surface)
+                                                            .hover(|s| s.bg(theme.hover))
+                                                            .border_1()
+                                                            .border_color(theme.border)
+                                                            .text_color(theme.foreground)
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                                this.adjust_font_size(-1.0, cx);
+                                                            }))
+                                                            .child("−"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .min_w(px(46.))
+                                                            .flex()
+                                                            .justify_center()
+                                                            .text_size(px(13.))
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .text_color(theme.accent)
+                                                            .child(format!("{:.0}px", self.font_size)),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w(px(28.))
+                                                            .h(px(28.))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .rounded(px(6.))
+                                                            .bg(theme.surface)
+                                                            .hover(|s| s.bg(theme.hover))
+                                                            .border_1()
+                                                            .border_color(theme.border)
+                                                            .text_color(theme.foreground)
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                                this.adjust_font_size(1.0, cx);
+                                                            }))
+                                                            .child("+"),
+                                                    ),
+                                            ),
+                                    )
+                                    // Font Family List
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(12.))
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .text_color(theme.foreground)
+                                                            .child("Font Family"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .px(px(6.))
+                                                            .py(px(1.5))
+                                                            .rounded(px(4.))
+                                                            .bg(theme.surface)
+                                                            .text_size(px(10.5))
+                                                            .font_weight(FontWeight::MEDIUM)
+                                                            .text_color(theme.accent)
+                                                            .child(self.font_family.clone()),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .flex_wrap()
+                                                    .gap_1p5()
+                                                    .children(
+                                                        self.system_fonts
+                                                            .iter()
+                                                            .map(|font_name| {
+                                                                let is_active = self.font_family == *font_name;
+                                                                let name_clone = font_name.clone();
+                                                                div()
+                                                                    .flex()
+                                                                    .flex_row()
+                                                                    .items_center()
+                                                                    .gap_1p5()
+                                                                    .px(px(8.))
+                                                                    .py(px(5.))
+                                                                    .rounded(px(5.))
+                                                                    .bg(if is_active { theme.surface_raised } else { theme.surface })
+                                                                    .border_1()
+                                                                    .border_color(if is_active { theme.accent } else { theme.border })
+                                                                    .hover(move |s| s.bg(theme.surface_raised))
+                                                                    .text_color(if is_active { theme.foreground } else { theme.muted_strong })
+                                                                    .text_size(px(11.))
+                                                                    .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                                                    .cursor(CursorStyle::PointingHand)
+                                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                                                        this.set_font_family(&name_clone, cx);
+                                                                    }))
+                                                                    .child(font_name.clone())
+                                                                    .when(is_active, |el| el.child(render_icon(IconType::Check, theme.accent, 11.0)))
+                                                            }),
+                                                    ),
+                                            ),
                                     ),
                             ),
                     )
@@ -451,20 +765,28 @@ impl Render for SettingsView {
                         div()
                             .flex()
                             .flex_col()
-                            .gap_2()
+                            .gap_2p5()
                             .child(
                                 div()
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(theme.muted_strong)
-                                    .child("WINDOW & BEHAVIOR"),
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(render_icon(IconType::Settings, theme.accent, 12.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(theme.muted_strong)
+                                            .child("WINDOW & BEHAVIOR"),
+                                    ),
                             )
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .gap_2()
-                                    .p(px(12.))
+                                    .gap_3()
+                                    .p(px(14.))
                                     .rounded(px(8.))
                                     .bg(theme.surface_raised)
                                     .border_1()
@@ -478,26 +800,38 @@ impl Render for SettingsView {
                                             .justify_between()
                                             .child(
                                                 div()
-                                                    .text_size(px(11.5))
-                                                    .text_color(theme.foreground)
-                                                    .child("Window Opacity"),
+                                                    .flex()
+                                                    .flex_col()
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(12.))
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .text_color(theme.foreground)
+                                                            .child("Window Opacity"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(11.))
+                                                            .text_color(theme.muted)
+                                                            .child("Background transparency level"),
+                                                    ),
                                             )
                                             .child(
                                                 div()
                                                     .flex()
                                                     .flex_row()
-                                                    .gap_1()
+                                                    .gap_1p5()
                                                     .children([1.0, 0.95, 0.90, 0.85, 0.75].into_iter().map(|val| {
                                                         let is_active = (self.opacity - val).abs() < 0.02;
                                                         let label = format!("{:.0}%", val * 100.0);
                                                         div()
-                                                            .px(px(6.))
-                                                            .py(px(2.))
-                                                            .rounded(px(4.))
+                                                            .px(px(8.))
+                                                            .py(px(4.))
+                                                            .rounded(px(5.))
                                                             .bg(if is_active { theme.accent } else { theme.surface })
                                                             .text_color(if is_active { theme.black } else { theme.foreground })
-                                                            .text_size(px(10.5))
-                                                            .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                                            .text_size(px(11.))
+                                                            .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
                                                             .cursor(CursorStyle::PointingHand)
                                                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
                                                                 this.adjust_opacity(val, cx);
@@ -515,24 +849,28 @@ impl Render for SettingsView {
                                             .justify_between()
                                             .child(
                                                 div()
-                                                    .text_size(px(11.5))
-                                                    .text_color(theme.foreground)
-                                                    .child("Cursor Blinking"),
+                                                    .flex()
+                                                    .flex_col()
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(12.))
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .text_color(theme.foreground)
+                                                            .child("Cursor Blinking"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(11.))
+                                                            .text_color(theme.muted)
+                                                            .child("Smooth animated terminal cursor blinking"),
+                                                    ),
                                             )
                                             .child(
                                                 div()
-                                                    .px(px(8.))
-                                                    .py(px(2.))
-                                                    .rounded(px(4.))
-                                                    .bg(if self.cursor_blink { theme.accent } else { theme.surface })
-                                                    .text_color(if self.cursor_blink { theme.black } else { theme.muted })
-                                                    .text_size(px(10.5))
-                                                    .font_weight(FontWeight::BOLD)
-                                                    .cursor(CursorStyle::PointingHand)
                                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                                                         this.toggle_cursor_blink(cx);
                                                     }))
-                                                    .child(if self.cursor_blink { "ON" } else { "OFF" }),
+                                                    .child(render_toggle_switch(self.cursor_blink, &theme)),
                                             ),
                                     )
                                     // Copy on select
@@ -544,24 +882,28 @@ impl Render for SettingsView {
                                             .justify_between()
                                             .child(
                                                 div()
-                                                    .text_size(px(11.5))
-                                                    .text_color(theme.foreground)
-                                                    .child("Copy on Select"),
+                                                    .flex()
+                                                    .flex_col()
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(12.))
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .text_color(theme.foreground)
+                                                            .child("Copy on Select"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(11.))
+                                                            .text_color(theme.muted)
+                                                            .child("Automatically copy text when selecting with mouse"),
+                                                    ),
                                             )
                                             .child(
                                                 div()
-                                                    .px(px(8.))
-                                                    .py(px(2.))
-                                                    .rounded(px(4.))
-                                                    .bg(if self.copy_on_select { theme.accent } else { theme.surface })
-                                                    .text_color(if self.copy_on_select { theme.black } else { theme.muted })
-                                                    .text_size(px(10.5))
-                                                    .font_weight(FontWeight::BOLD)
-                                                    .cursor(CursorStyle::PointingHand)
                                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                                                         this.toggle_copy_on_select(cx);
                                                     }))
-                                                    .child(if self.copy_on_select { "ON" } else { "OFF" }),
+                                                    .child(render_toggle_switch(self.copy_on_select, &theme)),
                                             ),
                                     ),
                             ),
@@ -571,47 +913,55 @@ impl Render for SettingsView {
                         div()
                             .flex()
                             .flex_row()
-                            .gap_2()
+                            .gap_3()
                             .child(
                                 div()
+                                    .id("edit-config-toml-btn")
                                     .flex_1()
                                     .flex()
+                                    .flex_row()
                                     .items_center()
                                     .justify_center()
-                                    .py(px(8.))
-                                    .rounded(px(6.))
+                                    .gap_2()
+                                    .py(px(10.))
+                                    .rounded(px(8.))
                                     .bg(theme.surface_raised)
                                     .hover(|s| s.bg(theme.hover))
                                     .border_1()
                                     .border_color(theme.border)
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::BOLD)
                                     .text_color(theme.foreground)
                                     .cursor(CursorStyle::PointingHand)
                                     .on_mouse_down(MouseButton::Left, |_ev, _window, _cx| {
                                         Self::open_settings_file();
                                     })
-                                    .child("Edit config.toml ↗"),
+                                    .child(render_icon(IconType::FileCode, theme.accent, 13.0))
+                                    .child("Edit fastty.toml ↗"),
                             )
                             .child(
                                 div()
+                                    .id("open-config-folder-btn")
                                     .flex_1()
                                     .flex()
+                                    .flex_row()
                                     .items_center()
                                     .justify_center()
-                                    .py(px(8.))
-                                    .rounded(px(6.))
+                                    .gap_2()
+                                    .py(px(10.))
+                                    .rounded(px(8.))
                                     .bg(theme.surface_raised)
                                     .hover(|s| s.bg(theme.hover))
                                     .border_1()
                                     .border_color(theme.border)
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::BOLD)
                                     .text_color(theme.foreground)
                                     .cursor(CursorStyle::PointingHand)
                                     .on_mouse_down(MouseButton::Left, |_ev, _window, _cx| {
                                         Self::open_config_folder();
                                     })
+                                    .child(render_icon(IconType::FolderOpen, theme.accent, 13.0))
                                     .child("Open Config Folder ↗"),
                             ),
                     ),

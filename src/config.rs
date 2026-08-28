@@ -185,6 +185,19 @@ pub fn try_get_custom_theme_full(name: &str) -> Option<[Option<(u8, u8, u8)>; 18
     Some(out)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TabLayout {
+    Horizontal,
+    Vertical,
+}
+
+impl Default for TabLayout {
+    fn default() -> Self {
+        TabLayout::Horizontal
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -209,6 +222,8 @@ pub struct Config {
     pub bottombar: BottombarConfig,
     #[serde(default)]
     pub cursor: CursorConfig,
+    #[serde(default)]
+    pub tab_layout: TabLayout,
     /// Treat the Option key as Alt (send `ESC` + key) instead of letting
     /// macOS compose the layout character. Mirrors zed's `option_as_meta`
     /// and ghostty's `macos-option-as-alt`; default is false so Option
@@ -393,6 +408,7 @@ impl Default for Config {
             notify_on_command_finish: default_notify_on_command_finish(),
             bottombar: BottombarConfig::default(),
             cursor: CursorConfig::default(),
+            tab_layout: TabLayout::default(),
             option_as_meta: default_option_as_meta(),
         }
     }
@@ -460,6 +476,11 @@ fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
     doc["scrollback"] = value(c.scrollback as i64);
     doc["opacity"] = value(c.opacity as f64);
     doc["option_as_meta"] = value(c.option_as_meta);
+    let tab_layout_str = match c.tab_layout {
+        TabLayout::Horizontal => "horizontal",
+        TabLayout::Vertical => "vertical",
+    };
+    doc["tab_layout"] = value(tab_layout_str);
     match &c.shell {
         Some(s) => doc["shell"] = value(s.as_str()),
         None => { doc.as_table_mut().remove("shell"); }
@@ -665,5 +686,17 @@ mod tests {
         assert_eq!(cfg.cursor.blink, false);
         assert_eq!(cfg.cursor.smooth, true);
         assert_eq!(cfg.cursor.animation_duration_ms, 120);
+    }
+
+    #[test]
+    fn test_tab_layout_config_toml_parsing() {
+        let toml_str = r#"
+            tab_layout = "vertical"
+        "#;
+        let cfg: Config = toml_edit::de::from_str(toml_str).unwrap();
+        assert_eq!(cfg.tab_layout, TabLayout::Vertical);
+
+        let serialized = config_to_toml_string(&cfg);
+        assert!(serialized.contains("tab_layout = \"vertical\""));
     }
 }
