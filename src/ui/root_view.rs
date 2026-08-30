@@ -898,6 +898,7 @@ pub struct RootView {
     pub scrollbar_drag_start_offset: usize,
     pub update_available: Option<crate::updater::ReleaseInfo>,
     pub is_updating: bool,
+    pub is_update_ready: bool,
     pub update_status: Option<String>,
     pub is_update_modal_open: bool,
     pub pressed_mouse_button: Option<MouseButton>,
@@ -1127,6 +1128,7 @@ impl RootView {
             update_available: None,
             is_updating: false,
             update_status: None,
+            is_update_ready: false,
             is_update_modal_open: false,
             pressed_mouse_button: None,
             ime_marked_text: None,
@@ -1728,20 +1730,18 @@ impl RootView {
 
     pub fn trigger_apply_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_updating {
+            self.is_update_modal_open = true;
+            cx.notify();
+            return;
+        }
+        if self.is_update_ready {
+            crate::updater::relaunch_fastty();
             return;
         }
         let Some(release) = self.update_available.clone() else {
             return;
         };
 
-        // Some install channels (a system package, Homebrew, an AppImage, or
-        // a system-wide Windows install) are owned by something other than
-        // Fastty's own updater. Overwriting their files in place would
-        // either fail outright (no permission) or silently desync that
-        // package manager's own record of what's installed. Point the user
-        // at the right update path instead of attempting it -- same idea as
-        // Zed's ZED_UPDATE_EXPLANATION and Ghostty leaving Linux updates to
-        // the distro's package manager.
         if let Some(reason) = release.self_update_blocked_reason.clone() {
             self.update_status = Some(format!(
                 "A new version (v{}) is available.\n\n{}\n\n{}",
@@ -1754,6 +1754,7 @@ impl RootView {
 
         self.is_updating = true;
         self.update_status = Some(format!("Downloading Fastty v{}...", release.version));
+        self.is_update_modal_open = true;
         cx.notify();
 
         let (result_tx, result_rx) = async_channel::unbounded::<Result<(), String>>();
@@ -1769,12 +1770,14 @@ impl RootView {
                     this.is_updating = false;
                     match res {
                         Ok(()) => {
-                            this.update_status = Some(format!("Fastty v{} installed successfully!\nPlease restart Fastty to use the new version.", release.version));
+                            this.is_update_ready = true;
+                            this.update_status = Some(format!("Fastty v{} installed successfully!\nRestart Fastty to use the new version.", release.version));
                             this.is_update_modal_open = true;
                             this.update_available = None;
                         }
                         Err(e) => {
-                            this.update_status = Some(format!("Update failed: {}", e));
+                            this.is_update_ready = false;
+                            this.update_status = Some(format!("Update failed:\n{}", e));
                             this.is_update_modal_open = true;
                         }
                     }
@@ -7395,22 +7398,57 @@ impl Render for RootView {
                                         .flex_row()
                                         .justify_end()
                                         .gap_2()
-                                        .child(
-                                            div()
-                                                .px(px(12.))
-                                                .py(px(5.))
-                                                .rounded(px(5.))
-                                                .bg(theme.accent)
-                                                .text_color(theme.black)
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_size(px(11.))
-                                                .cursor(CursorStyle::PointingHand)
-                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                    this.is_update_modal_open = false;
-                                                    cx.notify();
-                                                }))
-                                                .child("OK"),
-                                        ),
+                                        .when(self.is_update_ready, |el| {
+                                            el.child(
+                                                div()
+                                                    .px(px(12.))
+                                                    .py(px(5.))
+                                                    .rounded(px(5.))
+                                                    .bg(theme.surface_raised)
+                                                    .text_color(theme.foreground)
+                                                    .font_weight(FontWeight::NORMAL)
+                                                    .text_size(px(11.))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                        this.is_update_modal_open = false;
+                                                        cx.notify();
+                                                    }))
+                                                    .child("Later"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px(px(12.))
+                                                    .py(px(5.))
+                                                    .rounded(px(5.))
+                                                    .bg(theme.accent)
+                                                    .text_color(theme.black)
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_size(px(11.))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, |_ev, _window, _cx| {
+                                                        crate::updater::relaunch_fastty();
+                                                    })
+                                                    .child("Restart Now"),
+                                            )
+                                        })
+                                        .when(!self.is_update_ready, |el| {
+                                            el.child(
+                                                div()
+                                                    .px(px(12.))
+                                                    .py(px(5.))
+                                                    .rounded(px(5.))
+                                                    .bg(theme.accent)
+                                                    .text_color(theme.black)
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_size(px(11.))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                        this.is_update_modal_open = false;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(if self.is_updating { "Hide" } else { "OK" }),
+                                            )
+                                        }),
                                 ),
                         ),
                 )

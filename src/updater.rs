@@ -70,22 +70,7 @@ pub fn self_update_blocked_reason() -> Option<String> {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        // Homebrew Cask: brew keeps its own receipt of the installed
-        // version under the Caskroom. A DMG-drag install and a Cask install
-        // both land at the same /Applications/Fastty.app path, but only the
-        // Cask one has external state that self-replacing would desync.
-        for caskroom in ["/opt/homebrew/Caskroom/fastty", "/usr/local/Caskroom/fastty"] {
-            if std::path::Path::new(caskroom).exists() {
-                return Some(
-                    "Fastty was installed via Homebrew. Run `brew upgrade \
-                     --cask fastty` to update."
-                        .to_string(),
-                );
-            }
-        }
-    }
+
 
     #[cfg(target_os = "windows")]
     {
@@ -287,6 +272,10 @@ pub fn apply_update_sync(release: &ReleaseInfo) -> anyhow::Result<()> {
             anyhow::bail!("Failed to copy updated Fastty.app to {}", dest_app.display());
         }
 
+        let _ = std::process::Command::new("xattr")
+            .args(["-dr", "com.apple.quarantine", dest_app.to_str().unwrap()])
+            .status();
+
         let _ = std::fs::remove_dir_all(&backup_app);
         let _ = std::fs::remove_dir_all(&temp_dir);
 
@@ -368,4 +357,26 @@ pub fn apply_update_sync(release: &ReleaseInfo) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+pub fn relaunch_fastty() {
+    #[cfg(target_os = "macos")]
+    {
+        let mut dest_app = std::path::PathBuf::from("/Applications/Fastty.app");
+        if let Ok(current_exe) = std::env::current_exe() {
+            if let Some(parent) = current_exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+                if parent.extension().and_then(|e| e.to_str()) == Some("app") {
+                    dest_app = parent.to_path_buf();
+                }
+            }
+        }
+        let _ = std::process::Command::new("open").arg("-n").arg(dest_app).spawn();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Ok(current_exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(current_exe).spawn();
+        }
+    }
+    std::process::exit(0);
 }

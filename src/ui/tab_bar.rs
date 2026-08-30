@@ -29,7 +29,7 @@ pub struct TabBar {
     on_toggle_sidebar: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     update_available: Option<String>,
     is_updating: bool,
-    on_update: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    on_update: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>,
 }
 
 impl TabBar {
@@ -126,7 +126,7 @@ impl TabBar {
 
     pub fn on_update(
         mut self,
-        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_update = Some(Box::new(handler));
         self
@@ -141,6 +141,7 @@ impl RenderOnce for TabBar {
         let on_rename = self.on_rename_tab.map(std::rc::Rc::new);
         let on_tab_context = self.on_tab_context_menu.map(std::rc::Rc::new);
         let on_logo_context = self.on_logo_context_menu.map(std::rc::Rc::new);
+        let on_update = self.on_update.map(std::rc::Rc::new);
         let btn_hover_bg = theme.hover;
         let btn_default_bg = theme.surface;
 
@@ -220,7 +221,7 @@ impl RenderOnce for TabBar {
                                 version,
                                 self.is_updating,
                                 theme,
-                                self.on_update,
+                                on_update.clone(),
                             ))
                         })
                         .child(
@@ -333,7 +334,7 @@ impl RenderOnce for TabBar {
                                 version,
                                 self.is_updating,
                                 theme,
-                                self.on_update,
+                                on_update.clone(),
                             ))
                         })
                         .child(render_win_btn(
@@ -765,7 +766,7 @@ fn render_update_btn(
     version: String,
     is_updating: bool,
     theme: Theme,
-    on_update: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    on_update: Option<std::rc::Rc<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>>,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id("update-btn")
@@ -782,7 +783,12 @@ fn render_update_btn(
         .border_color(theme.green.opacity(0.4))
         .hover(move |s| s.bg(theme.green.opacity(0.25)).border_color(theme.green))
         .cursor(CursorStyle::PointingHand)
-        .when_some(on_update, |el, on_click| el.on_click(on_click))
+        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+            cx.stop_propagation();
+            if let Some(ref cb) = on_update {
+                cb(ev, window, cx);
+            }
+        })
         .child(super::icons::render_icon(
             icons::common::IconType::Download,
             theme.green,

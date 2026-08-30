@@ -15,6 +15,8 @@ cask "fastty" do
     strategy :github_latest
   end
 
+  auto_updates true
+
   app "Fastty.app"
 
   # Fastty is not (yet) signed/notarized by an Apple Developer ID, so a
