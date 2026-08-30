@@ -122,4 +122,27 @@ pub fn render_spinner(color: Hsla, size_px: f32) -> impl IntoElement {
         .flex_shrink_0()
 }
 
+pub fn get_deck_process_icon(process_name: &str) -> (IconType, &'static str) {
+    let lower = process_name.to_lowercase();
+    let base = std::path::Path::new(&lower)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&lower);
+
+    match base {
+        "nvim" | "vim" | "vi" | "nano" | "helix" | "hx" | "emacs" => (IconType::FileCode, "edit"),
+        "node" | "bun" | "deno" | "npm" | "pnpm" | "yarn" | "npx" | "ts-node" => (IconType::Code, "js"),
+        "cargo" | "rustc" | "rustup" => (IconType::Layers, "rust"),
+        "python" | "python3" | "py" | "ipython" | "uv" | "pip" => (IconType::Terminal, "py"),
+        "git" | "gh" | "lazygit" | "gitui" => (IconType::GitBranch, "git"),
+        "docker" | "docker-compose" | "podman" | "kubectl" | "k9s" | "helm" => (IconType::Server, "ops"),
+        "ssh" => (IconType::Server, "ssh"),
+        "go" => (IconType::Code, "go"),
+        "ruby" | "irb" | "rails" => (IconType::Code, "rb"),
+        "htop" | "btop" | "top" => (IconType::Cpu, "sys"),
+        "zsh" | "bash" | "fish" | "sh" => (IconType::Terminal, "sh"),
+        _ => (IconType::Terminal, "term"),
+    }
+}
+
 

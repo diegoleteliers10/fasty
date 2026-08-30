@@ -198,7 +198,7 @@ pub fn fetch_git_info(repo_path: &Path) -> Option<GitInfo> {
     let commit = head.peel_to_commit().ok()?;
     let hash = commit.id().to_string();
     let hash_short = if hash.len() >= 7 { hash[..7].to_string() } else { hash.clone() };
-    let summary = commit.summary().unwrap_or("").to_string();
+    let summary = commit.summary().ok().flatten().unwrap_or("").to_string();
     
     // Ahead/behind vs remote
     let (ahead, behind) = get_ahead_behind(&repo, &branch);
@@ -243,7 +243,7 @@ pub fn fetch_git_info(repo_path: &Path) -> Option<GitInfo> {
 
     let remote_url = repo.find_remote("origin")
         .ok()
-        .and_then(|r| r.url().map(|s| s.to_string()));
+        .and_then(|r| r.url().ok().map(|s| s.to_string()));
 
     Some(GitInfo {
         branch,

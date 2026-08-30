@@ -731,6 +731,18 @@ use icons::common::IconType;
 use super::icons::{render_app_logo, render_icon};
 
 #[derive(Clone, Debug)]
+pub struct GlobalSearchResult {
+    pub tab_idx: usize,
+    pub tab_id: usize,
+    pub tab_title: String,
+    pub process_name: Option<String>,
+    pub pane_id: usize,
+    pub offset: usize,
+    pub line_index: i32,
+    pub line_content: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct PaletteCommand {
     pub id: &'static str,
     pub icon: IconType,
@@ -739,9 +751,36 @@ pub struct PaletteCommand {
     pub shortcut: Option<&'static str>,
 }
 
+pub fn fuzzy_match_str(pattern: &str, target: &str) -> bool {
+    if pattern.is_empty() {
+        return true;
+    }
+    let p_lower = pattern.to_lowercase();
+    let t_lower = target.to_lowercase();
+    if t_lower.contains(&p_lower) {
+        return true;
+    }
+    let mut p_iter = p_lower.chars();
+    let mut curr_p = p_iter.next();
+    for ch in t_lower.chars() {
+        if let Some(p) = curr_p {
+            if ch == p {
+                curr_p = p_iter.next();
+            }
+        } else {
+            break;
+        }
+    }
+    curr_p.is_none()
+}
+
 pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
     let is_mac = cfg!(target_os = "macos");
     vec![
+        PaletteCommand { id: "tab_overview", icon: IconType::Layers, title: "Mission Control / Tab Peek Overview", category: "Navigation", shortcut: Some(if is_mac { "⌘⇧O" } else { "Ctrl+Shift+M" }) },
+        PaletteCommand { id: "global_search", icon: IconType::Search, title: "Find in All Tabs (Global Search)", category: "Terminal", shortcut: Some(if is_mac { "⌘⇧F" } else { "Ctrl+Shift+F" }) },
+        PaletteCommand { id: "save_session", icon: IconType::Folder, title: "Session: Save Current Workspace Snapshot", category: "Session", shortcut: None },
+        PaletteCommand { id: "restore_session", icon: IconType::RotateCcw, title: "Session: Attach / Restore Last Workspace", category: "Session", shortcut: None },
         PaletteCommand { id: "new_tab", icon: IconType::Plus, title: "New Tab", category: "Terminal", shortcut: Some(if is_mac { "⌘T" } else { "Ctrl+Shift+T" }) },
         PaletteCommand { id: "new_window", icon: IconType::ExternalLink, title: "New Window", category: "Window", shortcut: Some(if is_mac { "⌘⇧N" } else { "Ctrl+Shift+N" }) },
         PaletteCommand { id: "rename_tab", icon: IconType::Pencil, title: "Rename Active Tab", category: "Terminal", shortcut: Some(if is_mac { "⌘⇧R" } else { "Ctrl+Shift+R" }) },
@@ -824,6 +863,14 @@ pub struct RootView {
     pub is_project_jumper_open: bool,
     pub project_jumper_query: String,
     pub project_jumper_selected: usize,
+    pub is_tab_overview_open: bool,
+    pub tab_overview_selected: usize,
+    pub tab_overview_scroll_handle: ScrollHandle,
+    pub is_global_search_open: bool,
+    pub global_search_query: String,
+    pub global_search_results: Vec<GlobalSearchResult>,
+    pub global_search_selected: usize,
+    pub global_search_scroll_handle: ScrollHandle,
     pub is_git_menu_open: bool,
     pub is_git_branch_sub_open: bool,
     pub git_menu_pos: Option<(f32, f32)>,
@@ -1044,6 +1091,14 @@ impl RootView {
             is_project_jumper_open: false,
             project_jumper_query: String::new(),
             project_jumper_selected: 0,
+            is_tab_overview_open: false,
+            tab_overview_selected: 0,
+            tab_overview_scroll_handle: ScrollHandle::new(),
+            is_global_search_open: false,
+            global_search_query: String::new(),
+            global_search_results: Vec::new(),
+            global_search_selected: 0,
+            global_search_scroll_handle: ScrollHandle::new(),
             is_git_menu_open: false,
             is_git_branch_sub_open: false,
             git_menu_pos: None,
@@ -1081,6 +1136,8 @@ impl RootView {
             dragging_split_direction: SplitDirection::Horizontal,
             dragging_split_bounds: (0.0, 0.0, 0.0, 0.0),
         };
+
+        crate::keybindings::init_resolver(view.config.keybindings.clone(), view.config.keybinding_preset);
 
         // Background update check
         let (update_tx, update_rx) = async_channel::unbounded::<Option<crate::updater::ReleaseInfo>>();
@@ -1749,11 +1806,11 @@ impl RootView {
             }
         }
 
-        let bounds = Bounds::centered(None, size(px(540.), px(600.)), &*cx);
+        let bounds = Bounds::centered(None, size(px(720.), px(680.)), &*cx);
         if let Ok(handle) = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(440.), px(460.))),
+                window_min_size: Some(size(px(580.), px(500.))),
                 window_background: WindowBackgroundAppearance::Blurred,
                 app_id: Some("com.fastty.app.settings".into()),
                 titlebar: Some(TitlebarOptions {
@@ -1913,13 +1970,188 @@ impl RootView {
             self.is_ssh_manager_open = false;
             self.is_search_open = false;
             self.is_worktree_picker_open = false;
+            self.is_tab_overview_open = false;
+            self.is_global_search_open = false;
         }
         cx.notify();
+    }
+
+    pub fn toggle_tab_overview(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.is_tab_overview_open = !self.is_tab_overview_open;
+        if self.is_tab_overview_open {
+            self.tab_overview_selected = self.active_tab_idx;
+            self.is_global_search_open = false;
+            self.is_command_palette_open = false;
+            self.is_ssh_manager_open = false;
+            self.is_search_open = false;
+            self.is_worktree_picker_open = false;
+            self.is_project_jumper_open = false;
+            self.is_settings_open = false;
+            self.is_about_open = false;
+            self.tab_overview_scroll_handle.scroll_to_item(self.tab_overview_selected);
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_global_search(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.is_global_search_open = !self.is_global_search_open;
+        if self.is_global_search_open {
+            self.is_tab_overview_open = false;
+            self.is_command_palette_open = false;
+            self.is_ssh_manager_open = false;
+            self.is_search_open = false;
+            self.is_worktree_picker_open = false;
+            self.is_project_jumper_open = false;
+            self.is_settings_open = false;
+            self.is_about_open = false;
+            self.global_search_query.clear();
+            self.global_search_results.clear();
+            self.global_search_selected = 0;
+            self.global_search_scroll_handle.scroll_to_item(0);
+        }
+        cx.notify();
+    }
+
+    pub fn update_global_search(&mut self, cx: &mut Context<Self>) {
+        self.global_search_results.clear();
+        self.global_search_selected = 0;
+        let q = self.global_search_query.trim();
+        if q.is_empty() {
+            cx.notify();
+            return;
+        }
+
+        for (tab_idx, tab) in self.tabs.iter().enumerate() {
+            let proc = tab.terminal.as_ref().and_then(|t| t.get_foreground_process_name());
+            let tab_title = tab.custom_title.clone().unwrap_or_else(|| tab.title.clone());
+
+            // Check main terminal
+            if let Some(ref term) = tab.terminal {
+                let snippets = term.search_snippets(q, 10);
+                for snip in snippets {
+                    self.global_search_results.push(GlobalSearchResult {
+                        tab_idx,
+                        tab_id: tab.id,
+                        tab_title: tab_title.clone(),
+                        process_name: proc.clone(),
+                        pane_id: 0,
+                        offset: snip.offset,
+                        line_index: snip.line_index,
+                        line_content: snip.text,
+                    });
+                }
+            }
+
+            // Check split panes if any
+            for pane in tab.pane_tree.all_panes() {
+                if let Some(ref term) = pane.terminal {
+                    let snippets = term.search_snippets(q, 10);
+                    for snip in snippets {
+                        self.global_search_results.push(GlobalSearchResult {
+                            tab_idx,
+                            tab_id: tab.id,
+                            tab_title: pane.custom_title.clone().unwrap_or_else(|| pane.title.clone()),
+                            process_name: term.get_foreground_process_name(),
+                            pane_id: pane.id,
+                            offset: snip.offset,
+                            line_index: snip.line_index,
+                            line_content: snip.text,
+                        });
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn save_workspace_session(&mut self, session_name: &str) -> anyhow::Result<()> {
+        let mut persisted_tabs = Vec::new();
+        for tab in &self.tabs {
+            let layout = Some(tab.pane_tree.root.to_persisted());
+            persisted_tabs.push(crate::session_manager::PersistedTab {
+                id: tab.id,
+                title: tab.title.clone(),
+                custom_title: tab.custom_title.clone(),
+                cwd: tab.cwd.as_ref().map(|c| c.to_string_lossy().to_string()),
+                layout,
+            });
+        }
+
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let data = crate::session_manager::SessionData {
+            name: session_name.to_string(),
+            created_at: now,
+            updated_at: now,
+            active_tab_idx: self.active_tab_idx,
+            tabs: persisted_tabs,
+        };
+        crate::session_manager::save_session(&data)
+    }
+
+    pub fn restore_workspace_session(&mut self, session_name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = crate::session_manager::load_session(session_name) {
+            let shell = self.config.shell.clone().or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(crate::paths::default_system_shell);
+            for tab_data in session.tabs {
+                let tab_id = self.next_tab_id;
+                self.next_tab_id += 1;
+
+                let pane_tree = if let Some(ref persisted_layout) = tab_data.layout {
+                    let root_node = crate::pane_tree::PaneNode::restore_from_persisted(
+                        persisted_layout,
+                        &mut |cwd, title| self.spawn_terminal_pane(&shell, &[], cwd, title, window, cx),
+                    );
+                    let first_pane_id = root_node.all_panes().first().map(|p| p.id).unwrap_or(tab_id);
+                    crate::pane_tree::PaneTree {
+                        root: root_node,
+                        active_pane_id: first_pane_id,
+                    }
+                } else {
+                    let cwd = tab_data.cwd.as_deref().map(std::path::Path::new);
+                    let title = tab_data.custom_title.clone().or(Some(tab_data.title.clone()));
+                    let pane = self.spawn_terminal_pane(&shell, &[], cwd, title, window, cx);
+                    crate::pane_tree::PaneTree::new(pane)
+                };
+
+                let active_pane = pane_tree.active_pane();
+                let pane_title = active_pane.map(|p| p.title.clone()).unwrap_or(tab_data.title);
+                let pane_cwd = active_pane.and_then(|p| p.cwd.clone()).or_else(|| tab_data.cwd.map(std::path::PathBuf::from));
+                let pane_term = active_pane.and_then(|p| p.terminal.clone());
+
+                self.tabs.push(TabData {
+                    id: tab_id,
+                    pane_tree,
+                    title: pane_title,
+                    custom_title: tab_data.custom_title,
+                    terminal: pane_term,
+                    cwd: pane_cwd.clone(),
+                    git_status: None,
+                    git_checked_cwd: pane_cwd,
+                    git_last_poll: Some(std::time::Instant::now()),
+                    last_duration_ms: None,
+                    last_exit_code: None,
+                });
+            }
+
+            if session.active_tab_idx < self.tabs.len() {
+                self.active_tab_idx = session.active_tab_idx;
+            }
+            self.persist_session();
+            cx.notify();
+        }
     }
 
     pub fn execute_palette_command(&mut self, cmd_id: &str, _window: &mut Window, cx: &mut Context<Self>) {
         self.is_command_palette_open = false;
         match cmd_id {
+            "tab_overview" => self.toggle_tab_overview(_window, cx),
+            "global_search" => self.toggle_global_search(_window, cx),
+            "save_session" => {
+                let _ = self.save_workspace_session("default-workspace");
+                cx.notify();
+            }
+            "restore_session" => {
+                self.restore_workspace_session("default-workspace", _window, cx);
+            }
             "new_tab" => self.create_tab(_window, cx),
             "new_window" => {
                 let cwd = self.tabs.get(self.active_tab_idx).and_then(|t| t.cwd.clone());
@@ -2110,6 +2342,15 @@ impl RootView {
             }
             self.trigger_sidebar_animation(_window, cx);
         }
+        for tab in &self.tabs {
+            if let Some(ref term) = tab.terminal {
+                term.update_scrollback(loaded_config.scrollback);
+            }
+            tab.pane_tree.for_each_terminal(|term| {
+                term.update_scrollback(loaded_config.scrollback);
+            });
+        }
+        crate::keybindings::init_resolver(loaded_config.keybindings.clone(), loaded_config.keybinding_preset);
         self.config = loaded_config;
         cx.notify();
     }
@@ -2287,6 +2528,147 @@ impl RootView {
             return;
         }
 
+        // Tab Overview / Mission Control Keyboard Handler
+        if self.is_tab_overview_open {
+            if key_lower == "escape" || key_lower == "esc" {
+                self.is_tab_overview_open = false;
+                cx.notify();
+                return;
+            }
+            let count = self.tabs.len();
+            if count == 0 {
+                self.is_tab_overview_open = false;
+                cx.notify();
+                return;
+            }
+            if key_lower == "enter" || key_lower == "return" {
+                if let Some(tab) = self.tabs.get(self.tab_overview_selected) {
+                    let id = tab.id;
+                    self.is_tab_overview_open = false;
+                    self.select_tab(id, cx);
+                }
+                return;
+            }
+            if key_lower == "right" || key_lower == "arrowright" || key_lower == "l" || key_lower == "tab" {
+                self.tab_overview_selected = (self.tab_overview_selected + 1) % count;
+                self.tab_overview_scroll_handle.scroll_to_item(self.tab_overview_selected);
+                cx.notify();
+                return;
+            }
+            if key_lower == "left" || key_lower == "arrowleft" || key_lower == "h" {
+                self.tab_overview_selected = if self.tab_overview_selected == 0 {
+                    count - 1
+                } else {
+                    self.tab_overview_selected - 1
+                };
+                self.tab_overview_scroll_handle.scroll_to_item(self.tab_overview_selected);
+                cx.notify();
+                return;
+            }
+            if key_lower == "down" || key_lower == "arrowdown" || key_lower == "j" {
+                let cols = 3.min(count);
+                self.tab_overview_selected = (self.tab_overview_selected + cols).min(count - 1);
+                self.tab_overview_scroll_handle.scroll_to_item(self.tab_overview_selected);
+                cx.notify();
+                return;
+            }
+            if key_lower == "up" || key_lower == "arrowup" || key_lower == "k" {
+                let cols = 3.min(count);
+                self.tab_overview_selected = self.tab_overview_selected.saturating_sub(cols);
+                self.tab_overview_scroll_handle.scroll_to_item(self.tab_overview_selected);
+                cx.notify();
+                return;
+            }
+            if key_lower == "d" || key_lower == "x" || key_lower == "backspace" {
+                if let Some(tab) = self.tabs.get(self.tab_overview_selected) {
+                    let id = tab.id;
+                    self.close_tab(id, _window, cx);
+                    if self.tabs.is_empty() {
+                        self.is_tab_overview_open = false;
+                    } else {
+                        self.tab_overview_selected = self.tab_overview_selected.min(self.tabs.len() - 1);
+                    }
+                    cx.notify();
+                }
+                return;
+            }
+            if key_lower == "t" || key_lower == "n" {
+                self.is_tab_overview_open = false;
+                self.create_tab(_window, cx);
+                return;
+            }
+            return;
+        }
+
+        // Global Multi-Tab Search Keyboard Handler
+        if self.is_global_search_open {
+            if key_lower == "escape" || key_lower == "esc" {
+                self.is_global_search_open = false;
+                cx.notify();
+                return;
+            }
+            let count = self.global_search_results.len();
+            if key_lower == "enter" || key_lower == "return" {
+                if let Some(res) = self.global_search_results.get(self.global_search_selected) {
+                    let tab_id = res.tab_id;
+                    let offset = res.offset;
+                    let pane_id = res.pane_id;
+                    self.is_global_search_open = false;
+                    self.select_tab(tab_id, cx);
+                    if let Some(active_tab) = self.tabs.iter().find(|t| t.id == tab_id) {
+                        if pane_id > 0 {
+                            if let Some(pane) = active_tab.pane_tree.find_pane(pane_id) {
+                                if let Some(ref t) = pane.terminal {
+                                    t.scroll_to_offset(offset);
+                                }
+                            }
+                        } else if let Some(ref t) = active_tab.terminal {
+                            t.scroll_to_offset(offset);
+                        }
+                    }
+                    cx.notify();
+                }
+                return;
+            }
+            if key_lower == "down" || key_lower == "arrowdown" || key_lower == "tab" {
+                if count > 0 {
+                    self.global_search_selected = (self.global_search_selected + 1) % count;
+                    self.global_search_scroll_handle.scroll_to_item(self.global_search_selected);
+                    cx.notify();
+                }
+                return;
+            }
+            if key_lower == "up" || key_lower == "arrowup" {
+                if count > 0 {
+                    self.global_search_selected = if self.global_search_selected == 0 {
+                        count - 1
+                    } else {
+                        self.global_search_selected - 1
+                    };
+                    self.global_search_scroll_handle.scroll_to_item(self.global_search_selected);
+                    cx.notify();
+                }
+                return;
+            }
+            if key_lower == "backspace" {
+                self.global_search_query.pop();
+                self.update_global_search(cx);
+                return;
+            }
+            if let Some(ref ch) = event.keystroke.key_char {
+                if !modifiers.platform && !is_ctrl {
+                    self.global_search_query.push_str(ch);
+                    self.update_global_search(cx);
+                    return;
+                }
+            } else if key.len() == 1 && !modifiers.platform && !is_ctrl {
+                self.global_search_query.push_str(key);
+                self.update_global_search(cx);
+                return;
+            }
+            return;
+        }
+
         // 1. Command Palette Keyboard Handler
         if self.is_command_palette_open {
             if key_lower == "escape" || key_lower == "esc" {
@@ -2298,7 +2680,7 @@ impl RootView {
             let all_cmds = get_all_palette_commands();
             let filtered: Vec<&PaletteCommand> = all_cmds
                 .iter()
-                .filter(|c| query.is_empty() || c.title.to_lowercase().contains(&query) || c.category.to_lowercase().contains(&query))
+                .filter(|c| query.is_empty() || fuzzy_match_str(&query, c.title) || fuzzy_match_str(&query, c.category))
                 .collect();
             let count = filtered.len();
 
@@ -2365,7 +2747,7 @@ impl RootView {
             let query = self.ssh_manager_query.to_lowercase();
             let filtered: Vec<&crate::ssh::SshHost> = hosts
                 .iter()
-                .filter(|h| query.is_empty() || h.name.to_lowercase().contains(&query) || h.hostname.to_lowercase().contains(&query) || h.user.to_lowercase().contains(&query))
+                .filter(|h| query.is_empty() || fuzzy_match_str(&query, &h.name) || fuzzy_match_str(&query, &h.hostname) || fuzzy_match_str(&query, &h.user) || fuzzy_match_str(&query, &h.tag))
                 .collect();
             let count = filtered.len();
 
@@ -2374,7 +2756,8 @@ impl RootView {
                     let host_clone = (*host).clone();
                     self.is_ssh_manager_open = false;
                     let title = format!("ssh: {}", host_clone.name);
-                    self.create_tab_with_cmd("ssh", &host_clone.ssh_args(), Some(title), _window, cx);
+                    let (shell, args) = host_clone.resilient_shell_command();
+                    self.create_tab_with_cmd(&shell, &args, Some(title), _window, cx);
                 }
                 return;
             }
@@ -2653,105 +3036,7 @@ impl RootView {
             return;
         }
 
-        // 7. Command Palette Trigger (⌘P on macOS; Ctrl+Shift+P on Linux/Windows)
-        let is_command_palette = if cfg!(target_os = "macos") {
-            modifiers.platform && key_lower == "p"
-        } else {
-            is_ctrl && modifiers.shift && key_lower == "p"
-        };
-        if is_command_palette {
-            self.toggle_command_palette(_window, cx);
-            return;
-        }
-
-        // New Window Trigger (⌘⇧N on macOS; Ctrl+Shift+N on Linux/Windows)
-        let is_new_window = if cfg!(target_os = "macos") {
-            modifiers.platform && modifiers.shift && key_lower == "n"
-        } else {
-            is_ctrl && modifiers.shift && key_lower == "n"
-        };
-        if is_new_window {
-            self.execute_palette_command("new_window", _window, cx);
-            return;
-        }
-
-        // 8. SSH Manager Trigger (⌘O on macOS; Ctrl+Shift+O on Linux/Windows)
-        let is_ssh_mgr = if cfg!(target_os = "macos") {
-            modifiers.platform && key_lower == "o"
-        } else {
-            is_ctrl && modifiers.shift && key_lower == "o"
-        };
-        if is_ssh_mgr {
-            self.toggle_ssh_manager(_window, cx);
-            return;
-        }
-
-        // 9. Git Worktree Picker Trigger (⌘⌥W on macOS; Ctrl+Alt+W on Linux/Windows)
-        let is_worktree_trigger = if cfg!(target_os = "macos") {
-            modifiers.platform && modifiers.alt && key_lower == "w"
-        } else {
-            modifiers.control && modifiers.alt && key_lower == "w" && !is_alt_gr
-        };
-        if is_worktree_trigger {
-            self.toggle_worktree_picker(_window, cx);
-            return;
-        }
-
-        // 10. Project / Tab Jumper Trigger (⌘J on macOS; Ctrl+Shift+J on Linux/Windows)
-        let is_jumper_trigger = if cfg!(target_os = "macos") {
-            modifiers.platform && key_lower == "j"
-        } else {
-            is_ctrl && modifiers.shift && key_lower == "j"
-        };
-        if is_jumper_trigger {
-            self.toggle_project_jumper(_window, cx);
-            return;
-        }
-
-        // 11. Search in Buffer Trigger (⌘F on macOS; Ctrl+Shift+F / Ctrl+F on Linux/Windows)
-        let is_search_trigger = if cfg!(target_os = "macos") {
-            modifiers.platform && key_lower == "f"
-        } else {
-            (is_ctrl && modifiers.shift && key_lower == "f")
-                || (is_ctrl && key_lower == "f")
-        };
-        if is_search_trigger {
-            self.toggle_search(_window, cx);
-            return;
-        }
-
-        // 12. Open / Toggle Settings (⌘, / ⌘S on macOS; Ctrl+, / Ctrl+Shift+S on Linux/Windows)
-        let is_settings = if cfg!(target_os = "macos") {
-            modifiers.platform && (key == "," || key_lower == "s" || key_lower == "comma")
-        } else {
-            (is_ctrl && (key == "," || key_lower == "comma"))
-                || (is_ctrl && modifiers.shift && key_lower == "s")
-        };
-        if is_settings {
-            self.toggle_settings(_window, cx);
-            return;
-        }
-
-        // 3. Toggle Fullscreen (F11 on all OS; ⌃⌘F on macOS)
-        let is_fullscreen = key_lower == "f11"
-            || (cfg!(target_os = "macos") && modifiers.platform && modifiers.control && key_lower == "f");
-        if is_fullscreen {
-            _window.toggle_fullscreen();
-            return;
-        }
-
-        // 4. New Tab (⌘T on macOS; Ctrl+Shift+T on Linux/Windows)
-        let is_new_tab = if cfg!(target_os = "macos") {
-            modifiers.platform && key_lower == "t"
-        } else {
-            is_ctrl && modifiers.shift && key_lower == "t"
-        };
-        if is_new_tab {
-            self.create_tab(_window, cx);
-            return;
-        }
-
-        // 4b. Rename Tab (⌘⇧R on macOS; Ctrl+Shift+R on Linux/Windows)
+        // Rename Tab (⌘⇧R on macOS; Ctrl+Shift+R on Linux/Windows)
         let is_rename_tab = if cfg!(target_os = "macos") {
             modifiers.platform && modifiers.shift && key_lower == "r"
         } else {
@@ -2762,199 +3047,227 @@ impl RootView {
             return;
         }
 
-        // 4c. Split Right (⌘D on macOS; Ctrl+Shift+E on Linux/Windows)
-        let is_split_right = if cfg!(target_os = "macos") {
-            modifiers.platform && !modifiers.shift && key_lower == "d"
-        } else {
-            is_ctrl && modifiers.shift && key_lower == "e"
-        };
-        if is_split_right {
-            self.split_active_pane(Direction::Right, _window, cx);
-            return;
-        }
+        // Dynamic Keybinding Resolver Check (Default, Ghostty, Tmux, ITerm2 presets + User overrides)
+        let combo_opt = crate::keybindings::combo_from_key(
+            key,
+            is_ctrl,
+            modifiers.shift,
+            modifiers.alt && !is_alt_gr,
+            modifiers.platform,
+        );
+        let action_opt = combo_opt.and_then(|combo| {
+            let resolver_lock = crate::keybindings::RESOLVER.get_or_init(|| {
+                parking_lot::RwLock::new(crate::keybindings::KeyBindingResolver::with_defaults())
+            });
+            resolver_lock.read().resolve(&combo)
+        });
 
-        // Toggle Tab Sidebar (⌘B on macOS; Ctrl+B on Linux/Windows)
-        let is_toggle_sidebar = if cfg!(target_os = "macos") {
-            modifiers.platform && !modifiers.shift && key_lower == "b"
-        } else {
-            is_ctrl && !modifiers.shift && key_lower == "b"
-        };
-        if is_toggle_sidebar {
-            self.toggle_tab_sidebar(_window, cx);
-            return;
-        }
-
-        // 4d. Split Down (⌘⇧D on macOS; Ctrl+Shift+D on Linux/Windows)
-        let is_split_down = if cfg!(target_os = "macos") {
-            modifiers.platform && modifiers.shift && key_lower == "d"
-        } else {
-            is_ctrl && modifiers.shift && key_lower == "d"
-        };
-        if is_split_down {
-            self.split_active_pane(Direction::Down, _window, cx);
-            return;
-        }
-
-        // 4e. Focus Panes (⌥⌘←↑→↓ on macOS; Alt+←↑→↓ on Linux/Windows)
-        let is_focus_left = if cfg!(target_os = "macos") {
-            modifiers.platform && modifiers.alt && (key_lower == "left" || key_lower == "arrowleft")
-        } else {
-            modifiers.alt && !is_alt_gr && (key_lower == "left" || key_lower == "arrowleft")
-        };
-        if is_focus_left {
-            self.focus_pane_in_direction(Direction::Left, cx);
-            return;
-        }
-
-        let is_focus_right = if cfg!(target_os = "macos") {
-            modifiers.platform && modifiers.alt && (key_lower == "right" || key_lower == "arrowright")
-        } else {
-            modifiers.alt && !is_alt_gr && (key_lower == "right" || key_lower == "arrowright")
-        };
-        if is_focus_right {
-            self.focus_pane_in_direction(Direction::Right, cx);
-            return;
-        }
-
-        let is_focus_top = if cfg!(target_os = "macos") {
-            modifiers.platform && modifiers.alt && (key_lower == "up" || key_lower == "arrowup")
-        } else {
-            modifiers.alt && !is_alt_gr && (key_lower == "up" || key_lower == "arrowup")
-        };
-        if is_focus_top {
-            self.focus_pane_in_direction(Direction::Top, cx);
-            return;
-        }
-
-        let is_focus_down = if cfg!(target_os = "macos") {
-            modifiers.platform && modifiers.alt && (key_lower == "down" || key_lower == "arrowdown")
-        } else {
-            modifiers.alt && !is_alt_gr && (key_lower == "down" || key_lower == "arrowdown")
-        };
-        if is_focus_down {
-            self.focus_pane_in_direction(Direction::Down, cx);
-            return;
-        }
-
-        // 5. Close Active Pane (⌘W on macOS; Ctrl+Shift+W on Linux/Windows)
-        let is_close_pane = if cfg!(target_os = "macos") {
-            modifiers.platform && !modifiers.shift && key_lower == "w"
-        } else {
-            is_ctrl && modifiers.shift && key_lower == "w"
-        };
-        if is_close_pane {
-            self.close_active_pane(_window, cx);
-            return;
-        }
-
-        // 5b. Close Active Tab explicitly (⌘⇧W on macOS; Ctrl+Shift+Q on Linux/Windows)
-        let is_close_tab = if cfg!(target_os = "macos") {
-            modifiers.platform && modifiers.shift && key_lower == "w"
-        } else {
-            is_ctrl && modifiers.shift && key_lower == "q"
-        };
-        if is_close_tab {
-            if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
-                let id = active_tab.id;
-                self.close_tab(id, _window, cx);
-            }
-            return;
-        }
-
-        // 6. Next Tab (Ctrl+Tab, Ctrl+PageDown on all OS; ⌘Shift+] on macOS)
-        let is_next_tab = (is_ctrl && !modifiers.shift && key_lower == "tab")
-            || (is_ctrl && key_lower == "pagedown")
-            || (cfg!(target_os = "macos") && modifiers.platform && modifiers.shift && (key == "]" || key == "}"));
-        if is_next_tab {
-            if !self.tabs.is_empty() {
-                self.selection = None;
-                self.is_selecting = false;
-                self.selection_start = None;
-                self.active_tab_idx = (self.active_tab_idx + 1) % self.tabs.len();
-                cx.notify();
-            }
-            return;
-        }
-
-        // 7. Prev Tab (Ctrl+Shift+Tab, Ctrl+PageUp on all OS; ⌘Shift+[ on macOS)
-        let is_prev_tab = (is_ctrl && modifiers.shift && key_lower == "tab")
-            || (is_ctrl && key_lower == "pageup")
-            || (cfg!(target_os = "macos") && modifiers.platform && modifiers.shift && (key == "[" || key == "{"));
-        if is_prev_tab {
-            if !self.tabs.is_empty() {
-                self.selection = None;
-                self.is_selecting = false;
-                self.selection_start = None;
-                self.active_tab_idx = if self.active_tab_idx == 0 {
-                    self.tabs.len() - 1
-                } else {
-                    self.active_tab_idx - 1
-                };
-                cx.notify();
-            }
-            return;
-        }
-
-        // 8. Jump to Tab 1-9 (⌘1-9 on macOS; Alt+1-9 or Ctrl+Shift+1-9 on Linux/Windows)
-        let tab_jump: Option<usize> = if cfg!(target_os = "macos") {
-            if modifiers.platform {
-                key.parse::<usize>().ok()
-            } else {
-                None
-            }
-        } else if (modifiers.alt && !is_alt_gr) || (is_ctrl && modifiers.shift) {
-            key.parse::<usize>().ok()
-        } else {
-            None
-        };
-        if let Some(digit) = tab_jump {
-            if (1..=9).contains(&digit) {
-                let target = digit - 1;
-                if target < self.tabs.len() {
-                    self.selection = None;
-                    self.is_selecting = false;
-                    self.selection_start = None;
-                    self.active_tab_idx = target;
+        if let Some(action) = action_opt {
+            use crate::keybindings::Action;
+            match action {
+                Action::CommandPalette => {
+                    self.toggle_command_palette(_window, cx);
+                    return;
+                }
+                Action::NewWindow => {
+                    self.execute_palette_command("new_window", _window, cx);
+                    return;
+                }
+                Action::SshManager => {
+                    self.toggle_ssh_manager(_window, cx);
+                    return;
+                }
+                Action::WorktreePicker => {
+                    self.toggle_worktree_picker(_window, cx);
+                    return;
+                }
+                Action::ProjectJumper => {
+                    self.toggle_project_jumper(_window, cx);
+                    return;
+                }
+                Action::OpenSearch => {
+                    self.toggle_search(_window, cx);
+                    return;
+                }
+                Action::OpenSettings => {
+                    self.toggle_settings(_window, cx);
+                    return;
+                }
+                Action::ToggleFullscreen => {
+                    _window.toggle_fullscreen();
+                    return;
+                }
+                Action::NewTab => {
+                    self.create_tab(_window, cx);
+                    return;
+                }
+                Action::SplitRight => {
+                    self.split_active_pane(Direction::Right, _window, cx);
+                    return;
+                }
+                Action::SplitDown => {
+                    self.split_active_pane(Direction::Down, _window, cx);
+                    return;
+                }
+                Action::SplitLeft => {
+                    self.split_active_pane(Direction::Left, _window, cx);
+                    return;
+                }
+                Action::SplitTop => {
+                    self.split_active_pane(Direction::Top, _window, cx);
+                    return;
+                }
+                Action::ToggleTabSidebar => {
+                    self.toggle_tab_sidebar(_window, cx);
+                    return;
+                }
+                Action::FocusLeft => {
+                    self.focus_pane_in_direction(Direction::Left, cx);
+                    return;
+                }
+                Action::FocusRight => {
+                    self.focus_pane_in_direction(Direction::Right, cx);
+                    return;
+                }
+                Action::FocusTop => {
+                    self.focus_pane_in_direction(Direction::Top, cx);
+                    return;
+                }
+                Action::FocusDown => {
+                    self.focus_pane_in_direction(Direction::Down, cx);
+                    return;
+                }
+                Action::ClosePane => {
+                    self.close_active_pane(_window, cx);
+                    return;
+                }
+                Action::CloseTab => {
+                    if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
+                        let id = active_tab.id;
+                        self.close_tab(id, _window, cx);
+                    }
+                    return;
+                }
+                Action::NextTab => {
+                    if !self.tabs.is_empty() {
+                        self.selection = None;
+                        self.is_selecting = false;
+                        self.selection_start = None;
+                        self.active_tab_idx = (self.active_tab_idx + 1) % self.tabs.len();
+                        cx.notify();
+                    }
+                    return;
+                }
+                Action::PrevTab => {
+                    if !self.tabs.is_empty() {
+                        self.selection = None;
+                        self.is_selecting = false;
+                        self.selection_start = None;
+                        self.active_tab_idx = if self.active_tab_idx == 0 {
+                            self.tabs.len() - 1
+                        } else {
+                            self.active_tab_idx - 1
+                        };
+                        cx.notify();
+                    }
+                    return;
+                }
+                Action::SelectTab(digit) => {
+                    if (1..=9).contains(&digit) {
+                        let target = (digit - 1) as usize;
+                        if target < self.tabs.len() {
+                            self.selection = None;
+                            self.is_selecting = false;
+                            self.selection_start = None;
+                            self.active_tab_idx = target;
+                            cx.notify();
+                            return;
+                        }
+                    }
+                }
+                Action::IncreaseFontSize => {
+                    self.adjust_font_size(1.0, cx);
+                    return;
+                }
+                Action::DecreaseFontSize => {
+                    self.adjust_font_size(-1.0, cx);
+                    return;
+                }
+                Action::ResetFontSize => {
+                    self.font_size = 13.0;
+                    self.config.font.size = 13.0;
+                    let _ = self.config.save_default();
                     cx.notify();
                     return;
                 }
+                Action::ClearScrollback => {
+                    if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
+                        if let Some(ref terminal) = active_tab.terminal {
+                            terminal.scroll_to_bottom();
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
+                Action::PrevPrompt => {
+                    if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
+                        if let Some(ref terminal) = active_tab.terminal {
+                            terminal.scroll_to_prev_prompt();
+                            self.last_scroll_activity = std::time::Instant::now();
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
+                Action::NextPrompt => {
+                    if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
+                        if let Some(ref terminal) = active_tab.terminal {
+                            terminal.scroll_to_next_prompt();
+                            self.last_scroll_activity = std::time::Instant::now();
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
+                Action::Copy => {
+                    if let Some(text) = self.get_selected_text() {
+                        if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                            let _ = clip.set_text(text);
+                        }
+                    }
+                    return;
+                }
+                Action::Paste => {
+                    if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
+                        if let Some(ref terminal) = active_tab.terminal {
+                            if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                                if let Some(content) = crate::paste::get_clipboard_paste_content(&mut clip) {
+                                    crate::paste::paste_text_to_terminal(terminal, &content);
+                                    cx.notify();
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                Action::Quit => {
+                    cx.quit();
+                    return;
+                }
+                Action::TabOverview => {
+                    self.toggle_tab_overview(_window, cx);
+                    return;
+                }
+                Action::GlobalSearch => {
+                    self.toggle_global_search(_window, cx);
+                    return;
+                }
+                Action::ReloadConfig => {
+                    self.reload_config(_window, cx);
+                    return;
+                }
             }
-        }
-
-        // 9. Increase Font Size (⌘= / ⌘+ on macOS; Ctrl= / Ctrl+ on Linux/Windows)
-        let is_zoom_in = if cfg!(target_os = "macos") {
-            modifiers.platform && (key == "=" || key == "+" || key_lower == "equal" || key_lower == "plus")
-        } else {
-            is_ctrl && (key == "=" || key == "+" || key_lower == "equal" || key_lower == "plus")
-        };
-        if is_zoom_in {
-            self.adjust_font_size(1.0, cx);
-            return;
-        }
-
-        // 10. Decrease Font Size (⌘- on macOS; Ctrl- on Linux/Windows)
-        let is_zoom_out = if cfg!(target_os = "macos") {
-            modifiers.platform && (key == "-" || key == "_" || key_lower == "minus")
-        } else {
-            is_ctrl && (key == "-" || key == "_" || key_lower == "minus")
-        };
-        if is_zoom_out {
-            self.adjust_font_size(-1.0, cx);
-            return;
-        }
-
-        // 11. Reset Font Size (⌘0 on macOS; Ctrl0 on Linux/Windows)
-        let is_zoom_reset = if cfg!(target_os = "macos") {
-            modifiers.platform && key == "0"
-        } else {
-            is_ctrl && key == "0"
-        };
-        if is_zoom_reset {
-            self.font_size = 13.0;
-            self.config.font.size = 13.0;
-            let _ = self.config.save_default();
-            cx.notify();
-            return;
         }
 
         let Some(active_tab) = self.tabs.get(self.active_tab_idx) else {
@@ -2963,76 +3276,6 @@ impl RootView {
         let Some(ref terminal) = active_tab.terminal else {
             return;
         };
-
-        // 12. Clear Scrollback (⌘K on macOS; Ctrl+Shift+K on Linux/Windows)
-        let is_clear_scroll = if cfg!(target_os = "macos") {
-            modifiers.platform && key_lower == "k"
-        } else {
-            is_ctrl && modifiers.shift && key_lower == "k"
-        };
-        if is_clear_scroll {
-            terminal.scroll_to_bottom();
-            cx.notify();
-            return;
-        }
-
-        // 12b. Prev Prompt (⌘⇧↑ / ⌘⇧H on macOS; Ctrl+Shift+↑ / Ctrl+Shift+H on Linux/Windows)
-        let is_prev_prompt = if cfg!(target_os = "macos") {
-            modifiers.platform && modifiers.shift && (key_lower == "up" || key_lower == "arrowup" || key_lower == "h")
-        } else {
-            is_ctrl && modifiers.shift && (key_lower == "up" || key_lower == "arrowup" || key_lower == "h")
-        };
-        if is_prev_prompt {
-            terminal.scroll_to_prev_prompt();
-            self.last_scroll_activity = std::time::Instant::now();
-            cx.notify();
-            return;
-        }
-
-        // 12c. Next Prompt (⌘⇧↓ on macOS; Ctrl+Shift+↓ on Linux/Windows)
-        let is_next_prompt = if cfg!(target_os = "macos") {
-            modifiers.platform && modifiers.shift && (key_lower == "down" || key_lower == "arrowdown")
-        } else {
-            is_ctrl && modifiers.shift && (key_lower == "down" || key_lower == "arrowdown")
-        };
-        if is_next_prompt {
-            terminal.scroll_to_next_prompt();
-            self.last_scroll_activity = std::time::Instant::now();
-            cx.notify();
-            return;
-        }
-
-        // 13. Paste (⌘V on macOS; Ctrl+Shift+V or Shift+Insert on Linux/Windows)
-        let is_paste = if cfg!(target_os = "macos") {
-            modifiers.platform && key_lower == "v"
-        } else {
-            (is_ctrl && modifiers.shift && key_lower == "v")
-                || (modifiers.shift && key_lower == "insert")
-        };
-        if is_paste {
-            if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                if let Some(content) = crate::paste::get_clipboard_paste_content(&mut clip) {
-                    crate::paste::paste_text_to_terminal(terminal, &content);
-                    cx.notify();
-                    return;
-                }
-            }
-        }
-
-        // 14. Copy (⌘C on macOS; Ctrl+Shift+C on Linux/Windows)
-        let is_copy = if cfg!(target_os = "macos") {
-            modifiers.platform && key_lower == "c"
-        } else {
-            is_ctrl && modifiers.shift && key_lower == "c"
-        };
-        if is_copy {
-            if let Some(text) = self.get_selected_text() {
-                if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                    let _ = clip.set_text(text);
-                }
-            }
-            return;
-        }
 
         self.last_cursor_activity = std::time::Instant::now();
         self.cursor_blink_visible = true;
@@ -3245,6 +3488,8 @@ impl RootView {
             || self.is_search_open
             || self.is_worktree_picker_open
             || self.is_project_jumper_open
+            || self.is_tab_overview_open
+            || self.is_global_search_open
             || self.is_settings_open
             || self.is_about_open
             || self.is_update_modal_open
@@ -4291,11 +4536,15 @@ impl Render for RootView {
             .tabs
             .iter()
             .enumerate()
-            .map(|(idx, tab)| TabItem {
-                id: tab.id,
-                title: tab.custom_title.clone().unwrap_or_else(|| tab.title.clone()),
-                active: idx == self.active_tab_idx,
-                is_dirty: tab.git_status.as_ref().map_or(false, |g| g.unstaged > 0 || g.staged > 0),
+            .map(|(idx, tab)| {
+                let process_name = tab.terminal.as_ref().and_then(|t| t.get_foreground_process_name());
+                TabItem {
+                    id: tab.id,
+                    title: tab.custom_title.clone().unwrap_or_else(|| tab.title.clone()),
+                    active: idx == self.active_tab_idx,
+                    is_dirty: tab.git_status.as_ref().map_or(false, |g| g.unstaged > 0 || g.staged > 0),
+                    process_name,
+                }
             })
             .collect();
 
@@ -5327,7 +5576,7 @@ impl Render for RootView {
                 let all_cmds = get_all_palette_commands();
                 let filtered: Vec<PaletteCommand> = all_cmds
                     .into_iter()
-                    .filter(|c| query.is_empty() || c.title.to_lowercase().contains(&query) || c.category.to_lowercase().contains(&query))
+                    .filter(|c| query.is_empty() || fuzzy_match_str(&query, c.title) || fuzzy_match_str(&query, c.category))
                     .collect();
                 let selected_idx = self.command_palette_selected;
 
@@ -5503,7 +5752,7 @@ impl Render for RootView {
                 let query = self.ssh_manager_query.to_lowercase();
                 let filtered: Vec<crate::ssh::SshHost> = hosts
                     .into_iter()
-                    .filter(|h| query.is_empty() || h.name.to_lowercase().contains(&query) || h.hostname.to_lowercase().contains(&query) || h.user.to_lowercase().contains(&query))
+                    .filter(|h| query.is_empty() || fuzzy_match_str(&query, &h.name) || fuzzy_match_str(&query, &h.hostname) || fuzzy_match_str(&query, &h.user) || fuzzy_match_str(&query, &h.tag))
                     .collect();
                 let selected_idx = self.ssh_manager_selected;
 
@@ -5614,6 +5863,11 @@ impl Render for RootView {
                                                     .map(|(idx, host)| {
                                                         let is_selected = idx == selected_idx;
                                                         let host_clone = host.clone();
+                                                        let is_already_connected = self.tabs.iter().any(|t| {
+                                                            let title = t.custom_title.as_deref().unwrap_or(&t.title);
+                                                            title.contains(&host.name)
+                                                        });
+
                                                         div()
                                                             .flex()
                                                             .flex_row()
@@ -5634,7 +5888,8 @@ impl Render for RootView {
                                                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
                                                                 this.is_ssh_manager_open = false;
                                                                 let title = format!("ssh: {}", host_clone.name);
-                                                                this.create_tab_with_cmd("ssh", &host_clone.ssh_args(), Some(title), window, cx);
+                                                                let (shell, args) = host_clone.resilient_shell_command();
+                                                                this.create_tab_with_cmd(&shell, &args, Some(title), window, cx);
                                                             }))
                                                             .child(
                                                                 div()
@@ -5642,10 +5897,30 @@ impl Render for RootView {
                                                                     .flex_col()
                                                                     .child(
                                                                         div()
-                                                                            .text_size(px(12.))
-                                                                            .font_weight(FontWeight::BOLD)
-                                                                            .text_color(if is_selected { theme.black } else { theme.foreground })
-                                                                            .child(host.name),
+                                                                            .flex()
+                                                                            .flex_row()
+                                                                            .items_center()
+                                                                            .gap_2()
+                                                                            .child(
+                                                                                div()
+                                                                                    .text_size(px(12.))
+                                                                                    .font_weight(FontWeight::BOLD)
+                                                                                    .text_color(if is_selected { theme.black } else { theme.foreground })
+                                                                                    .child(host.name.clone()),
+                                                                            )
+                                                                            .when(is_already_connected, |el| {
+                                                                                el.child(
+                                                                                    div()
+                                                                                        .px(px(4.))
+                                                                                        .py(px(1.))
+                                                                                        .rounded(px(3.))
+                                                                                        .bg(theme.green.opacity(0.2))
+                                                                                        .text_size(px(9.))
+                                                                                        .font_weight(FontWeight::BOLD)
+                                                                                        .text_color(theme.green)
+                                                                                        .child("● Active"),
+                                                                                )
+                                                                            }),
                                                                     )
                                                                     .child(
                                                                         div()
@@ -5656,14 +5931,32 @@ impl Render for RootView {
                                                             )
                                                             .child(
                                                                 div()
-                                                                    .px(px(6.))
-                                                                    .py(px(2.))
-                                                                    .rounded(px(3.))
-                                                                    .bg(if is_selected { theme.black } else { theme.surface_raised })
-                                                                    .text_size(px(10.))
-                                                                    .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                                                                    .text_color(if is_selected { theme.accent } else { theme.muted })
-                                                                    .child(format!("port {}", host.port)),
+                                                                    .flex()
+                                                                    .flex_row()
+                                                                    .items_center()
+                                                                    .gap_1()
+                                                                    .child(
+                                                                        div()
+                                                                            .px(px(5.))
+                                                                            .py(px(1.5))
+                                                                            .rounded(px(3.))
+                                                                            .bg(if is_selected { theme.black } else { theme.surface_raised })
+                                                                            .text_size(px(9.5))
+                                                                            .font_weight(FontWeight::MEDIUM)
+                                                                            .text_color(if is_selected { theme.accent } else { theme.accent })
+                                                                            .child(format!("#{}", host.tag)),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .px(px(5.))
+                                                                            .py(px(1.5))
+                                                                            .rounded(px(3.))
+                                                                            .bg(if is_selected { theme.black } else { theme.surface_raised })
+                                                                            .text_size(px(9.5))
+                                                                            .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                                                            .text_color(if is_selected { theme.black.opacity(0.7) } else { theme.muted })
+                                                                            .child(format!(":{}", host.port)),
+                                                                    ),
                                                             )
                                                     })
                                                     .collect()
@@ -6494,6 +6787,545 @@ impl Render for RootView {
                                     ),
                             )
                         }),
+                )
+            })
+            // Mission Control / Tab Peek Grid View Overlay
+            .when(self.is_tab_overview_open, |this| {
+                let backdrop = gpui::hsla(0.0, 0.0, 0.0, 0.75);
+                let selected_idx = self.tab_overview_selected;
+                let font_fam = self.font_family.clone();
+
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(backdrop)
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(56.))
+                        .pb(px(24.))
+                        .px(px(24.))
+                        .gap_4()
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                            this.is_tab_overview_open = false;
+                            cx.notify();
+                        }))
+                        // Top Header Bar
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .w_full()
+                                .max_w(px(980.))
+                                .px(px(16.))
+                                .py(px(10.))
+                                .rounded(px(10.))
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.border)
+                                .shadow_lg()
+                                .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(render_icon(IconType::Layers, theme.accent, 16.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(14.))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(theme.foreground)
+                                                .child("Mission Control"),
+                                        )
+                                        .child(
+                                            div()
+                                                .px(px(6.))
+                                                .py(px(2.))
+                                                .rounded(px(4.))
+                                                .bg(theme.surface_raised)
+                                                .text_size(px(11.))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(theme.accent)
+                                                .child(format!("{} Tabs", self.tabs.len())),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_3()
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .text_color(theme.muted)
+                                                .child("← → ↑ ↓ Navigate • Enter Select • D Close • T New • ESC Exit"),
+                                        )
+                                        .child(
+                                            div()
+                                                .cursor(CursorStyle::PointingHand)
+                                                .p(px(4.))
+                                                .rounded(px(4.))
+                                                .hover(|s| s.bg(theme.hover))
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                    this.is_tab_overview_open = false;
+                                                    cx.notify();
+                                                }))
+                                                .child(render_icon(IconType::X, theme.muted, 14.0)),
+                                        ),
+                                ),
+                        )
+                        // Grid of Tab Thumbnails
+                        .child(
+                            div()
+                                .id("tab-overview-grid")
+                                .track_scroll(&self.tab_overview_scroll_handle)
+                                .flex()
+                                .flex_row()
+                                .flex_wrap()
+                                .justify_center()
+                                .w_full()
+                                .max_w(px(980.))
+                                .max_h(px(580.))
+                                .overflow_y_scroll()
+                                .gap_4()
+                                .p(px(4.))
+                                .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .children(
+                                    self.tabs.iter().enumerate().map(|(idx, tab)| {
+                                        let is_selected = idx == selected_idx;
+                                        let is_active_tab = idx == self.active_tab_idx;
+                                        let tab_id = tab.id;
+                                        let title = tab.custom_title.clone().unwrap_or_else(|| tab.title.clone());
+                                        let proc_name = tab.terminal.as_ref().and_then(|t| t.get_foreground_process_name()).unwrap_or_else(|| "terminal".to_string());
+                                        let (icon_type, _) = super::icons::get_deck_process_icon(&proc_name);
+                                        let preview_lines = tab.terminal.as_ref().map(|t| t.get_screen_preview_lines(7)).unwrap_or_default();
+                                        let split_count = tab.pane_tree.all_panes().len();
+                                        let branch_opt = tab.git_status.as_ref().map(|g| g.branch.clone());
+
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .w(px(290.))
+                                            .h(px(210.))
+                                            .rounded(px(10.))
+                                            .bg(theme.surface)
+                                            .border_2()
+                                            .border_color(if is_selected { theme.accent } else if is_active_tab { theme.accent.opacity(0.5) } else { theme.border })
+                                            .shadow_xl()
+                                            .cursor(CursorStyle::PointingHand)
+                                            .overflow_hidden()
+                                            .hover(|s| if !is_selected { s.border_color(theme.foreground.opacity(0.4)) } else { s })
+                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                                if this.tab_overview_selected != idx {
+                                                    this.tab_overview_selected = idx;
+                                                    cx.notify();
+                                                }
+                                            }))
+                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                                this.is_tab_overview_open = false;
+                                                this.select_tab(tab_id, cx);
+                                            }))
+                                            // Card Top Bar
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .px(px(10.))
+                                                    .py(px(7.))
+                                                    .bg(if is_selected { theme.accent.opacity(0.12) } else { theme.surface_raised })
+                                                    .border_b_1()
+                                                    .border_color(theme.border)
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .flex_row()
+                                                            .items_center()
+                                                            .gap_2()
+                                                            .child(render_icon(icon_type, theme.accent, 13.0))
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(11.5))
+                                                                    .font_weight(FontWeight::BOLD)
+                                                                    .text_color(theme.foreground)
+                                                                    .max_w(px(140.))
+                                                                    .overflow_hidden()
+                                                                    .child(title),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .flex_row()
+                                                            .items_center()
+                                                            .gap_1()
+                                                            .when(split_count > 1, |el| {
+                                                                el.child(
+                                                                    div()
+                                                                        .px(px(4.))
+                                                                        .py(px(1.))
+                                                                        .rounded(px(3.))
+                                                                        .bg(theme.black)
+                                                                        .text_size(px(9.5))
+                                                                        .text_color(theme.yellow)
+                                                                        .child(format!("{split_count} splits")),
+                                                                )
+                                                            })
+                                                            .child(
+                                                                div()
+                                                                    .px(px(5.))
+                                                                    .py(px(1.))
+                                                                    .rounded(px(3.))
+                                                                    .bg(if is_selected { theme.accent } else { theme.black })
+                                                                    .text_size(px(10.))
+                                                                    .font_weight(FontWeight::BOLD)
+                                                                    .text_color(if is_selected { theme.black } else { theme.muted })
+                                                                    .child(format!("#{}", idx + 1)),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .cursor(CursorStyle::PointingHand)
+                                                                    .p(px(2.))
+                                                                    .rounded(px(3.))
+                                                                    .hover(|s| s.bg(theme.hover))
+                                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
+                                                                        cx.stop_propagation();
+                                                                        this.close_tab(tab_id, window, cx);
+                                                                        if this.tabs.is_empty() {
+                                                                            this.is_tab_overview_open = false;
+                                                                        } else {
+                                                                            this.tab_overview_selected = this.tab_overview_selected.min(this.tabs.len() - 1);
+                                                                        }
+                                                                        cx.notify();
+                                                                    }))
+                                                                    .child(render_icon(IconType::X, theme.muted, 11.0)),
+                                                            ),
+                                                    ),
+                                            )
+                                            // Mini Terminal Preview
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .bg(theme.black.opacity(0.85))
+                                                    .p(px(8.))
+                                                    .font_family(font_fam.clone())
+                                                    .text_size(px(9.5))
+                                                    .text_color(theme.foreground.opacity(0.8))
+                                                    .overflow_hidden()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap(px(1.))
+                                                    .children(
+                                                        if preview_lines.is_empty() {
+                                                            vec![
+                                                                div()
+                                                                    .text_color(theme.muted)
+                                                                    .child("~ (empty buffer)")
+                                                            ]
+                                                        } else {
+                                                            preview_lines
+                                                                .into_iter()
+                                                                .map(|l| {
+                                                                    div()
+                                                                        .max_w(px(270.))
+                                                                        .overflow_hidden()
+                                                                        .child(if l.is_empty() { " ".to_string() } else { l })
+                                                                })
+                                                                .collect()
+                                                        }
+                                                    ),
+                                            )
+                                            // Card Bottom Status Bar
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .px(px(8.))
+                                                    .py(px(4.))
+                                                    .bg(theme.surface)
+                                                    .border_t_1()
+                                                    .border_color(theme.border)
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(9.5))
+                                                            .text_color(theme.muted)
+                                                            .child(format!("cmd: {}", proc_name)),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(9.5))
+                                                            .font_weight(FontWeight::MEDIUM)
+                                                            .text_color(theme.accent)
+                                                            .child(branch_opt.map(|b| format!("🌿 {b}")).unwrap_or_else(|| "local".to_string())),
+                                                    ),
+                                            )
+                                    })
+                                )
+                                // Plus Card to Add Tab
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .justify_center()
+                                        .w(px(290.))
+                                        .h(px(210.))
+                                        .rounded(px(10.))
+                                        .bg(theme.surface.opacity(0.5))
+                                        .border_2()
+                                        .border_color(theme.border)
+                                        .cursor(CursorStyle::PointingHand)
+                                        .hover(|s| s.bg(theme.hover).border_color(theme.accent))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, window, cx| {
+                                            this.is_tab_overview_open = false;
+                                            this.create_tab(window, cx);
+                                        }))
+                                        .child(render_icon(IconType::Plus, theme.accent, 28.0))
+                                        .child(
+                                            div()
+                                                .pt(px(6.))
+                                                .text_size(px(12.))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(theme.foreground)
+                                                .child("New Tab"),
+                                        ),
+                                ),
+                        ),
+                )
+            })
+            // Global Multi-Tab Search Overlay
+            .when(self.is_global_search_open, |this| {
+                let backdrop = gpui::hsla(0.0, 0.0, 0.0, 0.65);
+                let selected_idx = self.global_search_selected;
+                let results_count = self.global_search_results.len();
+
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(backdrop)
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(60.))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                            this.is_global_search_open = false;
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .w(px(580.))
+                                .rounded(px(10.))
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.border)
+                                .shadow_xl()
+                                .flex()
+                                .flex_col()
+                                .overflow_hidden()
+                                .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                // Input Box Header
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .px(px(12.))
+                                        .py(px(10.))
+                                        .border_b_1()
+                                        .border_color(theme.border)
+                                        .child(render_icon(IconType::Search, theme.accent, 14.0))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_size(px(13.))
+                                                .text_color(if self.global_search_query.is_empty() {
+                                                    theme.muted
+                                                } else {
+                                                    theme.foreground
+                                                })
+                                                .child(if self.global_search_query.is_empty() {
+                                                    "Search in all open tabs and splits (⌘⇧F)...".to_string()
+                                                } else {
+                                                    format!("{}|", self.global_search_query)
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .px(px(6.))
+                                                .py(px(2.))
+                                                .rounded(px(3.))
+                                                .bg(theme.surface_raised)
+                                                .text_size(px(10.))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(if results_count > 0 { theme.accent } else { theme.muted })
+                                                .child(format!("{results_count} results")),
+                                        )
+                                        .child(
+                                            div()
+                                                .px(px(5.))
+                                                .py(px(2.))
+                                                .rounded(px(3.))
+                                                .bg(theme.surface_raised)
+                                                .text_size(px(10.))
+                                                .text_color(theme.muted)
+                                                .child("ESC"),
+                                        ),
+                                )
+                                // Results List
+                                .child(
+                                    div()
+                                        .id("global-search-results-list")
+                                        .track_scroll(&self.global_search_scroll_handle)
+                                        .flex()
+                                        .flex_col()
+                                        .max_h(px(340.))
+                                        .overflow_y_scroll()
+                                        .p(px(4.))
+                                        .gap_1()
+                                        .children(
+                                            if self.global_search_query.trim().is_empty() {
+                                                vec![
+                                                    div()
+                                                        .p(px(20.))
+                                                        .flex()
+                                                        .flex_col()
+                                                        .items_center()
+                                                        .gap_1()
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(12.))
+                                                                .text_color(theme.foreground)
+                                                                .child("Find text across all tabs"),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(11.))
+                                                                .text_color(theme.muted)
+                                                                .child("Type any query to search the full scrollback of every active terminal."),
+                                                        ),
+                                                ]
+                                            } else if self.global_search_results.is_empty() {
+                                                vec![
+                                                    div()
+                                                        .p(px(16.))
+                                                        .flex()
+                                                        .flex_col()
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(12.))
+                                                                .text_color(theme.muted)
+                                                                .child("No matches found across active tabs"),
+                                                        ),
+                                                ]
+                                            } else {
+                                                self.global_search_results
+                                                    .iter()
+                                                    .enumerate()
+                                                    .map(|(idx, res)| {
+                                                        let is_selected = idx == selected_idx;
+                                                        let tab_id = res.tab_id;
+                                                        let offset = res.offset;
+                                                        let pane_id = res.pane_id;
+                                                        let proc_name = res.process_name.clone().unwrap_or_else(|| "sh".to_string());
+                                                        let (icon_type, _) = super::icons::get_deck_process_icon(&proc_name);
+
+                                                        div()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .px(px(10.))
+                                                            .py(px(6.))
+                                                            .rounded(px(6.))
+                                                            .bg(if is_selected { theme.accent } else { theme.surface })
+                                                            .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                                                if this.global_search_selected != idx {
+                                                                    this.global_search_selected = idx;
+                                                                    cx.notify();
+                                                                }
+                                                            }))
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                                                this.is_global_search_open = false;
+                                                                this.select_tab(tab_id, cx);
+                                                                if let Some(active_tab) = this.tabs.iter().find(|t| t.id == tab_id) {
+                                                                    if pane_id > 0 {
+                                                                        if let Some(pane) = active_tab.pane_tree.find_pane(pane_id) {
+                                                                            if let Some(ref t) = pane.terminal {
+                                                                                t.scroll_to_offset(offset);
+                                                                            }
+                                                                        }
+                                                                    } else if let Some(ref t) = active_tab.terminal {
+                                                                        t.scroll_to_offset(offset);
+                                                                    }
+                                                                }
+                                                                cx.notify();
+                                                            }))
+                                                            .child(
+                                                                div()
+                                                                    .flex()
+                                                                    .flex_row()
+                                                                    .items_center()
+                                                                    .justify_between()
+                                                                    .child(
+                                                                        div()
+                                                                            .flex()
+                                                                            .flex_row()
+                                                                            .items_center()
+                                                                            .gap_1()
+                                                                            .child(render_icon(icon_type, if is_selected { theme.black } else { theme.accent }, 12.0))
+                                                                            .child(
+                                                                                div()
+                                                                                    .text_size(px(11.5))
+                                                                                    .font_weight(FontWeight::BOLD)
+                                                                                    .text_color(if is_selected { theme.black } else { theme.foreground })
+                                                                                    .child(format!("Tab #{}: {}", res.tab_idx + 1, res.tab_title)),
+                                                                            ),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .px(px(4.))
+                                                                            .py(px(1.))
+                                                                            .rounded(px(3.))
+                                                                            .bg(if is_selected { theme.black } else { theme.surface_raised })
+                                                                            .text_size(px(9.5))
+                                                                            .text_color(if is_selected { theme.accent } else { theme.muted })
+                                                                            .child(format!("Line {}", res.line_index)),
+                                                                    ),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .pt(px(2.))
+                                                                    .text_size(px(11.))
+                                                                    .font_family(self.font_family.clone())
+                                                                    .text_color(if is_selected { theme.black.opacity(0.9) } else { theme.muted })
+                                                                    .child(res.line_content.clone()),
+                                                            )
+                                                    })
+                                                    .collect()
+                                            }
+                                        ),
+                                ),
+                        ),
                 )
             })
             .when(self.is_update_modal_open, |this| {

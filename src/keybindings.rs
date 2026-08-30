@@ -5,7 +5,42 @@
 //! config reload we re-parse the map and merge on top of the defaults.
 
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum KeybindingPreset {
+    #[default]
+    Default,
+    Ghostty,
+    Tmux,
+    ITerm2,
+}
+
+impl std::fmt::Display for KeybindingPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => write!(f, "default"),
+            Self::Ghostty => write!(f, "ghostty"),
+            Self::Tmux => write!(f, "tmux"),
+            Self::ITerm2 => write!(f, "iterm2"),
+        }
+    }
+}
+
+impl std::str::FromStr for KeybindingPreset {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "default" => Ok(Self::Default),
+            "ghostty" => Ok(Self::Ghostty),
+            "tmux" => Ok(Self::Tmux),
+            "iterm2" | "iterm" => Ok(Self::ITerm2),
+            _ => Ok(Self::Default),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeyCombo {
@@ -103,6 +138,8 @@ pub enum Action {
     FocusLeft,
     FocusTop,
     ClosePane,
+    GlobalSearch,
+    TabOverview,
     Quit,
 }
 
@@ -111,7 +148,7 @@ pub struct KeyBindingResolver {
 }
 
 impl KeyBindingResolver {
-    pub fn with_defaults() -> Self {
+    pub fn for_preset(preset: KeybindingPreset) -> Self {
         let mut b = HashMap::new();
         let mut insert = |s: &str, a: Action| {
             if let Some(c) = parse_combo(s) {
@@ -122,99 +159,209 @@ impl KeyBindingResolver {
         if cfg!(target_os = "macos") {
             insert("super+c", Action::Copy);
             insert("super+v", Action::Paste);
-            insert("super+t", Action::NewTab);
-            insert("super+w", Action::ClosePane);
-            insert("super+shift+w", Action::CloseTab);
-            insert("super+b", Action::ToggleTabSidebar);
-            insert("super+n", Action::NewWindow);
-            insert("super+f", Action::OpenSearch);
-            insert("super+s", Action::OpenSettings);
-            insert("super+comma", Action::OpenSettings);
-            insert("super+r", Action::ReloadConfig);
-            insert("super+p", Action::CommandPalette);
-            insert("super+o", Action::SshManager);
-            insert("super+j", Action::ProjectJumper);
-            insert("super+alt+w", Action::WorktreePicker);
-            insert("super+k", Action::ClearScrollback);
-            insert("ctrl+super+f", Action::ToggleFullscreen);
-            insert("f11", Action::ToggleFullscreen);
-            insert("super+q", Action::Quit);
+            insert("shift+insert", Action::Paste);
             insert("super+equal", Action::IncreaseFontSize);
             insert("super+plus", Action::IncreaseFontSize);
             insert("super+shift+plus", Action::IncreaseFontSize);
             insert("super+shift+equal", Action::IncreaseFontSize);
             insert("super+minus", Action::DecreaseFontSize);
             insert("super+0", Action::ResetFontSize);
-            insert("super+shift+]", Action::NextTab);
-            insert("super+shift+[", Action::PrevTab);
-            insert("ctrl+tab", Action::NextTab);
-            insert("ctrl+shift+tab", Action::PrevTab);
-            insert("super+shift+up", Action::PrevPrompt);
-            insert("super+shift+h", Action::PrevPrompt);
-            insert("super+shift+down", Action::NextPrompt);
-            for n in 1..=9u8 {
-                insert(&format!("super+{n}"), Action::SelectTab(n));
-                insert(&format!("alt+{n}"), Action::SelectTab(n));
-            }
-            insert("ctrl+shift+c", Action::Copy);
-            insert("ctrl+shift+v", Action::Paste);
-            insert("shift+insert", Action::Paste);
-            insert("ctrl+shift+t", Action::NewTab);
-            insert("ctrl+shift+w", Action::ClosePane);
-            insert("super+d", Action::SplitRight);
-            insert("super+shift+d", Action::SplitDown);
-            insert("super+alt+left", Action::FocusLeft);
-            insert("super+alt+right", Action::FocusRight);
-            insert("super+alt+up", Action::FocusTop);
-            insert("super+alt+down", Action::FocusDown);
+            insert("super+q", Action::Quit);
         } else {
-            insert("ctrl+shift+t", Action::NewTab);
-            insert("ctrl+shift+w", Action::ClosePane);
-            insert("ctrl+shift+q", Action::CloseTab);
-            insert("ctrl+b", Action::ToggleTabSidebar);
-            insert("ctrl+shift+b", Action::ToggleTabSidebar);
-            insert("ctrl+shift+n", Action::NewWindow);
             insert("ctrl+shift+c", Action::Copy);
             insert("ctrl+shift+v", Action::Paste);
             insert("shift+insert", Action::Paste);
-            insert("ctrl+shift+e", Action::SplitRight);
-            insert("ctrl+shift+d", Action::SplitDown);
-            insert("alt+left", Action::FocusLeft);
-            insert("alt+right", Action::FocusRight);
-            insert("alt+up", Action::FocusTop);
-            insert("alt+down", Action::FocusDown);
-            insert("ctrl+f", Action::OpenSearch);
-            insert("ctrl+comma", Action::OpenSettings);
-            insert("ctrl+shift+s", Action::OpenSettings);
-            insert("ctrl+shift+r", Action::ReloadConfig);
-            insert("ctrl+shift+p", Action::CommandPalette);
-            insert("ctrl+shift+o", Action::SshManager);
-            insert("ctrl+shift+j", Action::ProjectJumper);
-            insert("ctrl+alt+w", Action::WorktreePicker);
-            insert("ctrl+shift+k", Action::ClearScrollback);
-            insert("f11", Action::ToggleFullscreen);
-            insert("alt+f4", Action::Quit);
-            insert("ctrl+q", Action::Quit);
-            insert("f5", Action::ReloadConfig);
-            insert("f10", Action::ReloadConfig);
             insert("ctrl+equal", Action::IncreaseFontSize);
             insert("ctrl+plus", Action::IncreaseFontSize);
             insert("ctrl+shift+plus", Action::IncreaseFontSize);
             insert("ctrl+shift+equal", Action::IncreaseFontSize);
             insert("ctrl+minus", Action::DecreaseFontSize);
             insert("ctrl+0", Action::ResetFontSize);
-            insert("ctrl+tab", Action::NextTab);
-            insert("ctrl+page_down", Action::NextTab);
-            insert("ctrl+shift+tab", Action::PrevTab);
-            insert("ctrl+page_up", Action::PrevTab);
-            insert("ctrl+shift+up", Action::PrevPrompt);
-            insert("ctrl+shift+h", Action::PrevPrompt);
-            insert("ctrl+shift+down", Action::NextPrompt);
-            for n in 1..=9u8 {
-                insert(&format!("alt+{n}"), Action::SelectTab(n));
+            insert("alt+f4", Action::Quit);
+            insert("ctrl+q", Action::Quit);
+        }
+
+        match preset {
+            KeybindingPreset::Default => {
+                if cfg!(target_os = "macos") {
+                    insert("super+t", Action::NewTab);
+                    insert("super+w", Action::ClosePane);
+                    insert("super+shift+w", Action::CloseTab);
+                    insert("super+b", Action::ToggleTabSidebar);
+                    insert("super+n", Action::NewWindow);
+                    insert("super+f", Action::OpenSearch);
+                    insert("super+s", Action::OpenSettings);
+                    insert("super+comma", Action::OpenSettings);
+                    insert("super+r", Action::ReloadConfig);
+                    insert("super+p", Action::CommandPalette);
+                    insert("super+o", Action::SshManager);
+                    insert("super+j", Action::ProjectJumper);
+                    insert("super+alt+w", Action::WorktreePicker);
+                    insert("super+k", Action::ClearScrollback);
+                    insert("ctrl+super+f", Action::ToggleFullscreen);
+                    insert("f11", Action::ToggleFullscreen);
+                    insert("super+shift+]", Action::NextTab);
+                    insert("super+shift+[", Action::PrevTab);
+                    insert("ctrl+tab", Action::NextTab);
+                    insert("ctrl+shift+tab", Action::PrevTab);
+                    insert("super+shift+up", Action::PrevPrompt);
+                    insert("super+shift+h", Action::PrevPrompt);
+                    insert("super+shift+down", Action::NextPrompt);
+                    for n in 1..=9u8 {
+                        insert(&format!("super+{n}"), Action::SelectTab(n));
+                        insert(&format!("alt+{n}"), Action::SelectTab(n));
+                    }
+                    insert("ctrl+shift+c", Action::Copy);
+                    insert("ctrl+shift+v", Action::Paste);
+                    insert("ctrl+shift+t", Action::NewTab);
+                    insert("ctrl+shift+w", Action::ClosePane);
+                    insert("super+d", Action::SplitRight);
+                    insert("super+shift+d", Action::SplitDown);
+                    insert("super+alt+left", Action::FocusLeft);
+                    insert("super+alt+right", Action::FocusRight);
+                    insert("super+alt+up", Action::FocusTop);
+                    insert("super+alt+down", Action::FocusDown);
+                    insert("super+shift+f", Action::GlobalSearch);
+                    insert("super+shift+o", Action::TabOverview);
+                } else {
+                    insert("ctrl+shift+t", Action::NewTab);
+                    insert("ctrl+shift+w", Action::ClosePane);
+                    insert("ctrl+shift+q", Action::CloseTab);
+                    insert("ctrl+b", Action::ToggleTabSidebar);
+                    insert("ctrl+shift+b", Action::ToggleTabSidebar);
+                    insert("ctrl+shift+n", Action::NewWindow);
+                    insert("ctrl+shift+e", Action::SplitRight);
+                    insert("ctrl+shift+d", Action::SplitDown);
+                    insert("alt+left", Action::FocusLeft);
+                    insert("alt+right", Action::FocusRight);
+                    insert("alt+up", Action::FocusTop);
+                    insert("alt+down", Action::FocusDown);
+                    insert("ctrl+f", Action::OpenSearch);
+                    insert("ctrl+shift+f", Action::GlobalSearch);
+                    insert("ctrl+shift+m", Action::TabOverview);
+                    insert("ctrl+comma", Action::OpenSettings);
+                    insert("ctrl+shift+s", Action::OpenSettings);
+                    insert("ctrl+shift+r", Action::ReloadConfig);
+                    insert("ctrl+shift+p", Action::CommandPalette);
+                    insert("ctrl+shift+o", Action::SshManager);
+                    insert("ctrl+shift+j", Action::ProjectJumper);
+                    insert("ctrl+alt+w", Action::WorktreePicker);
+                    insert("ctrl+shift+k", Action::ClearScrollback);
+                    insert("f11", Action::ToggleFullscreen);
+                    insert("f5", Action::ReloadConfig);
+                    insert("f10", Action::ReloadConfig);
+                    insert("ctrl+tab", Action::NextTab);
+                    insert("ctrl+page_down", Action::NextTab);
+                    insert("ctrl+shift+tab", Action::PrevTab);
+                    insert("ctrl+page_up", Action::PrevTab);
+                    insert("ctrl+shift+up", Action::PrevPrompt);
+                    insert("ctrl+shift+h", Action::PrevPrompt);
+                    insert("ctrl+shift+down", Action::NextPrompt);
+                    for n in 1..=9u8 {
+                        insert(&format!("alt+{n}"), Action::SelectTab(n));
+                    }
+                }
+            }
+            KeybindingPreset::Ghostty => {
+                if cfg!(target_os = "macos") {
+                    insert("super+t", Action::NewTab);
+                    insert("super+w", Action::ClosePane);
+                    insert("super+shift+w", Action::CloseTab);
+                    insert("super+n", Action::NewWindow);
+                    insert("super+d", Action::SplitRight);
+                    insert("super+shift+d", Action::SplitDown);
+                    insert("super+alt+left", Action::FocusLeft);
+                    insert("super+alt+right", Action::FocusRight);
+                    insert("super+alt+up", Action::FocusTop);
+                    insert("super+alt+down", Action::FocusDown);
+                    insert("super+shift+j", Action::FocusDown);
+                    insert("super+shift+k", Action::FocusTop);
+                    insert("super+comma", Action::OpenSettings);
+                    insert("super+shift+p", Action::CommandPalette);
+                    insert("super+k", Action::ClearScrollback);
+                    insert("super+f", Action::OpenSearch);
+                    insert("super+shift+f", Action::GlobalSearch);
+                    insert("super+shift+o", Action::TabOverview);
+                    insert("ctrl+super+f", Action::ToggleFullscreen);
+                    insert("super+enter", Action::ToggleFullscreen);
+                    insert("super+shift+]", Action::NextTab);
+                    insert("super+shift+[", Action::PrevTab);
+                    for n in 1..=9u8 {
+                        insert(&format!("super+{n}"), Action::SelectTab(n));
+                    }
+                } else {
+                    insert("ctrl+shift+t", Action::NewTab);
+                    insert("ctrl+shift+w", Action::ClosePane);
+                    insert("ctrl+shift+q", Action::CloseTab);
+                    insert("ctrl+shift+n", Action::NewWindow);
+                    insert("ctrl+shift+o", Action::SplitRight);
+                    insert("ctrl+shift+e", Action::SplitDown);
+                    insert("ctrl+shift+left", Action::FocusLeft);
+                    insert("ctrl+shift+right", Action::FocusRight);
+                    insert("ctrl+shift+up", Action::FocusTop);
+                    insert("ctrl+shift+down", Action::FocusDown);
+                    insert("ctrl+comma", Action::OpenSettings);
+                    insert("ctrl+shift+p", Action::CommandPalette);
+                    insert("ctrl+shift+k", Action::ClearScrollback);
+                    insert("ctrl+shift+f", Action::GlobalSearch);
+                    insert("ctrl+shift+m", Action::TabOverview);
+                    insert("f11", Action::ToggleFullscreen);
+                    insert("ctrl+tab", Action::NextTab);
+                    insert("ctrl+shift+tab", Action::PrevTab);
+                }
+            }
+            KeybindingPreset::Tmux => {
+                insert("ctrl+b", Action::ToggleTabSidebar);
+                insert("ctrl+t", Action::NewTab);
+                insert("ctrl+w", Action::TabOverview);
+                insert("ctrl+d", Action::SplitRight);
+                insert("ctrl+shift+d", Action::SplitDown);
+                insert("alt+left", Action::FocusLeft);
+                insert("alt+right", Action::FocusRight);
+                insert("alt+up", Action::FocusTop);
+                insert("alt+down", Action::FocusDown);
+                insert("alt+h", Action::FocusLeft);
+                insert("alt+l", Action::FocusRight);
+                insert("alt+k", Action::FocusTop);
+                insert("alt+j", Action::FocusDown);
+                insert("ctrl+k", Action::ClearScrollback);
+                insert("ctrl+f", Action::OpenSearch);
+                insert("ctrl+shift+f", Action::GlobalSearch);
+                insert("ctrl+p", Action::CommandPalette);
+                insert("f11", Action::ToggleFullscreen);
+                for n in 1..=9u8 {
+                    insert(&format!("alt+{n}"), Action::SelectTab(n));
+                }
+            }
+            KeybindingPreset::ITerm2 => {
+                insert("super+t", Action::NewTab);
+                insert("super+w", Action::ClosePane);
+                insert("super+shift+w", Action::CloseTab);
+                insert("super+d", Action::SplitRight);
+                insert("super+shift+d", Action::SplitDown);
+                insert("super+alt+left", Action::FocusLeft);
+                insert("super+alt+right", Action::FocusRight);
+                insert("super+alt+up", Action::FocusTop);
+                insert("super+alt+down", Action::FocusDown);
+                insert("super+]", Action::NextTab);
+                insert("super+[", Action::PrevTab);
+                insert("super+f", Action::OpenSearch);
+                insert("super+shift+f", Action::GlobalSearch);
+                insert("super+alt+o", Action::TabOverview);
+                insert("super+k", Action::ClearScrollback);
+                insert("super+comma", Action::OpenSettings);
+                insert("super+shift+o", Action::SshManager);
+                for n in 1..=9u8 {
+                    insert(&format!("super+{n}"), Action::SelectTab(n));
+                }
             }
         }
+
         Self { bindings: b }
+    }
+
+    pub fn with_defaults() -> Self {
+        Self::for_preset(KeybindingPreset::Default)
     }
 
     pub fn apply_user(&mut self, user: HashMap<String, String>) {
@@ -328,6 +475,8 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "focus_left" => Some(Action::FocusLeft),
         "focus_top" => Some(Action::FocusTop),
         "close_pane" => Some(Action::ClosePane),
+        "global_search" | "search_all" | "multi_tab_search" => Some(Action::GlobalSearch),
+        "tab_overview" | "mission_control" | "tab_peek" => Some(Action::TabOverview),
         "quit" => Some(Action::Quit),
         _ => None,
     }
@@ -335,8 +484,8 @@ pub fn parse_action(s: &str) -> Option<Action> {
 
 pub static RESOLVER: std::sync::OnceLock<RwLock<KeyBindingResolver>> = std::sync::OnceLock::new();
 
-pub fn init_resolver(user: HashMap<String, String>) {
-    let mut r = KeyBindingResolver::with_defaults();
+pub fn init_resolver(user: HashMap<String, String>, preset: Option<KeybindingPreset>) {
+    let mut r = KeyBindingResolver::for_preset(preset.unwrap_or_default());
     r.apply_user(user);
     let lock = RESOLVER.get_or_init(|| RwLock::new(KeyBindingResolver { bindings: HashMap::new() }));
     *lock.write() = r;
@@ -385,4 +534,21 @@ pub fn combo_from_key(
         _ => return None,
     };
     Some(KeyCombo { ctrl, shift, alt, logo, key })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_preset_resolvers() {
+        let ghostty = KeyBindingResolver::for_preset(KeybindingPreset::Ghostty);
+        assert!(!ghostty.bindings.is_empty());
+
+        let tmux = KeyBindingResolver::for_preset(KeybindingPreset::Tmux);
+        assert!(!tmux.bindings.is_empty());
+
+        let iterm = KeyBindingResolver::for_preset(KeybindingPreset::ITerm2);
+        assert!(!iterm.bindings.is_empty());
+    }
 }

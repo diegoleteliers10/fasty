@@ -234,7 +234,7 @@ impl TerminalState {
         let rows = ((viewport_height as usize) / cell_h).max(24);
 
         let mut config = AlacrittyConfig::default();
-        config.scrolling_history = scrollback.min(1000);
+        config.scrolling_history = scrollback.clamp(500, 100_000);
         let size = TermSize::new(cols, rows);
 
         let pty_system = native_pty_system();
@@ -318,6 +318,7 @@ impl TerminalState {
                  __fastty_prompt() {\n\
                  \techo -ne \"\\e]133;D;$?\\e\\\\\"\n\
                  \techo -ne \"\\e]133;A\\e\\\\\"\n\
+                 \techo -ne \"\\e[?1000l\\e[?1002l\\e[?1003l\\e[?1006l\"\n\
                  }\n\
                  PROMPT_COMMAND=\"__fastty_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"\n\
                  trap '__fastty_cmd_start' DEBUG\n",
@@ -335,6 +336,7 @@ impl TerminalState {
                  __fastty_precmd() {\n\
                  \techo -ne \"\\e]133;D;$?\\e\\\\\"\n\
                  \techo -ne \"\\e]133;A\\e\\\\\"\n\
+                 \techo -ne \"\\e[?1000l\\e[?1002l\\e[?1003l\\e[?1006l\"\n\
                  }\n\
                  add-zsh-hook preexec __fastty_preexec\n\
                  add-zsh-hook precmd __fastty_precmd\n",
@@ -352,6 +354,7 @@ impl TerminalState {
                  end\n\
                  function __fastty_prompt --on-event fish_prompt\n\
                  \techo -ne \"\\e]133;A\\e\\\\\"\n\
+                 \techo -ne \"\\e[?1000l\\e[?1002l\\e[?1003l\\e[?1006l\"\n\
                  end\n",
             );
 
@@ -509,9 +512,14 @@ impl TerminalState {
             }
             let mut pending_notifications: std::collections::HashMap<String, PendingNotification> = std::collections::HashMap::new();
 
-            let mut handle_cmd = |cmd: OscCommand, cursor_line: i32, screen_lines: i32, base: u64| {
+            let mut handle_cmd = |cmd: OscCommand, cursor_line: i32, screen_lines: i32, base: u64, term: &mut alacritty_terminal::Term<EventListenerProxy>, parser: &mut Processor| {
                 match cmd {
                     OscCommand::PromptStarted => {
+                        // Reset mouse tracking modes on prompt start to prevent leaked escape codes if a child exited uncleanly
+                        for &b in b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l" {
+                            parser.advance(term, b);
+                        }
+
                         let scrolled = (base as i64 - screen_lines as i64).max(0);
                         let absolute_line = (scrolled + cursor_line as i64).max(0) as u64;
                         {
@@ -812,7 +820,7 @@ impl TerminalState {
                                             let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
                                             let screen_lines = term_locked.grid().screen_lines() as i32;
                                             let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
-                                            handle_cmd(cmd, cursor_line, screen_lines, base);
+                                            handle_cmd(cmd, cursor_line, screen_lines, base, &mut *term_locked, &mut parser);
                                         }
                                         seq_state = SequenceParseState::Normal;
                                     } else if byte == 0x1b {
@@ -830,7 +838,7 @@ impl TerminalState {
                                             let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
                                             let screen_lines = term_locked.grid().screen_lines() as i32;
                                             let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
-                                            handle_cmd(cmd, cursor_line, screen_lines, base);
+                                            handle_cmd(cmd, cursor_line, screen_lines, base, &mut *term_locked, &mut parser);
                                         }
                                         seq_state = SequenceParseState::Normal;
                                     } else {
@@ -960,6 +968,22 @@ impl TerminalState {
         get_process_cwd(pid)
     }
 
+    pub fn get_foreground_process_name(&self) -> Option<String> {
+        let pid = self.shell_pid?;
+        #[cfg(target_os = "macos")]
+        {
+            get_foreground_process_name_macos(pid)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            get_foreground_process_name_linux(pid)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            get_foreground_process_name_other(pid)
+        }
+    }
+
     pub fn is_process_running(&self) -> bool {
         let Some(pid) = self.shell_pid else { return false; };
         #[cfg(target_os = "macos")]
@@ -984,7 +1008,7 @@ impl TerminalState {
 
     pub fn update_scrollback(&self, scrollback: usize) {
         let mut term = self.term.lock();
-        term.grid_mut().update_history(scrollback.min(3000));
+        term.grid_mut().update_history(scrollback.clamp(500, 100_000));
     }
 
     pub fn is_mouse_mode_enabled(&self) -> bool {
@@ -1300,6 +1324,95 @@ impl TerminalState {
         matches
     }
 
+    pub fn search_snippets(&self, query: &str, max_results: usize) -> Vec<SearchSnippet> {
+        if query.trim().is_empty() {
+            return Vec::new();
+        }
+        use alacritty_terminal::index::Line;
+        let query_lower = query.to_lowercase();
+        let term = self.term.lock();
+        let grid = term.grid();
+        let history = grid.history_size();
+        let screen_lines = grid.screen_lines();
+        if screen_lines == 0 {
+            return Vec::new();
+        }
+        let mut snippets = Vec::new();
+
+        for line_i in -(history as i32)..(screen_lines as i32) {
+            let row = &grid[Line(line_i)];
+            let mut line_str = String::new();
+            for cell in row.into_iter() {
+                let c = cell.c;
+                if c != '\0' {
+                    line_str.push(c);
+                }
+            }
+            let trimmed = line_str.trim_end();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let trimmed_lower = trimmed.to_lowercase();
+            let is_match = if trimmed_lower.contains(&query_lower) {
+                true
+            } else if query_lower.len() >= 3 {
+                let mut p_idx = 0;
+                let q_chars: Vec<char> = query_lower.chars().collect();
+                for ch in trimmed_lower.chars() {
+                    if p_idx < q_chars.len() && ch == q_chars[p_idx] {
+                        p_idx += 1;
+                    }
+                }
+                p_idx == q_chars.len()
+            } else {
+                false
+            };
+
+            if is_match {
+                let offset = if line_i < 0 {
+                    (-line_i) as usize
+                } else {
+                    0
+                };
+                snippets.push(SearchSnippet {
+                    offset,
+                    line_index: line_i,
+                    text: trimmed.to_string(),
+                });
+                if snippets.len() >= max_results {
+                    break;
+                }
+            }
+        }
+        snippets
+    }
+
+    pub fn get_screen_preview_lines(&self, max_lines: usize) -> Vec<String> {
+        use alacritty_terminal::index::Line;
+        let term = self.term.lock();
+        let grid = term.grid();
+        let screen_lines = grid.screen_lines();
+        if screen_lines == 0 {
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        let count = screen_lines.min(max_lines);
+        for line_i in 0..count {
+            let row = &grid[Line(line_i as i32)];
+            let mut line_str = String::new();
+            for cell in row.into_iter() {
+                let c = cell.c;
+                if c != '\0' {
+                    line_str.push(c);
+                } else {
+                    line_str.push(' ');
+                }
+            }
+            lines.push(line_str.trim_end().to_string());
+        }
+        lines
+    }
+
     pub fn render_generation(&self) -> u64 {
         self.render_generation.load(Ordering::Relaxed)
     }
@@ -1307,6 +1420,13 @@ impl TerminalState {
     pub fn term(&self) -> &Arc<ParkingMutex<alacritty_terminal::term::Term<EventListenerProxy>>> {
         &self.term
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchSnippet {
+    pub offset: usize,
+    pub line_index: i32,
+    pub text: String,
 }
 
 /// Decode a `file://` URL or plain directory path to a local filesystem path.
@@ -1781,6 +1901,71 @@ fn get_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
+fn get_process_name_macos(pid: u32) -> Option<String> {
+    use std::os::raw::{c_int, c_void};
+    extern "C" {
+        fn proc_name(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
+    }
+    let mut name_buf = [0u8; 256];
+    let res = unsafe {
+        proc_name(
+            pid as c_int,
+            name_buf.as_mut_ptr() as *mut c_void,
+            name_buf.len() as u32,
+        )
+    };
+    if res > 0 {
+        let name_bytes = &name_buf[..res as usize];
+        // Strip trailing null bytes if present
+        let clean_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+        let name = String::from_utf8_lossy(&name_bytes[..clean_len]).trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn get_foreground_process_name_macos(shell_pid: u32) -> Option<String> {
+    use std::os::raw::{c_int, c_uint, c_void};
+
+    extern "C" {
+        fn proc_listpids(
+            proc_type: c_uint,
+            proc_type_arg: c_uint,
+            buffer: *mut c_void,
+            buffersize: c_int,
+        ) -> c_int;
+    }
+    const PROC_PPID_ONLY: c_uint = 6;
+
+    let mut pids = [0i32; 64];
+    let res = unsafe {
+        proc_listpids(
+            PROC_PPID_ONLY,
+            shell_pid as c_uint,
+            pids.as_mut_ptr() as *mut c_void,
+            std::mem::size_of_val(&pids) as c_int,
+        )
+    };
+    if res > 0 {
+        let count = (res as usize) / std::mem::size_of::<i32>();
+        for &p in pids[..count].iter().rev() {
+            if p > 0 && p != (shell_pid as i32) {
+                if let Some(child_name) = get_foreground_process_name_macos(p as u32) {
+                    return Some(child_name);
+                }
+                if let Some(name) = get_process_name_macos(p as u32) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    get_process_name_macos(shell_pid)
+}
+
+#[cfg(target_os = "macos")]
 fn has_active_child_process_macos(shell_pid: u32) -> bool {
     use std::os::raw::{c_int, c_uint, c_void};
 
@@ -1820,6 +2005,33 @@ fn get_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
+fn get_foreground_process_name_linux(shell_pid: u32) -> Option<String> {
+    if let Ok(content) = std::fs::read_to_string(format!("/proc/{}/task/{}/children", shell_pid, shell_pid)) {
+        let children: Vec<&str> = content.split_whitespace().collect();
+        if let Some(&child) = children.last() {
+            if let Ok(child_pid) = child.parse::<u32>() {
+                if let Some(name) = get_foreground_process_name_linux(child_pid) {
+                    return Some(name);
+                }
+                if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", child_pid)) {
+                    let trimmed = comm.trim().to_string();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed);
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", shell_pid)) {
+        let trimmed = comm.trim().to_string();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn has_active_child_process_linux(shell_pid: u32) -> bool {
     if let Ok(content) = std::fs::read_to_string(format!("/proc/{}/task/{}/children", shell_pid, shell_pid)) {
         return !content.trim().is_empty();
@@ -1829,6 +2041,11 @@ fn has_active_child_process_linux(shell_pid: u32) -> bool {
 
 #[cfg(target_os = "windows")]
 fn get_process_cwd(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn get_foreground_process_name_other(_shell_pid: u32) -> Option<String> {
     None
 }
 
@@ -1956,5 +2173,71 @@ mod tests {
         // OSC 4 - Palette Query
         let cmd = parse_osc(b"4;2;?", &mut cmd_start).unwrap();
         assert!(matches!(cmd, super::OscCommand::PaletteQuery { index: 2 }));
+    }
+
+    #[test]
+    fn test_mouse_reporting_reset_sequence() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::test::TermSize;
+        use alacritty_terminal::term::{Config, Term, TermMode};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let size = TermSize::new(80, 24);
+        let mut term: Term<VoidListener> = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+
+        // Enable mouse tracking
+        for &b in b"\x1b[?1000h\x1b[?1006h" {
+            parser.advance(&mut term, b);
+        }
+        assert!(term.mode().contains(TermMode::MOUSE_REPORT_CLICK));
+        assert!(term.mode().contains(TermMode::SGR_MOUSE));
+
+        // Reset mouse tracking
+        for &b in b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l" {
+            parser.advance(&mut term, b);
+        }
+        assert!(!term.mode().contains(TermMode::MOUSE_REPORT_CLICK));
+        assert!(!term.mode().contains(TermMode::SGR_MOUSE));
+        assert!(!term.mode().contains(TermMode::MOUSE_MOTION));
+        assert!(!term.mode().contains(TermMode::MOUSE_DRAG));
+    }
+
+    #[test]
+    fn test_search_snippets_and_preview() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::test::TermSize;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let size = TermSize::new(80, 24);
+        let mut term: Term<VoidListener> = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+
+        let sample = b"Line 1: cargo build\r\nLine 2: error in file.rs\r\nLine 3: success\r\n";
+        for &b in sample {
+            parser.advance(&mut term, b);
+        }
+
+        // Test preview lines from grid
+        let grid = term.grid();
+        let screen_lines = grid.screen_lines();
+        assert!(screen_lines >= 3);
+
+        use alacritty_terminal::index::Line;
+        let mut preview = Vec::new();
+        for i in 0..3 {
+            let row = &grid[Line(i as i32)];
+            let mut s = String::new();
+            for cell in row.into_iter() {
+                if cell.c != '\0' {
+                    s.push(cell.c);
+                }
+            }
+            preview.push(s.trim_end().to_string());
+        }
+        assert_eq!(preview[0], "Line 1: cargo build");
+        assert_eq!(preview[1], "Line 2: error in file.rs");
+        assert_eq!(preview[2], "Line 3: success");
     }
 }

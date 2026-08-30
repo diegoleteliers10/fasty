@@ -224,6 +224,8 @@ pub struct Config {
     pub cursor: CursorConfig,
     #[serde(default)]
     pub tab_layout: TabLayout,
+    #[serde(default)]
+    pub keybinding_preset: Option<crate::keybindings::KeybindingPreset>,
     /// Treat the Option key as Alt (send `ESC` + key) instead of letting
     /// macOS compose the layout character. Mirrors zed's `option_as_meta`
     /// and ghostty's `macos-option-as-alt`; default is false so Option
@@ -383,7 +385,7 @@ pub struct FontConfig {
     pub ligatures: bool,
 }
 
-fn default_scrollback() -> usize { 1000 }
+fn default_scrollback() -> usize { 10_000 }
 fn default_theme() -> Option<String> { Some("default".to_string()) }
 fn default_font_family() -> String { "monospace".to_string() }
 fn default_font_size() -> f32 { 14.0 }
@@ -402,6 +404,7 @@ impl Default for Config {
             scrollback: default_scrollback(),
             theme: default_theme(),
             keybindings: std::collections::HashMap::new(),
+            keybinding_preset: None,
             session_restore: default_session_restore(),
             copy_on_select: false,
             opacity: default_opacity(),
@@ -481,6 +484,11 @@ fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
         TabLayout::Vertical => "vertical",
     };
     doc["tab_layout"] = value(tab_layout_str);
+    if let Some(ref preset) = c.keybinding_preset {
+        doc["keybinding_preset"] = value(preset.to_string());
+    } else {
+        doc.as_table_mut().remove("keybinding_preset");
+    }
     match &c.shell {
         Some(s) => doc["shell"] = value(s.as_str()),
         None => { doc.as_table_mut().remove("shell"); }
@@ -521,7 +529,7 @@ fn config_to_toml_string(c: &Config) -> String {
 fn migrate_legacy_json_to_toml(toml_path: &Path, json_path: &Path) -> anyhow::Result<()> {
     let content = std::fs::read_to_string(json_path)?;
     let mut parsed: Config = serde_json::from_str(&content)?;
-    parsed.scrollback = parsed.scrollback.min(1000);
+    parsed.scrollback = parsed.scrollback.clamp(500, 100_000);
     atomic_write(toml_path, config_to_toml_string(&parsed).as_bytes())?;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -559,7 +567,7 @@ impl Config {
             let h = content_hash(content.as_bytes());
             match toml_edit::de::from_str::<Config>(&content) {
                 Ok(mut cfg) => {
-                    cfg.scrollback = cfg.scrollback.min(1000);
+                    cfg.scrollback = cfg.scrollback.clamp(500, 100_000);
                     *ACTIVE_THEME.write() = cfg.theme.clone().unwrap_or_else(|| "default".to_string());
                     set_last_applied_hash(h);
                     return Ok(cfg);

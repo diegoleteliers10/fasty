@@ -1,6 +1,6 @@
 [package]
 name = "fastty"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2021"
 
 [lib]
@@ -37,11 +37,12 @@ rustix = { version = "0.38", features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
 notify-rust = "4"
-git2 = { version = "0.19", default-features = false }
+git2 = { version = "0.21", default-features = false }
 notify = "6"
 dirs = "6"
 icons = "0.18.3"
 smallvec = "1"
+fff-search = { version = "0.10.6", features = ["ripgrep"] }
 
 [build-dependencies]
 winres = "0.1"

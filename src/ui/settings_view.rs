@@ -66,6 +66,10 @@ pub struct SettingsView {
     pub cursor_blink: bool,
     pub copy_on_select: bool,
     pub tab_layout: crate::config::TabLayout,
+    pub scrollback: usize,
+    pub keybinding_preset: crate::keybindings::KeybindingPreset,
+    pub detected_external_configs: Vec<crate::importer::DetectedConfig>,
+    pub import_status_message: Option<String>,
     pub focus_handle: gpui::FocusHandle,
     pub window_scroll_handle: ScrollHandle,
     pub system_fonts: Vec<String>,
@@ -79,6 +83,9 @@ impl SettingsView {
         let theme_name = loaded_config.theme.as_deref().unwrap_or("default").to_string();
         let theme = Theme::from_name(&theme_name).with_opacity(loaded_config.opacity);
         let tab_layout = loaded_config.tab_layout;
+        let scrollback = loaded_config.scrollback;
+        let keybinding_preset = loaded_config.keybinding_preset.unwrap_or_default();
+        let detected_external_configs = crate::importer::detect_all_external_configs();
 
         let font_size = loaded_config.font.size;
         let font_family = if loaded_config.font.family.is_empty() || loaded_config.font.family == "monospace" {
@@ -130,6 +137,10 @@ impl SettingsView {
             cursor_blink: loaded_config.cursor.blink,
             copy_on_select: loaded_config.copy_on_select,
             tab_layout,
+            scrollback,
+            keybinding_preset,
+            detected_external_configs,
+            import_status_message: None,
             config: loaded_config,
             theme,
             current_theme_name: theme_name,
@@ -205,6 +216,48 @@ impl SettingsView {
         let _ = self.config.save_default();
         crate::config::increment_config_version();
         cx.notify();
+    }
+
+    pub fn set_scrollback(&mut self, scrollback: usize, cx: &mut Context<Self>) {
+        self.scrollback = scrollback;
+        self.config.scrollback = scrollback;
+        let _ = self.config.save_default();
+        crate::config::increment_config_version();
+        cx.notify();
+    }
+
+    pub fn set_keybinding_preset(&mut self, preset: crate::keybindings::KeybindingPreset, cx: &mut Context<Self>) {
+        self.keybinding_preset = preset;
+        self.config.keybinding_preset = Some(preset);
+        let _ = self.config.save_default();
+        crate::keybindings::init_resolver(self.config.keybindings.clone(), Some(preset));
+        crate::config::increment_config_version();
+        cx.notify();
+    }
+
+    pub fn import_external(&mut self, app: crate::importer::ExternalApp, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        match crate::importer::import_external_config(app, &path, &mut self.config) {
+            Ok(msg) => {
+                self.import_status_message = Some(msg);
+                self.scrollback = self.config.scrollback;
+                self.font_size = self.config.font.size;
+                self.font_family = self.config.font.family.clone();
+                self.opacity = self.config.opacity;
+                if let Some(ref t) = self.config.theme {
+                    self.current_theme_name = t.clone();
+                    self.theme = Theme::from_name(t).with_opacity(self.config.opacity);
+                }
+                if let Some(p) = self.config.keybinding_preset {
+                    self.keybinding_preset = p;
+                }
+                crate::config::increment_config_version();
+                cx.notify();
+            }
+            Err(e) => {
+                self.import_status_message = Some(format!("Error importing: {e}"));
+                cx.notify();
+            }
+        }
     }
 
     pub fn open_settings_file() {
@@ -873,7 +926,7 @@ impl Render for SettingsView {
                                                     .child(render_toggle_switch(self.cursor_blink, &theme)),
                                             ),
                                     )
-                                    // Copy on select
+                                    // Scrollback Buffer Size
                                     .child(
                                         div()
                                             .flex()
@@ -889,25 +942,212 @@ impl Render for SettingsView {
                                                             .text_size(px(12.))
                                                             .font_weight(FontWeight::BOLD)
                                                             .text_color(theme.foreground)
-                                                            .child("Copy on Select"),
+                                                            .child("Scrollback History"),
                                                     )
                                                     .child(
                                                         div()
                                                             .text_size(px(11.))
                                                             .text_color(theme.muted)
-                                                            .child("Automatically copy text when selecting with mouse"),
+                                                            .child("Max lines kept in terminal buffer (local client state)"),
                                                     ),
                                             )
                                             .child(
                                                 div()
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                        this.toggle_copy_on_select(cx);
-                                                    }))
-                                                    .child(render_toggle_switch(self.copy_on_select, &theme)),
+                                                    .flex()
+                                                    .flex_row()
+                                                    .gap_1p5()
+                                                    .children([(5000, "5k"), (10000, "10k (Def)"), (20000, "20k"), (50000, "50k"), (100000, "100k")].into_iter().map(|(lines, label)| {
+                                                        let is_active = self.scrollback == lines;
+                                                        div()
+                                                            .px(px(8.))
+                                                            .py(px(4.))
+                                                            .rounded(px(5.))
+                                                            .bg(if is_active { theme.accent } else { theme.surface })
+                                                            .text_color(if is_active { theme.black } else { theme.foreground })
+                                                            .text_size(px(11.))
+                                                            .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                                                this.set_scrollback(lines, cx);
+                                                            }))
+                                                            .child(label)
+                                                    })),
                                             ),
                                     ),
                             ),
                     )
+                    // 5. Keybinding Preset Section
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2p5()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(render_icon(IconType::Layers, theme.accent, 12.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(theme.muted_strong)
+                                            .child("KEYBINDING PRESET"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .flex_wrap()
+                                    .gap_2()
+                                    .children([
+                                        (crate::keybindings::KeybindingPreset::Default, "Default (Fastty)", "Standard modern shortcuts"),
+                                        (crate::keybindings::KeybindingPreset::Ghostty, "Ghostty", "Ghostty-style splits & nav"),
+                                        (crate::keybindings::KeybindingPreset::Tmux, "tmux", "Ctrl+B & Alt arrows navigation"),
+                                        (crate::keybindings::KeybindingPreset::ITerm2, "iTerm2", "macOS iTerm2 muscle memory"),
+                                    ].into_iter().map(|(preset, name, desc)| {
+                                        let is_active = self.keybinding_preset == preset;
+                                        div()
+                                            .id(SharedString::from(format!("preset-card-{}", preset)))
+                                            .flex_1()
+                                            .min_w(px(180.))
+                                            .p(px(10.))
+                                            .rounded(px(8.))
+                                            .bg(if is_active { theme.surface_raised } else { theme.surface })
+                                            .border_1()
+                                            .border_color(if is_active { theme.accent } else { theme.border })
+                                            .hover(move |s| s.bg(theme.surface_raised))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                                this.set_keybinding_preset(preset, cx);
+                                            }))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(11.5))
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .text_color(if is_active { theme.foreground } else { theme.muted_strong })
+                                                            .child(name),
+                                                    )
+                                                    .when(is_active, |this| {
+                                                        this.child(render_icon(IconType::Check, theme.accent, 12.0))
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.5))
+                                                    .text_color(theme.muted)
+                                                    .child(desc),
+                                            )
+                                    })),
+                            ),
+                    )
+                    // 6. External Configs Migration Card
+                    .when(!self.detected_external_configs.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2p5()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(render_icon(IconType::Sparkles, theme.accent, 12.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(theme.muted_strong)
+                                                .child("MIGRATE FROM OTHER TERMINALS"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .p(px(12.))
+                                        .rounded(px(8.))
+                                        .bg(theme.surface_raised)
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .children(self.detected_external_configs.iter().map(|detected| {
+                                            let app = detected.app;
+                                            let path = detected.path.clone();
+                                            let label = detected.label.clone();
+                                            let details = detected.details.clone();
+
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .justify_between()
+                                                .p(px(8.))
+                                                .rounded(px(6.))
+                                                .bg(theme.surface)
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(12.))
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .text_color(theme.foreground)
+                                                                .child(label),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(10.5))
+                                                                .text_color(theme.muted)
+                                                                .child(details),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .px(px(10.))
+                                                        .py(px(5.))
+                                                        .rounded(px(5.))
+                                                        .bg(theme.accent)
+                                                        .hover(|s| s.opacity(0.9))
+                                                        .text_size(px(11.))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .text_color(theme.black)
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                                            this.import_external(app, path.clone(), cx);
+                                                        }))
+                                                        .child("Import & Adopt"),
+                                                )
+                                        }))
+                                        .when_some(self.import_status_message.as_ref(), |this, msg| {
+                                            this.child(
+                                                div()
+                                                    .p(px(8.))
+                                                    .rounded(px(5.))
+                                                    .bg(theme.accent.opacity(0.15))
+                                                    .text_size(px(11.5))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(theme.accent)
+                                                    .child(msg.clone()),
+                                            )
+                                        }),
+                                ),
+                        )
+                    })
                     // 5. Config File Action Buttons
                     .child(
                         div()

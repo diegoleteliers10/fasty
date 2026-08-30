@@ -11,6 +11,7 @@ pub struct TabItem {
     pub title: String,
     pub active: bool,
     pub is_dirty: bool,
+    pub process_name: Option<String>,
 }
 
 #[derive(IntoElement)]
@@ -547,6 +548,9 @@ impl RenderOnce for TabSidebar {
                                     (gpui::transparent_black(), theme.muted_strong)
                                 };
 
+                                let (deck_icon, _) = tab.process_name.as_deref().map(super::icons::get_deck_process_icon).unwrap_or((icons::common::IconType::Terminal, "term"));
+                                let icon_color = if is_active { theme.accent } else { theme.muted_strong };
+
                                 div()
                                     .id(SharedString::from(format!("vert-tab-{}", tab_id)))
                                     .flex()
@@ -586,6 +590,7 @@ impl RenderOnce for TabSidebar {
                                             .gap_2()
                                             .overflow_hidden()
                                             .flex_1()
+                                            .child(super::icons::render_icon(deck_icon, icon_color, 12.0))
                                             .child(
                                                 div()
                                                     .flex_1()
@@ -656,6 +661,9 @@ fn render_tab_strip(
                 (theme.tab_inactive_bg, theme.muted_strong, gpui::transparent_black())
             };
 
+            let (deck_icon, _) = tab.process_name.as_deref().map(super::icons::get_deck_process_icon).unwrap_or((icons::common::IconType::Terminal, "term"));
+            let icon_color = if is_active { theme.accent } else { theme.muted };
+
             div()
                 .id(SharedString::from(format!("tab-{}", tab_id)))
                 .flex()
@@ -693,9 +701,19 @@ fn render_tab_strip(
                 })
                 .child(
                     div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1p5()
                         .overflow_hidden()
-                        .text_ellipsis()
-                        .child(SharedString::from(tab.title)),
+                        .flex_1()
+                        .child(super::icons::render_icon(deck_icon, icon_color, 11.0))
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(SharedString::from(tab.title)),
+                        ),
                 )
                 .child(
                     div()

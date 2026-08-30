@@ -183,6 +183,12 @@ impl PaneNode {
         }
     }
 
+    pub fn all_panes(&self) -> Vec<&TerminalPane> {
+        let mut list = Vec::new();
+        self.collect_panes(&mut list);
+        list
+    }
+
     pub fn collect_panes_mut<'a>(&'a mut self, list: &mut Vec<&'a mut TerminalPane>) {
         match self {
             PaneNode::Leaf(pane) => list.push(pane),
@@ -240,13 +246,82 @@ impl PaneNode {
             PaneNode::Leaf(_) => false,
             PaneNode::Split { ratio, first, second, .. } => {
                 if path.is_empty() {
-                    *ratio = new_ratio.clamp(0.05, 0.95);
+                    *ratio = new_ratio.clamp(0.1, 0.9);
                     true
-                } else if path[0] == 0 {
-                    first.set_split_ratio_by_path(&path[1..], new_ratio)
                 } else {
-                    second.set_split_ratio_by_path(&path[1..], new_ratio)
+                    let next = path[0];
+                    let rest = &path[1..];
+                    if next == 0 {
+                        first.set_split_ratio_by_path(rest, new_ratio)
+                    } else if next == 1 {
+                        second.set_split_ratio_by_path(rest, new_ratio)
+                    } else {
+                        false
+                    }
                 }
+            }
+        }
+    }
+
+    pub fn to_persisted(&self) -> crate::session_manager::PersistedPaneNode {
+        match self {
+            PaneNode::Leaf(pane) => crate::session_manager::PersistedPaneNode::Leaf(crate::session_manager::PersistedPane {
+                id: pane.id,
+                title: pane.title.clone(),
+                custom_title: pane.custom_title.clone(),
+                cwd: pane.cwd.as_ref().map(|c| c.to_string_lossy().to_string()),
+            }),
+            PaneNode::Split { direction, ratio, first, second } => crate::session_manager::PersistedPaneNode::Split {
+                direction: match direction {
+                    SplitDirection::Horizontal => "Horizontal".to_string(),
+                    SplitDirection::Vertical => "Vertical".to_string(),
+                },
+                ratio: *ratio,
+                first: Box::new(first.to_persisted()),
+                second: Box::new(second.to_persisted()),
+            },
+        }
+    }
+
+    pub fn restore_from_persisted<F>(persisted: &crate::session_manager::PersistedPaneNode, spawn_pane: &mut F) -> Self
+    where
+        F: FnMut(Option<&std::path::Path>, Option<String>) -> TerminalPane,
+    {
+        match persisted {
+            crate::session_manager::PersistedPaneNode::Leaf(p) => {
+                let cwd = p.cwd.as_deref().map(std::path::Path::new);
+                let title = p.custom_title.clone().or(Some(p.title.clone()));
+                let pane = spawn_pane(cwd, title);
+                PaneNode::Leaf(pane)
+            }
+            crate::session_manager::PersistedPaneNode::Split { direction, ratio, first, second } => {
+                let dir = if direction == "Vertical" {
+                    SplitDirection::Vertical
+                } else {
+                    SplitDirection::Horizontal
+                };
+                let first_node = Self::restore_from_persisted(first, spawn_pane);
+                let second_node = Self::restore_from_persisted(second, spawn_pane);
+                PaneNode::Split {
+                    direction: dir,
+                    ratio: *ratio,
+                    first: Box::new(first_node),
+                    second: Box::new(second_node),
+                }
+            }
+        }
+    }
+
+    pub fn for_each_terminal<F: FnMut(&Arc<TerminalState>)>(&self, f: &mut F) {
+        match self {
+            PaneNode::Leaf(pane) => {
+                if let Some(ref t) = pane.terminal {
+                    f(t);
+                }
+            }
+            PaneNode::Split { first, second, .. } => {
+                first.for_each_terminal(f);
+                second.for_each_terminal(f);
             }
         }
     }
@@ -296,6 +371,10 @@ impl PaneTree {
 
     pub fn pane_count(&self) -> usize {
         self.all_panes().len()
+    }
+
+    pub fn for_each_terminal<F: FnMut(&Arc<TerminalState>)>(&self, mut f: F) {
+        self.root.for_each_terminal(&mut f);
     }
 
     pub fn split_active_pane(&mut self, new_pane: TerminalPane, direction: Direction) {
