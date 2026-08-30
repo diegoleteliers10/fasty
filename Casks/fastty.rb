@@ -15,8 +15,6 @@ cask "fastty" do
     strategy :github_latest
   end
 
-  depends_on macos: :sierra
-
   app "Fastty.app"
 
   # Fastty is not (yet) signed/notarized by an Apple Developer ID, so a
