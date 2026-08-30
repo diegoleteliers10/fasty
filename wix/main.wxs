@@ -61,8 +61,23 @@
         <Directory Id='ProgramsFolder' Name='Programs'>
           <Directory Id='APPLICATIONFOLDER' Name='Fastty'>
 
+            <!--
+              WiX v3 per-user validation (ICE38) requires that a component
+              installing into a user-profile directory use an HKCU registry
+              value as its KeyPath, not the file itself. The file still gets
+              installed; it's just not what MSI uses to detect presence.
+              Each component below therefore carries its own uniquely-named
+              registry value as KeyPath (File KeyPath='no').
+            -->
             <Component Id='License' Guid='*'>
-              <File Id='LicenseFile' Source='wix\License.rtf' KeyPath='yes'/>
+              <File Id='LicenseFile' Source='wix\License.rtf' KeyPath='no'/>
+              <RegistryValue
+                  Root='HKCU'
+                  Key='Software\Fastty'
+                  Name='LicenseInstalled'
+                  Type='integer'
+                  Value='1'
+                  KeyPath='yes'/>
             </Component>
 
             <Component Id='binary0' Guid='*'>
@@ -70,7 +85,19 @@
                   Id='exe0'
                   Name='fastty.exe'
                   Source='$(var.BinDir)\fastty.exe'
+                  KeyPath='no'/>
+              <RegistryValue
+                  Root='HKCU'
+                  Key='Software\Fastty'
+                  Name='BinaryInstalled'
+                  Type='integer'
+                  Value='1'
                   KeyPath='yes'/>
+              <!-- ICE64: per-user directories must be explicitly removed on
+                   uninstall; WiX won't infer it the way it does for
+                   per-machine Program Files installs. -->
+              <RemoveFolder Id='RemoveApplicationFolder' Directory='APPLICATIONFOLDER' On='uninstall'/>
+              <RemoveFolder Id='RemoveProgramsFolder' Directory='ProgramsFolder' On='uninstall'/>
             </Component>
 
           </Directory>

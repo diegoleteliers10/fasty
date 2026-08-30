@@ -206,7 +206,11 @@ jobs:
           & $candle -nologo -arch x64 -dVersion="$env:VERSION" -dBinDir="$binDir" -out wix\main.wixobj wix\main.wxs
           if ($LASTEXITCODE -ne 0) { throw "candle.exe failed with exit code $LASTEXITCODE" }
 
-          & $light -nologo -ext WixUIExtension -out "${{ matrix.msi_name }}" wix\main.wixobj
+          # sw69/sw91: expected, harmless ICE warnings for a deliberately
+          # per-user-only install (Shortcut targets a file from a sibling
+          # component in the same feature; files are per-user regardless of
+          # ALLUSERS since we never offer a per-machine mode).
+          & $light -nologo -ext WixUIExtension -sw69 -sw91 -out "${{ matrix.msi_name }}" wix\main.wixobj
           if ($LASTEXITCODE -ne 0) { throw "light.exe failed with exit code $LASTEXITCODE" }
 
       - name: Upload Build Artifacts
