@@ -105,19 +105,25 @@ jobs:
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
-          sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64 || true
+          sudo apt-get install -y libfuse2 imagemagick || sudo apt-get install -y libfuse2t64 imagemagick || true
 
           curl -fsSL -o linuxdeploy "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
           curl -fsSL -o linuxdeploy-plugin-appimage "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage"
           chmod +x linuxdeploy linuxdeploy-plugin-appimage
           export PATH="$PWD:$PATH"
 
+          # linuxdeploy only accepts icons at one of the XDG icon-theme sizes
+          # (8..512 square); assets/fasttyIcon.png is 500x500, so resize a
+          # copy down to a valid size rather than touching the shared asset.
+          convert assets/fasttyIcon.png -resize 256x256 fastty-icon-256.png
+
           mkdir -p AppDir
           ./linuxdeploy \
             --appdir AppDir \
             --executable target/${{ matrix.target }}/release/fastty \
             --desktop-file packaging/linux/fastty.desktop \
-            --icon-file assets/fasttyIcon.png \
+            --icon-file fastty-icon-256.png \
+            --icon-filename fastty \
             --output appimage
 
           mv Fastty-*.AppImage "${{ matrix.appimage_name }}"

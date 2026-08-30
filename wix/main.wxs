@@ -68,8 +68,14 @@
               installed; it's just not what MSI uses to detect presence.
               Each component below therefore carries its own uniquely-named
               registry value as KeyPath (File KeyPath='no').
+
+              A component with both a File and a RegistryValue can't use an
+              auto-generated Guid='*' (CNDL0230: WiX can only auto-derive a
+              guid when there's exactly one keypath-eligible resource), so
+              these use fixed GUIDs instead. Like UpgradeCode, never change
+              them once released.
             -->
-            <Component Id='License' Guid='*'>
+            <Component Id='License' Guid='0AA48662-E0F6-44B8-94BC-C324117836EF'>
               <File Id='LicenseFile' Source='wix\License.rtf' KeyPath='no'/>
               <RegistryValue
                   Root='HKCU'
@@ -80,7 +86,7 @@
                   KeyPath='yes'/>
             </Component>
 
-            <Component Id='binary0' Guid='*'>
+            <Component Id='binary0' Guid='30AACB66-CB54-46F1-BDC8-4330684E1704'>
               <File
                   Id='exe0'
                   Name='fastty.exe'
