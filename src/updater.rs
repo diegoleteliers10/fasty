@@ -7,6 +7,110 @@ pub struct ReleaseInfo {
     pub release_url: String,
     pub asset_name: String,
     pub download_url: String,
+    /// `Some(explanation)` when this install is owned by something other
+    /// than Fastty's own updater (a system package, Homebrew, an AppImage,
+    /// or a system-wide Windows install) and should NOT be overwritten in
+    /// place. See `self_update_blocked_reason` for the detection rules.
+    pub self_update_blocked_reason: Option<String>,
+}
+
+/// Returns `Some(explanation)` when Fastty should not try to replace its own
+/// files in place, plus human-readable instructions for how the user should
+/// update instead. Returns `None` when the current install is one the
+/// updater fully owns and can safely overwrite: the portable tar.gz/zip
+/// extract, a `/Applications/Fastty.app` dragged from the DMG, or (on
+/// Windows) a per-user install.
+///
+/// This mirrors how other native apps split the same problem:
+/// - Zed disables its self-updater on package-manager installs and lets the
+///   packager set `ZED_UPDATE_EXPLANATION` with update instructions; on
+///   Windows it installs per-user (no admin) specifically so its updater can
+///   keep overwriting files without elevation.
+/// - Ghostty never self-updates on Linux at all -- every Linux install
+///   (apt/dnf/pacman/Nix/Flatpak) is considered a package manager's
+///   responsibility, not the app's.
+///
+/// `FASTTY_UPDATE_EXPLANATION` is the same escape hatch as Zed's env var: a
+/// third-party packager (AUR, Nix, Flatpak, ...) whose install path our
+/// heuristics below don't recognize can set it to force this off with their
+/// own instructions.
+pub fn self_update_blocked_reason() -> Option<String> {
+    if let Ok(explanation) = std::env::var("FASTTY_UPDATE_EXPLANATION") {
+        if !explanation.trim().is_empty() {
+            return Some(explanation);
+        }
+    }
+
+    #[allow(unused_variables)]
+    let exe = std::env::current_exe().ok()?;
+
+    #[cfg(target_os = "linux")]
+    {
+        // AppImage: the executable path is a temporary mount/extraction
+        // recreated from the immutable .AppImage file on every launch, so
+        // overwriting it here has no lasting effect after a restart.
+        if std::env::var_os("APPIMAGE").is_some() {
+            return Some(
+                "Fastty is running as an AppImage. Download the latest \
+                 Fastty_*.AppImage from the Releases page to update."
+                    .to_string(),
+            );
+        }
+        // A system package (.deb, distro repo, etc.) lives under /usr and is
+        // typically root-owned; a normal user process can't (and shouldn't)
+        // overwrite it, and doing so would desync the package manager's
+        // own record of what's installed.
+        if exe.starts_with("/usr") {
+            return Some(
+                "Fastty was installed via a system package. Update it with \
+                 your package manager, e.g. `sudo apt update && sudo apt \
+                 upgrade fastty`."
+                    .to_string(),
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Homebrew Cask: brew keeps its own receipt of the installed
+        // version under the Caskroom. A DMG-drag install and a Cask install
+        // both land at the same /Applications/Fastty.app path, but only the
+        // Cask one has external state that self-replacing would desync.
+        for caskroom in ["/opt/homebrew/Caskroom/fastty", "/usr/local/Caskroom/fastty"] {
+            if std::path::Path::new(caskroom).exists() {
+                return Some(
+                    "Fastty was installed via Homebrew. Run `brew upgrade \
+                     --cask fastty` to update."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Anything under a system Program Files directory needs admin
+        // rights we don't want to silently request. Our own MSI installs
+        // per-user (under %LOCALAPPDATA%\Programs\Fastty) precisely so it
+        // falls through to the "self-update is fine" case below, matching
+        // how Zed's Windows installer avoids admin-owned directories too.
+        let exe_str = exe.to_string_lossy();
+        for program_files_var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+            if let Ok(program_files) = std::env::var(program_files_var) {
+                if !program_files.is_empty() && exe_str.starts_with(program_files.as_str()) {
+                    return Some(
+                        "Fastty is installed system-wide and requires \
+                         administrator rights to update. Download and run \
+                         the latest Fastty_*.msi installer from the \
+                         Releases page."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    None
 }
 
 #[derive(Deserialize)]
@@ -113,10 +217,15 @@ pub fn check_for_update_sync() -> Option<ReleaseInfo> {
             .unwrap_or_else(|| format!("https://github.com/diegoleteliers10/fasty/releases/tag/{}", tag)),
         asset_name: target_asset_name.to_string(),
         download_url,
+        self_update_blocked_reason: self_update_blocked_reason(),
     })
 }
 
 pub fn apply_update_sync(release: &ReleaseInfo) -> anyhow::Result<()> {
+    if let Some(reason) = &release.self_update_blocked_reason {
+        anyhow::bail!("{reason}");
+    }
+
     let temp_dir = std::env::temp_dir().join(format!("fastty-update-{}", release.version));
     let _ = std::fs::remove_dir_all(&temp_dir);
     std::fs::create_dir_all(&temp_dir)?;

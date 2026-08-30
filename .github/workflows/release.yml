@@ -10,9 +10,32 @@ permissions:
   contents: write
 
 jobs:
+  prepare:
+    name: Resolve Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Resolve Version
+        id: get_version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          fi
+          echo "Resolved version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build - ${{ matrix.target }}
+    needs: prepare
     runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -20,15 +43,20 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact_name: fastty-x86_64-unknown-linux-gnu.tar.gz
+            deb_name: fastty_${{ needs.prepare.outputs.version }}_amd64.deb
+            appimage_name: Fastty_${{ needs.prepare.outputs.version }}_amd64.AppImage
           - target: x86_64-apple-darwin
             os: macos-latest
             artifact_name: fastty-x86_64-apple-darwin.tar.gz
+            dmg_name: fastty-x86_64-apple-darwin.dmg
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact_name: fastty-aarch64-apple-darwin.tar.gz
+            dmg_name: fastty-aarch64-apple-darwin.dmg
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact_name: fastty-x86_64-pc-windows-msvc.zip
+            msi_name: Fastty_${{ needs.prepare.outputs.version }}_x64.msi
 
     steps:
       - name: Checkout Source Code
@@ -58,17 +86,54 @@ jobs:
           tar -czf ../${{ matrix.artifact_name }} fastty
           cd ..
 
+      # Paquete .deb para Debian/Ubuntu (doble clic o `sudo dpkg -i`)
+      - name: Install cargo-deb
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get install -y dpkg-dev
+          cargo install cargo-deb --locked
+
+      - name: Build DEB Package (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cargo deb --target ${{ matrix.target }} --no-build --output "${{ matrix.deb_name }}"
+          ls -la "${{ matrix.deb_name }}"
+
+      # AppImage universal para Linux (portable, sin necesidad de instalar nada)
+      - name: Build AppImage (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64 || true
+
+          curl -fsSL -o linuxdeploy "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
+          curl -fsSL -o linuxdeploy-plugin-appimage "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage"
+          chmod +x linuxdeploy linuxdeploy-plugin-appimage
+          export PATH="$PWD:$PATH"
+
+          mkdir -p AppDir
+          ./linuxdeploy \
+            --appdir AppDir \
+            --executable target/${{ matrix.target }}/release/fastty \
+            --desktop-file packaging/linux/fastty.desktop \
+            --icon-file assets/fasttyIcon.png \
+            --output appimage
+
+          mv Fastty-*.AppImage "${{ matrix.appimage_name }}"
+          ls -la "${{ matrix.appimage_name }}"
+
       # Empaquetado para macOS (Creación del App Bundle profesional con su icono .icns)
       - name: Package Binary (macOS)
         if: runner.os == 'macOS'
         run: |
           mkdir -p dist/Fastty.app/Contents/MacOS
           mkdir -p dist/Fastty.app/Contents/Resources
-          
+
           # Copiar ejecutable e icono .icns
           cp target/${{ matrix.target }}/release/fastty dist/Fastty.app/Contents/MacOS/fastty
           cp assets/fasttyIcon.icns dist/Fastty.app/Contents/Resources/AppIcon.icns
-          
+
           # Escribir el Info.plist de la app
           cat <<EOF > dist/Fastty.app/Contents/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
@@ -86,7 +151,9 @@ jobs:
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>
-              <string>0.6.2</string>
+              <string>${VERSION}</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
               <key>LSMinimumSystemVersion</key>
               <string>10.12</string>
               <key>NSHighResolutionCapable</key>
@@ -94,11 +161,27 @@ jobs:
           </dict>
           </plist>
           EOF
-          
+
           # Comprimir la estructura en .tar.gz
           cd dist
           tar -czf ../${{ matrix.artifact_name }} Fastty.app
           cd ..
+
+      # Creación del .dmg (con symlink a /Applications) para distribución directa y Homebrew Cask
+      - name: Create DMG (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          STAGING_DIR=$(mktemp -d)
+          cp -R dist/Fastty.app "$STAGING_DIR/"
+          ln -s /Applications "$STAGING_DIR/Applications"
+
+          hdiutil create \
+            -volname "Fastty" \
+            -srcfolder "$STAGING_DIR" \
+            -ov -format UDZO \
+            "${{ matrix.dmg_name }}"
+
+          rm -rf "$STAGING_DIR"
 
       # Empaquetado para Windows (Incrusta el icono automáticamente gracias a build.rs y winres)
       - name: Package Binary (Windows)
@@ -109,11 +192,60 @@ jobs:
           Copy-Item -Path target\${{ matrix.target }}\release\fastty.exe -Destination dist\fastty.exe
           Compress-Archive -Path dist\fastty.exe -DestinationPath ${{ matrix.artifact_name }}
 
+      # Instalador .msi (WiX Toolset v3, preinstalado en el runner windows-latest)
+      # Registra la app en el menú de inicio (accesos directos) y en
+      # Panel de Control > Programas y características (automático para todo MSI).
+      - name: Build MSI Installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $candle = Join-Path $env:WIX 'bin\candle.exe'
+          $light  = Join-Path $env:WIX 'bin\light.exe'
+          $binDir = "target\${{ matrix.target }}\release"
+
+          & $candle -nologo -arch x64 -dVersion="$env:VERSION" -dBinDir="$binDir" -out wix\main.wixobj wix\main.wxs
+          if ($LASTEXITCODE -ne 0) { throw "candle.exe failed with exit code $LASTEXITCODE" }
+
+          & $light -nologo -ext WixUIExtension -out "${{ matrix.msi_name }}" wix\main.wixobj
+          if ($LASTEXITCODE -ne 0) { throw "light.exe failed with exit code $LASTEXITCODE" }
+
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: ${{ matrix.artifact_name }}
+          retention-days: 1
+
+      - name: Upload DMG Artifact
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-dmg
+          path: ${{ matrix.dmg_name }}
+          retention-days: 1
+
+      - name: Upload MSI Artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-msi
+          path: ${{ matrix.msi_name }}
+          retention-days: 1
+
+      - name: Upload DEB Artifact
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-deb
+          path: ${{ matrix.deb_name }}
+          retention-days: 1
+
+      - name: Upload AppImage Artifact
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-appimage
+          path: ${{ matrix.appimage_name }}
           retention-days: 1
 
   release:
@@ -144,3 +276,50 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-cask:
+    name: Update Homebrew Cask
+    needs: [prepare, release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Download macOS DMG Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-apple-darwin-dmg'
+          path: dmgs
+          merge-multiple: true
+
+      - name: Compute Checksums
+        id: sha
+        run: |
+          ARM_SHA=$(sha256sum dmgs/fastty-aarch64-apple-darwin.dmg | awk '{print $1}')
+          INTEL_SHA=$(sha256sum dmgs/fastty-x86_64-apple-darwin.dmg | awk '{print $1}')
+          echo "arm_sha=$ARM_SHA" >> "$GITHUB_OUTPUT"
+          echo "intel_sha=$INTEL_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Update Cask File
+        run: |
+          sed -i -E "s/version \"[^\"]+\"/version \"${VERSION}\"/" Casks/fastty.rb
+          sed -i -E "s/arm:[[:space:]]+\"[a-f0-9]+\"/arm:   \"${{ steps.sha.outputs.arm_sha }}\"/" Casks/fastty.rb
+          sed -i -E "s/intel:[[:space:]]+\"[a-f0-9]+\"/intel: \"${{ steps.sha.outputs.intel_sha }}\"/" Casks/fastty.rb
+          cat Casks/fastty.rb
+
+      - name: Commit and Push Cask Update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/fastty.rb
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: update Homebrew cask to v${VERSION}"
+            git push origin HEAD:main
+          fi

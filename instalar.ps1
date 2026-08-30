@@ -29,6 +29,22 @@ $StateDir  = Join-Path $env:LOCALAPPDATA "fastty\state"
 $CacheDir  = Join-Path $env:LOCALAPPDATA "fastty\cache"
 $BinDir    = Join-Path $env:LOCALAPPDATA "fastty\bin"
 
+# ── 1.5. Refuse to step on an install already owned by the .msi installer ─────
+# Mirrors the "one owner per install" rule the app's own updater enforces
+# (see src/updater.rs / self_update_blocked_reason): the .msi installs
+# per-user under %LOCALAPPDATA%\Programs\Fastty, a different location than
+# this script's %LOCALAPPDATA%\fastty\bin. Installing here too would leave
+# two separate copies (and two Start Menu shortcuts) that disagree about
+# who is responsible for updating Fastty.
+$ForceInstall = $env:FASTTY_FORCE_INSTALL -eq "1"
+$MsiExePath = Join-Path $env:LOCALAPPDATA "Programs\Fastty\fastty.exe"
+if ((Test-Path $MsiExePath) -and -not $ForceInstall) {
+    Write-Host "NOTICE: Fastty is already installed via the .msi installer ($MsiExePath)." -ForegroundColor Yellow
+    Write-Host "        Download and run the latest Fastty_*.msi from the Releases page to update instead." -ForegroundColor Yellow
+    Write-Host '        Re-run with $env:FASTTY_FORCE_INSTALL="1" to install alongside it anyway.' -ForegroundColor Yellow
+    exit 1
+}
+
 # ── 2. Create directories ──────────────────────────────────────────────────────
 foreach ($dir in @($ConfigDir, $DataDir, $StateDir, $CacheDir, $BinDir)) {
     if (-not (Test-Path $dir)) {

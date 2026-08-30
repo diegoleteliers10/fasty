@@ -45,6 +45,31 @@ esac
 
 echo "Detected platform: OS=$OS, Arch=$ARCH -> Target=$TARGET"
 
+# ── 1.5. Refuse to step on an install already owned by a package manager ──────
+# Mirrors the "one owner per install" rule the app's own updater enforces
+# (see src/updater.rs / self_update_blocked_reason): if Fastty is already
+# managed by Homebrew or a system package, installing here too would create
+# two copies that disagree about who is responsible for updating it.
+FORCE_INSTALL="${FASTTY_FORCE_INSTALL:-0}"
+
+if [ "$OS" = "darwin" ]; then
+    for caskroom in "/opt/homebrew/Caskroom/$APP_NAME" "/usr/local/Caskroom/$APP_NAME"; do
+        if [ -d "$caskroom" ] && [ "$FORCE_INSTALL" != "1" ]; then
+            echo "NOTICE: Fastty is already installed via Homebrew (found $caskroom)." >&2
+            echo "        Run 'brew upgrade --cask fastty' to update instead." >&2
+            echo "        Re-run with FASTTY_FORCE_INSTALL=1 to install alongside it anyway." >&2
+            exit 1
+        fi
+    done
+else
+    if command -v dpkg >/dev/null 2>&1 && dpkg -s "$APP_NAME" >/dev/null 2>&1 && [ "$FORCE_INSTALL" != "1" ]; then
+        echo "NOTICE: Fastty is already installed via a .deb package." >&2
+        echo "        Run 'sudo apt update && sudo apt upgrade $APP_NAME' to update instead." >&2
+        echo "        Re-run with FASTTY_FORCE_INSTALL=1 to install alongside it anyway." >&2
+        exit 1
+    fi
+fi
+
 # ── 2. Resolve platform directories ───────────────────────────────────────────
 if [ "$OS" = "darwin" ]; then
     CONFIG_DIR="$HOME/Library/Application Support/fastty"

@@ -1,0 +1,131 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  WiX Toolset (v3) source for the Fastty MSI installer.
+  Built directly with candle.exe/light.exe (both ship with the WiX Toolset
+  preinstalled on GitHub's windows-latest runner image) from
+  .github/workflows/release.yml — no cargo-wix dependency required.
+
+  This installs PER-USER (InstallScope='perUser'), under
+  %LOCALAPPDATA%\Programs\Fastty, the same way Zed's Windows installer
+  deliberately avoids Program Files: no admin/UAC prompt is needed to
+  install OR to self-update afterwards, since Fastty's in-app updater
+  (src/updater.rs) replaces its own files in place and can only do that
+  where the current user already owns the directory. It still gets a Start
+  Menu shortcut and shows up in Settings > Apps / Control Panel > Programs
+  and Features for the installing user, same as a per-machine MSI.
+
+  Two variables are passed in via `candle -d`:
+    Version : the app version (e.g. 0.7.1), also used as the MSI ProductVersion
+    BinDir  : path to the directory containing the built fastty.exe
+
+  UpgradeCode below is fixed forever so future versions can upgrade in place;
+  never change it.
+-->
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+  <Product
+      Id='*'
+      Name='Fastty'
+      UpgradeCode='3DEAA1FF-CCC0-4B93-9B76-067FD72F55C2'
+      Manufacturer='Diego Letelier'
+      Language='1033'
+      Codepage='1252'
+      Version='$(var.Version)'>
+
+    <Package
+        Id='*'
+        Keywords='Installer'
+        Description='Fastty $(var.Version) Installer'
+        Manufacturer='Diego Letelier'
+        InstallerVersion='500'
+        Languages='1033'
+        Compressed='yes'
+        InstallScope='perUser'
+        SummaryCodepage='1252'/>
+
+    <MajorUpgrade
+        Schedule='afterInstallInitialize'
+        DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+    <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+    <Property Id='DiskPrompt' Value='Fastty Installation [1]'/>
+
+    <Property Id='WIXUI_INSTALLDIR' Value='APPLICATIONFOLDER'/>
+    <Property Id='ARPHELPLINK' Value='https://github.com/diegoleteliers10/fasty'/>
+    <Property Id='ARPURLINFOABOUT' Value='https://github.com/diegoleteliers10/fasty'/>
+    <Property Id='ARPNOREPAIR' Value='1' Secure='yes'/>
+
+    <!-- Per-user install root: %LOCALAPPDATA%\Programs\Fastty -->
+    <Directory Id='TARGETDIR' Name='SourceDir'>
+      <Directory Id='LocalAppDataFolder'>
+        <Directory Id='ProgramsFolder' Name='Programs'>
+          <Directory Id='APPLICATIONFOLDER' Name='Fastty'>
+
+            <Component Id='License' Guid='*'>
+              <File Id='LicenseFile' Source='wix\License.rtf' KeyPath='yes'/>
+            </Component>
+
+            <Component Id='binary0' Guid='*'>
+              <File
+                  Id='exe0'
+                  Name='fastty.exe'
+                  Source='$(var.BinDir)\fastty.exe'
+                  KeyPath='yes'/>
+            </Component>
+
+          </Directory>
+        </Directory>
+      </Directory>
+
+      <!-- Start Menu shortcut -->
+      <Directory Id='ProgramMenuFolder'>
+        <Directory Id='ApplicationProgramsFolder' Name='Fastty'>
+          <Component Id='ApplicationShortcut' Guid='*'>
+            <Shortcut
+                Id='ApplicationStartMenuShortcut'
+                Name='Fastty'
+                Description='Fast, GPU-accelerated terminal emulator'
+                Target='[#exe0]'
+                WorkingDirectory='APPLICATIONFOLDER'
+                Icon='ProductICO'/>
+            <RemoveFolder Id='ApplicationProgramsFolder' On='uninstall'/>
+            <RegistryValue
+                Root='HKCU'
+                Key='Software\Fastty'
+                Name='installed'
+                Type='integer'
+                Value='1'
+                KeyPath='yes'/>
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature
+        Id='MainApplication'
+        Title='Fastty'
+        Description='Installs the Fastty binary, its Start Menu shortcut, and license.'
+        Level='1'
+        ConfigurableDirectory='APPLICATIONFOLDER'
+        AllowAdvertise='no'
+        Display='expand'
+        Absent='disallow'>
+      <ComponentRef Id='License'/>
+      <ComponentRef Id='binary0'/>
+      <ComponentRef Id='ApplicationShortcut'/>
+    </Feature>
+
+    <!-- Registers the app in Settings > Apps / Control Panel > Programs and
+         Features for the current user (per-user MSIs still show up there). -->
+    <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+    <Icon Id='ProductICO' SourceFile='assets\fasttyIcon.ico'/>
+    <Property Id='ARPPRODUCTICON' Value='ProductICO'/>
+
+    <UI>
+      <UIRef Id='WixUI_InstallDir'/>
+    </UI>
+
+    <WixVariable Id='WixUILicenseRtf' Value='wix\License.rtf'/>
+
+  </Product>
+</Wix>

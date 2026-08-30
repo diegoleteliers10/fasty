@@ -1677,6 +1677,24 @@ impl RootView {
             return;
         };
 
+        // Some install channels (a system package, Homebrew, an AppImage, or
+        // a system-wide Windows install) are owned by something other than
+        // Fastty's own updater. Overwriting their files in place would
+        // either fail outright (no permission) or silently desync that
+        // package manager's own record of what's installed. Point the user
+        // at the right update path instead of attempting it -- same idea as
+        // Zed's ZED_UPDATE_EXPLANATION and Ghostty leaving Linux updates to
+        // the distro's package manager.
+        if let Some(reason) = release.self_update_blocked_reason.clone() {
+            self.update_status = Some(format!(
+                "A new version (v{}) is available.\n\n{}\n\n{}",
+                release.version, reason, release.release_url
+            ));
+            self.is_update_modal_open = true;
+            cx.notify();
+            return;
+        }
+
         self.is_updating = true;
         self.update_status = Some(format!("Downloading Fastty v{}...", release.version));
         cx.notify();

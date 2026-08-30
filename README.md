@@ -35,13 +35,41 @@ irm https://raw.githubusercontent.com/diegoleteliers10/fasty/main/instalar.ps1 |
 
 ---
 
+### Homebrew (macOS)
+
+```bash
+brew tap diegoleteliers10/fasty https://github.com/diegoleteliers10/fasty
+brew install --cask fastty
+```
+
 ### Manual Installation
 
 Download the latest pre-compiled archive for your platform from [Releases](https://github.com/diegoleteliers10/fasty/releases):
 
-- **macOS (Apple Silicon & Intel)**: Extract `fastty-aarch64-apple-darwin.tar.gz` or `fastty-x86_64-apple-darwin.tar.gz` and move `Fastty.app` to `/Applications/`.
-- **Linux**: Extract `fastty-x86_64-unknown-linux-gnu.tar.gz` and place `fastty` into `~/.local/bin/`.
-- **Windows**: Extract `fastty-x86_64-pc-windows-msvc.zip` and place `fastty.exe` in your `PATH`.
+- **macOS (Apple Silicon & Intel)**: Download `fastty-aarch64-apple-darwin.dmg` or `fastty-x86_64-apple-darwin.dmg`, open it, and drag `Fastty.app` to `Applications`. (Alternatively, extract the matching `.tar.gz` and move `Fastty.app` to `/Applications/` yourself.)
+- **Windows**: Run `Fastty_<version>_x64.msi` for a standard installer (adds Fastty to the Start Menu and to *Settings > Apps* / *Control Panel > Programs and Features* for clean uninstalling). It installs per-user under `%LOCALAPPDATA%\Programs\Fastty`, so it needs no administrator rights to install *or* to self-update later. Alternatively, extract `fastty-x86_64-pc-windows-msvc.zip` and place `fastty.exe` in your `PATH`.
+- **Linux (Debian/Ubuntu)**: `sudo dpkg -i fastty_<version>_amd64.deb` (or double-click it in a graphical file manager). Installs the binary, a desktop menu entry, and icon. Update it the same way `apt`/`dpkg` updates any package (see [Updates](#updates) below).
+- **Linux (any distro)**: Download `Fastty_<version>_amd64.AppImage`, `chmod +x` it, and run it directly — no installation required.
+- **Linux (manual)**: Extract `fastty-x86_64-unknown-linux-gnu.tar.gz` and place `fastty` into `~/.local/bin/`.
+
+> **Note:** Fastty isn't signed/notarized with an Apple Developer ID yet, so macOS Gatekeeper will flag a freshly downloaded copy as damaged/unverified. The Homebrew cask clears the quarantine flag automatically; for a manual DMG install, run `xattr -dr com.apple.quarantine /Applications/Fastty.app` once after copying it over.
+
+---
+
+## Updates
+
+Fastty checks GitHub's latest release on startup and shows an in-app "vX.Y.Z" button when a newer one exists. What happens when you click it depends on how Fastty got installed — the same split that Zed and Ghostty make between their own self-updater and a system package manager's:
+
+| Install method | Update path |
+|---|---|
+| `.tar.gz` / `.zip` (manual/`instalar.sh`) | Self-updates in place |
+| `.dmg` (drag to Applications) | Self-updates in place |
+| Homebrew Cask | `brew upgrade --cask fastty` (self-update is disabled so it doesn't desync brew's own record) |
+| `.msi` (per-user) | Self-updates in place (no admin needed, same as the install) |
+| `.deb` | `sudo apt update && sudo apt upgrade fastty` (self-update is disabled — the binary is owned by dpkg) |
+| `.AppImage` | Download the newest `Fastty_*.AppImage` manually (AppImages can't persist a self-replace across restarts) |
+
+When self-update isn't available, clicking the update button shows a modal explaining how to update instead of trying (and possibly failing) to overwrite files it doesn't own. Third-party packagers (AUR, Nix, Flatpak, ...) can force this behavior with their own message by setting the `FASTTY_UPDATE_EXPLANATION` environment variable when launching Fastty, the same escape hatch Zed exposes as `ZED_UPDATE_EXPLANATION`.
 
 ---
 

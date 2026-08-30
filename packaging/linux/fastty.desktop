@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Fastty
+GenericName=Terminal Emulator
+Comment=Fast GPU-accelerated Terminal Emulator
+Exec=fastty %U
+Icon=fastty
+Terminal=false
+Categories=System;TerminalEmulator;Utility;
+Keywords=shell;prompt;command;commandline;terminal;emulator;
+StartupWMClass=fastty
+Actions=NewWindow;
+
+[Desktop Action NewWindow]
+Name=New Window
+Exec=fastty

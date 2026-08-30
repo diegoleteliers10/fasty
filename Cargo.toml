@@ -1,6 +1,6 @@
 [package]
 name = "fastty"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 
 [lib]
@@ -71,4 +71,27 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "parser_bench"
 harness = false
+
+[package.metadata.deb]
+name = "fastty"
+maintainer = "Diego Letelier <diegoleteliers10@users.noreply.github.com>"
+copyright = "2025, Diego Letelier"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Fastty is a modern, high-performance terminal emulator designed for speed, \
+low memory usage, and seamless developer workflows. Built with Rust and GPUI, \
+it offers GPU-accelerated rendering, a tabbed interface, built-in Git \
+integration, and a fully configurable TOML-based setup."""
+section = "utils"
+priority = "optional"
+# Keep the Debian package version identical to the crate version (no "-1"
+# revision suffix), so the artifact is named fastty_<version>_amd64.deb.
+revision = ""
+assets = [
+    ["target/release/fastty", "usr/bin/", "755"],
+    ["packaging/linux/fastty.desktop", "usr/share/applications/", "644"],
+    ["assets/fasttyIcon.png", "usr/share/icons/hicolor/512x512/apps/fastty.png", "644"],
+    ["assets/fasttyIcon.png", "usr/share/pixmaps/fastty.png", "644"],
+    ["README.md", "usr/share/doc/fastty/README.md", "644"],
+]
 
