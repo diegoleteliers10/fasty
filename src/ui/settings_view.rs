@@ -358,7 +358,7 @@ impl Render for SettingsView {
                                     .text_size(px(9.5))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme.muted)
-                                    .child("v0.7.1"),
+                                    .child(concat!("v", env!("CARGO_PKG_VERSION"))),
                             ),
                     )
                     .child(

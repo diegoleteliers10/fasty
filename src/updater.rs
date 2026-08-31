@@ -44,6 +44,19 @@ pub fn self_update_blocked_reason() -> Option<String> {
     #[allow(unused_variables)]
     let exe = std::env::current_exe().ok()?;
 
+    #[cfg(target_os = "macos")]
+    {
+        for caskroom in ["/opt/homebrew/Caskroom/fastty", "/usr/local/Caskroom/fastty"] {
+            if std::path::Path::new(caskroom).exists() {
+                return Some(
+                    "Fastty was installed via Homebrew. Update it with \
+                     `brew upgrade --cask fastty`."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     {
         // AppImage: the executable path is a temporary mount/extraction
@@ -273,7 +286,11 @@ pub fn apply_update_sync(release: &ReleaseInfo) -> anyhow::Result<()> {
         }
 
         let _ = std::process::Command::new("xattr")
-            .args(["-dr", "com.apple.quarantine", dest_app.to_str().unwrap()])
+            .args(["-cr", dest_app.to_str().unwrap()])
+            .status();
+
+        let _ = std::process::Command::new("codesign")
+            .args(["--force", "--deep", "-s", "-", dest_app.to_str().unwrap()])
             .status();
 
         let _ = std::fs::remove_dir_all(&backup_app);

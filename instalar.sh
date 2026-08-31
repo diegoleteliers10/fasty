@@ -194,8 +194,9 @@ if [ "$OS" = "darwin" ]; then
         sudo ln -sf "$INSTALL_DIR/Fastty.app/Contents/MacOS/fastty" "$BIN_DIR/fastty"
     fi
 
-    # Remove macOS quarantine bit and refresh LaunchServices
-    xattr -dr com.apple.quarantine "$INSTALL_DIR/Fastty.app" 2>/dev/null || true
+    # Remove macOS quarantine attributes, ensure ad-hoc code signature, and refresh LaunchServices
+    xattr -cr "$INSTALL_DIR/Fastty.app" 2>/dev/null || true
+    codesign --force --deep -s - "$INSTALL_DIR/Fastty.app" 2>/dev/null || true
     /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$INSTALL_DIR/Fastty.app" 2>/dev/null || true
 
     echo "$APP_NAME installed successfully at $INSTALL_DIR/Fastty.app"

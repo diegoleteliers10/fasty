@@ -42,6 +42,12 @@ brew tap diegoleteliers10/fasty https://github.com/diegoleteliers10/fasty
 brew install --cask fastty
 ```
 
+Or install directly from the Cask URL without tapping:
+
+```bash
+brew install --cask https://raw.githubusercontent.com/diegoleteliers10/fasty/main/Casks/fastty.rb
+```
+
 ### Manual Installation
 
 Download the latest pre-compiled archive for your platform from [Releases](https://github.com/diegoleteliers10/fasty/releases):
@@ -52,7 +58,10 @@ Download the latest pre-compiled archive for your platform from [Releases](https
 - **Linux (any distro)**: Download `Fastty_<version>_amd64.AppImage`, `chmod +x` it, and run it directly — no installation required.
 - **Linux (manual)**: Extract `fastty-x86_64-unknown-linux-gnu.tar.gz` and place `fastty` into `~/.local/bin/`.
 
-> **Note:** Fastty isn't signed/notarized with an Apple Developer ID yet, so macOS Gatekeeper will flag a freshly downloaded copy as damaged/unverified. The Homebrew cask clears the quarantine flag automatically; for a manual DMG install, run `xattr -dr com.apple.quarantine /Applications/Fastty.app` once after copying it over.
+> **Note for macOS:** Fastty uses ad-hoc code signing. Installing via Homebrew or `instalar.sh` automatically configures macOS Gatekeeper permissions. If you download the DMG directly through a browser and macOS reports the app as damaged or unverified, run this command once:
+> ```bash
+> xattr -cr /Applications/Fastty.app
+> ```
 
 ---
 

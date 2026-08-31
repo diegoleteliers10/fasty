@@ -168,6 +168,9 @@ jobs:
           </plist>
           EOF
 
+          # Firma ad-hoc para macOS (evita rechazos inmediatos en Apple Silicon)
+          codesign --force --deep -s - dist/Fastty.app
+
           # Comprimir la estructura en .tar.gz
           cd dist
           tar -czf ../${{ matrix.artifact_name }} Fastty.app

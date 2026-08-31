@@ -1,7 +1,7 @@
 cask "fastty" do
   arch arm: "aarch64", intel: "x86_64"
 
-  version "0.7.4"
+  version "0.7.5"
   sha256 arm:   "8b0bf7d1d6b3b3f7c11cd6f07eb204fe91984fdd5b3602858b5377206d1a4ba6",
          intel: "3d497bd23950a10830615df35487ff4d9bd721ff7e4f887b0ce7c6a8ab880e13"
 
@@ -18,16 +18,17 @@ cask "fastty" do
   auto_updates true
 
   app "Fastty.app"
+  binary "#{appdir}/Fastty.app/Contents/MacOS/fastty"
 
-  # Fastty is not (yet) signed/notarized by an Apple Developer ID, so a
-  # freshly downloaded copy gets Gatekeeper's quarantine flag and macOS
-  # would otherwise refuse to open it ("Fastty is damaged and can't be
-  # opened"). This mirrors what instalar.sh already does for direct
-  # installs.
+  # Fastty is ad-hoc signed. The postflight removes quarantine attributes
+  # and refreshes the ad-hoc signature to prevent Gatekeeper damage alerts.
   postflight do
     system_command "/usr/bin/xattr",
-                    args: ["-dr", "com.apple.quarantine", "#{appdir}/Fastty.app"],
-                    sudo: false
+                   args: ["-cr", "#{appdir}/Fastty.app"],
+                   sudo: false
+    system_command "/usr/bin/codesign",
+                   args: ["--force", "--deep", "-s", "-", "#{appdir}/Fastty.app"],
+                   sudo: false
   end
 
   zap trash: [
