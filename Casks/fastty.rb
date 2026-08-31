@@ -1,7 +1,7 @@
 cask "fastty" do
   arch arm: "aarch64", intel: "x86_64"
 
-  version "0.7.5"
+  version "0.7.6"
   sha256 arm:   "8b0bf7d1d6b3b3f7c11cd6f07eb204fe91984fdd5b3602858b5377206d1a4ba6",
          intel: "3d497bd23950a10830615df35487ff4d9bd721ff7e4f887b0ce7c6a8ab880e13"
 

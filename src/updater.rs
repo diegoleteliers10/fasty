@@ -44,19 +44,6 @@ pub fn self_update_blocked_reason() -> Option<String> {
     #[allow(unused_variables)]
     let exe = std::env::current_exe().ok()?;
 
-    #[cfg(target_os = "macos")]
-    {
-        for caskroom in ["/opt/homebrew/Caskroom/fastty", "/usr/local/Caskroom/fastty"] {
-            if std::path::Path::new(caskroom).exists() {
-                return Some(
-                    "Fastty was installed via Homebrew. Update it with \
-                     `brew upgrade --cask fastty`."
-                        .to_string(),
-                );
-            }
-        }
-    }
-
     #[cfg(target_os = "linux")]
     {
         // AppImage: the executable path is a temporary mount/extraction

@@ -29,6 +29,7 @@ pub struct TabBar {
     on_toggle_sidebar: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     update_available: Option<String>,
     is_updating: bool,
+    is_update_ready: bool,
     on_update: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>,
 }
 
@@ -48,6 +49,7 @@ impl TabBar {
             on_toggle_sidebar: None,
             update_available: None,
             is_updating: false,
+            is_update_ready: false,
             on_update: None,
         }
     }
@@ -118,9 +120,10 @@ impl TabBar {
         self
     }
 
-    pub fn update_available(mut self, version: Option<String>, is_updating: bool) -> Self {
+    pub fn update_available(mut self, version: Option<String>, is_updating: bool, is_update_ready: bool) -> Self {
         self.update_available = version;
         self.is_updating = is_updating;
+        self.is_update_ready = is_update_ready;
         self
     }
 
@@ -220,6 +223,7 @@ impl RenderOnce for TabBar {
                             this.child(render_update_btn(
                                 version,
                                 self.is_updating,
+                                self.is_update_ready,
                                 theme,
                                 on_update.clone(),
                             ))
@@ -333,6 +337,7 @@ impl RenderOnce for TabBar {
                             this.child(render_update_btn(
                                 version,
                                 self.is_updating,
+                                self.is_update_ready,
                                 theme,
                                 on_update.clone(),
                             ))
@@ -765,9 +770,18 @@ fn render_tab_strip(
 fn render_update_btn(
     version: String,
     is_updating: bool,
+    is_update_ready: bool,
     theme: Theme,
     on_update: Option<std::rc::Rc<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>>,
 ) -> gpui::Stateful<gpui::Div> {
+    let (icon, label) = if is_update_ready {
+        (icons::common::IconType::Check, format!("v{} Ready (Restart)", version))
+    } else if is_updating {
+        (icons::common::IconType::Download, "Updating...".to_string())
+    } else {
+        (icons::common::IconType::Download, format!("v{}", version))
+    };
+
     div()
         .id("update-btn")
         .flex()
@@ -790,7 +804,7 @@ fn render_update_btn(
             }
         })
         .child(super::icons::render_icon(
-            icons::common::IconType::Download,
+            icon,
             theme.green,
             12.0,
         ))
@@ -799,11 +813,7 @@ fn render_update_btn(
                 .text_size(px(11.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.green)
-                .child(if is_updating {
-                    "Updating...".to_string()
-                } else {
-                    format!("v{}", version)
-                }),
+                .child(label),
         )
 }
 

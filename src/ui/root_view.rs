@@ -1141,17 +1141,55 @@ impl RootView {
 
         crate::keybindings::init_resolver(view.config.keybindings.clone(), view.config.keybinding_preset);
 
-        // Background update check
-        let (update_tx, update_rx) = async_channel::unbounded::<Option<crate::updater::ReleaseInfo>>();
+        // Background update check and silent automatic preparation
+        enum UpdateStatus {
+            Ready(crate::updater::ReleaseInfo),
+            Blocked(crate::updater::ReleaseInfo, String),
+            Available(crate::updater::ReleaseInfo),
+        }
+        let (update_tx, update_rx) = async_channel::unbounded::<UpdateStatus>();
         std::thread::spawn(move || {
-            let res = crate::updater::check_for_update_sync();
-            let _ = update_tx.send_blocking(res);
+            if let Some(release) = crate::updater::check_for_update_sync() {
+                if release.self_update_blocked_reason.is_none() {
+                    // Silently download and stage update in background
+                    match crate::updater::apply_update_sync(&release) {
+                        Ok(()) => {
+                            let _ = update_tx.send_blocking(UpdateStatus::Ready(release));
+                        }
+                        Err(_) => {
+                            let _ = update_tx.send_blocking(UpdateStatus::Available(release));
+                        }
+                    }
+                } else {
+                    let reason = release.self_update_blocked_reason.clone().unwrap_or_default();
+                    let _ = update_tx.send_blocking(UpdateStatus::Blocked(release, reason));
+                }
+            }
         });
 
         cx.spawn_in(_window, async move |this, cx| {
-            if let Ok(Some(release)) = update_rx.recv().await {
+            if let Ok(status) = update_rx.recv().await {
                 let _ = this.update_in(cx, |this, _window, cx| {
-                    this.update_available = Some(release);
+                    match status {
+                        UpdateStatus::Ready(release) => {
+                            this.is_update_ready = true;
+                            this.update_available = Some(release.clone());
+                            this.update_status = Some(format!(
+                                "Fastty v{} is installed and ready to use.\nRestart Fastty to switch to the new version.",
+                                release.version
+                            ));
+                        }
+                        UpdateStatus::Blocked(release, reason) => {
+                            this.is_update_ready = false;
+                            this.update_available = Some(release);
+                            this.update_status = Some(reason);
+                        }
+                        UpdateStatus::Available(release) => {
+                            this.is_update_ready = false;
+                            this.update_available = Some(release);
+                            this.update_status = None;
+                        }
+                    }
                     cx.notify();
                 });
             }
@@ -4668,7 +4706,7 @@ impl Render for RootView {
                     .on_toggle_sidebar(cx.listener(|this, _ev, window, cx| {
                         this.toggle_tab_sidebar(window, cx);
                     }))
-                    .update_available(self.update_available.as_ref().map(|u| u.version.clone()), self.is_updating)
+                    .update_available(self.update_available.as_ref().map(|u| u.version.clone()), self.is_updating, self.is_update_ready)
                     .on_update(cx.listener(|this, _ev, window, cx| {
                         this.trigger_apply_update(window, cx);
                     }))
