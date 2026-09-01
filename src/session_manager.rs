@@ -67,13 +67,13 @@ pub fn list_sessions() -> Vec<SessionData> {
         }
     }
 
-    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sessions.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
     sessions
 }
 
 pub fn save_session(session: &SessionData) -> anyhow::Result<()> {
     let dir = sessions_dir();
-    let safe_name = session.name.replace('/', "_").replace('\\', "_");
+    let safe_name = session.name.replace(['/', '\\'], "_");
     let path = dir.join(format!("{safe_name}.json"));
     let json = serde_json::to_string_pretty(session)?;
     fs::write(path, json)?;
@@ -82,7 +82,7 @@ pub fn save_session(session: &SessionData) -> anyhow::Result<()> {
 
 pub fn load_session(name: &str) -> Option<SessionData> {
     let dir = sessions_dir();
-    let safe_name = name.replace('/', "_").replace('\\', "_");
+    let safe_name = name.replace(['/', '\\'], "_");
     let path = dir.join(format!("{safe_name}.json"));
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str::<SessionData>(&content).ok()
@@ -90,7 +90,7 @@ pub fn load_session(name: &str) -> Option<SessionData> {
 
 pub fn delete_session(name: &str) -> anyhow::Result<()> {
     let dir = sessions_dir();
-    let safe_name = name.replace('/', "_").replace('\\', "_");
+    let safe_name = name.replace(['/', '\\'], "_");
     let path = dir.join(format!("{safe_name}.json"));
     if path.exists() {
         fs::remove_file(path)?;

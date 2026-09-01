@@ -187,16 +187,13 @@ pub fn try_get_custom_theme_full(name: &str) -> Option<[Option<(u8, u8, u8)>; 18
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TabLayout {
+    #[default]
     Horizontal,
     Vertical,
 }
 
-impl Default for TabLayout {
-    fn default() -> Self {
-        TabLayout::Horizontal
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -323,18 +320,15 @@ impl From<AlignSpec> for crate::widgets::Align {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CursorShapeConfig {
     Block,
+    #[default]
     Beam,
     Underline,
     HollowBlock,
 }
 
-impl Default for CursorShapeConfig {
-    fn default() -> Self {
-        CursorShapeConfig::Beam
-    }
-}
 
 impl From<CursorShapeConfig> for alacritty_terminal::vte::ansi::CursorShape {
     fn from(c: CursorShapeConfig) -> Self {

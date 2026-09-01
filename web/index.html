@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>fastty — Web Client</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app-container">
+    <header class="top-bar">
+      <div class="brand">
+        <span class="logo-icon">⚡</span>
+        <span class="logo-text">fastty</span>
+        <span class="badge wasm-badge">Wasm VT</span>
+      </div>
+
+      <div class="session-tabs-container">
+        <div id="session-tabs" class="session-tabs">
+          <!-- Dynamically populated from subscribe_sessions -->
+          <div class="tab loading-tab">Connecting to daemon...</div>
+        </div>
+      </div>
+
+      <div class="controls">
+        <!-- Font Size Config Toolbar -->
+        <div class="font-size-control" title="Font size (Ctrl - / Ctrl +)">
+          <button id="font-decrease-btn" class="btn-tool" title="Decrease font size (Ctrl -)">−</button>
+          <span id="font-size-display" class="font-size-text">14px</span>
+          <button id="font-increase-btn" class="btn-tool" title="Increase font size (Ctrl +)">+</button>
+          <button id="font-reset-btn" class="btn-tool" title="Reset font size (Ctrl 0)">↺</button>
+        </div>
+
+        <div id="connection-status" class="status-pill status-disconnected">
+          <span class="dot"></span>
+          <span class="text">Connecting...</span>
+        </div>
+        <button id="reconnect-btn" class="btn-icon" title="Reconnect">↻</button>
+      </div>
+    </header>
+
+    <main class="terminal-wrapper" id="terminal-wrapper" tabindex="0">
+      <div class="terminal-canvas-container" id="canvas-container">
+        <canvas id="terminal-canvas"></canvas>
+      </div>
+
+      <!-- Custom Scrollbar -->
+      <div class="terminal-scrollbar-track" id="scrollbar-track">
+        <div class="terminal-scrollbar-thumb" id="scrollbar-thumb"></div>
+      </div>
+
+      <!-- Floating Jump-to-bottom Button -->
+      <button id="jump-bottom-btn" class="jump-bottom-pill hidden">
+        <span>↓ Jump to bottom</span>
+      </button>
+
+      <div id="overlay-msg" class="overlay-msg hidden">
+        <div class="overlay-card">
+          <div class="spinner"></div>
+          <h3 id="overlay-title">Connecting to fastty...</h3>
+          <p id="overlay-desc">Make sure fastty is running locally with its daemon active.</p>
+        </div>
+      </div>
+    </main>
+
+    <footer class="status-bar">
+      <div class="status-left">
+        <span id="session-info">No active session</span>
+      </div>
+      <div class="status-right">
+        <span id="scroll-status" class="scroll-badge hidden">Scroll: 0 / 0</span>
+        <span class="separator">|</span>
+        <span id="term-dimensions">80 × 24</span>
+        <span class="separator">|</span>
+        <span id="term-cwd">~</span>
+      </div>
+    </footer>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

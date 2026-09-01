@@ -17,6 +17,7 @@ pub enum SyncStatus {
 
 /// Cached git status for a single tab. Populated by `detect_git_status` in main.rs.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct GitStatus {
     pub branch: String,           // "main"
     pub is_detached: bool,        // true when HEAD is a raw commit, not a branch ref
@@ -38,23 +39,6 @@ impl GitStatus {
 
 }
 
-impl Default for GitStatus {
-    fn default() -> Self {
-        Self {
-            branch: String::new(),
-            is_detached: false,
-            ahead: 0,
-            behind: 0,
-            staged: 0,
-            unstaged: 0,
-            untracked: 0,
-            sync_status: SyncStatus::default(),
-            last_commit_hash: String::new(),
-            last_commit_summary: String::new(),
-            remote_url: None,
-        }
-    }
-}
 
 /// A single entry from `git worktree list --porcelain`.
 #[derive(Debug, Clone)]

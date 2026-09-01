@@ -89,13 +89,15 @@ pub struct StatusInfo {
     pub last_exit_code: Option<i32>,
 }
 
+pub type GitContextCallback = Arc<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>;
+
 #[derive(IntoElement)]
 pub struct StatusBar {
     left_segments: Vec<Segment>,
     right_segments: Vec<Segment>,
     fallback_info: StatusInfo,
     theme: Theme,
-    on_git_context_menu: Option<Arc<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>,
+    on_git_context_menu: Option<GitContextCallback>,
 }
 
 impl StatusBar {

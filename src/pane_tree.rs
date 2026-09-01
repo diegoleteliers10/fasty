@@ -211,11 +211,11 @@ impl PaneNode {
                 let contains_in_first = first.find_pane(target_id).is_some();
                 let contains_in_second = second.find_pane(target_id).is_some();
 
-                let is_matching_axis = match (direction, dir) {
-                    (SplitDirection::Horizontal, Direction::Left | Direction::Right) => true,
-                    (SplitDirection::Vertical, Direction::Top | Direction::Down) => true,
-                    _ => false,
-                };
+                let is_matching_axis = matches!(
+                    (direction, dir),
+                    (SplitDirection::Horizontal, Direction::Left | Direction::Right)
+                        | (SplitDirection::Vertical, Direction::Top | Direction::Down)
+                );
 
                 if is_matching_axis && (contains_in_first || contains_in_second) {
                     let d = match dir {
@@ -455,7 +455,7 @@ impl PaneTree {
 
             if in_dir {
                 let dist = (px - ax).powi(2) + (py - ay).powi(2);
-                if best.map_or(true, |(_, min)| dist < min) {
+                if best.is_none_or(|(_, min)| dist < min) {
                     best = Some((pane.id, dist));
                 }
             }

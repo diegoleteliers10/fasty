@@ -1,0 +1,32 @@
+/* tslint:disable */
+/* eslint-disable */
+export const memory: WebAssembly.Memory;
+export const __wbg_fasttyvt_free: (a: number, b: number) => void;
+export const fasttyvt_clear_dirty: (a: number) => void;
+export const fasttyvt_cols: (a: number) => number;
+export const fasttyvt_cursor_col: (a: number) => number;
+export const fasttyvt_cursor_row: (a: number) => number;
+export const fasttyvt_cursor_visible: (a: number) => number;
+export const fasttyvt_cwd: (a: number, b: number) => void;
+export const fasttyvt_encode_key: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+export const fasttyvt_feed_bytes: (a: number, b: number, c: number) => void;
+export const fasttyvt_is_dirty: (a: number) => number;
+export const fasttyvt_max_scroll_offset: (a: number) => number;
+export const fasttyvt_new: (a: number, b: number, c: number) => number;
+export const fasttyvt_render_canvas: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+export const fasttyvt_resize: (a: number, b: number, c: number) => void;
+export const fasttyvt_rows: (a: number) => number;
+export const fasttyvt_scroll_display: (a: number, b: number) => void;
+export const fasttyvt_scroll_offset: (a: number) => number;
+export const fasttyvt_scroll_page_down: (a: number) => void;
+export const fasttyvt_scroll_page_up: (a: number) => void;
+export const fasttyvt_scroll_to: (a: number, b: number) => void;
+export const fasttyvt_scroll_to_bottom: (a: number) => void;
+export const fasttyvt_scroll_to_top: (a: number) => void;
+export const fasttyvt_title: (a: number, b: number) => void;
+export const fasttyvt_feed_str: (a: number, b: number, c: number) => void;
+export const __wbindgen_export: (a: number) => void;
+export const __wbindgen_add_to_stack_pointer: (a: number) => number;
+export const __wbindgen_export2: (a: number, b: number, c: number) => void;
+export const __wbindgen_export3: (a: number, b: number) => number;
+export const __wbindgen_export4: (a: number, b: number, c: number, d: number) => number;

@@ -4,6 +4,11 @@ use gpui::{
 };
 use crate::config::TabLayout;
 use super::theme::Theme;
+pub type TabCallback = Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>;
+pub type TabContextCallback = Box<dyn Fn(&(usize, f32, f32), &mut Window, &mut App) + 'static>;
+pub type ClickCallback = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
+pub type MouseDownCallback = Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>;
+
 
 #[derive(Clone, Debug)]
 pub struct TabItem {
@@ -20,17 +25,17 @@ pub struct TabBar {
     theme: Theme,
     layout: TabLayout,
     sidebar_open: bool,
-    on_select_tab: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
-    on_close_tab: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
-    on_rename_tab: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
-    on_tab_context_menu: Option<Box<dyn Fn(&(usize, f32, f32), &mut Window, &mut App) + 'static>>,
-    on_new_tab: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
-    on_logo_context_menu: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>,
-    on_toggle_sidebar: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    on_select_tab: Option<TabCallback>,
+    on_close_tab: Option<TabCallback>,
+    on_rename_tab: Option<TabCallback>,
+    on_tab_context_menu: Option<TabContextCallback>,
+    on_new_tab: Option<ClickCallback>,
+    on_logo_context_menu: Option<MouseDownCallback>,
+    on_toggle_sidebar: Option<ClickCallback>,
     update_available: Option<String>,
     is_updating: bool,
     is_update_ready: bool,
-    on_update: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>,
+    on_update: Option<MouseDownCallback>,
 }
 
 impl TabBar {
@@ -157,7 +162,7 @@ impl RenderOnce for TabBar {
         {
             let left_padding = px(76.);
 
-            return div()
+            div()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -244,7 +249,7 @@ impl RenderOnce for TabBar {
                                 })
                                 .child(super::icons::render_app_logo(15.0)),
                         ),
-                );
+                )
         }
 
         // Windows / Linux: [logo][tabs...+][drag spacer][update?][min][max][X]
@@ -366,12 +371,12 @@ pub struct TabSidebar {
     theme: Theme,
     anim_progress: f32,
     scroll_handle: ScrollHandle,
-    on_select_tab: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
-    on_close_tab: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
-    on_rename_tab: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
-    on_tab_context_menu: Option<Box<dyn Fn(&(usize, f32, f32), &mut Window, &mut App) + 'static>>,
-    on_new_tab: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
-    on_toggle_sidebar: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    on_select_tab: Option<TabCallback>,
+    on_close_tab: Option<TabCallback>,
+    on_rename_tab: Option<TabCallback>,
+    on_tab_context_menu: Option<TabContextCallback>,
+    on_new_tab: Option<ClickCallback>,
+    on_toggle_sidebar: Option<ClickCallback>,
 }
 
 impl TabSidebar {
@@ -639,11 +644,11 @@ impl RenderOnce for TabSidebar {
 fn render_tab_strip(
     tabs: Vec<TabItem>,
     theme: Theme,
-    on_select: Option<std::rc::Rc<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>>,
-    on_close: Option<std::rc::Rc<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>>,
-    on_rename: Option<std::rc::Rc<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>>,
-    on_tab_context: Option<std::rc::Rc<Box<dyn Fn(&(usize, f32, f32), &mut Window, &mut App) + 'static>>>,
-    on_new_tab: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    on_select: Option<std::rc::Rc<TabCallback>>,
+    on_close: Option<std::rc::Rc<TabCallback>>,
+    on_rename: Option<std::rc::Rc<TabCallback>>,
+    on_tab_context: Option<std::rc::Rc<TabContextCallback>>,
+    on_new_tab: Option<ClickCallback>,
     btn_hover_bg: gpui::Hsla,
     btn_default_bg: gpui::Hsla,
 ) -> gpui::Div {
@@ -772,7 +777,7 @@ fn render_update_btn(
     is_updating: bool,
     is_update_ready: bool,
     theme: Theme,
-    on_update: Option<std::rc::Rc<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>>,
+    on_update: Option<std::rc::Rc<MouseDownCallback>>,
 ) -> gpui::Stateful<gpui::Div> {
     let (icon, label) = if is_update_ready {
         (icons::common::IconType::Check, format!("v{} Ready (Restart)", version))

@@ -908,6 +908,12 @@ pub struct RootView {
     pub dragging_split_path: Vec<usize>,
     pub dragging_split_direction: SplitDirection,
     pub dragging_split_bounds: (f32, f32, f32, f32),
+    /// Pane id of a tab spawned from `-e`/`--exec` on the CLI. When that
+    /// pane's child process exits, the whole app quits — matching how
+    /// other terminals (Ghostty, Alacritty, Kitty, ...) treat `-e`: a
+    /// one-shot execution, not a persistent shell tab. `None` for every
+    /// other pane (normal tabs, splits, session restore, new windows).
+    exec_pane_id: Option<crate::pane_tree::PaneId>,
 }
 
 impl RootView {
@@ -1137,6 +1143,7 @@ impl RootView {
             dragging_split_path: Vec::new(),
             dragging_split_direction: SplitDirection::Horizontal,
             dragging_split_bounds: (0.0, 0.0, 0.0, 0.0),
+            exec_pane_id: None,
         };
 
         crate::keybindings::init_resolver(view.config.keybindings.clone(), view.config.keybinding_preset);
@@ -1198,6 +1205,7 @@ impl RootView {
         if let Some(tab_data) = initial_tab {
             view.attach_tab(tab_data, _window, cx);
         } else if cli_opts.command.is_some() || cli_opts.working_dir.is_some() || cli_opts.title.is_some() {
+            let is_exec_invocation = cli_opts.command.is_some();
             let shell = cli_opts.command.unwrap_or_else(|| {
                 view.config
                     .shell
@@ -1213,6 +1221,17 @@ impl RootView {
                 _window,
                 cx,
             );
+            // `-e`/`--exec` on the CLI means "run this one command and exit",
+            // matching Ghostty/Alacritty/Kitty/WezTerm. Tag the pane so the
+            // app quits when its child process exits, instead of leaving an
+            // empty tab open (the previous behavior, and still the right one
+            // for a bare `-d`/`--title` invocation that opens an interactive
+            // shell).
+            if is_exec_invocation {
+                if let Some(tab) = view.tabs.last() {
+                    view.exec_pane_id = Some(tab.pane_tree.active_pane_id);
+                }
+            }
         } else if restored_tabs.is_empty() {
             view.create_tab(_window, cx);
         } else {
@@ -1336,11 +1355,28 @@ impl RootView {
         .expect("Failed to initialize terminal state");
 
         let terminal_arc = Arc::new(terminal);
+        // Every pane is attachable over the local IPC daemon (`crate::daemon`)
+        // the moment it exists, regardless of how it was created (new tab,
+        // split, session restore, CLI `-e`) -- unregistered on the two removal
+        // paths, `close_tab` and `close_active_pane`.
+        crate::daemon::register(pane_id, terminal_arc.clone());
         let event_sender_loop = event_sender.clone();
 
         cx.spawn_in(window, async move |this, cx| {
-            while let Ok(event) = event_rx.recv().await {
-                while let Ok(AppEvent::Wakeup) = event_rx.try_recv() {}
+            while let Ok(mut event) = event_rx.recv().await {
+                // Coalesce consecutive Wakeup events (pure re-render pings) into
+                // the next real event, WITHOUT dropping that next event: a plain
+                // `while let Ok(AppEvent::Wakeup) = event_rx.try_recv() {}` discards
+                // whatever non-Wakeup event it happens to pull out of the channel
+                // when the pattern fails to match -- silently losing events (e.g. an
+                // `Exit` that immediately follows the Wakeup for a command's last
+                // bit of output) instead of just stopping the drain.
+                while matches!(event, AppEvent::Wakeup) {
+                    match event_rx.try_recv() {
+                        Ok(next) => event = next,
+                        Err(_) => break,
+                    }
+                }
 
                 let res = this.update_in(cx, |this, _window, cx| {
                     match event {
@@ -1439,6 +1475,13 @@ impl RootView {
                         AppEvent::Notification { title, body } => {
                             send_system_notification(&title, &body);
                         }
+                        AppEvent::Exit { .. }
+                            // A CLI `-e`/`--exec` invocation treats the given command as a
+                            // one-shot: when its process exits, quit the app instead of
+                            // leaving a dead pane open (see `exec_pane_id`).
+                            if this.exec_pane_id == Some(pane_id) => {
+                                cx.quit();
+                            }
                         _ => {
                             cx.notify();
                         }
@@ -1573,7 +1616,7 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let tab_is_single_pane = self.tabs.get(self.active_tab_idx).map_or(false, |t| t.pane_tree.pane_count() <= 1);
+        let tab_is_single_pane = self.tabs.get(self.active_tab_idx).is_some_and(|t| t.pane_tree.pane_count() <= 1);
         if tab_is_single_pane {
             if let Some(tab) = self.tabs.get(self.active_tab_idx) {
                 let tab_id = tab.id;
@@ -1582,7 +1625,9 @@ impl RootView {
         } else {
             if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
                 let active_id = tab.pane_tree.active_pane_id;
-                tab.pane_tree.close_pane(active_id);
+                if tab.pane_tree.close_pane(active_id) {
+                    crate::daemon::unregister(active_id);
+                }
                 if let Some(pane) = tab.pane_tree.active_pane() {
                     tab.terminal = pane.terminal.clone();
                     tab.cwd = pane.cwd.clone();
@@ -1628,8 +1673,16 @@ impl RootView {
         cx.notify();
 
         cx.spawn_in(window, async move |this, cx| {
-            while let Ok(event) = event_rx.recv().await {
-                while let Ok(AppEvent::Wakeup) = event_rx.try_recv() {}
+            while let Ok(mut event) = event_rx.recv().await {
+                // See the identical comment in `spawn_terminal_pane`: coalesce
+                // consecutive Wakeup events without dropping the first non-Wakeup
+                // event that follows one in the channel.
+                while matches!(event, AppEvent::Wakeup) {
+                    match event_rx.try_recv() {
+                        Ok(next) => event = next,
+                        Err(_) => break,
+                    }
+                }
 
                 let res = this.update_in(cx, |this, _window, cx| {
                     match event {
@@ -1755,7 +1808,10 @@ impl RootView {
         self.is_selecting = false;
         self.selection_start = None;
         if let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) {
-            self.tabs.remove(idx);
+            let removed = self.tabs.remove(idx);
+            for pane in removed.pane_tree.all_panes() {
+                crate::daemon::unregister(pane.id);
+            }
             if self.tabs.is_empty() {
                 self.create_tab(window, cx);
             } else if self.active_tab_idx >= self.tabs.len() {
@@ -2878,7 +2934,7 @@ impl RootView {
                         self.search_query.pop();
                         self.search_matches = term.search_matches(&self.search_query);
                         self.search_match_idx = 0;
-                        if let Some(&offset) = self.search_matches.get(0) {
+                        if let Some(&offset) = self.search_matches.first() {
                             term.scroll_to_offset(offset);
                             self.last_scroll_activity = std::time::Instant::now();
                         }
@@ -2897,7 +2953,7 @@ impl RootView {
                         self.search_query.push_str(&ch);
                         self.search_matches = term.search_matches(&self.search_query);
                         self.search_match_idx = 0;
-                        if let Some(&offset) = self.search_matches.get(0) {
+                        if let Some(&offset) = self.search_matches.first() {
                             term.scroll_to_offset(offset);
                             self.last_scroll_activity = std::time::Instant::now();
                         }
@@ -2997,8 +3053,8 @@ impl RootView {
                     let branch_str = t.git_status.as_ref().map(|g| g.branch.clone());
                     let matches = query.is_empty()
                         || t.title.to_lowercase().contains(&query)
-                        || cwd_str.as_ref().map_or(false, |c| c.to_lowercase().contains(&query))
-                        || branch_str.as_ref().map_or(false, |b| b.to_lowercase().contains(&query));
+                        || cwd_str.as_ref().is_some_and(|c| c.to_lowercase().contains(&query))
+                        || branch_str.as_ref().is_some_and(|b| b.to_lowercase().contains(&query));
                     if matches {
                         Some((idx, t.id, t.title.clone(), cwd_str))
                     } else {
@@ -3634,7 +3690,7 @@ impl RootView {
             }
             let screen_rows = ((avail_h / line_h) as i32).max(1);
             let display_offset = terminal.display_offset();
-            let grid_col = ((local_x / cell_w).floor() as usize).max(0);
+            let grid_col = (local_x / cell_w).floor() as usize;
             let grid_row = (((local_y / line_h).floor() as i32) - (display_offset as i32)).clamp(-(history_size as i32), screen_rows - 1);
             let start_point = alacritty_terminal::index::Point::new(
                 alacritty_terminal::index::Line(grid_row),
@@ -3770,7 +3826,7 @@ impl RootView {
         let avail_h = (viewport_size.height.to_f64() as f32 - 56.0).max(100.0);
         let screen_rows = ((avail_h / line_h) as i32).max(1);
         let display_offset = terminal.display_offset();
-        let grid_col = ((local_x / cell_w).floor() as usize).max(0);
+        let grid_col = (local_x / cell_w).floor() as usize;
         let grid_row = (((local_y / line_h).floor() as i32) - (display_offset as i32)).clamp(-(history_size as i32), screen_rows - 1);
         let current_point = alacritty_terminal::index::Point::new(
             alacritty_terminal::index::Line(grid_row),
@@ -3879,7 +3935,7 @@ impl RootView {
         let Some((raw_x, raw_y)) = self.selection_mouse_pos else { return; };
         let Some(active_tab) = self.tabs.get(self.active_tab_idx) else { return; };
         let active_pane = active_tab.pane_tree.active_pane();
-        let Some(terminal) = active_pane.as_ref().and_then(|p| p.terminal.as_ref()).or_else(|| active_tab.terminal.as_ref()) else { return; };
+        let Some(terminal) = active_pane.as_ref().and_then(|p| p.terminal.as_ref()).or(active_tab.terminal.as_ref()) else { return; };
 
         let (cell_w, line_h) = self.measure_cell_metrics(window);
         let px_per_line = if line_h > 0.0 { line_h } else { 18.0 };
@@ -4169,9 +4225,9 @@ impl RootView {
                             let block_cat = if (0x2500..=0x257F).contains(&code)
                                 || (0x2580..=0x259F).contains(&code)
                                 || (0x25A0..=0x25FF).contains(&code)
+                                || is_emoji
+                                || is_pua_icon
                             {
-                                Some(cell.c)
-                            } else if is_emoji || is_pua_icon {
                                 Some(cell.c)
                             } else {
                                 None
@@ -4310,7 +4366,7 @@ impl RootView {
                                         let col_end = char_to_end_col[last_char_idx];
                                         let col_len = col_end.saturating_sub(col_start).max(1);
 
-                                        let is_active_match = active_search_offset.map_or(false, |off| {
+                                        let is_active_match = active_search_offset.is_some_and(|off| {
                                             off == (display_offset + (num_lines.saturating_sub(1 + row_idx)))
                                         });
                                         row_highlights.push((col_start, col_len, is_active_match));
@@ -4333,7 +4389,7 @@ impl RootView {
                             selection_range,
                             search_highlights: all_search_highlights,
                             visible_images,
-                            theme: theme.clone(),
+                            theme,
                             cursor_color,
                             font_family: font_family.clone(),
                             font_size,
@@ -4428,7 +4484,7 @@ impl RootView {
                                 tab.cwd = p.cwd.clone();
                                 tab.git_status = p.git_status.clone();
                             }
-                            let mouse_mode = tab.terminal.as_ref().map_or(false, |t| t.is_mouse_mode_enabled());
+                            let mouse_mode = tab.terminal.as_ref().is_some_and(|t| t.is_mouse_mode_enabled());
                             if !mouse_mode || ev.modifiers.shift {
                                 let x = ev.position.x.to_f64() as f32;
                                 let y = ev.position.y.to_f64() as f32;
@@ -4583,7 +4639,7 @@ impl Render for RootView {
                     id: tab.id,
                     title: tab.custom_title.clone().unwrap_or_else(|| tab.title.clone()),
                     active: idx == self.active_tab_idx,
-                    is_dirty: tab.git_status.as_ref().map_or(false, |g| g.unstaged > 0 || g.staged > 0),
+                    is_dirty: tab.git_status.as_ref().is_some_and(|g| g.unstaged > 0 || g.staged > 0),
                     process_name,
                 }
             })
@@ -4594,7 +4650,7 @@ impl Render for RootView {
             if let Some(active_tab) = active_tab {
                 if let Some(ref term) = active_tab.terminal {
                     if let Some(proc_cwd) = term.get_current_working_directory() {
-                        if active_tab.cwd.as_ref().map_or(true, |c| c != &proc_cwd) {
+                        if active_tab.cwd.as_ref() != Some(&proc_cwd) {
                             active_tab.cwd = Some(proc_cwd);
                             true
                         } else {
@@ -4617,7 +4673,7 @@ impl Render for RootView {
         let (active_cwd, active_git, fallback_info) = if let Some(active_tab) = self.tabs.get_mut(self.active_tab_idx) {
             let now = std::time::Instant::now();
             let should_poll = active_tab.git_checked_cwd.as_ref() != active_tab.cwd.as_ref()
-                || active_tab.git_last_poll.map_or(true, |last| now.duration_since(last) >= std::time::Duration::from_secs(2));
+                || active_tab.git_last_poll.is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_secs(2));
 
             if should_poll {
                 active_tab.git_checked_cwd = active_tab.cwd.clone();
@@ -5984,7 +6040,7 @@ impl Render for RootView {
                                                                             .bg(if is_selected { theme.black } else { theme.surface_raised })
                                                                             .text_size(px(9.5))
                                                                             .font_weight(FontWeight::MEDIUM)
-                                                                            .text_color(if is_selected { theme.accent } else { theme.accent })
+                                                                            .text_color(if is_selected { theme.accent } else { theme.muted_strong })
                                                                             .child(format!("#{}", host.tag)),
                                                                     )
                                                                     .child(
@@ -6131,7 +6187,7 @@ impl Render for RootView {
             // Git Worktree Picker Modal
             .when(self.is_worktree_picker_open, |this| {
                 let active_cwd = self.tabs.get(self.active_tab_idx).and_then(|t| t.cwd.as_deref());
-                let is_git = active_cwd.map_or(false, crate::git::is_git_repo);
+                let is_git = active_cwd.is_some_and(crate::git::is_git_repo);
                 let worktrees = active_cwd.map(crate::git::list_worktrees).unwrap_or_default();
                 let query = self.worktree_picker_query.to_lowercase();
                 let filtered: Vec<crate::git::Worktree> = worktrees
@@ -6331,8 +6387,8 @@ impl Render for RootView {
                         let branch_str = t.git_status.as_ref().map(|g| g.branch.clone());
                         let matches = query.is_empty()
                             || t.title.to_lowercase().contains(&query)
-                            || cwd_str.as_ref().map_or(false, |c| c.to_lowercase().contains(&query))
-                            || branch_str.as_ref().map_or(false, |b| b.to_lowercase().contains(&query));
+                            || cwd_str.as_ref().is_some_and(|c| c.to_lowercase().contains(&query))
+                            || branch_str.as_ref().is_some_and(|b| b.to_lowercase().contains(&query));
                         if matches {
                             Some((idx, t.id, t.title.clone(), cwd_str, branch_str))
                         } else {

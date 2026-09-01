@@ -1,8 +1,8 @@
-use gpui::{
-    fill, point, px, size, App, Bounds, Element, ElementId, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, Pixels, Style, TextAlign, TextRun, Window,
-};
 use alacritty_terminal::vte::ansi::CursorShape;
+use gpui::{
+    fill, point, px, size, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
+    IntoElement, LayoutId, Pixels, Style, TextAlign, TextRun, Window,
+};
 
 use crate::ui::root_view::{Selection, StyledSpan};
 
@@ -99,13 +99,17 @@ impl Element for TerminalGridElement {
             let img_y = origin.y + px(img.row as f32 * self.line_h);
             let img_w = img.cols as f32 * self.cell_w;
             let img_h = img.rows as f32 * self.line_h;
-            let img_bounds = Bounds::new(
-                point(img_x, img_y),
-                size(px(img_w), px(img_h)),
-            );
+            let img_bounds = Bounds::new(point(img_x, img_y), size(px(img_w), px(img_h)));
             let mask = bounds.intersect(&img_bounds);
             if mask.size.width > px(0.0) && mask.size.height > px(0.0) {
-                let _ = window.paint_image(img_bounds, mask, gpui::Corners::default(), img.image.clone(), 0, false);
+                let _ = window.paint_image(
+                    img_bounds,
+                    mask,
+                    gpui::Corners::default(),
+                    img.image.clone(),
+                    0,
+                    false,
+                );
             }
         }
 
@@ -129,8 +133,13 @@ impl Element for TerminalGridElement {
 
             // 2. Selection
             if let Some(sel) = self.selection_range {
-                let (min_p, max_p) = if sel.start <= sel.end { (sel.start, sel.end) } else { (sel.end, sel.start) };
-                let sel_col_range = if grid_line_idx < min_p.line.0 || grid_line_idx > max_p.line.0 {
+                let (min_p, max_p) = if sel.start <= sel.end {
+                    (sel.start, sel.end)
+                } else {
+                    (sel.end, sel.start)
+                };
+                let sel_col_range = if grid_line_idx < min_p.line.0 || grid_line_idx > max_p.line.0
+                {
                     None
                 } else if min_p.line.0 == max_p.line.0 {
                     Some((min_p.column.0, max_p.column.0 + 1))
@@ -161,8 +170,16 @@ impl Element for TerminalGridElement {
                     let x_end = ((m_col + m_len) as f32 * self.cell_w).floor();
                     let quad_w = (x_end - x_start).max(self.cell_w);
 
-                    let bg_color = if is_active { self.theme.accent.opacity(0.70) } else { self.theme.yellow.opacity(0.40) };
-                    let border_color = if is_active { self.theme.accent } else { self.theme.yellow };
+                    let bg_color = if is_active {
+                        self.theme.accent.opacity(0.70)
+                    } else {
+                        self.theme.yellow.opacity(0.40)
+                    };
+                    let border_color = if is_active {
+                        self.theme.accent
+                    } else {
+                        self.theme.yellow
+                    };
 
                     let hl_bounds = Bounds::new(
                         point(origin.x + px(x_start), y),
@@ -197,7 +214,8 @@ impl Element for TerminalGridElement {
                         let mut text_run_start_col = span.start_col;
 
                         for (i, c) in span.text.chars().enumerate() {
-                            let char_col = span.char_cols.get(i).copied().unwrap_or(span.start_col + i);
+                            let char_col =
+                                span.char_cols.get(i).copied().unwrap_or(span.start_col + i);
                             let c_start = (char_col as f32 * self.cell_w).floor();
                             let c_end = ((char_col + 1) as f32 * self.cell_w).floor();
                             let c_w = (c_end - c_start).max(1.0);
@@ -206,7 +224,14 @@ impl Element for TerminalGridElement {
                                 size(px(c_w), px(self.line_h)),
                             );
 
-                            if paint_geometric_char(c, cell_bounds, span.fg, span.bg, default_bg, window) {
+                            if paint_geometric_char(
+                                c,
+                                cell_bounds,
+                                span.fg,
+                                span.bg,
+                                default_bg,
+                                window,
+                            ) {
                                 if !text_run_buf.is_empty() {
                                     paint_text_run(
                                         &text_run_buf,
@@ -312,7 +337,7 @@ impl Element for TerminalGridElement {
                             );
                             window.paint_quad(fill(b, self.cursor_color.opacity(0.80)));
                         }
-                        CursorShape::Beam | _ => {
+                        CursorShape::Beam => {
                             // Beam `|` (2px width)
                             let b = Bounds::new(
                                 point(origin.x + px(x_start), y),
@@ -320,6 +345,7 @@ impl Element for TerminalGridElement {
                             );
                             window.paint_quad(fill(b, self.cursor_color));
                         }
+                        CursorShape::Hidden => {}
                     }
                 }
             }
@@ -331,13 +357,17 @@ impl Element for TerminalGridElement {
             let img_y = origin.y + px(img.row as f32 * self.line_h);
             let img_w = img.cols as f32 * self.cell_w;
             let img_h = img.rows as f32 * self.line_h;
-            let img_bounds = Bounds::new(
-                point(img_x, img_y),
-                size(px(img_w), px(img_h)),
-            );
+            let img_bounds = Bounds::new(point(img_x, img_y), size(px(img_w), px(img_h)));
             let mask = bounds.intersect(&img_bounds);
             if mask.size.width > px(0.0) && mask.size.height > px(0.0) {
-                let _ = window.paint_image(img_bounds, mask, gpui::Corners::default(), img.image.clone(), 0, false);
+                let _ = window.paint_image(
+                    img_bounds,
+                    mask,
+                    gpui::Corners::default(),
+                    img.image.clone(),
+                    0,
+                    false,
+                );
             }
         }
     }
@@ -371,7 +401,11 @@ fn paint_text_run(
 
     let run = TextRun {
         len: text.len(),
-        font: if is_emoji { emoji_font.clone() } else { normal_font.clone() },
+        font: if is_emoji {
+            emoji_font.clone()
+        } else {
+            normal_font.clone()
+        },
         color: fg,
         background_color: None,
         underline: if is_underline {
@@ -407,20 +441,8 @@ fn paint_text_run(
 
     let _ = window
         .text_system()
-        .shape_line(
-            text.to_string().into(),
-            px(font_size),
-            &[run],
-            force_width,
-        )
-        .paint(
-            text_pos,
-            px(line_h),
-            align,
-            align_width,
-            window,
-            cx,
-        );
+        .shape_line(text.to_string().into(), px(font_size), &[run], force_width)
+        .paint(text_pos, px(line_h), align, align_width, window, cx);
 }
 
 fn paint_geometric_char(
@@ -445,66 +467,97 @@ fn paint_geometric_char(
     // 1. Block Elements (0x2580..=0x259F)
     if (0x2580..=0x259F).contains(&code) {
         match code {
-            0x2588 => { // Full block █
+            0x2588 => {
+                // Full block █
                 window.paint_quad(fill(bounds, fg));
             }
-            0x2580 => { // Upper half block ▀
+            0x2580 => {
+                // Upper half block ▀
                 window.paint_quad(fill(Bounds::new(point(x, y), size(width, half_h)), fg));
-                window.paint_quad(fill(Bounds::new(point(x, y + half_h), size(width, rem_h)), bg_c));
+                window.paint_quad(fill(
+                    Bounds::new(point(x, y + half_h), size(width, rem_h)),
+                    bg_c,
+                ));
             }
-            0x2584 => { // Lower half block ▄
+            0x2584 => {
+                // Lower half block ▄
                 window.paint_quad(fill(Bounds::new(point(x, y), size(width, half_h)), bg_c));
-                window.paint_quad(fill(Bounds::new(point(x, y + half_h), size(width, rem_h)), fg));
+                window.paint_quad(fill(
+                    Bounds::new(point(x, y + half_h), size(width, rem_h)),
+                    fg,
+                ));
             }
-            0x258C => { // Left half block ▌
+            0x258C => {
+                // Left half block ▌
                 window.paint_quad(fill(Bounds::new(point(x, y), size(half_w, line_h)), fg));
-                window.paint_quad(fill(Bounds::new(point(x + half_w, y), size(rem_w, line_h)), bg_c));
+                window.paint_quad(fill(
+                    Bounds::new(point(x + half_w, y), size(rem_w, line_h)),
+                    bg_c,
+                ));
             }
-            0x2590 => { // Right half block ▐
+            0x2590 => {
+                // Right half block ▐
                 window.paint_quad(fill(Bounds::new(point(x, y), size(half_w, line_h)), bg_c));
-                window.paint_quad(fill(Bounds::new(point(x + half_w, y), size(rem_w, line_h)), fg));
+                window.paint_quad(fill(
+                    Bounds::new(point(x + half_w, y), size(rem_w, line_h)),
+                    fg,
+                ));
             }
-            0x2581..=0x2587 => { // Lower fraction blocks  ▂▃▄▅▆▇
+            0x2581..=0x2587 => {
+                // Lower fraction blocks  ▂▃▄▅▆▇
                 let frac = (code - 0x2580) as f32 / 8.0;
                 let fill_h = (line_h * frac).floor().max(px(1.0));
                 window.paint_quad(fill(bounds, bg_c));
-                window.paint_quad(fill(Bounds::new(point(x, y + line_h - fill_h), size(width, fill_h)), fg));
+                window.paint_quad(fill(
+                    Bounds::new(point(x, y + line_h - fill_h), size(width, fill_h)),
+                    fg,
+                ));
             }
-            0x2589..=0x258F => { // Left fraction blocks ▏▎▍▌▋▊▉
+            0x2589..=0x258F => {
+                // Left fraction blocks ▏▎▍▌▋▊▉
                 let frac = (8 - (code - 0x2588)) as f32 / 8.0;
                 let fill_w = (width * frac).floor().max(px(1.0));
                 window.paint_quad(fill(bounds, bg_c));
                 window.paint_quad(fill(Bounds::new(point(x, y), size(fill_w, line_h)), fg));
             }
-            0x2591 => { // Light shade ░
+            0x2591 => {
+                // Light shade ░
                 let mut blended = fg;
                 blended.a = 0.25;
                 window.paint_quad(fill(bounds, bg_c));
                 window.paint_quad(fill(bounds, blended));
             }
-            0x2592 => { // Medium shade ▒
+            0x2592 => {
+                // Medium shade ▒
                 let mut blended = fg;
                 blended.a = 0.50;
                 window.paint_quad(fill(bounds, bg_c));
                 window.paint_quad(fill(bounds, blended));
             }
-            0x2593 => { // Dark shade ▓
+            0x2593 => {
+                // Dark shade ▓
                 let mut blended = fg;
                 blended.a = 0.75;
                 window.paint_quad(fill(bounds, bg_c));
                 window.paint_quad(fill(bounds, blended));
             }
-            0x2594 => { // Upper 1/8th ▔
+            0x2594 => {
+                // Upper 1/8th ▔
                 let fill_h = (line_h * 0.125).floor().max(px(1.0));
                 window.paint_quad(fill(bounds, bg_c));
                 window.paint_quad(fill(Bounds::new(point(x, y), size(width, fill_h)), fg));
             }
-            0x2595 => { // Right 1/8th ▕
+            0x2595 => {
+                // Right 1/8th ▕
                 let fill_w = (width * 0.125).floor().max(px(1.0));
                 window.paint_quad(fill(bounds, bg_c));
-                window.paint_quad(fill(Bounds::new(point(x + width - fill_w, y), size(fill_w, line_h)), fg));
+                window.paint_quad(fill(
+                    Bounds::new(point(x + width - fill_w, y), size(fill_w, line_h)),
+                    fg,
+                ));
             }
-            0x2596..=0x259F => { // Quadrants ▖▗▘▙▛▜▟▚▞
+            0x2596..=0x259F => {
+                // Quadrants ▖▗▘▙▛▜▟▚▞
                 let (tl, tr, bl, br) = match code {
                     0x2596 => (bg_c, bg_c, fg, bg_c),
                     0x2597 => (bg_c, bg_c, bg_c, fg),
@@ -519,9 +572,18 @@ fn paint_geometric_char(
                     _ => return false,
                 };
                 window.paint_quad(fill(Bounds::new(point(x, y), size(half_w, half_h)), tl));
-                window.paint_quad(fill(Bounds::new(point(x + half_w, y), size(rem_w, half_h)), tr));
-                window.paint_quad(fill(Bounds::new(point(x, y + half_h), size(half_w, rem_h)), bl));
-                window.paint_quad(fill(Bounds::new(point(x + half_w, y + half_h), size(rem_w, rem_h)), br));
+                window.paint_quad(fill(
+                    Bounds::new(point(x + half_w, y), size(rem_w, half_h)),
+                    tr,
+                ));
+                window.paint_quad(fill(
+                    Bounds::new(point(x, y + half_h), size(half_w, rem_h)),
+                    bl,
+                ));
+                window.paint_quad(fill(
+                    Bounds::new(point(x + half_w, y + half_h), size(rem_w, rem_h)),
+                    br,
+                ));
             }
             _ => return false,
         }
@@ -529,7 +591,9 @@ fn paint_geometric_char(
     }
 
     // 2. Box Drawing Characters (0x2500..=0x257F)
-    if let Some((left_style, right_style, top_style, bottom_style, kind)) = crate::ui::root_view::decode_box_drawing(ch) {
+    if let Some((left_style, right_style, top_style, bottom_style, kind)) =
+        crate::ui::root_view::decode_box_drawing(ch)
+    {
         let mid_x = (width / 2.0).floor();
         let mid_y = (line_h / 2.0).floor();
         let t_light = px(1.0);
@@ -551,23 +615,37 @@ fn paint_geometric_char(
             let mut rounded = gpui::Corners::default();
             let mut borders = gpui::Edges::default();
 
-            if code == 0x256D { // ╭
-                corner_bounds = Bounds::new(point(x + mid_x - t_l / 2.0, y + mid_y - t_t / 2.0), size(width - mid_x + t_l / 2.0, line_h - mid_y + t_t / 2.0));
+            if code == 0x256D {
+                // ╭
+                corner_bounds = Bounds::new(
+                    point(x + mid_x - t_l / 2.0, y + mid_y - t_t / 2.0),
+                    size(width - mid_x + t_l / 2.0, line_h - mid_y + t_t / 2.0),
+                );
                 rounded.top_left = radius;
                 borders.top = t_t;
                 borders.left = t_l;
-            } else if code == 0x256E { // ╮
-                corner_bounds = Bounds::new(point(x, y + mid_y - t_t / 2.0), size(mid_x + t_r / 2.0, line_h - mid_y + t_t / 2.0));
+            } else if code == 0x256E {
+                // ╮
+                corner_bounds = Bounds::new(
+                    point(x, y + mid_y - t_t / 2.0),
+                    size(mid_x + t_r / 2.0, line_h - mid_y + t_t / 2.0),
+                );
                 rounded.top_right = radius;
                 borders.top = t_t;
                 borders.right = t_r;
-            } else if code == 0x2570 { // ╰
-                corner_bounds = Bounds::new(point(x + mid_x - t_l / 2.0, y), size(width - mid_x + t_l / 2.0, mid_y + t_b / 2.0));
+            } else if code == 0x2570 {
+                // ╰
+                corner_bounds = Bounds::new(
+                    point(x + mid_x - t_l / 2.0, y),
+                    size(width - mid_x + t_l / 2.0, mid_y + t_b / 2.0),
+                );
                 rounded.bottom_left = radius;
                 borders.bottom = t_b;
                 borders.left = t_l;
-            } else if code == 0x256F { // ╯
-                corner_bounds = Bounds::new(point(x, y), size(mid_x + t_r / 2.0, mid_y + t_b / 2.0));
+            } else if code == 0x256F {
+                // ╯
+                corner_bounds =
+                    Bounds::new(point(x, y), size(mid_x + t_r / 2.0, mid_y + t_b / 2.0));
                 rounded.bottom_right = radius;
                 borders.bottom = t_b;
                 borders.right = t_r;
@@ -596,7 +674,10 @@ fn paint_geometric_char(
             }
             if right_style > 0 {
                 window.paint_quad(fill(
-                    Bounds::new(point(x + mid_x, y + mid_y - t_r / 2.0), size(width - mid_x, t_r)),
+                    Bounds::new(
+                        point(x + mid_x, y + mid_y - t_r / 2.0),
+                        size(width - mid_x, t_r),
+                    ),
                     fg,
                 ));
             }
@@ -617,7 +698,10 @@ fn paint_geometric_char(
             }
             if bottom_style > 0 {
                 window.paint_quad(fill(
-                    Bounds::new(point(x + mid_x - t_b / 2.0, y + mid_y), size(t_b, line_h - mid_y)),
+                    Bounds::new(
+                        point(x + mid_x - t_b / 2.0, y + mid_y),
+                        size(t_b, line_h - mid_y),
+                    ),
                     fg,
                 ));
             }
@@ -628,4 +712,3 @@ fn paint_geometric_char(
 
     false
 }
-

@@ -185,8 +185,8 @@ fn find_matching_brace(s: &str, open_idx: usize) -> Option<usize> {
     let bytes = s.as_bytes();
     if bytes.get(open_idx) != Some(&b'{') { return None; }
     let mut depth = 1i32;
-    for k in (open_idx + 1)..bytes.len() {
-        match bytes[k] {
+    for (k, &byte) in bytes.iter().enumerate().skip(open_idx + 1) {
+        match byte {
             b'{' => depth += 1,
             b'}' => {
                 depth -= 1;

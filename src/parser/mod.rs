@@ -128,7 +128,7 @@ impl Perform for Performer {
             0x07 => self.actions.push(Action::Bell),
             0x08 => self.actions.push(Action::Backspace),
             0x09 => self.actions.push(Action::Tab),
-            0x0A | 0x0B | 0x0C => self.actions.push(Action::LineFeed),
+            0x0A..=0x0C => self.actions.push(Action::LineFeed),
             0x0D => self.actions.push(Action::CarriageReturn),
             _ => {}
         }

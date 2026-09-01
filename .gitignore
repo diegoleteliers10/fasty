@@ -10,3 +10,9 @@ target/
 .DS_Store
 *.log
 run.log
+
+#scripts
+scripts/
+
+#plans
+docs/plans/

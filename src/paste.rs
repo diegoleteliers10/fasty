@@ -193,7 +193,7 @@ fn try_macos_clipboard_fallback() -> Option<String> {
 
     if output.status.success() {
         let res = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if res == "ok" && file_path.exists() && file_path.metadata().map_or(false, |m| m.len() > 0) {
+        if res == "ok" && file_path.exists() && file_path.metadata().is_ok_and(|m| m.len() > 0) {
             return Some(format_path_for_shell(&file_path));
         } else if !res.is_empty() && res != "ok" {
             let path = PathBuf::from(&res);

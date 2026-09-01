@@ -30,17 +30,34 @@ impl CliOptions {
                     println!(
                         "Fastty - GPU-accelerated terminal emulator\n\n\
                         USAGE:\n    \
-                        fastty [OPTIONS] [-- <CMD>...]\n\n\
+                        fastty [OPTIONS] [-- <CMD>...]\n    \
+                        fastty sessions\n    \
+                        fastty attach <session-id>\n    \
+                        fastty gateway [--port <PORT>]\n\n\
                         OPTIONS:\n    \
                         -d, --dir, --working-directory <DIR>  Set initial working directory\n    \
                         -t, --title <TITLE>                   Set initial tab/window title\n    \
                         -e, --exec, --command <CMD...>        Execute command and arguments\n    \
                         -v, --version                         Print version information\n    \
                         -h, --help                            Print this help message\n\n\
+                        SUBCOMMANDS (talk to an already running fastty over its local\n    \
+                        IPC daemon -- see docs/daemon-protocol.md):\n    \
+                        sessions [--watch] [--wait[=SECS]] List live tabs/splits (or stream\n    \
+                                                           changes with --watch)\n    \
+                        attach <id> [--read-only] [--wait[=SECS]]\n    \
+                                                           Attach interactively; --wait retries\n    \
+                                                           until fastty/that session shows up\n    \
+                        gateway [--port <PORT>] [--host <ADDR>]\n    \
+                                                           Serve the embedded web/Wasm client and\n    \
+                                                           bridge WebSocket traffic to the daemon\n\n\
                         EXAMPLES:\n    \
                         fastty --title \"Dev Server\" -d ~/api -e bun run dev\n    \
                         fastty -d /tmp\n    \
-                        fastty -- htop"
+                        fastty -- htop\n    \
+                        fastty sessions --watch\n    \
+                        fastty attach 1 --read-only\n    \
+                        fastty attach 1 --wait=30\n    \
+                        fastty gateway --port 8765"
                     );
                     std::process::exit(0);
                 }
@@ -67,7 +84,7 @@ impl CliOptions {
                 }
                 "-e" | "--exec" | "--command" => {
                     let mut cmd_args: Vec<String> = Vec::new();
-                    while let Some(next_arg) = iter.next() {
+                    for next_arg in iter.by_ref() {
                         cmd_args.push(next_arg);
                     }
                     if let Some(cmd) = cmd_args.first() {
@@ -79,7 +96,7 @@ impl CliOptions {
                 }
                 "--" => {
                     let mut cmd_args: Vec<String> = Vec::new();
-                    while let Some(next_arg) = iter.next() {
+                    for next_arg in iter.by_ref() {
                         cmd_args.push(next_arg);
                     }
                     if let Some(cmd) = cmd_args.first() {

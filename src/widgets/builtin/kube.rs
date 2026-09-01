@@ -68,7 +68,7 @@ impl Widget for KubeWidget {
             }],
             KubeState::NoKubectl => Vec::new(),
             KubeState::Error(e) => vec![Segment {
-                text: format!(" k8s:err "),
+                text: " k8s:err ".to_string(),
                 color: [0.90, 0.55, 0.45, 1.0],
                 tooltip: Some(format!("kubectl error: {}", e)),
             }],

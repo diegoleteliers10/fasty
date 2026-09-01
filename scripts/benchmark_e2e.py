@@ -6,11 +6,34 @@ import sys
 import tempfile
 import statistics
 import shutil
+import platform
 
 # Number of runs per benchmark to ensure statistical significance
 RUNS = 3
 
-# Terminal definitions and their command line syntax to run a command and auto-close
+# Number of untimed warm-up launches per test case, discarded before the
+# timed runs. GUI terminals pay a one-off cold-start cost (shader/font
+# cache, window server handshake, etc.) on the very first launch after
+# boot; without a warm-up that outlier skews the average heavily.
+WARMUP_RUNS = 1
+
+IS_MACOS = platform.system() == "Darwin"
+
+def macos_app_binary(app_name, binary_name):
+    """Path to a terminal's CLI-invokable binary embedded inside its .app bundle.
+
+    GUI terminals installed as macOS .app bundles (Ghostty.app, Alacritty.app,
+    kitty.app, WezTerm.app, ...) generally aren't on PATH, but the app bundle
+    embeds a real Mach-O binary at Contents/MacOS/<name> that can be invoked
+    directly like any CLI program.
+    """
+    path = f"/Applications/{app_name}.app/Contents/MacOS/{binary_name}"
+    return path if os.path.exists(path) else None
+
+# Terminal definitions and their command line syntax to run a command and auto-close.
+# `macos_app`/`macos_binary` are used only on macOS to locate the binary inside the
+# app bundle when it isn't on PATH; `binary` is the fallback (and the only thing used
+# on Linux/Windows).
 TERMINALS = {
     "fastty (This Project)": {
         "binary": "./target/release/fastty",
@@ -18,18 +41,39 @@ TERMINALS = {
     },
     "Ghostty": {
         "binary": "ghostty",
-        "cmd_args": lambda cmd: ["-e"] + cmd,
+        "macos_app": "Ghostty",
+        "macos_binary": "ghostty",
+        # Ghostty defaults to wait-after-command=false (the surface closes when
+        # the executed command exits) but quit-after-last-window-closed=false
+        # (the whole PROCESS keeps running with zero windows) -- without this
+        # override, run_trial's "wait for process exit" never returns.
+        # Known issue: on this machine (macOS 26/27 beta, Ghostty 1.3.1),
+        # even with this override the window/process still hangs open most
+        # of the time when invoked this way outside a normal Finder/Dock
+        # launch -- confirmed via `sample` to be idling in NSApplication's
+        # event loop rather than doing any work. Ghostty's own --help says
+        # direct CLI launch is unsupported on macOS ("use open -na
+        # Ghostty.app instead"), and `open -na` was tried too with the same
+        # result, so this looks like a Ghostty-side timing bug on this OS
+        # build rather than something fixable from here.
+        "cmd_args": lambda cmd: ["--quit-after-last-window-closed=true", "-e"] + cmd,
     },
     "Alacritty": {
         "binary": "alacritty",
+        "macos_app": "Alacritty",
+        "macos_binary": "alacritty",
         "cmd_args": lambda cmd: ["-e"] + cmd,
     },
     "Kitty": {
         "binary": "kitty",
+        "macos_app": "kitty",
+        "macos_binary": "kitty",
         "cmd_args": lambda cmd: cmd,
     },
     "WezTerm": {
         "binary": "wezterm",
+        "macos_app": "WezTerm",
+        "macos_binary": "wezterm",
         "cmd_args": lambda cmd: ["start", "--"] + cmd,
     },
     "GNOME Terminal": {
@@ -46,12 +90,23 @@ TERMINALS = {
     }
 }
 
-def check_binary(name, config):
-    """Check if the terminal binary exists on the system."""
+def resolve_binary(config):
+    """Resolve the actual invokable path for a terminal's binary, or None if absent."""
     binary = config["binary"]
     if binary.startswith("./") or binary.startswith("/"):
-        return os.path.exists(binary)
-    return shutil.which(binary) is not None
+        return os.path.abspath(binary) if os.path.exists(binary) else None
+    if IS_MACOS and "macos_app" in config:
+        found = macos_app_binary(config["macos_app"], config["macos_binary"])
+        if found:
+            return found
+    on_path = shutil.which(binary)
+    if on_path:
+        return on_path
+    return None
+
+def check_binary(name, config):
+    """Check if the terminal binary exists on the system."""
+    return resolve_binary(config) is not None
 
 def generate_payloads():
     """Generate temporary test files for benchmarking text rendering/processing."""
@@ -78,11 +133,11 @@ def generate_payloads():
 
 def run_trial(term_name, term_config, cmd):
     """Run a single benchmark trial and return the elapsed time."""
-    binary_path = term_config["binary"]
-    # Resolve local binary to absolute path if needed
-    if binary_path.startswith("./"):
-        binary_path = os.path.abspath(binary_path)
-        
+    binary_path = resolve_binary(term_config)
+    if binary_path is None:
+        print(f"  [Error] Could not resolve binary for {term_name}")
+        return None
+
     full_cmd = [binary_path] + term_config["cmd_args"](cmd)
     
     start_time = time.perf_counter()
@@ -111,6 +166,13 @@ def benchmark_terminal(term_name, term_config, test_cases):
     results = {}
     for case_name, cmd in test_cases.items():
         print(f"  Running '{case_name}'...", end="", flush=True)
+
+        # Untimed warm-up launches, discarded, to absorb one-off cold-start
+        # costs (shader/font cache, window server handshake) before timing.
+        for _ in range(WARMUP_RUNS):
+            run_trial(term_name, term_config, cmd)
+            time.sleep(0.2)
+
         times = []
         for _ in range(RUNS):
             # Run the command and capture elapsed time

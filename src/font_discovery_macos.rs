@@ -98,7 +98,7 @@ pub fn all_system_font_families() -> Vec<String> {
         }
         let array: core_foundation::array::CFArray<CFString> = core_foundation::array::CFArray::wrap_under_create_rule(array_ref);
         let mut families: Vec<String> = array.iter().map(|s| s.to_string()).filter(|s| !s.starts_with('.')).collect();
-        families.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        families.sort_by_key(|a| a.to_lowercase());
         families.dedup();
         families
     }

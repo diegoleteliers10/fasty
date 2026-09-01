@@ -103,7 +103,7 @@ pub fn parse_kitty_control(header: &[u8]) -> Option<KittyControl> {
                 ctrl.format = match val {
                     "100" => KittyFormat::Png,
                     "24" => KittyFormat::Rgb24,
-                    "32" | _ => KittyFormat::Rgba32,
+                    _ => KittyFormat::Rgba32,
                 };
             }
             "t" => {
@@ -111,7 +111,7 @@ pub fn parse_kitty_control(header: &[u8]) -> Option<KittyControl> {
                     "f" => KittyTransmission::File,
                     "t" => KittyTransmission::TempFile,
                     "s" => KittyTransmission::SharedMem,
-                    "d" | _ => KittyTransmission::Direct,
+                    _ => KittyTransmission::Direct,
                 };
             }
             "s" => ctrl.width_px = val.parse::<u32>().ok(),

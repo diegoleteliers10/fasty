@@ -213,6 +213,15 @@ pub struct TerminalState {
     pub prompt_lines: Arc<ParkingMutex<Vec<u64>>>,
     pub image_store: Arc<ParkingMutex<ImageStore>>,
     event_listener: EventListenerProxy,
+    /// Raw PTY byte stream, fanned out to anyone subscribed via
+    /// `subscribe_output` (currently just `crate::daemon`'s attach clients).
+    /// Closed receivers are pruned lazily on the next write.
+    output_subs: Arc<ParkingMutex<Vec<async_channel::Sender<Vec<u8>>>>>,
+    /// Flipped to `false` by the reader thread once it sees EOF/an error on
+    /// the PTY (i.e. the shell exited). Distinct from `is_process_running`,
+    /// which asks whether the shell has an active *foreground child* — this
+    /// asks whether the pane's shell process is there at all.
+    alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TerminalState {
@@ -233,8 +242,10 @@ impl TerminalState {
         let cols = ((viewport_width as usize) / cell_w).max(80);
         let rows = ((viewport_height as usize) / cell_h).max(24);
 
-        let mut config = AlacrittyConfig::default();
-        config.scrolling_history = scrollback.clamp(500, 100_000);
+        let config = AlacrittyConfig {
+            scrolling_history: scrollback.clamp(500, 100_000),
+            ..Default::default()
+        };
         let size = TermSize::new(cols, rows);
 
         let pty_system = native_pty_system();
@@ -443,6 +454,13 @@ impl TerminalState {
         let writer_boxed: Box<dyn Write + Send> = Box::new(writer);
         let writer_arc: Arc<ParkingMutex<Box<dyn Write + Send>>> =
             Arc::new(ParkingMutex::new(writer_boxed));
+
+        let output_subs: Arc<ParkingMutex<Vec<async_channel::Sender<Vec<u8>>>>> =
+            Arc::new(ParkingMutex::new(Vec::new()));
+        let output_subs_clone = Arc::clone(&output_subs);
+        let alive: Arc<std::sync::atomic::AtomicBool> =
+            Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let alive_clone = Arc::clone(&alive);
 
         let event_listener = EventListenerProxy::from_arc(writer_arc.clone());
         event_listener.set_event_sender(sender.clone());
@@ -759,10 +777,23 @@ impl TerminalState {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
+                        alive_clone.store(false, Ordering::Relaxed);
                         event_listener_clone.send_app_event(AppEvent::Exit { shell_pid: reader_shell_pid });
                         break;
                     }
                     Ok(n) => {
+                        // Fan out the raw chunk to any daemon attach clients before
+                        // parsing it. Best-effort: an unbounded channel never
+                        // backpressures the reader, and a closed receiver (client
+                        // disconnected) just gets pruned on its next failed send.
+                        {
+                            let mut subs = output_subs_clone.lock();
+                            if !subs.is_empty() {
+                                let chunk = buf[..n].to_vec();
+                                subs.retain(|tx| tx.try_send(chunk.clone()).is_ok());
+                            }
+                        }
+
                         let mut term_locked = term_clone.lock();
                         let mut local_lines = 0;
 
@@ -820,7 +851,7 @@ impl TerminalState {
                                             let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
                                             let screen_lines = term_locked.grid().screen_lines() as i32;
                                             let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
-                                            handle_cmd(cmd, cursor_line, screen_lines, base, &mut *term_locked, &mut parser);
+                                            handle_cmd(cmd, cursor_line, screen_lines, base, &mut term_locked, &mut parser);
                                         }
                                         seq_state = SequenceParseState::Normal;
                                     } else if byte == 0x1b {
@@ -838,7 +869,7 @@ impl TerminalState {
                                             let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
                                             let screen_lines = term_locked.grid().screen_lines() as i32;
                                             let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
-                                            handle_cmd(cmd, cursor_line, screen_lines, base, &mut *term_locked, &mut parser);
+                                            handle_cmd(cmd, cursor_line, screen_lines, base, &mut term_locked, &mut parser);
                                         }
                                         seq_state = SequenceParseState::Normal;
                                     } else {
@@ -855,7 +886,7 @@ impl TerminalState {
                                         let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
                                         let cursor_col = term_locked.grid().cursor.point.column.0;
                                         let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
-                                        let added = handle_apc(&apc_buf, cursor_line, cursor_col, base, &mut *term_locked, &mut parser);
+                                        let added = handle_apc(&apc_buf, cursor_line, cursor_col, base, &mut term_locked, &mut parser);
                                         local_lines += added;
                                         seq_state = SequenceParseState::Normal;
                                     } else if byte == 0x1b {
@@ -872,7 +903,7 @@ impl TerminalState {
                                         let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
                                         let cursor_col = term_locked.grid().cursor.point.column.0;
                                         let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
-                                        let added = handle_apc(&apc_buf, cursor_line, cursor_col, base, &mut *term_locked, &mut parser);
+                                        let added = handle_apc(&apc_buf, cursor_line, cursor_col, base, &mut term_locked, &mut parser);
                                         local_lines += added;
                                         seq_state = SequenceParseState::Normal;
                                     } else {
@@ -934,6 +965,7 @@ impl TerminalState {
                         continue;
                     }
                     Err(_) => {
+                        alive_clone.store(false, Ordering::Relaxed);
                         event_listener_clone.send_app_event(AppEvent::Exit { shell_pid: reader_shell_pid });
                         break;
                     }
@@ -952,11 +984,30 @@ impl TerminalState {
             prompt_lines,
             image_store,
             event_listener,
+            output_subs,
+            alive,
         })
     }
 
     pub fn shell_pid(&self) -> Option<u32> {
         self.shell_pid
+    }
+
+    /// Whether the pane's shell process is still there — `false` once the
+    /// reader thread has seen EOF/an error on the PTY. Unlike
+    /// `is_process_running`, this is about the shell itself, not whether it
+    /// currently has an active foreground child.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Subscribe to this pane's raw PTY output. Used by `crate::daemon` so an
+    /// attached client sees the same bytes the GPUI renderer does, without
+    /// stealing them — every subscriber gets its own copy of each chunk.
+    pub fn subscribe_output(&self) -> async_channel::Receiver<Vec<u8>> {
+        let (tx, rx) = async_channel::unbounded();
+        self.output_subs.lock().push(tx);
+        rx
     }
 
     pub fn set_event_sender(&self, sender: crate::event_listener::EventSender) {
@@ -1076,9 +1127,9 @@ impl TerminalState {
         } else {
             // Normal X10/1000 format: \x1b[M{btn + 32}{col + 32}{row + 32}
             let b_byte = if pressed { btn_code } else { 3 };
-            let cb = (b_byte.saturating_add(32)).min(255);
-            let cx = ((col_1 as u8).saturating_add(32)).min(255);
-            let cy = ((row_1 as u8).saturating_add(32)).min(255);
+            let cb = b_byte.saturating_add(32);
+            let cx = (col_1 as u8).saturating_add(32);
+            let cy = (row_1 as u8).saturating_add(32);
             let seq = [0x1b, b'[', b'M', cb, cx, cy];
             self.write_to_pty(&seq);
         }
@@ -1120,7 +1171,7 @@ impl TerminalState {
         }
 
         let mut btn_code: u8 = if left_down {
-            0 + 32
+            32
         } else if middle_down {
             1 + 32
         } else if right_down {
@@ -1146,9 +1197,9 @@ impl TerminalState {
             let seq = format!("\x1b[<{};{};{}M", btn_code, col_1, row_1);
             self.write_to_pty(seq.as_bytes());
         } else {
-            let cb = (btn_code.saturating_add(32)).min(255);
-            let cx = ((col_1 as u8).saturating_add(32)).min(255);
-            let cy = ((row_1 as u8).saturating_add(32)).min(255);
+            let cb = btn_code.saturating_add(32);
+            let cx = (col_1 as u8).saturating_add(32);
+            let cy = (row_1 as u8).saturating_add(32);
             let seq = [0x1b, b'[', b'M', cb, cx, cy];
             self.write_to_pty(&seq);
         }
@@ -1411,6 +1462,147 @@ impl TerminalState {
             lines.push(line_str.trim_end().to_string());
         }
         lines
+    }
+
+    /// Render the current screen (not scrollback) as ANSI/SGR bytes, so an
+    /// attaching daemon client sees what's already on screen instead of a
+    /// blank pane until the next write. Colors/attributes that depend on the
+    /// active GPUI theme (`NamedColor::Foreground/Background/Cursor/Dim*`)
+    /// fall back to the terminal's default rather than being resolved here --
+    /// this method has no theme to resolve them against, and a client-side
+    /// default is a reasonable approximation for a one-shot snapshot.
+    pub fn snapshot_ansi(&self) -> Vec<u8> {
+        use alacritty_terminal::index::Line;
+        use alacritty_terminal::term::cell::Flags;
+        use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
+
+        fn push_color(out: &mut Vec<u8>, color: AnsiColor, is_bg: bool) {
+            match color {
+                AnsiColor::Named(n) => {
+                    let code = match n {
+                        NamedColor::Black => 0,
+                        NamedColor::Red => 1,
+                        NamedColor::Green => 2,
+                        NamedColor::Yellow => 3,
+                        NamedColor::Blue => 4,
+                        NamedColor::Magenta => 5,
+                        NamedColor::Cyan => 6,
+                        NamedColor::White => 7,
+                        NamedColor::BrightBlack => 8,
+                        NamedColor::BrightRed => 9,
+                        NamedColor::BrightGreen => 10,
+                        NamedColor::BrightYellow => 11,
+                        NamedColor::BrightBlue => 12,
+                        NamedColor::BrightMagenta => 13,
+                        NamedColor::BrightCyan => 14,
+                        NamedColor::BrightWhite => 15,
+                        // Foreground/Background/Cursor/Dim* depend on the active
+                        // theme -- no theme to resolve them against here, so fall
+                        // back to the terminal's default color.
+                        _ => return,
+                    };
+                    if code < 8 {
+                        let base = if is_bg { 40 } else { 30 };
+                        out.extend(format!("\x1b[{}m", base + code).bytes());
+                    } else {
+                        let base = if is_bg { 100 } else { 90 };
+                        out.extend(format!("\x1b[{}m", base + (code - 8)).bytes());
+                    }
+                }
+                AnsiColor::Indexed(i) => {
+                    out.extend(format!("\x1b[{};5;{}m", if is_bg { 48 } else { 38 }, i).bytes());
+                }
+                AnsiColor::Spec(rgb) => {
+                    out.extend(
+                        format!(
+                            "\x1b[{};2;{};{};{}m",
+                            if is_bg { 48 } else { 38 },
+                            rgb.r,
+                            rgb.g,
+                            rgb.b
+                        )
+                        .bytes(),
+                    );
+                }
+            }
+        }
+
+        let term = self.term.lock();
+        let grid = term.grid();
+        let screen_lines = grid.screen_lines();
+        let cols = grid.columns();
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[H");
+
+        let mut cur_fg: Option<AnsiColor> = None;
+        let mut cur_bg: Option<AnsiColor> = None;
+        let mut cur_flags = Flags::empty();
+
+        for line_i in 0..screen_lines {
+            if line_i > 0 {
+                out.extend_from_slice(b"\r\n");
+            }
+            let row = &grid[Line(line_i as i32)];
+            for col in 0..cols {
+                let cell = &row[alacritty_terminal::index::Column(col)];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                if Some(cell.fg) != cur_fg {
+                    push_color(&mut out, cell.fg, false);
+                    cur_fg = Some(cell.fg);
+                }
+                if Some(cell.bg) != cur_bg {
+                    push_color(&mut out, cell.bg, true);
+                    cur_bg = Some(cell.bg);
+                }
+                if cell.flags != cur_flags {
+                    // Attribute changes don't compose incrementally in SGR the
+                    // way colors do (there's no "turn off just italic"), so
+                    // reset and reapply everything for this cell whenever the
+                    // flag set changes at all.
+                    out.extend_from_slice(b"\x1b[22;23;24;27;28;29m"); // clear bold/dim, italic, underline, inverse, strikethrough
+                    if cell.flags.contains(Flags::BOLD) {
+                        out.extend_from_slice(b"\x1b[1m");
+                    }
+                    if cell.flags.contains(Flags::DIM) {
+                        out.extend_from_slice(b"\x1b[2m");
+                    }
+                    if cell.flags.contains(Flags::ITALIC) {
+                        out.extend_from_slice(b"\x1b[3m");
+                    }
+                    if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+                        out.extend_from_slice(b"\x1b[4m");
+                    }
+                    if cell.flags.contains(Flags::INVERSE) {
+                        out.extend_from_slice(b"\x1b[7m");
+                    }
+                    if cell.flags.contains(Flags::HIDDEN) {
+                        out.extend_from_slice(b"\x1b[8m");
+                    }
+                    if cell.flags.contains(Flags::STRIKEOUT) {
+                        out.extend_from_slice(b"\x1b[9m");
+                    }
+                    // Re-send colors too -- the blanket reset above cleared them.
+                    push_color(&mut out, cell.fg, false);
+                    push_color(&mut out, cell.bg, true);
+                    cur_flags = cell.flags;
+                }
+                let c = if cell.c == '\0' { ' ' } else { cell.c };
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        out.extend_from_slice(b"\x1b[0m");
+
+        let cursor_line = grid.cursor.point.line.0;
+        let cursor_col = grid.cursor.point.column.0;
+        out.extend(format!("\x1b[{};{}H", (cursor_line + 1).max(1), cursor_col + 1).bytes());
+        out
     }
 
     pub fn render_generation(&self) -> u64 {
@@ -1787,11 +1979,7 @@ fn parse_osc(
         }
         b"1337" => {
             if let Ok(s) = std::str::from_utf8(payload) {
-                if let Some(dir) = s.strip_prefix("CurrentDir=") {
-                    Some(OscCommand::Cwd(dir.to_string()))
-                } else {
-                    None
-                }
+                s.strip_prefix("CurrentDir=").map(|dir| OscCommand::Cwd(dir.to_string()))
             } else {
                 None
             }

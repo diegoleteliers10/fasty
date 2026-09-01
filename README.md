@@ -12,10 +12,59 @@ Fastty is a modern, high-performance terminal emulator designed for speed, low m
 - **GPU-Accelerated Rendering**: Fast layout and rasterization powered by GPUI and Metal/Vulkan.
 - **TUI & CLI Compatibility**: Pixel-perfect rendering for OpenCode, Claude Code, lazygit, htop, and complex box-drawing/block ASCII art.
 - **Modern Tab System**: Underline selection styling, double-click/right-click tab renaming (`⌘⇧R` / `Ctrl+Shift+R`), duplicate tab, and dynamic process title updates.
+- **Local IPC Daemon Protocol**: Built-in multiplexer server via Unix domain socket (`fasttyd.sock`). List live sessions, attach remotely, or integrate with Neovim, Zed, and VS Code plugins.
+- **Native Web Gateway & Fastty-Wasm**: Embedded zero-dependency HTTP & WebSocket server (`fastty gateway`) and pure WebAssembly VT emulator to access your active terminals from any browser, tablet, or mobile device.
 - **Cross-Platform**: First-class support for macOS, Linux (Wayland/X11), and Windows with automatic shell detection (`zsh`, `fish`, `bash`, `powershell`, `pwsh`, `cmd`).
 - **Built-in Status Bar & Git Integration**: Branch indicator, worktree switcher (`⌘⌥W` / `Ctrl+Alt+W`), sync status, and command execution timer.
 - **Command Palette & SSH Manager**: Fast command navigation (`⌘P` / `Ctrl+Shift+P`) and SSH connection manager (`⌘O` / `Ctrl+Shift+O`).
 - **Config & Theming**: TOML configuration (`fastty.toml`) with live reload and built-in themes (*Default*, *Catppuccin*, *One Dark*, *Solarized Dark*, *High Contrast*).
+
+---
+
+## Daemon Protocol & Web Gateway
+
+Fastty includes a built-in session multiplexer and an embedded web server accessible via the CLI:
+
+### CLI Subcommands
+
+```bash
+# List all active tabs and splits with PID, CWD, and window title
+fastty sessions
+
+# Watch session changes in real time (reactive stream)
+fastty sessions --watch
+
+# Attach interactively to an existing session
+fastty attach <session-id>
+
+# Attach in read-only mode (viewing logs/builds without input interference)
+fastty attach <session-id> --read-only
+
+# Wait for a session to become available before attaching
+fastty attach <session-id> --wait=30
+```
+
+### Web Gateway & Browser Access
+
+Launch the native, zero-dependency web gateway:
+
+```bash
+# Start web gateway on default port 8765
+fastty gateway
+
+# Bind to custom port and network interface (e.g. for Tailscale or LAN access)
+fastty gateway --port 8765 --host 0.0.0.0
+
+# Enforce read-only access for all connected browsers
+fastty gateway --port 8765 --read-only
+```
+
+Then visit `http://localhost:8765` in your browser. The embedded WebAssembly engine (`fastty-wasm`) provides:
+- Batched 60/120 FPS HTML5 Canvas 2D rendering.
+- Interactive scrollback buffer, mouse wheel, and touch navigation.
+- Dynamic font size zoom controls and real-time tab switching.
+
+See [docs/daemon-protocol.md](docs/daemon-protocol.md) for the complete JSON IPC protocol specification.
 
 ---
 
@@ -91,6 +140,9 @@ cd fasty
 
 # Build in release mode
 cargo build --release
+
+# Build WebAssembly package
+cargo build --target wasm32-unknown-unknown -p fastty-wasm --release
 
 # The compiled binary is located at target/release/fastty
 ```

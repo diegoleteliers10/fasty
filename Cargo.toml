@@ -1,6 +1,12 @@
+[workspace]
+members = [
+    ".",
+    "crates/fastty-wasm",
+]
+
 [package]
 name = "fastty"
-version = "0.7.6"
+version = "0.7.7"
 edition = "2021"
 
 [lib]
@@ -95,4 +101,3 @@ assets = [
     ["assets/fasttyIcon.png", "usr/share/pixmaps/fastty.png", "644"],
     ["README.md", "usr/share/doc/fastty/README.md", "644"],
 ]
-
