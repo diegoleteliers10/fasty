@@ -7,8 +7,11 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -243,79 +246,93 @@ fn handle_websocket(mut stream: TcpStream, key: &str, _read_only: bool) {
     }
     let _ = stream.flush();
 
-    // 2. Connect to fastty daemon unix socket
-    let sock = socket_path();
-    let unix_stream = match UnixStream::connect(&sock) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "fastty gateway: failed to connect to daemon socket (is fastty running?): {}",
-                e
-            );
-            let error_msg = serde_json::json!({
-                "event": "error",
-                "code": "daemon_offline",
-                "message": format!("Cannot connect to fastty daemon socket at {}: is fastty running?", sock.display())
-            });
-            let _ = send_ws_text(&mut stream, &error_msg.to_string());
-            return;
-        }
-    };
-
-    let _ = stream.set_read_timeout(None);
-
-    let alive = Arc::new(AtomicBool::new(true));
-    let mut ws_read = match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let mut ws_write = stream;
-
-    let mut unix_read = match unix_stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let mut unix_write = unix_stream;
-
-    let alive_clone = Arc::clone(&alive);
-
-    // Thread 1: Read lines from Daemon Unix socket -> Send WebSocket text frames to browser
-    let forward_to_browser = std::thread::spawn(move || {
-        use std::io::BufRead;
-        let reader = std::io::BufReader::new(&mut unix_read);
-        for line in reader.lines() {
-            if !alive_clone.load(Ordering::Relaxed) {
-                break;
-            }
-            let Ok(line) = line else { break };
-            if line.trim().is_empty() {
-                continue;
-            }
-            if send_ws_text(&mut ws_write, &line).is_err() {
-                break;
-            }
-        }
-        alive_clone.store(false, Ordering::Relaxed);
-    });
-
-    // Thread 2 (Current): Read WebSocket frames from browser -> Write NDJSON lines to Daemon Unix socket
-    while alive.load(Ordering::Relaxed) {
-        match read_ws_text(&mut ws_read) {
-            Ok(Some(text)) => {
-                let mut line = text;
-                line.push('\n');
-                if unix_write.write_all(line.as_bytes()).is_err() {
-                    break;
-                }
-                let _ = unix_write.flush();
-            }
-            Ok(None) => continue,
-            Err(_) => break,
-        }
+    #[cfg(not(unix))]
+    {
+        let _ = _read_only;
+        let error_msg = serde_json::json!({
+            "event": "error",
+            "code": "unsupported_platform",
+            "message": "fastty daemon is not supported on this platform yet"
+        });
+        let _ = send_ws_text(&mut stream, &error_msg.to_string());
     }
 
-    alive.store(false, Ordering::Relaxed);
-    let _ = forward_to_browser.join();
+    #[cfg(unix)]
+    {
+        // 2. Connect to fastty daemon unix socket
+        let sock = socket_path();
+        let unix_stream = match UnixStream::connect(&sock) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "fastty gateway: failed to connect to daemon socket (is fastty running?): {}",
+                    e
+                );
+                let error_msg = serde_json::json!({
+                    "event": "error",
+                    "code": "daemon_offline",
+                    "message": format!("Cannot connect to fastty daemon socket at {}: is fastty running?", sock.display())
+                });
+                let _ = send_ws_text(&mut stream, &error_msg.to_string());
+                return;
+            }
+        };
+
+        let _ = stream.set_read_timeout(None);
+
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut ws_read = match stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut ws_write = stream;
+
+        let mut unix_read = match unix_stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut unix_write = unix_stream;
+
+        let alive_clone = Arc::clone(&alive);
+
+        // Thread 1: Read lines from Daemon Unix socket -> Send WebSocket text frames to browser
+        let forward_to_browser = std::thread::spawn(move || {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(&mut unix_read);
+            for line in reader.lines() {
+                if !alive_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(line) = line else { break };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if send_ws_text(&mut ws_write, &line).is_err() {
+                    break;
+                }
+            }
+            alive_clone.store(false, Ordering::Relaxed);
+        });
+
+        // Thread 2 (Current): Read WebSocket frames from browser -> Write NDJSON lines to Daemon Unix socket
+        while alive.load(Ordering::Relaxed) {
+            match read_ws_text(&mut ws_read) {
+                Ok(Some(text)) => {
+                    let mut line = text;
+                    line.push('\n');
+                    if unix_write.write_all(line.as_bytes()).is_err() {
+                        break;
+                    }
+                    let _ = unix_write.flush();
+                }
+                Ok(None) => continue,
+                Err(_) => break,
+            }
+        }
+
+        alive.store(false, Ordering::Relaxed);
+        let _ = forward_to_browser.join();
+    }
 }
 
 fn send_ws_text(stream: &mut TcpStream, text: &str) -> std::io::Result<()> {

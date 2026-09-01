@@ -1047,6 +1047,7 @@ impl TerminalState {
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
+            let _ = pid;
             false
         }
     }

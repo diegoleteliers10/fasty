@@ -11,6 +11,7 @@
 //! into) a tab that's open in another window, or over SSH into a machine
 //! that's already running fastty.
 
+#[cfg(unix)]
 use crate::daemon::{AttachMode, Request, Response};
 
 #[cfg(unix)]
