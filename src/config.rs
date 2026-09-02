@@ -435,14 +435,38 @@ fn user_legacy_json_path() -> PathBuf {
 }
 
 fn candidate_toml_paths() -> Vec<PathBuf> {
-    vec![
-        PathBuf::from("config.toml"),
-        PathBuf::from("fastty.toml"),
-        PathBuf::from("/etc/fastty/config.toml"),
-        PathBuf::from("/etc/fastty/fastty.toml"),
-        user_toml_path(),
-        user_fastty_toml_path(),
-    ]
+    let mut paths = Vec::new();
+
+    // 1. Current working directory
+    paths.push(PathBuf::from("fastty.toml"));
+    paths.push(PathBuf::from("config.toml"));
+
+    // 2. Explicit XDG_CONFIG_HOME
+    if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME") {
+        if !config_home.trim().is_empty() {
+            let p = PathBuf::from(config_home).join("fastty");
+            paths.push(p.join("fastty.toml"));
+            paths.push(p.join("config.toml"));
+        }
+    }
+
+    // 3. User home .config/fastty directory (all platforms)
+    if let Some(home) = dirs::home_dir() {
+        let dot_config = home.join(".config").join("fastty");
+        paths.push(dot_config.join("fastty.toml"));
+        paths.push(dot_config.join("config.toml"));
+        paths.push(home.join(".fastty.toml"));
+    }
+
+    // 4. Platform standard user directory
+    paths.push(user_fastty_toml_path());
+    paths.push(user_toml_path());
+
+    // 5. System-wide /etc directory
+    paths.push(PathBuf::from("/etc/fastty/fastty.toml"));
+    paths.push(PathBuf::from("/etc/fastty/config.toml"));
+
+    paths
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
@@ -473,6 +497,9 @@ fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
     doc["scrollback"] = value(c.scrollback as i64);
     doc["opacity"] = value(c.opacity as f64);
     doc["option_as_meta"] = value(c.option_as_meta);
+    doc["session_restore"] = value(c.session_restore);
+    doc["copy_on_select"] = value(c.copy_on_select);
+    doc["notify_on_command_finish"] = value(c.notify_on_command_finish);
     let tab_layout_str = match c.tab_layout {
         TabLayout::Horizontal => "horizontal",
         TabLayout::Vertical => "vertical",
@@ -512,6 +539,11 @@ fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
         cursor["animation_duration_ms"] = value(c.cursor.animation_duration_ms as i64);
     }
     ensure_table(doc, "keybindings");
+    if let Some(kb) = doc["keybindings"].as_table_mut() {
+        for (k, v) in &c.keybindings {
+            kb[k.as_str()] = value(v.as_str());
+        }
+    }
 }
 
 fn config_to_toml_string(c: &Config) -> String {
@@ -598,7 +630,7 @@ impl Config {
     }
 
     pub fn config_path() -> PathBuf {
-        user_toml_path()
+        Self::get_active_config_path()
     }
 
     pub fn get_active_config_path() -> PathBuf {
@@ -607,7 +639,13 @@ impl Config {
                 return path;
             }
         }
-        Self::config_path()
+        if let Some(home) = dirs::home_dir() {
+            let dot_config = home.join(".config").join("fastty");
+            if dot_config.parent().map(|p| p.exists()).unwrap_or(false) {
+                return dot_config.join("fastty.toml");
+            }
+        }
+        user_fastty_toml_path()
     }
 
     pub fn save_default(&self) -> anyhow::Result<()> {
@@ -700,5 +738,63 @@ mod tests {
 
         let serialized = config_to_toml_string(&cfg);
         assert!(serialized.contains("tab_layout = \"vertical\""));
+    }
+
+    #[test]
+    fn test_config_roundtrip_all_fields() {
+        let mut keybindings = std::collections::HashMap::new();
+        keybindings.insert("ctrl-shift-t".to_string(), "new_tab".to_string());
+        keybindings.insert("ctrl-shift-w".to_string(), "close_tab".to_string());
+
+        let cfg = Config {
+            font: FontConfig {
+                family: "Fira Code".to_string(),
+                size: 15.0,
+                weight: 500.0,
+                ligatures: true,
+            },
+            shell: Some("/bin/zsh".to_string()),
+            scrollback: 5000,
+            theme: Some("tokyo-night".to_string()),
+            keybindings,
+            session_restore: true,
+            copy_on_select: true,
+            opacity: 0.95,
+            notify_on_command_finish: true,
+            bottombar: BottombarConfig::default(),
+            cursor: CursorConfig {
+                shape: CursorShapeConfig::Beam,
+                blink: true,
+                smooth: true,
+                animation_duration_ms: 80,
+            },
+            tab_layout: TabLayout::Horizontal,
+            keybinding_preset: Some(crate::keybindings::KeybindingPreset::Ghostty),
+            option_as_meta: true,
+        };
+
+        let serialized = config_to_toml_string(&cfg);
+        let deserialized: Config = toml_edit::de::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized.font.family, "Fira Code");
+        assert_eq!(deserialized.font.size, 15.0);
+        assert_eq!(deserialized.font.weight, 500.0);
+        assert_eq!(deserialized.font.ligatures, true);
+        assert_eq!(deserialized.shell.as_deref(), Some("/bin/zsh"));
+        assert_eq!(deserialized.scrollback, 5000);
+        assert_eq!(deserialized.theme.as_deref(), Some("tokyo-night"));
+        assert_eq!(deserialized.session_restore, true);
+        assert_eq!(deserialized.copy_on_select, true);
+        assert_eq!(deserialized.notify_on_command_finish, true);
+        assert_eq!(deserialized.opacity, 0.95);
+        assert_eq!(deserialized.cursor.shape, CursorShapeConfig::Beam);
+        assert_eq!(deserialized.cursor.blink, true);
+        assert_eq!(deserialized.cursor.smooth, true);
+        assert_eq!(deserialized.cursor.animation_duration_ms, 80);
+        assert_eq!(deserialized.tab_layout, TabLayout::Horizontal);
+        assert_eq!(deserialized.keybinding_preset, Some(crate::keybindings::KeybindingPreset::Ghostty));
+        assert_eq!(deserialized.option_as_meta, true);
+        assert_eq!(deserialized.keybindings.get("ctrl-shift-t").map(|s| s.as_str()), Some("new_tab"));
+        assert_eq!(deserialized.keybindings.get("ctrl-shift-w").map(|s| s.as_str()), Some("close_tab"));
     }
 }

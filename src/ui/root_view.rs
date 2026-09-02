@@ -1829,6 +1829,7 @@ impl RootView {
             return;
         }
         if self.is_update_ready {
+            self.persist_session();
             crate::updater::relaunch_fastty();
             return;
         }
