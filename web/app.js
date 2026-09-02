@@ -52,6 +52,8 @@ class FasttyWebClient {
     this.jumpBottomBtn = document.getElementById("jump-bottom-btn");
     this.scrollbarTrack = document.getElementById("scrollbar-track");
     this.scrollbarThumb = document.getElementById("scrollbar-thumb");
+    this.newSessionBtn = document.getElementById("new-session-btn");
+    this.touchInputProxy = document.getElementById("touch-input-proxy");
 
     // Font size controls
     this.fontSizeDisplay = document.getElementById("font-size-display");
@@ -67,15 +69,48 @@ class FasttyWebClient {
     this.fontFamily = "'JetBrains Mono', monospace";
     this.dpr = window.devicePixelRatio || 1;
 
-    // Scroll state
+    // Scroll & Resize state
     this.wheelAccumulator = 0;
     this.isDraggingScrollbar = false;
     this.dragStartY = 0;
     this.dragStartOffset = 0;
     this.touchStartY = 0;
+    this.resizeDebounceTimer = null;
 
     this.updateFontSizeUI();
     this.initEvents();
+  }
+
+  measureCell() {
+    const ctx = document.createElement("canvas").getContext("2d");
+    ctx.font = `${this.fontSize}px ${this.fontFamily}`;
+    const w = ctx.measureText("M").width || (this.fontSize * 0.6);
+    const h = this.fontSize * 1.25;
+    return { width: Math.max(1, w), height: Math.max(1, h) };
+  }
+
+  getCalculatedDimensions() {
+    const cell = this.measureCell();
+    const rect = this.wrapper.getBoundingClientRect();
+    const cols = Math.max(20, Math.floor(rect.width / cell.width));
+    const rows = Math.max(5, Math.floor(rect.height / cell.height));
+    return { cols, rows };
+  }
+
+  sendResize() {
+    if (!this.activeSessionId || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const { cols, rows } = this.getCalculatedDimensions();
+    this.ws.send(JSON.stringify({ cmd: "resize", id: this.activeSessionId, cols, rows }) + "\n");
+    if (this.vt) {
+      this.vt.resize(cols, rows);
+    }
+    this.dimEl.textContent = `${cols} × ${rows}`;
+  }
+
+  spawnNewSession() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const { cols, rows } = this.getCalculatedDimensions();
+    this.ws.send(JSON.stringify({ cmd: "spawn", cols, rows }) + "\n");
   }
 
   async start() {
@@ -94,6 +129,7 @@ class FasttyWebClient {
     this.fontSize = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, newSize));
     localStorage.setItem("fastty_web_font_size", this.fontSize);
     this.updateFontSizeUI();
+    this.sendResize();
     if (this.vt) {
       this.vt.render_canvas(this.canvas, this.fontFamily, this.fontSize, this.dpr);
     }
@@ -111,6 +147,10 @@ class FasttyWebClient {
     this.fontIncBtn.addEventListener("click", () => this.setFontSize(this.fontSize + 1));
     this.fontResetBtn.addEventListener("click", () => this.setFontSize(DEFAULT_FONT_SIZE));
 
+    if (this.newSessionBtn) {
+      this.newSessionBtn.addEventListener("click", () => this.spawnNewSession());
+    }
+
     this.reconnectBtn.addEventListener("click", () => {
       if (this.ws) {
         this.ws.close();
@@ -127,10 +167,37 @@ class FasttyWebClient {
 
     window.addEventListener("resize", () => {
       this.dpr = window.devicePixelRatio || 1;
+      clearTimeout(this.resizeDebounceTimer);
+      this.resizeDebounceTimer = setTimeout(() => {
+        this.sendResize();
+      }, 100);
       if (this.vt) {
         this.vt.render_canvas(this.canvas, this.fontFamily, this.fontSize, this.dpr);
       }
     });
+
+    // Mobile Virtual Keyboard Proxy Events
+    if (this.touchInputProxy) {
+      this.touchInputProxy.addEventListener("input", (e) => {
+        if (e.data) {
+          this.sendInput(e.data);
+        }
+        this.touchInputProxy.value = "";
+      });
+
+      this.touchInputProxy.addEventListener("keydown", (e) => {
+        if (e.key === "Backspace") {
+          e.preventDefault();
+          this.sendInput("\x7f");
+        } else if (e.key === "Enter") {
+          e.preventDefault();
+          this.sendInput("\r");
+        } else if (e.key === "Tab") {
+          e.preventDefault();
+          this.sendInput("\t");
+        }
+      });
+    }
 
     // Keyboard Input & Shortcuts
     this.wrapper.addEventListener("keydown", (e) => {
@@ -284,10 +351,21 @@ class FasttyWebClient {
       }
     });
 
-    // Focus wrapper on click
+    // Focus wrapper and mobile touch proxy on click / tap
     this.wrapper.addEventListener("click", () => {
       this.wrapper.focus();
+      if (this.touchInputProxy && ('ontouchstart' in window || navigator.maxTouchPoints > 0)) {
+        this.touchInputProxy.focus();
+      }
     });
+
+    if (this.canvas) {
+      this.canvas.addEventListener("touchstart", () => {
+        if (this.touchInputProxy) {
+          this.touchInputProxy.focus();
+        }
+      }, { passive: true });
+    }
   }
 
   updateScrollbarUI() {
@@ -368,11 +446,19 @@ class FasttyWebClient {
         console.log(`⚡ Connected to fastty daemon v${msg.fastty_version} (protocol v${msg.version})`);
         break;
 
+      case "spawned":
+        if (msg.id) {
+          this.attachToSession(msg.id);
+        }
+        break;
+
       case "sessions":
         this.sessions = msg.sessions || [];
         this.renderTabs();
         if (this.sessions.length > 0 && !this.activeSessionId) {
           this.attachToSession(this.sessions[0].id);
+        } else if (this.sessions.length === 0) {
+          this.spawnNewSession();
         }
         break;
 
@@ -393,7 +479,7 @@ class FasttyWebClient {
             this.attachToSession(this.sessions[0].id);
           } else {
             this.activeSessionId = null;
-            this.showOverlay("No active sessions", "Open a tab in fastty to connect.");
+            this.spawnNewSession();
           }
         }
         break;
@@ -413,6 +499,7 @@ class FasttyWebClient {
         if (msg.id === this.activeSessionId) {
           this.vt.resize(msg.cols, msg.rows);
           this.dimEl.textContent = `${msg.cols} × ${msg.rows}`;
+          this.sendResize();
         }
         break;
 
@@ -473,7 +560,7 @@ class FasttyWebClient {
 
   renderTabs() {
     if (this.sessions.length === 0) {
-      this.tabsEl.innerHTML = '<div class="tab loading-tab">No sessions active</div>';
+      this.tabsEl.innerHTML = '<div class="tab loading-tab">Starting session...</div>';
       return;
     }
 
@@ -482,9 +569,29 @@ class FasttyWebClient {
       const tab = document.createElement("div");
       tab.className = `tab ${session.id === this.activeSessionId ? "active" : ""}`;
       const icon = getProcessIcon(session.title);
-      tab.innerHTML = `<span class="tab-icon">${icon}</span> [${session.id}] ${session.title}`;
+
+      const titleSpan = document.createElement("span");
+      titleSpan.innerHTML = `<span class="tab-icon">${icon}</span> [${session.id}] ${session.title}`;
+      tab.appendChild(titleSpan);
+
+      const closeBtn = document.createElement("span");
+      closeBtn.className = "tab-close";
+      closeBtn.textContent = "×";
+      closeBtn.title = "Close session";
+      closeBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.closeSession(session.id);
+      });
+      tab.appendChild(closeBtn);
+
       tab.addEventListener("click", () => this.attachToSession(session.id));
       this.tabsEl.appendChild(tab);
+    }
+  }
+
+  closeSession(id) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ cmd: "close", id }) + "\n");
     }
   }
 

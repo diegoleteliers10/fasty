@@ -95,6 +95,21 @@ pub enum Request {
         cols: usize,
         rows: usize,
     },
+    Spawn {
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        cols: Option<usize>,
+        #[serde(default)]
+        rows: Option<usize>,
+    },
+    Close {
+        id: PaneId,
+    },
 }
 
 /// Whether an `attach` is allowed to `write` to the session it attached to,
@@ -182,6 +197,9 @@ pub enum Response {
         /// any language, not maximally throughput-efficient.
         data: String,
     },
+    Spawned {
+        id: PaneId,
+    },
     Error {
         /// Stable, machine-matchable reason: `"bad_request"`,
         /// `"no_such_session"`, `"invalid_base64"`, `"not_attached"`,
@@ -190,6 +208,45 @@ pub enum Response {
         code: String,
         message: String,
     },
+}
+
+pub fn spawn_headless_session(
+    cmd: Option<&str>,
+    args: &[String],
+    cwd: Option<&str>,
+    cols: Option<usize>,
+    rows: Option<usize>,
+) -> Result<PaneId, String> {
+    static NEXT_PANE_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(100);
+
+    let shell = cmd
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("SHELL").ok())
+        .unwrap_or_else(crate::paths::default_system_shell);
+
+    let home_str = dirs::home_dir().map(|p| p.to_string_lossy().into_owned());
+    let default_cwd = cwd.or(home_str.as_deref());
+    let cols = cols.unwrap_or(80);
+    let rows = rows.unwrap_or(24);
+
+    let terminal = TerminalState::new_headless(&shell, args, default_cwd, cols, rows)
+        .map_err(|e| format!("failed to spawn terminal: {e}"))?;
+
+    let mut id = NEXT_PANE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    while is_registered(id) {
+        id = NEXT_PANE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    register(id, Arc::new(terminal));
+    Ok(id)
+}
+
+pub fn ensure_default_session() -> Option<PaneId> {
+    if registry().lock().is_empty() {
+        spawn_headless_session(None, &[], None, Some(80), Some(24)).ok()
+    } else {
+        None
+    }
 }
 
 fn session_info(id: PaneId, terminal: &TerminalState) -> SessionInfo {
@@ -332,6 +389,7 @@ mod unix_impl {
                 );
             }
             Request::List => {
+                let _ = ensure_default_session();
                 let sessions = registry()
                     .lock()
                     .iter()
@@ -472,6 +530,7 @@ mod unix_impl {
                 }
             }
             Request::SubscribeSessions => {
+                let _ = ensure_default_session();
                 let initial: Vec<SessionInfo> = registry()
                     .lock()
                     .iter()
@@ -535,21 +594,43 @@ mod unix_impl {
                 });
             }
             Request::Resize { id, cols, rows } => {
-                // Deliberately not implemented: the pane's real size is
-                // owned by the GPUI window it lives in, and a remote client
-                // resizing it out from under the person actually looking at
-                // it would be surprising. Attach clients should adapt to
-                // `Attached.{cols,rows}` instead of asking to change it.
-                let _ = (id, cols, rows);
-                send(
-                    &conn.out,
-                    &Response::Error {
-                        code: "unsupported".to_string(),
-                        message: "resize is not supported: attach clients read the pane's \
-                                  current size, they don't set it"
-                            .to_string(),
-                    },
-                );
+                if let Some(terminal) = registry().lock().get(&id) {
+                    terminal.resize(cols, rows);
+                } else {
+                    send(
+                        &conn.out,
+                        &Response::Error {
+                            code: "no_such_session".to_string(),
+                            message: "no such session".to_string(),
+                        },
+                    );
+                }
+            }
+            Request::Spawn {
+                command,
+                args,
+                cwd,
+                cols,
+                rows,
+            } => {
+                match spawn_headless_session(command.as_deref(), &args, cwd.as_deref(), cols, rows) {
+                    Ok(id) => {
+                        send(&conn.out, &Response::Spawned { id });
+                    }
+                    Err(e) => {
+                        send(
+                            &conn.out,
+                            &Response::Error {
+                                code: "spawn_failed".to_string(),
+                                message: e,
+                            },
+                        );
+                    }
+                }
+            }
+            Request::Close { id } => {
+                unregister(id);
+                send(&conn.out, &Response::Closed { id });
             }
         }
     }
@@ -688,6 +769,14 @@ mod tests {
                 cols: 80,
                 rows: 24,
             },
+            Request::Spawn {
+                command: Some("bash".to_string()),
+                args: vec!["-l".to_string()],
+                cwd: Some("/tmp".to_string()),
+                cols: Some(100),
+                rows: Some(30),
+            },
+            Request::Close { id: 42 },
         ];
 
         for req in reqs {
@@ -722,6 +811,29 @@ mod tests {
                     assert_eq!(c1, c2);
                     assert_eq!(r1, r2);
                 }
+                (
+                    Request::Spawn {
+                        command: c1,
+                        args: a1,
+                        cwd: cw1,
+                        cols: co1,
+                        rows: r1,
+                    },
+                    Request::Spawn {
+                        command: c2,
+                        args: a2,
+                        cwd: cw2,
+                        cols: co2,
+                        rows: r2,
+                    },
+                ) => {
+                    assert_eq!(c1, c2);
+                    assert_eq!(a1, a2);
+                    assert_eq!(cw1, cw2);
+                    assert_eq!(co1, co2);
+                    assert_eq!(r1, r2);
+                }
+                (Request::Close { id: a }, Request::Close { id: b }) => assert_eq!(a, b),
                 _ => panic!("mismatched variant: {req:?} vs {parsed:?}"),
             }
         }

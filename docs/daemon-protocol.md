@@ -34,6 +34,8 @@ Un objeto JSON por línea (`\n`-terminated) en ambas direcciones.
 {"cmd": "detach", "id": 1}
 {"cmd": "write", "id": 1, "data": "<base64>"}
 {"cmd": "resize", "id": 1, "cols": 80, "rows": 24}
+{"cmd": "spawn", "command": "zsh", "args": ["-l"], "cwd": "/home/user", "cols": 80, "rows": 24}
+{"cmd": "close", "id": 1}
 ```
 
 - `id` es el `PaneId` de fastty (un `usize`, único por proceso — cada split
@@ -53,11 +55,10 @@ Un objeto JSON por línea (`\n`-terminated) en ambas direcciones.
 - `detach` es por sesión **y por conexión**: solo corta el streaming de esa
   sesión en la conexión que lo pide, no afecta a otros clientes adjuntados
   a la misma sesión desde otra conexión.
-- `resize` está deliberadamente **sin implementar**: el tamaño real de la
-  pestaña lo maneja la ventana GPUI que la está mostrando, y que un cliente
-  remoto la redimensione por debajo del usuario sería confuso. Devuelve
-  `error` con code `unsupported`; un cliente de attach debería adaptarse al
-  `cols`/`rows` que vienen en el evento `attached`, no pedir cambiarlo.
+- `resize`: actualiza dinámicamente las dimensiones en columnas y filas de la
+  terminal (`cols`, `rows`) y emite `SIGWINCH` en el kernel PTY.
+- `spawn`: crea una nueva sesión de terminal headless/remota y devuelve `{"event": "spawned", "id": <id>}`.
+- `close`: cierra y desregistra la sesión especificada por `id`.
 
 ### Responses (daemon → cliente)
 

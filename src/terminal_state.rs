@@ -225,6 +225,33 @@ pub struct TerminalState {
 }
 
 impl TerminalState {
+    pub fn new_headless(
+        executable: &str,
+        exec_args: &[String],
+        cwd: Option<&str>,
+        cols: usize,
+        rows: usize,
+    ) -> anyhow::Result<Self> {
+        let cols = cols.max(10);
+        let rows = rows.max(5);
+        let cell_w = 9.0;
+        let cell_h = 18.0;
+        let viewport_w = (cols as f32) * cell_w;
+        let viewport_h = (rows as f32) * cell_h;
+        Self::new(
+            executable,
+            exec_args,
+            cwd,
+            10_000,
+            FontConfig::default(),
+            cell_w,
+            cell_h,
+            viewport_w,
+            viewport_h,
+            crate::event_listener::EventSender::None,
+        )
+    }
+
     pub fn new(
         executable: &str,
         exec_args: &[String],

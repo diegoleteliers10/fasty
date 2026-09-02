@@ -23,6 +23,7 @@
           <!-- Dynamically populated from subscribe_sessions -->
           <div class="tab loading-tab">Connecting to daemon...</div>
         </div>
+        <button id="new-session-btn" class="btn-new-tab" title="New Session (+)">+</button>
       </div>
 
       <div class="controls">
@@ -43,6 +44,7 @@
     </header>
 
     <main class="terminal-wrapper" id="terminal-wrapper" tabindex="0">
+      <textarea id="touch-input-proxy" class="touch-input-proxy" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
       <div class="terminal-canvas-container" id="canvas-container">
         <canvas id="terminal-canvas"></canvas>
       </div>

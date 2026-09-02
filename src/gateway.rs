@@ -95,6 +95,17 @@ pub fn sha1(input: &[u8]) -> [u8; 20] {
 }
 
 pub fn run_gateway(host: &str, port: u16, read_only: bool) {
+    let _ = crate::paths::init();
+
+    #[cfg(unix)]
+    {
+        let sock = socket_path();
+        if UnixStream::connect(&sock).is_err() {
+            crate::daemon::start();
+            crate::daemon::ensure_default_session();
+        }
+    }
+
     let bind_addr = format!("{}:{}", host, port);
     let listener = match TcpListener::bind(&bind_addr) {
         Ok(l) => l,
@@ -261,17 +272,25 @@ fn handle_websocket(mut stream: TcpStream, key: &str, _read_only: bool) {
     {
         // 2. Connect to fastty daemon unix socket
         let sock = socket_path();
-        let unix_stream = match UnixStream::connect(&sock) {
+        let mut unix_stream = UnixStream::connect(&sock);
+        if unix_stream.is_err() {
+            crate::daemon::start();
+            crate::daemon::ensure_default_session();
+            std::thread::sleep(Duration::from_millis(50));
+            unix_stream = UnixStream::connect(&sock);
+        }
+
+        let unix_stream = match unix_stream {
             Ok(s) => s,
             Err(e) => {
                 eprintln!(
-                    "fastty gateway: failed to connect to daemon socket (is fastty running?): {}",
+                    "fastty gateway: failed to connect to daemon socket: {}",
                     e
                 );
                 let error_msg = serde_json::json!({
                     "event": "error",
                     "code": "daemon_offline",
-                    "message": format!("Cannot connect to fastty daemon socket at {}: is fastty running?", sock.display())
+                    "message": format!("Cannot connect to fastty daemon socket at {}: {}", sock.display(), e)
                 });
                 let _ = send_ws_text(&mut stream, &error_msg.to_string());
                 return;
