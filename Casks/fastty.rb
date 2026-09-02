@@ -1,9 +1,9 @@
 cask "fastty" do
   arch arm: "aarch64", intel: "x86_64"
 
-  version "0.7.9"
-  sha256 arm:   "3528f5e81a8ef88b096eb603e735f5c93048081ef95b1dd0ab29aacdbad21342",
-         intel: "6330ad37d6c78d9c7879c1526d156edb63f8d53dd55398ed3834b43942723701"
+  version "0.7.10"
+  sha256 arm:   "075af19b5adc96c3e626f118a6c84ab6501548845f6e0f655309a1a768b32d6a",
+         intel: "ca0aec58d46788f0a9ef0ec3174801459604bfa6630586ce478897df5e699d69"
 
   url "https://github.com/diegoleteliers10/fasty/releases/download/v#{version}/fastty-#{arch}-apple-darwin.dmg"
   name "Fastty"
