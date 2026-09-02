@@ -627,5 +627,9 @@ class FasttyWebClient {
 // Bootstrap
 window.addEventListener("DOMContentLoaded", () => {
   const client = new FasttyWebClient();
-  client.start().catch(console.error);
+  client.start().catch((err) => {
+    console.error("Fastty Web initialization failed:", err);
+    client.setStatus("disconnected", "Wasm Error");
+    client.showOverlay("Failed to initialize Wasm VT", err.message || String(err));
+  });
 });

@@ -20,7 +20,8 @@ use crate::daemon::{base64_encode, socket_path};
 const EMBEDDED_INDEX_HTML: &str = include_str!("../web/index.html");
 const EMBEDDED_STYLE_CSS: &str = include_str!("../web/style.css");
 const EMBEDDED_APP_JS: &str = include_str!("../web/app.js");
-const EMBEDDED_WASM: &[u8] = include_bytes!("../web/fastty_wasm.wasm");
+const EMBEDDED_PKG_JS: &str = include_str!("../web/pkg/fastty_wasm.js");
+const EMBEDDED_PKG_WASM: &[u8] = include_bytes!("../web/pkg/fastty_wasm_bg.wasm");
 
 /// Simple pure-Rust SHA-1 implementation (RFC 3174) for the WebSocket handshake.
 pub fn sha1(input: &[u8]) -> [u8; 20] {
@@ -211,8 +212,15 @@ fn handle_client(mut stream: TcpStream, read_only: bool) {
                 EMBEDDED_APP_JS.as_bytes(),
             );
         }
-        "/fastty_wasm.wasm" => {
-            send_http_response(&mut stream, "application/wasm", EMBEDDED_WASM);
+        "/pkg/fastty_wasm.js" => {
+            send_http_response(
+                &mut stream,
+                "application/javascript; charset=utf-8",
+                EMBEDDED_PKG_JS.as_bytes(),
+            );
+        }
+        "/pkg/fastty_wasm_bg.wasm" | "/fastty_wasm_bg.wasm" | "/fastty_wasm.wasm" => {
+            send_http_response(&mut stream, "application/wasm", EMBEDDED_PKG_WASM);
         }
         _ => {
             let body = "404 Not Found";
