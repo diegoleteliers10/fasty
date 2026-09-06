@@ -89,22 +89,23 @@ fn print_sessions_table(sessions: &[crate::daemon::SessionInfo]) {
         .max()
         .unwrap_or(5)
         .max(5);
-    println!("{:<id_w$}  {:<title_w$}  ALIVE  CWD", "ID", "TITLE");
+    println!("{:<id_w$}  {:<title_w$}  ALIVE  LINES  CWD", "ID", "TITLE");
     for s in sessions {
         println!(
-            "{:<id_w$}  {:<title_w$}  {:<5}  {}",
+            "{:<id_w$}  {:<title_w$}  {:<5}  {:<5}  {}",
             s.id,
             s.title,
             if s.alive { "yes" } else { "no" },
+            s.history_size,
             s.cwd.as_deref().unwrap_or("-"),
         );
     }
 }
 
-pub fn run_sessions_command(watch: bool, wait_secs: Option<u64>) -> ! {
+pub fn run_sessions_command(watch: bool, wait_secs: Option<u64>, json: bool) -> ! {
     #[cfg(not(unix))]
     {
-        let _ = (watch, wait_secs);
+        let _ = (watch, wait_secs, json);
         eprintln!(
             "fastty sessions: not supported on this platform yet \
              (the daemon only listens on Unix domain sockets)."
@@ -135,7 +136,15 @@ pub fn run_sessions_command(watch: bool, wait_secs: Option<u64>) -> ! {
         if !watch {
             match read_response(&mut reader) {
                 Ok(Response::Sessions { sessions }) => {
-                    print_sessions_table(&sessions);
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&sessions)
+                                .unwrap_or_else(|_| "[]".to_string())
+                        );
+                    } else {
+                        print_sessions_table(&sessions);
+                    }
                     std::process::exit(0);
                 }
                 Ok(Response::Error { code, message }) => {
@@ -160,29 +169,54 @@ pub fn run_sessions_command(watch: bool, wait_secs: Option<u64>) -> ! {
         loop {
             match read_response(&mut reader) {
                 Ok(Response::Sessions { sessions }) => {
-                    print_sessions_table(&sessions);
+                    if json {
+                        println!("{}", serde_json::to_string(&sessions).unwrap_or_default());
+                    } else {
+                        print_sessions_table(&sessions);
+                    }
                     let _ = std::io::stdout().flush();
                 }
                 Ok(Response::SessionAdded { session }) => {
-                    println!(
-                        "+ [{}] {} ({})",
-                        session.id,
-                        session.title,
-                        session.cwd.as_deref().unwrap_or("-")
-                    );
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "event": "session_added", "session": session })
+                        );
+                    } else {
+                        println!(
+                            "+ [{}] {} ({})",
+                            session.id,
+                            session.title,
+                            session.cwd.as_deref().unwrap_or("-")
+                        );
+                    }
                     let _ = std::io::stdout().flush();
                 }
                 Ok(Response::SessionRemoved { id }) => {
-                    println!("- [{id}]");
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "event": "session_removed", "id": id })
+                        );
+                    } else {
+                        println!("- [{id}]");
+                    }
                     let _ = std::io::stdout().flush();
                 }
                 Ok(Response::SessionUpdated { session }) => {
-                    println!(
-                        "~ [{}] {} ({})",
-                        session.id,
-                        session.title,
-                        session.cwd.as_deref().unwrap_or("-")
-                    );
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "event": "session_updated", "session": session })
+                        );
+                    } else {
+                        println!(
+                            "~ [{}] {} ({})",
+                            session.id,
+                            session.title,
+                            session.cwd.as_deref().unwrap_or("-")
+                        );
+                    }
                     let _ = std::io::stdout().flush();
                 }
                 Ok(Response::Error { code, message }) => {

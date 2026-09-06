@@ -51,6 +51,16 @@ impl FasttyVt {
         self.dirty = true;
     }
 
+    /// Restore the entire screen in microseconds from a binary snapshot (magic b"FST1").
+    #[wasm_bindgen]
+    pub fn restore_binary_snapshot(&mut self, data: &[u8]) -> bool {
+        let restored = self.terminal.restore_binary_snapshot(data);
+        if restored {
+            self.dirty = true;
+        }
+        restored
+    }
+
     /// Scroll display up into history (positive delta) or down towards bottom (negative delta).
     #[wasm_bindgen]
     pub fn scroll_display(&mut self, lines: i32) {

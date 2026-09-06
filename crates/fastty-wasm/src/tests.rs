@@ -82,4 +82,91 @@ mod tests {
         assert_eq!(term.cursor.row, 4);
         assert_eq!(term.cursor.col, 9);
     }
+
+    #[test]
+    fn test_restore_binary_snapshot() {
+        let mut term = Terminal::new(80, 24, 100);
+        let mut data = Vec::new();
+        // Header (32 bytes)
+        data.extend_from_slice(b"FST1"); // magic
+        data.extend_from_slice(&1u16.to_le_bytes()); // version
+        data.extend_from_slice(&2u16.to_le_bytes()); // flags (cursor visible)
+        data.extend_from_slice(&2u16.to_le_bytes()); // cols = 2
+        data.extend_from_slice(&1u16.to_le_bytes()); // rows = 1
+        data.extend_from_slice(&1u16.to_le_bytes()); // cursor_col = 1
+        data.extend_from_slice(&0u16.to_le_bytes()); // cursor_row = 0
+        data.extend_from_slice(&2u32.to_le_bytes()); // cell_count = 2
+        data.push(0); // cursor_style
+        data.push(0); // reserved1
+        data.extend_from_slice(&[0u8; 10]); // reserved2
+
+        // Cell 0: 'A'
+        data.extend_from_slice(&('A' as u32).to_le_bytes());
+        data.extend_from_slice(&0x00FF0000u32.to_le_bytes());
+        data.extend_from_slice(&0x00000000u32.to_le_bytes());
+        data.extend_from_slice(&(1u16).to_le_bytes()); // bold
+        data.extend_from_slice(&0u16.to_le_bytes());
+
+        // Cell 1: 'B'
+        data.extend_from_slice(&('B' as u32).to_le_bytes());
+        data.extend_from_slice(&0x0000FF00u32.to_le_bytes());
+        data.extend_from_slice(&0x00000000u32.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+
+        assert!(term.restore_binary_snapshot(&data));
+        assert_eq!(term.grid().cols, 2);
+        assert_eq!(term.grid().rows, 1);
+        assert_eq!(term.grid().cells[0][0].c, 'A');
+        assert_eq!(term.grid().cells[0][0].fg, 0x00FF0000);
+        assert_eq!(term.grid().cells[0][0].flags, FLAG_BOLD);
+        assert_eq!(term.grid().cells[0][1].c, 'B');
+        assert_eq!(term.cursor.col, 1);
+    }
+
+    #[test]
+    fn test_restore_binary_snapshot_compressed() {
+        let mut term = Terminal::new(80, 24, 100);
+        let mut data = Vec::new();
+        // Header (32 bytes) with flags: cursor visible (2) | deflate (4) = 6
+        data.extend_from_slice(b"FST1"); // magic
+        data.extend_from_slice(&1u16.to_le_bytes()); // version
+        data.extend_from_slice(&6u16.to_le_bytes()); // flags: cursor visible | deflate
+        data.extend_from_slice(&2u16.to_le_bytes()); // cols = 2
+        data.extend_from_slice(&1u16.to_le_bytes()); // rows = 1
+        data.extend_from_slice(&1u16.to_le_bytes()); // cursor_col = 1
+        data.extend_from_slice(&0u16.to_le_bytes()); // cursor_row = 0
+        data.extend_from_slice(&2u32.to_le_bytes()); // cell_count = 2
+        data.push(0); // cursor_style
+        data.push(0); // reserved1
+        data.extend_from_slice(&[0u8; 10]); // reserved2
+
+        // Raw cells (32 bytes)
+        let mut raw_cells = Vec::new();
+        // Cell 0: 'X'
+        raw_cells.extend_from_slice(&('X' as u32).to_le_bytes());
+        raw_cells.extend_from_slice(&0x00FF0000u32.to_le_bytes());
+        raw_cells.extend_from_slice(&0x00000000u32.to_le_bytes());
+        raw_cells.extend_from_slice(&(1u16).to_le_bytes()); // bold
+        raw_cells.extend_from_slice(&0u16.to_le_bytes());
+
+        // Cell 1: 'Y'
+        raw_cells.extend_from_slice(&('Y' as u32).to_le_bytes());
+        raw_cells.extend_from_slice(&0x0000FF00u32.to_le_bytes());
+        raw_cells.extend_from_slice(&0x00000000u32.to_le_bytes());
+        raw_cells.extend_from_slice(&0u16.to_le_bytes());
+        raw_cells.extend_from_slice(&0u16.to_le_bytes());
+
+        let compressed_cells = miniz_oxide::deflate::compress_to_vec(&raw_cells, 6);
+        data.extend_from_slice(&compressed_cells);
+
+        assert!(term.restore_binary_snapshot(&data));
+        assert_eq!(term.grid().cols, 2);
+        assert_eq!(term.grid().rows, 1);
+        assert_eq!(term.grid().cells[0][0].c, 'X');
+        assert_eq!(term.grid().cells[0][0].fg, 0x00FF0000);
+        assert_eq!(term.grid().cells[0][0].flags, FLAG_BOLD);
+        assert_eq!(term.grid().cells[0][1].c, 'Y');
+        assert_eq!(term.cursor.col, 1);
+    }
 }

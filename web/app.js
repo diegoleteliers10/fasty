@@ -54,6 +54,10 @@ class FasttyWebClient {
     this.scrollbarThumb = document.getElementById("scrollbar-thumb");
     this.newSessionBtn = document.getElementById("new-session-btn");
     this.touchInputProxy = document.getElementById("touch-input-proxy");
+    this.appContainer = document.querySelector(".app-container");
+    this.mobileToolbar = document.getElementById("mobile-toolbar");
+    this.ctrlBtn = document.getElementById("vkey-ctrl");
+    this.ctrlActive = false;
 
     // Font size controls
     this.fontSizeDisplay = document.getElementById("font-size-display");
@@ -79,6 +83,17 @@ class FasttyWebClient {
 
     this.updateFontSizeUI();
     this.initEvents();
+  }
+
+  setCtrlActive(active) {
+    this.ctrlActive = active;
+    if (this.ctrlBtn) {
+      if (active) {
+        this.ctrlBtn.classList.add("active");
+      } else {
+        this.ctrlBtn.classList.remove("active");
+      }
+    }
   }
 
   measureCell() {
@@ -114,6 +129,17 @@ class FasttyWebClient {
   }
 
   async start() {
+    // 0. Handle access token from URL query or localStorage
+    const urlParams = new URLSearchParams(window.location.search);
+    const urlToken = urlParams.get("token");
+    if (urlToken) {
+      localStorage.setItem("fastty_token", urlToken);
+      urlParams.delete("token");
+      const cleanSearch = urlParams.toString();
+      const cleanUrl = window.location.pathname + (cleanSearch ? "?" + cleanSearch : "") + window.location.hash;
+      window.history.replaceState({}, document.title, cleanUrl);
+    }
+
     // 1. Initialize WebAssembly module
     await init();
     this.vt = new FasttyVt(80, 24, 10000);
@@ -176,11 +202,40 @@ class FasttyWebClient {
       }
     });
 
+    if (window.visualViewport) {
+      const handleVisualViewport = () => {
+        const vh = window.visualViewport.height;
+        if (this.appContainer) {
+          this.appContainer.style.height = `${vh}px`;
+        }
+        clearTimeout(this.resizeDebounceTimer);
+        this.resizeDebounceTimer = setTimeout(() => {
+          this.sendResize();
+        }, 80);
+        if (this.vt) {
+          this.vt.render_canvas(this.canvas, this.fontFamily, this.fontSize, this.dpr);
+        }
+      };
+      window.visualViewport.addEventListener("resize", handleVisualViewport);
+      window.visualViewport.addEventListener("scroll", () => window.scrollTo(0, 0));
+    }
+
     // Mobile Virtual Keyboard Proxy Events
     if (this.touchInputProxy) {
       this.touchInputProxy.addEventListener("input", (e) => {
         if (e.data) {
-          this.sendInput(e.data);
+          if (this.ctrlActive && e.data.length === 1) {
+            const ch = e.data.toLowerCase();
+            const code = ch.charCodeAt(0);
+            if (code >= 97 && code <= 122) {
+              this.sendInput(String.fromCharCode(code - 96));
+            } else {
+              this.sendInput(e.data);
+            }
+            this.setCtrlActive(false);
+          } else {
+            this.sendInput(e.data);
+          }
         }
         this.touchInputProxy.value = "";
       });
@@ -262,13 +317,68 @@ class FasttyWebClient {
         return; // Allow standard browser copy
       }
 
-      const seq = FasttyVt.encode_key(e.key, e.ctrlKey, e.altKey, e.shiftKey, e.metaKey);
+      const effectiveCtrl = e.ctrlKey || this.ctrlActive;
+      const seq = FasttyVt.encode_key(e.key, effectiveCtrl, e.altKey, e.shiftKey, e.metaKey);
+      if (this.ctrlActive) {
+        this.setCtrlActive(false);
+      }
       if (seq) {
         e.preventDefault();
         e.stopPropagation();
         this.sendInput(seq);
       }
     });
+
+    // Mobile Toolbar Virtual Keys
+    if (this.mobileToolbar) {
+      this.mobileToolbar.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        const btn = e.target.closest(".vkey");
+        if (!btn) return;
+
+        const action = btn.dataset.action;
+        const char = btn.dataset.char;
+
+        if (action === "ctrl") {
+          this.setCtrlActive(!this.ctrlActive);
+          return;
+        }
+
+        if (action === "esc") {
+          this.sendInput("\x1b");
+        } else if (action === "tab") {
+          this.sendInput("\t");
+        } else if (action === "up") {
+          this.sendInput("\x1b[A");
+        } else if (action === "down") {
+          this.sendInput("\x1b[B");
+        } else if (action === "left") {
+          this.sendInput("\x1b[D");
+        } else if (action === "right") {
+          this.sendInput("\x1b[C");
+        } else if (char) {
+          if (this.ctrlActive && char.length === 1) {
+            const ch = char.toLowerCase();
+            const code = ch.charCodeAt(0);
+            if (code >= 97 && code <= 122) {
+              this.sendInput(String.fromCharCode(code - 96));
+            } else {
+              this.sendInput(char);
+            }
+          } else {
+            this.sendInput(char);
+          }
+        }
+
+        if (this.ctrlActive) {
+          this.setCtrlActive(false);
+        }
+
+        if (this.touchInputProxy && ("ontouchstart" in window || navigator.maxTouchPoints > 0)) {
+          this.touchInputProxy.focus();
+        }
+      });
+    }
 
     // Mouse Wheel / Trackpad Scroll
     this.wrapper.addEventListener("wheel", (e) => {
@@ -405,9 +515,12 @@ class FasttyWebClient {
     this.showOverlay("Connecting to fastty daemon...", "Ensure fastty is running with its socket active.");
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    const savedToken = localStorage.getItem("fastty_token");
+    const query = savedToken ? `?token=${encodeURIComponent(savedToken)}` : "";
+    const wsUrl = `${protocol}//${window.location.host}/ws${query}`;
 
     this.ws = new WebSocket(wsUrl);
+    this.ws.binaryType = "arraybuffer";
 
     this.ws.onopen = () => {
       this.setStatus("connected", "Connected");
@@ -418,6 +531,13 @@ class FasttyWebClient {
     };
 
     this.ws.onmessage = (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        const bytes = new Uint8Array(event.data);
+        if (this.vt && this.vt.restore_binary_snapshot(bytes)) {
+          this.updateScrollbarUI();
+        }
+        return;
+      }
       try {
         const lines = event.data.split("\n");
         for (const line of lines) {
@@ -430,9 +550,13 @@ class FasttyWebClient {
       }
     };
 
-    this.ws.onclose = () => {
+    this.ws.onclose = (event) => {
       this.setStatus("disconnected", "Disconnected");
-      this.showOverlay("Disconnected from daemon", "Click ↻ or restart fastty.");
+      if (event && event.code === 1009) {
+        this.showOverlay("Disconnected: frame too large", "WebSocket frame exceeded 1 MiB limit.");
+      } else {
+        this.showOverlay("Disconnected from daemon", "Click ↻ or restart fastty.");
+      }
     };
 
     this.ws.onerror = (err) => {
@@ -545,6 +669,7 @@ class FasttyWebClient {
 
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ cmd: "attach", id, mode: "read_write" }) + "\n");
+      this.ws.send(JSON.stringify({ cmd: "binary_snapshot", id }) + "\n");
     }
 
     this.wrapper.focus();

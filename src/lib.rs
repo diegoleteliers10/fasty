@@ -24,3 +24,4 @@ pub mod terminal_state;
 pub mod ui;
 pub mod updater;
 pub mod widgets;
+pub mod server;

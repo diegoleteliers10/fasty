@@ -27,6 +27,7 @@ Un objeto JSON por línea (`\n`-terminated) en ambas direcciones.
 
 ```jsonc
 {"cmd": "hello"}
+{"cmd": "hello", "read_only": true}
 {"cmd": "list"}
 {"cmd": "subscribe_sessions"}
 {"cmd": "attach", "id": 1}
@@ -41,7 +42,10 @@ Un objeto JSON por línea (`\n`-terminated) en ambas direcciones.
 - `id` es el `PaneId` de fastty (un `usize`, único por proceso — cada split
   cuenta como su propia sesión, no solo cada tab).
 - `hello` es opcional pero recomendado como primer mensaje: te confirma que
-  hablás con la versión de protocolo que esperás antes de mandar nada más.
+  hablás con la versión de protocolo que esperás antes de mandar nada más. Acepta
+  el campo opcional `"read_only": true` para fijar la conexión completa en modo
+  solo-lectura (sticky). En una conexión `read_only`, cualquier llamada a `write`,
+  `spawn` o `close` es rechazada con código de error `"read_only"`.
 - `subscribe_sessions`: inicia una suscripción push a los cambios de la
   lista de sesiones. Envía un evento inicial `sessions` con el estado actual,
   seguido de eventos `session_added`, `session_removed`, y `session_updated`
@@ -58,20 +62,22 @@ Un objeto JSON por línea (`\n`-terminated) en ambas direcciones.
 - `resize`: actualiza dinámicamente las dimensiones en columnas y filas de la
   terminal (`cols`, `rows`) y emite `SIGWINCH` en el kernel PTY.
 - `spawn`: crea una nueva sesión de terminal headless/remota y devuelve `{"event": "spawned", "id": <id>}`.
-- `close`: cierra y desregistra la sesión especificada por `id`.
+- `close`: cierra y desregistra la sesión especificada por `id`. Solo se pueden cerrar sesiones headless creadas remotamente vía `spawn`. Las sesiones GUI abiertas en la ventana devuelven error `not_closable`.
+- `binary_snapshot`: solicita un snapshot binario ultrarrápido con cabecera `FST1` (comprimido con Deflate).
 
 ### Responses (daemon → cliente)
 
 ```jsonc
 {"event": "hello", "version": 1, "fastty_version": "0.7.6"}
 {"event": "sessions", "sessions": [
-  {"id": 1, "title": "zsh", "cwd": "/Users/you", "cols": 89, "rows": 32, "alive": true}
+  {"id": 1, "title": "zsh", "cwd": "/Users/you", "cols": 89, "rows": 32, "alive": true, "history_size": 0}
 ]}
-{"event": "session_added", "session": {"id": 2, "title": "zsh", "cwd": "/tmp", "cols": 89, "rows": 32, "alive": true}}
+{"event": "session_added", "session": {"id": 2, "title": "zsh", "cwd": "/tmp", "cols": 89, "rows": 32, "alive": true, "history_size": 0}}
 {"event": "session_removed", "id": 2}
-{"event": "session_updated", "session": {"id": 1, "title": "vim", "cwd": "/Users/you", "cols": 89, "rows": 32, "alive": true}}
+{"event": "session_updated", "session": {"id": 1, "title": "vim", "cwd": "/Users/you", "cols": 89, "rows": 32, "alive": true, "history_size": 120}}
 {"event": "attached", "id": 1, "cols": 89, "rows": 32, "mode": "read_only"}
 {"event": "snapshot", "id": 1, "data": "<base64, ANSI/SGR>"}
+{"event": "binary_snapshot", "id": 1, "data": "<base64, FST1 binary snapshot>"}
 {"event": "detached", "id": 1}
 {"event": "closed", "id": 1}
 {"event": "output", "id": 1, "data": "<base64>"}

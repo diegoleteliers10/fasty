@@ -228,10 +228,90 @@ impl Terminal {
         let rows = rows.max(1);
         self.main_grid.resize(cols, rows);
         self.alt_grid.resize(cols, rows);
-        self.scroll_top = 0;
-        self.scroll_bottom = rows - 1;
-        self.cursor.col = self.cursor.col.min(cols - 1);
-        self.cursor.row = self.cursor.row.min(rows - 1);
+        self.scroll_bottom = rows.saturating_sub(1);
+        if self.scroll_top >= rows {
+            self.scroll_top = 0;
+        }
+    }
+
+    /// Restore full terminal state in microseconds from raw binary snapshot.
+    pub fn restore_binary_snapshot(&mut self, data: &[u8]) -> bool {
+        if data.len() < 32 {
+            return false;
+        }
+        if &data[0..4] != b"FST1" {
+            return false;
+        }
+        let cols = u16::from_le_bytes([data[8], data[9]]) as usize;
+        let rows = u16::from_le_bytes([data[10], data[11]]) as usize;
+        let cursor_col = u16::from_le_bytes([data[12], data[13]]) as usize;
+        let cursor_row = u16::from_le_bytes([data[14], data[15]]) as usize;
+        let cell_count = u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as usize;
+        let flags = u16::from_le_bytes([data[6], data[7]]);
+        let is_alt = (flags & (1 << 0)) != 0;
+        let cursor_visible = (flags & (1 << 1)) != 0;
+        let is_deflated = (flags & (1 << 2)) != 0;
+
+        if cols == 0 || rows == 0 || cell_count != cols * rows {
+            return false;
+        }
+
+        let decompressed_buf: Vec<u8>;
+        let payload: &[u8] = if is_deflated {
+            decompressed_buf = match miniz_oxide::inflate::decompress_to_vec(&data[32..]) {
+                Ok(b) => b,
+                Err(_) => return false,
+            };
+            let required_len = cell_count.checked_mul(16);
+            if required_len.map_or(true, |len| decompressed_buf.len() < len) {
+                return false;
+            }
+            &decompressed_buf[..cell_count * 16]
+        } else {
+            let required_len = cell_count.checked_mul(16).and_then(|n| n.checked_add(32));
+            if required_len.map_or(true, |len| data.len() < len) {
+                return false;
+            }
+            &data[32..32 + cell_count * 16]
+        };
+
+        self.resize(cols, rows);
+        self.is_alt = is_alt;
+        self.cursor.col = cursor_col.min(cols.saturating_sub(1));
+        self.cursor.row = cursor_row.min(rows.saturating_sub(1));
+        self.cursor.visible = cursor_visible;
+
+        let grid = self.grid_mut();
+
+        for r in 0..rows {
+            for c in 0..cols {
+                let offset = (r * cols + c) * 16;
+                let chunk = &payload[offset..offset + 16];
+                let cp = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let fg = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+                let bg = u32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
+                let cell_flags_raw = u16::from_le_bytes([chunk[12], chunk[13]]);
+
+                let mut flags = 0u8;
+                if (cell_flags_raw & (1 << 0)) != 0 { flags |= FLAG_BOLD; }
+                if (cell_flags_raw & (1 << 1)) != 0 { flags |= FLAG_DIM; }
+                if (cell_flags_raw & (1 << 2)) != 0 { flags |= FLAG_ITALIC; }
+                if (cell_flags_raw & (1 << 3)) != 0 { flags |= FLAG_UNDERLINE; }
+                if (cell_flags_raw & (1 << 4)) != 0 { flags |= FLAG_INVERSE; }
+                if (cell_flags_raw & (1 << 5)) != 0 { flags |= FLAG_HIDDEN; }
+                if (cell_flags_raw & (1 << 6)) != 0 { flags |= FLAG_STRIKETHROUGH; }
+
+                let ch = std::char::from_u32(cp).unwrap_or(' ');
+                grid.cells[r][c] = Cell {
+                    c: ch,
+                    fg,
+                    bg,
+                    flags,
+                };
+            }
+        }
+
+        true
     }
 
     pub fn line_feed(&mut self) {

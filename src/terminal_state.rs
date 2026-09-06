@@ -201,6 +201,17 @@ impl ImageStore {
     pub fn delete_by_placement(&mut self, p_id: u32) {
         self.placements.retain(|p| p.placement_id != p_id);
     }
+
+    /// Prunes placements past the maximum scrollback and removes unreferenced textures.
+    pub fn prune_old_placements(&mut self, min_visible_abs_line: u64) {
+        let initial_len = self.placements.len();
+        self.placements.retain(|p| (p.absolute_line + p.rows as u64) >= min_visible_abs_line);
+        if self.placements.len() < initial_len {
+            let active_ids: std::collections::HashSet<u32> =
+                self.placements.iter().map(|p| p.image_id).collect();
+            self.images.retain(|id, _| active_ids.contains(id));
+        }
+    }
 }
 
 pub struct TerminalState {
@@ -222,6 +233,7 @@ pub struct TerminalState {
     /// which asks whether the shell has an active *foreground child* — this
     /// asks whether the pane's shell process is there at all.
     alive: Arc<std::sync::atomic::AtomicBool>,
+    has_terminated: std::sync::atomic::AtomicBool,
 }
 
 impl TerminalState {
@@ -973,6 +985,11 @@ impl TerminalState {
                         drop(term_locked);
 
                         total_lines_pushed_clone.fetch_add(local_lines, Ordering::Relaxed);
+                        if local_lines > 0 {
+                            let total_pushed = total_lines_pushed_clone.load(Ordering::Relaxed);
+                            let min_line = total_pushed.saturating_sub(scrollback as u64);
+                            image_store_clone.lock().prune_old_placements(min_line);
+                        }
 
                         // Synchronized Output: if the app still holds mode 2026
                         // set and the safety deadline passed, release it so a
@@ -1013,6 +1030,7 @@ impl TerminalState {
             event_listener,
             output_subs,
             alive,
+            has_terminated: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1078,6 +1096,47 @@ impl TerminalState {
             false
         }
     }
+
+    pub fn terminate_process(&self) {
+        if self.has_terminated.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let Some(pid) = self.shell_pid else { return; };
+        if pid <= 1 { return; }
+        #[cfg(not(windows))]
+        {
+            let ipid = pid as i32;
+            if ipid <= 1 { return; }
+            std::thread::spawn(move || {
+                unsafe {
+                    libc::kill(-ipid, libc::SIGHUP);
+                    libc::kill(-ipid, libc::SIGTERM);
+                    libc::kill(ipid, libc::SIGHUP);
+                    libc::kill(ipid, libc::SIGTERM);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                unsafe {
+                    if libc::kill(ipid, 0) == 0 {
+                        libc::kill(-ipid, libc::SIGKILL);
+                        libc::kill(ipid, libc::SIGKILL);
+                    }
+                }
+            });
+        }
+        #[cfg(windows)]
+        {
+            let _ = pid;
+        }
+    }
+}
+
+impl Drop for TerminalState {
+    fn drop(&mut self) {
+        self.terminate_process();
+    }
+}
+
+impl TerminalState {
 
     pub fn write_to_pty(&self, bytes: &[u8]) {
         let mut w = self.writer.lock();
@@ -1524,10 +1583,26 @@ impl TerminalState {
                         NamedColor::BrightMagenta => 13,
                         NamedColor::BrightCyan => 14,
                         NamedColor::BrightWhite => 15,
-                        // Foreground/Background/Cursor/Dim* depend on the active
-                        // theme -- no theme to resolve them against here, so fall
-                        // back to the terminal's default color.
-                        _ => return,
+                        NamedColor::Foreground => {
+                            if !is_bg {
+                                out.extend_from_slice(b"\x1b[39m");
+                            }
+                            return;
+                        }
+                        NamedColor::Background => {
+                            if is_bg {
+                                out.extend_from_slice(b"\x1b[49m");
+                            }
+                            return;
+                        }
+                        _ => {
+                            if is_bg {
+                                out.extend_from_slice(b"\x1b[49m");
+                            } else {
+                                out.extend_from_slice(b"\x1b[39m");
+                            }
+                            return;
+                        }
                     };
                     if code < 8 {
                         let base = if is_bg { 40 } else { 30 };
@@ -1631,6 +1706,164 @@ impl TerminalState {
         let cursor_col = grid.cursor.point.column.0;
         out.extend(format!("\x1b[{};{}H", (cursor_line + 1).max(1), cursor_col + 1).bytes());
         out
+    }
+
+    /// Take a full binary terminal state snapshot in microseconds.
+    ///
+    /// Directly extracts cells into a flat `FasttyPackedCell` contiguous vector with a 32-byte
+    /// `FasttyBinarySnapshotHeader`. Restorable directly in WASM or native clients with zero VT
+    /// parsing overhead.
+    fn snapshot_binary_parts(&self) -> (
+        crate::server::binary_snapshot::FasttyBinarySnapshotHeader,
+        Vec<crate::server::binary_snapshot::FasttyPackedCell>,
+    ) {
+        use alacritty_terminal::index::Line;
+        use alacritty_terminal::term::cell::Flags;
+        use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
+        use crate::server::binary_snapshot::{
+            FasttyBinarySnapshotHeader, FasttyPackedCell,
+            BINARY_SNAPSHOT_MAGIC, BINARY_SNAPSHOT_VERSION,
+            CELL_FLAG_BOLD, CELL_FLAG_DIM, CELL_FLAG_ITALIC, CELL_FLAG_UNDERLINE,
+            CELL_FLAG_INVERSE, CELL_FLAG_HIDDEN, CELL_FLAG_STRIKETHROUGH,
+            SNAPSHOT_FLAG_ALT_SCREEN, SNAPSHOT_FLAG_CURSOR_VISIBLE,
+        };
+
+        fn color_to_rgb(color: AnsiColor, default: u32) -> u32 {
+            match color {
+                AnsiColor::Named(n) => match n {
+                    NamedColor::Black => 0x001E1E2E,
+                    NamedColor::Red => 0x00F38BA8,
+                    NamedColor::Green => 0x00A6E3A1,
+                    NamedColor::Yellow => 0x00F9E2AF,
+                    NamedColor::Blue => 0x0089B4FA,
+                    NamedColor::Magenta => 0x00F5C2E7,
+                    NamedColor::Cyan => 0x0094E2D5,
+                    NamedColor::White => 0x00BAC2DE,
+                    NamedColor::BrightBlack => 0x00585B70,
+                    NamedColor::BrightRed => 0x00F38BA8,
+                    NamedColor::BrightGreen => 0x00A6E3A1,
+                    NamedColor::BrightYellow => 0x00F9E2AF,
+                    NamedColor::BrightBlue => 0x0089B4FA,
+                    NamedColor::BrightMagenta => 0x00F5C2E7,
+                    NamedColor::BrightCyan => 0x0094E2D5,
+                    NamedColor::BrightWhite => 0x00A6ADC8,
+                    _ => default,
+                },
+                AnsiColor::Indexed(i) => {
+                    if i < 16 {
+                        match i {
+                            0 => 0x001E1E2E,
+                            1 => 0x00F38BA8,
+                            2 => 0x00A6E3A1,
+                            3 => 0x00F9E2AF,
+                            4 => 0x0089B4FA,
+                            5 => 0x00F5C2E7,
+                            6 => 0x0094E2D5,
+                            7 => 0x00BAC2DE,
+                            8 => 0x00585B70,
+                            9 => 0x00F38BA8,
+                            10 => 0x00A6E3A1,
+                            11 => 0x00F9E2AF,
+                            12 => 0x0089B4FA,
+                            13 => 0x00F5C2E7,
+                            14 => 0x0094E2D5,
+                            15 => 0x00A6ADC8,
+                            _ => default,
+                        }
+                    } else if i >= 232 {
+                        let gray = ((i - 232) as u32) * 10 + 8;
+                        (gray << 16) | (gray << 8) | gray
+                    } else {
+                        let idx = i - 16;
+                        let r = (idx / 36) % 6;
+                        let g = (idx / 6) % 6;
+                        let b = idx % 6;
+                        let r_val = if r > 0 { (r * 40 + 55) as u32 } else { 0 };
+                        let g_val = if g > 0 { (g * 40 + 55) as u32 } else { 0 };
+                        let b_val = if b > 0 { (b * 40 + 55) as u32 } else { 0 };
+                        (r_val << 16) | (g_val << 8) | b_val
+                    }
+                }
+                AnsiColor::Spec(rgb) => {
+                    ((rgb.r as u32) << 16) | ((rgb.g as u32) << 8) | (rgb.b as u32)
+                }
+            }
+        }
+
+        let term = self.term.lock();
+        let grid = term.grid();
+        let screen_lines = grid.screen_lines();
+        let cols = grid.columns();
+
+        let total_cells = screen_lines * cols;
+        let mut cells = Vec::with_capacity(total_cells);
+
+        for line_i in 0..screen_lines {
+            let row = &grid[Line(line_i as i32)];
+            for col in 0..cols {
+                let cell = &row[alacritty_terminal::index::Column(col)];
+                let mut flags = 0u16;
+                if cell.flags.contains(Flags::BOLD) { flags |= CELL_FLAG_BOLD; }
+                if cell.flags.contains(Flags::DIM) { flags |= CELL_FLAG_DIM; }
+                if cell.flags.contains(Flags::ITALIC) { flags |= CELL_FLAG_ITALIC; }
+                if cell.flags.intersects(Flags::ALL_UNDERLINES) { flags |= CELL_FLAG_UNDERLINE; }
+                if cell.flags.contains(Flags::INVERSE) { flags |= CELL_FLAG_INVERSE; }
+                if cell.flags.contains(Flags::HIDDEN) { flags |= CELL_FLAG_HIDDEN; }
+                if cell.flags.contains(Flags::STRIKEOUT) { flags |= CELL_FLAG_STRIKETHROUGH; }
+
+                let c = if cell.c == '\0' { ' ' as u32 } else { cell.c as u32 };
+                let fg = color_to_rgb(cell.fg, 0x00CDD6F4);
+                let bg = color_to_rgb(cell.bg, 0x001E1E2E);
+
+                cells.push(FasttyPackedCell {
+                    c,
+                    fg,
+                    bg,
+                    flags,
+                    _reserved: 0,
+                });
+            }
+        }
+
+        let mut snapshot_flags = 0u16;
+        let mode = *term.mode();
+        if mode.contains(alacritty_terminal::term::TermMode::ALT_SCREEN) {
+            snapshot_flags |= SNAPSHOT_FLAG_ALT_SCREEN;
+        }
+        if mode.contains(alacritty_terminal::term::TermMode::SHOW_CURSOR) {
+            snapshot_flags |= SNAPSHOT_FLAG_CURSOR_VISIBLE;
+        }
+
+        let cursor_line = grid.cursor.point.line.0.max(0) as u16;
+        let cursor_col = grid.cursor.point.column.0 as u16;
+
+        let header = FasttyBinarySnapshotHeader {
+            magic: BINARY_SNAPSHOT_MAGIC,
+            version: BINARY_SNAPSHOT_VERSION,
+            flags: snapshot_flags,
+            cols: cols as u16,
+            rows: screen_lines as u16,
+            cursor_col,
+            cursor_row: cursor_line,
+            cursor_style: 0,
+            _reserved1: 0,
+            cell_count: cells.len() as u32,
+            _reserved2: [0; 10],
+        };
+
+        (header, cells)
+    }
+
+    /// Take a full binary terminal state snapshot in microseconds.
+    pub fn snapshot_binary(&self) -> Vec<u8> {
+        let (header, cells) = self.snapshot_binary_parts();
+        crate::server::binary_snapshot::encode_snapshot(&header, &cells)
+    }
+
+    /// Take a full binary terminal state snapshot compressed with Deflate.
+    pub fn snapshot_binary_compressed(&self) -> Vec<u8> {
+        let (header, cells) = self.snapshot_binary_parts();
+        crate::server::binary_snapshot::encode_snapshot_compressed(&header, &cells)
     }
 
     pub fn render_generation(&self) -> u64 {
@@ -2455,5 +2688,48 @@ mod tests {
         assert_eq!(preview[0], "Line 1: cargo build");
         assert_eq!(preview[1], "Line 2: error in file.rs");
         assert_eq!(preview[2], "Line 3: success");
+    }
+
+    #[test]
+    fn test_image_store_prune_old_placements() {
+        let mut store = ImageStore::new();
+        let frame1 = image::Frame::new(image::RgbaImage::new(1, 1));
+        let frame2 = image::Frame::new(image::RgbaImage::new(1, 1));
+        let p1 = ImagePlacement {
+            image_id: 1,
+            placement_id: 10,
+            absolute_line: 100,
+            col: 0,
+            rows: 10,
+            cols: 20,
+            z_index: 0,
+            image: Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame1])),
+        };
+        let p2 = ImagePlacement {
+            image_id: 2,
+            placement_id: 20,
+            absolute_line: 500,
+            col: 0,
+            rows: 10,
+            cols: 20,
+            z_index: 0,
+            image: Arc::new(gpui::RenderImage::new(smallvec::smallvec![frame2])),
+        };
+        store.add_image(1, p1.image.clone());
+        store.add_image(2, p2.image.clone());
+        store.add_placement(p1);
+        store.add_placement(p2);
+
+        assert_eq!(store.placements.len(), 2);
+        assert_eq!(store.images.len(), 2);
+
+        // Prune anything that ended before line 200 (p1: 100+10 = 110 < 200)
+        store.prune_old_placements(200);
+
+        assert_eq!(store.placements.len(), 1);
+        assert_eq!(store.placements[0].image_id, 2);
+        assert_eq!(store.images.len(), 1);
+        assert!(store.images.contains_key(&2));
+        assert!(!store.images.contains_key(&1));
     }
 }

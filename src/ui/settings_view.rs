@@ -1,6 +1,6 @@
 use gpui::{
     Context, CursorStyle, FontWeight, KeyDownEvent, MouseButton, Render, ScrollHandle,
-    SharedString, Window, WindowHandle, div, prelude::*, px,
+    SharedString, Window, WindowControlArea, WindowHandle, div, prelude::*, px,
 };
 use icons::common::IconType;
 use parking_lot::Mutex;
@@ -151,6 +151,31 @@ impl SettingsView {
             system_fonts,
             theme_cards,
         }
+    }
+
+    pub fn new_with_config(window: &mut Window, active_config: &Config, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::new(window, cx);
+        view.sync_from_config(active_config, cx);
+        view
+    }
+
+    pub fn sync_from_config(&mut self, cfg: &Config, cx: &mut Context<Self>) {
+        self.config = cfg.clone();
+        self.opacity = cfg.opacity;
+        self.scrollback = cfg.scrollback;
+        self.cursor_blink = cfg.cursor.blink;
+        self.copy_on_select = cfg.copy_on_select;
+        self.tab_layout = cfg.tab_layout;
+        self.font_size = cfg.font.size;
+        if !cfg.font.family.is_empty() && cfg.font.family != "monospace" {
+            self.font_family = cfg.font.family.clone();
+        }
+        self.keybinding_preset = cfg.keybinding_preset.unwrap_or_default();
+        if let Some(ref t) = cfg.theme {
+            self.current_theme_name = t.clone();
+        }
+        self.theme = Theme::from_name(&self.current_theme_name).with_opacity(self.opacity);
+        cx.notify();
     }
 
     fn handle_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, _cx: &mut Context<Self>) {
@@ -313,7 +338,7 @@ impl Render for SettingsView {
             .on_key_down(cx.listener(Self::handle_key_down))
             .w_full()
             .h_full()
-            .bg(theme.background)
+            .bg(theme.window_fill())
             .text_color(theme.foreground)
             .flex()
             .flex_col()
@@ -366,6 +391,7 @@ impl Render for SettingsView {
                             .id("settings-drag-spacer")
                             .flex_1()
                             .h_full()
+                            .window_control_area(WindowControlArea::Drag)
                             .on_mouse_down(MouseButton::Left, |ev, window, _cx| {
                                 if ev.click_count == 2 {
                                     window.zoom_window();
@@ -399,6 +425,9 @@ impl Render for SettingsView {
                                         .w(px(26.))
                                         .h(px(22.))
                                         .rounded(px(4.))
+                                        .when(cfg!(target_os = "windows"), |this| {
+                                            this.window_control_area(WindowControlArea::Close)
+                                        })
                                         .hover(move |s| s.bg(gpui::Hsla { h: 0.0, s: 0.7, l: 0.45, a: 1.0 }))
                                         .cursor(CursorStyle::PointingHand)
                                         .on_mouse_down(MouseButton::Left, |_ev, window, _cx| {
@@ -417,6 +446,7 @@ impl Render for SettingsView {
                     .track_scroll(&self.window_scroll_handle)
                     .flex_1()
                     .overflow_y_scroll()
+                    .bg(theme.main_bg)
                     .p(px(24.))
                     .flex()
                     .flex_col()
@@ -869,20 +899,35 @@ impl Render for SettingsView {
                                                             .child("Background transparency level"),
                                                     ),
                                             )
-                                            .child(
+                                            .child({
+                                                let opacity_pills = {
+                                                    let mut options = vec![1.0, 0.95, 0.90, 0.85, 0.80, 0.75];
+                                                    if !options.iter().any(|&val| (self.opacity - val).abs() < 0.025) {
+                                                        options.push(self.opacity);
+                                                        options.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                                                    }
+                                                    options
+                                                };
                                                 div()
                                                     .flex()
                                                     .flex_row()
                                                     .gap_1p5()
-                                                    .children([1.0, 0.95, 0.90, 0.85, 0.75].into_iter().map(|val| {
-                                                        let is_active = (self.opacity - val).abs() < 0.02;
+                                                    .children(opacity_pills.into_iter().map(|val| {
+                                                        let is_active = (self.opacity - val).abs() < 0.025;
                                                         let label = format!("{:.0}%", val * 100.0);
                                                         div()
+                                                            .flex()
+                                                            .flex_row()
+                                                            .items_center()
+                                                            .gap_1()
                                                             .px(px(8.))
                                                             .py(px(4.))
                                                             .rounded(px(5.))
+                                                            .border_1()
+                                                            .border_color(if is_active { theme.accent } else { theme.border })
                                                             .bg(if is_active { theme.accent } else { theme.surface })
-                                                            .text_color(if is_active { theme.black } else { theme.foreground })
+                                                            .hover(move |s| if !is_active { s.bg(theme.surface_raised) } else { s })
+                                                            .text_color(if is_active { theme.background } else { theme.foreground })
                                                             .text_size(px(11.))
                                                             .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
                                                             .cursor(CursorStyle::PointingHand)
@@ -890,8 +935,9 @@ impl Render for SettingsView {
                                                                 this.adjust_opacity(val, cx);
                                                             }))
                                                             .child(label)
-                                                    })),
-                                            ),
+                                                            .when(is_active, |el| el.child(render_icon(IconType::Check, theme.background, 10.0)))
+                                                    }))
+                                            }),
                                     )
                                     // Cursor Blink
                                     .child(
@@ -951,19 +997,45 @@ impl Render for SettingsView {
                                                             .child("Max lines kept in terminal buffer (local client state)"),
                                                     ),
                                             )
-                                            .child(
+                                            .child({
+                                                let scrollback_pills = {
+                                                    let mut options: Vec<(usize, String)> = vec![
+                                                        (5000, "5k".to_string()),
+                                                        (10000, "10k (Def)".to_string()),
+                                                        (20000, "20k".to_string()),
+                                                        (50000, "50k".to_string()),
+                                                        (100000, "100k".to_string()),
+                                                    ];
+                                                    if !options.iter().any(|(lines, _)| *lines == self.scrollback) {
+                                                        let custom_label = if self.scrollback % 1000 == 0 {
+                                                            format!("{}k", self.scrollback / 1000)
+                                                        } else {
+                                                            format!("{}", self.scrollback)
+                                                        };
+                                                        options.push((self.scrollback, custom_label));
+                                                        options.sort_by_key(|(lines, _)| *lines);
+                                                    }
+                                                    options
+                                                };
                                                 div()
                                                     .flex()
                                                     .flex_row()
                                                     .gap_1p5()
-                                                    .children([(5000, "5k"), (10000, "10k (Def)"), (20000, "20k"), (50000, "50k"), (100000, "100k")].into_iter().map(|(lines, label)| {
+                                                    .children(scrollback_pills.into_iter().map(|(lines, label)| {
                                                         let is_active = self.scrollback == lines;
                                                         div()
+                                                            .flex()
+                                                            .flex_row()
+                                                            .items_center()
+                                                            .gap_1()
                                                             .px(px(8.))
                                                             .py(px(4.))
                                                             .rounded(px(5.))
+                                                            .border_1()
+                                                            .border_color(if is_active { theme.accent } else { theme.border })
                                                             .bg(if is_active { theme.accent } else { theme.surface })
-                                                            .text_color(if is_active { theme.black } else { theme.foreground })
+                                                            .hover(move |s| if !is_active { s.bg(theme.surface_raised) } else { s })
+                                                            .text_color(if is_active { theme.background } else { theme.foreground })
                                                             .text_size(px(11.))
                                                             .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
                                                             .cursor(CursorStyle::PointingHand)
@@ -971,8 +1043,9 @@ impl Render for SettingsView {
                                                                 this.set_scrollback(lines, cx);
                                                             }))
                                                             .child(label)
-                                                    })),
-                                            ),
+                                                            .when(is_active, |el| el.child(render_icon(IconType::Check, theme.background, 10.0)))
+                                                    }))
+                                            }),
                                     ),
                             ),
                     )

@@ -33,23 +33,26 @@ fn main() {
     match subcommand_args.next().as_deref() {
         Some("sessions") => {
             let mut watch = false;
+            let mut json = false;
             let mut wait: Option<u64> = None;
             for arg in subcommand_args {
                 match parse_wait_flag(&arg) {
                     Some(w) => wait = Some(w),
                     None if arg == "--watch" => watch = true,
+                    None if arg == "--json" => json = true,
                     None => {
                         eprintln!("fastty sessions: unknown flag {arg}");
                         std::process::exit(1);
                     }
                 }
             }
-            fastty::daemon_client::run_sessions_command(watch, wait);
+            fastty::daemon_client::run_sessions_command(watch, wait, json);
         }
         Some("gateway") => {
             let mut port: u16 = 8765;
             let mut host = "127.0.0.1".to_string();
             let mut read_only = false;
+            let mut token: Option<String> = None;
             let mut iter = subcommand_args.peekable();
             while let Some(arg) = iter.next() {
                 match arg.as_str() {
@@ -69,17 +72,26 @@ fn main() {
                             std::process::exit(1);
                         }
                     }
+                    "-t" | "--token" => {
+                        if let Some(t) = iter.next() {
+                            token = Some(t);
+                        } else {
+                            eprintln!("fastty gateway: missing token argument");
+                            std::process::exit(1);
+                        }
+                    }
                     "--read-only" => {
                         read_only = true;
                     }
                     "--help" => {
                         println!(
-                            "Usage: fastty gateway [--port <PORT>] [--host <ADDR>] [--read-only]\n\n\
+                            "Usage: fastty gateway [--port <PORT>] [--host <ADDR>] [--token <TOKEN>] [--read-only]\n\n\
                              Options:\n  \
-                             -p, --port <PORT>    Port to listen on (default: 8765)\n  \
-                             -h, --host <ADDR>    Host address to bind to (default: 127.0.0.1)\n      \
-                             --read-only          Enforce read-only access for all browser sessions\n      \
-                             --help               Print this help message"
+                             -p, --port <PORT>     Port to listen on (default: 8765)\n  \
+                             -h, --host <ADDR>     Host address to bind to (default: 127.0.0.1)\n  \
+                             -t, --token <TOKEN>   Access token (required on non-loopback, auto-generated if omitted)\n      \
+                             --read-only           Enforce read-only access for all browser sessions\n      \
+                             --help                Print this help message"
                         );
                         std::process::exit(0);
                     }
@@ -88,6 +100,8 @@ fn main() {
                             port = p;
                         } else if let Some(h) = unknown.strip_prefix("--host=").or_else(|| unknown.strip_prefix("--bind=")) {
                             host = h.to_string();
+                        } else if let Some(t) = unknown.strip_prefix("--token=") {
+                            token = Some(t.to_string());
                         } else {
                             eprintln!("fastty gateway: unknown flag {unknown}");
                             std::process::exit(1);
@@ -95,7 +109,7 @@ fn main() {
                     }
                 }
             }
-            fastty::gateway::run_gateway(&host, port, read_only);
+            fastty::gateway::run_gateway(&host, port, read_only, token);
             std::process::exit(0);
         }
         Some("attach") => {

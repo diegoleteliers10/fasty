@@ -329,6 +329,12 @@ impl Theme {
         self.tab_bar_bg.a = self.opacity;
         self.status_bar_bg.a = self.opacity;
         self.sidebar_bg.a = self.opacity;
+        self.surface.a = (self.surface.a * self.opacity).clamp(0.0, 1.0);
+        self.surface_raised.a = (self.surface_raised.a * self.opacity).clamp(0.0, 1.0);
+        self.tab_active_bg.a = (self.tab_active_bg.a * self.opacity).clamp(0.0, 1.0);
+        self.tab_inactive_bg.a = (self.tab_inactive_bg.a * self.opacity).clamp(0.0, 1.0);
+        self.hover.a = (self.hover.a * self.opacity).clamp(0.0, 1.0);
+        self.border.a = (self.border.a * self.opacity).clamp(0.0, 1.0);
         self
     }
 
@@ -351,4 +357,25 @@ pub fn rgb_to_hsla(r: u8, g: u8, b: u8) -> Hsla {
     let u = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
     let Rgba { r, g, b, a } = rgb(u);
     Rgba { r, g, b, a }.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_theme_with_opacity_scales_components() {
+        let theme = Theme::fastty_default().with_opacity(0.8);
+        assert_eq!(theme.opacity, 0.8);
+        assert!((theme.background.a - 0.8).abs() < 1e-4);
+        assert!((theme.surface.a - 0.8).abs() < 1e-4);
+        assert!((theme.surface_raised.a - 0.8).abs() < 1e-4);
+        assert!((theme.tab_bar_bg.a - 0.8).abs() < 1e-4);
+        assert!((theme.tab_active_bg.a - 0.8).abs() < 1e-4);
+        assert!((theme.tab_inactive_bg.a - 0.8).abs() < 1e-4);
+        assert!((theme.status_bar_bg.a - 0.8).abs() < 1e-4);
+        assert!((theme.sidebar_bg.a - 0.8).abs() < 1e-4);
+        assert!((theme.hover.a - 0.8).abs() < 1e-4);
+        assert!((theme.border.a - 0.8).abs() < 1e-4);
+    }
 }

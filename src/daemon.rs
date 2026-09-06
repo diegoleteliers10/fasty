@@ -35,7 +35,19 @@ use crate::terminal_state::TerminalState;
 /// tolerate unknown fields and events either way.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-type Registry = Mutex<HashMap<PaneId, Arc<TerminalState>>>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    Gui,
+    Headless,
+}
+
+#[derive(Clone)]
+pub struct SessionEntry {
+    pub terminal: Arc<TerminalState>,
+    pub kind: SessionKind,
+}
+
+type Registry = Mutex<HashMap<PaneId, SessionEntry>>;
 
 fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
@@ -43,18 +55,47 @@ fn registry() -> &'static Registry {
 }
 
 /// Called when a pane's `TerminalState` is created, so it becomes visible to
-/// `list`/`attach` immediately.
-pub fn register(pane_id: PaneId, terminal: Arc<TerminalState>) {
-    registry().lock().insert(pane_id, terminal);
+/// `fastty sessions` / `fastty attach`.
+pub fn register(id: PaneId, terminal: Arc<TerminalState>) {
+    registry().lock().insert(
+        id,
+        SessionEntry {
+            terminal,
+            kind: SessionKind::Gui,
+        },
+    );
 }
 
-/// Called from the pane-removal paths (`close_tab`, `close_active_pane`).
-pub fn unregister(pane_id: PaneId) {
-    registry().lock().remove(&pane_id);
+/// Called when a headless session is created via IPC `spawn`.
+pub fn register_headless(id: PaneId, terminal: Arc<TerminalState>) {
+    registry().lock().insert(
+        id,
+        SessionEntry {
+            terminal,
+            kind: SessionKind::Headless,
+        },
+    );
+}
+
+/// Called when a pane is closed in the GUI or terminated, so external clients stop seeing
+/// it in `fastty sessions`.
+pub fn unregister(id: PaneId) {
+    registry().lock().remove(&id);
 }
 
 fn is_registered(pane_id: PaneId) -> bool {
     registry().lock().contains_key(&pane_id)
+}
+
+/// Look up a registered terminal by its id, used by the GUI to access
+/// headless sessions spawned via IPC.
+pub fn get_session(id: PaneId) -> Option<Arc<TerminalState>> {
+    registry().lock().get(&id).map(|e| Arc::clone(&e.terminal))
+}
+
+/// List all active session IDs currently registered in the daemon.
+pub fn list_session_ids() -> Vec<PaneId> {
+    registry().lock().keys().copied().collect()
 }
 
 /// Path to the daemon's control socket: `<state_dir>/fasttyd.sock`.
@@ -70,7 +111,10 @@ pub fn socket_path() -> std::path::PathBuf {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    Hello,
+    Hello {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        read_only: bool,
+    },
     List,
     /// Push-updated session list: an initial `sessions` event with everything
     /// currently registered, followed by `session_added` / `session_removed`
@@ -110,6 +154,10 @@ pub enum Request {
     Close {
         id: PaneId,
     },
+    /// Fast microsecond binary snapshot of terminal state (magic b"FST1").
+    BinarySnapshot {
+        id: PaneId,
+    },
 }
 
 /// Whether an `attach` is allowed to `write` to the session it attached to,
@@ -131,6 +179,8 @@ pub struct SessionInfo {
     pub cols: usize,
     pub rows: usize,
     pub alive: bool,
+    #[serde(default)]
+    pub history_size: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -178,6 +228,11 @@ pub enum Response {
     /// before the first live `output` event arrives. A client that doesn't
     /// care about this can treat it exactly like an `output` event.
     Snapshot {
+        id: PaneId,
+        data: String,
+    },
+    /// Raw microsecond binary snapshot (base64-encoded bytes with magic b"FST1").
+    BinarySnapshot {
         id: PaneId,
         data: String,
     },
@@ -237,7 +292,7 @@ pub fn spawn_headless_session(
         id = NEXT_PANE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    register(id, Arc::new(terminal));
+    register_headless(id, Arc::new(terminal));
     Ok(id)
 }
 
@@ -262,6 +317,7 @@ fn session_info(id: PaneId, terminal: &TerminalState) -> SessionInfo {
         cols,
         rows,
         alive: terminal.is_alive(),
+        history_size: terminal.history_size(),
     }
 }
 
@@ -318,25 +374,16 @@ mod unix_impl {
     /// One currently-attached session on a connection: its stop-flag (so
     /// `Detach{id}` can stop just this attach thread) and whether `write` to
     /// this `id` is allowed on this connection.
-    struct Attachment {
-        alive: Arc<AtomicBool>,
-        read_only: bool,
+    pub(super) struct Attachment {
+        pub(super) alive: Arc<AtomicBool>,
+        pub(super) read_only: bool,
     }
 
-    /// Per-connection state: everything a `handle_request` call needs beyond
-    /// the request itself.
-    struct Conn {
-        out: Arc<Mutex<UnixStream>>,
-        /// Flips to false once the read loop ends (client disconnected or
-        /// sent unparseable input); every attach/subscription thread checks
-        /// this on each poll tick and stops promptly instead of leaking past
-        /// the connection's lifetime.
-        conn_alive: Arc<AtomicBool>,
-        /// One entry per currently-attached session on *this* connection.
-        /// Only ever touched from the connection's single reader thread
-        /// (inserts here, removals in `Detach`), so a plain `HashMap` behind
-        /// no lock is enough.
-        attachments: HashMap<PaneId, Attachment>,
+    pub(super) struct Conn {
+        pub(super) out: Arc<Mutex<UnixStream>>,
+        pub(super) conn_alive: Arc<AtomicBool>,
+        pub(super) read_only: bool,
+        pub(super) attachments: HashMap<PaneId, Attachment>,
     }
 
     fn handle_connection(stream: UnixStream) {
@@ -347,6 +394,7 @@ mod unix_impl {
         let mut conn = Conn {
             out: Arc::new(Mutex::new(write_half)),
             conn_alive: Arc::new(AtomicBool::new(true)),
+            read_only: false,
             attachments: HashMap::new(),
         };
 
@@ -377,9 +425,12 @@ mod unix_impl {
         }
     }
 
-    fn handle_request(request: Request, conn: &mut Conn) {
+    pub(super) fn handle_request(request: Request, conn: &mut Conn) {
         match request {
-            Request::Hello => {
+            Request::Hello { read_only } => {
+                if read_only {
+                    conn.read_only = true;
+                }
                 send(
                     &conn.out,
                     &Response::Hello {
@@ -393,12 +444,12 @@ mod unix_impl {
                 let sessions = registry()
                     .lock()
                     .iter()
-                    .map(|(id, terminal)| session_info(*id, terminal))
+                    .map(|(id, entry)| session_info(*id, &entry.terminal))
                     .collect();
                 send(&conn.out, &Response::Sessions { sessions });
             }
             Request::Attach { id, mode } => {
-                let terminal = registry().lock().get(&id).cloned();
+                let terminal = registry().lock().get(&id).map(|e| Arc::clone(&e.terminal));
                 let Some(terminal) = terminal else {
                     send(
                         &conn.out,
@@ -409,6 +460,11 @@ mod unix_impl {
                     );
                     return;
                 };
+                let effective_mode = if conn.read_only {
+                    AttachMode::ReadOnly
+                } else {
+                    mode
+                };
                 let (cols, rows) = terminal.dimensions();
                 send(
                     &conn.out,
@@ -416,7 +472,7 @@ mod unix_impl {
                         id,
                         cols,
                         rows,
-                        mode,
+                        mode: effective_mode,
                     },
                 );
                 send(
@@ -437,7 +493,7 @@ mod unix_impl {
                     id,
                     Attachment {
                         alive: Arc::clone(&alive),
-                        read_only: mode == AttachMode::ReadOnly,
+                        read_only: effective_mode == AttachMode::ReadOnly,
                     },
                 );
 
@@ -495,6 +551,16 @@ mod unix_impl {
                 }
             }
             Request::Write { id, data } => {
+                if conn.read_only {
+                    send(
+                        &conn.out,
+                        &Response::Error {
+                            code: "read_only".to_string(),
+                            message: "connection is in read-only mode".to_string(),
+                        },
+                    );
+                    return;
+                }
                 if conn.attachments.get(&id).is_some_and(|a| a.read_only) {
                     send(
                         &conn.out,
@@ -517,8 +583,8 @@ mod unix_impl {
                     );
                     return;
                 };
-                if let Some(terminal) = registry().lock().get(&id) {
-                    terminal.write_to_pty(&bytes);
+                if let Some(entry) = registry().lock().get(&id) {
+                    entry.terminal.write_to_pty(&bytes);
                 } else {
                     send(
                         &conn.out,
@@ -534,7 +600,7 @@ mod unix_impl {
                 let initial: Vec<SessionInfo> = registry()
                     .lock()
                     .iter()
-                    .map(|(id, terminal)| session_info(*id, terminal))
+                    .map(|(id, entry)| session_info(*id, &entry.terminal))
                     .collect();
                 send(
                     &conn.out,
@@ -556,7 +622,7 @@ mod unix_impl {
                         let current: HashMap<PaneId, SessionInfo> = registry()
                             .lock()
                             .iter()
-                            .map(|(id, terminal)| (*id, session_info(*id, terminal)))
+                            .map(|(id, entry)| (*id, session_info(*id, &entry.terminal)))
                             .collect();
 
                         for id in last.keys() {
@@ -594,8 +660,8 @@ mod unix_impl {
                 });
             }
             Request::Resize { id, cols, rows } => {
-                if let Some(terminal) = registry().lock().get(&id) {
-                    terminal.resize(cols, rows);
+                if let Some(entry) = registry().lock().get(&id) {
+                    entry.terminal.resize(cols, rows);
                 } else {
                     send(
                         &conn.out,
@@ -613,6 +679,16 @@ mod unix_impl {
                 cols,
                 rows,
             } => {
+                if conn.read_only {
+                    send(
+                        &conn.out,
+                        &Response::Error {
+                            code: "read_only".to_string(),
+                            message: "connection is in read-only mode".to_string(),
+                        },
+                    );
+                    return;
+                }
                 match spawn_headless_session(command.as_deref(), &args, cwd.as_deref(), cols, rows) {
                     Ok(id) => {
                         send(&conn.out, &Response::Spawned { id });
@@ -629,8 +705,63 @@ mod unix_impl {
                 }
             }
             Request::Close { id } => {
-                unregister(id);
-                send(&conn.out, &Response::Closed { id });
+                if conn.read_only {
+                    send(
+                        &conn.out,
+                        &Response::Error {
+                            code: "read_only".to_string(),
+                            message: "connection is in read-only mode".to_string(),
+                        },
+                    );
+                    return;
+                }
+                let entry = registry().lock().get(&id).cloned();
+                match entry {
+                    Some(entry) => {
+                        if entry.kind == SessionKind::Gui {
+                            send(
+                                &conn.out,
+                                &Response::Error {
+                                    code: "not_closable".to_string(),
+                                    message: "GUI session cannot be closed via daemon without force".to_string(),
+                                },
+                            );
+                            return;
+                        }
+                        entry.terminal.terminate_process();
+                        unregister(id);
+                        send(&conn.out, &Response::Closed { id });
+                    }
+                    None => {
+                        send(
+                            &conn.out,
+                            &Response::Error {
+                                code: "no_such_session".to_string(),
+                                message: "no such session".to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+            Request::BinarySnapshot { id } => {
+                if let Some(entry) = registry().lock().get(&id) {
+                    let bin = entry.terminal.snapshot_binary_compressed();
+                    send(
+                        &conn.out,
+                        &Response::BinarySnapshot {
+                            id,
+                            data: base64_encode(&bin),
+                        },
+                    );
+                } else {
+                    send(
+                        &conn.out,
+                        &Response::Error {
+                            code: "no_such_session".to_string(),
+                            message: "no such session".to_string(),
+                        },
+                    );
+                }
             }
         }
     }
@@ -748,7 +879,8 @@ mod tests {
     #[test]
     fn test_request_serialization_roundtrip() {
         let reqs = vec![
-            Request::Hello,
+            Request::Hello { read_only: false },
+            Request::Hello { read_only: true },
             Request::List,
             Request::SubscribeSessions,
             Request::Attach {
@@ -783,7 +915,9 @@ mod tests {
             let json = serde_json::to_string(&req).expect("serialize");
             let parsed: Request = serde_json::from_str(&json).expect("deserialize");
             match (&req, &parsed) {
-                (Request::Hello, Request::Hello) => {}
+                (Request::Hello { read_only: a }, Request::Hello { read_only: b }) => {
+                    assert_eq!(a, b);
+                }
                 (Request::List, Request::List) => {}
                 (Request::SubscribeSessions, Request::SubscribeSessions) => {}
                 (Request::Attach { id: a, mode: m1 }, Request::Attach { id: b, mode: m2 }) => {
@@ -869,5 +1003,150 @@ mod tests {
         };
         let json = serde_json::to_string(&res).unwrap();
         assert!(json.contains(r#""code":"read_only""#));
+    }
+
+    #[test]
+    fn test_hello_backward_compatibility() {
+        let json_no_flag = r#"{"cmd":"hello"}"#;
+        let req1: Request = serde_json::from_str(json_no_flag).expect("deserialize without flag");
+        match req1 {
+            Request::Hello { read_only } => assert!(!read_only),
+            _ => panic!("wrong variant"),
+        }
+
+        let json_with_flag = r#"{"cmd":"hello","read_only":true}"#;
+        let req2: Request = serde_json::from_str(json_with_flag).expect("deserialize with flag");
+        match req2 {
+            Request::Hello { read_only } => assert!(read_only),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_daemon_read_only_sticky_enforcement() {
+        use std::os::unix::net::UnixStream;
+        use std::io::{BufRead, BufReader};
+        use std::sync::atomic::AtomicBool;
+        use unix_impl::{handle_request, Conn};
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut conn = Conn {
+            out: Arc::new(Mutex::new(server)),
+            conn_alive: Arc::new(AtomicBool::new(true)),
+            read_only: false,
+            attachments: HashMap::new(),
+        };
+
+        let mut client_reader = BufReader::new(client);
+
+        // 1. Send Hello with read_only: true
+        handle_request(Request::Hello { read_only: true }, &mut conn);
+        assert!(conn.read_only);
+
+        let mut line = String::new();
+        client_reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""event":"hello""#));
+
+        // 2. Try to disable read_only with Hello { read_only: false } -> should remain sticky true
+        handle_request(Request::Hello { read_only: false }, &mut conn);
+        assert!(conn.read_only);
+        line.clear();
+        client_reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""event":"hello""#));
+
+        // 3. Write command rejected with code "read_only"
+        handle_request(
+            Request::Write {
+                id: 1,
+                data: base64_encode(b"test"),
+            },
+            &mut conn,
+        );
+        line.clear();
+        client_reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""code":"read_only""#));
+
+        // 4. Spawn command rejected with code "read_only"
+        handle_request(
+            Request::Spawn {
+                command: None,
+                args: vec![],
+                cwd: None,
+                cols: None,
+                rows: None,
+            },
+            &mut conn,
+        );
+        line.clear();
+        client_reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""code":"read_only""#));
+
+        // 5. Close command rejected with code "read_only"
+        handle_request(Request::Close { id: 1 }, &mut conn);
+        line.clear();
+        client_reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""code":"read_only""#));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_close_gui_vs_headless_session() {
+        use std::os::unix::net::UnixStream;
+        use std::io::{BufRead, BufReader};
+        use std::sync::atomic::AtomicBool;
+        use unix_impl::{handle_request, Conn};
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut conn = Conn {
+            out: Arc::new(Mutex::new(server)),
+            conn_alive: Arc::new(AtomicBool::new(true)),
+            read_only: false,
+            attachments: HashMap::new(),
+        };
+        let mut client_reader = BufReader::new(client);
+
+        // 1. Non-existent session
+        handle_request(Request::Close { id: 999_999 }, &mut conn);
+        let mut line = String::new();
+        client_reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""code":"no_such_session""#));
+
+        // 2. GUI session
+        if let Ok(gui_term) = TerminalState::new_headless("/bin/sh", &[], None, 80, 24) {
+            let gui_id = 999_001;
+            register(gui_id, Arc::new(gui_term));
+            handle_request(Request::Close { id: gui_id }, &mut conn);
+            line.clear();
+            client_reader.read_line(&mut line).unwrap();
+            assert!(line.contains(r#""code":"not_closable""#));
+            assert!(is_registered(gui_id));
+            unregister(gui_id);
+        }
+
+        // 3. Headless session
+        if let Ok(headless_term) = TerminalState::new_headless("/bin/sh", &[], None, 80, 24) {
+            let headless_id = 999_002;
+            register_headless(headless_id, Arc::new(headless_term));
+            assert!(is_registered(headless_id));
+            handle_request(Request::Close { id: headless_id }, &mut conn);
+            line.clear();
+            client_reader.read_line(&mut line).unwrap();
+            assert!(line.contains(r#""event":"closed""#));
+            assert!(!is_registered(headless_id));
+        }
+    }
+
+    #[test]
+    fn test_session_info_history_size() {
+        let json = r#"{"id":42,"title":"zsh","cwd":"/tmp","cols":80,"rows":24,"alive":true,"history_size":120}"#;
+        let info: SessionInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.id, 42);
+        assert_eq!(info.history_size, 120);
+
+        // Backward compatibility: missing history_size defaults to 0
+        let old_json = r#"{"id":42,"title":"zsh","cwd":"/tmp","cols":80,"rows":24,"alive":true}"#;
+        let old_info: SessionInfo = serde_json::from_str(old_json).unwrap();
+        assert_eq!(old_info.history_size, 0);
     }
 }

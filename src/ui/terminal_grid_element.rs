@@ -60,7 +60,7 @@ impl Element for TerminalGridElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let style = Style {
             size: gpui::Size {
-                width: px(self.row_width).into(),
+                width: gpui::relative(1.0).into(),
                 height: px(self.line_h * self.lines.len() as f32).into(),
             },
             ..Default::default()
@@ -122,7 +122,11 @@ impl Element for TerminalGridElement {
                 if let Some(bg) = span.bg {
                     let x_start = (span.start_col as f32 * self.cell_w).floor();
                     let x_end = (span.end_col as f32 * self.cell_w).floor();
-                    let span_width = (x_end - x_start).max(0.0);
+                    let span_width = if x_end >= self.row_width - 1.0 {
+                        (bounds.size.width.to_f64() as f32 - x_start).max(0.0)
+                    } else {
+                        (x_end - x_start).max(0.0)
+                    };
                     let bg_bounds = Bounds::new(
                         point(origin.x + px(x_start), y),
                         size(px(span_width), px(self.line_h)),
@@ -154,7 +158,11 @@ impl Element for TerminalGridElement {
                 if let Some((c_start, c_end)) = sel_col_range {
                     let x_start = (c_start as f32 * self.cell_w).floor();
                     let x_end = (c_end as f32 * self.cell_w).floor();
-                    let quad_w = (x_end - x_start).max(0.0);
+                    let quad_w = if x_end >= self.row_width - 1.0 {
+                        (bounds.size.width.to_f64() as f32 - x_start).max(0.0)
+                    } else {
+                        (x_end - x_start).max(0.0)
+                    };
                     let sel_bounds = Bounds::new(
                         point(origin.x + px(x_start), y),
                         size(px(quad_w), px(self.line_h)),
@@ -441,7 +449,7 @@ fn paint_text_run(
 
     let _ = window
         .text_system()
-        .shape_line(text.to_string().into(), px(font_size), &[run], force_width)
+        .shape_line(gpui::SharedString::from(text), px(font_size), &[run], force_width)
         .paint(text_pos, px(line_h), align, align_width, window, cx);
 }
 
@@ -449,12 +457,11 @@ fn paint_geometric_char(
     ch: char,
     bounds: Bounds<Pixels>,
     fg: gpui::Hsla,
-    bg: Option<gpui::Hsla>,
+    _bg: Option<gpui::Hsla>,
     theme_bg: gpui::Hsla,
     window: &mut Window,
 ) -> bool {
     let code = ch as u32;
-    let bg_c = bg.unwrap_or(theme_bg);
     let x = bounds.origin.x;
     let y = bounds.origin.y;
     let width = bounds.size.width;
@@ -466,124 +473,120 @@ fn paint_geometric_char(
 
     // 1. Block Elements (0x2580..=0x259F)
     if (0x2580..=0x259F).contains(&code) {
+        let fill_fg = {
+            let mut c = fg;
+            c.a = (c.a * theme_bg.a).clamp(0.0, 1.0);
+            c
+        };
         match code {
             0x2588 => {
                 // Full block █
-                window.paint_quad(fill(bounds, fg));
+                window.paint_quad(fill(bounds, fill_fg));
             }
             0x2580 => {
                 // Upper half block ▀
-                window.paint_quad(fill(Bounds::new(point(x, y), size(width, half_h)), fg));
-                window.paint_quad(fill(
-                    Bounds::new(point(x, y + half_h), size(width, rem_h)),
-                    bg_c,
-                ));
+                window.paint_quad(fill(Bounds::new(point(x, y), size(width, half_h)), fill_fg));
             }
             0x2584 => {
                 // Lower half block ▄
-                window.paint_quad(fill(Bounds::new(point(x, y), size(width, half_h)), bg_c));
                 window.paint_quad(fill(
                     Bounds::new(point(x, y + half_h), size(width, rem_h)),
-                    fg,
+                    fill_fg,
                 ));
             }
             0x258C => {
                 // Left half block ▌
-                window.paint_quad(fill(Bounds::new(point(x, y), size(half_w, line_h)), fg));
-                window.paint_quad(fill(
-                    Bounds::new(point(x + half_w, y), size(rem_w, line_h)),
-                    bg_c,
-                ));
+                window.paint_quad(fill(Bounds::new(point(x, y), size(half_w, line_h)), fill_fg));
             }
             0x2590 => {
                 // Right half block ▐
-                window.paint_quad(fill(Bounds::new(point(x, y), size(half_w, line_h)), bg_c));
                 window.paint_quad(fill(
                     Bounds::new(point(x + half_w, y), size(rem_w, line_h)),
-                    fg,
+                    fill_fg,
                 ));
             }
             0x2581..=0x2587 => {
                 // Lower fraction blocks  ▂▃▄▅▆▇
                 let frac = (code - 0x2580) as f32 / 8.0;
                 let fill_h = (line_h * frac).floor().max(px(1.0));
-                window.paint_quad(fill(bounds, bg_c));
                 window.paint_quad(fill(
                     Bounds::new(point(x, y + line_h - fill_h), size(width, fill_h)),
-                    fg,
+                    fill_fg,
                 ));
             }
             0x2589..=0x258F => {
                 // Left fraction blocks ▏▎▍▌▋▊▉
                 let frac = (8 - (code - 0x2588)) as f32 / 8.0;
                 let fill_w = (width * frac).floor().max(px(1.0));
-                window.paint_quad(fill(bounds, bg_c));
-                window.paint_quad(fill(Bounds::new(point(x, y), size(fill_w, line_h)), fg));
+                window.paint_quad(fill(Bounds::new(point(x, y), size(fill_w, line_h)), fill_fg));
             }
             0x2591 => {
                 // Light shade ░
-                let mut blended = fg;
-                blended.a = 0.25;
-                window.paint_quad(fill(bounds, bg_c));
+                let mut blended = fill_fg;
+                blended.a = 0.25 * theme_bg.a;
                 window.paint_quad(fill(bounds, blended));
             }
             0x2592 => {
                 // Medium shade ▒
-                let mut blended = fg;
-                blended.a = 0.50;
-                window.paint_quad(fill(bounds, bg_c));
+                let mut blended = fill_fg;
+                blended.a = 0.50 * theme_bg.a;
                 window.paint_quad(fill(bounds, blended));
             }
             0x2593 => {
                 // Dark shade ▓
-                let mut blended = fg;
-                blended.a = 0.75;
-                window.paint_quad(fill(bounds, bg_c));
+                let mut blended = fill_fg;
+                blended.a = 0.75 * theme_bg.a;
                 window.paint_quad(fill(bounds, blended));
             }
             0x2594 => {
                 // Upper 1/8th ▔
                 let fill_h = (line_h * 0.125).floor().max(px(1.0));
-                window.paint_quad(fill(bounds, bg_c));
-                window.paint_quad(fill(Bounds::new(point(x, y), size(width, fill_h)), fg));
+                window.paint_quad(fill(Bounds::new(point(x, y), size(width, fill_h)), fill_fg));
             }
             0x2595 => {
                 // Right 1/8th ▕
                 let fill_w = (width * 0.125).floor().max(px(1.0));
-                window.paint_quad(fill(bounds, bg_c));
                 window.paint_quad(fill(
                     Bounds::new(point(x + width - fill_w, y), size(fill_w, line_h)),
-                    fg,
+                    fill_fg,
                 ));
             }
             0x2596..=0x259F => {
                 // Quadrants ▖▗▘▙▛▜▟▚▞
                 let (tl, tr, bl, br) = match code {
-                    0x2596 => (bg_c, bg_c, fg, bg_c),
-                    0x2597 => (bg_c, bg_c, bg_c, fg),
-                    0x2598 => (fg, bg_c, bg_c, bg_c),
-                    0x2599 => (fg, bg_c, fg, fg),
-                    0x259A => (fg, bg_c, bg_c, fg),
-                    0x259B => (fg, fg, fg, bg_c),
-                    0x259C => (fg, fg, bg_c, fg),
-                    0x259D => (bg_c, fg, bg_c, bg_c),
-                    0x259E => (bg_c, fg, fg, bg_c),
-                    0x259F => (bg_c, fg, fg, fg),
+                    0x2596 => (false, false, true, false),
+                    0x2597 => (false, false, false, true),
+                    0x2598 => (true, false, false, false),
+                    0x2599 => (true, false, true, true),
+                    0x259A => (true, false, false, true),
+                    0x259B => (true, true, true, false),
+                    0x259C => (true, true, false, true),
+                    0x259D => (false, true, false, false),
+                    0x259E => (false, true, true, false),
+                    0x259F => (false, true, true, true),
                     _ => return false,
                 };
-                window.paint_quad(fill(Bounds::new(point(x, y), size(half_w, half_h)), tl));
-                window.paint_quad(fill(
-                    Bounds::new(point(x + half_w, y), size(rem_w, half_h)),
-                    tr,
-                ));
-                window.paint_quad(fill(
-                    Bounds::new(point(x, y + half_h), size(half_w, rem_h)),
-                    bl,
-                ));
-                window.paint_quad(fill(
-                    Bounds::new(point(x + half_w, y + half_h), size(rem_w, rem_h)),
-                    br,
-                ));
+                if tl {
+                    window.paint_quad(fill(Bounds::new(point(x, y), size(half_w, half_h)), fill_fg));
+                }
+                if tr {
+                    window.paint_quad(fill(
+                        Bounds::new(point(x + half_w, y), size(rem_w, half_h)),
+                        fill_fg,
+                    ));
+                }
+                if bl {
+                    window.paint_quad(fill(
+                        Bounds::new(point(x, y + half_h), size(half_w, rem_h)),
+                        fill_fg,
+                    ));
+                }
+                if br {
+                    window.paint_quad(fill(
+                        Bounds::new(point(x + half_w, y + half_h), size(rem_w, rem_h)),
+                        fill_fg,
+                    ));
+                }
             }
             _ => return false,
         }
@@ -604,9 +607,6 @@ fn paint_geometric_char(
         let t_r = get_t(right_style);
         let t_t = get_t(top_style);
         let t_b = get_t(bottom_style);
-
-        // Always paint background first
-        window.paint_quad(fill(bounds, bg_c));
 
         if kind == 1 {
             // Round corners (0x256D..=0x2570)

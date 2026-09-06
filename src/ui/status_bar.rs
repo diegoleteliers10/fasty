@@ -276,7 +276,7 @@ impl RenderOnce for StatusBar {
             .flex_row()
             .items_center()
             .justify_between()
-            .h(px(24.))
+            .h(px(20.))
             .w_full()
             .bg(theme.status_bar_bg)
             .px(px(12.))

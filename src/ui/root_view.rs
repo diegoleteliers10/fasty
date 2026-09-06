@@ -819,6 +819,26 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
     ]
 }
 
+#[derive(Clone, Debug)]
+pub enum CloseTarget {
+    Pane { tab_id: usize, pane_id: usize },
+    Tab { tab_id: usize },
+    OtherTabs { keep_id: usize },
+}
+
+#[derive(Clone, Debug)]
+pub struct RunningProcessInfo {
+    pub pane_id: usize,
+    pub process_name: String,
+    pub pid: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingClose {
+    pub target: CloseTarget,
+    pub running_processes: Vec<RunningProcessInfo>,
+}
+
 pub struct RootView {
     config: Config,
     window_id: gpui::WindowId,
@@ -884,6 +904,8 @@ pub struct RootView {
     pub has_selection_dragged: bool,
     pub selection_start: Option<alacritty_terminal::index::Point>,
     pub selection_mouse_pos: Option<(f32, f32)>,
+    pub selection_autoscroll_accum: f32,
+    pub cursor_window_pos: Option<(f32, f32)>,
     pub hovered_url: Option<String>,
     pub hovered_url_range: Option<(i32, usize, usize)>,
     pub current_theme_name: String,
@@ -894,6 +916,7 @@ pub struct RootView {
     pub is_dragging_scrollbar: bool,
     pub dragging_scrollbar_pane_id: Option<usize>,
     pub last_scrolled_pane_id: Option<usize>,
+    pub scroll_fade_active: bool,
     pub scrollbar_drag_start_y: f32,
     pub scrollbar_drag_start_offset: usize,
     pub update_available: Option<crate::updater::ReleaseInfo>,
@@ -901,6 +924,7 @@ pub struct RootView {
     pub is_update_ready: bool,
     pub update_status: Option<String>,
     pub is_update_modal_open: bool,
+    pub pending_close: Option<PendingClose>,
     pub pressed_mouse_button: Option<MouseButton>,
     pub(crate) ime_marked_text: Option<String>,
     pub last_config_version: u64,
@@ -994,13 +1018,18 @@ impl RootView {
 
                     // Selection auto-scroll while dragging outside/near viewport bounds
                     if this.is_selecting && this.selection_mouse_pos.is_some() {
-                        this.update_selection_from_mouse(_window, cx);
+                        this.tick_selection_autoscroll(0.035, _window, cx);
                         needs_notify = true;
                     }
 
                     // Scroll fade active window
                     let elapsed = this.last_scroll_activity.elapsed();
-                    if this.is_dragging_scrollbar || elapsed < std::time::Duration::from_millis(1500) {
+                    let is_fading = elapsed < std::time::Duration::from_millis(1500);
+                    if this.is_dragging_scrollbar || is_fading {
+                        this.scroll_fade_active = true;
+                        needs_notify = true;
+                    } else if this.scroll_fade_active {
+                        this.scroll_fade_active = false;
                         needs_notify = true;
                     }
 
@@ -1119,6 +1148,8 @@ impl RootView {
             has_selection_dragged: false,
             selection_start: None,
             selection_mouse_pos: None,
+            selection_autoscroll_accum: 0.0,
+            cursor_window_pos: None,
             hovered_url: None,
             hovered_url_range: None,
             current_theme_name: theme_name,
@@ -1129,6 +1160,7 @@ impl RootView {
             is_dragging_scrollbar: false,
             dragging_scrollbar_pane_id: None,
             last_scrolled_pane_id: None,
+            scroll_fade_active: false,
             scrollbar_drag_start_y: 0.0,
             scrollbar_drag_start_offset: 0,
             update_available: None,
@@ -1136,6 +1168,7 @@ impl RootView {
             update_status: None,
             is_update_ready: false,
             is_update_modal_open: false,
+            pending_close: None,
             pressed_mouse_button: None,
             ime_marked_text: None,
             last_config_version: crate::config::current_config_version(),
@@ -1623,20 +1656,50 @@ impl RootView {
                 self.close_tab(tab_id, window, cx);
             }
         } else {
-            if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
+            if let Some(tab) = self.tabs.get(self.active_tab_idx) {
                 let active_id = tab.pane_tree.active_pane_id;
-                if tab.pane_tree.close_pane(active_id) {
-                    crate::daemon::unregister(active_id);
+                if let Some(pane) = tab.pane_tree.find_pane(active_id) {
+                    if let Some(term) = &pane.terminal {
+                        if term.is_process_running() {
+                            let name = term.get_foreground_process_name().unwrap_or_else(|| "process".to_string());
+                            let pid = term.shell_pid().unwrap_or(0);
+                            self.pending_close = Some(PendingClose {
+                                target: CloseTarget::Pane { tab_id: tab.id, pane_id: active_id },
+                                running_processes: vec![RunningProcessInfo {
+                                    pane_id: active_id,
+                                    process_name: name,
+                                    pid,
+                                }],
+                            });
+                            cx.notify();
+                            return;
+                        }
+                    }
                 }
-                if let Some(pane) = tab.pane_tree.active_pane() {
-                    tab.terminal = pane.terminal.clone();
-                    tab.cwd = pane.cwd.clone();
-                    tab.git_status = pane.git_status.clone();
+                let tab_id = tab.id;
+                self.force_close_pane(tab_id, active_id, cx);
+            }
+        }
+    }
+
+    pub fn force_close_pane(&mut self, tab_id: usize, pane_id: usize, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            if let Some(pane) = tab.pane_tree.find_pane(pane_id) {
+                if let Some(ref term) = pane.terminal {
+                    term.terminate_process();
                 }
             }
-            self.persist_session();
-            cx.notify();
+            if tab.pane_tree.close_pane(pane_id) {
+                crate::daemon::unregister(pane_id);
+            }
+            if let Some(pane) = tab.pane_tree.active_pane() {
+                tab.terminal = pane.terminal.clone();
+                tab.cwd = pane.cwd.clone();
+                tab.git_status = pane.git_status.clone();
+            }
         }
+        self.persist_session();
+        cx.notify();
     }
 
     pub fn with_initial_tab(window: &mut Window, cli_opts: crate::cli::CliOptions, tab_data: TabData, cx: &mut Context<Self>) -> Self {
@@ -1804,12 +1867,47 @@ impl RootView {
     }
 
     pub fn close_tab(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
+            let running: Vec<RunningProcessInfo> = tab.pane_tree.all_panes()
+                .into_iter()
+                .filter_map(|pane| {
+                    if let Some(term) = &pane.terminal {
+                        if term.is_process_running() {
+                            let name = term.get_foreground_process_name().unwrap_or_else(|| "process".to_string());
+                            let pid = term.shell_pid().unwrap_or(0);
+                            return Some(RunningProcessInfo {
+                                pane_id: pane.id,
+                                process_name: name,
+                                pid,
+                            });
+                        }
+                    }
+                    None
+                })
+                .collect();
+
+            if !running.is_empty() {
+                self.pending_close = Some(PendingClose {
+                    target: CloseTarget::Tab { tab_id },
+                    running_processes: running,
+                });
+                cx.notify();
+                return;
+            }
+        }
+        self.force_close_tab(tab_id, window, cx);
+    }
+
+    pub fn force_close_tab(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.selection = None;
         self.is_selecting = false;
         self.selection_start = None;
         if let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) {
             let removed = self.tabs.remove(idx);
             for pane in removed.pane_tree.all_panes() {
+                if let Some(ref term) = pane.terminal {
+                    term.terminate_process();
+                }
                 crate::daemon::unregister(pane.id);
             }
             if self.tabs.is_empty() {
@@ -1819,6 +1917,42 @@ impl RootView {
             }
             self.persist_session();
             cx.notify();
+        }
+    }
+
+    pub fn confirm_pending_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_close.take() else { return; };
+        match pending.target {
+            CloseTarget::Tab { tab_id } => {
+                if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
+                    for pane in tab.pane_tree.all_panes() {
+                        if let Some(term) = &pane.terminal {
+                            term.terminate_process();
+                        }
+                    }
+                }
+                self.force_close_tab(tab_id, window, cx);
+            }
+            CloseTarget::Pane { tab_id, pane_id } => {
+                if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
+                    if let Some(pane) = tab.pane_tree.find_pane(pane_id) {
+                        if let Some(term) = &pane.terminal {
+                            term.terminate_process();
+                        }
+                    }
+                }
+                self.force_close_pane(tab_id, pane_id, cx);
+            }
+            CloseTarget::OtherTabs { keep_id } => {
+                for tab in self.tabs.iter().filter(|t| t.id != keep_id) {
+                    for pane in tab.pane_tree.all_panes() {
+                        if let Some(term) = &pane.terminal {
+                            term.terminate_process();
+                        }
+                    }
+                }
+                self.force_close_other_tabs(keep_id, window, cx);
+            }
         }
     }
 
@@ -1893,7 +2027,9 @@ impl RootView {
         let existing = { *crate::ui::settings_view::SETTINGS_WINDOW_HANDLE.lock() };
         if let Some(handle) = existing {
             let mut activated = false;
+            let current_config = self.config.clone();
             let _ = handle.update(cx, |view, window, cx| {
+                view.sync_from_config(&current_config, cx);
                 window.activate_window();
                 window.focus(&view.focus_handle, cx);
                 activated = true;
@@ -1905,6 +2041,7 @@ impl RootView {
         }
 
         let bounds = Bounds::centered(None, size(px(720.), px(680.)), &*cx);
+        let current_config = self.config.clone();
         if let Ok(handle) = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -1920,7 +2057,7 @@ impl RootView {
             },
             |w, cx| {
                 w.set_background_appearance(WindowBackgroundAppearance::Blurred);
-                cx.new(|cx| SettingsView::new(w, cx))
+                cx.new(|cx| SettingsView::new_with_config(w, &current_config, cx))
             },
         ) {
             *crate::ui::settings_view::SETTINGS_WINDOW_HANDLE.lock() = Some(handle);
@@ -1976,7 +2113,48 @@ impl RootView {
         cx.notify();
     }
 
-    pub fn close_other_tabs(&mut self, keep_id: usize, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn close_other_tabs(&mut self, keep_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let other_running: Vec<RunningProcessInfo> = self.tabs
+            .iter()
+            .filter(|t| t.id != keep_id)
+            .flat_map(|t| t.pane_tree.all_panes())
+            .filter_map(|pane| {
+                if let Some(term) = &pane.terminal {
+                    if term.is_process_running() {
+                        let name = term.get_foreground_process_name().unwrap_or_else(|| "process".to_string());
+                        let pid = term.shell_pid().unwrap_or(0);
+                        return Some(RunningProcessInfo {
+                            pane_id: pane.id,
+                            process_name: name,
+                            pid,
+                        });
+                    }
+                }
+                None
+            })
+            .collect();
+
+        if !other_running.is_empty() {
+            self.pending_close = Some(PendingClose {
+                target: CloseTarget::OtherTabs { keep_id },
+                running_processes: other_running,
+            });
+            cx.notify();
+            return;
+        }
+
+        self.force_close_other_tabs(keep_id, window, cx);
+    }
+
+    pub fn force_close_other_tabs(&mut self, keep_id: usize, _window: &mut Window, cx: &mut Context<Self>) {
+        for tab in self.tabs.iter().filter(|t| t.id != keep_id) {
+            for pane in tab.pane_tree.all_panes() {
+                if let Some(ref term) = pane.terminal {
+                    term.terminate_process();
+                }
+                crate::daemon::unregister(pane.id);
+            }
+        }
         self.tabs.retain(|t| t.id == keep_id);
         self.active_tab_idx = 0;
         self.persist_session();
@@ -2511,7 +2689,7 @@ impl RootView {
     }
 
     fn convert_color(&self, color: AnsiColor, is_fg: bool) -> Hsla {
-        match color {
+        let mut hsla = match color {
             AnsiColor::Named(named) => match named {
                 NamedColor::Black => self.theme.black,
                 NamedColor::Red => self.theme.red,
@@ -2573,7 +2751,13 @@ impl RootView {
                     rgb_to_hsla(gray, gray, gray)
                 }
             }
+        };
+
+        if !is_fg && self.theme.opacity < 1.0 {
+            hsla.a = self.theme.opacity;
         }
+
+        hsla
     }
 
     fn handle_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2593,8 +2777,22 @@ impl RootView {
             return;
         }
 
-        let is_alt_gr = modifiers.control && modifiers.alt;
+        let is_alt_gr = modifiers.control && !modifiers.platform && modifiers.alt;
         let is_ctrl = modifiers.control && !is_alt_gr;
+
+        // Pending Close Modal Keyboard Handler
+        if self.pending_close.is_some() {
+            if key_lower == "escape" || key_lower == "esc" {
+                self.pending_close = None;
+                cx.notify();
+                return;
+            }
+            if key_lower == "enter" || key_lower == "return" {
+                self.confirm_pending_close(_window, cx);
+                return;
+            }
+            return;
+        }
 
         // 0. Rename Tab Modal Keyboard Handler
         if self.is_rename_tab_open {
@@ -3591,6 +3789,7 @@ impl RootView {
             || self.is_settings_open
             || self.is_about_open
             || self.is_update_modal_open
+            || self.pending_close.is_some()
     }
 
     pub fn ime_commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -3712,9 +3911,45 @@ impl RootView {
     }
 
     fn handle_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let cur_x = event.position.x.to_f64() as f32;
+        let cur_y = event.position.y.to_f64() as f32;
+        let prev_pos = self.cursor_window_pos;
+        self.cursor_window_pos = Some((cur_x, cur_y));
+
+        // Repaint when mouse enters, moves within, or leaves scrollbar proximity (within 48px inside right edge)
+        if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+            let in_prox = tab.pane_tree.all_panes().iter().any(|p| {
+                if let Some(b) = p.last_bounds {
+                    let bx = b.origin.x.to_f64() as f32;
+                    let by = b.origin.y.to_f64() as f32;
+                    let bw = b.size.width.to_f64() as f32;
+                    let bh = b.size.height.to_f64() as f32;
+                    let right_edge = bx + bw;
+                    cur_y >= (by - 4.0) && cur_y <= (by + bh + 4.0) && cur_x >= (right_edge - 48.0) && cur_x <= (right_edge + 8.0)
+                } else {
+                    false
+                }
+            });
+            let was_in_prox = prev_pos.is_some_and(|(px, py)| {
+                tab.pane_tree.all_panes().iter().any(|p| {
+                    if let Some(b) = p.last_bounds {
+                        let bx = b.origin.x.to_f64() as f32;
+                        let by = b.origin.y.to_f64() as f32;
+                        let bw = b.size.width.to_f64() as f32;
+                        let bh = b.size.height.to_f64() as f32;
+                        let right_edge = bx + bw;
+                        py >= (by - 4.0) && py <= (by + bh + 4.0) && px >= (right_edge - 48.0) && px <= (right_edge + 8.0)
+                    } else {
+                        false
+                    }
+                })
+            });
+            if in_prox || was_in_prox {
+                cx.notify();
+            }
+        }
+
         if self.is_dragging_pane_split {
-            let cur_x = event.position.x.to_f64() as f32;
-            let cur_y = event.position.y.to_f64() as f32;
             let (bx, by, bw, bh) = self.dragging_split_bounds;
             let new_ratio = match self.dragging_split_direction {
                 SplitDirection::Horizontal => {
@@ -3803,6 +4038,7 @@ impl RootView {
                 self.is_selecting = false;
                 self.has_selection_dragged = false;
                 self.selection_mouse_pos = None;
+                self.selection_autoscroll_accum = 0.0;
                 self.pressed_mouse_button = None;
                 if self.config.copy_on_select {
                     if let Some(text) = self.get_selected_text() {
@@ -3814,11 +4050,11 @@ impl RootView {
                 cx.notify();
                 return;
             }
-            let raw_x = event.position.x.to_f64() as f32;
-            let raw_y = event.position.y.to_f64() as f32;
+            let raw_x = cur_x;
+            let raw_y = cur_y;
             self.selection_mouse_pos = Some((raw_x, raw_y));
             self.has_selection_dragged = true;
-            self.update_selection_from_mouse(_window, cx);
+            self.update_selection_endpoint(_window, cx);
             return;
         }
 
@@ -3889,6 +4125,7 @@ impl RootView {
         self.dragging_split_path.clear();
         self.selection_mouse_pos = None;
         self.has_selection_dragged = false;
+        self.selection_autoscroll_accum = 0.0;
         if self.is_selecting {
             self.is_selecting = false;
             if self.config.copy_on_select {
@@ -3929,7 +4166,7 @@ impl RootView {
         }
     }
 
-    fn update_selection_from_mouse(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn update_selection_endpoint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_selecting || !self.has_selection_dragged {
             return;
         }
@@ -3952,33 +4189,16 @@ impl RootView {
         let screen_rows = ((avail_h / px_per_line) as i32).max(1);
         let screen_cols = ((avail_w / cell_width) as usize).max(1);
         let history_size = terminal.history_size();
-
-        // Autoscroll triggers when cursor is dragged near/into top or bottom edges (or beyond)
-        let top_scroll_zone = top_edge + px_per_line * 2.0;
-        let bottom_scroll_zone = bottom_edge - px_per_line * 2.0;
-
-        if raw_y < top_scroll_zone {
-            let dist = (top_scroll_zone - raw_y).max(0.0);
-            let lines = ((dist / px_per_line).ceil() as isize).clamp(1, 8);
-            terminal.scroll(lines);
-            self.last_scroll_activity = std::time::Instant::now();
-        } else if raw_y > bottom_scroll_zone {
-            let dist = (raw_y - bottom_scroll_zone).max(0.0);
-            let lines = -(((dist / px_per_line).ceil() as isize).clamp(1, 8));
-            terminal.scroll(lines);
-            self.last_scroll_activity = std::time::Instant::now();
-        }
-
-        let new_display_offset = terminal.display_offset();
+        let display_offset = terminal.display_offset();
 
         let updated_grid_row = if raw_y < top_edge {
-            -(new_display_offset as i32)
+            -(display_offset as i32)
         } else if raw_y > bottom_edge {
-            (screen_rows - 1) - (new_display_offset as i32)
+            (screen_rows - 1) - (display_offset as i32)
         } else {
             let rel_y = (raw_y - top_edge).clamp(0.0, avail_h - 1.0);
             let row_in_screen = (rel_y / px_per_line).floor() as i32;
-            row_in_screen - (new_display_offset as i32)
+            row_in_screen - (display_offset as i32)
         }.clamp(-(history_size as i32), screen_rows - 1);
 
         let local_x = (raw_x - sidebar_w - 1.0).max(0.0);
@@ -4008,6 +4228,60 @@ impl RootView {
                 self.selection = Some(Selection { start, end });
                 cx.notify();
             }
+        }
+    }
+
+    fn tick_selection_autoscroll(&mut self, dt: f32, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_selecting || !self.has_selection_dragged {
+            self.selection_autoscroll_accum = 0.0;
+            return;
+        }
+        let Some((_raw_x, raw_y)) = self.selection_mouse_pos else {
+            self.selection_autoscroll_accum = 0.0;
+            return;
+        };
+        let Some(active_tab) = self.tabs.get(self.active_tab_idx) else { return; };
+        let active_pane = active_tab.pane_tree.active_pane();
+        let Some(terminal) = active_pane.as_ref().and_then(|p| p.terminal.as_ref()).or(active_tab.terminal.as_ref()) else { return; };
+
+        let (_, line_h) = self.measure_cell_metrics(window);
+        let px_per_line = if line_h > 0.0 { line_h } else { 18.0 };
+
+        let top_edge = 32.0;
+        let v = window.viewport_size();
+        let avail_h = (v.height.to_f64() as f32 - 56.0).max(100.0);
+        let bottom_edge = top_edge + avail_h;
+
+        // Auto-scroll triggers near or past the top/bottom edges
+        let top_scroll_zone = top_edge + px_per_line * 1.5;
+        let bottom_scroll_zone = bottom_edge - px_per_line * 1.5;
+
+        let (dist, direction) = if raw_y < top_scroll_zone {
+            ((top_scroll_zone - raw_y).max(0.0), 1.0f32)
+        } else if raw_y > bottom_scroll_zone {
+            ((raw_y - bottom_scroll_zone).max(0.0), -1.0f32)
+        } else {
+            self.selection_autoscroll_accum = 0.0;
+            return;
+        };
+
+        if dist <= 0.0 {
+            self.selection_autoscroll_accum = 0.0;
+            return;
+        }
+
+        // Distance-scaled continuous velocity:
+        // Starts very slow at boundary (~1.5 lines/sec = 1 line every ~0.66s),
+        // accelerates smoothly as cursor is dragged further away.
+        let speed = (1.5 + 0.05 * dist.powf(1.4)).clamp(1.0, 70.0);
+        self.selection_autoscroll_accum += direction * speed * dt;
+
+        if self.selection_autoscroll_accum.abs() >= 1.0 {
+            let lines = self.selection_autoscroll_accum.trunc() as isize;
+            self.selection_autoscroll_accum -= lines as f32;
+            terminal.scroll(lines);
+            self.last_scroll_activity = std::time::Instant::now();
+            self.update_selection_endpoint(window, cx);
         }
     }
 
@@ -4412,13 +4686,35 @@ impl RootView {
                 let pane_scrollbar_thumb = if history_size > 0 {
                     let elapsed_ms = self.last_scroll_activity.elapsed().as_millis();
                     let is_this_dragging = self.is_dragging_scrollbar && self.dragging_scrollbar_pane_id == Some(pane.id);
-                    let is_this_scrolling = self.last_scrolled_pane_id == Some(pane.id) && elapsed_ms < 1500;
-                    if is_this_dragging || is_this_scrolling {
-                        let alpha_mult = if is_this_dragging || (self.last_scrolled_pane_id == Some(pane.id) && elapsed_ms < 700) {
-                            1.0
+                    let is_this_scrolling = (self.last_scrolled_pane_id == Some(pane.id) || (self.last_scrolled_pane_id.is_none() && is_active)) && elapsed_ms < 1500;
+
+                    // Proximity check against this pane's right edge
+                    let right_edge = container_x + avail_w;
+                    let bottom_edge = container_y + avail_h;
+                    let (is_in_proximity, dist_from_right) = if let Some((mx, my)) = self.cursor_window_pos {
+                        if my >= (container_y - 4.0) && my <= (bottom_edge + 4.0) && mx >= (right_edge - 48.0) && mx <= (right_edge + 8.0) {
+                            let dist = (right_edge - mx).max(0.0);
+                            (true, dist)
+                        } else {
+                            (false, 999.0)
+                        }
+                    } else {
+                        (false, 999.0)
+                    };
+
+                    if is_this_dragging || is_this_scrolling || is_in_proximity {
+                        let (alpha_mult, visual_w) = if is_this_dragging {
+                            (1.0, 8.0)
+                        } else if dist_from_right <= 14.0 {
+                            (0.90, 8.0)
+                        } else if is_in_proximity {
+                            let t = ((48.0 - dist_from_right) / 34.0).clamp(0.0, 1.0);
+                            (0.30 + 0.60 * t, 6.0)
+                        } else if elapsed_ms < 700 {
+                            (1.0, 5.0)
                         } else {
                             let t = (elapsed_ms - 700) as f32 / 800.0;
-                            (1.0 - t).clamp(0.0, 1.0)
+                            ((1.0 - t).clamp(0.0, 1.0), 5.0)
                         };
 
                         let track_h = avail_h;
@@ -4427,22 +4723,30 @@ impl RootView {
                         let progress = 1.0 - (display_offset as f32 / history_size as f32).clamp(0.0, 1.0);
                         let thumb_top = ((track_h - thumb_h) * progress).clamp(0.0, track_h - thumb_h);
 
-                        let mut thumb_bg = theme.muted;
-                        thumb_bg.a = 0.45 * alpha_mult;
-                        let mut thumb_hover_bg = theme.muted_strong;
-                        thumb_hover_bg.a = 0.85 * alpha_mult;
+                        let mut thumb_bg = if is_this_dragging { theme.accent } else { theme.muted };
+                        thumb_bg.a = 0.50 * alpha_mult;
+                        let mut thumb_hover_bg = if is_this_dragging { theme.accent } else { theme.muted_strong };
+                        thumb_hover_bg.a = 0.90 * alpha_mult;
 
                         Some(
                             div()
+                                .id(("scrollbar-hit-area", pane_id))
                                 .absolute()
-                                .right(px(2.))
+                                .right(px(4.))
                                 .top(px(thumb_top))
-                                .w(px(5.))
+                                .w(px(14.))
                                 .h(px(thumb_h))
-                                .rounded_full()
-                                .bg(thumb_bg)
-                                .hover(move |s| s.bg(thumb_hover_bg))
+                                .flex()
+                                .justify_end()
                                 .cursor(CursorStyle::PointingHand)
+                                .child(
+                                    div()
+                                        .w(px(visual_w))
+                                        .h_full()
+                                        .rounded_full()
+                                        .bg(thumb_bg)
+                                        .hover(move |s| s.bg(thumb_hover_bg))
+                                )
                                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
                                     this.is_dragging_scrollbar = true;
                                     this.dragging_scrollbar_pane_id = Some(pane_id);
@@ -4707,7 +5011,7 @@ impl Render for RootView {
         let avail_w = (viewport_size.width.to_f64() as f32 - 1.0 - sidebar_w).max(100.0);
         // Chrome layout constants — must match TabBar/StatusBar element heights
         const TAB_BAR_HEIGHT: f32 = 32.0;
-        const STATUS_BAR_HEIGHT: f32 = 24.0;
+        const STATUS_BAR_HEIGHT: f32 = 20.0;
         let avail_h = (viewport_size.height.to_f64() as f32
             - TAB_BAR_HEIGHT
             - STATUS_BAR_HEIGHT)
@@ -7544,6 +7848,173 @@ impl Render for RootView {
                                                     .child(if self.is_updating { "Hide" } else { "OK" }),
                                             )
                                         }),
+                                ),
+                        ),
+                )
+            })
+            .when(self.pending_close.is_some(), |this| {
+                let pending = self.pending_close.clone().unwrap();
+                let process_names: Vec<String> = pending
+                    .running_processes
+                    .iter()
+                    .map(|p| p.process_name.clone())
+                    .collect();
+
+                let (target_label, desc) = match pending.target {
+                    CloseTarget::Pane { .. } => {
+                        let name = process_names.first().cloned().unwrap_or_else(|| "process".to_string());
+                        ("Close Pane?", format!("Process '{}' is still running in this pane.", name))
+                    }
+                    CloseTarget::Tab { .. } => {
+                        if process_names.len() == 1 {
+                            ("Close Tab?", format!("Process '{}' is still running in this tab.", process_names[0]))
+                        } else {
+                            ("Close Tab?", format!("{} processes are still running in this tab.", process_names.len()))
+                        }
+                    }
+                    CloseTarget::OtherTabs { .. } => {
+                        ("Close Other Tabs?", format!("{} processes are still running in other tabs.", process_names.len()))
+                    }
+                };
+
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.55))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                            this.pending_close = None;
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .w(px(380.))
+                                .p(px(16.))
+                                .rounded(px(10.))
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.border)
+                                .shadow_xl()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .pb(px(6.))
+                                        .border_b_1()
+                                        .border_color(theme.border)
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .px(px(6.))
+                                                        .py(px(1.))
+                                                        .rounded(px(4.))
+                                                        .bg(theme.yellow)
+                                                        .text_color(theme.black)
+                                                        .text_size(px(10.))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .child("ACTIVE"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(13.))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .text_color(theme.foreground)
+                                                        .child(target_label),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                    this.pending_close = None;
+                                                    cx.notify();
+                                                }))
+                                                .child(render_icon(IconType::X, theme.muted_strong, 12.0)),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(theme.foreground)
+                                        .child(desc),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_1()
+                                        .children(process_names.into_iter().map(|name| {
+                                            div()
+                                                .px(px(8.))
+                                                .py(px(2.))
+                                                .rounded(px(4.))
+                                                .bg(theme.surface_raised)
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .text_size(px(11.))
+                                                .text_color(theme.accent)
+                                                .child(name)
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme.muted_strong)
+                                        .child("Do you want to terminate the running process and close?"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .justify_end()
+                                        .gap_2()
+                                        .pt(px(4.))
+                                        .child(
+                                            div()
+                                                .px(px(12.))
+                                                .py(px(5.))
+                                                .rounded(px(5.))
+                                                .bg(theme.surface_raised)
+                                                .text_color(theme.foreground)
+                                                .text_size(px(11.))
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                    this.pending_close = None;
+                                                    cx.notify();
+                                                }))
+                                                .child("Cancel"),
+                                        )
+                                        .child(
+                                            div()
+                                                .px(px(12.))
+                                                .py(px(5.))
+                                                .rounded(px(5.))
+                                                .bg(theme.red)
+                                                .text_color(theme.white)
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_size(px(11.))
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, window, cx| {
+                                                    this.confirm_pending_close(window, cx);
+                                                }))
+                                                .child("Terminate & Close"),
+                                        ),
                                 ),
                         ),
                 )

@@ -1,6 +1,6 @@
 use gpui::{
     App, ClickEvent, CursorStyle, FontWeight, IntoElement, MouseButton, MouseDownEvent, RenderOnce,
-    ScrollHandle, SharedString, Window, div, prelude::*, px,
+    ScrollHandle, SharedString, Window, WindowControlArea, div, prelude::*, px,
 };
 use crate::config::TabLayout;
 use super::theme::Theme;
@@ -209,6 +209,7 @@ impl RenderOnce for TabBar {
                         .id("mac-tab-bar-drag-spacer")
                         .flex_1()
                         .h_full()
+                        .window_control_area(WindowControlArea::Drag)
                         .on_mouse_down(MouseButton::Left, |ev, window, _cx| {
                             if ev.click_count == 2 {
                                 window.zoom_window();
@@ -325,6 +326,7 @@ impl RenderOnce for TabBar {
                         .id("tab-bar-drag-spacer")
                         .flex_1()
                         .h_full()
+                        .window_control_area(WindowControlArea::Drag)
                         .on_mouse_down(MouseButton::Left, |ev, window, _cx| {
                             if ev.click_count == 2 {
                                 window.zoom_window();
@@ -349,12 +351,14 @@ impl RenderOnce for TabBar {
                         })
                         .child(render_win_btn(
                             "win-minimize",
+                            if cfg!(target_os = "windows") { Some(WindowControlArea::Min) } else { None },
                             btn_hover_bg,
                             |window| window.minimize_window(),
                             render_minimize_icon(theme.foreground),
                         ))
                         .child(render_win_btn(
                             "win-maximize",
+                            if cfg!(target_os = "windows") { Some(WindowControlArea::Max) } else { None },
                             btn_hover_bg,
                             |window| window.zoom_window(),
                             render_maximize_icon(theme.foreground),
@@ -828,6 +832,7 @@ fn render_update_btn(
 #[cfg(not(target_os = "macos"))]
 fn render_win_btn(
     id: &'static str,
+    area: Option<WindowControlArea>,
     btn_hover_bg: gpui::Hsla,
     action: impl Fn(&mut Window) + 'static,
     icon: impl gpui::IntoElement,
@@ -839,6 +844,7 @@ fn render_win_btn(
         .justify_center()
         .w(px(46.))
         .h(px(32.))
+        .when_some(area, |this, a| this.window_control_area(a))
         .hover(move |s| s.bg(btn_hover_bg))
         .cursor(CursorStyle::PointingHand)
         .on_mouse_down(MouseButton::Left, move |_ev, window, _cx| {
@@ -858,6 +864,9 @@ fn render_close_btn(theme: Theme) -> gpui::Stateful<gpui::Div> {
         .justify_center()
         .w(px(46.))
         .h(px(32.))
+        .when(cfg!(target_os = "windows"), |this| {
+            this.window_control_area(WindowControlArea::Close)
+        })
         .hover(move |s| s.bg(red_hover))
         .cursor(CursorStyle::PointingHand)
         .on_mouse_down(MouseButton::Left, |_ev, window, _cx| {

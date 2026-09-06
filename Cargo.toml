@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "fastty"
-version = "0.7.10"
+version = "0.8.0"
 edition = "2021"
 
 [lib]
@@ -49,6 +49,7 @@ dirs = "6"
 icons = "0.18.3"
 smallvec = "1"
 fff-search = { version = "0.10.6", features = ["ripgrep"] }
+miniz_oxide = "0.8"
 
 [build-dependencies]
 winres = "0.1"
