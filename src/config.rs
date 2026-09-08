@@ -229,7 +229,10 @@ pub struct Config {
     /// keys produce the real character (e.g. `~` via option+n on Latam).
     #[serde(default = "default_option_as_meta")]
     pub option_as_meta: bool,
+    #[serde(default)]
+    pub ai: crate::ai::AiConfig,
 }
+
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BottombarConfig {
@@ -407,8 +410,10 @@ impl Default for Config {
             cursor: CursorConfig::default(),
             tab_layout: TabLayout::default(),
             option_as_meta: default_option_as_meta(),
+            ai: crate::ai::AiConfig::default(),
         }
     }
+
 }
 
 impl Default for FontConfig {
@@ -542,6 +547,79 @@ fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
     if let Some(kb) = doc["keybindings"].as_table_mut() {
         for (k, v) in &c.keybindings {
             kb[k.as_str()] = value(v.as_str());
+        }
+    }
+    apply_ai_to_doc(doc, &c.ai);
+}
+
+fn apply_ai_to_doc(doc: &mut DocumentMut, ai_cfg: &crate::ai::AiConfig) {
+    ensure_table(doc, "ai");
+    if let Some(ai) = doc["ai"].as_table_mut() {
+        ai["default"] = value(ai_cfg.default.as_str());
+        if let Some(ref m) = ai_cfg.default_model {
+            ai["default_model"] = value(m.as_str());
+        } else {
+            ai.remove("default_model");
+        }
+        ai["permission_mode"] = value(ai_cfg.permission_mode.to_string());
+
+        if !ai.contains_key("providers") || !ai["providers"].is_table() {
+            ai["providers"] = Item::Table(Table::new());
+        }
+        if let Some(providers_tbl) = ai["providers"].as_table_mut() {
+            for (name, prov) in &ai_cfg.providers {
+                if !providers_tbl.contains_key(name) || !providers_tbl[name].is_table() {
+                    providers_tbl[name] = Item::Table(Table::new());
+                }
+                if let Some(p_tbl) = providers_tbl[name].as_table_mut() {
+                    match prov {
+                        crate::ai::ProviderConfig::OpenaiCompat {
+                            base_url,
+                            api_key_env,
+                            api_key,
+                            models,
+                        } => {
+                            p_tbl["type"] = value("openai-compat");
+                            p_tbl["base_url"] = value(base_url.as_str());
+                            if let Some(ref env_k) = api_key_env {
+                                p_tbl["api_key_env"] = value(env_k.as_str());
+                            } else {
+                                p_tbl.remove("api_key_env");
+                            }
+                            if let Some(ref key) = api_key {
+                                p_tbl["api_key"] = value(key.as_str());
+                            } else {
+                                p_tbl.remove("api_key");
+                            }
+                            let mut arr = toml_edit::Array::new();
+                            for m in models {
+                                arr.push(m.as_str());
+                            }
+                            p_tbl["models"] = value(arr);
+                        }
+                        crate::ai::ProviderConfig::Anthropic {
+                            base_url,
+                            api_key_env,
+                            api_key,
+                            models,
+                        } => {
+                            p_tbl["type"] = value("anthropic");
+                            p_tbl["base_url"] = value(base_url.as_str());
+                            p_tbl["api_key_env"] = value(api_key_env.as_str());
+                            if let Some(ref key) = api_key {
+                                p_tbl["api_key"] = value(key.as_str());
+                            } else {
+                                p_tbl.remove("api_key");
+                            }
+                            let mut arr = toml_edit::Array::new();
+                            for m in models {
+                                arr.push(m.as_str());
+                            }
+                            p_tbl["models"] = value(arr);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -771,6 +849,7 @@ mod tests {
             tab_layout: TabLayout::Horizontal,
             keybinding_preset: Some(crate::keybindings::KeybindingPreset::Ghostty),
             option_as_meta: true,
+            ai: crate::ai::AiConfig::default(),
         };
 
         let serialized = config_to_toml_string(&cfg);

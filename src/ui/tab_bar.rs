@@ -36,6 +36,8 @@ pub struct TabBar {
     is_updating: bool,
     is_update_ready: bool,
     on_update: Option<MouseDownCallback>,
+    ai_sidebar_open: bool,
+    on_toggle_ai: Option<MouseDownCallback>,
 }
 
 impl TabBar {
@@ -56,8 +58,11 @@ impl TabBar {
             is_updating: false,
             is_update_ready: false,
             on_update: None,
+            ai_sidebar_open: false,
+            on_toggle_ai: None,
         }
     }
+
 
     pub fn layout(mut self, layout: TabLayout) -> Self {
         self.layout = layout;
@@ -139,6 +144,19 @@ impl TabBar {
         self.on_update = Some(Box::new(handler));
         self
     }
+
+    pub fn ai_sidebar_open(mut self, open: bool) -> Self {
+        self.ai_sidebar_open = open;
+        self
+    }
+
+    pub fn on_toggle_ai(
+        mut self,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_toggle_ai = Some(Box::new(handler));
+        self
+    }
 }
 
 impl RenderOnce for TabBar {
@@ -150,8 +168,9 @@ impl RenderOnce for TabBar {
         let on_tab_context = self.on_tab_context_menu.map(std::rc::Rc::new);
         let on_logo_context = self.on_logo_context_menu.map(std::rc::Rc::new);
         let on_update = self.on_update.map(std::rc::Rc::new);
+        let on_toggle_ai = self.on_toggle_ai.map(std::rc::Rc::new);
         let btn_hover_bg = theme.hover;
-        let btn_default_bg = theme.surface;
+
 
         let is_vertical = self.layout == TabLayout::Vertical;
         let show_tabs = !is_vertical && self.tabs.len() > 1;
@@ -181,7 +200,6 @@ impl RenderOnce for TabBar {
                             .w(px(24.))
                             .h(px(22.))
                             .rounded(px(4.))
-                            .bg(if self.sidebar_open { theme.surface_raised } else { theme.surface })
                             .hover(move |s| s.bg(btn_hover_bg))
                             .cursor(CursorStyle::PointingHand)
                             .when_some(self.on_toggle_sidebar, |this, on_click| this.on_click(on_click))
@@ -201,7 +219,6 @@ impl RenderOnce for TabBar {
                         on_tab_context,
                         self.on_new_tab,
                         btn_hover_bg,
-                        btn_default_bg,
                     ))
                 })
                 .child(
@@ -236,7 +253,35 @@ impl RenderOnce for TabBar {
                         })
                         .child(
                             div()
+                                .id("fastty-ai-btn")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w(px(22.))
+                                .h(px(22.))
+                                .rounded(px(4.))
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(move |s| s.bg(btn_hover_bg))
+                                .when(self.ai_sidebar_open, |s| s.bg(theme.selected))
+                                .on_mouse_down(MouseButton::Left, {
+                                    let on_toggle_ai = on_toggle_ai.clone();
+                                    move |ev, window, cx| {
+                                        if let Some(ref cb) = on_toggle_ai {
+                                            cb(ev, window, cx);
+                                        }
+                                    }
+                                })
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .text_color(if self.ai_sidebar_open { theme.foreground } else { theme.muted })
+                                        .child("✦"),
+                                ),
+                        )
+                        .child(
+                            div()
                                 .id("fastty-logo")
+
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -297,7 +342,6 @@ impl RenderOnce for TabBar {
                                     .w(px(24.))
                                     .h(px(22.))
                                     .rounded(px(4.))
-                                    .bg(if self.sidebar_open { theme.surface_raised } else { theme.surface })
                                     .hover(move |s| s.bg(btn_hover_bg))
                                     .cursor(CursorStyle::PointingHand)
                                     .when_some(self.on_toggle_sidebar, |this, on_click| this.on_click(on_click))
@@ -317,7 +361,6 @@ impl RenderOnce for TabBar {
                                 on_tab_context,
                                 self.on_new_tab,
                                 btn_hover_bg,
-                                btn_default_bg,
                             ))
                         }),
                 )
@@ -349,8 +392,35 @@ impl RenderOnce for TabBar {
                                 on_update.clone(),
                             ))
                         })
+                        .child(
+                            div()
+                                .id("win-ai-btn")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .w(px(32.))
+                                .h(px(32.))
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(move |s| s.bg(btn_hover_bg))
+                                .when(self.ai_sidebar_open, |s| s.bg(theme.selected))
+                                .on_mouse_down(MouseButton::Left, {
+                                    let on_toggle_ai = on_toggle_ai.clone();
+                                    move |ev, window, cx| {
+                                        if let Some(ref cb) = on_toggle_ai {
+                                            cb(ev, window, cx);
+                                        }
+                                    }
+                                })
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .text_color(if self.ai_sidebar_open { theme.foreground } else { theme.muted })
+                                        .child("✦"),
+                                ),
+                        )
                         .child(render_win_btn(
                             "win-minimize",
+
                             if cfg!(target_os = "windows") { Some(WindowControlArea::Min) } else { None },
                             btn_hover_bg,
                             |window| window.minimize_window(),
@@ -508,10 +578,8 @@ impl RenderOnce for TabSidebar {
                                     )
                                     .child(
                                         div()
-                                            .px(px(5.))
+                                            .px(px(2.))
                                             .py(px(1.))
-                                            .rounded(px(4.))
-                                            .bg(theme.surface_raised)
                                             .text_size(px(9.5))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(theme.muted)
@@ -527,7 +595,6 @@ impl RenderOnce for TabSidebar {
                                     .w(px(22.))
                                     .h(px(22.))
                                     .rounded(px(4.))
-                                    .bg(theme.surface)
                                     .hover(move |s| s.bg(btn_hover_bg))
                                     .cursor(CursorStyle::PointingHand)
                                     .when_some(self.on_new_tab, |this, on_click| this.on_click(on_click))
@@ -654,7 +721,6 @@ fn render_tab_strip(
     on_tab_context: Option<std::rc::Rc<TabContextCallback>>,
     on_new_tab: Option<ClickCallback>,
     btn_hover_bg: gpui::Hsla,
-    btn_default_bg: gpui::Hsla,
 ) -> gpui::Div {
     div()
         .flex()
@@ -763,7 +829,6 @@ fn render_tab_strip(
                 .w(px(22.))
                 .h(px(22.))
                 .rounded(px(4.))
-                .bg(btn_default_bg)
                 .hover(move |s| s.bg(btn_hover_bg))
                 .cursor(CursorStyle::PointingHand)
                 .when_some(on_new_tab, |this, on_click| this.on_click(on_click))

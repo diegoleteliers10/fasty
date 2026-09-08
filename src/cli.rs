@@ -33,7 +33,8 @@ impl CliOptions {
                         fastty [OPTIONS] [-- <CMD>...]\n    \
                         fastty sessions\n    \
                         fastty attach <session-id>\n    \
-                        fastty gateway [--port <PORT>]\n\n\
+                        fastty gateway [--port <PORT>]\n    \
+                        fastty ask [OPTIONS] <PROMPT>\n\n\
                         OPTIONS:\n    \
                         -d, --dir, --working-directory <DIR>  Set initial working directory\n    \
                         -t, --title <TITLE>                   Set initial tab/window title\n    \

@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "fastty"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 
 [lib]
@@ -50,6 +50,9 @@ icons = "0.18.3"
 smallvec = "1"
 fff-search = { version = "0.10.6", features = ["ripgrep"] }
 miniz_oxide = "0.8"
+ureq = { version = "2.12", features = ["json"] }
+schemars = { version = "0.8", features = ["derive"] }
+
 
 [build-dependencies]
 winres = "0.1"

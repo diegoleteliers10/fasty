@@ -3,6 +3,7 @@ use icons::common::{IconType, StaticSvgElement, icon_registry_getter::get_icon_e
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 static ICON_CACHE: OnceLock<Mutex<HashMap<IconType, &'static [u8]>>> = OnceLock::new();
 
@@ -96,14 +97,8 @@ pub fn render_sidebar_icon(color: Hsla, size_px: f32) -> impl IntoElement {
         .flex_shrink_0()
 }
 
-pub fn render_spinner(color: Hsla, size_px: f32) -> impl IntoElement {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let frame = ((now_ms / 100) % 8) as usize;
-
-    static SPINNER_FRAMES: [&[u8]; 8] = [
+pub fn render_spinner(color: Hsla, size_px: f32, id: impl Into<ElementId>) -> impl IntoElement {
+    const SPINNER_FRAMES: [&[u8]; 8] = [
         br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 3a9 9 0 0 1 9 9"/></svg>"#,
         br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18.36 5.64a9 9 0 0 1 2.64 8.72"/></svg>"#,
         br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 12a9 9 0 0 1-9 9"/></svg>"#,
@@ -115,11 +110,18 @@ pub fn render_spinner(color: Hsla, size_px: f32) -> impl IntoElement {
     ];
 
     svg()
-        .data(SPINNER_FRAMES[frame])
         .text_color(color)
         .w(px(size_px))
         .h(px(size_px))
         .flex_shrink_0()
+        .with_animation(
+            id,
+            Animation::new(Duration::from_millis(800)).repeat(),
+            |icon, delta| {
+                let frame = (delta * 8.) as usize % 8;
+                icon.data(SPINNER_FRAMES[frame])
+            },
+        )
 }
 
 pub fn get_deck_process_icon(process_name: &str) -> (IconType, &'static str) {
@@ -145,4 +147,23 @@ pub fn get_deck_process_icon(process_name: &str) -> (IconType, &'static str) {
     }
 }
 
+pub fn render_at_sign_icon(color: Hsla, size_px: f32) -> impl IntoElement {
+    static SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8"/></svg>"#;
+    svg()
+        .data(SVG)
+        .text_color(color)
+        .w(px(size_px))
+        .h(px(size_px))
+        .flex_shrink_0()
+}
+
+pub fn render_paperclip_icon(color: Hsla, size_px: f32) -> impl IntoElement {
+    static SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>"#;
+    svg()
+        .data(SVG)
+        .text_color(color)
+        .w(px(size_px))
+        .h(px(size_px))
+        .flex_shrink_0()
+}
 

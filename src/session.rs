@@ -67,6 +67,7 @@ impl Session {
                 active_tab: self.legacy_active_tab,
                 position: None,
                 size: None,
+                ai_sidebar_open: false,
             }],
             active_window: 0,
             legacy_tabs: self.legacy_tabs,
@@ -84,7 +85,10 @@ pub struct WindowSession {
     pub position: Option<(i32, i32)>,
     #[serde(default)]
     pub size: Option<(u32, u32)>,
+    #[serde(default)]
+    pub ai_sidebar_open: bool,
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabInfo {

@@ -813,6 +813,7 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
         PaletteCommand { id: "focus_down", icon: IconType::ChevronDown, title: "Focus Pane Down", category: "Panes", shortcut: Some(if is_mac { "⌥⌘↓" } else { "Alt+↓" }) },
         PaletteCommand { id: "close_pane", icon: IconType::X, title: "Close Active Pane", category: "Panes", shortcut: Some(if is_mac { "⌘W" } else { "Ctrl+Shift+W" }) },
         PaletteCommand { id: "toggle_tab_sidebar", icon: IconType::Folder, title: "Toggle Tabs Sidebar", category: "View", shortcut: Some(if is_mac { "⌘B" } else { "Ctrl+B" }) },
+        PaletteCommand { id: "toggle_ai_sidebar", icon: IconType::Sparkles, title: "Fastty AI: Toggle Assistant Sidebar", category: "AI", shortcut: Some(if is_mac { "⌘L" } else { "Ctrl+Shift+L" }) },
         PaletteCommand { id: "layout_horizontal", icon: IconType::Folder, title: "Tabs Layout: Horizontal Top Bar", category: "View", shortcut: None },
         PaletteCommand { id: "layout_vertical", icon: IconType::Folder, title: "Tabs Layout: Vertical Sidebar", category: "View", shortcut: None },
         PaletteCommand { id: "quit", icon: IconType::LogOut, title: "Quit Fastty", category: "Application", shortcut: Some(if is_mac { "⌘Q" } else { "Alt+F4" }) },
@@ -938,7 +939,29 @@ pub struct RootView {
     /// one-shot execution, not a persistent shell tab. `None` for every
     /// other pane (normal tabs, splits, session restore, new windows).
     exec_pane_id: Option<crate::pane_tree::PaneId>,
+    pub ai_sidebar_open: bool,
+    pub ai_sidebar_width: f32,
+    pub is_dragging_ai_sidebar: bool,
+    pub ai_input_text: String,
+    pub ai_input_state: crate::ui::TextInputState,
+    pub is_dragging_ai_input: bool,
+    pub ai_input_focused: bool,
+    pub ai_messages: Vec<crate::ui::ai_sidebar::AiUiMessage>,
+    pub ai_streaming_text: String,
+    pub ai_streaming_thinking: String,
+    pub ai_is_streaming: bool,
+    pub ai_last_usage: Option<(u64, u64)>,
+    pub ai_cancel_token: Option<crate::ai::CancelToken>,
+    pub ai_pending_confirmation: Option<crate::ui::ai_sidebar::AiUiPendingConfirmation>,
+    pub ai_confirm_reply_tx: Option<async_channel::Sender<crate::ai::PermissionDecision>>,
+    pub ai_permission_checker: std::sync::Arc<crate::ai::PermissionChecker>,
+    pub ai_agent_mode: String,
+    pub ai_expanded_thinkings: std::collections::HashSet<usize>,
+    pub ai_attached_files: Vec<std::path::PathBuf>,
+    pub ai_at_menu_open: bool,
+    pub ai_at_matches: Vec<String>,
 }
+
 
 impl RootView {
     #[inline]
@@ -1067,9 +1090,12 @@ impl RootView {
         .detach();
 
         let mut restored_tabs = Vec::new();
+        let mut restored_ai_sidebar_open = false;
+        let ai_permission_mode = loaded_config.ai.permission_mode;
         if initial_tab.is_none() && loaded_config.session_restore {
             if let Some(session) = crate::session::load() {
                 if let Some(win) = session.windows.first() {
+                    restored_ai_sidebar_open = win.ai_sidebar_open;
                     for tab_info in &win.tabs {
                         let cwd_path = tab_info.cwd.clone();
                         let title = tab_info.title_override.clone().or_else(|| tab_info.custom_name.clone());
@@ -1177,7 +1203,29 @@ impl RootView {
             dragging_split_direction: SplitDirection::Horizontal,
             dragging_split_bounds: (0.0, 0.0, 0.0, 0.0),
             exec_pane_id: None,
+            ai_sidebar_open: restored_ai_sidebar_open,
+            ai_sidebar_width: 340.0,
+            is_dragging_ai_sidebar: false,
+            ai_input_text: String::new(),
+            ai_input_state: crate::ui::TextInputState::default(),
+            is_dragging_ai_input: false,
+            ai_input_focused: true,
+            ai_messages: Vec::new(),
+            ai_streaming_text: String::new(),
+            ai_streaming_thinking: String::new(),
+            ai_is_streaming: false,
+            ai_last_usage: None,
+            ai_cancel_token: None,
+            ai_pending_confirmation: None,
+            ai_confirm_reply_tx: None,
+            ai_permission_checker: std::sync::Arc::new(crate::ai::PermissionChecker::new(ai_permission_mode)),
+            ai_agent_mode: "Agent".to_string(),
+            ai_expanded_thinkings: std::collections::HashSet::new(),
+            ai_attached_files: Vec::new(),
+            ai_at_menu_open: false,
+            ai_at_matches: Vec::new(),
         };
+
 
         crate::keybindings::init_resolver(view.config.keybindings.clone(), view.config.keybinding_preset);
 
@@ -1301,6 +1349,7 @@ impl RootView {
                 active_tab: self.active_tab_idx,
                 position: None,
                 size: None,
+                ai_sidebar_open: self.ai_sidebar_open,
             }],
             active_window: 0,
             legacy_tabs: Vec::new(),
@@ -2040,12 +2089,12 @@ impl RootView {
             }
         }
 
-        let bounds = Bounds::centered(None, size(px(720.), px(680.)), &*cx);
+        let bounds = Bounds::centered(None, size(px(880.), px(640.)), &*cx);
         let current_config = self.config.clone();
         if let Ok(handle) = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(580.), px(500.))),
+                window_min_size: Some(size(px(740.), px(520.))),
                 window_background: WindowBackgroundAppearance::Blurred,
                 app_id: Some("com.fastty.app.settings".into()),
                 titlebar: Some(TitlebarOptions {
@@ -2515,6 +2564,7 @@ impl RootView {
             "focus_down" => self.focus_pane_in_direction(Direction::Down, cx),
             "close_pane" => self.close_active_pane(_window, cx),
             "toggle_tab_sidebar" => self.toggle_tab_sidebar(_window, cx),
+            "toggle_ai_sidebar" => self.toggle_ai_sidebar(_window, cx),
             "layout_horizontal" => self.set_tab_layout_mode(TabLayout::Horizontal, _window, cx),
             "layout_vertical" => self.set_tab_layout_mode(TabLayout::Vertical, _window, cx),
             "quit" => cx.quit(),
@@ -2535,6 +2585,605 @@ impl RootView {
         self.trigger_sidebar_animation(window, cx);
         cx.notify();
     }
+
+    pub fn toggle_ai_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ai_sidebar_open = !self.ai_sidebar_open;
+        if self.ai_sidebar_open {
+            self.ai_input_focused = true;
+            window.focus(&self.focus_handle, cx);
+        }
+        self.persist_session();
+        cx.notify();
+    }
+
+    pub fn cancel_ai_stream(&mut self) {
+        if let Some(token) = self.ai_cancel_token.take() {
+            token.cancel();
+        }
+        self.ai_is_streaming = false;
+    }
+
+    pub fn update_ai_at_matches(&mut self, query: &str) {
+        let active_cwd = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|t| t.cwd.as_ref().map(|p| p.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "~".to_string());
+
+        let mut all_files = Vec::new();
+        if let Ok(repo) = git2::Repository::discover(&active_cwd) {
+            if let Ok(index) = repo.index() {
+                for entry in index.iter() {
+                    if let Ok(s) = std::str::from_utf8(&entry.path) {
+                        all_files.push(s.to_string());
+                    }
+                }
+            }
+        }
+        if all_files.is_empty() {
+            if let Ok(entries) = std::fs::read_dir(&active_cwd) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if let Ok(rel) = p.strip_prefix(&active_cwd) {
+                        all_files.push(rel.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        all_files.sort();
+
+        let q = query.to_lowercase();
+        if q.is_empty() {
+            self.ai_at_matches = all_files.into_iter().take(20).collect();
+        } else {
+            self.ai_at_matches = all_files
+                .into_iter()
+                .filter(|f| f.to_lowercase().contains(&q))
+                .take(20)
+                .collect();
+        }
+    }
+
+    pub fn insert_ai_at_path(&mut self, path: &str) {
+        let text = self.ai_input_state.text.clone();
+        let cursor_char_idx = self.ai_input_state.cursor;
+        let chars: Vec<char> = text.chars().collect();
+        let cursor_clamped = cursor_char_idx.min(chars.len());
+
+        let before_cursor: String = chars[..cursor_clamped].iter().collect();
+        let after_cursor: String = chars[cursor_clamped..].iter().collect();
+
+        if let Some(at_idx) = before_cursor.rfind('@') {
+            let before_at = &before_cursor[..at_idx];
+            let new_text = format!("{}@{} {}", before_at, path, after_cursor);
+            let new_cursor = before_at.chars().count() + 1 + path.chars().count() + 1;
+            self.ai_input_state.set_text_with_cursor(new_text, new_cursor);
+        } else {
+            let insertion = format!("@{} ", path);
+            self.ai_input_state.insert_str(&insertion);
+        }
+        self.ai_input_text = self.ai_input_state.text.clone();
+        self.ai_at_menu_open = false;
+    }
+
+    pub fn check_ai_at_trigger(&mut self) {
+        let text = &self.ai_input_state.text;
+        let cursor = self.ai_input_state.cursor;
+        let chars: Vec<char> = text.chars().collect();
+        let cursor_clamped = cursor.min(chars.len());
+        let before: String = chars[..cursor_clamped].iter().collect();
+        if let Some(at_idx) = before.rfind('@') {
+            let query = &before[at_idx + 1..];
+            if !query.contains(' ') && !query.contains('\n') {
+                self.update_ai_at_matches(query);
+                self.ai_at_menu_open = true;
+                return;
+            }
+        }
+        self.ai_at_menu_open = false;
+    }
+
+    pub fn open_ai_file_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::bounded::<Option<std::path::PathBuf>>(1);
+        std::thread::spawn(move || {
+            let res = crate::ui::ai_sidebar::pick_file_dialog();
+            let _ = tx.send_blocking(res);
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Some(path)) = rx.recv().await {
+                let _ = this.update_in(cx, |this, _window, cx| {
+                    if !this.ai_attached_files.contains(&path) {
+                        this.ai_attached_files.push(path);
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn submit_ai_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.ai_input_state.text.trim().to_string();
+        if text.is_empty() || self.ai_is_streaming {
+            return;
+        }
+        self.ai_input_state.clear();
+        self.ai_input_text.clear();
+        self.ai_at_menu_open = false;
+
+        let active_cwd = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|t| t.cwd.clone())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        let mut augmented_content = text.clone();
+
+        // 1. Parse @path references from user input
+        for word in text.split_whitespace() {
+            if let Some(path_part) = word.strip_prefix('@') {
+                let clean = path_part.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '/' && c != '_' && c != '-');
+                if !clean.is_empty() {
+                    let path = active_cwd.join(clean);
+                    if path.is_file() {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            let max_chars = 16_000;
+                            let snippet = if content.len() > max_chars {
+                                format!("{}... (truncated)", &content[..max_chars])
+                            } else {
+                                content
+                            };
+                            augmented_content.push_str(&format!("\n\n[Referenced file: {}]\n```\n{}\n```", clean, snippet));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Attach any files/images selected with clip picker
+        let attached = std::mem::take(&mut self.ai_attached_files);
+        for path in attached {
+            let is_img = crate::ui::ai_sidebar::is_image_path(&path);
+            if is_img {
+                augmented_content.push_str(&format!("\n\n[Attached image: {}]", path.display()));
+            } else if path.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let max_chars = 16_000;
+                    let snippet = if content.len() > max_chars {
+                        format!("{}... (truncated)", &content[..max_chars])
+                    } else {
+                        content
+                    };
+                    augmented_content.push_str(&format!("\n\n[Attached file: {}]\n```\n{}\n```", path.display(), snippet));
+                } else {
+                    augmented_content.push_str(&format!("\n\n[Attached file: {}]", path.display()));
+                }
+            }
+        }
+
+        self.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
+            is_user: true,
+            text: text.clone(),
+            thinking: None,
+            tool_calls: Vec::new(),
+            timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+        });
+
+        let cfg = self.config.ai.clone();
+        let active_prov = self.config.ai.default.clone();
+        let active_mod = self.config.ai.active_model();
+        let (model, default_model) = match crate::ai::create_model_from_config(
+            &cfg,
+            Some(&active_prov),
+            Some(active_mod.as_str()),
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                self.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
+                    is_user: false,
+                    text: format!("Error initializing AI model: {}", e),
+                    thinking: None,
+                    tool_calls: Vec::new(),
+                    timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                });
+                cx.notify();
+                return;
+            }
+        };
+
+        let tools = if self.ai_agent_mode == "Ask" {
+            Vec::new()
+        } else {
+            crate::ai::default_tools()
+        };
+        self.ai_permission_checker.set_mode(cfg.permission_mode);
+        let checker = self.ai_permission_checker.clone();
+
+        let (ask_tx, ask_rx) = async_channel::unbounded::<(
+            String,
+            String,
+            async_channel::Sender<crate::ai::PermissionDecision>,
+        )>();
+        let (event_tx, event_rx) = async_channel::unbounded::<crate::ai::AgentEvent>();
+
+        struct UiPermissionHandler {
+            ask_tx: async_channel::Sender<(
+                String,
+                String,
+                async_channel::Sender<crate::ai::PermissionDecision>,
+            )>,
+        }
+        impl crate::ai::PermissionHandler for UiPermissionHandler {
+            fn ask_permission(
+                &self,
+                tool_name: &str,
+                input_summary: &str,
+            ) -> crate::ai::PermissionDecision {
+                let (reply_tx, reply_rx) = async_channel::bounded(1);
+                if self
+                    .ask_tx
+                    .send_blocking((
+                        tool_name.to_string(),
+                        input_summary.to_string(),
+                        reply_tx,
+                    ))
+                    .is_err()
+                {
+                    return crate::ai::PermissionDecision::Deny;
+                }
+                reply_rx
+                    .recv_blocking()
+                    .unwrap_or(crate::ai::PermissionDecision::Deny)
+            }
+        }
+
+        let perm_handler = std::sync::Arc::new(UiPermissionHandler { ask_tx });
+        let ctx_tool = crate::ai::ToolCtx {
+            cwd: active_cwd.clone(),
+        };
+
+        let mut agent = crate::ai::Agent::new(
+            model,
+            default_model,
+            tools,
+            checker,
+            perm_handler,
+            ctx_tool,
+        );
+
+        let cancel_tok = agent.cancel_token();
+        self.ai_cancel_token = Some(cancel_tok);
+        self.ai_is_streaming = true;
+        self.ai_streaming_text.clear();
+        self.ai_streaming_thinking.clear();
+
+        let sys_prompt = if self.ai_agent_mode == "Ask" {
+            format!(
+                "{}\n\n[MODE: ASK ONLY]\nYou are in Ask mode. You must ONLY answer questions, explain concepts, and provide direct advice. You have no tools and cannot execute commands or modify files.",
+                crate::ai::system_prompt(&active_cwd)
+            )
+        } else {
+            crate::ai::system_prompt(&active_cwd)
+        };
+        agent.add_message(crate::ai::Message::system(sys_prompt));
+        let last_idx = self.ai_messages.len().saturating_sub(1);
+        for (idx, m) in self.ai_messages.iter().enumerate() {
+            if m.is_user {
+                if idx == last_idx {
+                    agent.add_message(crate::ai::Message::user(&augmented_content));
+                } else {
+                    agent.add_message(crate::ai::Message::user(&m.text));
+                }
+            } else if !m.text.is_empty() {
+                agent.add_message(crate::ai::Message::assistant(&m.text));
+            }
+        }
+
+        let event_tx_clone = event_tx.clone();
+        std::thread::Builder::new()
+            .name("ai-agent-turn".into())
+            .spawn(move || {
+                let tx = event_tx_clone;
+                let res = agent.run_turn(move |ev| {
+                    let _ = tx.send_blocking(ev);
+                });
+                if let Err(e) = res {
+                    let _ = event_tx.send_blocking(crate::ai::AgentEvent::Error(format!("{}", e)));
+                }
+            })
+            .ok();
+
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok((tool_name, input_summary, reply_tx)) = ask_rx.recv().await {
+                let _ = this.update_in(cx, |this, _window, cx| {
+                    this.ai_pending_confirmation =
+                        Some(crate::ui::ai_sidebar::AiUiPendingConfirmation {
+                            tool_name,
+                            input_summary,
+                        });
+                    this.ai_confirm_reply_tx = Some(reply_tx);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(ev) = event_rx.recv().await {
+                let _ = this.update_in(cx, |this, _window, cx| {
+                    match ev {
+                        crate::ai::AgentEvent::TextDelta(d) => {
+                            this.ai_streaming_text.push_str(&d);
+                        }
+                        crate::ai::AgentEvent::ThinkingDelta(t) => {
+                            this.ai_streaming_thinking.push_str(&t);
+                        }
+                        crate::ai::AgentEvent::ToolStart { id, name, args } => {
+                            if let Some(last) = this.ai_messages.last_mut() {
+                                if !last.is_user {
+                                    last.tool_calls.push(crate::ui::ai_sidebar::AiUiToolCall {
+                                        id,
+                                        name,
+                                        args,
+                                        output: None,
+                                        is_error: false,
+                                        is_running: true,
+                                    });
+                                } else {
+                                    this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
+                                        is_user: false,
+                                        text: String::new(),
+                                        thinking: None,
+                                        tool_calls: vec![crate::ui::ai_sidebar::AiUiToolCall {
+                                            id,
+                                            name,
+                                            args,
+                                            output: None,
+                                            is_error: false,
+                                            is_running: true,
+                                        }],
+                                        timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                                    });
+                                }
+                            }
+                        }
+                        crate::ai::AgentEvent::ToolEnd {
+                            id,
+                            output,
+                            is_error,
+                            ..
+                        } => {
+                            for m in this.ai_messages.iter_mut().rev() {
+                                if let Some(tc) = m.tool_calls.iter_mut().find(|c| c.id == id) {
+                                    tc.output = Some(output);
+                                    tc.is_error = is_error;
+                                    tc.is_running = false;
+                                    break;
+                                }
+                            }
+                        }
+                        crate::ai::AgentEvent::TurnEnd => {
+                            let text = std::mem::take(&mut this.ai_streaming_text);
+                            let thinking = if this.ai_streaming_thinking.is_empty() {
+                                None
+                            } else {
+                                Some(std::mem::take(&mut this.ai_streaming_thinking))
+                            };
+                            let has_last_tools = this
+                                .ai_messages
+                                .last()
+                                .map(|m| !m.is_user && !m.tool_calls.is_empty())
+                                .unwrap_or(false);
+                            if !text.is_empty() || thinking.is_some() {
+                                this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
+                                    is_user: false,
+                                    text,
+                                    thinking,
+                                    tool_calls: Vec::new(),
+                                    timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                                });
+                            } else if !has_last_tools {
+                                this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
+                                    is_user: false,
+                                    text: "(Assistant completed turn with no content)".to_string(),
+                                    thinking: None,
+                                    tool_calls: Vec::new(),
+                                    timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                                });
+                            }
+                            this.ai_is_streaming = false;
+                            this.ai_cancel_token = None;
+                        }
+                        crate::ai::AgentEvent::Usage { input, output } => {
+                            this.ai_last_usage = Some((input, output));
+                        }
+                        crate::ai::AgentEvent::Error(err) => {
+                            this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
+                                is_user: false,
+                                text: format!("Error: {}", err),
+                                thinking: None,
+                                tool_calls: Vec::new(),
+                                timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                            });
+                            this.ai_is_streaming = false;
+                            this.ai_cancel_token = None;
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+
+        cx.notify();
+    }
+
+    fn render_ai_sidebar(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let provider = self.config.ai.default.clone();
+        let model = self.config.ai.active_model();
+        let active_cwd = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|t| t.cwd.as_ref().map(|p| p.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "~".to_string());
+        let active_branch = self.tabs.get(self.active_tab_idx).and_then(|t| t.git_status.as_ref().map(|g| g.branch.clone()));
+
+        let total_chars: usize = self.ai_messages.iter().map(|m| m.text.len() + m.thinking.as_deref().unwrap_or("").len()).sum();
+        let max_context = self.config.ai.context_window.max(1_000) as f32;
+        let used_tokens = match self.ai_last_usage {
+            Some((input, output)) => (input + output) as f32,
+            None => (total_chars / 4).max(380) as f32,
+        };
+        let context_pct = (used_tokens / max_context).clamp(0.0, 1.0);
+
+        let sidebar = crate::ui::ai_sidebar::AiSidebar::new(
+            self.theme,
+            self.ai_sidebar_width,
+            provider,
+            model,
+        )
+        .agent_mode(self.ai_agent_mode.clone())
+        .expanded_thinkings(self.ai_expanded_thinkings.clone())
+        .cwd(active_cwd)
+        .git_branch(active_branch)
+        .context_pct(context_pct)
+        .messages(self.ai_messages.clone())
+        .streaming(
+            self.ai_is_streaming,
+            self.ai_streaming_text.clone(),
+            self.ai_streaming_thinking.clone(),
+        )
+        .pending_confirmation(self.ai_pending_confirmation.clone())
+        .input_text(self.ai_input_state.text.clone())
+        .cursor_pos(self.ai_input_state.cursor)
+        .selection(self.ai_input_state.selection)
+        .is_focused(self.ai_input_focused)
+        .on_toggle_mode(cx.listener(|this, mode: &String, _window, cx| {
+            this.ai_agent_mode = mode.clone();
+            cx.notify();
+        }))
+        .on_toggle_thinking(cx.listener(|this, target: &usize, _window, cx| {
+            if this.ai_expanded_thinkings.contains(target) {
+                this.ai_expanded_thinkings.remove(target);
+            } else {
+                this.ai_expanded_thinkings.insert(*target);
+            }
+            cx.notify();
+        }))
+        .attached_files(self.ai_attached_files.clone())
+        .on_remove_attachment(cx.listener(|this, idx: &usize, _window, cx| {
+            if *idx < this.ai_attached_files.len() {
+                this.ai_attached_files.remove(*idx);
+                cx.notify();
+            }
+        }))
+        .at_menu_open(self.ai_at_menu_open)
+        .at_matches(self.ai_at_matches.clone())
+        .on_select_at_match(cx.listener(|this, path: &String, _window, cx| {
+            this.insert_ai_at_path(path);
+            this.ai_at_menu_open = false;
+            cx.notify();
+        }))
+        .on_at_click(cx.listener(|this, _ev, _window, cx| {
+            this.ai_at_menu_open = !this.ai_at_menu_open;
+            if this.ai_at_menu_open {
+                this.update_ai_at_matches("");
+            }
+            cx.notify();
+        }))
+        .on_attach_click(cx.listener(|this, _ev, window, cx| {
+            this.open_ai_file_dialog(window, cx);
+        }))
+        .on_new_chat(cx.listener(|this, _ev, _window, cx| {
+            this.cancel_ai_stream();
+            this.ai_messages.clear();
+            this.ai_streaming_text.clear();
+            this.ai_streaming_thinking.clear();
+            this.ai_expanded_thinkings.clear();
+            this.ai_attached_files.clear();
+            this.ai_at_menu_open = false;
+            this.ai_input_state.clear();
+            this.ai_input_text.clear();
+            this.ai_last_usage = None;
+            cx.notify();
+        }))
+        .on_model_click(cx.listener(|this, _ev, window, cx| {
+            this.open_settings_window(window, cx);
+        }))
+        .on_click_char(cx.listener(|this, target: &usize, _window, cx| {
+            this.ai_input_focused = true;
+            this.is_dragging_ai_input = true;
+            this.ai_input_state.start_drag(*target);
+            this.ai_input_text = this.ai_input_state.text.clone();
+            cx.notify();
+        }))
+        .on_focus(cx.listener(|this, _ev, _window, cx| {
+            this.ai_input_focused = true;
+            cx.notify();
+        }))
+        .on_close(cx.listener(|this, _ev, window, cx| {
+            this.toggle_ai_sidebar(window, cx);
+        }))
+        .on_clear(cx.listener(|this, _ev, _window, cx| {
+            this.ai_messages.clear();
+            this.ai_streaming_text.clear();
+            this.ai_streaming_thinking.clear();
+            this.ai_expanded_thinkings.clear();
+            this.ai_attached_files.clear();
+            this.ai_at_menu_open = false;
+            this.ai_last_usage = None;
+            cx.notify();
+        }))
+        .on_cancel(cx.listener(|this, _ev, _window, cx| {
+            this.cancel_ai_stream();
+            cx.notify();
+        }))
+        .on_submit(cx.listener(|this, _ev, window, cx| {
+            this.submit_ai_prompt(window, cx);
+        }))
+        .on_confirm(cx.listener(|this, (always, allow): &(bool, bool), _window, cx| {
+            if *always && *allow {
+                if let Some(ref pending) = this.ai_pending_confirmation {
+                    this.ai_permission_checker.allow_always_tool(&pending.tool_name, &pending.input_summary);
+                }
+            }
+            if let Some(tx) = this.ai_confirm_reply_tx.take() {
+                let dec = if *allow {
+                    crate::ai::PermissionDecision::Allow
+                } else {
+                    crate::ai::PermissionDecision::Deny
+                };
+                let _ = tx.send_blocking(dec);
+            }
+            this.ai_pending_confirmation = None;
+            cx.notify();
+        }));
+
+        div()
+            .relative()
+            .h_full()
+            .child(sidebar)
+            .child(
+                div()
+                    .id("ai-sidebar-resize-handle")
+                    .absolute()
+                    .top_0()
+                    .left(px(-3.))
+                    .bottom_0()
+                    .w(px(7.))
+                    .cursor(CursorStyle::ResizeColumn)
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                        this.is_dragging_ai_sidebar = true;
+                        cx.notify();
+                    }))
+            )
+    }
+
 
     pub fn set_tab_layout_mode(&mut self, layout: TabLayout, window: &mut Window, cx: &mut Context<Self>) {
         if self.tab_layout == layout {
@@ -2780,7 +3429,153 @@ impl RootView {
         let is_alt_gr = modifiers.control && !modifiers.platform && modifiers.alt;
         let is_ctrl = modifiers.control && !is_alt_gr;
 
+        // AI Sidebar Input Keyboard Handler
+        if self.ai_sidebar_open && self.ai_input_focused {
+            if key_lower == "escape" || key_lower == "esc" {
+                if self.ai_at_menu_open {
+                    self.ai_at_menu_open = false;
+                } else if let Some(tx) = self.ai_confirm_reply_tx.take() {
+                    let _ = tx.send_blocking(crate::ai::PermissionDecision::Deny);
+                    self.ai_pending_confirmation = None;
+                } else if self.ai_is_streaming {
+                    self.cancel_ai_stream();
+                } else {
+                    self.ai_sidebar_open = false;
+                }
+                cx.notify();
+                return;
+            }
+            if (modifiers.platform && key_lower == "l") || (modifiers.shift && is_ctrl && key_lower == "l") {
+                self.toggle_ai_sidebar(_window, cx);
+                return;
+            }
+            // Select All: Cmd+A (macOS) or Ctrl+A (Linux/Windows)
+            let is_select_all = (cfg!(target_os = "macos") && modifiers.platform && key_lower == "a")
+                || (!cfg!(target_os = "macos") && is_ctrl && key_lower == "a");
+            if is_select_all {
+                self.ai_input_state.select_all();
+                cx.notify();
+                return;
+            }
+            // Copy: Cmd+C (macOS) or Ctrl+C (Linux/Windows)
+            let is_copy = (cfg!(target_os = "macos") && modifiers.platform && key_lower == "c")
+                || (!cfg!(target_os = "macos") && is_ctrl && key_lower == "c");
+            if is_copy {
+                if let Some(sel_text) = self.ai_input_state.selected_text() {
+                    if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                        let _ = clip.set_text(sel_text);
+                    }
+                }
+                return;
+            }
+            // Cut: Cmd+X (macOS) or Ctrl+X (Linux/Windows)
+            let is_cut = (cfg!(target_os = "macos") && modifiers.platform && key_lower == "x")
+                || (!cfg!(target_os = "macos") && is_ctrl && key_lower == "x");
+            if is_cut {
+                if let Some(sel_text) = self.ai_input_state.selected_text() {
+                    if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                        let _ = clip.set_text(sel_text);
+                    }
+                    self.ai_input_state.delete_selection();
+                    self.ai_input_text = self.ai_input_state.text.clone();
+                    self.check_ai_at_trigger();
+                    cx.notify();
+                }
+                return;
+            }
+            // Paste: Cmd+V (macOS) or Ctrl+V (Linux/Windows)
+            let is_paste = (cfg!(target_os = "macos") && modifiers.platform && key_lower == "v")
+                || (!cfg!(target_os = "macos") && is_ctrl && key_lower == "v");
+            if is_paste {
+                if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                    if let Ok(text) = clip.get_text() {
+                        self.ai_input_state.insert_str(&text);
+                        self.ai_input_text = self.ai_input_state.text.clone();
+                        self.check_ai_at_trigger();
+                        cx.notify();
+                    }
+                }
+                return;
+            }
+            if key_lower == "enter" || key_lower == "return" {
+                if self.ai_at_menu_open && !self.ai_at_matches.is_empty() {
+                    let first = self.ai_at_matches[0].clone();
+                    self.insert_ai_at_path(&first);
+                    cx.notify();
+                    return;
+                }
+                if modifiers.shift {
+                    self.ai_input_state.insert_str("\n");
+                    self.ai_input_text = self.ai_input_state.text.clone();
+                    self.check_ai_at_trigger();
+                } else if self.ai_pending_confirmation.is_some() && modifiers.platform {
+                    if let Some(tx) = self.ai_confirm_reply_tx.take() {
+                        let _ = tx.send_blocking(crate::ai::PermissionDecision::Allow);
+                    }
+                    self.ai_pending_confirmation = None;
+                } else {
+                    self.submit_ai_prompt(_window, cx);
+                }
+                cx.notify();
+                return;
+            }
+            if key_lower == "backspace" {
+                self.ai_input_state.backspace();
+                self.ai_input_text = self.ai_input_state.text.clone();
+                self.check_ai_at_trigger();
+                cx.notify();
+                return;
+            }
+            if key_lower == "delete" {
+                self.ai_input_state.delete_forward();
+                self.ai_input_text = self.ai_input_state.text.clone();
+                self.check_ai_at_trigger();
+                cx.notify();
+                return;
+            }
+            if key_lower == "left" || key_lower == "arrowleft" {
+                self.ai_input_state.move_left(modifiers.shift);
+                self.check_ai_at_trigger();
+                cx.notify();
+                return;
+            }
+            if key_lower == "right" || key_lower == "arrowright" {
+                self.ai_input_state.move_right(modifiers.shift);
+                self.check_ai_at_trigger();
+                cx.notify();
+                return;
+            }
+            if key_lower == "home" {
+                self.ai_input_state.move_home(modifiers.shift);
+                self.check_ai_at_trigger();
+                cx.notify();
+                return;
+            }
+            if key_lower == "end" {
+                self.ai_input_state.move_end(modifiers.shift);
+                self.check_ai_at_trigger();
+                cx.notify();
+                return;
+            }
+            if let Some(ref ch) = event.keystroke.key_char {
+                if !modifiers.platform && !is_ctrl {
+                    self.ai_input_state.insert_str(ch);
+                    self.ai_input_text = self.ai_input_state.text.clone();
+                    self.check_ai_at_trigger();
+                    cx.notify();
+                    return;
+                }
+            } else if key.len() == 1 && !modifiers.platform && !is_ctrl {
+                self.ai_input_state.insert_str(key);
+                self.ai_input_text = self.ai_input_state.text.clone();
+                self.check_ai_at_trigger();
+                cx.notify();
+                return;
+            }
+        }
+
         // Pending Close Modal Keyboard Handler
+
         if self.pending_close.is_some() {
             if key_lower == "escape" || key_lower == "esc" {
                 self.pending_close = None;
@@ -3417,6 +4212,11 @@ impl RootView {
                     self.toggle_tab_sidebar(_window, cx);
                     return;
                 }
+                Action::ToggleAiSidebar => {
+                    self.toggle_ai_sidebar(_window, cx);
+                    return;
+                }
+
                 Action::FocusLeft => {
                     self.focus_pane_in_direction(Direction::Left, cx);
                     return;
@@ -3790,7 +4590,9 @@ impl RootView {
             || self.is_about_open
             || self.is_update_modal_open
             || self.pending_close.is_some()
+            || (self.ai_sidebar_open && self.ai_input_focused)
     }
+
 
     pub fn ime_commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.ime_marked_text = None;
@@ -3947,6 +4749,42 @@ impl RootView {
             if in_prox || was_in_prox {
                 cx.notify();
             }
+        }
+
+        if self.is_dragging_ai_input {
+            let win_w = _window.viewport_size().width.to_f64() as f32;
+            let sidebar_left = win_w - self.ai_sidebar_width;
+            let text_left = sidebar_left + 8.0 + 8.0;
+            let rel_x = (cur_x - text_left).max(0.0);
+            let col = (rel_x / 7.2).round() as usize;
+
+            let avail_w = (self.ai_sidebar_width - 44.0).max(80.0);
+            let max_cols = ((avail_w / 7.2).floor() as usize).max(10);
+            let lines = crate::ui::text_input::wrap_text_into_lines(&self.ai_input_state.text, max_cols);
+            let win_h = _window.viewport_size().height.to_f64() as f32;
+            let box_bottom = win_h - 48.0;
+            let line_h = 18.0;
+            let box_top = box_bottom - (lines.len() as f32 * line_h);
+            let line_idx = if cur_y < box_top {
+                0
+            } else {
+                (((cur_y - box_top) / line_h).floor() as usize).min(lines.len().saturating_sub(1))
+            };
+            if let Some(target_line) = lines.get(line_idx) {
+                let char_idx = (target_line.start_char + col).min(target_line.start_char + target_line.text.chars().count());
+                self.ai_input_state.update_drag(char_idx);
+                self.ai_input_text = self.ai_input_state.text.clone();
+                cx.notify();
+            }
+            return;
+        }
+
+        if self.is_dragging_ai_sidebar {
+            let win_w = _window.viewport_size().width.to_f64() as f32;
+            let new_w = (win_w - cur_x).clamp(240.0, 750.0);
+            self.ai_sidebar_width = new_w;
+            cx.notify();
+            return;
         }
 
         if self.is_dragging_pane_split {
@@ -4122,6 +4960,11 @@ impl RootView {
         self.is_dragging_scrollbar = false;
         self.dragging_scrollbar_pane_id = None;
         self.is_dragging_pane_split = false;
+        self.is_dragging_ai_sidebar = false;
+        if self.is_dragging_ai_input {
+            self.is_dragging_ai_input = false;
+            self.ai_input_state.end_drag();
+        }
         self.dragging_split_path.clear();
         self.selection_mouse_pos = None;
         self.has_selection_dragged = false;
@@ -5008,8 +5851,10 @@ impl Render for RootView {
         let (cell_w, line_h) = self.measure_cell_metrics(_window);
         let viewport_size = _window.viewport_size();
         let sidebar_w = self.current_sidebar_width();
-        let avail_w = (viewport_size.width.to_f64() as f32 - 1.0 - sidebar_w).max(100.0);
+        let ai_w = if self.ai_sidebar_open { self.ai_sidebar_width } else { 0.0 };
+        let avail_w = (viewport_size.width.to_f64() as f32 - 1.0 - sidebar_w - ai_w).max(100.0);
         // Chrome layout constants — must match TabBar/StatusBar element heights
+
         const TAB_BAR_HEIGHT: f32 = 32.0;
         const STATUS_BAR_HEIGHT: f32 = 20.0;
         let avail_h = (viewport_size.height.to_f64() as f32
@@ -5066,6 +5911,10 @@ impl Render for RootView {
                     .sidebar_open(self.sidebar_open)
                     .on_toggle_sidebar(cx.listener(|this, _ev, window, cx| {
                         this.toggle_tab_sidebar(window, cx);
+                    }))
+                    .ai_sidebar_open(self.ai_sidebar_open)
+                    .on_toggle_ai(cx.listener(|this, _ev, window, cx| {
+                        this.toggle_ai_sidebar(window, cx);
                     }))
                     .update_available(self.update_available.as_ref().map(|u| u.version.clone()), self.is_updating, self.is_update_ready)
                     .on_update(cx.listener(|this, _ev, window, cx| {
@@ -5159,8 +6008,12 @@ impl Render for RootView {
                             .child(super::ime::registration(cx.entity(), self.focus_handle.clone()))
                             .child(terminal_area),
                     )
+                    .when(self.ai_sidebar_open, |this| {
+                        this.child(self.render_ai_sidebar(_window, cx))
+                    })
             )
             .child(
+
                 StatusBar::new(left_segs, right_segs, fallback_info, theme)
                     .on_git_context_menu(cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
                         if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
@@ -5174,6 +6027,7 @@ impl Render for RootView {
             )
             .when(self.is_context_menu_open, |this| {
                 let sc_palette = if cfg!(target_os = "macos") { "⌘P" } else { "Ctrl+Shift+P" };
+                let sc_ai = if cfg!(target_os = "macos") { "⌘L" } else { "Ctrl+Shift+L" };
                 let sc_ssh = if cfg!(target_os = "macos") { "⌘O" } else { "Ctrl+Shift+O" };
                 let sc_search = if cfg!(target_os = "macos") { "⌘F" } else { "Ctrl+Shift+F" };
                 let sc_settings = if cfg!(target_os = "macos") { "⌘," } else { "Ctrl+," };
@@ -5244,6 +6098,16 @@ impl Render for RootView {
                             cx.listener(|this, _ev, window, cx| {
                                 this.is_context_menu_open = false;
                                 this.toggle_command_palette(window, cx);
+                            }),
+                            theme,
+                        ))
+                        .child(render_context_menu_item(
+                            IconType::Sparkles,
+                            "Fastty AI",
+                            Some(sc_ai),
+                            cx.listener(|this, _ev, window, cx| {
+                                this.is_context_menu_open = false;
+                                this.toggle_ai_sidebar(window, cx);
                             }),
                             theme,
                         ))
@@ -6866,6 +7730,7 @@ impl Render for RootView {
                 };
                 let branch_name = git_info.branch.clone();
                 let remote_url = git_info.remote_url.clone();
+                let has_remote = remote_url.is_some();
 
                 this.child(
                     div()
@@ -6925,147 +7790,227 @@ impl Render for RootView {
                                                 .child("Git Actions"),
                                         ),
                                 )
-                                .child(render_context_menu_item(
-                                    IconType::GitPullRequest,
-                                    "Git Status",
-                                    None,
-                                    cx.listener(|this, _ev, _window, cx| {
-                                        this.is_git_menu_open = false;
-                                        if let Some(tab) = this.tabs.get(this.active_tab_idx) {
-                                            if let Some(ref term) = tab.terminal {
-                                                term.write_to_pty(b"git status\r");
-                                            }
-                                        }
-                                        cx.notify();
-                                    }),
-                                    theme,
-                                ))
-                                .child(render_context_menu_item(
-                                    IconType::ArrowDown,
-                                    "Git Pull",
-                                    None,
-                                    cx.listener(|this, _ev, _window, cx| {
-                                        this.is_git_menu_open = false;
-                                        if let Some(tab) = this.tabs.get(this.active_tab_idx) {
-                                            if let Some(ref term) = tab.terminal {
-                                                term.write_to_pty(b"git pull\r");
-                                            }
-                                        }
-                                        cx.notify();
-                                    }),
-                                    theme,
-                                ))
-                                .child(render_context_menu_item(
-                                    IconType::ArrowUp,
-                                    "Git Push",
-                                    None,
-                                    cx.listener(|this, _ev, _window, cx| {
-                                        this.is_git_menu_open = false;
-                                        if let Some(tab) = this.tabs.get(this.active_tab_idx) {
-                                            if let Some(ref term) = tab.terminal {
-                                                term.write_to_pty(b"git push\r");
-                                            }
-                                        }
-                                        cx.notify();
-                                    }),
-                                    theme,
-                                ))
-                                .child(render_context_menu_item(
-                                    IconType::GitGraph,
-                                    "Git Log Graph",
-                                    None,
-                                    cx.listener(|this, _ev, _window, cx| {
-                                        this.is_git_menu_open = false;
-                                        if let Some(tab) = this.tabs.get(this.active_tab_idx) {
-                                            if let Some(ref term) = tab.terminal {
-                                                term.write_to_pty(b"git log --oneline --graph --all -n 25\r");
-                                            }
-                                        }
-                                        cx.notify();
-                                    }),
-                                    theme,
-                                ))
-                                .child(render_context_menu_item(
-                                    IconType::FileDiff,
-                                    "Git Diff",
-                                    None,
-                                    cx.listener(|this, _ev, _window, cx| {
-                                        this.is_git_menu_open = false;
-                                        if let Some(tab) = this.tabs.get(this.active_tab_idx) {
-                                            if let Some(ref term) = tab.terminal {
-                                                term.write_to_pty(b"git diff\r");
-                                            }
-                                        }
-                                        cx.notify();
-                                    }),
-                                    theme,
-                                ))
-                                .child(render_context_menu_item(
-                                    IconType::RefreshCw,
-                                    "Git Fetch All",
-                                    None,
-                                    cx.listener(|this, _ev, _window, cx| {
-                                        this.is_git_menu_open = false;
-                                        if let Some(tab) = this.tabs.get(this.active_tab_idx) {
-                                            if let Some(ref term) = tab.terminal {
-                                                term.write_to_pty(b"git fetch --all --prune\r");
-                                            }
-                                        }
-                                        cx.notify();
-                                    }),
-                                    theme,
-                                ))
-                                .child(render_context_menu_item(
-                                    IconType::GitBranch,
-                                    "Change Branch",
-                                    Some("▶"),
-                                    cx.listener(|this, _ev, _window, cx| {
-                                        this.is_git_branch_sub_open = !this.is_git_branch_sub_open;
-                                        cx.notify();
-                                    }),
-                                    theme,
-                                ))
-                                .child(render_context_menu_item(
-                                    IconType::GitBranch,
-                                    "Git Worktree Picker",
-                                    Some(if cfg!(target_os = "macos") { "⌘⌥W" } else { "Ctrl+Alt+W" }),
-                                    cx.listener(|this, _ev, window, cx| {
-                                        this.is_git_menu_open = false;
-                                        this.is_git_branch_sub_open = false;
-                                        this.toggle_worktree_picker(window, cx);
-                                    }),
-                                    theme,
-                                ))
-                                .child(render_context_menu_item(
-                                    IconType::Clipboard,
-                                    "Copy Branch Name",
-                                    None,
-                                    {
-                                        let b_name = branch_name.clone();
-                                        cx.listener(move |this, _ev, _window, cx| {
-                                            this.is_git_menu_open = false;
-                                            this.is_git_branch_sub_open = false;
-                                            if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                                                let _ = clip.set_text(b_name.clone());
-                                            }
-                                            cx.notify();
-                                        })
-                                    },
-                                    theme,
-                                ))
-                                .when_some(remote_url, |this, url| {
-                                    this.child(render_context_menu_item(
-                                        IconType::Globe,
-                                        "Open Remote in Browser",
+                                .child(
+                                    render_context_menu_item(
+                                        IconType::GitPullRequest,
+                                        "Git Status",
                                         None,
-                                        cx.listener(move |this, _ev, _window, cx| {
+                                        cx.listener(|this, _ev, _window, cx| {
                                             this.is_git_menu_open = false;
-                                            this.is_git_branch_sub_open = false;
-                                            open_path_or_url(&url);
+                                            if let Some(tab) = this.tabs.get(this.active_tab_idx) {
+                                                if let Some(ref term) = tab.terminal {
+                                                    term.write_to_pty(b"git status\r");
+                                                }
+                                            }
                                             cx.notify();
                                         }),
                                         theme,
-                                    ))
+                                    )
+                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                                        if *hovered && this.is_git_branch_sub_open {
+                                            this.is_git_branch_sub_open = false;
+                                            cx.notify();
+                                        }
+                                    })),
+                                )
+                                .child(
+                                    render_context_menu_item(
+                                        IconType::ArrowDown,
+                                        "Git Pull",
+                                        None,
+                                        cx.listener(|this, _ev, _window, cx| {
+                                            this.is_git_menu_open = false;
+                                            if let Some(tab) = this.tabs.get(this.active_tab_idx) {
+                                                if let Some(ref term) = tab.terminal {
+                                                    term.write_to_pty(b"git pull\r");
+                                                }
+                                            }
+                                            cx.notify();
+                                        }),
+                                        theme,
+                                    )
+                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                                        if *hovered && this.is_git_branch_sub_open {
+                                            this.is_git_branch_sub_open = false;
+                                            cx.notify();
+                                        }
+                                    })),
+                                )
+                                .child(
+                                    render_context_menu_item(
+                                        IconType::ArrowUp,
+                                        "Git Push",
+                                        None,
+                                        cx.listener(|this, _ev, _window, cx| {
+                                            this.is_git_menu_open = false;
+                                            if let Some(tab) = this.tabs.get(this.active_tab_idx) {
+                                                if let Some(ref term) = tab.terminal {
+                                                    term.write_to_pty(b"git push\r");
+                                                }
+                                            }
+                                            cx.notify();
+                                        }),
+                                        theme,
+                                    )
+                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                                        if *hovered && this.is_git_branch_sub_open {
+                                            this.is_git_branch_sub_open = false;
+                                            cx.notify();
+                                        }
+                                    })),
+                                )
+                                .child(
+                                    render_context_menu_item(
+                                        IconType::GitGraph,
+                                        "Git Log Graph",
+                                        None,
+                                        cx.listener(|this, _ev, _window, cx| {
+                                            this.is_git_menu_open = false;
+                                            if let Some(tab) = this.tabs.get(this.active_tab_idx) {
+                                                if let Some(ref term) = tab.terminal {
+                                                    term.write_to_pty(b"git log --oneline --graph --all -n 25\r");
+                                                }
+                                            }
+                                            cx.notify();
+                                        }),
+                                        theme,
+                                    )
+                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                                        if *hovered && this.is_git_branch_sub_open {
+                                            this.is_git_branch_sub_open = false;
+                                            cx.notify();
+                                        }
+                                    })),
+                                )
+                                .child(
+                                    render_context_menu_item(
+                                        IconType::FileDiff,
+                                        "Git Diff",
+                                        None,
+                                        cx.listener(|this, _ev, _window, cx| {
+                                            this.is_git_menu_open = false;
+                                            if let Some(tab) = this.tabs.get(this.active_tab_idx) {
+                                                if let Some(ref term) = tab.terminal {
+                                                    term.write_to_pty(b"git diff\r");
+                                                }
+                                            }
+                                            cx.notify();
+                                        }),
+                                        theme,
+                                    )
+                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                                        if *hovered && this.is_git_branch_sub_open {
+                                            this.is_git_branch_sub_open = false;
+                                            cx.notify();
+                                        }
+                                    })),
+                                )
+                                .child(
+                                    render_context_menu_item(
+                                        IconType::RefreshCw,
+                                        "Git Fetch All",
+                                        None,
+                                        cx.listener(|this, _ev, _window, cx| {
+                                            this.is_git_menu_open = false;
+                                            if let Some(tab) = this.tabs.get(this.active_tab_idx) {
+                                                if let Some(ref term) = tab.terminal {
+                                                    term.write_to_pty(b"git fetch --all --prune\r");
+                                                }
+                                            }
+                                            cx.notify();
+                                        }),
+                                        theme,
+                                    )
+                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                                        if *hovered && this.is_git_branch_sub_open {
+                                            this.is_git_branch_sub_open = false;
+                                            cx.notify();
+                                        }
+                                    })),
+                                )
+                                .child(
+                                    render_context_menu_item(
+                                        IconType::GitBranch,
+                                        "Change Branch",
+                                        Some("▶"),
+                                        cx.listener(|this, _ev, _window, cx| {
+                                            this.is_git_branch_sub_open = !this.is_git_branch_sub_open;
+                                            cx.notify();
+                                        }),
+                                        theme,
+                                    )
+                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                                        if *hovered && !this.is_git_branch_sub_open {
+                                            this.is_git_branch_sub_open = true;
+                                            cx.notify();
+                                        }
+                                    })),
+                                )
+                                .child(
+                                    render_context_menu_item(
+                                        IconType::GitBranch,
+                                        "Git Worktree Picker",
+                                        Some(if cfg!(target_os = "macos") { "⌘⌥W" } else { "Ctrl+Alt+W" }),
+                                        cx.listener(|this, _ev, window, cx| {
+                                            this.is_git_menu_open = false;
+                                            this.is_git_branch_sub_open = false;
+                                            this.toggle_worktree_picker(window, cx);
+                                        }),
+                                        theme,
+                                    )
+                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                                        if *hovered && this.is_git_branch_sub_open {
+                                            this.is_git_branch_sub_open = false;
+                                            cx.notify();
+                                        }
+                                    })),
+                                )
+                                .child(
+                                    render_context_menu_item(
+                                        IconType::Clipboard,
+                                        "Copy Branch Name",
+                                        None,
+                                        {
+                                            let b_name = branch_name.clone();
+                                            cx.listener(move |this, _ev, _window, cx| {
+                                                this.is_git_menu_open = false;
+                                                this.is_git_branch_sub_open = false;
+                                                if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                                                    let _ = clip.set_text(b_name.clone());
+                                                }
+                                                cx.notify();
+                                            })
+                                        },
+                                        theme,
+                                    )
+                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                                        if *hovered && this.is_git_branch_sub_open {
+                                            this.is_git_branch_sub_open = false;
+                                            cx.notify();
+                                        }
+                                    })),
+                                )
+                                .when_some(remote_url, |this, url| {
+                                    this.child(
+                                        render_context_menu_item(
+                                            IconType::Globe,
+                                            "Open Remote in Browser",
+                                            None,
+                                            cx.listener(move |this, _ev, _window, cx| {
+                                                this.is_git_menu_open = false;
+                                                this.is_git_branch_sub_open = false;
+                                                open_path_or_url(&url);
+                                                cx.notify();
+                                            }),
+                                            theme,
+                                        )
+                                        .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                                            if *hovered && this.is_git_branch_sub_open {
+                                                this.is_git_branch_sub_open = false;
+                                                cx.notify();
+                                            }
+                                        })),
+                                    )
                                 }),
                         )
                         .when(self.is_git_branch_sub_open, |parent| {
@@ -7073,12 +8018,19 @@ impl Render for RootView {
                             let branches = active_cwd.map(crate::git::list_local_branches).unwrap_or_default();
                             let current_branch = branch_name.clone();
 
+                            let items_below = if has_remote { 3.0 } else { 2.0 };
+                            let change_branch_bottom = 32.0 + 6.0 + items_below * 31.0;
+                            let change_branch_top = change_branch_bottom + 27.0;
+                            let branch_count = branches.len().max(1) as f32;
+                            let submenu_h = (39.0 + branch_count * 31.0 - 4.0).min(320.0);
+                            let submenu_bottom = (change_branch_top - submenu_h).max(32.0);
+
                             parent.child(
                                 div()
                                     .id("git-branch-submenu-popup")
                                     .absolute()
-                                    .bottom(px(32.))
-                                    .left(px(258.))
+                                    .bottom(px(submenu_bottom))
+                                    .left(px(256.))
                                     .w(px(210.))
                                     .max_h(px(320.))
                                     .overflow_y_scroll()
@@ -7160,6 +8112,8 @@ impl Render for RootView {
                                                                 .flex_row()
                                                                 .items_center()
                                                                 .gap_2()
+                                                                .flex_1()
+                                                                .overflow_hidden()
                                                                 .child(render_icon(
                                                                     IconType::GitBranch,
                                                                     if is_current { theme.green } else { theme.accent },
@@ -7167,15 +8121,20 @@ impl Render for RootView {
                                                                 ))
                                                                 .child(
                                                                     div()
+                                                                        .flex_1()
+                                                                        .overflow_hidden()
+                                                                        .text_ellipsis()
                                                                         .text_size(px(12.))
                                                                         .font_weight(if is_current { FontWeight::BOLD } else { FontWeight::MEDIUM })
                                                                         .text_color(if is_current { theme.green } else { theme.foreground })
-                                                                        .child(target_branch),
+                                                                        .child(SharedString::from(target_branch)),
                                                                 ),
                                                         )
                                                         .when(is_current, |el| {
                                                             el.child(
                                                                 div()
+                                                                    .flex_shrink_0()
+                                                                    .pl(px(4.))
                                                                     .text_size(px(10.))
                                                                     .font_weight(FontWeight::BOLD)
                                                                     .text_color(theme.green)

@@ -134,8 +134,13 @@ fn main() {
             }
             fastty::daemon_client::run_attach_command(id, read_only, wait);
         }
+        Some("ask") => {
+            run_ask_command(subcommand_args);
+            std::process::exit(0);
+        }
         _ => {}
     }
+
 
     let cli_opts = CliOptions::parse();
     fastty::daemon::start();
@@ -182,3 +187,116 @@ fn open_main_window(cx: &mut App, cli_opts: CliOptions) {
     )
     .expect("failed to open Fastty window");
 }
+
+fn run_ask_command(mut args: impl Iterator<Item = String>) {
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let mut prompt_parts = Vec::new();
+    let mut provider_override: Option<String> = None;
+    let mut model_override: Option<String> = None;
+    let mut no_tools = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-p" | "--provider" => {
+                provider_override = args.next();
+            }
+            "-m" | "--model" => {
+                model_override = args.next();
+            }
+            "--no-tools" => {
+                no_tools = true;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "Usage: fastty ask [OPTIONS] <PROMPT>\n\n\
+                     Ask the Fastty AI agent directly from the terminal.\n\n\
+                     Options:\n  \
+                     -p, --provider <NAME>  Specify AI provider (e.g. ollama, anthropic)\n  \
+                     -m, --model <MODEL>    Specify model name\n  \
+                     --no-tools             Disable tool execution\n  \
+                     -h, --help             Print this help message"
+                );
+                std::process::exit(0);
+            }
+            other => {
+                prompt_parts.push(other.to_string());
+            }
+        }
+    }
+
+    let prompt = prompt_parts.join(" ");
+    if prompt.trim().is_empty() {
+        eprintln!("fastty ask: prompt cannot be empty. Run `fastty ask --help` for usage.");
+        std::process::exit(1);
+    }
+
+    let cfg = fastty::config::Config::load().unwrap_or_default();
+    let (model, model_name) = match fastty::ai::create_model_from_config(
+        &cfg.ai,
+        provider_override.as_deref(),
+        model_override.as_deref(),
+    ) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("fastty ask error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let tools = if no_tools {
+        Vec::new()
+    } else {
+        fastty::ai::default_tools()
+    };
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let checker = Arc::new(fastty::ai::PermissionChecker::new(cfg.ai.permission_mode));
+    let perm_handler = Arc::new(fastty::ai::CliPermissionHandler::new(checker.clone()));
+    let ctx = fastty::ai::ToolCtx { cwd: cwd.clone() };
+
+    let mut agent = fastty::ai::Agent::new(
+        model,
+        model_name,
+        tools,
+        checker,
+        perm_handler,
+        ctx,
+    );
+
+    agent.add_message(fastty::ai::Message::system(fastty::ai::system_prompt(&cwd)));
+    agent.add_message(fastty::ai::Message::user(prompt));
+
+    if let Err(e) = agent.run_turn(|ev| match ev {
+        fastty::ai::AgentEvent::TextDelta(d) => {
+            print!("{}", d);
+            let _ = std::io::stdout().flush();
+        }
+        fastty::ai::AgentEvent::ThinkingDelta(t) => {
+            print!("\x1b[2m{}\x1b[0m", t);
+            let _ = std::io::stdout().flush();
+        }
+        fastty::ai::AgentEvent::ToolStart { name, args, .. } => {
+            println!("\n\x1b[36m⚡ Running tool '{}':\x1b[0m {}", name, args);
+        }
+        fastty::ai::AgentEvent::ToolEnd { output, is_error, .. } => {
+            if is_error {
+                println!("\x1b[31m✗ Tool error:\x1b[0m\n{}", output);
+            } else {
+                println!("\x1b[32m✓ Tool result:\x1b[0m\n{}", output);
+            }
+        }
+        fastty::ai::AgentEvent::TurnEnd => {
+            println!();
+        }
+        fastty::ai::AgentEvent::Usage { .. } => {}
+        fastty::ai::AgentEvent::Error(err) => {
+            eprintln!("\n\x1b[31m[fastty-ai error]: {}\x1b[0m", err);
+        }
+    }) {
+        eprintln!("Turn failed: {}", e);
+        std::process::exit(1);
+    }
+}
+

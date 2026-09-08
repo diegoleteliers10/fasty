@@ -129,6 +129,7 @@ pub enum Action {
     ClearScrollback,
     ToggleFullscreen,
     ToggleTabSidebar,
+    ToggleAiSidebar,
     SplitRight,
     SplitDown,
     SplitLeft,
@@ -188,6 +189,7 @@ impl KeyBindingResolver {
                     insert("super+w", Action::ClosePane);
                     insert("super+shift+w", Action::CloseTab);
                     insert("super+b", Action::ToggleTabSidebar);
+                    insert("super+l", Action::ToggleAiSidebar);
                     insert("super+n", Action::NewWindow);
                     insert("super+f", Action::OpenSearch);
                     insert("super+s", Action::OpenSettings);
@@ -229,6 +231,7 @@ impl KeyBindingResolver {
                     insert("ctrl+shift+q", Action::CloseTab);
                     insert("ctrl+b", Action::ToggleTabSidebar);
                     insert("ctrl+shift+b", Action::ToggleTabSidebar);
+                    insert("ctrl+shift+l", Action::ToggleAiSidebar);
                     insert("ctrl+shift+n", Action::NewWindow);
                     insert("ctrl+shift+e", Action::SplitRight);
                     insert("ctrl+shift+d", Action::SplitDown);
@@ -466,6 +469,7 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "clear_scrollback" => Some(Action::ClearScrollback),
         "toggle_fullscreen" => Some(Action::ToggleFullscreen),
         "toggle_tab_sidebar" => Some(Action::ToggleTabSidebar),
+        "toggle_ai_sidebar" => Some(Action::ToggleAiSidebar),
         "split_right" => Some(Action::SplitRight),
         "split_down" => Some(Action::SplitDown),
         "split_left" => Some(Action::SplitLeft),
