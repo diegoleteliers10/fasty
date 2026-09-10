@@ -22,6 +22,8 @@ pub struct AiUiMessage {
     pub thinking: Option<String>,
     pub tool_calls: Vec<AiUiToolCall>,
     pub timestamp: Option<String>,
+    pub images: Vec<std::path::PathBuf>,
+    pub documents: Vec<std::path::PathBuf>,
 }
 
 impl AiUiMessage {
@@ -32,6 +34,8 @@ impl AiUiMessage {
             thinking: None,
             tool_calls: Vec::new(),
             timestamp: None,
+            images: Vec::new(),
+            documents: Vec::new(),
         }
     }
 
@@ -42,7 +46,19 @@ impl AiUiMessage {
             thinking: None,
             tool_calls: Vec::new(),
             timestamp: None,
+            images: Vec::new(),
+            documents: Vec::new(),
         }
+    }
+
+    pub fn with_images(mut self, images: Vec<std::path::PathBuf>) -> Self {
+        self.images = images;
+        self
+    }
+
+    pub fn with_documents(mut self, documents: Vec<std::path::PathBuf>) -> Self {
+        self.documents = documents;
+        self
     }
 
     pub fn with_thinking(mut self, thinking: impl Into<String>) -> Self {
@@ -108,6 +124,11 @@ pub struct AiSidebar {
     pub at_menu_open: bool,
     pub at_matches: Vec<String>,
     pub on_select_at_match: Option<Box<dyn Fn(&String, &mut Window, &mut App) + 'static>>,
+    pub composer_bounds: Option<std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>>,
+    pub message_selection: Option<(usize, usize, usize)>,
+    pub on_select_message_char: Option<std::sync::Arc<dyn Fn(&(usize, usize), &mut Window, &mut App) + 'static>>,
+    pub on_drag_message_char: Option<std::sync::Arc<dyn Fn(&(usize, usize), &mut Window, &mut App) + 'static>>,
+    pub scroll_handle: Option<gpui::ScrollHandle>,
 }
 
 impl AiSidebar {
@@ -154,7 +175,17 @@ impl AiSidebar {
             at_menu_open: false,
             at_matches: Vec::new(),
             on_select_at_match: None,
+            composer_bounds: None,
+            message_selection: None,
+            on_select_message_char: None,
+            on_drag_message_char: None,
+            scroll_handle: None,
         }
+    }
+
+    pub fn scroll_handle(mut self, handle: gpui::ScrollHandle) -> Self {
+        self.scroll_handle = Some(handle);
+        self
     }
 
     pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
@@ -216,6 +247,32 @@ impl AiSidebar {
 
     pub fn input_text(mut self, text: impl Into<String>) -> Self {
         self.input_text = text.into();
+        self
+    }
+
+    pub fn composer_bounds(mut self, bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>) -> Self {
+        self.composer_bounds = Some(bounds);
+        self
+    }
+
+    pub fn message_selection(mut self, sel: Option<(usize, usize, usize)>) -> Self {
+        self.message_selection = sel;
+        self
+    }
+
+    pub fn on_select_message_char(
+        mut self,
+        cb: impl Fn(&(usize, usize), &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_select_message_char = Some(std::sync::Arc::new(cb));
+        self
+    }
+
+    pub fn on_drag_message_char(
+        mut self,
+        cb: impl Fn(&(usize, usize), &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_drag_message_char = Some(std::sync::Arc::new(cb));
         self
     }
 
@@ -499,44 +556,75 @@ fn parse_tool_row(tc: &AiUiToolCall) -> ParsedToolRow {
     let status_text = if tc.is_running {
         "running".to_string()
     } else if tc.is_error {
-        "failed".to_string()
+        // run_command errors carry "Command exited with code N:\n..." prefix
+        if tc.name == "run_command" {
+            if let Some(ref out) = tc.output {
+                let first = out.lines().next().unwrap_or("");
+                if let Some(rest) = first.strip_prefix("Command exited with code ") {
+                    let code = rest.trim_end_matches(':').trim();
+                    format!("exit {}", code)
+                } else {
+                    "failed".to_string()
+                }
+            } else {
+                "failed".to_string()
+            }
+        } else {
+            "failed".to_string()
+        }
     } else if let Some(ref out) = tc.output {
         if tc.name == "run_command" {
-            if let Some(pos) = out.find("failed") {
-                let start = out[..pos]
-                    .char_indices()
-                    .rev()
-                    .find(|(_, c)| c.is_whitespace() || *c == ':')
-                    .map(|(i, c)| i + c.len_utf8())
-                    .unwrap_or(0);
-                let end = pos + "failed".len();
-                let snip = out.get(start..end).map(|s| s.trim()).unwrap_or("");
-                if !snip.is_empty() {
-                    snip.to_string()
-                } else {
-                    "done".to_string()
-                }
-            } else if out.contains("test result: ok") {
+            if out.contains("test result: ok") {
                 "ok".to_string()
             } else {
                 "done".to_string()
             }
         } else if tc.name == "search" || tc.name == "list_dir" {
-            let lines = out.lines().count();
-            if lines > 0 {
-                format!("{} matches", lines)
+            // First line is "Found N matches:" or "Found N matching files ..."
+            let first = out.lines().next().unwrap_or("");
+            if let Some(rest) = first.strip_prefix("Found ") {
+                let n: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if n.is_empty() { "done".to_string() } else { format!("{} found", n) }
+            } else if first.starts_with("No matches") || first.starts_with("Directory") {
+                let lines = out.lines().count().saturating_sub(1);
+                if lines > 0 { format!("{} entries", lines) } else { "0 found".to_string() }
             } else {
-                "done".to_string()
+                let count = out.lines().count();
+                format!("{} results", count)
             }
         } else if tc.name == "read_file" {
-            let lines = out.lines().count();
-            if lines > 0 {
+            // Header: "--- path (lines S-E of T) ---"
+            let first = out.lines().next().unwrap_or("");
+            if let Some(inner) = first.rfind("(lines ").and_then(|i| {
+                let s = &first[i + 7..];
+                s.find(" of ").map(|e| s[..e].to_string())
+            }) {
+                format!("L{}", inner)
+            } else {
+                let lines = out.lines().count();
                 format!("L1-{}", lines)
+            }
+        } else if tc.name == "edit_file" {
+            // "Successfully replaced 1 occurrence in '...' (+5 -3)"
+            // "Successfully wrote N bytes to '...'"
+            // Use rfind("(+") to specifically target stats paren, not parens in file paths.
+            if let Some(paren_start) = out.rfind("(+").or_else(|| out.rfind("(-")) {
+                let inner = &out[paren_start + 1..];
+                if let Some(paren_end) = inner.find(')') {
+                    inner[..paren_end].trim().to_string()
+                } else {
+                    "done".to_string()
+                }
+            } else if out.contains("wrote") {
+                let words: Vec<&str> = out.split_whitespace().collect();
+                if let Some(pos) = words.iter().position(|w| *w == "wrote") {
+                    words.get(pos + 1).map(|n| format!("{} B", n)).unwrap_or_else(|| "done".to_string())
+                } else {
+                    "done".to_string()
+                }
             } else {
                 "done".to_string()
             }
-        } else if tc.name == "edit_file" {
-            "+1 -1".to_string()
         } else {
             "done".to_string()
         }
@@ -702,6 +790,7 @@ fn render_confirmation_section(
                             .rounded(px(2.))
                             .text_size(px(11.5))
                             .text_color(color)
+                            .overflow_hidden()
                             .when_some(tint, |d, tint| d.bg(tint))
                             .child(SharedString::from(format!("{}{}", prefix, text)))
                     })),
@@ -948,111 +1037,31 @@ fn render_thinking_indicator(theme: &Theme) -> Div {
         )
 }
 
-fn render_stream_cursor(theme: &Theme) -> impl IntoElement {
-    div()
-        .flex()
-        .ml(px(4.))
-        .w(px(2.))
-        .h(px(13.))
-        .rounded(px(1.))
-        .bg(theme.accent)
-        .with_animation(
-            "ai-stream-cursor",
-            Animation::new(Duration::from_millis(1100))
-                .repeat()
-                .with_easing(pulsating_between(0.25, 1.0))
-                .with_max_fps(30.),
-            |el, delta| el.opacity(delta),
-        )
-}
-
-fn render_markdown_prose(text: &str, theme: &Theme, is_streaming: bool) -> Div {
-    let mut container = div().flex().flex_col().gap_2().w_full().min_w(px(0.));
-    let paragraphs: Vec<&str> = text.split("\n\n").collect();
-    let num_paras = paragraphs.len();
-
-    for (p_idx, para) in paragraphs.into_iter().enumerate() {
-        let is_last_para = p_idx + 1 == num_paras;
-
-        if !para.contains('`') {
-            let mut para_div = div()
-                .w_full()
-                .min_w(px(0.))
-                .text_size(px(13.))
-                .text_color(theme.foreground)
-                .child(para.to_string());
-            if is_last_para && is_streaming {
-                para_div = para_div.child(render_stream_cursor(theme));
-            }
-            container = container.child(para_div);
-            continue;
-        }
-
-        let mut row = div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .gap_1()
-            .w_full()
-            .min_w(px(0.));
-
-        let parts: Vec<&str> = para.split('`').collect();
-        for (i, part) in parts.into_iter().enumerate() {
-            if part.is_empty() {
-                continue;
-            }
-            if i % 2 == 1 {
-                row = row.child(
-                    div()
-                        .px(px(5.))
-                        .py(px(1.5))
-                        .rounded(px(4.))
-                        .bg(theme.surface_raised)
-                        .border_1()
-                        .border_color(theme.border)
-                        .text_size(px(12.))
-                        .text_color(theme.accent)
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(part.to_string()),
-                );
-            } else {
-                row = row.child(
-                    div()
-                        .text_size(px(13.))
-                        .text_color(theme.foreground)
-                        .child(part.to_string()),
-                );
-            }
-        }
-
-        if is_last_para && is_streaming {
-            row = row.child(
-                div()
-                    .w(px(2.))
-                    .h(px(14.))
-                    .rounded(px(1.))
-                    .bg(theme.accent)
-                    .flex_shrink_0()
-                    .with_animation(
-                        "ai-stream-cursor-inline",
-                        Animation::new(Duration::from_millis(1100))
-                            .repeat()
-                            .with_easing(pulsating_between(0.25, 1.0))
-                            .with_max_fps(30.),
-                        |el, delta| el.opacity(delta),
-                    ),
-            );
-        }
-
-        container = container.child(row);
-    }
-
-    container
+fn render_markdown_prose(
+    text: &str,
+    theme: &Theme,
+    is_streaming: bool,
+    selection: Option<(usize, usize)>,
+    on_select_char: Option<std::sync::Arc<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
+    on_drag_char: Option<std::sync::Arc<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
+    text_left: f32,
+    window: Option<&Window>,
+) -> Div {
+    crate::ui::markdown::render_markdown_selectable(
+        text,
+        theme,
+        is_streaming,
+        selection,
+        on_select_char,
+        on_drag_char,
+        text_left,
+        window,
+    )
 }
 
 impl RenderOnce for AiSidebar {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let win_ref = &*window;
         let theme = self.theme;
         let sidebar_bg = Hsla { a: theme.opacity, ..theme.sidebar_bg };
         let surface_raised = theme.surface_raised;
@@ -1073,6 +1082,10 @@ impl RenderOnce for AiSidebar {
         let on_at_click = self.on_at_click.map(std::rc::Rc::new);
         let on_attach_click = self.on_attach_click.map(std::rc::Rc::new);
         let on_select_at_match = self.on_select_at_match.map(std::rc::Rc::new);
+        let composer_bounds = self.composer_bounds.clone();
+        let message_selection = self.message_selection;
+        let on_select_message_char = self.on_select_message_char.clone();
+        let on_drag_message_char = self.on_drag_message_char.clone();
         let expanded_thinkings = self.expanded_thinkings;
 
         let input_val = self.input_text.clone();
@@ -1080,6 +1093,13 @@ impl RenderOnce for AiSidebar {
         let active_branch = self.git_branch.clone();
         let context_pct = self.context_pct;
         let active_mode = self.agent_mode.clone();
+
+        // Text left edge = sidebar left + 8px scroll-area px + 4px outer-wrapper px.
+        // Mouse events use window-absolute X, so we subtract this to get text-relative X.
+        let win_w = window.viewport_size().width.to_f64() as f32;
+        let sidebar_w = self.width;
+        let msg_text_left = win_w - sidebar_w + 12.0;
+        let streaming_text_left = win_w - sidebar_w + 8.0; // scroll-area px only (no inner px wrapper for streaming)
 
         div()
             .id("ai-sidebar-container")
@@ -1091,58 +1111,83 @@ impl RenderOnce for AiSidebar {
             .border_l_1()
             .border_color(theme.border)
             .child(
-                // 1. Header: identity · context · actions on one row
+                // 1. Header: Sleek, compact single toolbar (h: 36px) matching Fastty's design system
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .justify_between()
+                    .h(px(36.))
                     .w_full()
-                    .px(px(14.))
-                    .py(px(10.))
+                    .px(px(12.))
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(
+                    // Left: Git branch
+                    .child({
+                        let has_branch = active_branch.is_some();
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap_2()
+                            .gap(px(6.))
                             .min_w(px(0.))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .min_w(px(0.))
-                                    .child(
-                                        div()
-                                            .text_size(px(13.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme.foreground)
-                                            .child("Fastty AI"),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap_1()
-                                            .text_size(px(11.))
-                                            .text_color(theme.muted)
-                                            .overflow_hidden()
-                                            .child(SharedString::from(display_cwd))
-                                            .when_some(active_branch, |this, branch| {
-                                                this.child(SharedString::from(format!("· {}", branch)))
-                                            }),
-                                    ),
-                            ),
-                    )
+                            .flex_1()
+                            .overflow_hidden()
+                            .when_some(active_branch, |this, branch| {
+                                this.child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(4.))
+                                        .min_w(px(0.))
+                                        .overflow_hidden()
+                                        .child(crate::ui::icons::render_icon(
+                                            IconType::GitBranch,
+                                            theme.muted_strong,
+                                            12.0,
+                                        ))
+                                        .child(
+                                            div()
+                                                .text_size(px(12.))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(theme.foreground)
+                                                .truncate()
+                                                .child(SharedString::from(branch)),
+                                        ),
+                                )
+                            })
+                            .when(!has_branch, |this| {
+                                this.child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(4.))
+                                        .min_w(px(0.))
+                                        .overflow_hidden()
+                                        .child(crate::ui::icons::render_icon(
+                                            IconType::Folder,
+                                            theme.muted,
+                                            11.0,
+                                        ))
+                                        .child(
+                                            div()
+                                                .text_size(px(12.))
+                                                .text_color(theme.muted_strong)
+                                                .truncate()
+                                                .child(SharedString::from(display_cwd)),
+                                        ),
+                                )
+                            })
+                    })
+                    // Right: Context indicator + Actions
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap_1()
+                            .gap(px(2.))
                             .flex_shrink_0()
                             // Context usage
                             .child(
@@ -1150,15 +1195,17 @@ impl RenderOnce for AiSidebar {
                                     .flex()
                                     .flex_row()
                                     .items_center()
-                                    .gap_1p5()
-                                    .mr(px(6.))
+                                    .gap(px(3.5))
+                                    .px(px(4.))
+                                    .py(px(2.))
+                                    .mr(px(2.))
+                                    .child(render_context_ring(context_pct, &theme))
                                     .child(
                                         div()
-                                            .text_size(px(11.))
+                                            .text_size(px(10.5))
                                             .text_color(theme.muted)
                                             .child(SharedString::from(format!("{:.0}%", context_pct * 100.0))),
-                                    )
-                                    .child(render_context_ring(context_pct, &theme)),
+                                    ),
                             )
                             // New Chat '+'
                             .child(
@@ -1167,12 +1214,12 @@ impl RenderOnce for AiSidebar {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .w(px(24.))
-                                    .h(px(24.))
+                                    .w(px(22.))
+                                    .h(px(22.))
                                     .rounded(px(4.))
                                     .cursor(CursorStyle::PointingHand)
-                                    .hover(move |s| s.bg(theme.hover))
                                     .text_color(theme.muted)
+                                    .hover(move |s| s.bg(theme.hover).text_color(theme.foreground))
                                     .on_mouse_down(MouseButton::Left, {
                                         let on_new_chat = on_new_chat.clone();
                                         let on_clear = on_clear.clone();
@@ -1187,22 +1234,22 @@ impl RenderOnce for AiSidebar {
                                     .child(crate::ui::icons::render_icon(
                                         IconType::Plus,
                                         theme.muted,
-                                        13.0,
+                                        12.0,
                                     )),
                             )
-                            // History / Clear
+                            // Clear / History
                             .child(
                                 div()
                                     .id("ai-clear-btn")
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .w(px(24.))
-                                    .h(px(24.))
+                                    .w(px(22.))
+                                    .h(px(22.))
                                     .rounded(px(4.))
                                     .cursor(CursorStyle::PointingHand)
-                                    .hover(move |s| s.bg(theme.hover))
                                     .text_color(theme.muted)
+                                    .hover(move |s| s.bg(theme.hover).text_color(theme.foreground))
                                     .on_mouse_down(MouseButton::Left, {
                                         let on_clear = on_clear.clone();
                                         move |ev, window, cx| {
@@ -1214,7 +1261,7 @@ impl RenderOnce for AiSidebar {
                                     .child(crate::ui::icons::render_icon(
                                         IconType::RotateCcw,
                                         theme.muted,
-                                        12.0,
+                                        11.0,
                                     )),
                             )
                             // Close '✕'
@@ -1224,12 +1271,12 @@ impl RenderOnce for AiSidebar {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .w(px(24.))
-                                    .h(px(24.))
+                                    .w(px(22.))
+                                    .h(px(22.))
                                     .rounded(px(4.))
                                     .cursor(CursorStyle::PointingHand)
-                                    .hover(move |s| s.bg(theme.hover))
                                     .text_color(theme.muted)
+                                    .hover(move |s| s.bg(theme.hover).text_color(theme.foreground))
                                     .on_mouse_down(MouseButton::Left, {
                                         let on_close = on_close.clone();
                                         move |ev, window, cx| {
@@ -1241,7 +1288,7 @@ impl RenderOnce for AiSidebar {
                                     .child(crate::ui::icons::render_icon(
                                         IconType::X,
                                         theme.muted,
-                                        12.0,
+                                        11.0,
                                     )),
                             ),
                     ),
@@ -1256,22 +1303,115 @@ impl RenderOnce for AiSidebar {
                     .overflow_y_scroll()
                     .px(px(8.))
                     .py(px(8.))
-                    .gap_3()
-                    .children(self.messages.into_iter().enumerate().map(|(msg_idx, msg)| {
-                        if msg.is_user {
-                            // User message: plain text, no bubble
-                            div()
-                                .w_full()
-                                .px(px(4.))
-                                .text_size(px(13.))
-                                .text_color(theme.foreground)
-                                .child(msg.text.clone())
-                        } else {
-                            div()
-                                .flex()
-                                .flex_col()
-                                .w_full()
-                                .gap_2()
+                    .gap_4()
+                    .when_some(self.scroll_handle.clone(), |this, sh| this.track_scroll(&sh))
+                    .children({
+                        let sidebar_width = self.width;
+                        let on_select_msg = on_select_message_char.clone();
+                        let on_drag_msg = on_drag_message_char.clone();
+                        self.messages.clone().into_iter().enumerate().map(move |(msg_idx, msg)| {
+                            if msg.is_user {
+                                div()
+                                    .w_full()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .items_end()
+                                    .my(px(3.))
+                                    .child(
+                                        div()
+                                            .max_w(px((sidebar_width - 32.0).max(120.0)))
+                                            .rounded(px(10.))
+                                            .bg(theme.surface_raised)
+                                            .border_1()
+                                            .border_color(theme.border)
+                                            .px(px(12.))
+                                            .py(px(8.))
+                                            .cursor(CursorStyle::IBeam)
+                                            .when(!msg.images.is_empty(), |d| {
+                                                d.child(
+                                                    div()
+                                                        .flex()
+                                                        .flex_row()
+                                                        .flex_wrap()
+                                                        .gap_1()
+                                                        .mb(px(6.))
+                                                        .children(msg.images.iter().map(|img_path| {
+                                                            let name = img_path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| "Image".to_string());
+                                                            div()
+                                                                .flex()
+                                                                .flex_row()
+                                                                .items_center()
+                                                                .gap_1()
+                                                                .px(px(6.))
+                                                                .py(px(2.))
+                                                                .rounded(px(4.))
+                                                                .bg(theme.surface)
+                                                                .border_1()
+                                                                .border_color(theme.border)
+                                                                .child(div().text_size(px(11.)).child("🖼"))
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(11.))
+                                                                        .text_color(theme.foreground)
+                                                                        .max_w(px(140.))
+                                                                        .overflow_hidden()
+                                                                        .child(SharedString::from(name)),
+                                                                )
+                                                        })),
+                                                )
+                                            })
+                                            .when(!msg.documents.is_empty(), |d| {
+                                                d.child(
+                                                    div()
+                                                        .flex()
+                                                        .flex_row()
+                                                        .flex_wrap()
+                                                        .gap_1()
+                                                        .mb(px(6.))
+                                                        .children(msg.documents.iter().map(|doc_path| {
+                                                            let name = doc_path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| "Document.pdf".to_string());
+                                                            div()
+                                                                .flex()
+                                                                .flex_row()
+                                                                .items_center()
+                                                                .gap_1()
+                                                                .px(px(6.))
+                                                                .py(px(2.))
+                                                                .rounded(px(4.))
+                                                                .bg(theme.surface)
+                                                                .border_1()
+                                                                .border_color(theme.border)
+                                                                .child(div().text_size(px(11.)).child("📄"))
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(11.))
+                                                                        .text_color(theme.foreground)
+                                                                        .max_w(px(140.))
+                                                                        .overflow_hidden()
+                                                                        .child(SharedString::from(name)),
+                                                                )
+                                                        })),
+                                                )
+                                            })
+                                            .when(!msg.text.is_empty(), |d| {
+                                                d.child(
+                                                    div()
+                                                        .text_size(px(13.))
+                                                        .text_color(theme.foreground)
+                                                        .child(msg.text.clone()),
+                                                )
+                                            }),
+                                    )
+                            } else {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .w_full()
+                                    .min_w(px(0.))
+                                    .px(px(4.))
+                                    .my(px(3.))
+                                    .gap_3()
                                 // Collapsible reasoning line
                                 .when_some(msg.thinking.clone(), |this, thinking| {
                                     let summary_snip: String = thinking.lines().next().unwrap_or("Model reasoning").chars().take(48).collect();
@@ -1283,6 +1423,7 @@ impl RenderOnce for AiSidebar {
                                             .flex_col()
                                             .w_full()
                                             .gap_1()
+                                            .my(px(1.))
                                             .child(
                                                 div()
                                                     .id(("ai-thinking-header", msg_idx))
@@ -1324,24 +1465,25 @@ impl RenderOnce for AiSidebar {
                                                 d.child(
                                                     div()
                                                         .w_full()
+                                                        .min_w(px(0.))
                                                         .pl(px(14.))
                                                         .text_size(px(11.5))
                                                         .text_color(theme.muted_strong)
+                                                        .overflow_hidden()
                                                         .child(thinking),
                                                 )
                                             }),
                                     )
                                 })
-                                // Tool calls: flat rows with a left hairline
+                                // Tool calls: distinct cards with full padding and margins
                                 .when(!msg.tool_calls.is_empty(), |this| {
                                     this.child(
                                         div()
                                             .flex()
                                             .flex_col()
                                             .w_full()
-                                            .border_l_1()
-                                            .border_color(theme.border)
-                                            .pl(px(10.))
+                                            .gap_2()
+                                            .my(px(2.))
                                             .children(msg.tool_calls.into_iter().enumerate().map(|(tc_idx, tc)| {
                                                 let info = parse_tool_row(&tc);
                                                 div()
@@ -1349,7 +1491,12 @@ impl RenderOnce for AiSidebar {
                                                     .flex_row()
                                                     .items_center()
                                                     .justify_between()
-                                                    .py(px(4.))
+                                                    .px(px(10.))
+                                                    .py(px(6.))
+                                                    .rounded(px(6.))
+                                                    .bg(theme.surface)
+                                                    .border_1()
+                                                    .border_color(theme.border)
                                                     .child(
                                                         div()
                                                             .flex()
@@ -1422,12 +1569,106 @@ impl RenderOnce for AiSidebar {
                                 })
                                 // Assistant prose
                                 .when(!msg.text.is_empty(), |this| {
-                                    this.child(render_markdown_prose(&msg.text, &theme, false))
+                                    let text_to_copy = msg.text.clone();
+                                    let active_sel = if let Some((sel_msg, s, e)) = message_selection {
+                                        if sel_msg == msg_idx { Some((s, e)) } else { None }
+                                    } else {
+                                        None
+                                    };
+
+                                    let on_select_cb = on_select_msg.as_ref().map(|cb| {
+                                        let cb = cb.clone();
+                                        std::sync::Arc::new(move |target: usize, window: &mut Window, cx: &mut App| {
+                                            cb(&(msg_idx, target), window, cx);
+                                        }) as std::sync::Arc<dyn Fn(usize, &mut Window, &mut App) + 'static>
+                                    });
+
+                                    let on_drag_cb = on_drag_msg.as_ref().map(|cb| {
+                                        let cb = cb.clone();
+                                        std::sync::Arc::new(move |target: usize, window: &mut Window, cx: &mut App| {
+                                            cb(&(msg_idx, target), window, cx);
+                                        }) as std::sync::Arc<dyn Fn(usize, &mut Window, &mut App) + 'static>
+                                    });
+
+                                    this.child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .w_full()
+                                            .min_w(px(0.))
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .w_full()
+                                                    .min_w(px(0.))
+                                                    .overflow_hidden()
+                                                    .cursor(CursorStyle::IBeam)
+                                                    .child(render_markdown_prose(
+                                                        &msg.text,
+                                                        &theme,
+                                                        false,
+                                                        active_sel,
+                                                        on_select_cb,
+                                                        on_drag_cb,
+                                                        msg_text_left,
+                                                        Some(win_ref),
+                                                    ))
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .justify_end()
+                                                    .items_center()
+                                                    .pt(px(2.))
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .flex_row()
+                                                            .items_center()
+                                                            .gap_1()
+                                                            .px(px(6.))
+                                                            .py(px(2.))
+                                                            .rounded(px(4.))
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .text_size(px(11.))
+                                                            .text_color(theme.muted)
+                                                            .hover(move |s| s.bg(theme.surface_raised).text_color(theme.foreground))
+                                                            .on_mouse_down(MouseButton::Left, move |_ev, _window, _cx| {
+                                                                if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                                                                    let _ = clip.set_text(text_to_copy.clone());
+                                                                }
+                                                            })
+                                                            .child(crate::ui::icons::render_icon(IconType::Copy, theme.muted, 11.0))
+                                                            .child("Copy")
+                                                    )
+                                            )
+                                    )
                                 })
                         }
-                    }))
+                    })
+                })
                     // 3. Streaming Activity
                     .when(self.is_streaming, |this| {
+                        let stream_idx = self.messages.len();
+                        let active_sel = if let Some((sel_msg, s, e)) = message_selection {
+                            if sel_msg == stream_idx { Some((s, e)) } else { None }
+                        } else {
+                            None
+                        };
+                        let on_select_cb = on_select_message_char.as_ref().map(|cb| {
+                            let cb = cb.clone();
+                            std::sync::Arc::new(move |target: usize, window: &mut Window, cx: &mut App| {
+                                cb(&(stream_idx, target), window, cx);
+                            }) as std::sync::Arc<dyn Fn(usize, &mut Window, &mut App) + 'static>
+                        });
+                        let on_drag_cb = on_drag_message_char.as_ref().map(|cb| {
+                            let cb = cb.clone();
+                            std::sync::Arc::new(move |target: usize, window: &mut Window, cx: &mut App| {
+                                cb(&(stream_idx, target), window, cx);
+                            }) as std::sync::Arc<dyn Fn(usize, &mut Window, &mut App) + 'static>
+                        });
+
                         this.child(
                             div()
                                 .flex()
@@ -1443,6 +1684,9 @@ impl RenderOnce for AiSidebar {
                                             .flex_row()
                                             .items_center()
                                             .gap_1()
+                                            .w_full()
+                                            .min_w(px(0.))
+                                            .overflow_hidden()
                                             .text_size(px(11.5))
                                             .text_color(theme.muted)
                                             .child(crate::ui::icons::render_icon(
@@ -1465,7 +1709,16 @@ impl RenderOnce for AiSidebar {
                                     d.child(render_thinking_indicator(&theme))
                                 })
                                 .when(!self.streaming_text.is_empty(), |d| {
-                                    d.child(render_markdown_prose(&self.streaming_text, &theme, true))
+                                    d.child(render_markdown_prose(
+                                        &self.streaming_text,
+                                        &theme,
+                                        true,
+                                        active_sel,
+                                        on_select_cb,
+                                        on_drag_cb,
+                                        streaming_text_left,
+                                        Some(win_ref),
+                                    ))
                                 }),
                         )
                     })
@@ -1529,6 +1782,8 @@ impl RenderOnce for AiSidebar {
                                                 .px(px(8.))
                                                 .py(px(4.))
                                                 .rounded(px(4.))
+                                                .min_w(px(0.))
+                                                .overflow_hidden()
                                                 .cursor(CursorStyle::PointingHand)
                                                 .hover(move |s| s.bg(theme.hover))
                                                 .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
@@ -1541,6 +1796,7 @@ impl RenderOnce for AiSidebar {
                                                     div()
                                                         .text_size(px(12.))
                                                         .text_color(theme.foreground)
+                                                        .overflow_hidden()
                                                         .child(SharedString::from(file_path.clone())),
                                                 )
                                         })),
@@ -1581,6 +1837,8 @@ impl RenderOnce for AiSidebar {
                                                     div()
                                                         .text_size(px(11.))
                                                         .text_color(theme.foreground)
+                                                        .max_w(px(120.))
+                                                        .overflow_hidden()
                                                         .child(SharedString::from(name)),
                                                 )
                                                 .child(
@@ -1604,6 +1862,20 @@ impl RenderOnce for AiSidebar {
                             .child(
                                 div()
                                     .id("ai-composer-input-scroll")
+                                    .relative()
+                                    .child({
+                                        let bounds_cell = composer_bounds.clone();
+                                        canvas(
+                                            |_, _, _| {},
+                                            move |bounds, _, _, _| {
+                                                if let Some(ref c) = bounds_cell {
+                                                    c.set(Some(bounds));
+                                                }
+                                            },
+                                        )
+                                        .absolute()
+                                        .size_full()
+                                    })
                                     .w_full()
                                     .min_h(px(44.))
                                     .max_h(px(140.))
@@ -1636,7 +1908,7 @@ impl RenderOnce for AiSidebar {
                                                     }),
                                             )
                                     } else {
-                                        let avail_w = (self.width - 48.0).max(80.0);
+                                        let avail_w = (self.width - 44.0).max(80.0);
                                         let max_cols = ((avail_w / 7.2).floor() as usize).max(10);
                                         let lines = crate::ui::text_input::wrap_text_into_lines(&input_val, max_cols);
                                         let num_lines = lines.len();
@@ -1661,6 +1933,8 @@ impl RenderOnce for AiSidebar {
 
                                                 let on_click_char = on_click_char.clone();
                                                 let line_start = line.start_char;
+                                                let line_text_clone = line.text.clone();
+                                                let composer_bounds = composer_bounds.clone();
 
                                                 div()
                                                     .w_full()
@@ -1670,9 +1944,19 @@ impl RenderOnce for AiSidebar {
                                                     .cursor(CursorStyle::IBeam)
                                                     .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                                                         let click_x = ev.position.x.to_f64() as f32;
-                                                        let container_left = (sidebar_w - avail_w).max(0.0) / 2.0;
-                                                        let rel_x = (click_x - container_left).max(0.0);
-                                                        let col = (rel_x / 7.2).round() as usize;
+                                                        let rel_x = if let Some(ref cbounds) = composer_bounds {
+                                                            if let Some(b) = cbounds.get() {
+                                                                (click_x - b.origin.x.to_f64() as f32).max(0.0)
+                                                            } else {
+                                                                let win_w = window.viewport_size().width.to_f64() as f32;
+                                                                (click_x - (win_w - sidebar_w + 24.0)).max(0.0)
+                                                            }
+                                                        } else {
+                                                            let win_w = window.viewport_size().width.to_f64() as f32;
+                                                            (click_x - (win_w - sidebar_w + 24.0)).max(0.0)
+                                                        };
+
+                                                        let col = crate::ui::text_input::index_for_x(&line_text_clone, rel_x, 13.0, window);
                                                         let target = line_start + col.min(line_len);
                                                         if let Some(ref cb) = on_click_char {
                                                             cb(&target, window, cx);
@@ -1685,6 +1969,7 @@ impl RenderOnce for AiSidebar {
                                                         selection,
                                                         13.0,
                                                         &theme,
+                                                        Some(win_ref),
                                                     ))
                                             }))
                                     }),
@@ -1863,7 +2148,7 @@ impl RenderOnce for AiSidebar {
                                                     }
                                                 })
                                         } else {
-                                            let is_empty = input_val.trim().is_empty();
+                                            let is_empty = input_val.trim().is_empty() && self.attached_files.is_empty();
                                             div()
                                                 .id("ai-submit-btn")
                                                 .flex()

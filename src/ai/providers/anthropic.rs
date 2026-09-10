@@ -11,14 +11,20 @@ pub struct AnthropicProvider {
     base_url: String,
     api_key: String,
     default_model: String,
+    client: ureq::Agent,
 }
 
 impl AnthropicProvider {
     pub fn new(base_url: String, api_key: String, default_model: String) -> Self {
+        let client = ureq::builder()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(60))
+            .build();
         Self {
             base_url,
             api_key,
             default_model,
+            client,
         }
     }
 }
@@ -50,7 +56,7 @@ fn convert_messages_and_system(messages: &[Message]) -> (Option<String>, Vec<ser
     for m in messages {
         match m.role {
             Role::System => {
-                system_prompts.push(m.content.clone());
+                system_prompts.push(m.content.as_text_lossy().to_string());
             }
             Role::User => {
                 if !current_user_blocks.is_empty() {
@@ -60,16 +66,52 @@ fn convert_messages_and_system(messages: &[Message]) -> (Option<String>, Vec<ser
                     }));
                     current_user_blocks.clear();
                 }
-                out_messages.push(json!({
-                    "role": "user",
-                    "content": m.content,
-                }));
+
+                match &m.content {
+                    crate::ai::model::MessageContent::Text(s) => {
+                        out_messages.push(json!({
+                            "role": "user",
+                            "content": s,
+                        }));
+                    }
+                    crate::ai::model::MessageContent::Parts(parts) => {
+                        let blocks: Vec<serde_json::Value> = parts
+                            .iter()
+                            .map(|p| match p {
+                                crate::ai::model::ContentPart::Text { text } => json!({
+                                    "type": "text",
+                                    "text": text,
+                                }),
+                                crate::ai::model::ContentPart::Image { media_type, data } => json!({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": data,
+                                    }
+                                }),
+                                crate::ai::model::ContentPart::Document { media_type, data, .. } => json!({
+                                    "type": "document",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": data,
+                                    }
+                                }),
+                            })
+                            .collect();
+                        out_messages.push(json!({
+                            "role": "user",
+                            "content": blocks,
+                        }));
+                    }
+                }
             }
             Role::Tool => {
                 current_user_blocks.push(json!({
                     "type": "tool_result",
                     "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
-                    "content": m.content,
+                    "content": m.content.as_text_lossy().to_string(),
                     "is_error": m.is_error,
                 }));
             }
@@ -82,12 +124,13 @@ fn convert_messages_and_system(messages: &[Message]) -> (Option<String>, Vec<ser
                     current_user_blocks.clear();
                 }
 
+                let text = m.content.as_text_lossy().to_string();
                 if let Some(ref tool_calls) = m.tool_calls {
                     let mut content_blocks: Vec<serde_json::Value> = Vec::new();
-                    if !m.content.is_empty() {
+                    if !text.is_empty() {
                         content_blocks.push(json!({
                             "type": "text",
-                            "text": m.content,
+                            "text": text,
                         }));
                     }
                     for tc in tool_calls {
@@ -107,7 +150,7 @@ fn convert_messages_and_system(messages: &[Message]) -> (Option<String>, Vec<ser
                 } else {
                     out_messages.push(json!({
                         "role": "assistant",
-                        "content": m.content,
+                        "content": text,
                     }));
                 }
             }
@@ -144,6 +187,7 @@ impl LanguageModel for AnthropicProvider {
         let cancel_clone = cancel.clone();
         let base_url = self.base_url.trim_end_matches('/').to_string();
         let api_key = self.api_key.clone();
+        let client = self.client.clone();
 
         std::thread::Builder::new()
             .name("ai-anthropic-stream".into())
@@ -197,15 +241,11 @@ impl LanguageModel for AnthropicProvider {
                     body["tools"] = json!(tools_json);
                 }
 
-                let agent = ureq::builder()
-                    .timeout_connect(Duration::from_secs(10))
-                    .timeout_read(Duration::from_secs(60))
-                    .build();
-
                 let build_req = |b: &serde_json::Value| {
-                    let mut r = agent.post(&url)
+                    let mut r = client.post(&url)
                         .set("Content-Type", "application/json")
-                        .set("anthropic-version", "2023-06-01");
+                        .set("anthropic-version", "2023-06-01")
+                        .set("anthropic-beta", "pdfs-2024-09-25");
                     if !api_key.is_empty() {
                         r = r.set("x-api-key", &api_key)
                              .set("Authorization", &format!("Bearer {}", api_key));

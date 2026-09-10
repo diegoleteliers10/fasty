@@ -1,5 +1,7 @@
 pub mod agent;
 pub mod config;
+pub mod document;
+pub mod image;
 pub mod model;
 pub mod permissions;
 pub mod prompt;
@@ -10,9 +12,11 @@ pub mod tools;
 
 pub use agent::{Agent, AgentEvent, CliPermissionHandler, PermissionHandler};
 pub use config::{AiConfig, PermissionMode, ProviderConfig};
+pub use document::{is_pdf_path, load_and_prepare_document};
+pub use image::load_and_prepare_image;
 pub use model::{
-    CancelToken, CompletionEvent, CompletionRequest, LanguageModel, Message, Role, StopReason,
-    ToolCall, ToolDefinition,
+    CancelToken, CompletionEvent, CompletionRequest, ContentPart, LanguageModel, Message,
+    MessageContent, Role, StopReason, ToolCall, ToolDefinition,
 };
 pub use permissions::{PermissionChecker, PermissionDecision};
 pub use prompt::system_prompt;

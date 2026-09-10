@@ -19,3 +19,4 @@ pub use tab_bar::{TabBar, TabSidebar};
 pub use text_input::{render_line_spans, wrap_text_into_lines, TextInputState, WrappedVisualLine};
 pub use theme::Theme;
 
+pub mod markdown;

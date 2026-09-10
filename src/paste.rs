@@ -233,6 +233,35 @@ pub fn get_clipboard_paste_content(clip: &mut arboard::Clipboard) -> Option<Stri
     None
 }
 
+/// Reads an image from the clipboard and returns the saved temporary PathBuf if present.
+pub fn get_clipboard_image(clip: &mut arboard::Clipboard) -> Option<PathBuf> {
+    // 1. Direct image data from arboard
+    if let Ok(image_data) = clip.get_image() {
+        if let Ok(saved_path) = save_clipboard_image(image_data) {
+            return Some(saved_path);
+        }
+    }
+
+    // 2. macOS fallback for screenshot/finder clipboard PNG
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(content) = try_macos_clipboard_fallback() {
+            let clean = content.trim().trim_matches('\'').trim_matches('"');
+            let unescaped = clean.replace("\\ ", " ");
+            let path = PathBuf::from(&unescaped);
+            if path.exists() && crate::ui::ai_sidebar::is_image_path(&path) {
+                return Some(path);
+            }
+            let direct_path = PathBuf::from(clean);
+            if direct_path.exists() && crate::ui::ai_sidebar::is_image_path(&direct_path) {
+                return Some(direct_path);
+            }
+        }
+    }
+
+    None
+}
+
 /// Writes paste text into the terminal PTY with bracketed paste if enabled.
 pub fn paste_text_to_terminal(terminal: &crate::terminal_state::TerminalState, text: &str) {
     if terminal.is_bracketed_paste_enabled() {

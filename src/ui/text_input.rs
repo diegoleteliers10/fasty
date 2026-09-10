@@ -1,11 +1,12 @@
-use gpui::{div, px, Div, ParentElement, SharedString, Styled};
+use gpui::{div, px, Div, ParentElement, SharedString, Styled, Window};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TextInputState {
     pub text: String,
     pub cursor: usize, // Character offset (0..=char_count)
     pub selection: Option<(usize, usize)>, // (start, end) where start < end
     pub drag_anchor: Option<usize>,
+    pub last_bounds: Option<gpui::Bounds<gpui::Pixels>>,
 }
 
 impl TextInputState {
@@ -16,6 +17,7 @@ impl TextInputState {
             cursor,
             selection: None,
             drag_anchor: None,
+            last_bounds: None,
         }
     }
 
@@ -233,6 +235,24 @@ impl TextInputState {
             self.drag_anchor = None;
         }
     }
+
+    pub fn index_for_position(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+        font_size: f32,
+        padding_left: f32,
+        window: &Window,
+    ) -> usize {
+        if self.text.is_empty() {
+            return 0;
+        }
+        let rel_x = if let Some(bounds) = self.last_bounds {
+            (position.x.to_f64() as f32 - bounds.origin.x.to_f64() as f32 - padding_left).max(0.0)
+        } else {
+            0.0
+        };
+        index_for_x(&self.text, rel_x, font_size, window)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +324,96 @@ pub fn wrap_text_into_lines(text: &str, max_cols: usize) -> Vec<WrappedVisualLin
     lines
 }
 
+pub fn selection_highlight_color() -> gpui::Hsla {
+    gpui::Hsla {
+        h: 215.0 / 360.0,
+        s: 0.88,
+        l: 0.52,
+        a: 0.48,
+    }
+}
+
+pub fn char_to_byte_idx(text: &str, char_idx: usize) -> usize {
+    text.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(text.len())
+}
+
+pub fn byte_to_char_idx(text: &str, byte_idx: usize) -> usize {
+    let mut count = 0;
+    for (b, _) in text.char_indices() {
+        if b >= byte_idx {
+            return count;
+        }
+        count += 1;
+    }
+    count
+}
+
+pub fn index_for_x(
+    text: &str,
+    rel_x: f32,
+    font_size: f32,
+    window: &Window,
+) -> usize {
+    if text.is_empty() || rel_x <= 0.0 {
+        return 0;
+    }
+    let char_count = text.chars().count();
+    let text_run = window.text_style().to_run(text.len());
+    let layout = window.text_system().layout_line(text, px(font_size), &[text_run], None);
+    let total_width = layout.width.to_f64() as f32;
+    if rel_x >= total_width {
+        return char_count;
+    }
+
+    let mut best_idx = 0;
+    let mut best_dist = rel_x.abs();
+
+    for i in 1..=char_count {
+        let x = if i == char_count {
+            total_width
+        } else {
+            let byte_idx = char_to_byte_idx(text, i);
+            layout.x_for_index(byte_idx).to_f64() as f32
+        };
+        let dist = (rel_x - x).abs();
+        if dist < best_dist {
+            best_dist = dist;
+            best_idx = i;
+        } else if x > rel_x {
+            break;
+        }
+    }
+
+    best_idx
+}
+
+pub fn x_for_index(
+    text: &str,
+    char_idx: usize,
+    font_size: f32,
+    window: Option<&Window>,
+) -> f32 {
+    if char_idx == 0 || text.is_empty() {
+        return 0.0;
+    }
+    let char_count = text.chars().count();
+    if let Some(w) = window {
+        let text_run = w.text_style().to_run(text.len());
+        let layout = w.text_system().layout_line(text, px(font_size), &[text_run], None);
+        if char_idx >= char_count {
+            layout.width.to_f64() as f32
+        } else {
+            let byte_idx = char_to_byte_idx(text, char_idx);
+            layout.x_for_index(byte_idx).to_f64() as f32
+        }
+    } else {
+        (char_idx as f32) * (font_size * 0.55)
+    }
+}
+
 pub fn render_line_spans(
     line_text: &str,
     start_char: usize,
@@ -311,21 +421,13 @@ pub fn render_line_spans(
     selection: Option<(usize, usize)>,
     font_size: f32,
     theme: &crate::ui::Theme,
+    window: Option<&Window>,
 ) -> Div {
     let line_len = line_text.chars().count();
     let line_end = start_char + line_len;
-    let chars: Vec<char> = line_text.chars().collect();
+    let sel_bg = selection_highlight_color();
 
-    let sel_range = selection.and_then(|(s, e)| {
-        let s_clamped = s.max(start_char).min(line_end);
-        let e_clamped = e.max(start_char).min(line_end);
-        if s_clamped < e_clamped {
-            Some((s_clamped - start_char, e_clamped - start_char))
-        } else {
-            None
-        }
-    });
-
+    // Local cursor position in 0..=line_len
     let local_cursor = cursor.and_then(|c| {
         if c >= start_char && c <= line_end {
             Some(c - start_char)
@@ -334,84 +436,70 @@ pub fn render_line_spans(
         }
     });
 
-    let mut children: Vec<Div> = Vec::new();
-
-    let mut render_segment = |text: &str, is_selected: bool, seg_start: usize| {
-        let seg_len = text.chars().count();
-        let seg_end = seg_start + seg_len;
-        let cur_in_seg = local_cursor.and_then(|c| {
-            if c >= seg_start && c <= seg_end {
-                Some(c - seg_start)
-            } else {
-                None
-            }
-        });
-
-        if let Some(c_rel) = cur_in_seg {
-            let seg_chars: Vec<char> = text.chars().collect();
-            let before: String = seg_chars[..c_rel].iter().collect();
-            let after: String = seg_chars[c_rel..].iter().collect();
-
-            if !before.is_empty() {
-                let mut d = div()
-                    .text_size(px(font_size))
-                    .text_color(theme.foreground)
-                    .child(SharedString::from(before));
-                if is_selected {
-                    d = d.bg(theme.selected).rounded(px(2.));
-                }
-                children.push(d);
-            }
-
-            children.push(
-                div()
-                    .w(px(2.))
-                    .h(px(font_size + 2.0))
-                    .rounded(px(1.))
-                    .bg(theme.accent)
-                    .flex_shrink_0(),
-            );
-
-            if !after.is_empty() {
-                let mut d = div()
-                    .text_size(px(font_size))
-                    .text_color(theme.foreground)
-                    .child(SharedString::from(after));
-                if is_selected {
-                    d = d.bg(theme.selected).rounded(px(2.));
-                }
-                children.push(d);
-            }
-        } else if !text.is_empty() {
-            let mut d = div()
-                .text_size(px(font_size))
-                .text_color(theme.foreground)
-                .child(SharedString::from(text.to_string()));
-            if is_selected {
-                d = d.bg(theme.selected).rounded(px(2.));
-            }
-            children.push(d);
+    // Local selection range in 0..=line_len
+    let local_sel = selection.and_then(|(s, e)| {
+        let s_norm = s.min(e);
+        let e_norm = s.max(e);
+        let s_clamped = s_norm.max(start_char).min(line_end);
+        let e_clamped = e_norm.max(start_char).min(line_end);
+        if s_clamped < e_clamped {
+            Some((s_clamped - start_char, e_clamped - start_char))
+        } else {
+            None
         }
-    };
+    });
 
-    if let Some((s, e)) = sel_range {
-        let pre: String = chars[..s].iter().collect();
-        let sel: String = chars[s..e].iter().collect();
-        let post: String = chars[e..].iter().collect();
+    let mut container = div()
+        .relative()
+        .flex_shrink_0()
+        .h(px(font_size + 4.0))
+        .flex()
+        .items_center();
 
-        render_segment(&pre, false, 0);
-        render_segment(&sel, true, s);
-        render_segment(&post, false, e);
-    } else {
-        render_segment(line_text, false, 0);
+    // 1. Selection highlight rectangle (under text, absolute, takes 0 flow width)
+    if let Some((s, e)) = local_sel {
+        let sel_start_x = x_for_index(line_text, s, font_size, window);
+        let sel_end_x = x_for_index(line_text, e, font_size, window);
+        let sel_w = (sel_end_x - sel_start_x).max(1.0);
+        container = container.child(
+            div()
+                .absolute()
+                .left(px(sel_start_x))
+                .top(px(1.))
+                .w(px(sel_w))
+                .h(px(font_size + 2.0))
+                .bg(sel_bg)
+                .rounded(px(2.)),
+        );
     }
 
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .flex_wrap()
-        .children(children)
+    // 2. Cursor indicator (absolute, takes 0 flow width)
+    if let Some(c) = local_cursor {
+        let cursor_x = x_for_index(line_text, c, font_size, window);
+        let snapped_x = if cursor_x > 0.0 { (cursor_x - 0.75).max(0.0) } else { 0.0 };
+        container = container.child(
+            div()
+                .absolute()
+                .left(px(snapped_x))
+                .top(px(1.))
+                .w(px(1.5))
+                .h(px(font_size + 2.0))
+                .bg(theme.accent)
+                .rounded(px(1.)),
+        );
+    }
+
+    // 3. Text content (single continuous element, NEVER split, NEVER shifts)
+    if line_len > 0 {
+        container = container.child(
+            div()
+                .text_size(px(font_size))
+                .text_color(theme.foreground)
+                .child(SharedString::from(line_text.to_string())),
+        );
+    }
+
+    container
 }
 
 #[cfg(test)]
@@ -445,5 +533,13 @@ mod tests {
         assert!(lines.len() >= 3);
         let reconstructed = lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("");
         assert_eq!(reconstructed, text);
+    }
+
+    #[test]
+    fn test_render_line_spans_partitions() {
+        let theme = crate::ui::Theme::default();
+        let _ = render_line_spans("hello world", 0, Some(5), Some((2, 8)), 12.0, &theme, None);
+        let _ = render_line_spans("", 0, Some(0), None, 12.0, &theme, None);
+        let _ = render_line_spans("abc", 0, None, Some((0, 3)), 12.0, &theme, None);
     }
 }

@@ -1,4 +1,5 @@
 //! fastty library - GPUI terminal emulator
+#![recursion_limit = "512"]
 
 pub mod ai;
 pub mod cli;

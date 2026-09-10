@@ -1,6 +1,7 @@
 use gpui::{
-    Context, CursorStyle, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, Render, ScrollHandle,
-    SharedString, Window, WindowControlArea, WindowHandle, div, prelude::*, px,
+    canvas, Context, CursorStyle, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Render, ScrollHandle, SharedString, Window, WindowControlArea, WindowHandle, div,
+    prelude::*, px,
 };
 use icons::common::IconType;
 use parking_lot::Mutex;
@@ -141,6 +142,11 @@ pub struct SettingsView {
     pub ai_model_state: crate::ui::TextInputState,
     pub detected_ollama_models: Vec<String>,
     pub ai_test_status: AiTestStatus,
+    pub search_input_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    pub ai_model_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    pub ai_base_url_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    pub ai_api_key_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    pub is_dragging_input: bool,
 }
 
 impl SettingsView {
@@ -262,6 +268,11 @@ impl SettingsView {
             ai_model_input,
             detected_ollama_models,
             ai_test_status: AiTestStatus::Idle,
+            search_input_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
+            ai_model_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
+            ai_base_url_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
+            ai_api_key_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
+            is_dragging_input: false,
         }
     }
 
@@ -1004,7 +1015,7 @@ fn render_card_row(
 }
 
 impl SettingsView {
-    fn render_sidebar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tabs = [
             (SettingsTab::General, None),
             (SettingsTab::Appearance, None),
@@ -1066,47 +1077,64 @@ impl SettingsView {
                     .items_center()
                     .gap_2()
                     .cursor(CursorStyle::IBeam)
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                         this.active_input_field = Some(ActiveInputField::Search);
-                        let click_x = ev.position.x.to_f64() as f32;
-                        let text_left = 12.0 + 10.0 + 16.0;
-                        let rel_x = (click_x - text_left).max(0.0);
-                        let col = (rel_x / 7.2).round() as usize;
-                        this.search_input.set_cursor(col);
+                        this.search_input.last_bounds = this.search_input_bounds.get();
+                        let col = this.search_input.index_for_position(ev.position, 11.5, 0.0, window);
+                        this.search_input.start_drag(col);
+                        this.is_dragging_input = true;
                         cx.notify();
                     }))
                     .child(render_icon(IconType::Search, if is_search_active { theme.accent } else { theme.muted }, 12.0))
-                    .child(if query.is_empty() {
+                    .child(
                         div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .when(is_search_active, |this| {
-                                this.child(
-                                    div()
-                                        .w(px(2.))
-                                        .h(px(13.))
-                                        .rounded(px(1.))
-                                        .bg(theme.accent)
-                                        .mr(px(2.)),
+                            .relative()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child({
+                                let bounds_cell = self.search_input_bounds.clone();
+                                canvas(
+                                    |_, _, _| {},
+                                    move |bounds, _, _, _| {
+                                        bounds_cell.set(Some(bounds));
+                                    },
+                                )
+                                .absolute()
+                                .size_full()
+                            })
+                            .child(if query.is_empty() {
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .when(is_search_active, |this| {
+                                        this.child(
+                                            div()
+                                                .w(px(2.))
+                                                .h(px(13.))
+                                                .rounded(px(1.))
+                                                .bg(theme.accent)
+                                                .mr(px(2.)),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(theme.muted)
+                                            .child("Search settings..."),
+                                    )
+                            } else {
+                                crate::ui::text_input::render_line_spans(
+                                    &query,
+                                    0,
+                                    if is_search_active { Some(self.search_input.cursor) } else { None },
+                                    self.search_input.selection,
+                                    11.5,
+                                    theme,
+                                    Some(window),
                                 )
                             })
-                            .child(
-                                div()
-                                    .text_size(px(11.5))
-                                    .text_color(theme.muted)
-                                    .child("Search settings..."),
-                            )
-                    } else {
-                        crate::ui::text_input::render_line_spans(
-                            &query,
-                            0,
-                            if is_search_active { Some(self.search_input.cursor) } else { None },
-                            self.search_input.selection,
-                            11.5,
-                            theme,
-                        )
-                    })
+                    )
             })
             // App Branding / Profile Card
             .child(
@@ -1208,7 +1236,7 @@ impl SettingsView {
             )
     }
 
-    fn render_content_pane(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_content_pane(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("settings-content-pane")
             .flex_1()
@@ -1246,9 +1274,9 @@ impl SettingsView {
                                     .child(self.active_tab.label()),
                             ),
                     )
+                    // Drag region to move window
                     .child(
                         div()
-                            .id("settings-header-drag")
                             .flex_1()
                             .h_full()
                             .window_control_area(WindowControlArea::Drag)
@@ -1311,7 +1339,7 @@ impl SettingsView {
                         SettingsTab::General => self.render_tab_general(theme, cx),
                         SettingsTab::Appearance => self.render_tab_appearance(theme, cx),
                         SettingsTab::Keyboard => self.render_tab_keyboard(theme, cx),
-                        SettingsTab::Ai => self.render_tab_ai(theme, cx),
+                        SettingsTab::Ai => self.render_tab_ai(theme, window, cx),
                         SettingsTab::Migration => self.render_tab_migration(theme, cx),
                         SettingsTab::Advanced => self.render_tab_advanced(theme, cx),
                     }),
@@ -2016,7 +2044,7 @@ impl SettingsView {
             )
     }
 
-    fn render_tab_ai(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_tab_ai(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let providers = [
             ("ollama", "Ollama", "Local / Free", "Offline private models on localhost:11434"),
             ("anthropic", "Anthropic", "Cloud API", "Claude 3.7 Sonnet & 3.5 Haiku"),
@@ -2161,6 +2189,18 @@ impl SettingsView {
                                 div()
                                     .w(px(210.))
                                     .h(px(30.))
+                                    .relative()
+                                    .child({
+                                        let bounds_cell = self.ai_model_bounds.clone();
+                                        canvas(
+                                            |_, _, _| {},
+                                            move |bounds, _, _, _| {
+                                                bounds_cell.set(Some(bounds));
+                                            },
+                                        )
+                                        .absolute()
+                                        .size_full()
+                                    })
                                     .px(px(8.))
                                     .rounded(px(6.))
                                     .bg(theme.surface_raised)
@@ -2173,12 +2213,10 @@ impl SettingsView {
                                     .cursor(CursorStyle::IBeam)
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                                         this.active_input_field = Some(ActiveInputField::AiModel);
-                                        let click_x = ev.position.x.to_f64() as f32;
-                                        let win_w = window.viewport_size().width.to_f64() as f32;
-                                        let box_left = win_w - 24.0 - 210.0 + 8.0;
-                                        let rel_x = (click_x - box_left).max(0.0);
-                                        let col = (rel_x / 7.2).round() as usize;
-                                        this.ai_model_state.set_cursor(col);
+                                        this.ai_model_state.last_bounds = this.ai_model_bounds.get();
+                                        let col = this.ai_model_state.index_for_position(ev.position, 11.0, 8.0, window);
+                                        this.ai_model_state.start_drag(col);
+                                        this.is_dragging_input = true;
                                         cx.notify();
                                     }))
                                     .child(
@@ -2223,6 +2261,7 @@ impl SettingsView {
                                                     self.ai_model_state.selection,
                                                     11.0,
                                                     theme,
+                                                    Some(window),
                                                 )
                                             }),
                                     )
@@ -2360,6 +2399,18 @@ impl SettingsView {
                                         div()
                                             .w(px(210.))
                                             .h(px(30.))
+                                            .relative()
+                                            .child({
+                                                let bounds_cell = self.ai_base_url_bounds.clone();
+                                                canvas(
+                                                    |_, _, _| {},
+                                                    move |bounds, _, _, _| {
+                                                        bounds_cell.set(Some(bounds));
+                                                    },
+                                                )
+                                                .absolute()
+                                                .size_full()
+                                            })
                                             .px(px(8.))
                                             .rounded(px(6.))
                                             .bg(theme.surface_raised)
@@ -2370,12 +2421,10 @@ impl SettingsView {
                                             .cursor(CursorStyle::IBeam)
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                                                 this.active_input_field = Some(ActiveInputField::AiBaseUrl);
-                                                let click_x = ev.position.x.to_f64() as f32;
-                                                let win_w = window.viewport_size().width.to_f64() as f32;
-                                                let box_left = win_w - 24.0 - 210.0 - 55.0;
-                                                let rel_x = (click_x - box_left).max(0.0);
-                                                let col = (rel_x / 7.2).round() as usize;
-                                                this.ai_base_url_state.set_cursor(col);
+                                                this.ai_base_url_state.last_bounds = this.ai_base_url_bounds.get();
+                                                let col = this.ai_base_url_state.index_for_position(ev.position, 11.0, 8.0, window);
+                                                this.ai_base_url_state.start_drag(col);
+                                                this.is_dragging_input = true;
                                                 cx.notify();
                                             }))
                                             .child(if url_val.is_empty() {
@@ -2407,6 +2456,7 @@ impl SettingsView {
                                                     self.ai_base_url_state.selection,
                                                     11.0,
                                                     theme,
+                                                    Some(window),
                                                 )
                                             }),
                                     )
@@ -2442,6 +2492,18 @@ impl SettingsView {
                                         div()
                                             .w(px(210.))
                                             .h(px(30.))
+                                            .relative()
+                                            .child({
+                                                let bounds_cell = self.ai_api_key_bounds.clone();
+                                                canvas(
+                                                    |_, _, _| {},
+                                                    move |bounds, _, _, _| {
+                                                        bounds_cell.set(Some(bounds));
+                                                    },
+                                                )
+                                                .absolute()
+                                                .size_full()
+                                            })
                                             .px(px(8.))
                                             .rounded(px(6.))
                                             .bg(theme.surface_raised)
@@ -2452,12 +2514,10 @@ impl SettingsView {
                                             .cursor(CursorStyle::IBeam)
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                                                 this.active_input_field = Some(ActiveInputField::AiApiKey);
-                                                let click_x = ev.position.x.to_f64() as f32;
-                                                let win_w = window.viewport_size().width.to_f64() as f32;
-                                                let box_left = win_w - 24.0 - 210.0 - 55.0;
-                                                let rel_x = (click_x - box_left).max(0.0);
-                                                let col = (rel_x / 7.2).round() as usize;
-                                                this.ai_api_key_state.set_cursor(col);
+                                                this.ai_api_key_state.last_bounds = this.ai_api_key_bounds.get();
+                                                let col = this.ai_api_key_state.index_for_position(ev.position, 11.0, 8.0, window);
+                                                this.ai_api_key_state.start_drag(col);
+                                                this.is_dragging_input = true;
                                                 cx.notify();
                                             }))
                                             .child(if key_val.is_empty() {
@@ -2489,6 +2549,7 @@ impl SettingsView {
                                                     self.ai_api_key_state.selection,
                                                     11.0,
                                                     theme,
+                                                    Some(window),
                                                 )
                                             } else {
                                                 div()
@@ -2956,16 +3017,67 @@ impl SettingsView {
                     ),
             )
     }
+    fn handle_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_dragging_input {
+            return;
+        }
+        if let Some(field) = self.active_input_field {
+            match field {
+                ActiveInputField::Search => {
+                    self.search_input.last_bounds = self.search_input_bounds.get();
+                    let col = self.search_input.index_for_position(ev.position, 11.5, 0.0, window);
+                    self.search_input.update_drag(col);
+                    self.search_query = self.search_input.text.clone();
+                    cx.notify();
+                }
+                ActiveInputField::AiModel => {
+                    self.ai_model_state.last_bounds = self.ai_model_bounds.get();
+                    let col = self.ai_model_state.index_for_position(ev.position, 11.0, 8.0, window);
+                    self.ai_model_state.update_drag(col);
+                    self.ai_model_input = self.ai_model_state.text.clone();
+                    cx.notify();
+                }
+                ActiveInputField::AiBaseUrl => {
+                    self.ai_base_url_state.last_bounds = self.ai_base_url_bounds.get();
+                    let col = self.ai_base_url_state.index_for_position(ev.position, 11.0, 8.0, window);
+                    self.ai_base_url_state.update_drag(col);
+                    self.ai_base_url_input = self.ai_base_url_state.text.clone();
+                    cx.notify();
+                }
+                ActiveInputField::AiApiKey => {
+                    self.ai_api_key_state.last_bounds = self.ai_api_key_bounds.get();
+                    let col = self.ai_api_key_state.index_for_position(ev.position, 11.0, 8.0, window);
+                    self.ai_api_key_state.update_drag(col);
+                    self.ai_api_key_input = self.ai_api_key_state.text.clone();
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn handle_mouse_up(&mut self, _ev: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_dragging_input {
+            self.is_dragging_input = false;
+            self.search_input.end_drag();
+            self.ai_model_state.end_drag();
+            self.ai_base_url_state.end_drag();
+            self.ai_api_key_state.end_drag();
+            cx.notify();
+        }
+    }
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        let win_ref = &*window;
 
         div()
             .track_focus(&self.focus_handle)
             .key_context("SettingsView")
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_mouse_move(cx.listener(Self::handle_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
             .w_full()
             .h_full()
             .bg(theme.window_fill())
@@ -2973,7 +3085,7 @@ impl Render for SettingsView {
             .flex()
             .flex_row()
             .overflow_hidden()
-            .child(self.render_sidebar(&theme, cx))
-            .child(self.render_content_pane(&theme, cx))
+            .child(self.render_sidebar(&theme, win_ref, cx))
+            .child(self.render_content_pane(&theme, win_ref, cx))
     }
 }

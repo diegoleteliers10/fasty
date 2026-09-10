@@ -899,6 +899,7 @@ pub struct RootView {
     pub ssh_manager_scroll_handle: ScrollHandle,
     pub worktree_picker_scroll_handle: ScrollHandle,
     pub project_jumper_scroll_handle: ScrollHandle,
+    pub ai_scroll_handle: ScrollHandle,
     pub typed_prompt_buf: String,
     pub selection: Option<Selection>,
     pub is_selecting: bool,
@@ -960,6 +961,13 @@ pub struct RootView {
     pub ai_attached_files: Vec<std::path::PathBuf>,
     pub ai_at_menu_open: bool,
     pub ai_at_matches: Vec<String>,
+    /// Incoming stream deltas not yet revealed in the UI. Drained at ~28fps by the ticker.
+    pub ai_pending_text: String,
+    pub ai_pending_thinking: String,
+    pub ai_composer_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    pub ai_message_selection: Option<(usize, usize, usize)>,
+    pub ai_message_selection_anchor: Option<(usize, usize)>,
+    pub is_dragging_message_selection: bool,
 }
 
 
@@ -1078,7 +1086,33 @@ impl RootView {
                         needs_notify = true;
                     }
 
+                    // Progressive AI stream reveal (smooth word-by-word / token-by-token effect)
+                    let text_len = this.ai_pending_text.len();
+                    if text_len > 0 {
+                        // Dynamic drain rate: base 6 chars per 35ms tick (~170 chars/s),
+                        // or text_len / 4 to smoothly catch up if a large chunk arrives.
+                        let drain_size = 6.max(text_len / 4).min(text_len);
+                        let mut actual_drain = drain_size;
+                        while actual_drain < text_len && !this.ai_pending_text.is_char_boundary(actual_drain) {
+                            actual_drain += 1;
+                        }
+                        this.ai_streaming_text.extend(this.ai_pending_text.drain(..actual_drain));
+                        needs_notify = true;
+                    }
+
+                    let think_len = this.ai_pending_thinking.len();
+                    if think_len > 0 {
+                        let drain_size = 12.max(think_len / 3).min(think_len);
+                        let mut actual_drain = drain_size;
+                        while actual_drain < think_len && !this.ai_pending_thinking.is_char_boundary(actual_drain) {
+                            actual_drain += 1;
+                        }
+                        this.ai_streaming_thinking.extend(this.ai_pending_thinking.drain(..actual_drain));
+                        needs_notify = true;
+                    }
+
                     if needs_notify {
+                        this.scroll_ai_to_bottom();
                         cx.notify();
                     }
                 });
@@ -1168,6 +1202,7 @@ impl RootView {
             ssh_manager_scroll_handle: ScrollHandle::new(),
             worktree_picker_scroll_handle: ScrollHandle::new(),
             project_jumper_scroll_handle: ScrollHandle::new(),
+            ai_scroll_handle: ScrollHandle::new(),
             typed_prompt_buf: String::new(),
             selection: None,
             is_selecting: false,
@@ -1224,6 +1259,12 @@ impl RootView {
             ai_attached_files: Vec::new(),
             ai_at_menu_open: false,
             ai_at_matches: Vec::new(),
+            ai_pending_text: String::new(),
+            ai_pending_thinking: String::new(),
+            ai_composer_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
+            ai_message_selection: None,
+            ai_message_selection_anchor: None,
+            is_dragging_message_selection: false,
         };
 
 
@@ -2600,6 +2641,14 @@ impl RootView {
         if let Some(token) = self.ai_cancel_token.take() {
             token.cancel();
         }
+        if !self.ai_pending_text.is_empty() {
+            self.ai_streaming_text.push_str(&self.ai_pending_text);
+            self.ai_pending_text.clear();
+        }
+        if !self.ai_pending_thinking.is_empty() {
+            self.ai_streaming_thinking.push_str(&self.ai_pending_thinking);
+            self.ai_pending_thinking.clear();
+        }
         self.ai_is_streaming = false;
     }
 
@@ -2704,7 +2753,7 @@ impl RootView {
 
     pub fn submit_ai_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.ai_input_state.text.trim().to_string();
-        if text.is_empty() || self.ai_is_streaming {
+        if (text.is_empty() && self.ai_attached_files.is_empty()) || self.ai_is_streaming {
             return;
         }
         self.ai_input_state.clear();
@@ -2743,10 +2792,15 @@ impl RootView {
 
         // 2. Attach any files/images selected with clip picker
         let attached = std::mem::take(&mut self.ai_attached_files);
+        let mut attached_images: Vec<std::path::PathBuf> = Vec::new();
+        let mut attached_documents: Vec<std::path::PathBuf> = Vec::new();
         for path in attached {
             let is_img = crate::ui::ai_sidebar::is_image_path(&path);
+            let is_pdf = crate::ai::is_pdf_path(&path);
             if is_img {
-                augmented_content.push_str(&format!("\n\n[Attached image: {}]", path.display()));
+                attached_images.push(path);
+            } else if is_pdf {
+                attached_documents.push(path);
             } else if path.is_file() {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     let max_chars = 16_000;
@@ -2757,7 +2811,7 @@ impl RootView {
                     };
                     augmented_content.push_str(&format!("\n\n[Attached file: {}]\n```\n{}\n```", path.display(), snippet));
                 } else {
-                    augmented_content.push_str(&format!("\n\n[Attached file: {}]", path.display()));
+                    augmented_content.push_str(&format!("\n\n[Attached binary file: {}]", path.display()));
                 }
             }
         }
@@ -2768,7 +2822,10 @@ impl RootView {
             thinking: None,
             tool_calls: Vec::new(),
             timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+            images: attached_images.clone(),
+            documents: attached_documents.clone(),
         });
+        self.ai_scroll_handle.scroll_to_bottom();
 
         let cfg = self.config.ai.clone();
         let active_prov = self.config.ai.default.clone();
@@ -2786,6 +2843,8 @@ impl RootView {
                     thinking: None,
                     tool_calls: Vec::new(),
                     timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                    images: Vec::new(),
+                    documents: Vec::new(),
                 });
                 cx.notify();
                 return;
@@ -2857,6 +2916,8 @@ impl RootView {
         self.ai_is_streaming = true;
         self.ai_streaming_text.clear();
         self.ai_streaming_thinking.clear();
+        self.ai_pending_text.clear();
+        self.ai_pending_thinking.clear();
 
         let sys_prompt = if self.ai_agent_mode == "Ask" {
             format!(
@@ -2871,7 +2932,61 @@ impl RootView {
         for (idx, m) in self.ai_messages.iter().enumerate() {
             if m.is_user {
                 if idx == last_idx {
-                    agent.add_message(crate::ai::Message::user(&augmented_content));
+                    if !attached_images.is_empty() || !attached_documents.is_empty() {
+                        let mut parts = Vec::new();
+                        for img_path in &attached_images {
+                            match crate::ai::load_and_prepare_image(img_path) {
+                                Ok(part) => parts.push(part),
+                                Err(e) => {
+                                    augmented_content.push_str(&format!("\n\n[Attached image error {}: {}]", img_path.display(), e));
+                                }
+                            }
+                        }
+                        for doc_path in &attached_documents {
+                            match crate::ai::load_and_prepare_document(doc_path) {
+                                Ok(part) => parts.push(part),
+                                Err(e) => {
+                                    augmented_content.push_str(&format!("\n\n[Attached PDF error {}: {}]", doc_path.display(), e));
+                                }
+                            }
+                        }
+                        let prompt_text = if augmented_content.trim().is_empty() {
+                            if !attached_documents.is_empty() {
+                                "Analyze and summarize this document.".to_string()
+                            } else {
+                                "Describe this image and analyze its contents.".to_string()
+                            }
+                        } else {
+                            augmented_content.clone()
+                        };
+                        parts.push(crate::ai::ContentPart::Text { text: prompt_text });
+                        agent.add_message(crate::ai::Message::user_parts(parts));
+                    } else {
+                        agent.add_message(crate::ai::Message::user(&augmented_content));
+                    }
+                } else if !m.images.is_empty() || !m.documents.is_empty() {
+                    let mut parts = Vec::new();
+                    for img_path in &m.images {
+                        if let Ok(part) = crate::ai::load_and_prepare_image(img_path) {
+                            parts.push(part);
+                        }
+                    }
+                    for doc_path in &m.documents {
+                        if let Ok(part) = crate::ai::load_and_prepare_document(doc_path) {
+                            parts.push(part);
+                        }
+                    }
+                    let prompt_text = if m.text.trim().is_empty() {
+                        if !m.documents.is_empty() {
+                            "Analyze and summarize this document.".to_string()
+                        } else {
+                            "Describe this image and analyze its contents.".to_string()
+                        }
+                    } else {
+                        m.text.clone()
+                    };
+                    parts.push(crate::ai::ContentPart::Text { text: prompt_text });
+                    agent.add_message(crate::ai::Message::user_parts(parts));
                 } else {
                     agent.add_message(crate::ai::Message::user(&m.text));
                 }
@@ -2914,12 +3029,28 @@ impl RootView {
                 let _ = this.update_in(cx, |this, _window, cx| {
                     match ev {
                         crate::ai::AgentEvent::TextDelta(d) => {
-                            this.ai_streaming_text.push_str(&d);
+                            this.ai_pending_text.push_str(&d);
+                            // Do not call cx.notify() here!
+                            // The 35ms ticker progressively drains ai_pending_text into ai_streaming_text,
+                            // giving a smooth, word-by-word streaming effect without GPUI frame coalescing dumps.
+                            return;
                         }
                         crate::ai::AgentEvent::ThinkingDelta(t) => {
-                            this.ai_streaming_thinking.push_str(&t);
+                            this.ai_pending_thinking.push_str(&t);
+                            // Also smooth reveal for thinking deltas
+                            return;
                         }
                         crate::ai::AgentEvent::ToolStart { id, name, args } => {
+                            // Flush any buffered streaming text and thinking before running the tool
+                            if !this.ai_pending_text.is_empty() {
+                                this.ai_streaming_text.push_str(&this.ai_pending_text);
+                                this.ai_pending_text.clear();
+                            }
+                            if !this.ai_pending_thinking.is_empty() {
+                                this.ai_streaming_thinking.push_str(&this.ai_pending_thinking);
+                                this.ai_pending_thinking.clear();
+                            }
+
                             if let Some(last) = this.ai_messages.last_mut() {
                                 if !last.is_user {
                                     last.tool_calls.push(crate::ui::ai_sidebar::AiUiToolCall {
@@ -2944,6 +3075,8 @@ impl RootView {
                                             is_running: true,
                                         }],
                                         timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                                        images: Vec::new(),
+                                        documents: Vec::new(),
                                     });
                                 }
                             }
@@ -2964,6 +3097,16 @@ impl RootView {
                             }
                         }
                         crate::ai::AgentEvent::TurnEnd => {
+                            // Flush any remaining buffered text/thinking
+                            if !this.ai_pending_text.is_empty() {
+                                this.ai_streaming_text.push_str(&this.ai_pending_text);
+                                this.ai_pending_text.clear();
+                            }
+                            if !this.ai_pending_thinking.is_empty() {
+                                this.ai_streaming_thinking.push_str(&this.ai_pending_thinking);
+                                this.ai_pending_thinking.clear();
+                            }
+
                             let text = std::mem::take(&mut this.ai_streaming_text);
                             let thinking = if this.ai_streaming_thinking.is_empty() {
                                 None
@@ -2982,6 +3125,8 @@ impl RootView {
                                     thinking,
                                     tool_calls: Vec::new(),
                                     timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                                    images: Vec::new(),
+                                    documents: Vec::new(),
                                 });
                             } else if !has_last_tools {
                                 this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
@@ -2990,6 +3135,8 @@ impl RootView {
                                     thinking: None,
                                     tool_calls: Vec::new(),
                                     timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                                    images: Vec::new(),
+                                    documents: Vec::new(),
                                 });
                             }
                             this.ai_is_streaming = false;
@@ -2997,19 +3144,32 @@ impl RootView {
                         }
                         crate::ai::AgentEvent::Usage { input, output } => {
                             this.ai_last_usage = Some((input, output));
+                            return;
                         }
                         crate::ai::AgentEvent::Error(err) => {
+                            if !this.ai_pending_text.is_empty() {
+                                this.ai_streaming_text.push_str(&this.ai_pending_text);
+                                this.ai_pending_text.clear();
+                            }
+                            if !this.ai_pending_thinking.is_empty() {
+                                this.ai_streaming_thinking.push_str(&this.ai_pending_thinking);
+                                this.ai_pending_thinking.clear();
+                            }
+
                             this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
                                 is_user: false,
                                 text: format!("Error: {}", err),
                                 thinking: None,
                                 tool_calls: Vec::new(),
                                 timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                                images: Vec::new(),
+                                documents: Vec::new(),
                             });
                             this.ai_is_streaming = false;
                             this.ai_cancel_token = None;
                         }
                     }
+                    this.scroll_ai_to_bottom();
                     cx.notify();
                 });
             }
@@ -3017,6 +3177,12 @@ impl RootView {
         .detach();
 
         cx.notify();
+    }
+
+    pub fn scroll_ai_to_bottom(&self) {
+        if self.ai_is_streaming {
+            self.ai_scroll_handle.scroll_to_bottom();
+        }
     }
 
     fn render_ai_sidebar(
@@ -3047,6 +3213,7 @@ impl RootView {
             provider,
             model,
         )
+        .scroll_handle(self.ai_scroll_handle.clone())
         .agent_mode(self.ai_agent_mode.clone())
         .expanded_thinkings(self.ai_expanded_thinkings.clone())
         .cwd(active_cwd)
@@ -3063,6 +3230,27 @@ impl RootView {
         .cursor_pos(self.ai_input_state.cursor)
         .selection(self.ai_input_state.selection)
         .is_focused(self.ai_input_focused)
+        .composer_bounds(self.ai_composer_bounds.clone())
+        .message_selection(self.ai_message_selection)
+        .on_select_message_char(cx.listener(|this, (msg_idx, target): &(usize, usize), _window, cx| {
+            this.ai_input_state.selection = None;
+            this.ai_message_selection_anchor = Some((*msg_idx, *target));
+            this.ai_message_selection = Some((*msg_idx, *target, *target));
+            this.is_dragging_message_selection = true;
+            cx.notify();
+        }))
+        .on_drag_message_char(cx.listener(|this, (msg_idx, target): &(usize, usize), _window, cx| {
+            if this.is_dragging_message_selection {
+                if let Some((anchor_msg, anchor_char)) = this.ai_message_selection_anchor {
+                    if anchor_msg == *msg_idx {
+                        let s = anchor_char.min(*target);
+                        let e = anchor_char.max(*target);
+                        this.ai_message_selection = Some((*msg_idx, s, e));
+                        cx.notify();
+                    }
+                }
+            }
+        }))
         .on_toggle_mode(cx.listener(|this, mode: &String, _window, cx| {
             this.ai_agent_mode = mode.clone();
             cx.notify();
@@ -3104,6 +3292,8 @@ impl RootView {
             this.ai_messages.clear();
             this.ai_streaming_text.clear();
             this.ai_streaming_thinking.clear();
+            this.ai_pending_text.clear();
+            this.ai_pending_thinking.clear();
             this.ai_expanded_thinkings.clear();
             this.ai_attached_files.clear();
             this.ai_at_menu_open = false;
@@ -3118,6 +3308,8 @@ impl RootView {
         .on_click_char(cx.listener(|this, target: &usize, _window, cx| {
             this.ai_input_focused = true;
             this.is_dragging_ai_input = true;
+            this.ai_message_selection = None;
+            this.ai_message_selection_anchor = None;
             this.ai_input_state.start_drag(*target);
             this.ai_input_text = this.ai_input_state.text.clone();
             cx.notify();
@@ -3133,6 +3325,8 @@ impl RootView {
             this.ai_messages.clear();
             this.ai_streaming_text.clear();
             this.ai_streaming_thinking.clear();
+            this.ai_pending_text.clear();
+            this.ai_pending_thinking.clear();
             this.ai_expanded_thinkings.clear();
             this.ai_attached_files.clear();
             this.ai_at_menu_open = false;
@@ -3167,6 +3361,12 @@ impl RootView {
         div()
             .relative()
             .h_full()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                if !this.ai_input_focused {
+                    this.ai_input_focused = true;
+                    cx.notify();
+                }
+            }))
             .child(sidebar)
             .child(
                 div()
@@ -3465,6 +3665,27 @@ impl RootView {
                     if let Some(mut clip) = crate::event_listener::clipboard_helper() {
                         let _ = clip.set_text(sel_text);
                     }
+                    return;
+                }
+                if let Some((msg_idx, s, e)) = self.ai_message_selection {
+                    if s < e {
+                        let text = if msg_idx < self.ai_messages.len() {
+                            Some(self.ai_messages[msg_idx].text.as_str())
+                        } else if msg_idx == self.ai_messages.len() && !self.ai_streaming_text.is_empty() {
+                            Some(self.ai_streaming_text.as_str())
+                        } else {
+                            None
+                        };
+                        if let Some(txt) = text {
+                            let selected: String = txt.chars().skip(s).take(e - s).collect();
+                            if !selected.is_empty() {
+                                if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                                    let _ = clip.set_text(selected);
+                                }
+                                return;
+                            }
+                        }
+                    }
                 }
                 return;
             }
@@ -3488,6 +3709,11 @@ impl RootView {
                 || (!cfg!(target_os = "macos") && is_ctrl && key_lower == "v");
             if is_paste {
                 if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                    if let Some(img_path) = crate::paste::get_clipboard_image(&mut clip) {
+                        self.ai_attached_files.push(img_path);
+                        cx.notify();
+                        return;
+                    }
                     if let Ok(text) = clip.get_text() {
                         self.ai_input_state.insert_str(&text);
                         self.ai_input_text = self.ai_input_state.text.clone();
@@ -4326,6 +4552,26 @@ impl RootView {
                     return;
                 }
                 Action::Copy => {
+                    if let Some((msg_idx, s, e)) = self.ai_message_selection {
+                        if s < e {
+                            let text = if msg_idx < self.ai_messages.len() {
+                                Some(self.ai_messages[msg_idx].text.as_str())
+                            } else if msg_idx == self.ai_messages.len() && !self.ai_streaming_text.is_empty() {
+                                Some(self.ai_streaming_text.as_str())
+                            } else {
+                                None
+                            };
+                            if let Some(txt) = text {
+                                let selected: String = txt.chars().skip(s).take(e - s).collect();
+                                if !selected.is_empty() {
+                                    if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                                        let _ = clip.set_text(selected);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     if let Some(text) = self.get_selected_text() {
                         if let Some(mut clip) = crate::event_listener::clipboard_helper() {
                             let _ = clip.set_text(text);
@@ -4640,6 +4886,16 @@ impl RootView {
             return;
         };
 
+        // Click in terminal area unfocuses the AI input so keystrokes go to the terminal.
+        if self.ai_sidebar_open && self.ai_input_focused {
+            let win_w = window.viewport_size().width.to_f64() as f32;
+            let sidebar_left = win_w - self.ai_sidebar_width;
+            if (event.position.x.to_f64() as f32) < sidebar_left {
+                self.ai_input_focused = false;
+                cx.notify();
+            }
+        }
+
         let (cell_w, line_h) = self.measure_cell_metrics(window);
         let sidebar_w = self.current_sidebar_width();
         let local_x = (event.position.x.to_f64() as f32 - sidebar_w - 1.0).max(0.0);
@@ -4752,25 +5008,24 @@ impl RootView {
         }
 
         if self.is_dragging_ai_input {
-            let win_w = _window.viewport_size().width.to_f64() as f32;
-            let sidebar_left = win_w - self.ai_sidebar_width;
-            let text_left = sidebar_left + 8.0 + 8.0;
-            let rel_x = (cur_x - text_left).max(0.0);
-            let col = (rel_x / 7.2).round() as usize;
+            let (rel_x, rel_y) = if let Some(bounds) = self.ai_composer_bounds.get() {
+                (
+                    (cur_x - bounds.origin.x.to_f64() as f32).max(0.0),
+                    (cur_y - bounds.origin.y.to_f64() as f32).max(0.0),
+                )
+            } else {
+                let win_w = _window.viewport_size().width.to_f64() as f32;
+                let text_left = win_w - self.ai_sidebar_width + 22.0;
+                ((cur_x - text_left).max(0.0), 0.0)
+            };
 
             let avail_w = (self.ai_sidebar_width - 44.0).max(80.0);
             let max_cols = ((avail_w / 7.2).floor() as usize).max(10);
             let lines = crate::ui::text_input::wrap_text_into_lines(&self.ai_input_state.text, max_cols);
-            let win_h = _window.viewport_size().height.to_f64() as f32;
-            let box_bottom = win_h - 48.0;
             let line_h = 18.0;
-            let box_top = box_bottom - (lines.len() as f32 * line_h);
-            let line_idx = if cur_y < box_top {
-                0
-            } else {
-                (((cur_y - box_top) / line_h).floor() as usize).min(lines.len().saturating_sub(1))
-            };
+            let line_idx = ((rel_y / line_h).floor() as usize).min(lines.len().saturating_sub(1));
             if let Some(target_line) = lines.get(line_idx) {
+                let col = crate::ui::text_input::index_for_x(&target_line.text, rel_x, 13.0, _window);
                 let char_idx = (target_line.start_char + col).min(target_line.start_char + target_line.text.chars().count());
                 self.ai_input_state.update_drag(char_idx);
                 self.ai_input_text = self.ai_input_state.text.clone();
@@ -4964,6 +5219,16 @@ impl RootView {
         if self.is_dragging_ai_input {
             self.is_dragging_ai_input = false;
             self.ai_input_state.end_drag();
+        }
+        if self.is_dragging_message_selection {
+            self.is_dragging_message_selection = false;
+            if let Some((_, s, e)) = self.ai_message_selection {
+                if s == e {
+                    self.ai_message_selection = None;
+                    self.ai_message_selection_anchor = None;
+                }
+            }
+            cx.notify();
         }
         self.dragging_split_path.clear();
         self.selection_mouse_pos = None;

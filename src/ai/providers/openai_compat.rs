@@ -11,14 +11,20 @@ pub struct OpenAiCompatProvider {
     base_url: String,
     api_key: Option<String>,
     default_model: String,
+    client: ureq::Agent,
 }
 
 impl OpenAiCompatProvider {
     pub fn new(base_url: String, api_key: Option<String>, default_model: String) -> Self {
+        let client = ureq::builder()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(60))
+            .build();
         Self {
             base_url,
             api_key,
             default_model,
+            client,
         }
     }
 }
@@ -41,19 +47,60 @@ fn clean_schema(val: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn format_messages(messages: &[Message]) -> Vec<serde_json::Value> {
+fn format_messages(messages: &[Message], is_openai_native: bool) -> Vec<serde_json::Value> {
     messages
         .iter()
         .map(|m| match m.role {
             Role::System => json!({
                 "role": "system",
-                "content": m.content,
+                "content": m.content.as_text_lossy().to_string(),
             }),
-            Role::User => json!({
-                "role": "user",
-                "content": m.content,
-            }),
+            Role::User => match &m.content {
+                crate::ai::model::MessageContent::Text(s) => json!({
+                    "role": "user",
+                    "content": s,
+                }),
+                crate::ai::model::MessageContent::Parts(parts) => {
+                    let blocks: Vec<serde_json::Value> = parts
+                        .iter()
+                        .map(|p| match p {
+                            crate::ai::model::ContentPart::Text { text } => json!({
+                                "type": "text",
+                                "text": text,
+                            }),
+                            crate::ai::model::ContentPart::Image { media_type, data } => json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{};base64,{}", media_type, data),
+                                    "detail": "auto",
+                                }
+                            }),
+                            crate::ai::model::ContentPart::Document { media_type, data, name } => {
+                                if is_openai_native {
+                                    json!({
+                                        "type": "file",
+                                        "file": {
+                                            "filename": name.clone().unwrap_or_else(|| "document.pdf".to_string()),
+                                            "file_data": format!("data:{};base64,{}", media_type, data),
+                                        }
+                                    })
+                                } else {
+                                    json!({
+                                        "type": "text",
+                                        "text": format!("[Attached PDF document: {}]", name.as_deref().unwrap_or("document.pdf")),
+                                    })
+                                }
+                            }
+                        })
+                        .collect();
+                    json!({
+                        "role": "user",
+                        "content": blocks,
+                    })
+                }
+            },
             Role::Assistant => {
+                let text = m.content.as_text_lossy().to_string();
                 if let Some(ref tool_calls) = m.tool_calls {
                     let tc_json: Vec<_> = tool_calls
                         .iter()
@@ -70,20 +117,20 @@ fn format_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                         .collect();
                     json!({
                         "role": "assistant",
-                        "content": if m.content.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(m.content.clone()) },
+                        "content": if text.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(text) },
                         "tool_calls": tc_json,
                     })
                 } else {
                     json!({
                         "role": "assistant",
-                        "content": m.content,
+                        "content": text,
                     })
                 }
             }
             Role::Tool => json!({
                 "role": "tool",
                 "tool_call_id": m.tool_call_id.clone().unwrap_or_default(),
-                "content": m.content,
+                "content": m.content.as_text_lossy().to_string(),
             }),
         })
         .collect()
@@ -103,6 +150,7 @@ impl LanguageModel for OpenAiCompatProvider {
         let cancel_clone = cancel.clone();
         let base_url = self.base_url.trim_end_matches('/').to_string();
         let api_key = self.api_key.clone();
+        let client = self.client.clone();
 
         std::thread::Builder::new()
             .name("ai-openai-stream".into())
@@ -126,9 +174,10 @@ impl LanguageModel for OpenAiCompatProvider {
                     .unwrap_or(raw_model)
                     .trim();
 
+                let is_openai_native = base_url.contains("api.openai.com") || base_url.contains("openai.azure.com");
                 let mut body = json!({
                     "model": clean_model,
-                    "messages": format_messages(&req.messages),
+                    "messages": format_messages(&req.messages, is_openai_native),
                     "stream": true,
                     "stream_options": { "include_usage": true },
                 });
@@ -158,13 +207,8 @@ impl LanguageModel for OpenAiCompatProvider {
                     body["tools"] = json!(tools_json);
                 }
 
-                let agent = ureq::builder()
-                    .timeout_connect(Duration::from_secs(10))
-                    .timeout_read(Duration::from_secs(60))
-                    .build();
-
                 let build_req = |b: &serde_json::Value| {
-                    let mut r = agent.post(&url);
+                    let mut r = client.post(&url);
                     if let Some(ref key) = api_key {
                         if !key.is_empty() {
                             r = r.set("Authorization", &format!("Bearer {}", key));
