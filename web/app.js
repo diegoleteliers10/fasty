@@ -53,6 +53,28 @@ class FasttyWebClient {
     this.scrollbarTrack = document.getElementById("scrollbar-track");
     this.scrollbarThumb = document.getElementById("scrollbar-thumb");
     this.newSessionBtn = document.getElementById("new-session-btn");
+    this.versionEl = document.getElementById("daemon-version");
+    this.releaseBtn = document.getElementById("release-btn");
+    this.releaseOverlay = document.getElementById("release-overlay");
+    this.releaseTitle = document.getElementById("release-title");
+    this.releaseCloseBtn = document.getElementById("release-close");
+
+    if (this.releaseBtn) {
+      this.releaseBtn.addEventListener("click", () => this.showReleaseOverlay());
+    }
+    if (this.releaseCloseBtn) {
+      this.releaseCloseBtn.addEventListener("click", () => this.hideReleaseOverlay());
+    }
+    if (this.releaseOverlay) {
+      this.releaseOverlay.addEventListener("click", (e) => {
+        if (e.target === this.releaseOverlay) this.hideReleaseOverlay();
+      });
+    }
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && this.releaseOverlay && !this.releaseOverlay.classList.contains("hidden")) {
+        this.hideReleaseOverlay();
+      }
+    });
     this.touchInputProxy = document.getElementById("touch-input-proxy");
     this.appContainer = document.querySelector(".app-container");
     this.mobileToolbar = document.getElementById("mobile-toolbar");
@@ -568,6 +590,11 @@ class FasttyWebClient {
     switch (msg.event) {
       case "hello":
         console.log(`⚡ Connected to fastty daemon v${msg.fastty_version} (protocol v${msg.version})`);
+        if (msg.fastty_version) {
+          this.daemonVersion = msg.fastty_version;
+          if (this.versionEl) this.versionEl.textContent = `v${msg.fastty_version}`;
+          if (this.releaseTitle) this.releaseTitle.textContent = `What's new in fastty v${msg.fastty_version}`;
+        }
         break;
 
       case "spawned":
@@ -746,6 +773,14 @@ class FasttyWebClient {
 
   hideOverlay() {
     this.overlayMsg.classList.add("hidden");
+  }
+
+  showReleaseOverlay() {
+    if (this.releaseOverlay) this.releaseOverlay.classList.remove("hidden");
+  }
+
+  hideReleaseOverlay() {
+    if (this.releaseOverlay) this.releaseOverlay.classList.add("hidden");
   }
 }
 

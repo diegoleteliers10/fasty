@@ -611,6 +611,75 @@ body, html {
   display: none;
 }
 
+.version-badge {
+  background-color: rgba(137, 180, 250, 0.15);
+  color: var(--accent);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+/* Release Notes Overlay */
+.release-card {
+  text-align: left;
+  max-width: 440px;
+}
+
+.release-card h3 {
+  text-align: center;
+  margin: 0 0 12px 0;
+}
+
+.release-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.release-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--subtext0);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.release-tag {
+  background-color: rgba(249, 226, 175, 0.15);
+  color: var(--yellow);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.release-close-btn {
+  display: block;
+  width: 100%;
+  background-color: var(--accent);
+  color: #11111b;
+  border: none;
+  padding: 7px 14px;
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: bold;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.release-close-btn:hover {
+  background-color: var(--accent-hover);
+}
+
 .separator {
   color: var(--surface1);
 }
@@ -679,6 +748,9 @@ body, html {
   }
 
   #scroll-status,
+  #scroll-status + .separator,
+  #daemon-version,
+  #daemon-version + .separator,
   .status-right .separator:first-of-type,
   #term-dimensions,
   .status-right .separator:nth-of-type(2) {

@@ -40,6 +40,7 @@
           <span class="text">Connecting...</span>
         </div>
         <button id="reconnect-btn" class="btn-icon" title="Reconnect">↻</button>
+        <button id="release-btn" class="btn-icon" title="What's new">✦</button>
       </div>
     </header>
 
@@ -66,6 +67,20 @@
           <p id="overlay-desc">Make sure fastty is running locally with its daemon active.</p>
         </div>
       </div>
+
+      <div id="release-overlay" class="overlay-msg hidden">
+        <div class="overlay-card release-card">
+          <h3 id="release-title">What's new in fastty</h3>
+          <ul class="release-list">
+            <li><span class="release-tag">Images</span>Paste screenshots into AI chat (⌘V) — auto-scaled, Anthropic + OpenAI models</li>
+            <li><span class="release-tag">PDF</span>Native PDF attachments with text + page rendering</li>
+            <li><span class="release-tag">Markdown</span>Rich answers: syntax highlighting, LaTeX math, copy buttons</li>
+            <li><span class="release-tag">Composer</span>Pixel-accurate text selection and cursor placement</li>
+            <li><span class="release-tag">Header</span>Streamlined AI header with live autoscroll follow</li>
+          </ul>
+          <button id="release-close" class="release-close-btn">Close</button>
+        </div>
+      </div>
     </main>
 
     <!-- Mobile Virtual Keys Accessory Toolbar -->
@@ -88,6 +103,8 @@
         <span id="session-info">No active session</span>
       </div>
       <div class="status-right">
+        <span id="daemon-version" class="version-badge" title="Daemon version">v…</span>
+        <span class="separator">|</span>
         <span id="scroll-status" class="scroll-badge hidden">Scroll: 0 / 0</span>
         <span class="separator">|</span>
         <span id="term-dimensions">80 × 24</span>
