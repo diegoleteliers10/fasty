@@ -118,6 +118,13 @@ impl Tool for RunCommandTool {
             c
         };
 
+        // Inherit the current process environment so the user's PATH (bun, node, npm, …) is
+        // available. portable_pty's CommandBuilder starts with an empty env, so we seed it
+        // explicitly before applying any overrides.
+        for (key, val) in std::env::vars() {
+            cmd.env(key, val);
+        }
+
         cmd.cwd(&ctx.cwd);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
