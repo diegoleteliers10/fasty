@@ -232,7 +232,7 @@ fn run_ask_command(mut args: impl Iterator<Item = String>) {
         std::process::exit(1);
     }
 
-    let cfg = fastty::config::Config::load().unwrap_or_default();
+    let cfg = fastty::config::load_lenient();
     let (model, model_name) = match fastty::ai::create_model_from_config(
         &cfg.ai,
         provider_override.as_deref(),

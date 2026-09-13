@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod config;
+pub mod diff;
 pub mod document;
 pub mod image;
 pub mod model;

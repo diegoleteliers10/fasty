@@ -942,6 +942,8 @@ pub struct RootView {
     exec_pane_id: Option<crate::pane_tree::PaneId>,
     pub ai_sidebar_open: bool,
     pub ai_sidebar_width: f32,
+    /// 0..=1 open/close animation progress, mirroring the tabs sidebar.
+    pub ai_sidebar_anim_progress: f32,
     pub is_dragging_ai_sidebar: bool,
     pub ai_input_text: String,
     pub ai_input_state: crate::ui::TextInputState,
@@ -965,6 +967,8 @@ pub struct RootView {
     pub ai_pending_text: String,
     pub ai_pending_thinking: String,
     pub ai_composer_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    /// Timestamp until which the message "Copy" button shows "Copied".
+    pub ai_copy_feedback_until: Option<std::time::Instant>,
     pub ai_message_selection: Option<(usize, usize, usize)>,
     pub ai_message_selection_anchor: Option<(usize, usize)>,
     pub is_dragging_message_selection: bool,
@@ -976,6 +980,15 @@ impl RootView {
     pub fn current_sidebar_width(&self) -> f32 {
         if self.tab_layout == TabLayout::Vertical || self.sidebar_anim_progress > 0.001 {
             (210.0 * self.sidebar_anim_progress).round()
+        } else {
+            0.0
+        }
+    }
+
+    #[inline]
+    pub fn current_ai_sidebar_width(&self) -> f32 {
+        if self.ai_sidebar_open || self.ai_sidebar_anim_progress > 0.001 {
+            (self.ai_sidebar_width * self.ai_sidebar_anim_progress).round()
         } else {
             0.0
         }
@@ -1013,7 +1026,7 @@ impl RootView {
     ) -> Self {
         config::load_custom_themes();
         crate::snippets::load();
-        let loaded_config = Config::load().unwrap_or_default();
+        let loaded_config = crate::config::load_lenient();
         let theme_name = loaded_config.theme.as_deref().unwrap_or("default").to_string();
         let theme = Theme::from_name(&theme_name).with_opacity(loaded_config.opacity);
 
@@ -1062,6 +1075,14 @@ impl RootView {
                     } else if this.scroll_fade_active {
                         this.scroll_fade_active = false;
                         needs_notify = true;
+                    }
+
+                    // Copy feedback revert ("Copied" -> "Copy" after ~1.5s)
+                    if let Some(until) = this.ai_copy_feedback_until {
+                        if std::time::Instant::now() >= until {
+                            this.ai_copy_feedback_until = None;
+                            needs_notify = true;
+                        }
                     }
 
                     // Cursor blink logic (every ~525ms = 15 ticks of 35ms)
@@ -1240,6 +1261,7 @@ impl RootView {
             exec_pane_id: None,
             ai_sidebar_open: restored_ai_sidebar_open,
             ai_sidebar_width: 340.0,
+            ai_sidebar_anim_progress: if restored_ai_sidebar_open { 1.0 } else { 0.0 },
             is_dragging_ai_sidebar: false,
             ai_input_text: String::new(),
             ai_input_state: crate::ui::TextInputState::default(),
@@ -1262,6 +1284,7 @@ impl RootView {
             ai_pending_text: String::new(),
             ai_pending_thinking: String::new(),
             ai_composer_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
+            ai_copy_feedback_until: None,
             ai_message_selection: None,
             ai_message_selection_anchor: None,
             is_dragging_message_selection: false,
@@ -2634,13 +2657,53 @@ impl RootView {
             window.focus(&self.focus_handle, cx);
         }
         self.persist_session();
+        self.trigger_ai_sidebar_animation(window, cx);
         cx.notify();
+    }
+
+    /// 160ms ease-out-cubic open/close animation, same as the tabs sidebar.
+    pub fn trigger_ai_sidebar_animation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let target = if self.ai_sidebar_open { 1.0f32 } else { 0.0f32 };
+
+        if (self.ai_sidebar_anim_progress - target).abs() < 0.001 {
+            return;
+        }
+
+        cx.spawn_in(window, async move |this, cx| {
+            let start_time = std::time::Instant::now();
+            let duration = std::time::Duration::from_millis(160);
+            let initial = this.update_in(cx, |this, _window, _cx| this.ai_sidebar_anim_progress).unwrap_or(0.0);
+
+            loop {
+                let elapsed = start_time.elapsed();
+                let t = (elapsed.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0);
+                let eased = 1.0 - (1.0 - t).powi(3);
+                let current = initial + (target - initial) * eased;
+                let done = t >= 1.0;
+
+                let res = this.update_in(cx, |this, _window, cx| {
+                    this.ai_sidebar_anim_progress = if done { target } else { current };
+                    cx.notify();
+                });
+
+                if res.is_err() || done {
+                    break;
+                }
+                cx.background_executor().timer(std::time::Duration::from_millis(8)).await;
+            }
+        }).detach();
     }
 
     pub fn cancel_ai_stream(&mut self) {
         if let Some(token) = self.ai_cancel_token.take() {
             token.cancel();
         }
+        // Deny any pending permission request so the blocked agent thread
+        // unblocks and terminates instead of leaking into the next session.
+        if let Some(tx) = self.ai_confirm_reply_tx.take() {
+            let _ = tx.send_blocking(crate::ai::PermissionDecision::Deny);
+        }
+        self.ai_pending_confirmation = None;
         if !self.ai_pending_text.is_empty() {
             self.ai_streaming_text.push_str(&self.ai_pending_text);
             self.ai_pending_text.clear();
@@ -2862,6 +2925,7 @@ impl RootView {
         let (ask_tx, ask_rx) = async_channel::unbounded::<(
             String,
             String,
+            String,
             async_channel::Sender<crate::ai::PermissionDecision>,
         )>();
         let (event_tx, event_rx) = async_channel::unbounded::<crate::ai::AgentEvent>();
@@ -2870,12 +2934,14 @@ impl RootView {
             ask_tx: async_channel::Sender<(
                 String,
                 String,
+                String,
                 async_channel::Sender<crate::ai::PermissionDecision>,
             )>,
         }
         impl crate::ai::PermissionHandler for UiPermissionHandler {
             fn ask_permission(
                 &self,
+                tool_call_id: &str,
                 tool_name: &str,
                 input_summary: &str,
             ) -> crate::ai::PermissionDecision {
@@ -2883,6 +2949,7 @@ impl RootView {
                 if self
                     .ask_tx
                     .send_blocking((
+                        tool_call_id.to_string(),
                         tool_name.to_string(),
                         input_summary.to_string(),
                         reply_tx,
@@ -3010,14 +3077,18 @@ impl RootView {
             .ok();
 
         cx.spawn_in(window, async move |this, cx| {
-            while let Ok((tool_name, input_summary, reply_tx)) = ask_rx.recv().await {
+            while let Ok((tool_id, tool_name, input_summary, reply_tx)) = ask_rx.recv().await {
                 let _ = this.update_in(cx, |this, _window, cx| {
                     this.ai_pending_confirmation =
                         Some(crate::ui::ai_sidebar::AiUiPendingConfirmation {
+                            tool_id,
                             tool_name,
                             input_summary,
                         });
                     this.ai_confirm_reply_tx = Some(reply_tx);
+                    // The confirmation card renders at the end of the message
+                    // list; bring it into view so the user sees the diff.
+                    this.ai_scroll_handle.scroll_to_bottom();
                     cx.notify();
                 });
             }
@@ -3051,6 +3122,26 @@ impl RootView {
                                 this.ai_pending_thinking.clear();
                             }
 
+                            // Commit any in-flight streamed text into ai_messages now so the tool
+                            // call row lands on the same assistant message, never in split state.
+                            if !this.ai_streaming_text.is_empty() {
+                                let text = std::mem::take(&mut this.ai_streaming_text);
+                                let thinking = if this.ai_streaming_thinking.is_empty() {
+                                    None
+                                } else {
+                                    Some(std::mem::take(&mut this.ai_streaming_thinking))
+                                };
+                                this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
+                                    is_user: false,
+                                    text,
+                                    thinking,
+                                    tool_calls: Vec::new(),
+                                    timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                                    images: Vec::new(),
+                                    documents: Vec::new(),
+                                });
+                            }
+
                             if let Some(last) = this.ai_messages.last_mut() {
                                 if !last.is_user {
                                     last.tool_calls.push(crate::ui::ai_sidebar::AiUiToolCall {
@@ -3060,6 +3151,7 @@ impl RootView {
                                         output: None,
                                         is_error: false,
                                         is_running: true,
+                                    diff: None,
                                     });
                                 } else {
                                     this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
@@ -3073,6 +3165,7 @@ impl RootView {
                                             output: None,
                                             is_error: false,
                                             is_running: true,
+                                        diff: None,
                                         }],
                                         timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
                                         images: Vec::new(),
@@ -3085,6 +3178,7 @@ impl RootView {
                             id,
                             output,
                             is_error,
+                            diff,
                             ..
                         } => {
                             for m in this.ai_messages.iter_mut().rev() {
@@ -3092,6 +3186,7 @@ impl RootView {
                                     tc.output = Some(output);
                                     tc.is_error = is_error;
                                     tc.is_running = false;
+                                    tc.diff = diff;
                                     break;
                                 }
                             }
@@ -3209,7 +3304,7 @@ impl RootView {
 
         let sidebar = crate::ui::ai_sidebar::AiSidebar::new(
             self.theme,
-            self.ai_sidebar_width,
+            self.current_ai_sidebar_width(),
             provider,
             model,
         )
@@ -3234,6 +3329,9 @@ impl RootView {
         .message_selection(self.ai_message_selection)
         .on_select_message_char(cx.listener(|this, (msg_idx, target): &(usize, usize), _window, cx| {
             this.ai_input_state.selection = None;
+            // The sidebar keyboard handler (Cmd+C, Escape, ⌘↵) only runs when
+            // the panel owns focus, so selecting a message takes focus here.
+            this.ai_input_focused = true;
             this.ai_message_selection_anchor = Some((*msg_idx, *target));
             this.ai_message_selection = Some((*msg_idx, *target, *target));
             this.is_dragging_message_selection = true;
@@ -3250,6 +3348,12 @@ impl RootView {
                     }
                 }
             }
+        }))
+        .copy_feedback(self.ai_copy_feedback_until.is_some())
+        .on_copied(cx.listener(|this, _ev, _window, cx| {
+            this.ai_copy_feedback_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
+            cx.notify();
         }))
         .on_toggle_mode(cx.listener(|this, mode: &String, _window, cx| {
             this.ai_agent_mode = mode.clone();
@@ -3288,7 +3392,7 @@ impl RootView {
             this.open_ai_file_dialog(window, cx);
         }))
         .on_new_chat(cx.listener(|this, _ev, _window, cx| {
-            this.cancel_ai_stream();
+            this.cancel_ai_stream(); // also clears ai_pending_confirmation + ai_confirm_reply_tx
             this.ai_messages.clear();
             this.ai_streaming_text.clear();
             this.ai_streaming_thinking.clear();
@@ -3300,6 +3404,8 @@ impl RootView {
             this.ai_input_state.clear();
             this.ai_input_text.clear();
             this.ai_last_usage = None;
+            this.ai_message_selection = None;
+            this.ai_message_selection_anchor = None;
             cx.notify();
         }))
         .on_model_click(cx.listener(|this, _ev, window, cx| {
@@ -3331,6 +3437,13 @@ impl RootView {
             this.ai_attached_files.clear();
             this.ai_at_menu_open = false;
             this.ai_last_usage = None;
+            // Drop any leftover confirmation so it can't reappear in a fresh view.
+            if let Some(tx) = this.ai_confirm_reply_tx.take() {
+                let _ = tx.send_blocking(crate::ai::PermissionDecision::Deny);
+            }
+            this.ai_pending_confirmation = None;
+            this.ai_message_selection = None;
+            this.ai_message_selection_anchor = None;
             cx.notify();
         }))
         .on_cancel(cx.listener(|this, _ev, _window, cx| {
@@ -3437,7 +3550,7 @@ impl RootView {
     }
 
     pub fn reload_config(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let loaded_config = Config::load().unwrap_or_default();
+        let loaded_config = crate::config::load_lenient();
         let theme_name = loaded_config.theme.as_deref().unwrap_or("default").to_string();
         self.current_theme_name = theme_name.clone();
         self.theme = Theme::from_name(&theme_name).with_opacity(loaded_config.opacity);
@@ -4889,7 +5002,7 @@ impl RootView {
         // Click in terminal area unfocuses the AI input so keystrokes go to the terminal.
         if self.ai_sidebar_open && self.ai_input_focused {
             let win_w = window.viewport_size().width.to_f64() as f32;
-            let sidebar_left = win_w - self.ai_sidebar_width;
+            let sidebar_left = win_w - self.current_ai_sidebar_width();
             if (event.position.x.to_f64() as f32) < sidebar_left {
                 self.ai_input_focused = false;
                 cx.notify();
@@ -5015,11 +5128,11 @@ impl RootView {
                 )
             } else {
                 let win_w = _window.viewport_size().width.to_f64() as f32;
-                let text_left = win_w - self.ai_sidebar_width + 22.0;
+                let text_left = win_w - self.current_ai_sidebar_width() + 22.0;
                 ((cur_x - text_left).max(0.0), 0.0)
             };
 
-            let avail_w = (self.ai_sidebar_width - 44.0).max(80.0);
+            let avail_w = (self.current_ai_sidebar_width() - 44.0).max(80.0);
             let max_cols = ((avail_w / 7.2).floor() as usize).max(10);
             let lines = crate::ui::text_input::wrap_text_into_lines(&self.ai_input_state.text, max_cols);
             let line_h = 18.0;
@@ -5162,6 +5275,36 @@ impl RootView {
             alacritty_terminal::index::Line(grid_row),
             alacritty_terminal::index::Column(grid_col),
         );
+
+        // Containment: this handler runs for every mouse move in the window
+        // (it lives on the root div), so only run link-hover detection when
+        // the pointer is actually inside the active terminal pane. Otherwise
+        // hovering the AI panel, tab bar or status bar would underline links
+        // in the terminal behind the cursor.
+        let inside_active_pane = active_tab
+            .pane_tree
+            .all_panes()
+            .iter()
+            .find(|p| p.id == active_tab.pane_tree.active_pane_id)
+            .and_then(|p| p.last_bounds)
+            .map(|b| {
+                let x0 = b.origin.x.to_f64() as f32;
+                let y0 = b.origin.y.to_f64() as f32;
+                cur_x >= x0
+                    && cur_x < x0 + b.size.width.to_f64() as f32
+                    && cur_y >= y0
+                    && cur_y < y0 + b.size.height.to_f64() as f32
+            })
+            .unwrap_or(false);
+
+        if !inside_active_pane {
+            if self.hovered_url.is_some() {
+                self.hovered_url = None;
+                self.hovered_url_range = None;
+                cx.notify();
+            }
+            return;
+        }
 
         // URL / OSC 8 Hyperlink Hover detection
         if let Some(term_guard) = terminal.term().try_lock() {
@@ -6116,7 +6259,7 @@ impl Render for RootView {
         let (cell_w, line_h) = self.measure_cell_metrics(_window);
         let viewport_size = _window.viewport_size();
         let sidebar_w = self.current_sidebar_width();
-        let ai_w = if self.ai_sidebar_open { self.ai_sidebar_width } else { 0.0 };
+        let ai_w = self.current_ai_sidebar_width();
         let avail_w = (viewport_size.width.to_f64() as f32 - 1.0 - sidebar_w - ai_w).max(100.0);
         // Chrome layout constants — must match TabBar/StatusBar element heights
 
@@ -6273,9 +6416,10 @@ impl Render for RootView {
                             .child(super::ime::registration(cx.entity(), self.focus_handle.clone()))
                             .child(terminal_area),
                     )
-                    .when(self.ai_sidebar_open, |this| {
-                        this.child(self.render_ai_sidebar(_window, cx))
-                    })
+                    .when(
+                        self.ai_sidebar_open || self.ai_sidebar_anim_progress > 0.001,
+                        |this| this.child(self.render_ai_sidebar(_window, cx)),
+                    )
             )
             .child(
 

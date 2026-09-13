@@ -22,6 +22,7 @@ pub enum AgentEvent {
         name: String,
         output: String,
         is_error: bool,
+        diff: Option<crate::ai::diff::FileDiff>,
     },
     TurnEnd,
     Usage {
@@ -32,7 +33,12 @@ pub enum AgentEvent {
 }
 
 pub trait PermissionHandler: Send + Sync {
-    fn ask_permission(&self, tool_name: &str, input_summary: &str) -> PermissionDecision;
+    fn ask_permission(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        input_summary: &str,
+    ) -> PermissionDecision;
 }
 
 pub struct CliPermissionHandler {
@@ -46,7 +52,12 @@ impl CliPermissionHandler {
 }
 
 impl PermissionHandler for CliPermissionHandler {
-    fn ask_permission(&self, tool_name: &str, input_summary: &str) -> PermissionDecision {
+    fn ask_permission(
+        &self,
+        _tool_call_id: &str,
+        tool_name: &str,
+        input_summary: &str,
+    ) -> PermissionDecision {
         print!(
             "\n[fastty-ai] Tool '{}' requested permission to run:\n{}\nAllow execution? [y/N/always]: ",
             tool_name, input_summary
@@ -71,6 +82,17 @@ impl PermissionHandler for CliPermissionHandler {
     }
 }
 
+/// Max output tokens per model request. Large `edit_file` tool calls carry
+/// whole code blocks as JSON, so this must be high enough that the tool-call
+/// JSON is never truncated mid-argument. Truncated JSON is the main cause of
+/// "the agent keeps loading but never applies the edit".
+const MAX_OUTPUT_TOKENS: u32 = 8192;
+
+/// How many times the exact same tool call may fail consecutively before the
+/// turn is aborted. Prevents endless read -> failed edit -> retry loops that
+/// spin the tool spinner forever without producing an edit.
+const MAX_IDENTICAL_TOOL_FAILURES: usize = 3;
+
 pub struct Agent {
     model: Arc<dyn LanguageModel>,
     model_name: String,
@@ -80,6 +102,8 @@ pub struct Agent {
     messages: Vec<Message>,
     ctx: ToolCtx,
     cancel: CancelToken,
+    last_failed_call: Option<(String, String)>,
+    identical_failures: usize,
 }
 
 impl Agent {
@@ -100,6 +124,8 @@ impl Agent {
             messages: Vec::new(),
             ctx,
             cancel: CancelToken::new(),
+            last_failed_call: None,
+            identical_failures: 0,
         }
     }
 
@@ -140,7 +166,7 @@ impl Agent {
                 messages: self.messages.clone(),
                 tools: tool_defs.clone(),
                 temperature: Some(0.2),
-                max_tokens: Some(4096),
+                max_tokens: Some(MAX_OUTPUT_TOKENS),
             };
 
             let (tx, rx) = async_channel::unbounded();
@@ -251,6 +277,7 @@ impl Agent {
                         name: tc.name.clone(),
                         output: err_msg.clone(),
                         is_error: true,
+                        diff: None,
                     });
                     self.messages.push(Message::tool_result(tc.id, err_msg, true));
                     continue;
@@ -262,7 +289,8 @@ impl Agent {
                     PermissionDecision::Allow => PermissionDecision::Allow,
                     PermissionDecision::Deny => PermissionDecision::Deny,
                     PermissionDecision::Confirm => {
-                        self.permission_handler.ask_permission(&tc.name, &tc.arguments)
+                        self.permission_handler
+                            .ask_permission(&tc.id, &tc.name, &tc.arguments)
                     }
                 };
 
@@ -273,6 +301,7 @@ impl Agent {
                         name: tc.name.clone(),
                         output: deny_msg.clone(),
                         is_error: true,
+                        diff: None,
                     });
                     self.messages.push(Message::tool_result(tc.id, deny_msg, true));
                     continue;
@@ -282,12 +311,23 @@ impl Agent {
                 let input_val: serde_json::Value = match serde_json::from_str(&tc.arguments) {
                     Ok(v) => v,
                     Err(e) => {
-                        let err_msg = format!("JSON parse error in tool arguments: {}", e);
+                        let err_msg = if stop_reason == StopReason::MaxTokens {
+                            format!(
+                                "JSON parse error in tool arguments: {}. The tool call was cut off because the response hit the token limit. The edit is too large for one call: split it into several smaller edits with minimal old_string/new_string pairs.",
+                                e
+                            )
+                        } else {
+                            format!(
+                                "JSON parse error in tool arguments: {}. Retry with valid JSON.",
+                                e
+                            )
+                        };
                         on_event(AgentEvent::ToolEnd {
                             id: tc.id.clone(),
                             name: tc.name.clone(),
                             output: err_msg.clone(),
                             is_error: true,
+                            diff: None,
                         });
                         self.messages.push(Message::tool_result(tc.id, err_msg, true));
                         continue;
@@ -300,11 +340,47 @@ impl Agent {
                     Err(e) => e,
                 };
 
+                if out.is_error {
+                    // Circuit breaker: stop when the identical call keeps failing,
+                    // otherwise the model retries the same edit forever.
+                    let same_as_last = self
+                        .last_failed_call
+                        .as_ref()
+                        .is_some_and(|(n, a)| n == &tc.name && a == &tc.arguments);
+                    if same_as_last {
+                        self.identical_failures += 1;
+                    } else {
+                        self.last_failed_call = Some((tc.name.clone(), tc.arguments.clone()));
+                        self.identical_failures = 1;
+                    }
+
+                    if self.identical_failures >= MAX_IDENTICAL_TOOL_FAILURES {
+                        let msg = format!(
+                            "The same '{}' call failed {} times in a row. Stopping this turn to avoid an endless retry loop. Last error: {}",
+                            tc.name, self.identical_failures, out.content
+                        );
+                        on_event(AgentEvent::ToolEnd {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            output: msg.clone(),
+                            is_error: true,
+                            diff: None,
+                        });
+                        self.messages.push(Message::tool_result(tc.id, msg, true));
+                        on_event(AgentEvent::TurnEnd);
+                        return Ok(());
+                    }
+                } else {
+                    self.last_failed_call = None;
+                    self.identical_failures = 0;
+                }
+
                 on_event(AgentEvent::ToolEnd {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
                     output: out.content.clone(),
                     is_error: out.is_error,
+                    diff: out.diff,
                 });
 
                 self.messages.push(Message::tool_result(

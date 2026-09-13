@@ -152,7 +152,7 @@ pub struct SettingsView {
 impl SettingsView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         config::load_custom_themes();
-        let loaded_config = Config::load().unwrap_or_default();
+        let loaded_config = crate::config::load_lenient();
         let theme_name = loaded_config.theme.as_deref().unwrap_or("default").to_string();
         let theme = Theme::from_name(&theme_name).with_opacity(loaded_config.opacity);
         let tab_layout = loaded_config.tab_layout;

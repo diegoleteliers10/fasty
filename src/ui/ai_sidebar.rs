@@ -13,6 +13,8 @@ pub struct AiUiToolCall {
     pub output: Option<String>,
     pub is_error: bool,
     pub is_running: bool,
+    /// Applied diff for edit tools, rendered as a review card under the row.
+    pub diff: Option<crate::ai::diff::FileDiff>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +81,7 @@ impl AiUiMessage {
 
 #[derive(Debug, Clone)]
 pub struct AiUiPendingConfirmation {
+    pub tool_id: String,
     pub tool_name: String,
     pub input_summary: String,
 }
@@ -129,6 +132,9 @@ pub struct AiSidebar {
     pub on_select_message_char: Option<std::sync::Arc<dyn Fn(&(usize, usize), &mut Window, &mut App) + 'static>>,
     pub on_drag_message_char: Option<std::sync::Arc<dyn Fn(&(usize, usize), &mut Window, &mut App) + 'static>>,
     pub scroll_handle: Option<gpui::ScrollHandle>,
+    /// True while the message "Copy" button shows the "Copied" confirmation.
+    pub copy_feedback: bool,
+    pub on_copied: Option<MouseDownCallback>,
 }
 
 impl AiSidebar {
@@ -180,11 +186,23 @@ impl AiSidebar {
             on_select_message_char: None,
             on_drag_message_char: None,
             scroll_handle: None,
+            copy_feedback: false,
+            on_copied: None,
         }
     }
 
     pub fn scroll_handle(mut self, handle: gpui::ScrollHandle) -> Self {
         self.scroll_handle = Some(handle);
+        self
+    }
+
+    pub fn copy_feedback(mut self, active: bool) -> Self {
+        self.copy_feedback = active;
+        self
+    }
+
+    pub fn on_copied(mut self, handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static) -> Self {
+        self.on_copied = Some(Box::new(handler));
         self
     }
 
@@ -657,7 +675,234 @@ struct ParsedDiffCard {
 }
 
 const DIFF_CONTEXT_LINES: usize = 3;
-const DIFF_MAX_ROWS: usize = 24;
+const DIFF_MAX_ROWS: usize = 200;
+
+/// Diff card rendered under an edit_file tool row. While the tool runs it
+/// previews the change from the raw args; once applied it shows the real
+/// diff. When this exact tool call is awaiting permission, Accept / Reject
+/// buttons render on the card so the user can decide right there.
+fn render_tool_diff_card(
+    theme: &Theme,
+    diff: &crate::ai::diff::FileDiff,
+    pending: bool,
+    running: bool,
+    on_confirm: Option<std::rc::Rc<ConfirmCallback>>,
+    card_idx: usize,
+) -> Div {
+    let file_name = diff
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&diff.path)
+        .to_string();
+
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .rounded(px(6.))
+        .border_1()
+        .border_color(if pending { theme.accent } else { theme.border })
+        .bg(theme.main_bg)
+        .overflow_hidden()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .px(px(8.))
+                .py(px(4.))
+                .bg(theme.surface)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(if pending { theme.accent } else { theme.muted })
+                                .flex_shrink_0()
+                                .child(if running {
+                                    "Editing"
+                                } else if pending {
+                                    "Edit — review"
+                                } else {
+                                    "Edited"
+                                }),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.foreground)
+                                .overflow_hidden()
+                                .child(SharedString::from(file_name)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .text_size(px(10.5))
+                        .font_weight(FontWeight::BOLD)
+                        .flex_shrink_0()
+                        .child(
+                            div()
+                                .text_color(theme.bright_green)
+                                .child(SharedString::from(format!("+{}", diff.added))),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme.bright_red)
+                                .child(SharedString::from(format!("-{}", diff.removed))),
+                        ),
+                ),
+        );
+
+    // Diff body as a SINGLE text element inside the scroll box: per-row divs
+    // collapsed on top of each other inside the scrollable flex container,
+    // so the whole diff is painted as one StyledText with per-line
+    // highlights instead. Short diffs size naturally; long ones get a
+    // fixed-height inner scroll box.
+    //
+    // Each line shows a muted gutter with the real file line number (not the
+    // "Linea N" text, and baked-in read_file "NNN |" prefixes are hidden from
+    // display), then the +/-/space marker and the content.
+    let mut body_text = String::new();
+    let mut body_highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
+    for line in &diff.lines {
+        let num = line.old_line.or(line.new_line);
+        let gutter = match num {
+            Some(n) => format!("{:>4} ", n),
+            None => "     ".to_string(),
+        };
+        let (prefix, color, tint) = match line.kind {
+            crate::ai::diff::DiffLineKind::Context => (" ", theme.muted_strong, None),
+            crate::ai::diff::DiffLineKind::Del => {
+                ("-", theme.bright_red, Some(gpui::Hsla::from(gpui::rgba(0xf04e4e1a))))
+            }
+            crate::ai::diff::DiffLineKind::Add => (
+                "+",
+                theme.bright_green,
+                Some(gpui::Hsla::from(gpui::rgba(0x8ee0441a))),
+            ),
+        };
+        let gutter_start = body_text.len();
+        body_text.push_str(&gutter);
+        let content_start = body_text.len();
+        body_text.push_str(prefix);
+        body_text.push_str(crate::ai::diff::strip_baked_prefix(&line.text));
+        let content_end = body_text.len();
+        body_text.push('\n');
+        body_highlights.push((
+            gutter_start..content_start,
+            HighlightStyle {
+                color: Some(theme.muted),
+                ..Default::default()
+            },
+        ));
+        let mut style = HighlightStyle {
+            color: Some(color),
+            ..Default::default()
+        };
+        if let Some(tint) = tint {
+            style.background_color = Some(tint);
+        }
+        body_highlights.push((content_start..content_end, style));
+    }
+    if body_text.ends_with('\n') {
+        body_text.pop();
+    }
+
+    let tall = diff.lines.len() > 12;
+    let mut body = div()
+        .id(ElementId::named_usize("ai-tool-diff-body", card_idx))
+        .w_full()
+        .px(px(4.))
+        .py(px(4.))
+        .text_size(px(11.))
+        .whitespace_nowrap()
+        .overflow_hidden()
+        // Occlude the panel scroll behind this body: wheel gestures over the
+        // diff scroll only the diff, never the messages area (GPUI applies
+        // wheel deltas to every scrollable under the cursor otherwise).
+        .occlude();
+    if tall {
+        body = body.h(px(240.)).overflow_y_scroll();
+    }
+    if diff.lines.is_empty() {
+        body = body.child(
+            div()
+                .px(px(3.))
+                .py(px(2.))
+                .text_size(px(11.))
+                .text_color(theme.muted)
+                .child(if running { "Preparing diff…" } else { "No changes" }),
+        );
+    } else {
+        body = body.child(StyledText::new(body_text).with_highlights(body_highlights));
+    }
+    card = card.child(body);
+
+    // Inline Accept / Allow Always / Reject while awaiting permission for
+    // this exact call. Allow Always registers the file path in the session
+    // allowlist so later edits to the same file apply without asking.
+    if pending {
+        if let Some(on_confirm) = on_confirm {
+            let on_confirm_allow = on_confirm.clone();
+            let on_confirm_always = on_confirm.clone();
+            let on_confirm_decline = on_confirm;
+            card = card.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .bg(theme.surface)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(render_confirm_button(
+                                "Accept", theme, true, false, (false, true), &on_confirm_allow,
+                            ))
+                            .child(render_confirm_button(
+                                "Allow Always",
+                                theme,
+                                false,
+                                false,
+                                (true, true),
+                                &on_confirm_always,
+                            ))
+                            .child(render_confirm_button(
+                                "Reject", theme, false, true, (false, false), &on_confirm_decline,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.muted)
+                            .child("⌘↵ Accept"),
+                    ),
+            );
+        }
+    }
+
+    card
+}
 
 fn render_confirm_button(
     label: &'static str,
@@ -702,9 +947,14 @@ fn render_confirmation_section(
         return div().into_any_element();
     };
 
+    // edit_file confirmations render inline on the tool row's diff card
+    // (Accept / Reject buttons next to the diff), never as a separate card.
+    if conf.tool_name == "edit_file" {
+        return div().into_any_element();
+    }
+
     if let Some(diff) = parse_diff_confirmation(&conf.tool_name, &conf.input_summary) {
         let on_confirm_allow = on_confirm.clone();
-        let on_confirm_always = on_confirm.clone();
         let on_confirm_decline = on_confirm.clone();
         return div()
             .flex()
@@ -769,14 +1019,17 @@ fn render_confirmation_section(
                             ),
                     ),
             )
-            // Diff body
+            // Diff body (scrollable so large edits stay reviewable)
             .child(
                 div()
+                    .id("ai-confirm-diff-body")
                     .flex()
                     .flex_col()
                     .p(px(10.))
                     .bg(theme.main_bg)
                     .gap(px(2.))
+                    .max_h(px(300.))
+                    .overflow_y_scroll()
                     .children(diff.rows.into_iter().map(|row| {
                         let (prefix, text, color, tint) = match row {
                             DiffRow::Context(line) => ("  ", line, theme.muted_strong, None),
@@ -795,7 +1048,8 @@ fn render_confirmation_section(
                             .child(SharedString::from(format!("{}{}", prefix, text)))
                     })),
             )
-            // Actions
+            // Actions: edits are accept/reject — no "Allow Always", every edit
+            // keeps showing its diff.
             .child(
                 div()
                     .flex()
@@ -812,15 +1066,14 @@ fn render_confirmation_section(
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(render_confirm_button("Allow", theme, true, false, (false, true), &on_confirm_allow))
-                            .child(render_confirm_button("Allow Always", theme, false, false, (true, true), &on_confirm_always))
-                            .child(render_confirm_button("Decline", theme, false, true, (false, false), &on_confirm_decline)),
+                            .child(render_confirm_button("Accept", theme, true, false, (false, true), &on_confirm_allow))
+                            .child(render_confirm_button("Reject", theme, false, true, (false, false), &on_confirm_decline)),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(theme.muted)
-                            .child("⌘↵ Allow"),
+                            .child("⌘↵ Accept"),
                     ),
             )
             .into_any_element();
@@ -901,12 +1154,16 @@ fn parse_diff_confirmation(tool_name: &str, summary: &str) -> Option<ParsedDiffC
             .zip(new_lines.iter())
             .take_while(|(a, b)| a == b)
             .count();
-        let suffix = old_lines[prefix..]
+        // Compare from the ends so an insertion in the middle keeps the
+        // shared tail aligned.
+        let suffix = old_lines
             .iter()
-            .zip(new_lines[prefix..].iter())
             .rev()
+            .zip(new_lines.iter().rev())
             .take_while(|(a, b)| a == b)
-            .count();
+            .count()
+            .min(old_lines.len() - prefix)
+            .min(new_lines.len() - prefix);
         let old_mid = &old_lines[prefix..old_lines.len() - suffix];
         let new_mid = &new_lines[prefix..new_lines.len() - suffix];
 
@@ -1037,6 +1294,7 @@ fn render_thinking_indicator(theme: &Theme) -> Div {
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_markdown_prose(
     text: &str,
     theme: &Theme,
@@ -1046,6 +1304,7 @@ fn render_markdown_prose(
     on_drag_char: Option<std::sync::Arc<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
     text_left: f32,
     window: Option<&Window>,
+    registry: Option<(&crate::ui::markdown::RowRegistry, usize)>,
 ) -> Div {
     crate::ui::markdown::render_markdown_selectable(
         text,
@@ -1056,6 +1315,7 @@ fn render_markdown_prose(
         on_drag_char,
         text_left,
         window,
+        registry,
     )
 }
 
@@ -1072,6 +1332,12 @@ impl RenderOnce for AiSidebar {
         let on_cancel = self.on_cancel.map(std::rc::Rc::new);
         let on_submit = self.on_submit.map(std::rc::Rc::new);
         let on_confirm = self.on_confirm.map(std::rc::Rc::new);
+        let pending_confirmation = self.pending_confirmation.clone();
+        let on_copied = self.on_copied.map(std::rc::Rc::new);
+        let copy_feedback = self.copy_feedback;
+        // Selectable text rows are registered fresh on every render pass.
+        let row_registry: crate::ui::markdown::RowRegistry =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let on_focus = self.on_focus.map(std::rc::Rc::new);
         let on_click_char = self.on_click_char.map(std::rc::Rc::new);
         let on_new_chat = self.on_new_chat.map(std::rc::Rc::new);
@@ -1117,12 +1383,11 @@ impl RenderOnce for AiSidebar {
                     .flex_row()
                     .items_center()
                     .justify_between()
-                    .h(px(36.))
-                    .w_full()
-                    .px(px(12.))
-                    .border_b_1()
-                    .border_color(theme.border)
-                    // Left: Git branch
+                     .h(px(36.))
+                     .w_full()
+                     .px(px(12.))
+                     // No visible divider under the header: section edges are imaginary.
+                     // Left: Git branch
                     .child({
                         let has_branch = active_branch.is_some();
                         div()
@@ -1305,10 +1570,44 @@ impl RenderOnce for AiSidebar {
                     .py(px(8.))
                     .gap_4()
                     .when_some(self.scroll_handle.clone(), |this, sh| this.track_scroll(&sh))
+                    // Container-level drag continuation: while a message
+                    // selection drag is active, moves over gaps, code-block
+                    // padding or list markers still update the selection via
+                    // the nearest registered row.
+                    .on_mouse_move({
+                        let registry = row_registry.clone();
+                        let on_drag = on_drag_message_char.clone();
+                        move |ev: &MouseMoveEvent, window, cx| {
+                            if ev.pressed_button != Some(MouseButton::Left) {
+                                return;
+                            }
+                            let idx = crate::ui::markdown::row_at_point(&registry, ev.position);
+                            let target = idx.and_then(|i| {
+                                registry.borrow().get(i).map(|row| {
+                                    (
+                                        row.msg_idx,
+                                        crate::ui::markdown::char_target_in_row(
+                                            row,
+                                            ev.position,
+                                            window,
+                                        ),
+                                    )
+                                })
+                            });
+                            if let (Some((msg_idx, target)), Some(ref cb)) =
+                                (target, on_drag.as_ref())
+                            {
+                                cb(&(msg_idx, target), window, cx);
+                            }
+                        }
+                    })
                     .children({
                         let sidebar_width = self.width;
                         let on_select_msg = on_select_message_char.clone();
+                        let tool_pending_conf = pending_confirmation.clone();
+                        let tool_on_confirm = on_confirm.clone();
                         let on_drag_msg = on_drag_message_char.clone();
+                        let registry = row_registry.clone();
                         self.messages.clone().into_iter().enumerate().map(move |(msg_idx, msg)| {
                             if msg.is_user {
                                 div()
@@ -1328,6 +1627,32 @@ impl RenderOnce for AiSidebar {
                                             .px(px(12.))
                                             .py(px(8.))
                                             .cursor(CursorStyle::IBeam)
+                                            // Fallback selection start: presses landing on the
+                                            // bubble padding/border (where no text row is hit)
+                                            // anchor at the nearest char of this message, so
+                                            // right-to-left selections can start at the
+                                            // question's end instead of doing nothing.
+                                            .on_mouse_down(MouseButton::Left, {
+                                                let registry = registry.clone();
+                                                let on_select = on_select_msg.clone();
+                                                move |ev: &MouseDownEvent, window, cx| {
+                                                    let idx = crate::ui::markdown::row_at_point_in_message(
+                                                        &registry, msg_idx, ev.position,
+                                                    );
+                                                    if let Some(i) = idx {
+                                                        let target = registry.borrow().get(i).map(|row| {
+                                                            crate::ui::markdown::char_target_in_row(
+                                                                row, ev.position, window,
+                                                            )
+                                                        });
+                                                        if let (Some(target), Some(ref cb)) =
+                                                            (target, on_select.as_ref())
+                                                        {
+                                                            cb(&(msg_idx, target), window, cx);
+                                                        }
+                                                    }
+                                                }
+                                            })
                                             .when(!msg.images.is_empty(), |d| {
                                                 d.child(
                                                     div()
@@ -1395,11 +1720,43 @@ impl RenderOnce for AiSidebar {
                                                 )
                                             })
                                             .when(!msg.text.is_empty(), |d| {
+                                                let active_sel = if let Some((sel_msg, s, e)) = message_selection {
+                                                    if sel_msg == msg_idx { Some((s, e)) } else { None }
+                                                } else {
+                                                    None
+                                                };
+                                                let on_select_cb = on_select_msg.as_ref().map(|cb| {
+                                                    let cb = cb.clone();
+                                                    std::sync::Arc::new(move |target: usize, window: &mut Window, cx: &mut App| {
+                                                        cb(&(msg_idx, target), window, cx);
+                                                    }) as std::sync::Arc<dyn Fn(usize, &mut Window, &mut App) + 'static>
+                                                });
+                                                let on_drag_cb = on_drag_msg.as_ref().map(|cb| {
+                                                    let cb = cb.clone();
+                                                    std::sync::Arc::new(move |target: usize, window: &mut Window, cx: &mut App| {
+                                                        cb(&(msg_idx, target), window, cx);
+                                                    }) as std::sync::Arc<dyn Fn(usize, &mut Window, &mut App) + 'static>
+                                                });
+                                                // Scroll area px(8) + bubble right-align offset when at max_w
+                                                // + bubble inner px(12) left padding = 44px from sidebar left.
+                                                let user_text_left = (win_w - sidebar_width + 44.0).max(0.0);
                                                 d.child(
                                                     div()
                                                         .text_size(px(13.))
                                                         .text_color(theme.foreground)
-                                                        .child(msg.text.clone()),
+                                                        .w_full()
+                                                        .min_w(px(0.))
+                                                        .child(render_markdown_prose(
+                                                            &msg.text,
+                                                            &theme,
+                                                            false,
+                                                            active_sel,
+                                                            on_select_cb,
+                                                            on_drag_cb,
+                                                            user_text_left,
+                                                            Some(win_ref),
+                                                            Some((&registry, msg_idx)),
+                                                        )),
                                                 )
                                             }),
                                     )
@@ -1484,20 +1841,86 @@ impl RenderOnce for AiSidebar {
                                             .w_full()
                                             .gap_2()
                                             .my(px(2.))
-                                            .children(msg.tool_calls.into_iter().enumerate().map(|(tc_idx, tc)| {
-                                                let info = parse_tool_row(&tc);
-                                                div()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .items_center()
-                                                    .justify_between()
-                                                    .px(px(10.))
-                                                    .py(px(6.))
-                                                    .rounded(px(6.))
-                                                    .bg(theme.surface)
-                                                    .border_1()
-                                                    .border_color(theme.border)
-                                                    .child(
+                                              .children(msg.tool_calls.into_iter().enumerate().map(|(tc_idx, tc)| {
+                                                 let info = parse_tool_row(&tc);
+                                                 let is_edit = tc.name == "edit_file";
+                                                 let awaiting = tool_pending_conf
+                                                     .as_ref()
+                                                     .filter(|p| p.tool_id == tc.id)
+                                                     .cloned();
+                                                 // Card source: the applied diff once the tool
+                                                 // finishes; while running/pending a preview built
+                                                 // from the raw args, so the diff is visible
+                                                 // immediately — never a bare spinner.
+                                                 let (card_diff, card_running) =
+                                                     if let Some(diff) = tc.diff.clone() {
+                                                         (diff, false)
+                                                     } else if is_edit {
+                                                         match parse_diff_confirmation("edit_file", &tc.args) {
+                                                             Some(p) => (
+                                                                 crate::ai::diff::FileDiff {
+                                                                     path: p.file_path,
+                                                                     lines: p.rows.into_iter().map(|r| {
+                                                                         let (kind, text) = match r {
+                                                                             DiffRow::Context(t) => (crate::ai::diff::DiffLineKind::Context, t),
+                                                                             DiffRow::Del(t) => (crate::ai::diff::DiffLineKind::Del, t),
+                                                                             DiffRow::Add(t) => (crate::ai::diff::DiffLineKind::Add, t),
+                                                                         };
+                                                                         crate::ai::diff::DiffLine {
+                                                                             kind,
+                                                                             text,
+                                                                             old_line: None,
+                                                                             new_line: None,
+                                                                         }
+                                                                     }).collect(),
+                                                                     added: p.add_count,
+                                                                     removed: p.del_count,
+                                                                     truncated: false,
+                                                                 },
+                                                                 tc.is_running,
+                                                             ),
+                                                             None => (
+                                                                 crate::ai::diff::FileDiff {
+                                                                     path: info.target.clone(),
+                                                                     lines: Vec::new(),
+                                                                     added: 0,
+                                                                     removed: 0,
+                                                                     truncated: false,
+                                                                 },
+                                                                 tc.is_running,
+                                                             ),
+                                                         }
+                                                     } else {
+                                                         (
+                                                             crate::ai::diff::FileDiff {
+                                                                 path: String::new(),
+                                                                 lines: Vec::new(),
+                                                                 added: 0,
+                                                                 removed: 0,
+                                                                 truncated: false,
+                                                             },
+                                                             false,
+                                                         )
+                                                     };
+                                                 let show_card = is_edit || tc.diff.is_some();
+                                                 div()
+                                                     .flex()
+                                                     .flex_col()
+                                                     .w_full()
+                                                     .gap_1()
+                                                     .child(
+                                                     div()
+                                                     .flex()
+                                                     .flex_row()
+                                                     .items_center()
+                                                     .justify_between()
+                                                     .px(px(10.))
+                                                     .py(px(6.))
+                                                     .rounded(px(6.))
+                                                     .bg(theme.surface)
+                                                     .border_1()
+                                                     .border_color(theme.border)
+                                                     .child(
                                                         div()
                                                             .flex()
                                                             .flex_row()
@@ -1561,10 +1984,21 @@ impl RenderOnce for AiSidebar {
                                                                         },
                                                                         11.0,
                                                                     ))
-                                                                    .into_any_element()
-                                                            })
-                                                    )
-                                            })),
+                                                                     .into_any_element()
+                                                             })
+                                                     )
+                                                     )
+                                                     .when(show_card, |d| {
+                                                         d.child(render_tool_diff_card(
+                                                             &theme,
+                                                             &card_diff,
+                                                             awaiting.is_some(),
+                                                             card_running,
+                                                             awaiting.as_ref().map(|_| tool_on_confirm.clone()).flatten(),
+                                                             tc_idx,
+                                                         ))
+                                                     })
+                                              })),
                                     )
                                 })
                                 // Assistant prose
@@ -1597,6 +2031,27 @@ impl RenderOnce for AiSidebar {
                                             .w_full()
                                             .min_w(px(0.))
                                             .gap_1()
+                                            .on_mouse_down(MouseButton::Left, {
+                                                let registry = registry.clone();
+                                                let on_select = on_select_cb.clone();
+                                                move |ev: &MouseDownEvent, window, cx| {
+                                                    let idx = crate::ui::markdown::row_at_point_in_message(
+                                                        &registry, msg_idx, ev.position,
+                                                    );
+                                                    if let Some(i) = idx {
+                                                        let target = registry.borrow().get(i).map(|row| {
+                                                            crate::ui::markdown::char_target_in_row(
+                                                                row, ev.position, window,
+                                                            )
+                                                        });
+                                                        if let (Some(target), Some(ref cb)) =
+                                                            (target, on_select.as_ref())
+                                                        {
+                                                            cb(target, window, cx);
+                                                        }
+                                                    }
+                                                }
+                                            })
                                             .child(
                                                 div()
                                                     .w_full()
@@ -1612,37 +2067,42 @@ impl RenderOnce for AiSidebar {
                                                         on_drag_cb,
                                                         msg_text_left,
                                                         Some(win_ref),
+                                                        Some((&registry, msg_idx)),
                                                     ))
                                             )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .justify_end()
-                                                    .items_center()
-                                                    .pt(px(2.))
-                                                    .child(
-                                                        div()
-                                                            .flex()
-                                                            .flex_row()
-                                                            .items_center()
-                                                            .gap_1()
-                                                            .px(px(6.))
-                                                            .py(px(2.))
-                                                            .rounded(px(4.))
-                                                            .cursor(CursorStyle::PointingHand)
-                                                            .text_size(px(11.))
-                                                            .text_color(theme.muted)
-                                                            .hover(move |s| s.bg(theme.surface_raised).text_color(theme.foreground))
-                                                            .on_mouse_down(MouseButton::Left, move |_ev, _window, _cx| {
-                                                                if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                                                                    let _ = clip.set_text(text_to_copy.clone());
-                                                                }
-                                                            })
-                                                            .child(crate::ui::icons::render_icon(IconType::Copy, theme.muted, 11.0))
-                                                            .child("Copy")
-                                                    )
-                                            )
+                                             .child(
+                                                 div()
+                                                     .flex()
+                                                     .flex_row()
+                                                     .justify_end()
+                                                     .items_center()
+                                                     .pt(px(2.))
+                                                     .child({
+                                                         let on_copied = on_copied.clone();
+                                                         div()
+                                                             .flex()
+                                                             .flex_row()
+                                                             .items_center()
+                                                             .gap_1()
+                                                             .px(px(6.))
+                                                             .py(px(2.))
+                                                             .rounded(px(4.))
+                                                             .cursor(CursorStyle::PointingHand)
+                                                             .text_size(px(11.))
+                                                             .text_color(if copy_feedback { theme.green } else { theme.muted })
+                                                             .hover(move |s| s.bg(theme.surface_raised).text_color(theme.foreground))
+                                                             .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                                                                 if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                                                                     let _ = clip.set_text(text_to_copy.clone());
+                                                                 }
+                                                                 if let Some(ref cb) = on_copied {
+                                                                     cb(ev, window, cx);
+                                                                 }
+                                                             })
+                                                             .child(crate::ui::icons::render_icon(if copy_feedback { IconType::Check } else { IconType::Copy }, if copy_feedback { theme.green } else { theme.muted }, 11.0))
+                                                             .child(if copy_feedback { "Copied" } else { "Copy" })
+                                                     })
+                                             )
                                     )
                                 })
                         }
@@ -1651,6 +2111,7 @@ impl RenderOnce for AiSidebar {
                     // 3. Streaming Activity
                     .when(self.is_streaming, |this| {
                         let stream_idx = self.messages.len();
+                        let registry = row_registry.clone();
                         let active_sel = if let Some((sel_msg, s, e)) = message_selection {
                             if sel_msg == stream_idx { Some((s, e)) } else { None }
                         } else {
@@ -1718,6 +2179,7 @@ impl RenderOnce for AiSidebar {
                                         on_drag_cb,
                                         streaming_text_left,
                                         Some(win_ref),
+                                        Some((&registry, stream_idx)),
                                     ))
                                 }),
                         )
@@ -1729,13 +2191,12 @@ impl RenderOnce for AiSidebar {
             )
             .child(
                 // 5. Inset Composer Card & Footer
+                // No visible divider above the composer: section edges are imaginary.
                 div()
                     .flex()
                     .flex_col()
                     .p(px(12.))
                     .pt(px(6.))
-                    .border_t_1()
-                    .border_color(theme.border)
                     .child(
                         // Composer Inset Box
                         div()

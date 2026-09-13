@@ -731,9 +731,42 @@ impl Config {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        // Never persist an in-memory default config over an existing file
+        // whose load previously failed: that would silently destroy the
+        // user's settings (providers, api keys, keybindings).
+        if CONFIG_LOAD_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+            && path.exists()
+            && *CONFIG_LOADED_FROM_EXISTING.lock().unwrap_or_else(|p| p.into_inner()) == false
+        {
+            anyhow::bail!(
+                "Refusing to save config: the existing file failed to load earlier this session. Fix {} and restart.",
+                path.display()
+            );
+        }
         let res = self.save(&path);
         increment_config_version();
         res
+    }
+}
+
+static CONFIG_LOAD_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CONFIG_LOADED_FROM_EXISTING: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// Loads the config, falling back to defaults on failure while remembering
+/// that the on-disk file was unreadable so a later save cannot destroy it.
+pub fn load_lenient() -> Config {
+    match Config::load() {
+        Ok(cfg) => {
+            if let Ok(mut flag) = CONFIG_LOADED_FROM_EXISTING.lock() {
+                *flag = true;
+            }
+            cfg
+        }
+        Err(e) => {
+            eprintln!("[fastty] config load failed, using defaults until restart: {e}");
+            CONFIG_LOAD_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            Config::default()
+        }
     }
 }
 

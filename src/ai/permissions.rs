@@ -84,10 +84,25 @@ impl PermissionChecker {
             }
         }
 
-        // 2. Session allowlist check
+        // 2. Session allowlist check — an explicit "Allow Always" from an
+        //    earlier edit or command silences future calls with the same scope.
         let cache_key = format!("{}:{}", tool_name, Self::scope_for(tool_name, input_summary));
         if self.is_always_allowed(&cache_key) {
             return PermissionDecision::Allow;
+        }
+
+        // 3. File edits show their diff for review before applying. Only a
+        //    session allowlist entry (Allow Always) or Yolo mode skips the ask.
+        if tool_name == "edit_file" {
+            let mode = self
+                .mode
+                .read()
+                .map(|m| *m)
+                .unwrap_or(PermissionMode::ConfirmWrites);
+            return match mode {
+                PermissionMode::Yolo => PermissionDecision::Allow,
+                _ => PermissionDecision::Confirm,
+            };
         }
 
         // 3. Permission mode rules

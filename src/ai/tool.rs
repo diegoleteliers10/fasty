@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use serde_json::Value;
 
+use crate::ai::diff::FileDiff;
 use crate::ai::model::CancelToken;
 
 #[derive(Debug, Clone)]
@@ -12,6 +13,8 @@ pub struct ToolCtx {
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    /// Structured file diff for edit tools, rendered as a review card.
+    pub diff: Option<FileDiff>,
 }
 
 impl ToolOutput {
@@ -19,6 +22,15 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: false,
+            diff: None,
+        }
+    }
+
+    pub fn success_with_diff(content: impl Into<String>, diff: FileDiff) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            diff: Some(diff),
         }
     }
 
@@ -26,6 +38,7 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: true,
+            diff: None,
         }
     }
 }

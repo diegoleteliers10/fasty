@@ -274,6 +274,143 @@ fn align_at(file_lines: &[FileLine], query_lines: &[&str], start_idx: usize) -> 
     })
 }
 
+/// Strips `read_file`-style line-number prefixes from each line, e.g.
+/// "  42 | fn main() {" -> "fn main() {". Models routinely paste these
+/// numbered lines into old_string, which otherwise never matches the file.
+fn strip_line_number_prefixes(query: &str) -> Option<String> {
+    let mut changed = false;
+    let mut out = String::with_capacity(query.len());
+    for line in query.split('\n') {
+        let trimmed_start = line.trim_start();
+        let digits = trimmed_start
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        let rest = trimmed_start
+            .get(digits..)
+            .map(str::trim_start)
+            .unwrap_or("");
+        let sep = rest.chars().next();
+        let is_separator = matches!(sep, Some('|') | Some('│') | Some(':'));
+        if digits > 0 && digits <= 6 && is_separator {
+            let after = &rest[sep.map_or(0, |c| c.len_utf8())..];
+            let after = after.strip_prefix(' ').unwrap_or(after);
+            out.push_str(after);
+            changed = true;
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    // One '\n' was pushed per split segment; drop the trailing one.
+    out.pop();
+    if changed {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+enum FuzzyError {
+    NoMatch,
+    Ambiguous(String),
+}
+
+/// Upper bound on DP cells the fuzzy matcher may spend in one call. Without
+/// this, a large old_string on a large file explodes into billions of cells
+/// and the tool call appears to hang forever with a spinning indicator.
+const FUZZY_CELL_BUDGET: u64 = 4_000_000;
+
+fn find_fuzzy(content: &str, query: &str) -> Result<(MatchRange, (i32, i32)), FuzzyError> {
+    let file_lines = split_lines(content);
+    let query_lines: Vec<&str> = query.lines().collect();
+    if query_lines.is_empty() || file_lines.is_empty() {
+        return Err(FuzzyError::NoMatch);
+    }
+
+    // Per-start DP cost is window * query_len; derive how many start
+    // positions fit in the budget.
+    let m = query_lines.len();
+    // Very large queries never benefit from fuzzy alignment; exact match and
+    // line-number stripping already ran. Guard before the budget math.
+    if m == 0 || m > 400 || file_lines.is_empty() {
+        return Err(FuzzyError::NoMatch);
+    }
+    let window = (m + m / 2).max(3);
+    let per_start = (window as u64) * (m as u64 + 1);
+    let max_starts = (FUZZY_CELL_BUDGET / per_start.max(1)).max(1) as usize;
+
+    let total = file_lines.len() as u64 * per_start;
+    let starts: Vec<usize> = if total <= FUZZY_CELL_BUDGET {
+        (0..file_lines.len()).collect()
+    } else {
+        // Prefilter: only try starts whose first line plausibly matches the
+        // first query line (or the query's first line anywhere).
+        let first = query_lines[0].trim();
+        if first.is_empty() {
+            return Err(FuzzyError::NoMatch);
+        }
+        let mut candidates: Vec<usize> = file_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.text.trim() == first || fuzzy_eq(&l.text, first))
+            .map(|(i, _)| i)
+            .take(max_starts)
+            .collect();
+        if candidates.is_empty() {
+            // Fall back to the first max_starts positions.
+            candidates = (0..max_starts.min(file_lines.len())).collect();
+        }
+        candidates
+    };
+
+    let mut candidates: Vec<FuzzyMatch> = Vec::new();
+    for start in starts {
+        if let Some(candidate) = align_at(&file_lines, &query_lines, start) {
+            candidates.push(candidate);
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err(FuzzyError::NoMatch);
+    }
+
+    let best_cost = candidates.iter().map(|c| c.cost).min().expect("non-empty");
+    let mut best: Option<&FuzzyMatch> = None;
+    let mut tie_lines: Vec<usize> = Vec::new();
+    for candidate in &candidates {
+        if candidate.cost != best_cost {
+            continue;
+        }
+        let line = line_number_at(content, candidate.range.start);
+        match best {
+            None => {
+                best = Some(candidate);
+                tie_lines.push(line);
+            }
+            Some(current) if candidate.ratio > current.ratio => {
+                best = Some(candidate);
+                tie_lines.clear();
+                tie_lines.push(line);
+            }
+            Some(current) if candidate.ratio == current.ratio && !tie_lines.contains(&line) => {
+                tie_lines.push(line);
+            }
+            _ => {}
+        }
+    }
+
+    match best {
+        Some(m) if tie_lines.len() <= 1 => Ok((m.range, (m.first_line_delta, m.rest_delta))),
+        Some(_) => Err(FuzzyError::Ambiguous(format!(
+            "old_string matched multiple locations in the file at lines: {}. \
+             Please provide more context in old_string to uniquely identify the location.",
+            tie_lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(", ")
+        ))),
+        None => unreachable!("candidates is non-empty"),
+    }
+}
+
 /// Two-tier search: byte-exact first, then fuzzy over trimmed lines.
 /// Returns the matched byte range plus the indent deltas (first line, rest)
 /// to apply to the replacement text.
@@ -284,60 +421,28 @@ fn find_match(content: &str, query: &str) -> Result<(MatchRange, (i32, i32)), St
     match find_exact(content, query) {
         Ok(range) => Ok((range, (0, 0))),
         Err(err) if !err.is_empty() => Err(err),
-        Err(_) => {
-            let file_lines = split_lines(content);
-            let query_lines: Vec<&str> = query.lines().collect();
-            let mut candidates: Vec<FuzzyMatch> = Vec::new();
-            for start in 0..file_lines.len() {
-                if let Some(candidate) = align_at(&file_lines, &query_lines, start) {
-                    candidates.push(candidate);
+        Err(_) => match find_fuzzy(content, query) {
+            Ok(found) => Ok(found),
+            Err(FuzzyError::Ambiguous(msg)) => Err(msg),
+            Err(FuzzyError::NoMatch) => {
+                // Last resort: the model may have copied read_file output
+                // including its "  12 | " line-number prefixes.
+                if let Some(stripped) = strip_line_number_prefixes(query) {
+                    if stripped != query {
+                        if let Ok(found) = find_match(content, &stripped) {
+                            return Ok(found);
+                        }
+                    }
                 }
-            }
-
-            if candidates.is_empty() {
-                return Err(
+                Err(
                     "Could not find matching text for this edit. The old_string did not match \
-                     any content in the file (matching tolerates whitespace differences). \
-                     Please read the file again to get the current content."
+                     any content in the file (matching tolerates whitespace differences and \
+                     read_file line-number prefixes). Please read the file again to get the \
+                     current content."
                         .to_string(),
-                );
+                )
             }
-
-            let best_cost = candidates.iter().map(|c| c.cost).min().expect("non-empty");
-            let mut best: Option<&FuzzyMatch> = None;
-            let mut tie_lines: Vec<usize> = Vec::new();
-            for candidate in &candidates {
-                if candidate.cost != best_cost {
-                    continue;
-                }
-                let line = line_number_at(content, candidate.range.start);
-                match best {
-                    None => {
-                        best = Some(candidate);
-                        tie_lines.push(line);
-                    }
-                    Some(current) if candidate.ratio > current.ratio => {
-                        best = Some(candidate);
-                        tie_lines.clear();
-                        tie_lines.push(line);
-                    }
-                    Some(current) if candidate.ratio == current.ratio && !tie_lines.contains(&line) => {
-                        tie_lines.push(line);
-                    }
-                    _ => {}
-                }
-            }
-
-            match best {
-                Some(m) if tie_lines.len() <= 1 => Ok((m.range, (m.first_line_delta, m.rest_delta))),
-                Some(_) => Err(format!(
-                    "old_string matched multiple locations in the file at lines: {}. \
-                     Please provide more context in old_string to uniquely identify the location.",
-                    tie_lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(", ")
-                )),
-                None => unreachable!("candidates is non-empty"),
-            }
-        }
+        },
     }
 }
 
@@ -456,19 +561,28 @@ impl Tool for EditFileTool {
 
             let added = new_str.lines().count();
             let removed = old_str.lines().count();
-            Ok(ToolOutput::success(format!(
-                "Successfully replaced 1 occurrence in '{}' (+{} -{})",
-                target_path.display(),
-                added,
-                removed
-            )))
+            let diff = crate::ai::diff::diff_contents(
+                target_path.display().to_string(),
+                &file_content,
+                &updated,
+            );
+            Ok(ToolOutput::success_with_diff(
+                format!(
+                    "Successfully replaced 1 occurrence in '{}' (+{} -{})",
+                    target_path.display(),
+                    added,
+                    removed
+                ),
+                diff,
+            ))
         } else if let Some(content) = parsed.content {
             if let Some(parent) = target_path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
 
+            let previous = fs::read_to_string(&target_path).ok();
             let bytes_len = content.len();
-            if let Err(e) = fs::write(&target_path, content) {
+            if let Err(e) = fs::write(&target_path, &content) {
                 return Err(ToolOutput::error(format!(
                     "Failed to write file '{}': {}",
                     target_path.display(),
@@ -476,11 +590,24 @@ impl Tool for EditFileTool {
                 )));
             }
 
-            Ok(ToolOutput::success(format!(
-                "Successfully wrote {} bytes to '{}'",
-                bytes_len,
-                target_path.display()
-            )))
+            let out = if let Some(old) = previous {
+                let diff = crate::ai::diff::diff_contents(
+                    target_path.display().to_string(),
+                    &old,
+                    &content,
+                );
+                ToolOutput::success_with_diff(
+                    format!("Successfully wrote {} bytes to '{}'", bytes_len, target_path.display()),
+                    diff,
+                )
+            } else {
+                ToolOutput::success(format!(
+                    "Successfully wrote {} bytes to '{}'",
+                    bytes_len,
+                    target_path.display()
+                ))
+            };
+            Ok(out)
         } else {
             Err(ToolOutput::error(
                 "Either old_string and new_string, or content must be provided.",
@@ -541,6 +668,26 @@ mod tests {
     }
 
     #[test]
+    fn line_number_prefixes_are_stripped_before_matching() {
+        let content = "fn main() {\n    println!(\"hi\");\n}\n";
+        // Model copied read_file output verbatim.
+        let query = "1 | fn main() {\n2 |     println!(\"hi\");\n3 | }";
+        let (range, _) = find_match(content, query).expect("stripped match");
+        assert!(content[range.start..range.end].starts_with("fn main()"));
+    }
+
+    #[test]
+    fn line_number_strip_survives_pipes_and_colons() {
+        assert_eq!(
+            strip_line_number_prefixes("  12 | a\n   3│ b\n4: c").as_deref(),
+            Some("a\nb\nc")
+        );
+        assert_eq!(strip_line_number_prefixes("no prefix"), None);
+        assert_eq!(strip_line_number_prefixes("12345678 | too wide"), None);
+        assert_eq!(strip_line_number_prefixes("foo | not a number"), None);
+    }
+
+    #[test]
     fn missing_new_string_is_a_validation_error() {
         let tool = EditFileTool::new();
         let input = serde_json::json!({ "path": "x.txt", "old_string": "a" });
@@ -562,5 +709,46 @@ mod tests {
         crate::ai::tool::ToolCtx {
             cwd: std::env::temp_dir(),
         }
+    }
+}
+
+#[cfg(test)]
+mod fuzzy_perf_tests {
+    use super::*;
+
+    #[test]
+    fn fuzzy_scan_on_large_file_completes_quickly() {
+        // 20k lines, 120 chars each
+        let mut content = String::with_capacity(20_000 * 121);
+        for i in 0..20_000 {
+            content.push_str(&format!("fn generated_line_{i}() {{ let x = {i}; let padding = \"aaaaaabbbbbbccccc\"; }}\n"));
+        }
+        // 200-line query that does NOT exist anywhere (forces full scan path)
+        let mut query = String::new();
+        for i in 0..200 {
+            query.push_str(&format!("totally_absent_line_{i}(x, y, z) // does not exist\n"));
+        }
+        let start = std::time::Instant::now();
+        let result = find_match(&content, &query);
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "should not match");
+        assert!(elapsed.as_secs() < 5, "fuzzy scan took too long: {:?}", elapsed);
+    }
+
+    #[test]
+    fn fuzzy_finds_match_in_large_file_within_budget() {
+        let mut content = String::with_capacity(20_000 * 121);
+        for i in 0..20_000 {
+            content.push_str(&format!("fn generated_line_{i}() {{ let x = {i}; }}\n"));
+        }
+        // A real 60-line block pasted with an extra blank line difference.
+        let target_start = 10_000;
+        let mut target = String::new();
+        for i in target_start..target_start + 60 {
+            target.push_str(&format!("fn generated_line_{i}() {{ let x = {i}; }}\n"));
+        }
+        let (range, _) = find_match(&content, target.trim_end()).expect("should find the block");
+        let found = &content[range.start..range.end];
+        assert!(found.contains(&format!("generated_line_{target_start}")));
     }
 }
