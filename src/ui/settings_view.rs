@@ -1,7 +1,7 @@
 use gpui::{
     canvas, Context, CursorStyle, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Render, ScrollHandle, SharedString, Window, WindowControlArea, WindowHandle, div,
-    prelude::*, px,
+    MouseUpEvent, Render, ScrollHandle, ScrollStrategy, SharedString, UniformListScrollHandle, Window,
+    WindowControlArea, WindowHandle, div, prelude::*, px, uniform_list,
 };
 use icons::common::IconType;
 use parking_lot::Mutex;
@@ -19,42 +19,6 @@ pub struct ThemeCardInfo {
     pub bg_color: gpui::Hsla,
     pub surf_color: gpui::Hsla,
     pub acc_color: gpui::Hsla,
-}
-
-fn filter_programming_fonts(all_fonts: Vec<String>, current_font: &str) -> Vec<String> {
-    let coding_keywords = [
-        "mono", "code", "typewriter", "console", "courier", "hack", "menlo", "monaco",
-        "consolas", "inconsolata", "fira", "jetbrains", "cascadia", "meslo", "source", "dejavu",
-    ];
-
-    let mut result = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    if !current_font.is_empty() {
-        result.push(current_font.to_string());
-        seen.insert(current_font.to_lowercase());
-    }
-
-    for font in all_fonts {
-        let lower = font.to_lowercase();
-        let matches = coding_keywords.iter().any(|k| lower.contains(k));
-        if matches && !seen.contains(&lower) {
-            seen.insert(lower);
-            result.push(font);
-        }
-    }
-
-    if result.is_empty() {
-        result = vec![
-            "Menlo".to_string(),
-            "Monaco".to_string(),
-            "Courier New".to_string(),
-            "Fira Code".to_string(),
-            "JetBrains Mono".to_string(),
-        ];
-    }
-
-    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -98,6 +62,7 @@ pub enum ActiveInputField {
     AiBaseUrl,
     AiApiKey,
     AiModel,
+    FontSearch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +99,13 @@ pub struct SettingsView {
     pub search_query: String,
     pub search_input: crate::ui::TextInputState,
     pub active_input_field: Option<ActiveInputField>,
+    pub font_combobox_open: bool,
+    pub font_search_query: String,
+    pub font_search_state: crate::ui::TextInputState,
+    pub font_highlighted_index: usize,
+    pub font_scroll_handle: UniformListScrollHandle,
+    pub font_trigger_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    pub font_search_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     pub ai_base_url_input: String,
     pub ai_base_url_state: crate::ui::TextInputState,
     pub ai_api_key_input: String,
@@ -180,8 +152,32 @@ impl SettingsView {
 
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
-        let raw_fonts = available_system_fonts();
-        let system_fonts = filter_programming_fonts(raw_fonts, &font_family);
+        let mut raw_fonts = cx.text_system().all_font_names();
+        for f in available_system_fonts() {
+            if !raw_fonts.iter().any(|existing| existing.eq_ignore_ascii_case(&f)) {
+                raw_fonts.push(f);
+            }
+        }
+
+        let mut system_fonts: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        if !font_family.is_empty() {
+            seen.insert(font_family.to_lowercase());
+            system_fonts.push(font_family.clone());
+        }
+
+        let mut other_fonts: Vec<String> = Vec::new();
+        for font in raw_fonts {
+            let trimmed = font.trim().to_string();
+            let lower = trimmed.to_lowercase();
+            if !trimmed.is_empty() && !trimmed.starts_with('.') && !seen.contains(&lower) {
+                seen.insert(lower);
+                other_fonts.push(trimmed);
+            }
+        }
+        other_fonts.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        system_fonts.extend(other_fonts);
 
         let theme_cards: Vec<ThemeCardInfo> = crate::config::all_theme_names()
             .into_iter()
@@ -260,6 +256,13 @@ impl SettingsView {
             search_query: String::new(),
             search_input: crate::ui::TextInputState::default(),
             active_input_field: None,
+            font_combobox_open: false,
+            font_search_query: String::new(),
+            font_search_state: crate::ui::TextInputState::default(),
+            font_highlighted_index: 0,
+            font_scroll_handle: UniformListScrollHandle::new(),
+            font_trigger_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
+            font_search_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             ai_base_url_state: crate::ui::TextInputState::new(ai_base_url_input.clone()),
             ai_base_url_input,
             ai_api_key_state: crate::ui::TextInputState::new(ai_api_key_input.clone()),
@@ -274,6 +277,39 @@ impl SettingsView {
             ai_api_key_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             is_dragging_input: false,
         }
+    }
+
+    pub fn filtered_font_indices(&self) -> Vec<usize> {
+        let q = self.font_search_query.trim().to_lowercase();
+        if q.is_empty() {
+            (0..self.system_fonts.len()).collect()
+        } else {
+            self.system_fonts
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| name.to_lowercase().contains(&q))
+                .map(|(idx, _)| idx)
+                .collect()
+        }
+    }
+
+    pub fn toggle_font_combobox(&mut self, cx: &mut Context<Self>) {
+        self.font_combobox_open = !self.font_combobox_open;
+        if self.font_combobox_open {
+            self.active_input_field = Some(ActiveInputField::FontSearch);
+            self.font_search_state.clear();
+            self.font_search_query.clear();
+            let indices = self.filtered_font_indices();
+            if let Some(pos) = indices.iter().position(|&idx| self.system_fonts.get(idx) == Some(&self.font_family)) {
+                self.font_highlighted_index = pos;
+                self.font_scroll_handle.scroll_to_item(pos, ScrollStrategy::Center);
+            } else {
+                self.font_highlighted_index = 0;
+            }
+        } else if self.active_input_field == Some(ActiveInputField::FontSearch) {
+            self.active_input_field = None;
+        }
+        cx.notify();
     }
 
     pub fn new_with_config(window: &mut Window, active_config: &Config, cx: &mut Context<Self>) -> Self {
@@ -418,11 +454,24 @@ impl SettingsView {
                 self.save_ai_provider_config();
                 cx.notify();
             }
+            ActiveInputField::FontSearch => {
+                self.font_search_query = self.font_search_state.text.clone();
+                self.font_highlighted_index = 0;
+                cx.notify();
+            }
         }
     }
 
     fn handle_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if ev.keystroke.key == "escape" {
+            if self.font_combobox_open {
+                self.font_combobox_open = false;
+                if self.active_input_field == Some(ActiveInputField::FontSearch) {
+                    self.active_input_field = None;
+                }
+                cx.notify();
+                return;
+            }
             if self.active_input_field.is_some() {
                 if self.active_input_field == Some(ActiveInputField::Search) && !self.search_query.is_empty() {
                     self.search_query.clear();
@@ -446,6 +495,43 @@ impl SettingsView {
             let is_plat = ev.keystroke.modifiers.platform;
             let shift = ev.keystroke.modifiers.shift;
 
+            if field == ActiveInputField::FontSearch {
+                if key_lower == "down" || key_lower == "arrowdown" {
+                    let indices = self.filtered_font_indices();
+                    if !indices.is_empty() {
+                        self.font_highlighted_index = (self.font_highlighted_index + 1) % indices.len();
+                        self.font_scroll_handle.scroll_to_item(self.font_highlighted_index, ScrollStrategy::Nearest);
+                        cx.notify();
+                    }
+                    return;
+                }
+                if key_lower == "up" || key_lower == "arrowup" {
+                    let indices = self.filtered_font_indices();
+                    if !indices.is_empty() {
+                        self.font_highlighted_index = if self.font_highlighted_index == 0 {
+                            indices.len() - 1
+                        } else {
+                            self.font_highlighted_index - 1
+                        };
+                        self.font_scroll_handle.scroll_to_item(self.font_highlighted_index, ScrollStrategy::Nearest);
+                        cx.notify();
+                    }
+                    return;
+                }
+                if key_lower == "enter" || key_lower == "return" {
+                    let indices = self.filtered_font_indices();
+                    if let Some(&font_idx) = indices.get(self.font_highlighted_index) {
+                        if let Some(name) = self.system_fonts.get(font_idx).cloned() {
+                            self.set_font_family(&name, cx);
+                        }
+                    }
+                    self.font_combobox_open = false;
+                    self.active_input_field = None;
+                    cx.notify();
+                    return;
+                }
+            }
+
             // Select All: Cmd+A (macOS) or Ctrl+A (Linux/Windows)
             let is_select_all = (cfg!(target_os = "macos") && is_plat && key_lower == "a")
                 || (!cfg!(target_os = "macos") && is_ctrl && key_lower == "a");
@@ -455,6 +541,7 @@ impl SettingsView {
                     ActiveInputField::AiBaseUrl => &mut self.ai_base_url_state,
                     ActiveInputField::AiApiKey => &mut self.ai_api_key_state,
                     ActiveInputField::AiModel => &mut self.ai_model_state,
+                    ActiveInputField::FontSearch => &mut self.font_search_state,
                 };
                 state.select_all();
                 cx.notify();
@@ -470,6 +557,7 @@ impl SettingsView {
                     ActiveInputField::AiBaseUrl => &self.ai_base_url_state,
                     ActiveInputField::AiApiKey => &self.ai_api_key_state,
                     ActiveInputField::AiModel => &self.ai_model_state,
+                    ActiveInputField::FontSearch => &self.font_search_state,
                 };
                 if let Some(sel) = state.selected_text() {
                     if let Some(mut clip) = crate::event_listener::clipboard_helper() {
@@ -488,6 +576,7 @@ impl SettingsView {
                     ActiveInputField::AiBaseUrl => &mut self.ai_base_url_state,
                     ActiveInputField::AiApiKey => &mut self.ai_api_key_state,
                     ActiveInputField::AiModel => &mut self.ai_model_state,
+                    ActiveInputField::FontSearch => &mut self.font_search_state,
                 };
                 if let Some(sel) = state.selected_text() {
                     if let Some(mut clip) = crate::event_listener::clipboard_helper() {
@@ -511,6 +600,7 @@ impl SettingsView {
                             ActiveInputField::AiBaseUrl => &mut self.ai_base_url_state,
                             ActiveInputField::AiApiKey => &mut self.ai_api_key_state,
                             ActiveInputField::AiModel => &mut self.ai_model_state,
+                            ActiveInputField::FontSearch => &mut self.font_search_state,
                         };
                         state.insert_str(clean);
                         self.sync_active_field_text(field, cx);
@@ -531,6 +621,7 @@ impl SettingsView {
                     ActiveInputField::AiBaseUrl => &mut self.ai_base_url_state,
                     ActiveInputField::AiApiKey => &mut self.ai_api_key_state,
                     ActiveInputField::AiModel => &mut self.ai_model_state,
+                    ActiveInputField::FontSearch => &mut self.font_search_state,
                 };
                 state.backspace();
                 self.sync_active_field_text(field, cx);
@@ -543,6 +634,7 @@ impl SettingsView {
                     ActiveInputField::AiBaseUrl => &mut self.ai_base_url_state,
                     ActiveInputField::AiApiKey => &mut self.ai_api_key_state,
                     ActiveInputField::AiModel => &mut self.ai_model_state,
+                    ActiveInputField::FontSearch => &mut self.font_search_state,
                 };
                 state.delete_forward();
                 self.sync_active_field_text(field, cx);
@@ -555,6 +647,7 @@ impl SettingsView {
                     ActiveInputField::AiBaseUrl => &mut self.ai_base_url_state,
                     ActiveInputField::AiApiKey => &mut self.ai_api_key_state,
                     ActiveInputField::AiModel => &mut self.ai_model_state,
+                    ActiveInputField::FontSearch => &mut self.font_search_state,
                 };
                 state.move_left(shift);
                 cx.notify();
@@ -567,6 +660,7 @@ impl SettingsView {
                     ActiveInputField::AiBaseUrl => &mut self.ai_base_url_state,
                     ActiveInputField::AiApiKey => &mut self.ai_api_key_state,
                     ActiveInputField::AiModel => &mut self.ai_model_state,
+                    ActiveInputField::FontSearch => &mut self.font_search_state,
                 };
                 state.move_right(shift);
                 cx.notify();
@@ -579,6 +673,7 @@ impl SettingsView {
                     ActiveInputField::AiBaseUrl => &mut self.ai_base_url_state,
                     ActiveInputField::AiApiKey => &mut self.ai_api_key_state,
                     ActiveInputField::AiModel => &mut self.ai_model_state,
+                    ActiveInputField::FontSearch => &mut self.font_search_state,
                 };
                 state.move_home(shift);
                 cx.notify();
@@ -591,6 +686,7 @@ impl SettingsView {
                     ActiveInputField::AiBaseUrl => &mut self.ai_base_url_state,
                     ActiveInputField::AiApiKey => &mut self.ai_api_key_state,
                     ActiveInputField::AiModel => &mut self.ai_model_state,
+                    ActiveInputField::FontSearch => &mut self.font_search_state,
                 };
                 state.move_end(shift);
                 cx.notify();
@@ -612,6 +708,7 @@ impl SettingsView {
                             ActiveInputField::AiBaseUrl => &mut self.ai_base_url_state,
                             ActiveInputField::AiApiKey => &mut self.ai_api_key_state,
                             ActiveInputField::AiModel => &mut self.ai_model_state,
+                            ActiveInputField::FontSearch => &mut self.font_search_state,
                         };
                         state.insert_str(txt);
                         self.sync_active_field_text(field, cx);
@@ -1327,22 +1424,29 @@ impl SettingsView {
             // Scrollable Content
             .child(
                 div()
-                    .id("settings-scroll-content")
-                    .track_scroll(&self.window_scroll_handle)
+                    .id("settings-scroll-container")
+                    .relative()
                     .flex_1()
-                    .overflow_y_scroll()
-                    .p(px(24.))
-                    .flex()
-                    .flex_col()
-                    .gap_6()
-                    .child(match self.active_tab {
-                        SettingsTab::General => self.render_tab_general(theme, cx),
-                        SettingsTab::Appearance => self.render_tab_appearance(theme, cx),
-                        SettingsTab::Keyboard => self.render_tab_keyboard(theme, cx),
-                        SettingsTab::Ai => self.render_tab_ai(theme, window, cx),
-                        SettingsTab::Migration => self.render_tab_migration(theme, cx),
-                        SettingsTab::Advanced => self.render_tab_advanced(theme, cx),
-                    }),
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .id("settings-scroll-content")
+                            .track_scroll(&self.window_scroll_handle)
+                            .size_full()
+                            .overflow_y_scroll()
+                            .p(px(24.))
+                            .flex()
+                            .flex_col()
+                            .gap_6()
+                            .child(match self.active_tab {
+                                SettingsTab::General => self.render_tab_general(theme, cx),
+                                SettingsTab::Appearance => self.render_tab_appearance(theme, window, cx),
+                                SettingsTab::Keyboard => self.render_tab_keyboard(theme, cx),
+                                SettingsTab::Ai => self.render_tab_ai(theme, window, cx),
+                                SettingsTab::Migration => self.render_tab_migration(theme, cx),
+                                SettingsTab::Advanced => self.render_tab_advanced(theme, cx),
+                            }),
+                    ),
             )
     }
 
@@ -1613,7 +1717,7 @@ impl SettingsView {
             )
     }
 
-    fn render_tab_appearance(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_tab_appearance(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         div()
             .flex()
             .flex_col()
@@ -1801,7 +1905,13 @@ impl SettingsView {
                     .flex_col()
                     .child(render_section_header("Typography", theme))
                     .child(
-                        render_group_card(theme)
+                        div()
+                            .bg(theme.surface)
+                            .border_1()
+                            .border_color(theme.border)
+                            .rounded(px(10.))
+                            .flex()
+                            .flex_col()
                             .child(render_card_row(
                                 "Font Size",
                                 Some("Terminal text grid cell point size"),
@@ -1866,68 +1976,416 @@ impl SettingsView {
                             .child(
                                 div()
                                     .p(px(16.))
+                                    .child(self.render_font_combobox(theme, window, cx)),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_font_combobox(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        let is_open = self.font_combobox_open;
+        let is_search_active = self.active_input_field == Some(ActiveInputField::FontSearch);
+        let query = self.font_search_query.clone();
+        let query_lower = query.trim().to_lowercase();
+        let filtered_indices: Vec<usize> = if query_lower.is_empty() {
+            (0..self.system_fonts.len()).collect()
+        } else {
+            self.system_fonts
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.to_lowercase().contains(&query_lower))
+                .map(|(idx, _)| idx)
+                .collect()
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .child("Font Family"),
+                    )
+                    .child(
+                        div()
+                            .px(px(6.))
+                            .py(px(2.))
+                            .rounded(px(4.))
+                            .bg(theme.surface_raised)
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.accent)
+                            .child(self.font_family.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(36.))
+                            .px(px(12.))
+                            .rounded(px(6.))
+                            .bg(if is_open { theme.surface_raised } else { theme.surface })
+                            .border_1()
+                            .border_color(if is_open { theme.accent } else { theme.border })
+                            .hover(move |s| s.bg(theme.surface_raised).border_color(theme.accent))
+                            .cursor(CursorStyle::PointingHand)
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                this.toggle_font_combobox(cx);
+                            }))
+                            .child({
+                                let bounds_cell = self.font_trigger_bounds.clone();
+                                canvas(
+                                    |_, _, _| {},
+                                    move |bounds, _, _, _| {
+                                        bounds_cell.set(Some(bounds));
+                                    },
+                                )
+                                .absolute()
+                                .size_full()
+                            })
+                            .child(
+                                div()
                                     .flex()
-                                    .flex_col()
+                                    .flex_row()
+                                    .items_center()
                                     .gap_2()
                                     .child(
                                         div()
+                                            .w(px(22.))
+                                            .h(px(22.))
+                                            .rounded(px(4.))
+                                            .bg(theme.surface_raised)
+                                            .border_1()
+                                            .border_color(theme.border)
                                             .flex()
-                                            .flex_row()
                                             .items_center()
-                                            .justify_between()
-                                            .child(
-                                                div()
-                                                    .text_size(px(12.5))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(theme.foreground)
-                                                    .child("Font Family"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px(px(6.))
-                                                    .py(px(2.))
-                                                    .rounded(px(4.))
-                                                    .bg(theme.surface_raised)
-                                                    .text_size(px(11.))
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(theme.accent)
-                                                    .child(self.font_family.clone()),
-                                            ),
+                                            .justify_center()
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(theme.accent)
+                                            .font_family(SharedString::from(self.font_family.clone()))
+                                            .child("Aa"),
                                     )
                                     .child(
                                         div()
-                                            .flex()
-                                            .flex_row()
-                                            .flex_wrap()
-                                            .gap_1p5()
-                                            .children(self.system_fonts.iter().map(|font_name| {
-                                                let is_active = self.font_family == *font_name;
-                                                let name_clone = font_name.clone();
-                                                div()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .items_center()
-                                                    .gap_1p5()
-                                                    .px(px(8.))
-                                                    .py(px(5.))
-                                                    .rounded(px(5.))
-                                                    .bg(if is_active { theme.surface_raised } else { theme.surface })
-                                                    .border_1()
-                                                    .border_color(if is_active { theme.accent } else { theme.border })
-                                                    .hover(move |s| s.bg(theme.surface_raised))
-                                                    .text_color(if is_active { theme.foreground } else { theme.muted_strong })
-                                                    .text_size(px(11.))
-                                                    .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                                        this.set_font_family(&name_clone, cx);
-                                                    }))
-                                                    .child(font_name.clone())
-                                                    .when(is_active, |el| el.child(render_icon(IconType::Check, theme.accent, 11.0)))
-                                            })),
+                                            .text_size(px(12.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.foreground)
+                                            .child(self.font_family.clone()),
                                     ),
-                            ),
-                    ),
+                            )
+                            .child(render_icon(
+                                if is_open { IconType::ChevronUp } else { IconType::ChevronDown },
+                                if is_open { theme.accent } else { theme.muted_strong },
+                                12.0,
+                            )),
+                    )
+                    .when(is_open, |combobox| {
+                        let total_fonts = self.system_fonts.len();
+                        let shown_fonts = filtered_indices.len();
+
+                        let open_upward = if let Some(bounds) = self.font_trigger_bounds.get() {
+                            let window_h = window.viewport_size().height;
+                            let space_below = window_h - bounds.bottom();
+                            let space_above = bounds.top();
+                            space_below < px(290.) && space_above > space_below
+                        } else {
+                            false
+                        };
+
+                        combobox.child(
+                            div()
+                                .id("font-combobox-dropdown")
+                                .absolute()
+                                .when(open_upward, |el| el.bottom(px(42.)))
+                                .when(!open_upward, |el| el.top(px(42.)))
+                                .left_0()
+                                .right_0()
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_scroll_wheel(|_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .rounded(px(8.))
+                                .bg({
+                                    let mut bg = theme.surface_raised;
+                                    bg.a = 1.0;
+                                    bg
+                                })
+                                .border_1()
+                                .border_color(theme.border)
+                                .shadow_lg()
+                                .p(px(6.))
+                                .flex()
+                                .flex_col()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .h(px(32.))
+                                        .rounded(px(6.))
+                                        .bg(theme.surface)
+                                        .border_1()
+                                        .border_color(if is_search_active { theme.accent } else { theme.border })
+                                        .px(px(8.))
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .cursor(CursorStyle::IBeam)
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.active_input_field = Some(ActiveInputField::FontSearch);
+                                            this.font_search_state.last_bounds = this.font_search_bounds.get();
+                                            let col = this.font_search_state.index_for_position(ev.position, 11.5, 0.0, window);
+                                            this.font_search_state.start_drag(col);
+                                            this.is_dragging_input = true;
+                                            cx.notify();
+                                        }))
+                                        .child(render_icon(
+                                            IconType::Search,
+                                            if is_search_active { theme.accent } else { theme.muted },
+                                            12.0,
+                                        ))
+                                        .child(
+                                            div()
+                                                .relative()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .child({
+                                                    let bounds_cell = self.font_search_bounds.clone();
+                                                    canvas(
+                                                        |_, _, _| {},
+                                                        move |bounds, _, _, _| {
+                                                            bounds_cell.set(Some(bounds));
+                                                        },
+                                                    )
+                                                    .absolute()
+                                                    .size_full()
+                                                })
+                                                .child(if query.is_empty() {
+                                                    div()
+                                                        .flex()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .when(is_search_active, |this| {
+                                                            this.child(
+                                                                div()
+                                                                    .w(px(2.))
+                                                                    .h(px(13.))
+                                                                    .rounded(px(1.))
+                                                                    .bg(theme.accent)
+                                                                    .mr(px(2.)),
+                                                            )
+                                                        })
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(11.5))
+                                                                .text_color(theme.muted)
+                                                                .child("Search font family..."),
+                                                        )
+                                                } else {
+                                                    crate::ui::text_input::render_line_spans(
+                                                        &query,
+                                                        0,
+                                                        if is_search_active { Some(self.font_search_state.cursor) } else { None },
+                                                        self.font_search_state.selection,
+                                                        11.5,
+                                                        theme,
+                                                        Some(window),
+                                                    )
+                                                }),
+                                        )
+                                        .when(!query.is_empty(), |el| {
+                                            el.child(
+                                                div()
+                                                    .px(px(4.))
+                                                    .py(px(2.))
+                                                    .rounded(px(4.))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .hover(move |s| s.bg(theme.surface_raised))
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.font_search_state.clear();
+                                                        this.font_search_query.clear();
+                                                        this.font_highlighted_index = 0;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(render_icon(IconType::X, theme.muted, 11.0)),
+                                            )
+                                        }),
+                                )
+                                .child(div().h(px(1.)).bg(theme.border).my(px(2.)))
+                                .child(
+                                    div()
+                                        .id("font-combobox-list")
+                                        .h(px(230.))
+                                        .overflow_hidden()
+                                        .when(filtered_indices.is_empty(), |el| {
+                                            el.child(
+                                                div()
+                                                    .py(px(24.))
+                                                    .flex()
+                                                    .flex_col()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .gap_1p5()
+                                                    .child(render_icon(IconType::Search, theme.muted, 16.0))
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(11.5))
+                                                            .text_color(theme.muted)
+                                                            .child(format!("No fonts matching \"{}\"", query)),
+                                                    ),
+                                            )
+                                        })
+                                        .when(!filtered_indices.is_empty(), |el| {
+                                            let filtered = filtered_indices.clone();
+                                            el.child(
+                                                uniform_list(
+                                                    "font-uniform-list",
+                                                    filtered.len(),
+                                                    cx.processor(move |this: &mut SettingsView, range: std::ops::Range<usize>, _window, cx| {
+                                                        let theme = this.theme;
+                                                        let font_family_curr = this.font_family.clone();
+                                                        let highlighted = this.font_highlighted_index;
+                                                        let mut items = Vec::with_capacity(range.len());
+
+                                                        for pos in range {
+                                                            let font_idx = filtered[pos];
+                                                            let font_name = this.system_fonts[font_idx].clone();
+                                                            let is_selected = font_family_curr == font_name;
+                                                            let is_focused = pos == highlighted;
+                                                            let name_for_click = font_name.clone();
+
+                                                            items.push(
+                                                                div()
+                                                                    .id(pos)
+                                                                    .h(px(28.))
+                                                                    .flex()
+                                                                    .flex_row()
+                                                                    .items_center()
+                                                                    .justify_between()
+                                                                    .px(px(8.))
+                                                                    .py(px(4.))
+                                                                    .rounded(px(5.))
+                                                                    .bg(if is_selected {
+                                                                        theme.accent.opacity(0.15)
+                                                                    } else if is_focused {
+                                                                        theme.hover
+                                                                    } else {
+                                                                        theme.surface_raised
+                                                                    })
+                                                                    .hover(move |s| {
+                                                                        s.bg(if is_selected {
+                                                                            theme.accent.opacity(0.2)
+                                                                        } else {
+                                                                            theme.hover
+                                                                        })
+                                                                    })
+                                                                    .cursor(CursorStyle::PointingHand)
+                                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                                                        cx.stop_propagation();
+                                                                        this.set_font_family(&name_for_click, cx);
+                                                                        this.font_combobox_open = false;
+                                                                        this.active_input_field = None;
+                                                                        cx.notify();
+                                                                    }))
+                                                                    .child(
+                                                                        div()
+                                                                            .flex()
+                                                                            .flex_row()
+                                                                            .items_center()
+                                                                            .gap_2()
+                                                                            .child(
+                                                                                div()
+                                                                                    .text_size(px(12.))
+                                                                                    .text_color(if is_selected {
+                                                                                        theme.foreground
+                                                                                    } else if is_focused {
+                                                                                        theme.foreground
+                                                                                    } else {
+                                                                                        theme.muted_strong
+                                                                                    })
+                                                                                    .font_weight(if is_selected {
+                                                                                        FontWeight::BOLD
+                                                                                    } else {
+                                                                                        FontWeight::NORMAL
+                                                                                    })
+                                                                                    .child(font_name.clone()),
+                                                                            )
+                                                                            .child(
+                                                                                div()
+                                                                                    .px(px(4.))
+                                                                                    .py(px(0.5))
+                                                                                    .rounded(px(3.))
+                                                                                    .bg(theme.surface)
+                                                                                    .text_size(px(9.5))
+                                                                                    .text_color(theme.muted)
+                                                                                    .font_family(SharedString::from(font_name.clone()))
+                                                                                    .child("Aa"),
+                                                                            ),
+                                                                    )
+                                                                    .when(is_selected, |row| {
+                                                                        row.child(render_icon(IconType::Check, theme.accent, 11.0))
+                                                                    }),
+                                                            );
+                                                        }
+                                                        items
+                                                    }),
+                                                )
+                                                .track_scroll(&self.font_scroll_handle)
+                                                .h(px(230.))
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .pt(px(6.))
+                                        .pb(px(2.))
+                                        .px(px(4.))
+                                        .border_t_1()
+                                        .border_color(theme.border)
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_size(px(10.5))
+                                                .text_color(theme.muted)
+                                                .child(format!("{} of {} fonts", shown_fonts, total_fonts)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(10.))
+                                                .text_color(theme.muted)
+                                                .child("↑↓ navigate • ↵ select • esc close"),
+                                        ),
+                                 ),
+                        )
+                    }),
             )
     }
 
@@ -3051,6 +3509,13 @@ impl SettingsView {
                     self.ai_api_key_input = self.ai_api_key_state.text.clone();
                     cx.notify();
                 }
+                ActiveInputField::FontSearch => {
+                    self.font_search_state.last_bounds = self.font_search_bounds.get();
+                    let col = self.font_search_state.index_for_position(ev.position, 11.5, 0.0, window);
+                    self.font_search_state.update_drag(col);
+                    self.font_search_query = self.font_search_state.text.clone();
+                    cx.notify();
+                }
             }
         }
     }
@@ -3062,6 +3527,7 @@ impl SettingsView {
             self.ai_model_state.end_drag();
             self.ai_base_url_state.end_drag();
             self.ai_api_key_state.end_drag();
+            self.font_search_state.end_drag();
             cx.notify();
         }
     }

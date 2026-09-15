@@ -135,6 +135,11 @@ pub struct AiSidebar {
     /// True while the message "Copy" button shows the "Copied" confirmation.
     pub copy_feedback: bool,
     pub on_copied: Option<MouseDownCallback>,
+    pub context_used_tokens: u64,
+    pub context_max_tokens: u64,
+    pub ai_last_usage: Option<(u64, u64)>,
+    pub context_hovercard_open: bool,
+    pub on_hover_context: Option<Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>>,
 }
 
 impl AiSidebar {
@@ -151,7 +156,7 @@ impl AiSidebar {
             model_name: model_name.into(),
             cwd: "~".to_string(),
             git_branch: None,
-            context_pct: 0.15,
+            context_pct: 0.0,
             agent_mode: "Agent".to_string(),
             messages: Vec::new(),
             streaming_text: String::new(),
@@ -188,7 +193,29 @@ impl AiSidebar {
             scroll_handle: None,
             copy_feedback: false,
             on_copied: None,
+            context_used_tokens: 0,
+            context_max_tokens: 128_000,
+            ai_last_usage: None,
+            context_hovercard_open: false,
+            on_hover_context: None,
         }
+    }
+
+    pub fn context_tokens(mut self, used: u64, max: u64, last_usage: Option<(u64, u64)>) -> Self {
+        self.context_used_tokens = used;
+        self.context_max_tokens = max;
+        self.ai_last_usage = last_usage;
+        self
+    }
+
+    pub fn context_hovercard_open(mut self, open: bool) -> Self {
+        self.context_hovercard_open = open;
+        self
+    }
+
+    pub fn on_hover_context(mut self, handler: impl Fn(&bool, &mut Window, &mut App) + 'static) -> Self {
+        self.on_hover_context = Some(Box::new(handler));
+        self
     }
 
     pub fn scroll_handle(mut self, handle: gpui::ScrollHandle) -> Self {
@@ -1256,6 +1283,204 @@ fn render_context_ring(pct: f32, theme: &Theme) -> impl IntoElement {
     .size(size)
 }
 
+fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    let len = s.len();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn render_context_hovercard(
+    _provider_name: &str,
+    model_name: &str,
+    used_tokens: u64,
+    max_tokens: u64,
+    last_usage: Option<(u64, u64)>,
+    pct: f32,
+    theme: &Theme,
+) -> impl IntoElement {
+    let progress = pct.clamp(0.0, 1.0);
+    let pct_label = format!("{:.1}%", progress * 100.0);
+    let remaining_tokens = max_tokens.saturating_sub(used_tokens);
+    let bar_color = if progress > 0.8 { theme.bright_red } else { theme.accent };
+
+    div()
+        .id("ai-context-hovercard")
+        .absolute()
+        .top(px(38.))
+        .right(px(10.))
+        .w(px(250.))
+        .p(px(12.))
+        .rounded(px(8.))
+        .bg({
+            let mut bg = theme.surface_raised;
+            bg.a = 1.0;
+            bg
+        })
+        .border_1()
+        .border_color(theme.border)
+        .shadow_xl()
+        .occlude()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_down(MouseButton::Right, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_move(|_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_scroll_wheel(|_, _, cx| {
+            cx.stop_propagation();
+        })
+        // Card Header: Title & Model Pill
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(5.))
+                        .child(crate::ui::icons::render_icon(IconType::Sparkles, theme.accent, 12.0))
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme.foreground)
+                                .child("Context Window"),
+                        ),
+                )
+                .child(
+                    div()
+                        .px(px(5.))
+                        .py(px(1.5))
+                        .rounded(px(4.))
+                        .bg({
+                            let mut bg = theme.surface;
+                            bg.a = 1.0;
+                            bg
+                        })
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_size(px(9.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.muted)
+                        .child(model_name.to_string()),
+                ),
+        )
+        // Progress Bar & Percentage
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .text_size(px(10.5))
+                        .child(
+                            div()
+                                .text_color(theme.muted_strong)
+                                .child("Capacity"),
+                        )
+                        .child(
+                            div()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(if progress > 0.8 { theme.bright_red } else { theme.accent })
+                                .child(pct_label),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(4.))
+                        .rounded(px(2.))
+                        .bg(theme.border)
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .h_full()
+                                .w(gpui::DefiniteLength::Fraction(progress))
+                                .rounded(px(2.))
+                                .bg(bar_color),
+                        ),
+                ),
+        )
+        // Token Stats Breakdown
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .pt(px(2.))
+                .border_t_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .text_size(px(10.5))
+                        .child(div().text_color(theme.muted).child("Used Tokens"))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.foreground)
+                                .child(format!("{} / {}", format_number(used_tokens), format_number(max_tokens))),
+                        ),
+                )
+                .when_some(last_usage, |rows, (input, output)| {
+                    rows.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .text_size(px(10.))
+                            .child(div().text_color(theme.muted).child("Prompt / Completion"))
+                            .child(
+                                div()
+                                    .text_color(theme.muted_strong)
+                                    .child(format!("{} / {}", format_number(input), format_number(output))),
+                            ),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .text_size(px(10.))
+                        .child(div().text_color(theme.muted).child("Remaining"))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(if remaining_tokens < 2_000 { theme.bright_red } else { theme.muted_strong })
+                                .child(format_number(remaining_tokens)),
+                        ),
+                ),
+        )
+}
+
 fn render_thinking_indicator(theme: &Theme) -> Div {
     div()
         .flex()
@@ -1359,6 +1584,13 @@ impl RenderOnce for AiSidebar {
         let active_branch = self.git_branch.clone();
         let context_pct = self.context_pct;
         let active_mode = self.agent_mode.clone();
+        let context_used_tokens = self.context_used_tokens;
+        let context_max_tokens = self.context_max_tokens;
+        let ai_last_usage = self.ai_last_usage;
+        let context_hovercard_open = self.context_hovercard_open;
+        let on_hover_context = self.on_hover_context.map(std::rc::Rc::new);
+        let provider_name = self.provider_name.clone();
+        let model_name = self.model_name.clone();
 
         // Text left edge = sidebar left + 8px scroll-area px + 4px outer-wrapper px.
         // Mouse events use window-absolute X, so we subtract this to get text-relative X.
@@ -1369,6 +1601,7 @@ impl RenderOnce for AiSidebar {
 
         div()
             .id("ai-sidebar-container")
+            .relative()
             .flex()
             .flex_col()
             .w(px(self.width))
@@ -1454,9 +1687,11 @@ impl RenderOnce for AiSidebar {
                             .items_center()
                             .gap(px(2.))
                             .flex_shrink_0()
-                            // Context usage
+                            // Context usage + HoverCard
                             .child(
                                 div()
+                                    .id("ai-context-indicator-trigger")
+                                    .relative()
                                     .flex()
                                     .flex_row()
                                     .items_center()
@@ -1464,6 +1699,14 @@ impl RenderOnce for AiSidebar {
                                     .px(px(4.))
                                     .py(px(2.))
                                     .mr(px(2.))
+                                    .rounded(px(4.))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(move |s| s.bg(theme.hover))
+                                    .when_some(on_hover_context.clone(), |el, handler| {
+                                        el.on_hover(move |is_hovered, window, cx| {
+                                            handler(is_hovered, window, cx);
+                                        })
+                                    })
                                     .child(render_context_ring(context_pct, &theme))
                                     .child(
                                         div()
@@ -2662,5 +2905,16 @@ impl RenderOnce for AiSidebar {
                             ),
                     )
             )
+            .when(context_hovercard_open, |container| {
+                container.child(render_context_hovercard(
+                    &provider_name,
+                    &model_name,
+                    context_used_tokens,
+                    context_max_tokens,
+                    ai_last_usage,
+                    context_pct,
+                    &theme,
+                ))
+            })
     }
 }

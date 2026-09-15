@@ -657,7 +657,7 @@ pub(crate) fn available_system_fonts() -> Vec<String> {
     #[cfg(target_os = "linux")]
     {
         if let Ok(output) = std::process::Command::new("fc-list")
-            .args([":spacing=100", "family"])
+            .args([":", "family"])
             .output()
         {
             if output.status.success() {
@@ -666,7 +666,7 @@ pub(crate) fn available_system_fonts() -> Vec<String> {
                 for line in stdout.lines() {
                     for part in line.split(',') {
                         let name = part.trim();
-                        if !name.is_empty() {
+                        if !name.is_empty() && !name.starts_with('.') {
                             set.insert(name.to_string());
                         }
                     }
@@ -677,25 +677,74 @@ pub(crate) fn available_system_fonts() -> Vec<String> {
             }
         }
         vec![
+            "DejaVu Sans".to_string(),
             "DejaVu Sans Mono".to_string(),
             "Fira Code".to_string(),
             "JetBrains Mono".to_string(),
             "Hack".to_string(),
+            "Ubuntu".to_string(),
             "Ubuntu Mono".to_string(),
             "Liberation Mono".to_string(),
+            "Liberation Sans".to_string(),
+            "Liberation Serif".to_string(),
             "monospace".to_string(),
+            "sans-serif".to_string(),
         ]
     }
     #[cfg(target_os = "windows")]
     {
+        let mut reg_fonts = Vec::new();
+        if let Ok(output) = std::process::Command::new("reg")
+            .args(["query", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"])
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with("HKEY_") {
+                        continue;
+                    }
+                    if let Some(font_entry) = trimmed.split("    REG_").next() {
+                        let mut font_name = font_entry.trim();
+                        if let Some(idx) = font_name.rfind('(') {
+                            font_name = font_name[..idx].trim();
+                        }
+                        if !font_name.is_empty() && !font_name.starts_with('.') {
+                            reg_fonts.push(font_name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if !reg_fonts.is_empty() {
+            reg_fonts.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+            reg_fonts.dedup();
+            return reg_fonts;
+        }
+
         vec![
+            "Arial".to_string(),
+            "Calibri".to_string(),
+            "Cambria".to_string(),
             "Cascadia Code".to_string(),
             "Cascadia Mono".to_string(),
+            "Comic Sans MS".to_string(),
             "Consolas".to_string(),
-            "Lucida Console".to_string(),
             "Courier New".to_string(),
             "Fira Code".to_string(),
+            "Georgia".to_string(),
+            "Impact".to_string(),
             "JetBrains Mono".to_string(),
+            "Lucida Console".to_string(),
+            "Lucida Sans Unicode".to_string(),
+            "Microsoft Sans Serif".to_string(),
+            "Segoe UI".to_string(),
+            "Segoe UI Variable".to_string(),
+            "Tahoma".to_string(),
+            "Times New Roman".to_string(),
+            "Trebuchet MS".to_string(),
+            "Verdana".to_string(),
             "monospace".to_string(),
         ]
     }
@@ -954,6 +1003,9 @@ pub struct RootView {
     pub ai_streaming_thinking: String,
     pub ai_is_streaming: bool,
     pub ai_last_usage: Option<(u64, u64)>,
+    pub ai_accumulated_usage: (u64, u64),
+    pub ai_current_turn_usage: (u64, u64),
+    pub ai_context_hovercard_open: bool,
     pub ai_cancel_token: Option<crate::ai::CancelToken>,
     pub ai_pending_confirmation: Option<crate::ui::ai_sidebar::AiUiPendingConfirmation>,
     pub ai_confirm_reply_tx: Option<async_channel::Sender<crate::ai::PermissionDecision>>,
@@ -1272,6 +1324,9 @@ impl RootView {
             ai_streaming_thinking: String::new(),
             ai_is_streaming: false,
             ai_last_usage: None,
+            ai_accumulated_usage: (0, 0),
+            ai_current_turn_usage: (0, 0),
+            ai_context_hovercard_open: false,
             ai_cancel_token: None,
             ai_pending_confirmation: None,
             ai_confirm_reply_tx: None,
@@ -1621,13 +1676,19 @@ impl RootView {
                         AppEvent::Notification { title, body } => {
                             send_system_notification(&title, &body);
                         }
-                        AppEvent::Exit { .. }
-                            // A CLI `-e`/`--exec` invocation treats the given command as a
-                            // one-shot: when its process exits, quit the app instead of
-                            // leaving a dead pane open (see `exec_pane_id`).
-                            if this.exec_pane_id == Some(pane_id) => {
+                        AppEvent::Exit { .. } => {
+                            if this.exec_pane_id == Some(pane_id) {
                                 cx.quit();
+                            } else if let Some(tab) = this.tabs.iter().find(|t| t.pane_tree.find_pane(pane_id).is_some()) {
+                                let tab_id = tab.id;
+                                let pane_count = tab.pane_tree.pane_count();
+                                if pane_count > 1 {
+                                    this.force_close_pane(tab_id, pane_id, cx);
+                                } else {
+                                    this.close_tab(tab_id, _window, cx);
+                                }
                             }
+                        }
                         _ => {
                             cx.notify();
                         }
@@ -1757,29 +1818,28 @@ impl RootView {
         }
     }
 
-    pub fn close_active_pane(
+    pub fn close_pane_by_id(
         &mut self,
+        pane_id: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let tab_is_single_pane = self.tabs.get(self.active_tab_idx).is_some_and(|t| t.pane_tree.pane_count() <= 1);
-        if tab_is_single_pane {
-            if let Some(tab) = self.tabs.get(self.active_tab_idx) {
-                let tab_id = tab.id;
-                self.close_tab(tab_id, window, cx);
-            }
+        let tab_opt = self.tabs.iter().find(|t| t.pane_tree.find_pane(pane_id).is_some()).map(|t| (t.id, t.pane_tree.pane_count()));
+        let Some((tab_id, pane_count)) = tab_opt else { return; };
+
+        if pane_count <= 1 {
+            self.close_tab(tab_id, window, cx);
         } else {
-            if let Some(tab) = self.tabs.get(self.active_tab_idx) {
-                let active_id = tab.pane_tree.active_pane_id;
-                if let Some(pane) = tab.pane_tree.find_pane(active_id) {
+            if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
+                if let Some(pane) = tab.pane_tree.find_pane(pane_id) {
                     if let Some(term) = &pane.terminal {
                         if term.is_process_running() {
                             let name = term.get_foreground_process_name().unwrap_or_else(|| "process".to_string());
                             let pid = term.shell_pid().unwrap_or(0);
                             self.pending_close = Some(PendingClose {
-                                target: CloseTarget::Pane { tab_id: tab.id, pane_id: active_id },
+                                target: CloseTarget::Pane { tab_id, pane_id },
                                 running_processes: vec![RunningProcessInfo {
-                                    pane_id: active_id,
+                                    pane_id,
                                     process_name: name,
                                     pid,
                                 }],
@@ -1789,13 +1849,29 @@ impl RootView {
                         }
                     }
                 }
-                let tab_id = tab.id;
-                self.force_close_pane(tab_id, active_id, cx);
             }
+            self.force_close_pane(tab_id, pane_id, cx);
+        }
+    }
+
+    pub fn close_active_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+            let active_id = tab.pane_tree.active_pane_id;
+            self.close_pane_by_id(active_id, window, cx);
         }
     }
 
     pub fn force_close_pane(&mut self, tab_id: usize, pane_id: usize, cx: &mut Context<Self>) {
+        self.selection = None;
+        self.is_selecting = false;
+        self.selection_start = None;
+        if self.exec_pane_id == Some(pane_id) {
+            self.exec_pane_id = None;
+        }
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
             if let Some(pane) = tab.pane_tree.find_pane(pane_id) {
                 if let Some(ref term) = pane.terminal {
@@ -2018,6 +2094,9 @@ impl RootView {
         if let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) {
             let removed = self.tabs.remove(idx);
             for pane in removed.pane_tree.all_panes() {
+                if self.exec_pane_id == Some(pane.id) {
+                    self.exec_pane_id = None;
+                }
                 if let Some(ref term) = pane.terminal {
                     term.terminate_process();
                 }
@@ -2712,6 +2791,12 @@ impl RootView {
             self.ai_streaming_thinking.push_str(&self.ai_pending_thinking);
             self.ai_pending_thinking.clear();
         }
+        self.ai_accumulated_usage.0 += self.ai_current_turn_usage.0;
+        self.ai_accumulated_usage.1 += self.ai_current_turn_usage.1;
+        self.ai_current_turn_usage = (0, 0);
+        if self.ai_accumulated_usage != (0, 0) {
+            self.ai_last_usage = Some(self.ai_accumulated_usage);
+        }
         self.ai_is_streaming = false;
     }
 
@@ -3112,7 +3197,12 @@ impl RootView {
                             return;
                         }
                         crate::ai::AgentEvent::ToolStart { id, name, args } => {
-                            // Flush any buffered streaming text and thinking before running the tool
+                            this.ai_accumulated_usage.0 += this.ai_current_turn_usage.0;
+                            this.ai_accumulated_usage.1 += this.ai_current_turn_usage.1;
+                            this.ai_current_turn_usage = (0, 0);
+                            this.ai_last_usage = Some(this.ai_accumulated_usage);
+
+                            // Flush any text/thinking accumulated so far into an assistant bubble
                             if !this.ai_pending_text.is_empty() {
                                 this.ai_streaming_text.push_str(&this.ai_pending_text);
                                 this.ai_pending_text.clear();
@@ -3121,16 +3211,13 @@ impl RootView {
                                 this.ai_streaming_thinking.push_str(&this.ai_pending_thinking);
                                 this.ai_pending_thinking.clear();
                             }
-
-                            // Commit any in-flight streamed text into ai_messages now so the tool
-                            // call row lands on the same assistant message, never in split state.
-                            if !this.ai_streaming_text.is_empty() {
-                                let text = std::mem::take(&mut this.ai_streaming_text);
-                                let thinking = if this.ai_streaming_thinking.is_empty() {
-                                    None
-                                } else {
-                                    Some(std::mem::take(&mut this.ai_streaming_thinking))
-                                };
+                            let text = std::mem::take(&mut this.ai_streaming_text);
+                            let thinking = if this.ai_streaming_thinking.is_empty() {
+                                None
+                            } else {
+                                Some(std::mem::take(&mut this.ai_streaming_thinking))
+                            };
+                            if !text.is_empty() || thinking.is_some() {
                                 this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
                                     is_user: false,
                                     text,
@@ -3192,6 +3279,11 @@ impl RootView {
                             }
                         }
                         crate::ai::AgentEvent::TurnEnd => {
+                            this.ai_accumulated_usage.0 += this.ai_current_turn_usage.0;
+                            this.ai_accumulated_usage.1 += this.ai_current_turn_usage.1;
+                            this.ai_current_turn_usage = (0, 0);
+                            this.ai_last_usage = Some(this.ai_accumulated_usage);
+
                             // Flush any remaining buffered text/thinking
                             if !this.ai_pending_text.is_empty() {
                                 this.ai_streaming_text.push_str(&this.ai_pending_text);
@@ -3238,10 +3330,25 @@ impl RootView {
                             this.ai_cancel_token = None;
                         }
                         crate::ai::AgentEvent::Usage { input, output } => {
-                            this.ai_last_usage = Some((input, output));
+                            let effective_input = if input > 0 {
+                                input
+                            } else {
+                                let chars: usize = this.ai_messages.iter().map(|m| m.text.len() + m.thinking.as_deref().unwrap_or("").len()).sum();
+                                ((chars / 4).max(50)) as u64
+                            };
+                            this.ai_current_turn_usage = (effective_input, output);
+                            let total_in = this.ai_accumulated_usage.0 + this.ai_current_turn_usage.0;
+                            let total_out = this.ai_accumulated_usage.1 + this.ai_current_turn_usage.1;
+                            this.ai_last_usage = Some((total_in, total_out));
                             return;
                         }
                         crate::ai::AgentEvent::Error(err) => {
+                            this.ai_accumulated_usage.0 += this.ai_current_turn_usage.0;
+                            this.ai_accumulated_usage.1 += this.ai_current_turn_usage.1;
+                            this.ai_current_turn_usage = (0, 0);
+                            if this.ai_accumulated_usage != (0, 0) {
+                                this.ai_last_usage = Some(this.ai_accumulated_usage);
+                            }
                             if !this.ai_pending_text.is_empty() {
                                 this.ai_streaming_text.push_str(&this.ai_pending_text);
                                 this.ai_pending_text.clear();
@@ -3295,12 +3402,29 @@ impl RootView {
         let active_branch = self.tabs.get(self.active_tab_idx).and_then(|t| t.git_status.as_ref().map(|g| g.branch.clone()));
 
         let total_chars: usize = self.ai_messages.iter().map(|m| m.text.len() + m.thinking.as_deref().unwrap_or("").len()).sum();
-        let max_context = self.config.ai.context_window.max(1_000) as f32;
-        let used_tokens = match self.ai_last_usage {
-            Some((input, output)) => (input + output) as f32,
-            None => (total_chars / 4).max(380) as f32,
+        let max_context_u64 = self.config.ai.context_window.max(1_000) as u64;
+        let total_in = self.ai_accumulated_usage.0 + self.ai_current_turn_usage.0;
+        let total_out = self.ai_accumulated_usage.1 + self.ai_current_turn_usage.1;
+        let effective_usage = if total_in > 0 || total_out > 0 {
+            Some((total_in, total_out))
+        } else {
+            self.ai_last_usage
         };
-        let context_pct = (used_tokens / max_context).clamp(0.0, 1.0);
+        let used_tokens_u64 = match effective_usage {
+            Some((input, output)) => input + output,
+            None => {
+                if total_chars == 0 {
+                    0
+                } else {
+                    (total_chars / 4) as u64
+                }
+            }
+        };
+        let context_pct = if max_context_u64 > 0 {
+            (used_tokens_u64 as f32 / max_context_u64 as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
 
         let sidebar = crate::ui::ai_sidebar::AiSidebar::new(
             self.theme,
@@ -3314,6 +3438,12 @@ impl RootView {
         .cwd(active_cwd)
         .git_branch(active_branch)
         .context_pct(context_pct)
+        .context_tokens(used_tokens_u64, max_context_u64, effective_usage)
+        .context_hovercard_open(self.ai_context_hovercard_open)
+        .on_hover_context(cx.listener(|this, is_hovered: &bool, _window, cx| {
+            this.ai_context_hovercard_open = *is_hovered;
+            cx.notify();
+        }))
         .messages(self.ai_messages.clone())
         .streaming(
             self.ai_is_streaming,
@@ -3404,6 +3534,8 @@ impl RootView {
             this.ai_input_state.clear();
             this.ai_input_text.clear();
             this.ai_last_usage = None;
+            this.ai_accumulated_usage = (0, 0);
+            this.ai_current_turn_usage = (0, 0);
             this.ai_message_selection = None;
             this.ai_message_selection_anchor = None;
             cx.notify();
@@ -3437,6 +3569,8 @@ impl RootView {
             this.ai_attached_files.clear();
             this.ai_at_menu_open = false;
             this.ai_last_usage = None;
+            this.ai_accumulated_usage = (0, 0);
+            this.ai_current_turn_usage = (0, 0);
             // Drop any leftover confirmation so it can't reappear in a fresh view.
             if let Some(tx) = this.ai_confirm_reply_tx.take() {
                 let _ = tx.send_blocking(crate::ai::PermissionDecision::Deny);
@@ -4995,9 +5129,6 @@ impl RootView {
         let Some(active_tab) = self.tabs.get(self.active_tab_idx) else {
             return;
         };
-        let Some(ref terminal) = active_tab.terminal else {
-            return;
-        };
 
         // Click in terminal area unfocuses the AI input so keystrokes go to the terminal.
         if self.ai_sidebar_open && self.ai_input_focused {
@@ -5009,20 +5140,80 @@ impl RootView {
             }
         }
 
+        let mouse_x = event.position.x.to_f64() as f32;
+        let mouse_y = event.position.y.to_f64() as f32;
+
+        // Find which pane was clicked based on its rendered bounds
+        let clicked_pane = active_tab.pane_tree.all_panes().into_iter().find(|p| {
+            if let Some(b) = p.last_bounds {
+                let bx = b.origin.x.to_f64() as f32;
+                let by = b.origin.y.to_f64() as f32;
+                let bw = b.size.width.to_f64() as f32;
+                let bh = b.size.height.to_f64() as f32;
+                mouse_x >= bx && mouse_x <= bx + bw && mouse_y >= by && mouse_y <= by + bh
+            } else {
+                false
+            }
+        }).or_else(|| active_tab.pane_tree.active_pane());
+
+        let clicked_pane_id = clicked_pane.as_ref().map(|p| p.id);
+        let clicked_bounds = clicked_pane.as_ref().and_then(|p| p.last_bounds);
+
+        // Switch active pane if clicking a different pane
+        if let Some(pid) = clicked_pane_id {
+            if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
+                if tab.pane_tree.active_pane_id != pid {
+                    tab.pane_tree.active_pane_id = pid;
+                    if let Some(p) = tab.pane_tree.active_pane() {
+                        tab.terminal = p.terminal.clone();
+                        tab.cwd = p.cwd.clone();
+                        tab.git_status = p.git_status.clone();
+                    }
+                    cx.notify();
+                }
+            }
+        }
+
+        let Some(active_tab) = self.tabs.get(self.active_tab_idx) else {
+            return;
+        };
+        let active_pane = active_tab.pane_tree.active_pane();
+        let Some(ref terminal) = active_pane.as_ref().and_then(|p| p.terminal.as_ref()).or(active_tab.terminal.as_ref()) else {
+            return;
+        };
+
         let (cell_w, line_h) = self.measure_cell_metrics(window);
-        let sidebar_w = self.current_sidebar_width();
-        let local_x = (event.position.x.to_f64() as f32 - sidebar_w - 1.0).max(0.0);
-        let local_y = (event.position.y.to_f64() as f32 - 32.0).max(0.0);
+        let (pane_origin_x, pane_origin_y, pane_w, pane_h) = if let Some(b) = clicked_bounds.or_else(|| active_pane.and_then(|p| p.last_bounds)) {
+            (
+                b.origin.x.to_f64() as f32,
+                b.origin.y.to_f64() as f32,
+                b.size.width.to_f64() as f32,
+                b.size.height.to_f64() as f32,
+            )
+        } else {
+            let sidebar_w = self.current_sidebar_width();
+            let v = window.viewport_size();
+            (
+                sidebar_w + 1.0,
+                32.0,
+                (v.width.to_f64() as f32 - sidebar_w).max(100.0),
+                (v.height.to_f64() as f32 - 56.0).max(100.0),
+            )
+        };
+
+        let local_x = (mouse_x - pane_origin_x).max(0.0);
+        let local_y = (mouse_y - pane_origin_y).max(0.0);
         let col = ((local_x / cell_w).floor() as usize) + 1;
         let row = ((local_y / line_h).floor() as usize) + 1;
 
         self.pressed_mouse_button = Some(event.button);
 
-        if terminal.is_mouse_mode_enabled() {
+        let is_right_click = event.button == MouseButton::Right;
+
+        if terminal.is_mouse_mode_enabled() && !is_right_click && event.click_count < 2 {
             let btn = match event.button {
                 MouseButton::Left => 0,
                 MouseButton::Middle => 1,
-                MouseButton::Right => 2,
                 _ => 0,
             };
             terminal.send_mouse_button_with_mods(
@@ -5036,6 +5227,8 @@ impl RootView {
             );
             return;
         }
+
+        let target_pane_id = clicked_pane_id.unwrap_or(active_tab.pane_tree.active_pane_id);
 
         if event.button == MouseButton::Left {
             // URL Click check (Cmd+Click on macOS, Ctrl+Click on Linux/Windows)
@@ -5052,32 +5245,110 @@ impl RootView {
                 }
             }
 
-            // Start Text Selection
             let history_size = terminal.history_size();
-            let viewport_size = window.viewport_size();
-            let avail_h = (viewport_size.height.to_f64() as f32 - 56.0).max(100.0);
-            if local_y > avail_h {
+            if local_y > pane_h {
                 return;
             }
-            let screen_rows = ((avail_h / line_h) as i32).max(1);
+            let screen_rows = ((pane_h / line_h) as i32).max(1);
+            let screen_cols = ((pane_w / cell_w) as usize).max(1);
             let display_offset = terminal.display_offset();
-            let grid_col = (local_x / cell_w).floor() as usize;
+            let grid_col = ((local_x / cell_w).floor() as usize).min(screen_cols.saturating_sub(1));
             let grid_row = (((local_y / line_h).floor() as i32) - (display_offset as i32)).clamp(-(history_size as i32), screen_rows - 1);
             let start_point = alacritty_terminal::index::Point::new(
                 alacritty_terminal::index::Line(grid_row),
                 alacritty_terminal::index::Column(grid_col),
             );
+
+            if event.click_count == 2 {
+                // Double click: Select word under cursor and open context menu
+                if let Some(term_guard) = terminal.term().try_lock() {
+                    let grid = term_guard.grid();
+                    if let Some((_token, start_c, end_c)) = crate::selection_classifier::extract_token(grid, start_point, screen_cols) {
+                        let start_p = alacritty_terminal::index::Point::new(
+                            alacritty_terminal::index::Line(grid_row),
+                            alacritty_terminal::index::Column(start_c),
+                        );
+                        let end_p = alacritty_terminal::index::Point::new(
+                            alacritty_terminal::index::Line(grid_row),
+                            alacritty_terminal::index::Column(end_c.saturating_sub(1)),
+                        );
+                        self.selection = Some(Selection {
+                            start: start_p,
+                            end: end_p,
+                        });
+                    } else {
+                        self.selection = None;
+                    }
+                }
+                self.is_selecting = false;
+                self.has_selection_dragged = false;
+                self.selection_start = None;
+                self.open_pane_context_menu(target_pane_id, mouse_x, mouse_y, cx);
+                return;
+            } else if event.click_count >= 3 {
+                // Triple click: Select whole line and open context menu
+                let start_p = alacritty_terminal::index::Point::new(
+                    alacritty_terminal::index::Line(grid_row),
+                    alacritty_terminal::index::Column(0),
+                );
+                let end_p = alacritty_terminal::index::Point::new(
+                    alacritty_terminal::index::Line(grid_row),
+                    alacritty_terminal::index::Column(screen_cols.saturating_sub(1)),
+                );
+                self.selection = Some(Selection {
+                    start: start_p,
+                    end: end_p,
+                });
+                self.is_selecting = false;
+                self.has_selection_dragged = false;
+                self.selection_start = None;
+                self.open_pane_context_menu(target_pane_id, mouse_x, mouse_y, cx);
+                return;
+            }
+
+            // Single click: Start Text Selection in this pane
             self.is_selecting = true;
             self.has_selection_dragged = false;
             self.selection_start = Some(start_point);
             self.selection = None;
-            self.selection_mouse_pos = Some((event.position.x.to_f64() as f32, event.position.y.to_f64() as f32));
+            self.selection_mouse_pos = Some((mouse_x, mouse_y));
             cx.notify();
         } else if event.button == MouseButton::Right {
-            let active_pane_id = active_tab.pane_tree.active_pane_id;
-            let x = event.position.x.to_f64() as f32;
-            let y = event.position.y.to_f64() as f32;
-            self.open_pane_context_menu(active_pane_id, x, y, cx);
+            // Right click: If no selection yet, select word under cursor if present, and open context menu
+            if self.selection.is_none() {
+                let history_size = terminal.history_size();
+                let screen_rows = ((pane_h / line_h) as i32).max(1);
+                let screen_cols = ((pane_w / cell_w) as usize).max(1);
+                let display_offset = terminal.display_offset();
+                let grid_col = ((local_x / cell_w).floor() as usize).min(screen_cols.saturating_sub(1));
+                let grid_row = (((local_y / line_h).floor() as i32) - (display_offset as i32)).clamp(-(history_size as i32), screen_rows - 1);
+                let point = alacritty_terminal::index::Point::new(
+                    alacritty_terminal::index::Line(grid_row),
+                    alacritty_terminal::index::Column(grid_col),
+                );
+
+                if let Some(term_guard) = terminal.term().try_lock() {
+                    let grid = term_guard.grid();
+                    if let Some((_token, start_c, end_c)) = crate::selection_classifier::extract_token(grid, point, screen_cols) {
+                        let start_p = alacritty_terminal::index::Point::new(
+                            alacritty_terminal::index::Line(grid_row),
+                            alacritty_terminal::index::Column(start_c),
+                        );
+                        let end_p = alacritty_terminal::index::Point::new(
+                            alacritty_terminal::index::Line(grid_row),
+                            alacritty_terminal::index::Column(end_c.saturating_sub(1)),
+                        );
+                        self.selection = Some(Selection {
+                            start: start_p,
+                            end: end_p,
+                        });
+                    }
+                }
+            }
+            self.is_selecting = false;
+            self.has_selection_dragged = false;
+            self.selection_start = None;
+            self.open_pane_context_menu(target_pane_id, mouse_x, mouse_y, cx);
         }
     }
 
@@ -5213,30 +5484,59 @@ impl RootView {
         }
 
         let Some(active_tab) = self.tabs.get(self.active_tab_idx) else { return; };
-        let Some(ref terminal) = active_tab.terminal else { return; };
+
+        // Find hovered pane based on rendered bounds
+        let hovered_pane = active_tab.pane_tree.all_panes().into_iter().find(|p| {
+            if let Some(b) = p.last_bounds {
+                let bx = b.origin.x.to_f64() as f32;
+                let by = b.origin.y.to_f64() as f32;
+                let bw = b.size.width.to_f64() as f32;
+                let bh = b.size.height.to_f64() as f32;
+                cur_x >= bx && cur_x <= bx + bw && cur_y >= by && cur_y <= by + bh
+            } else {
+                false
+            }
+        });
 
         let (cell_w, line_h) = self.measure_cell_metrics(_window);
-        let sidebar_w = self.current_sidebar_width();
-        let local_x = (event.position.x.to_f64() as f32 - sidebar_w - 1.0).max(0.0);
-        let local_y = (event.position.y.to_f64() as f32 - 32.0).max(0.0);
 
-        if terminal.is_mouse_mode_enabled() {
-            let left = self.pressed_mouse_button == Some(MouseButton::Left);
-            let middle = self.pressed_mouse_button == Some(MouseButton::Middle);
-            let right = self.pressed_mouse_button == Some(MouseButton::Right);
-            let col = ((local_x / cell_w).floor() as usize) + 1;
-            let row = ((local_y / line_h).floor() as usize) + 1;
-            terminal.send_mouse_motion(
-                col,
-                row,
-                left,
-                middle,
-                right,
-                event.modifiers.shift,
-                event.modifiers.alt,
-                event.modifiers.control,
-            );
-            return;
+        // Terminal mouse motion reporting (for active pane if dragging, or hovered pane if moving)
+        let motion_pane = if self.pressed_mouse_button.is_some() {
+            active_tab.pane_tree.active_pane()
+        } else {
+            hovered_pane.clone().or_else(|| active_tab.pane_tree.active_pane())
+        };
+
+        if let Some(ref pane) = motion_pane {
+            if let Some(ref term) = pane.terminal {
+                if term.is_mouse_mode_enabled() {
+                    let (pane_x, pane_y) = if let Some(b) = pane.last_bounds {
+                        (b.origin.x.to_f64() as f32, b.origin.y.to_f64() as f32)
+                    } else {
+                        (self.current_sidebar_width() + 1.0, 32.0)
+                    };
+                    let local_x = (cur_x - pane_x).max(0.0);
+                    let local_y = (cur_y - pane_y).max(0.0);
+                    let left = self.pressed_mouse_button == Some(MouseButton::Left);
+                    let middle = self.pressed_mouse_button == Some(MouseButton::Middle);
+                    let right = self.pressed_mouse_button == Some(MouseButton::Right);
+                    let col = ((local_x / cell_w).floor() as usize) + 1;
+                    let row = ((local_y / line_h).floor() as usize) + 1;
+                    term.send_mouse_motion(
+                        col,
+                        row,
+                        left,
+                        middle,
+                        right,
+                        event.modifiers.shift,
+                        event.modifiers.alt,
+                        event.modifiers.control,
+                    );
+                    if self.pressed_mouse_button.is_some() {
+                        return;
+                    }
+                }
+            }
         }
 
         if self.is_selecting {
@@ -5264,40 +5564,40 @@ impl RootView {
             return;
         }
 
-        let history_size = terminal.history_size();
-        let viewport_size = _window.viewport_size();
-        let avail_h = (viewport_size.height.to_f64() as f32 - 56.0).max(100.0);
-        let screen_rows = ((avail_h / line_h) as i32).max(1);
-        let display_offset = terminal.display_offset();
-        let grid_col = (local_x / cell_w).floor() as usize;
-        let grid_row = (((local_y / line_h).floor() as i32) - (display_offset as i32)).clamp(-(history_size as i32), screen_rows - 1);
-        let current_point = alacritty_terminal::index::Point::new(
-            alacritty_terminal::index::Line(grid_row),
-            alacritty_terminal::index::Column(grid_col),
-        );
+        // Link / OSC 8 Hover detection across any hovered pane
+        let target_link_pane = hovered_pane.or_else(|| active_tab.pane_tree.active_pane());
+        let Some(link_pane) = target_link_pane else {
+            if self.hovered_url.is_some() {
+                self.hovered_url = None;
+                self.hovered_url_range = None;
+                cx.notify();
+            }
+            return;
+        };
 
-        // Containment: this handler runs for every mouse move in the window
-        // (it lives on the root div), so only run link-hover detection when
-        // the pointer is actually inside the active terminal pane. Otherwise
-        // hovering the AI panel, tab bar or status bar would underline links
-        // in the terminal behind the cursor.
-        let inside_active_pane = active_tab
-            .pane_tree
-            .all_panes()
-            .iter()
-            .find(|p| p.id == active_tab.pane_tree.active_pane_id)
-            .and_then(|p| p.last_bounds)
-            .map(|b| {
-                let x0 = b.origin.x.to_f64() as f32;
-                let y0 = b.origin.y.to_f64() as f32;
-                cur_x >= x0
-                    && cur_x < x0 + b.size.width.to_f64() as f32
-                    && cur_y >= y0
-                    && cur_y < y0 + b.size.height.to_f64() as f32
-            })
-            .unwrap_or(false);
+        let Some(ref terminal) = link_pane.terminal else {
+            if self.hovered_url.is_some() {
+                self.hovered_url = None;
+                self.hovered_url_range = None;
+                cx.notify();
+            }
+            return;
+        };
 
-        if !inside_active_pane {
+        let Some(b) = link_pane.last_bounds else {
+            if self.hovered_url.is_some() {
+                self.hovered_url = None;
+                self.hovered_url_range = None;
+                cx.notify();
+            }
+            return;
+        };
+
+        let bx = b.origin.x.to_f64() as f32;
+        let by = b.origin.y.to_f64() as f32;
+        let bw = b.size.width.to_f64() as f32;
+        let bh = b.size.height.to_f64() as f32;
+        if cur_x < bx || cur_x > bx + bw || cur_y < by || cur_y > by + bh {
             if self.hovered_url.is_some() {
                 self.hovered_url = None;
                 self.hovered_url_range = None;
@@ -5305,6 +5605,18 @@ impl RootView {
             }
             return;
         }
+
+        let local_x = (cur_x - bx).max(0.0);
+        let local_y = (cur_y - by).max(0.0);
+        let history_size = terminal.history_size();
+        let screen_rows = ((bh / line_h) as i32).max(1);
+        let display_offset = terminal.display_offset();
+        let grid_col = (local_x / cell_w).floor() as usize;
+        let grid_row = (((local_y / line_h).floor() as i32) - (display_offset as i32)).clamp(-(history_size as i32), screen_rows - 1);
+        let current_point = alacritty_terminal::index::Point::new(
+            alacritty_terminal::index::Line(grid_row),
+            alacritty_terminal::index::Column(grid_col),
+        );
 
         // URL / OSC 8 Hyperlink Hover detection
         if let Some(term_guard) = terminal.term().try_lock() {
@@ -5389,29 +5701,36 @@ impl RootView {
             cx.notify();
         }
         if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
-            if let Some(ref terminal) = active_tab.terminal {
-                if terminal.is_mouse_mode_enabled() {
-                    let (cell_w, line_h) = self.measure_cell_metrics(_window);
-                    let sidebar_w = self.current_sidebar_width();
-                    let local_x = (event.position.x.to_f64() as f32 - sidebar_w - 1.0).max(0.0);
-                    let local_y = (event.position.y.to_f64() as f32 - 32.0).max(0.0);
-                    let col = ((local_x / cell_w).floor() as usize) + 1;
-                    let row = ((local_y / line_h).floor() as usize) + 1;
-                    let btn = match event.button {
-                        MouseButton::Left => 0,
-                        MouseButton::Middle => 1,
-                        MouseButton::Right => 2,
-                        _ => 0,
-                    };
-                    terminal.send_mouse_button_with_mods(
-                        btn,
-                        col,
-                        row,
-                        false,
-                        event.modifiers.shift,
-                        event.modifiers.alt,
-                        event.modifiers.control,
-                    );
+            let active_pane = active_tab.pane_tree.active_pane();
+            if let Some(p) = active_pane.as_ref() {
+                if let Some(ref terminal) = p.terminal {
+                    if terminal.is_mouse_mode_enabled() {
+                        let (cell_w, line_h) = self.measure_cell_metrics(_window);
+                        let (pane_x, pane_y) = if let Some(b) = p.last_bounds {
+                            (b.origin.x.to_f64() as f32, b.origin.y.to_f64() as f32)
+                        } else {
+                            (self.current_sidebar_width() + 1.0, 32.0)
+                        };
+                        let local_x = (event.position.x.to_f64() as f32 - pane_x).max(0.0);
+                        let local_y = (event.position.y.to_f64() as f32 - pane_y).max(0.0);
+                        let col = ((local_x / cell_w).floor() as usize) + 1;
+                        let row = ((local_y / line_h).floor() as usize) + 1;
+                        let btn = match event.button {
+                            MouseButton::Left => 0,
+                            MouseButton::Middle => 1,
+                            MouseButton::Right => 2,
+                            _ => 0,
+                        };
+                        terminal.send_mouse_button_with_mods(
+                            btn,
+                            col,
+                            row,
+                            false,
+                            event.modifiers.shift,
+                            event.modifiers.alt,
+                            event.modifiers.control,
+                        );
+                    }
                 }
             }
         }
@@ -5430,15 +5749,29 @@ impl RootView {
         let px_per_line = if line_h > 0.0 { line_h } else { 18.0 };
         let cell_width = if cell_w > 0.0 { cell_w } else { 9.0 };
 
-        let top_edge = 32.0;
-        let v = window.viewport_size();
-        let avail_h = (v.height.to_f64() as f32 - 56.0).max(100.0);
-        let sidebar_w = self.current_sidebar_width();
-        let avail_w = (v.width.to_f64() as f32 - sidebar_w).max(100.0);
-        let bottom_edge = top_edge + avail_h;
+        let (pane_x, pane_y, pane_w, pane_h) = if let Some(b) = active_pane.as_ref().and_then(|p| p.last_bounds) {
+            (
+                b.origin.x.to_f64() as f32,
+                b.origin.y.to_f64() as f32,
+                b.size.width.to_f64() as f32,
+                b.size.height.to_f64() as f32,
+            )
+        } else {
+            let v = window.viewport_size();
+            let sidebar_w = self.current_sidebar_width();
+            (
+                sidebar_w + 1.0,
+                32.0,
+                (v.width.to_f64() as f32 - sidebar_w).max(100.0),
+                (v.height.to_f64() as f32 - 56.0).max(100.0),
+            )
+        };
 
-        let screen_rows = ((avail_h / px_per_line) as i32).max(1);
-        let screen_cols = ((avail_w / cell_width) as usize).max(1);
+        let top_edge = pane_y;
+        let bottom_edge = pane_y + pane_h;
+
+        let screen_rows = ((pane_h / px_per_line) as i32).max(1);
+        let screen_cols = ((pane_w / cell_width) as usize).max(1);
         let history_size = terminal.history_size();
         let display_offset = terminal.display_offset();
 
@@ -5447,13 +5780,13 @@ impl RootView {
         } else if raw_y > bottom_edge {
             (screen_rows - 1) - (display_offset as i32)
         } else {
-            let rel_y = (raw_y - top_edge).clamp(0.0, avail_h - 1.0);
+            let rel_y = (raw_y - top_edge).clamp(0.0, pane_h - 1.0);
             let row_in_screen = (rel_y / px_per_line).floor() as i32;
             row_in_screen - (display_offset as i32)
         }.clamp(-(history_size as i32), screen_rows - 1);
 
-        let local_x = (raw_x - sidebar_w - 1.0).max(0.0);
-        let updated_col = if raw_y < top_edge && raw_x < 5.0 {
+        let local_x = (raw_x - pane_x).max(0.0);
+        let updated_col = if raw_y < top_edge && raw_x < pane_x + 5.0 {
             0
         } else {
             ((local_x / cell_width).floor() as usize).min(screen_cols.saturating_sub(1))
@@ -5498,10 +5831,15 @@ impl RootView {
         let (_, line_h) = self.measure_cell_metrics(window);
         let px_per_line = if line_h > 0.0 { line_h } else { 18.0 };
 
-        let top_edge = 32.0;
-        let v = window.viewport_size();
-        let avail_h = (v.height.to_f64() as f32 - 56.0).max(100.0);
-        let bottom_edge = top_edge + avail_h;
+        let (top_edge, bottom_edge) = if let Some(b) = active_pane.as_ref().and_then(|p| p.last_bounds) {
+            let by = b.origin.y.to_f64() as f32;
+            let bh = b.size.height.to_f64() as f32;
+            (by, by + bh)
+        } else {
+            let v = window.viewport_size();
+            let avail_h = (v.height.to_f64() as f32 - 56.0).max(100.0);
+            (32.0, 32.0 + avail_h)
+        };
 
         // Auto-scroll triggers near or past the top/bottom edges
         let top_scroll_zone = top_edge + px_per_line * 1.5;
@@ -5555,8 +5893,9 @@ impl RootView {
                 false
             }
         }).or_else(|| active_tab.pane_tree.active_pane());
-        let target_pane_id = target_pane.map(|p| p.id);
-        let Some(terminal) = target_pane.and_then(|p| p.terminal.as_ref()) else {
+        let target_pane_id = target_pane.as_ref().map(|p| p.id);
+        let target_bounds = target_pane.as_ref().and_then(|p| p.last_bounds);
+        let Some(terminal) = target_pane.as_ref().and_then(|p| p.terminal.as_ref()) else {
             return;
         };
 
@@ -5573,9 +5912,14 @@ impl RootView {
             self.last_scrolled_pane_id = target_pane_id;
             if terminal.is_mouse_mode_enabled() {
                 let (cell_w, _) = self.measure_cell_metrics(_window);
-                let sidebar_w = self.current_sidebar_width();
-                let local_x = (event.position.x.to_f64() as f32 - sidebar_w - 1.0).max(0.0);
-                let local_y = (event.position.y.to_f64() as f32 - 32.0).max(0.0);
+                let (pane_x, pane_y) = if let Some(b) = target_bounds {
+                    (b.origin.x.to_f64() as f32, b.origin.y.to_f64() as f32)
+                } else {
+                    let sidebar_w = self.current_sidebar_width();
+                    (sidebar_w + 1.0, 32.0)
+                };
+                let local_x = (mouse_x - pane_x).max(0.0);
+                let local_y = (mouse_y - pane_y).max(0.0);
                 let col = ((local_x / cell_w).floor() as usize) + 1;
                 let row = ((local_y / px_per_line).floor() as usize) + 1;
                 let btn = if delta_y > 0.0 { 64 } else { 65 };
@@ -6032,7 +6376,7 @@ impl RootView {
                             cx.notify();
                         }
                     }))
-                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, _ev, _window, cx| {
                         if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
                             tab.pane_tree.active_pane_id = pane_id;
                             if let Some(p) = tab.pane_tree.active_pane() {
@@ -6040,12 +6384,18 @@ impl RootView {
                                 tab.cwd = p.cwd.clone();
                                 tab.git_status = p.git_status.clone();
                             }
-                            let mouse_mode = tab.terminal.as_ref().is_some_and(|t| t.is_mouse_mode_enabled());
-                            if !mouse_mode || ev.modifiers.shift {
-                                let x = ev.position.x.to_f64() as f32;
-                                let y = ev.position.y.to_f64() as f32;
-                                this.open_pane_context_menu(pane_id, x, y, cx);
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _ev, _window, cx| {
+                        if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
+                            tab.pane_tree.active_pane_id = pane_id;
+                            if let Some(p) = tab.pane_tree.active_pane() {
+                                tab.terminal = p.terminal.clone();
+                                tab.cwd = p.cwd.clone();
+                                tab.git_status = p.git_status.clone();
                             }
+                            cx.notify();
                         }
                     }))
                     .when_some(grid_el, |d, el| d.child(el))
@@ -6447,8 +6797,10 @@ impl Render for RootView {
 
                 this.child(
                     div()
+                        .id("logo-menu-backdrop")
                         .absolute()
                         .inset_0()
+                        .occlude()
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                             this.is_context_menu_open = false;
                             cx.notify();
@@ -6456,7 +6808,13 @@ impl Render for RootView {
                         .on_mouse_down(MouseButton::Right, cx.listener(|this, _ev, _window, cx| {
                             this.is_context_menu_open = false;
                             cx.notify();
-                        })),
+                        }))
+                        .on_mouse_move(|_ev, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_scroll_wheel(|_ev, _window, cx| {
+                            cx.stop_propagation();
+                        }),
                 )
                 .child(
                     div()
@@ -6468,9 +6826,15 @@ impl Render for RootView {
                         .w(px(220.))
                         .p(px(4.))
                         .rounded(px(8.))
-                        .bg(theme.surface)
+                        .bg({
+                            let mut bg = theme.surface;
+                            bg.a = 1.0;
+                            bg
+                        })
                         .border_1()
                         .border_color(theme.border)
+                        .shadow_xl()
+                        .occlude()
                         .flex()
                         .flex_col()
                         .gap_1()
@@ -6478,6 +6842,12 @@ impl Render for RootView {
                             cx.stop_propagation();
                         })
                         .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_mouse_move(|_ev, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_scroll_wheel(|_ev, _window, cx| {
                             cx.stop_propagation();
                         })
                         .child(render_context_menu_item(
@@ -6741,9 +7111,10 @@ impl Render for RootView {
                         )),
                 )
             })
-            // Terminal / Pane Right-Click Context Menu Overlay
+            // Terminal / Pane Right-Click / Double-Click Context Menu Overlay
             .when(self.is_pane_context_menu_open, |this| {
                 let (menu_x, menu_y) = self.pane_context_menu_pos;
+                let target_pane_id = self.pane_context_menu_pane_id;
                 let sc_copy = if cfg!(target_os = "macos") { "⌘C" } else { "Ctrl+Shift+C" };
                 let sc_paste = if cfg!(target_os = "macos") { "⌘V" } else { "Ctrl+Shift+V" };
                 let sc_split_right = if cfg!(target_os = "macos") { "⌘D" } else { "Ctrl+Shift+E" };
@@ -6770,10 +7141,16 @@ impl Render for RootView {
                     menu_y.max(36.0)
                 };
 
+                let mut menu_bg = theme.surface;
+                menu_bg.a = 1.0;
+
                 this.child(
                     div()
+                        .id("pane-context-menu-backdrop")
                         .absolute()
                         .inset_0()
+                        .occlude()
+                        .on_scroll_wheel(|_ev, _window, cx| cx.stop_propagation())
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                             this.is_pane_context_menu_open = false;
                             cx.notify();
@@ -6792,13 +7169,20 @@ impl Render for RootView {
                         .w(px(220.))
                         .p(px(4.))
                         .rounded(px(8.))
-                        .bg(theme.surface)
+                        .bg(menu_bg)
                         .border_1()
                         .border_color(theme.border)
                         .shadow_xl()
+                        .occlude()
                         .flex()
                         .flex_col()
                         .gap_1()
+                        .on_mouse_move(|_ev, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_scroll_wheel(|_ev, _window, cx| {
+                            cx.stop_propagation();
+                        })
                         .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
                             cx.stop_propagation();
                         })
@@ -6826,10 +7210,11 @@ impl Render for RootView {
                             IconType::Plus,
                             "Paste",
                             Some(sc_paste),
-                            cx.listener(|this, _ev, _window, cx| {
+                            cx.listener(move |this, _ev, _window, cx| {
                                 this.is_pane_context_menu_open = false;
                                 if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
-                                    if let Some(ref terminal) = active_tab.terminal {
+                                    let pane = active_tab.pane_tree.find_pane(target_pane_id).or_else(|| active_tab.pane_tree.active_pane());
+                                    if let Some(terminal) = pane.and_then(|p| p.terminal.as_ref()).or(active_tab.terminal.as_ref()) {
                                         if let Some(mut clip) = crate::event_listener::clipboard_helper() {
                                             if let Some(content) = crate::paste::get_clipboard_paste_content(&mut clip) {
                                                 crate::paste::paste_text_to_terminal(terminal, &content);
@@ -6846,8 +7231,16 @@ impl Render for RootView {
                             IconType::Plus,
                             "Split Pane Right",
                             Some(sc_split_right),
-                            cx.listener(|this, _ev, window, cx| {
+                            cx.listener(move |this, _ev, window, cx| {
                                 this.is_pane_context_menu_open = false;
+                                if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
+                                    tab.pane_tree.active_pane_id = target_pane_id;
+                                    if let Some(p) = tab.pane_tree.active_pane() {
+                                        tab.terminal = p.terminal.clone();
+                                        tab.cwd = p.cwd.clone();
+                                        tab.git_status = p.git_status.clone();
+                                    }
+                                }
                                 this.split_active_pane(Direction::Right, window, cx);
                             }),
                             theme,
@@ -6856,8 +7249,16 @@ impl Render for RootView {
                             IconType::Plus,
                             "Split Pane Down",
                             Some(sc_split_down),
-                            cx.listener(|this, _ev, window, cx| {
+                            cx.listener(move |this, _ev, window, cx| {
                                 this.is_pane_context_menu_open = false;
+                                if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
+                                    tab.pane_tree.active_pane_id = target_pane_id;
+                                    if let Some(p) = tab.pane_tree.active_pane() {
+                                        tab.terminal = p.terminal.clone();
+                                        tab.cwd = p.cwd.clone();
+                                        tab.git_status = p.git_status.clone();
+                                    }
+                                }
                                 this.split_active_pane(Direction::Down, window, cx);
                             }),
                             theme,
@@ -6866,8 +7267,16 @@ impl Render for RootView {
                             IconType::Plus,
                             "Split Pane Left",
                             None,
-                            cx.listener(|this, _ev, window, cx| {
+                            cx.listener(move |this, _ev, window, cx| {
                                 this.is_pane_context_menu_open = false;
+                                if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
+                                    tab.pane_tree.active_pane_id = target_pane_id;
+                                    if let Some(p) = tab.pane_tree.active_pane() {
+                                        tab.terminal = p.terminal.clone();
+                                        tab.cwd = p.cwd.clone();
+                                        tab.git_status = p.git_status.clone();
+                                    }
+                                }
                                 this.split_active_pane(Direction::Left, window, cx);
                             }),
                             theme,
@@ -6876,8 +7285,16 @@ impl Render for RootView {
                             IconType::Plus,
                             "Split Pane Top",
                             None,
-                            cx.listener(|this, _ev, window, cx| {
+                            cx.listener(move |this, _ev, window, cx| {
                                 this.is_pane_context_menu_open = false;
+                                if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
+                                    tab.pane_tree.active_pane_id = target_pane_id;
+                                    if let Some(p) = tab.pane_tree.active_pane() {
+                                        tab.terminal = p.terminal.clone();
+                                        tab.cwd = p.cwd.clone();
+                                        tab.git_status = p.git_status.clone();
+                                    }
+                                }
                                 this.split_active_pane(Direction::Top, window, cx);
                             }),
                             theme,
@@ -6898,8 +7315,16 @@ impl Render for RootView {
                             IconType::Search,
                             "Find in Buffer...",
                             Some(sc_search),
-                            cx.listener(|this, _ev, window, cx| {
+                            cx.listener(move |this, _ev, window, cx| {
                                 this.is_pane_context_menu_open = false;
+                                if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
+                                    tab.pane_tree.active_pane_id = target_pane_id;
+                                    if let Some(p) = tab.pane_tree.active_pane() {
+                                        tab.terminal = p.terminal.clone();
+                                        tab.cwd = p.cwd.clone();
+                                        tab.git_status = p.git_status.clone();
+                                    }
+                                }
                                 this.toggle_search(window, cx);
                             }),
                             theme,
@@ -6908,10 +7333,11 @@ impl Render for RootView {
                             IconType::Trash2,
                             "Clear / Reset Terminal",
                             Some(sc_clear),
-                            cx.listener(|this, _ev, _window, cx| {
+                            cx.listener(move |this, _ev, _window, cx| {
                                 this.is_pane_context_menu_open = false;
                                 if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
-                                    if let Some(ref term) = active_tab.terminal {
+                                    let pane = active_tab.pane_tree.find_pane(target_pane_id).or_else(|| active_tab.pane_tree.active_pane());
+                                    if let Some(ref term) = pane.and_then(|p| p.terminal.as_ref()).or(active_tab.terminal.as_ref()) {
                                         term.scroll_to_bottom();
                                         term.write_to_pty(b"\x0c");
                                     }
@@ -6925,9 +7351,9 @@ impl Render for RootView {
                             IconType::X,
                             "Close Pane",
                             Some(sc_close_pane),
-                            cx.listener(|this, _ev, window, cx| {
+                            cx.listener(move |this, _ev, window, cx| {
                                 this.is_pane_context_menu_open = false;
-                                this.close_active_pane(window, cx);
+                                this.close_pane_by_id(target_pane_id, window, cx);
                             }),
                             theme,
                         ))

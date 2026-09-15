@@ -311,8 +311,18 @@ impl LanguageModel for OpenAiCompatProvider {
                         }
 
                         if let Some(usage) = parsed.get("usage") {
-                            let input = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let output = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let input = usage
+                                .get("prompt_tokens")
+                                .or_else(|| usage.get("prompt_eval_count"))
+                                .or_else(|| usage.get("input_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let output = usage
+                                .get("completion_tokens")
+                                .or_else(|| usage.get("eval_count"))
+                                .or_else(|| usage.get("output_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
                             let _ = tx.send_blocking(CompletionEvent::Usage { input, output });
                         }
 
