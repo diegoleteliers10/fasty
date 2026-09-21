@@ -1,6 +1,9 @@
 //! Git status types and worktree helpers shared between main and renderer.
 
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use crate::event_listener::EventSender;
 use crate::terminal_state::AppEvent;
 use notify::Watcher;
@@ -256,6 +259,49 @@ fn get_ahead_behind(repo: &git2::Repository, branch: &str) -> (usize, usize) {
     repo.graph_ahead_behind(local, remote).unwrap_or((0, 0))
 }
 
+/// TTL for [`fetch_git_info_cached`]. A full status scan (git2 discover +
+/// head + recursive untracked walk) is the most expensive recurring read in
+/// the app; events like `CwdChanged` + `CommandFinished` often arrive in
+/// bursts for the same directory, so a short TTL collapses them into one.
+const GIT_INFO_CACHE_TTL: Duration = Duration::from_secs(2);
+const GIT_INFO_CACHE_MAX_ENTRIES: usize = 128;
+
+/// Canonicalized path -> (fetched at, status). `None` statuses are cached
+/// too so plain directories skip the discover walk-up on every event.
+type GitInfoCache = Mutex<HashMap<PathBuf, (Instant, Option<GitInfo>)>>;
+
+fn git_info_cache() -> &'static GitInfoCache {
+    static CACHE: OnceLock<GitInfoCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cached [`fetch_git_info`], keyed by canonicalized path.
+///
+/// `None` (not a repo) is cached too, so plain directories stop paying a
+/// `Repository::discover` walk-up on every event. Entries expire after
+/// [`GIT_INFO_CACHE_TTL`]; callers that need an immediate refresh after a
+/// known mutation (commit, checkout) should call [`fetch_git_info`] directly.
+pub fn fetch_git_info_cached(repo_path: &Path) -> Option<GitInfo> {
+    let key = repo_path
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.to_path_buf());
+    if let Ok(guard) = git_info_cache().lock() {
+        if let Some((at, info)) = guard.get(&key) {
+            if at.elapsed() < GIT_INFO_CACHE_TTL {
+                return info.clone();
+            }
+        }
+    }
+    let info = fetch_git_info(repo_path);
+    if let Ok(mut guard) = git_info_cache().lock() {
+        if guard.len() >= GIT_INFO_CACHE_MAX_ENTRIES {
+            guard.clear();
+        }
+        guard.insert(key, (Instant::now(), info.clone()));
+    }
+    info
+}
+
 
 
 pub struct GitWatcherManager {
@@ -323,5 +369,32 @@ impl GitWatcherManager {
 
     pub fn prune_unreferenced(&mut self, active_repos: &std::collections::HashSet<PathBuf>) {
         self.watchers.retain(|path, _| active_repos.contains(path));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cached_matches_direct() {
+        // GitStatus has no PartialEq; compare Debug rendering instead.
+        let dir = std::env::temp_dir();
+        assert_eq!(
+            format!("{:?}", fetch_git_info_cached(&dir)),
+            format!("{:?}", fetch_git_info(&dir))
+        );
+        // Second call serves the cached entry.
+        assert_eq!(
+            format!("{:?}", fetch_git_info_cached(&dir)),
+            format!("{:?}", fetch_git_info(&dir))
+        );
+    }
+
+    #[test]
+    fn test_cached_none_for_missing_path() {
+        let missing = std::env::temp_dir().join("fastty-definitely-not-a-repo-12345");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(fetch_git_info_cached(&missing).is_none());
     }
 }

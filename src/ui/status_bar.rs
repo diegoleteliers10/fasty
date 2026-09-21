@@ -14,6 +14,10 @@ pub struct StatusBarModel {
     pub theme: Theme,
 }
 
+/// A `poll()` call on the render path must only dispatch work (spawn and
+/// return). Anything slower blocks the frame: log it (punto 4).
+const SLOW_POLL_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(250);
+
 impl StatusBarModel {
     pub fn new(config: &Config, theme: Theme) -> Self {
         let mut widgets = Vec::new();
@@ -39,6 +43,8 @@ impl StatusBarModel {
                 active_tab_cwd: cwd.as_deref(),
                 active_tab_git: git.as_ref(),
                 opacity: 1.0,
+                // No window handle here; preserve previous behavior.
+                window_focused: true,
             };
             let mut widgets = widgets_arc.lock();
             for w in widgets.iter_mut() {
@@ -54,11 +60,13 @@ impl StatusBarModel {
         &self,
         cwd: Option<&std::path::Path>,
         git: Option<&GitStatus>,
+        window_focused: bool,
     ) -> (Vec<Segment>, Vec<Segment>) {
         let ctx = WidgetContext {
             active_tab_cwd: cwd,
             active_tab_git: git,
             opacity: 1.0,
+            window_focused,
         };
         let mut left = Vec::new();
         let mut right = Vec::new();
@@ -67,8 +75,20 @@ impl StatusBarModel {
         let now = std::time::Instant::now();
         for w in widgets.iter_mut() {
             if now.duration_since(w.last_poll()) >= w.poll_interval() {
+                // Permanent cheap observability (punto 4): a poll that runs
+                // on the render path must return immediately (spawn and go).
+                // Anything slow here is a UI jank regression: log it.
+                let poll_start = std::time::Instant::now();
                 w.poll(&ctx);
                 w.set_last_poll(now);
+                let took = poll_start.elapsed();
+                if took > SLOW_POLL_THRESHOLD {
+                    eprintln!(
+                        "[fastty] slow widget poll: id={} took {:?} (blocks status-bar render)",
+                        w.id(),
+                        took
+                    );
+                }
             }
             let segs = w.render(&ctx);
             match w.align() {

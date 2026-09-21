@@ -16,7 +16,7 @@ use super::theme::{Theme, rgb_to_hsla};
 use crate::config::{self, Config, TabLayout};
 use crate::event_listener::EventSender;
 use crate::git::GitStatus;
-use crate::pane_tree::{Direction, PaneNode, PaneTree, SplitDirection, TerminalPane};
+use crate::pane_tree::{Direction, PaneId, PaneNode, PaneTree, SplitDirection, TerminalPane};
 use crate::terminal_state::{AppEvent, TerminalState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +37,9 @@ pub struct TabData {
     pub git_last_poll: Option<std::time::Instant>,
     pub last_duration_ms: Option<u128>,
     pub last_exit_code: Option<i32>,
+    /// F2: zoomed pane (tmux `prefix+z` semantics). The pane takes the whole
+    /// terminal area until toggled off. Per-tab, transient (not persisted).
+    pub zoomed_pane: Option<PaneId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -50,6 +53,9 @@ pub struct StyledSpan {
     pub is_underline: bool,
     /// Pure-emoji span (color glyphs from fallback fonts).
     pub is_emoji: bool,
+    /// Nerd Font icon span (PUA codepoints). Shaped with the auto-detected
+    /// Nerd Font when one is installed, else today's cascade behavior.
+    pub is_nerd: bool,
     /// Font-size factor measured so the emoji ink fits its reserved cells.
     pub emoji_scale: Option<f32>,
     /// Terminal column for each char in `text` (including zerowidth chars,
@@ -619,6 +625,37 @@ fn is_emoji_codepoint(code: u32) -> bool {
     )
 }
 
+/// Nerd Font icon codepoints: BMP private-use area (Powerline, Font
+/// Awesome, Devicons, Octicons, Seti, Codicons, ...), its conventional
+/// stragglers, and the supplementary PUA planes.
+pub fn is_nerd_codepoint(code: u32) -> bool {
+    (0xE000..=0xF8FF).contains(&code)
+        || (0x23FB..=0x23FE).contains(&code)
+        || code == 0x2B58
+        || (0xF0000..=0xFFFFD).contains(&code)
+        || (0x100000..=0x10FFFD).contains(&code)
+}
+
+/// Finds an installed Nerd Font for icon fallback. Prefers `*Mono`
+/// variants (terminal metrics; note the suffix match: the family name
+/// itself may contain "mono", e.g. "JetBrainsMono Nerd Font"), else the
+/// first match. Case-insensitive. Returns `None` when no Nerd Font exists:
+/// callers keep today's behavior.
+pub fn find_nerd_font_family(names: &[String]) -> Option<String> {
+    let mut best: Option<(u8, String)> = None;
+    for name in names {
+        let lower = name.to_lowercase();
+        if !lower.contains("nerd") {
+            continue;
+        }
+        let score = if lower.ends_with("mono") { 0 } else { 1 };
+        if best.as_ref().is_none_or(|(s, _)| score < *s) {
+            best = Some((score, name.clone()));
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
 pub fn open_path_or_url(target: impl AsRef<std::ffi::OsStr>) {
     #[cfg(target_os = "macos")]
     {
@@ -839,6 +876,8 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
         PaletteCommand { id: "worktree", icon: IconType::GitPullRequest, title: "Git Worktree Picker", category: "Git", shortcut: Some(if is_mac { "⌘⌥W" } else { "Ctrl+Alt+W" }) },
         PaletteCommand { id: "project_jumper", icon: IconType::Folder, title: "Project / Tab Jumper", category: "Navigation", shortcut: Some(if is_mac { "⌘J" } else { "Ctrl+Shift+J" }) },
         PaletteCommand { id: "ssh", icon: IconType::Server, title: "SSH Host Manager", category: "Tools", shortcut: Some(if is_mac { "⌘O" } else { "Ctrl+Shift+O" }) },
+        PaletteCommand { id: "snippets", icon: IconType::Terminal, title: "Snippets: Insert Snippet...", category: "Tools", shortcut: None },
+        PaletteCommand { id: "prs", icon: IconType::GitPullRequest, title: "GitHub: Pull Requests (Checkout/Approve/Merge)", category: "Git", shortcut: None },
         PaletteCommand { id: "settings", icon: IconType::Settings, title: "Open Settings", category: "Preferences", shortcut: Some(if is_mac { "⌘," } else { "Ctrl+," }) },
         PaletteCommand { id: "about", icon: IconType::Zap, title: "About Fastty", category: "Application", shortcut: None },
         PaletteCommand { id: "fullscreen", icon: IconType::Maximize2, title: "Toggle Fullscreen", category: "Window", shortcut: Some(if is_mac { "⌃⌘F" } else { "F11" }) },
@@ -861,12 +900,215 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
         PaletteCommand { id: "focus_top", icon: IconType::ChevronUp, title: "Focus Pane Top", category: "Panes", shortcut: Some(if is_mac { "⌥⌘↑" } else { "Alt+↑" }) },
         PaletteCommand { id: "focus_down", icon: IconType::ChevronDown, title: "Focus Pane Down", category: "Panes", shortcut: Some(if is_mac { "⌥⌘↓" } else { "Alt+↓" }) },
         PaletteCommand { id: "close_pane", icon: IconType::X, title: "Close Active Pane", category: "Panes", shortcut: Some(if is_mac { "⌘W" } else { "Ctrl+Shift+W" }) },
+        PaletteCommand { id: "zoom_pane", icon: IconType::Maximize2, title: "Zoom Active Pane (Toggle)", category: "Panes", shortcut: None },
         PaletteCommand { id: "toggle_tab_sidebar", icon: IconType::Folder, title: "Toggle Tabs Sidebar", category: "View", shortcut: Some(if is_mac { "⌘B" } else { "Ctrl+B" }) },
         PaletteCommand { id: "toggle_ai_sidebar", icon: IconType::Sparkles, title: "Fastty AI: Toggle Assistant Sidebar", category: "AI", shortcut: Some(if is_mac { "⌘L" } else { "Ctrl+Shift+L" }) },
         PaletteCommand { id: "layout_horizontal", icon: IconType::Folder, title: "Tabs Layout: Horizontal Top Bar", category: "View", shortcut: None },
         PaletteCommand { id: "layout_vertical", icon: IconType::Folder, title: "Tabs Layout: Vertical Sidebar", category: "View", shortcut: None },
         PaletteCommand { id: "quit", icon: IconType::LogOut, title: "Quit Fastty", category: "Application", shortcut: Some(if is_mac { "⌘Q" } else { "Alt+F4" }) },
     ]
+}
+
+/// Maps a palette command id to the theme it switches to, if any.
+/// Used for live preview: navigating to the row previews the theme,
+/// `Enter` commits it, `Esc` reverts to the previous one.
+pub fn theme_name_for_palette_id(cmd_id: &str) -> Option<&'static str> {
+    match cmd_id {
+        "theme_default" => Some("default"),
+        "theme_catppuccin" => Some("catppuccin"),
+        "theme_one_dark" => Some("one-dark"),
+        "theme_solarized" => Some("solarized-dark"),
+        "theme_high_contrast" => Some("high-contrast"),
+        _ => None,
+    }
+}
+
+/// Snapshot of the visual settings a palette preview may touch.
+#[derive(Clone, Debug)]
+pub struct PalettePreviewState {
+    pub theme_name: String,
+    pub font_size: f32,
+    pub tab_layout: TabLayout,
+    pub sidebar_open: bool,
+}
+
+/// What a palette entry previews while navigating. Font deltas apply to the
+/// baseline snapshot (idempotent under repeated hovers); layout/theme swap.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PalettePreviewKind {
+    Theme(&'static str),
+    FontDelta(f32),
+    FontReset,
+    Layout(TabLayout),
+}
+
+/// Maps a palette command id to its live preview, if any. `Enter` commits
+/// it (saves), `Esc` reverts to the snapshot.
+pub fn palette_preview_kind(cmd_id: &str) -> Option<PalettePreviewKind> {
+    if let Some(theme_name) = theme_name_for_palette_id(cmd_id) {
+        return Some(PalettePreviewKind::Theme(theme_name));
+    }
+    match cmd_id {
+        "zoom_in" => Some(PalettePreviewKind::FontDelta(1.0)),
+        "zoom_out" => Some(PalettePreviewKind::FontDelta(-1.0)),
+        "zoom_reset" => Some(PalettePreviewKind::FontReset),
+        "layout_horizontal" => Some(PalettePreviewKind::Layout(TabLayout::Horizontal)),
+        "layout_vertical" => Some(PalettePreviewKind::Layout(TabLayout::Vertical)),
+        _ => None,
+    }
+}
+
+impl RootView {
+    /// Palette entries matching the current query. UX4: with an empty query
+    /// the most-recently executed commands sort first (stable otherwise),
+    /// so repeat actions are one `Enter` away.
+    pub fn filtered_palette_commands(&self) -> Vec<PaletteCommand> {
+        let query = self.command_palette_query.to_lowercase();
+        let mut cmds: Vec<PaletteCommand> = get_all_palette_commands()
+            .into_iter()
+            .filter(|c| {
+                query.is_empty()
+                    || fuzzy_match_str(&query, c.title)
+                    || fuzzy_match_str(&query, c.category)
+            })
+            .collect();
+        if query.is_empty() && !self.palette_recent.is_empty() {
+            cmds.sort_by_key(|c| {
+                self.palette_recent
+                    .iter()
+                    .position(|r| r == c.id)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        cmds
+    }
+
+    /// Records a palette execution for recent-first ordering (max 5).
+    pub fn record_palette_recent(&mut self, cmd_id: &str) {
+        if let Some(pos) = self.palette_recent.iter().position(|r| r == cmd_id) {
+            self.palette_recent.remove(pos);
+        }
+        self.palette_recent.insert(0, cmd_id.to_string());
+        self.palette_recent.truncate(5);
+    }
+}
+
+/// UX6: wraps a raw provider/stream error in an error-styled bubble with an
+/// actionable hint, instead of a plain-text message that is easy to miss.
+pub fn ai_error_message(err: &str) -> crate::ui::ai_sidebar::AiUiMessage {
+    let hint = if err.contains("API key")
+        || err.contains("api_key")
+        || err.contains("not found in configuration")
+    {
+        "Tip: set your API key under Settings (AI tab) or via environment variable."
+    } else if err.contains("Timeout")
+        || err.contains("timed out")
+        || err.contains("connect")
+        || err.contains("Connection")
+        || err.contains("network")
+        || err.contains("DNS")
+    {
+        "Tip: check your network connection and provider status, then retry."
+    } else {
+        "Tip: retry, or check provider settings under Settings (AI tab)."
+    };
+    crate::ui::ai_sidebar::AiUiMessage::error(format!("Error: {err}\n\n{hint}"))
+        .with_timestamp(crate::ui::ai_sidebar::current_time_str())
+}
+
+/// F5: PR picker mode. Browse lists PRs; Actions operates on one PR with an
+/// explicit command preview per row (the two-step flow is the confirmation).
+#[derive(Clone, Debug, PartialEq)]
+pub enum PrPickerMode {
+    Browse,
+    Actions { number: usize, title: String },
+}
+
+/// F5: one browsable PR row (current-branch PR pinned first, deduped).
+#[derive(Clone, Debug)]
+pub struct PrPickerRow {
+    pub number: usize,
+    pub title: String,
+    /// `@author` for listed PRs, review state for the current-branch one.
+    pub detail: String,
+    pub is_current: bool,
+}
+
+/// F5: flattens a widget snapshot into picker rows.
+pub(crate) fn pr_picker_rows(
+    snapshot: &crate::widgets::builtin::git_prs::PrsSummary,
+) -> Vec<PrPickerRow> {
+    let mut rows = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if let Some(ref pr) = snapshot.current_pr {
+        seen.insert(pr.number);
+        rows.push(PrPickerRow {
+            number: pr.number,
+            title: pr.title.clone(),
+            detail: pr
+                .review_decision
+                .clone()
+                .unwrap_or_else(|| pr.state.clone()),
+            is_current: true,
+        });
+    }
+    for pr in &snapshot.open_prs {
+        if seen.insert(pr.number) {
+            rows.push(PrPickerRow {
+                number: pr.number,
+                title: pr.title.clone(),
+                detail: pr
+                    .author
+                    .as_ref()
+                    .map(|a| format!("@{}", a.login))
+                    .unwrap_or_default(),
+                is_current: false,
+            });
+        }
+    }
+    rows
+}
+
+/// F5: actions available on a selected PR, in fixed order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrPickerAction {
+    Checkout,
+    Approve,
+    Merge,
+    Back,
+}
+
+pub fn pr_action_count() -> usize {
+    4
+}
+
+pub fn pr_action_for_index(idx: usize) -> PrPickerAction {
+    match idx {
+        0 => PrPickerAction::Checkout,
+        1 => PrPickerAction::Approve,
+        2 => PrPickerAction::Merge,
+        _ => PrPickerAction::Back,
+    }
+}
+
+pub fn pr_action_label(action: PrPickerAction, number: usize) -> String {
+    match action {
+        PrPickerAction::Checkout => format!("Checkout PR #{number}"),
+        PrPickerAction::Approve => format!("Approve PR #{number}"),
+        PrPickerAction::Merge => format!("Merge PR #{number}"),
+        PrPickerAction::Back => "← Back to list".to_string(),
+    }
+}
+
+/// F5: the exact command that will be typed into the pane (shown as preview
+/// in the row, so the action is explicit before committing with Enter).
+pub fn pr_action_command(action: PrPickerAction, number: usize) -> Option<String> {
+    match action {
+        PrPickerAction::Checkout => Some(format!("gh pr checkout {number}")),
+        PrPickerAction::Approve => Some(format!("gh pr review {number} --approve")),
+        PrPickerAction::Merge => Some(format!("gh pr merge {number} --merge")),
+        PrPickerAction::Back => None,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -900,6 +1142,9 @@ pub struct RootView {
     focus_handle: FocusHandle,
     font_size: f32,
     font_family: SharedString,
+    /// F3: installed Nerd Font for PUA icon fallback, if any. `None` keeps
+    /// today's behavior (OS cascade). Resolved once at startup.
+    nerd_font_family: Option<SharedString>,
     status_bar_model: StatusBarModel,
     pub tab_layout: TabLayout,
     pub sidebar_open: bool,
@@ -923,6 +1168,17 @@ pub struct RootView {
     pub is_ssh_manager_open: bool,
     pub ssh_manager_query: String,
     pub ssh_manager_selected: usize,
+    /// F4: snippet picker (fuzzy search over triggers, preview, insert).
+    pub is_snippet_picker_open: bool,
+    pub snippet_query: String,
+    pub snippet_selected: usize,
+    /// F5: PR picker (browse PRs, checkout/approve/merge via `gh`).
+    pub is_pr_picker_open: bool,
+    pub pr_picker_query: String,
+    pub pr_picker_selected: usize,
+    pub pr_picker_mode: PrPickerMode,
+    pub pr_picker_cwd: Option<std::path::PathBuf>,
+    pub(crate) pr_snapshot: Arc<std::sync::Mutex<Option<crate::widgets::builtin::git_prs::PrsSummary>>>,
     pub is_search_open: bool,
     pub search_query: String,
     pub search_match_idx: usize,
@@ -946,6 +1202,8 @@ pub struct RootView {
     pub git_menu_pos: Option<(f32, f32)>,
     pub command_palette_scroll_handle: ScrollHandle,
     pub ssh_manager_scroll_handle: ScrollHandle,
+    pub snippet_scroll_handle: ScrollHandle,
+    pub pr_picker_scroll_handle: ScrollHandle,
     pub worktree_picker_scroll_handle: ScrollHandle,
     pub project_jumper_scroll_handle: ScrollHandle,
     pub ai_scroll_handle: ScrollHandle,
@@ -960,6 +1218,19 @@ pub struct RootView {
     pub hovered_url: Option<String>,
     pub hovered_url_range: Option<(i32, usize, usize)>,
     pub current_theme_name: String,
+    /// Snapshot of the visual settings a command-palette preview may touch.
+    /// Taken before the first preview step: `Enter` commits (saves), `Esc`
+    /// restores everything without touching the config file.
+    pub palette_preview_original: Option<PalettePreviewState>,
+    /// Last config load failure (path + parse error), shown as a banner
+    /// instead of failing silently to defaults. Session-dismissible.
+    pub config_error: Option<String>,
+    /// One-line first-run hint bar. True only when neither a config file nor
+    /// a saved session exists yet; dismissed for the session via "Got it".
+    pub show_onboarding_hint: bool,
+    /// Most-recently executed palette commands (ids, most recent first,
+    /// capped). Sorted to the top when the palette query is empty.
+    pub palette_recent: Vec<String>,
     pub cursor_blink_visible: bool,
     pub last_cursor_activity: std::time::Instant,
     pub last_scroll_activity: std::time::Instant,
@@ -1104,6 +1375,11 @@ impl RootView {
             loaded_config.font.family.clone().into()
         };
 
+        // F3: auto-detect an installed Nerd Font for PUA icon fallback.
+        // Only used when one exists; otherwise rendering is unchanged.
+        let nerd_font_family: Option<SharedString> =
+            find_nerd_font_family(&_window.text_system().all_font_names()).map(|n| n.into());
+
         // Scrollbar fade and cursor ticker (interval: 35ms for smooth 30-60fps fade out)
         cx.spawn_in(_window, async move |this, cx| {
             let mut blink_counter = 0u32;
@@ -1227,6 +1503,7 @@ impl RootView {
             focus_handle,
             font_size,
             font_family,
+            nerd_font_family,
             status_bar_model,
             tab_layout,
             sidebar_open,
@@ -1250,6 +1527,15 @@ impl RootView {
             is_ssh_manager_open: false,
             ssh_manager_query: String::new(),
             ssh_manager_selected: 0,
+            is_snippet_picker_open: false,
+            snippet_query: String::new(),
+            snippet_selected: 0,
+            is_pr_picker_open: false,
+            pr_picker_query: String::new(),
+            pr_picker_selected: 0,
+            pr_picker_mode: PrPickerMode::Browse,
+            pr_picker_cwd: None,
+            pr_snapshot: Arc::new(std::sync::Mutex::new(None)),
             is_search_open: false,
             search_query: String::new(),
             search_match_idx: 0,
@@ -1273,6 +1559,8 @@ impl RootView {
             git_menu_pos: None,
             command_palette_scroll_handle: ScrollHandle::new(),
             ssh_manager_scroll_handle: ScrollHandle::new(),
+            snippet_scroll_handle: ScrollHandle::new(),
+            pr_picker_scroll_handle: ScrollHandle::new(),
             worktree_picker_scroll_handle: ScrollHandle::new(),
             project_jumper_scroll_handle: ScrollHandle::new(),
             ai_scroll_handle: ScrollHandle::new(),
@@ -1287,6 +1575,11 @@ impl RootView {
             hovered_url: None,
             hovered_url_range: None,
             current_theme_name: theme_name,
+            palette_preview_original: None,
+            config_error: crate::config::load_error(),
+            show_onboarding_hint: !crate::config::Config::get_active_config_path().exists()
+                && !crate::session::session_path().exists(),
+            palette_recent: Vec::new(),
             cursor_blink_visible: true,
             last_cursor_activity: std::time::Instant::now(),
             last_scroll_activity: std::time::Instant::now() - std::time::Duration::from_secs(10),
@@ -1617,7 +1910,7 @@ impl RootView {
                             let sender_bg = event_sender_loop.clone();
                             let p_bg = p.clone();
                             std::thread::spawn(move || {
-                                if let Some(git) = crate::git::fetch_git_info(&p_bg) {
+                                if let Some(git) = crate::git::fetch_git_info_cached(&p_bg) {
                                     sender_bg.send(AppEvent::GitStatusUpdated {
                                         window_id: None,
                                         tab_idx: pane_id,
@@ -1647,7 +1940,7 @@ impl RootView {
                             if let Some(cwd) = cwd_to_poll {
                                 let sender_bg = event_sender_loop.clone();
                                 std::thread::spawn(move || {
-                                    if let Some(git) = crate::git::fetch_git_info(&cwd) {
+                                    if let Some(git) = crate::git::fetch_git_info_cached(&cwd) {
                                         sender_bg.send(AppEvent::GitStatusUpdated {
                                             window_id: None,
                                             tab_idx: pane_id,
@@ -1716,7 +2009,7 @@ impl RootView {
             let sender_bg = event_sender.clone();
             let p_bg = p.clone();
             std::thread::spawn(move || {
-                if let Some(git) = crate::git::fetch_git_info(&p_bg) {
+                if let Some(git) = crate::git::fetch_git_info_cached(&p_bg) {
                     sender_bg.send(AppEvent::GitStatusUpdated {
                         window_id: None,
                         tab_idx: pane_id,
@@ -1772,6 +2065,7 @@ impl RootView {
             git_last_poll: Some(std::time::Instant::now()),
             last_duration_ms: None,
             last_exit_code: None,
+            zoomed_pane: None,
         });
 
         self.active_tab_idx = self.tabs.len() - 1;
@@ -1791,6 +2085,8 @@ impl RootView {
         let new_pane = self.spawn_terminal_pane(&default_shell, &[], current_cwd.as_deref(), None, window, cx);
         if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
             tab.pane_tree.split_active_pane(new_pane, direction);
+            // A new split exits zoom: the tree changed under it.
+            tab.zoomed_pane = None;
             if let Some(pane) = tab.pane_tree.active_pane() {
                 tab.terminal = pane.terminal.clone();
                 tab.cwd = pane.cwd.clone();
@@ -1865,6 +2161,24 @@ impl RootView {
         }
     }
 
+    /// F2: toggles zoom on the active pane (tmux `prefix+z` semantics): the
+    /// pane takes the whole terminal area until toggled off. No-op with a
+    /// single pane. Per-tab and transient (not persisted, not previewed).
+    pub fn toggle_pane_zoom(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
+            if tab.pane_tree.pane_count() < 2 {
+                return;
+            }
+            let active = tab.pane_tree.active_pane_id;
+            tab.zoomed_pane = if tab.zoomed_pane == Some(active) {
+                None
+            } else {
+                Some(active)
+            };
+            cx.notify();
+        }
+    }
+
     pub fn force_close_pane(&mut self, tab_id: usize, pane_id: usize, cx: &mut Context<Self>) {
         self.selection = None;
         self.is_selecting = false;
@@ -1880,6 +2194,10 @@ impl RootView {
             }
             if tab.pane_tree.close_pane(pane_id) {
                 crate::daemon::unregister(pane_id);
+            }
+            // A closed zoomed pane exits zoom; other panes keep it.
+            if tab.zoomed_pane == Some(pane_id) {
+                tab.zoomed_pane = None;
             }
             if let Some(pane) = tab.pane_tree.active_pane() {
                 tab.terminal = pane.terminal.clone();
@@ -1962,7 +2280,7 @@ impl RootView {
                             let sender_bg = event_sender.clone();
                             let p_bg = p.clone();
                             std::thread::spawn(move || {
-                                if let Some(git) = crate::git::fetch_git_info(&p_bg) {
+                                if let Some(git) = crate::git::fetch_git_info_cached(&p_bg) {
                                     sender_bg.send(AppEvent::GitStatusUpdated {
                                         window_id: None,
                                         tab_idx: tab_id,
@@ -1985,7 +2303,7 @@ impl RootView {
                             if let Some(cwd) = cwd_to_poll {
                                 let sender_bg = event_sender.clone();
                                 std::thread::spawn(move || {
-                                    if let Some(git) = crate::git::fetch_git_info(&cwd) {
+                                    if let Some(git) = crate::git::fetch_git_info_cached(&cwd) {
                                         sender_bg.send(AppEvent::GitStatusUpdated {
                                             window_id: None,
                                             tab_idx: tab_id,
@@ -2360,6 +2678,8 @@ impl RootView {
             self.is_settings_open = false;
             self.is_command_palette_open = false;
             self.is_ssh_manager_open = false;
+            self.is_snippet_picker_open = false;
+            self.is_pr_picker_open = false;
             self.is_search_open = false;
         }
         cx.notify();
@@ -2370,11 +2690,18 @@ impl RootView {
         if self.is_command_palette_open {
             self.command_palette_query.clear();
             self.command_palette_selected = 0;
+            // Fresh open: no preview in flight yet (set lazily on first hover).
+            self.palette_preview_original = None;
             self.is_settings_open = false;
             self.is_context_menu_open = false;
             self.is_about_open = false;
             self.is_ssh_manager_open = false;
+            self.is_snippet_picker_open = false;
+            self.is_pr_picker_open = false;
             self.is_search_open = false;
+        } else {
+            // Closed without committing (toggle/Esc/backdrop): drop preview.
+            self.cancel_palette_preview(_window, cx);
         }
         cx.notify();
     }
@@ -2388,8 +2715,104 @@ impl RootView {
             self.is_context_menu_open = false;
             self.is_about_open = false;
             self.is_command_palette_open = false;
+            self.is_snippet_picker_open = false;
+            self.is_pr_picker_open = false;
             self.is_search_open = false;
         }
+        cx.notify();
+    }
+
+    /// F4: snippet picker open/close. Reads the live snippet map on every
+    /// open, so file edits appear instantly (same live-reload as Tab expand).
+    pub fn toggle_snippet_picker(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.is_snippet_picker_open = !self.is_snippet_picker_open;
+        if self.is_snippet_picker_open {
+            self.snippet_query.clear();
+            self.snippet_selected = 0;
+            self.snippet_scroll_handle.scroll_to_item(0);
+            self.is_settings_open = false;
+            self.is_context_menu_open = false;
+            self.is_about_open = false;
+            self.is_command_palette_open = false;
+            self.is_ssh_manager_open = false;
+            self.is_pr_picker_open = false;
+            self.is_search_open = false;
+            self.is_worktree_picker_open = false;
+            self.is_project_jumper_open = false;
+        }
+        cx.notify();
+    }
+
+    /// F4: inserts the expanded snippet body into the active pane (active
+    /// split first, tab terminal as fallback). No trailing Enter is sent:
+    /// the user reviews the text and executes it themselves.
+    pub fn insert_snippet_body(&mut self, body: &str, cx: &mut Context<Self>) {
+        let (expanded, _) = crate::snippets::expand(body);
+        if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+            let term = tab
+                .pane_tree
+                .active_pane()
+                .and_then(|p| p.terminal.clone())
+                .or_else(|| tab.terminal.clone());
+            if let Some(t) = term {
+                t.write_to_pty(expanded.as_bytes());
+            }
+        }
+        self.is_snippet_picker_open = false;
+        cx.notify();
+    }
+
+    /// F5: PR picker open/close. Fetches in background on every open; the
+    /// modal shows Loading until the snapshot lands (regular renders pick
+    /// it up, same as widgets).
+    pub fn toggle_pr_picker(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.is_pr_picker_open = !self.is_pr_picker_open;
+        if self.is_pr_picker_open {
+            self.pr_picker_query.clear();
+            self.pr_picker_selected = 0;
+            self.pr_picker_scroll_handle.scroll_to_item(0);
+            self.pr_picker_mode = PrPickerMode::Browse;
+            let cwd = self.tabs.get(self.active_tab_idx).and_then(|t| t.cwd.clone());
+            self.pr_picker_cwd = cwd.clone();
+            self.is_settings_open = false;
+            self.is_context_menu_open = false;
+            self.is_about_open = false;
+            self.is_command_palette_open = false;
+            self.is_ssh_manager_open = false;
+            self.is_snippet_picker_open = false;
+            self.is_search_open = false;
+            self.is_worktree_picker_open = false;
+            self.is_project_jumper_open = false;
+            if let Some(dir) = cwd {
+                if let Ok(mut guard) = self.pr_snapshot.lock() {
+                    *guard = None;
+                }
+                let state = self.pr_snapshot.clone();
+                std::thread::spawn(move || {
+                    let summary = crate::widgets::builtin::git_prs::fetch_prs_summary(&dir);
+                    if let Ok(mut guard) = state.lock() {
+                        *guard = summary;
+                    }
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// F5: types the action command into the active pane (visible, like the
+    /// git menu) and closes the picker.
+    pub fn run_pr_action_command(&mut self, cmd: &str, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+            let term = tab
+                .pane_tree
+                .active_pane()
+                .and_then(|p| p.terminal.clone())
+                .or_else(|| tab.terminal.clone());
+            if let Some(t) = term {
+                t.write_to_pty(format!("{cmd}\r").as_bytes());
+            }
+        }
+        self.is_pr_picker_open = false;
         cx.notify();
     }
 
@@ -2404,6 +2827,8 @@ impl RootView {
             self.is_about_open = false;
             self.is_command_palette_open = false;
             self.is_ssh_manager_open = false;
+            self.is_snippet_picker_open = false;
+            self.is_pr_picker_open = false;
             self.is_worktree_picker_open = false;
             self.is_project_jumper_open = false;
         }
@@ -2420,6 +2845,8 @@ impl RootView {
             self.is_about_open = false;
             self.is_command_palette_open = false;
             self.is_ssh_manager_open = false;
+            self.is_snippet_picker_open = false;
+            self.is_pr_picker_open = false;
             self.is_search_open = false;
             self.is_project_jumper_open = false;
         }
@@ -2436,6 +2863,8 @@ impl RootView {
             self.is_about_open = false;
             self.is_command_palette_open = false;
             self.is_ssh_manager_open = false;
+            self.is_snippet_picker_open = false;
+            self.is_pr_picker_open = false;
             self.is_search_open = false;
             self.is_worktree_picker_open = false;
             self.is_tab_overview_open = false;
@@ -2451,6 +2880,8 @@ impl RootView {
             self.is_global_search_open = false;
             self.is_command_palette_open = false;
             self.is_ssh_manager_open = false;
+            self.is_snippet_picker_open = false;
+            self.is_pr_picker_open = false;
             self.is_search_open = false;
             self.is_worktree_picker_open = false;
             self.is_project_jumper_open = false;
@@ -2467,6 +2898,8 @@ impl RootView {
             self.is_tab_overview_open = false;
             self.is_command_palette_open = false;
             self.is_ssh_manager_open = false;
+            self.is_snippet_picker_open = false;
+            self.is_pr_picker_open = false;
             self.is_search_open = false;
             self.is_worktree_picker_open = false;
             self.is_project_jumper_open = false;
@@ -2597,6 +3030,7 @@ impl RootView {
                     git_last_poll: Some(std::time::Instant::now()),
                     last_duration_ms: None,
                     last_exit_code: None,
+                    zoomed_pane: None,
                 });
             }
 
@@ -2610,6 +3044,14 @@ impl RootView {
 
     pub fn execute_palette_command(&mut self, cmd_id: &str, _window: &mut Window, cx: &mut Context<Self>) {
         self.is_command_palette_open = false;
+        self.record_palette_recent(cmd_id);
+        // Leaving the palette on a non-preview command discards any preview;
+        // previewable commands (theme, font size, layout) commit in their
+        // arms below: theme/layout are absolute (idempotent), font size
+        // persists the already-previewed value.
+        if palette_preview_kind(cmd_id).is_none() {
+            self.cancel_palette_preview(_window, cx);
+        }
         match cmd_id {
             "tab_overview" => self.toggle_tab_overview(_window, cx),
             "global_search" => self.toggle_global_search(_window, cx),
@@ -2666,19 +3108,34 @@ impl RootView {
                 cx.notify();
             }
             "ssh" => self.toggle_ssh_manager(_window, cx),
+            "snippets" => self.toggle_snippet_picker(_window, cx),
+            "prs" => self.toggle_pr_picker(_window, cx),
             "settings" => self.toggle_settings(_window, cx),
             "about" => self.toggle_about(_window, cx),
             "fullscreen" => {
                 _window.toggle_fullscreen();
                 cx.notify();
             }
-            "zoom_in" => self.adjust_font_size(1.0, cx),
-            "zoom_out" => self.adjust_font_size(-1.0, cx),
+            "zoom_in" => {
+                if self.palette_preview_original.is_none() {
+                    self.adjust_font_size(1.0, cx);
+                } else {
+                    // Already previewed while navigating: just persist.
+                    self.commit_font_size(cx);
+                }
+            }
+            "zoom_out" => {
+                if self.palette_preview_original.is_none() {
+                    self.adjust_font_size(-1.0, cx);
+                } else {
+                    self.commit_font_size(cx);
+                }
+            }
             "zoom_reset" => {
-                self.font_size = 13.0;
-                self.config.font.size = 13.0;
-                let _ = self.config.save_default();
-                cx.notify();
+                if self.palette_preview_original.is_none() {
+                    self.font_size = 13.0;
+                }
+                self.commit_font_size(cx);
             }
             "theme_default" => self.set_theme("default", cx),
             "theme_catppuccin" => self.set_theme("catppuccin", cx),
@@ -2706,6 +3163,7 @@ impl RootView {
             "focus_top" | "focus_up" => self.focus_pane_in_direction(Direction::Top, cx),
             "focus_down" => self.focus_pane_in_direction(Direction::Down, cx),
             "close_pane" => self.close_active_pane(_window, cx),
+            "zoom_pane" => self.toggle_pane_zoom(cx),
             "toggle_tab_sidebar" => self.toggle_tab_sidebar(_window, cx),
             "toggle_ai_sidebar" => self.toggle_ai_sidebar(_window, cx),
             "layout_horizontal" => self.set_tab_layout_mode(TabLayout::Horizontal, _window, cx),
@@ -2972,6 +3430,7 @@ impl RootView {
             timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
             images: attached_images.clone(),
             documents: attached_documents.clone(),
+            is_error: false,
         });
         self.ai_scroll_handle.scroll_to_bottom();
 
@@ -2985,15 +3444,8 @@ impl RootView {
         ) {
             Ok(res) => res,
             Err(e) => {
-                self.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
-                    is_user: false,
-                    text: format!("Error initializing AI model: {}", e),
-                    thinking: None,
-                    tool_calls: Vec::new(),
-                    timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
-                    images: Vec::new(),
-                    documents: Vec::new(),
-                });
+                self.ai_messages
+                    .push(ai_error_message(&format!("initializing AI model: {e}")));
                 cx.notify();
                 return;
             }
@@ -3226,6 +3678,7 @@ impl RootView {
                                     timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
                                     images: Vec::new(),
                                     documents: Vec::new(),
+                                    is_error: false,
                                 });
                             }
 
@@ -3257,6 +3710,7 @@ impl RootView {
                                         timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
                                         images: Vec::new(),
                                         documents: Vec::new(),
+                                        is_error: false,
                                     });
                                 }
                             }
@@ -3314,6 +3768,7 @@ impl RootView {
                                     timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
                                     images: Vec::new(),
                                     documents: Vec::new(),
+                                    is_error: false,
                                 });
                             } else if !has_last_tools {
                                 this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
@@ -3324,6 +3779,7 @@ impl RootView {
                                     timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
                                     images: Vec::new(),
                                     documents: Vec::new(),
+                                    is_error: false,
                                 });
                             }
                             this.ai_is_streaming = false;
@@ -3358,15 +3814,7 @@ impl RootView {
                                 this.ai_pending_thinking.clear();
                             }
 
-                            this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
-                                is_user: false,
-                                text: format!("Error: {}", err),
-                                thinking: None,
-                                tool_calls: Vec::new(),
-                                timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
-                                images: Vec::new(),
-                                documents: Vec::new(),
-                            });
+                            this.ai_messages.push(ai_error_message(&err));
                             this.ai_is_streaming = false;
                             this.ai_cancel_token = None;
                         }
@@ -3633,6 +4081,8 @@ impl RootView {
 
 
     pub fn set_tab_layout_mode(&mut self, layout: TabLayout, window: &mut Window, cx: &mut Context<Self>) {
+        // Committed selection: persist. Any in-flight preview ends here.
+        self.palette_preview_original = None;
         if self.tab_layout == layout {
             return;
         }
@@ -3685,6 +4135,10 @@ impl RootView {
 
     pub fn reload_config(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let loaded_config = crate::config::load_lenient();
+        // External reload wins over any in-flight palette preview, and
+        // refreshes the config-error banner (fixing the file clears it).
+        self.palette_preview_original = None;
+        self.config_error = crate::config::load_error();
         let theme_name = loaded_config.theme.as_deref().unwrap_or("default").to_string();
         self.current_theme_name = theme_name.clone();
         self.theme = Theme::from_name(&theme_name).with_opacity(loaded_config.opacity);
@@ -3728,6 +4182,8 @@ impl RootView {
     }
 
     pub fn set_theme(&mut self, theme_name: &str, cx: &mut Context<Self>) {
+        // Committed selection: persist. Any in-flight preview ends here.
+        self.palette_preview_original = None;
         self.current_theme_name = theme_name.to_string();
         self.config.theme = Some(self.current_theme_name.clone());
         let _ = self.config.save_default();
@@ -3736,8 +4192,132 @@ impl RootView {
         cx.notify();
     }
 
+    /// Snapshots the previewable visual settings before the first preview
+    /// step, so cancelling restores them losslessly.
+    fn ensure_palette_preview(&mut self) {
+        if self.palette_preview_original.is_none() {
+            self.palette_preview_original = Some(PalettePreviewState {
+                theme_name: self.current_theme_name.clone(),
+                font_size: self.font_size,
+                tab_layout: self.tab_layout,
+                sidebar_open: self.sidebar_open,
+            });
+        }
+    }
+
+    /// Transient preview: swaps the UI colors without touching the config
+    /// file, so cancelling restores the previous theme losslessly.
+    pub fn preview_theme_transient(&mut self, theme_name: &str, cx: &mut Context<Self>) {
+        if self.current_theme_name == theme_name {
+            return;
+        }
+        self.ensure_palette_preview();
+        self.current_theme_name = theme_name.to_string();
+        self.theme = Theme::from_name(theme_name).with_opacity(self.config.opacity);
+        self.status_bar_model = StatusBarModel::new(&self.config, self.theme);
+        cx.notify();
+    }
+
+    /// Transient font-size preview (no disk write).
+    pub fn preview_font_size_transient(&mut self, size: f32, cx: &mut Context<Self>) {
+        let size = size.clamp(9.0, 36.0);
+        if (self.font_size - size).abs() < f32::EPSILON {
+            return;
+        }
+        self.ensure_palette_preview();
+        self.font_size = size;
+        cx.notify();
+    }
+
+    /// Transient tab-layout preview (no disk write), with sidebar animation.
+    pub fn preview_layout_transient(
+        &mut self,
+        layout: TabLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tab_layout == layout {
+            return;
+        }
+        self.ensure_palette_preview();
+        self.tab_layout = layout;
+        if layout == TabLayout::Vertical {
+            self.sidebar_open = true;
+        }
+        self.trigger_sidebar_animation(window, cx);
+        cx.notify();
+    }
+
+    /// Reverts an uncommitted preview. No-op when nothing is previewing.
+    pub fn cancel_palette_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(original) = self.palette_preview_original.take() {
+            let mut changed = false;
+            if self.current_theme_name != original.theme_name {
+                self.current_theme_name = original.theme_name;
+                self.theme =
+                    Theme::from_name(&self.current_theme_name).with_opacity(self.config.opacity);
+                self.status_bar_model = StatusBarModel::new(&self.config, self.theme);
+                changed = true;
+            }
+            if (self.font_size - original.font_size).abs() > f32::EPSILON {
+                self.font_size = original.font_size;
+                changed = true;
+            }
+            if self.tab_layout != original.tab_layout
+                || self.sidebar_open != original.sidebar_open
+            {
+                self.tab_layout = original.tab_layout;
+                self.sidebar_open = original.sidebar_open;
+                self.trigger_sidebar_animation(window, cx);
+                changed = true;
+            }
+            if changed {
+                cx.notify();
+            }
+        }
+    }
+
+    /// If the palette entry previews something (theme, font size, layout),
+    /// applies it transiently; otherwise reverts to the pre-preview state so
+    /// non-preview rows show the real settings.
+    pub fn preview_palette_command(
+        &mut self,
+        cmd_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match palette_preview_kind(cmd_id) {
+            Some(PalettePreviewKind::Theme(name)) => self.preview_theme_transient(name, cx),
+            Some(PalettePreviewKind::FontDelta(delta)) => {
+                let base = self
+                    .palette_preview_original
+                    .as_ref()
+                    .map(|s| s.font_size)
+                    .unwrap_or(self.font_size);
+                self.preview_font_size_transient(base + delta, cx);
+            }
+            Some(PalettePreviewKind::FontReset) => self.preview_font_size_transient(13.0, cx),
+            Some(PalettePreviewKind::Layout(layout)) => {
+                self.preview_layout_transient(layout, window, cx)
+            }
+            None => self.cancel_palette_preview(window, cx),
+        }
+    }
+
     pub fn adjust_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        // Committed change (e.g. keyboard shortcut): persist.
+        self.palette_preview_original = None;
         self.font_size = (self.font_size + delta).clamp(9.0, 36.0);
+        self.config.font.size = self.font_size;
+        let _ = self.config.save_default();
+        cx.notify();
+    }
+
+    /// Commits the current (possibly previewed) font size to disk.
+    /// Used by palette `zoom_*` Enter: the value was already previewed while
+    /// navigating, so re-applying the delta would double it.
+    pub fn commit_font_size(&mut self, cx: &mut Context<Self>) {
+        self.palette_preview_original = None;
         self.config.font.size = self.font_size;
         let _ = self.config.save_default();
         cx.notify();
@@ -4237,15 +4817,11 @@ impl RootView {
         if self.is_command_palette_open {
             if key_lower == "escape" || key_lower == "esc" {
                 self.is_command_palette_open = false;
+                self.cancel_palette_preview(_window, cx);
                 cx.notify();
                 return;
             }
-            let query = self.command_palette_query.to_lowercase();
-            let all_cmds = get_all_palette_commands();
-            let filtered: Vec<&PaletteCommand> = all_cmds
-                .iter()
-                .filter(|c| query.is_empty() || fuzzy_match_str(&query, c.title) || fuzzy_match_str(&query, c.category))
-                .collect();
+            let filtered = self.filtered_palette_commands();
             let count = filtered.len();
 
             if key_lower == "enter" || key_lower == "return" {
@@ -4259,6 +4835,10 @@ impl RootView {
                 if count > 0 {
                     self.command_palette_selected = (self.command_palette_selected + 1) % count;
                     self.command_palette_scroll_handle.scroll_to_item(self.command_palette_selected);
+                    let selected_id = filtered.get(self.command_palette_selected).map(|c| c.id);
+                    if let Some(id) = selected_id {
+                        self.preview_palette_command(id, _window, cx);
+                    }
                     cx.notify();
                 }
                 return;
@@ -4271,6 +4851,10 @@ impl RootView {
                         self.command_palette_selected - 1
                     };
                     self.command_palette_scroll_handle.scroll_to_item(self.command_palette_selected);
+                    let selected_id = filtered.get(self.command_palette_selected).map(|c| c.id);
+                    if let Some(id) = selected_id {
+                        self.preview_palette_command(id, _window, cx);
+                    }
                     cx.notify();
                 }
                 return;
@@ -4279,6 +4863,15 @@ impl RootView {
                 self.command_palette_query.pop();
                 self.command_palette_selected = 0;
                 self.command_palette_scroll_handle.scroll_to_item(0);
+                // Re-filter after the edit so the row under the cursor previews.
+                let selected_id = self
+                    .filtered_palette_commands()
+                    .into_iter()
+                    .next()
+                    .map(|c| c.id);
+                if let Some(id) = selected_id {
+                    self.preview_palette_command(id, _window, cx);
+                }
                 cx.notify();
                 return;
             }
@@ -4287,6 +4880,14 @@ impl RootView {
                     self.command_palette_query.push_str(ch);
                     self.command_palette_selected = 0;
                     self.command_palette_scroll_handle.scroll_to_item(0);
+                    let selected_id = self
+                        .filtered_palette_commands()
+                        .into_iter()
+                        .next()
+                        .map(|c| c.id);
+                    if let Some(id) = selected_id {
+                        self.preview_palette_command(id, _window, cx);
+                    }
                     cx.notify();
                     return;
                 }
@@ -4294,13 +4895,212 @@ impl RootView {
                 self.command_palette_query.push_str(key);
                 self.command_palette_selected = 0;
                 self.command_palette_scroll_handle.scroll_to_item(0);
+                let selected_id = self
+                    .filtered_palette_commands()
+                    .into_iter()
+                    .next()
+                    .map(|c| c.id);
+                if let Some(id) = selected_id {
+                    self.preview_palette_command(id, _window, cx);
+                }
                 cx.notify();
                 return;
             }
             return;
         }
 
-        // 2. SSH Manager Keyboard Handler
+        // 2. Snippet Picker Keyboard Handler (F4)
+        if self.is_snippet_picker_open {
+            if key_lower == "escape" || key_lower == "esc" {
+                self.is_snippet_picker_open = false;
+                cx.notify();
+                return;
+            }
+            let all_snips = crate::snippets::all();
+            let query = self.snippet_query.to_lowercase();
+            let filtered: Vec<&(String, String)> = all_snips
+                .iter()
+                .filter(|(trigger, body)| {
+                    query.is_empty()
+                        || fuzzy_match_str(&query, trigger)
+                        || fuzzy_match_str(&query, body)
+                })
+                .collect();
+            let count = filtered.len();
+
+            if key_lower == "enter" || key_lower == "return" {
+                if let Some((_, body)) = filtered.get(self.snippet_selected) {
+                    let body = (*body).clone();
+                    self.insert_snippet_body(&body, cx);
+                }
+                return;
+            }
+            if key_lower == "down" || key_lower == "arrowdown" || key_lower == "tab" {
+                if count > 0 {
+                    self.snippet_selected = (self.snippet_selected + 1) % count;
+                    self.snippet_scroll_handle.scroll_to_item(self.snippet_selected);
+                    cx.notify();
+                }
+                return;
+            }
+            if key_lower == "up" || key_lower == "arrowup" {
+                if count > 0 {
+                    self.snippet_selected = if self.snippet_selected == 0 {
+                        count - 1
+                    } else {
+                        self.snippet_selected - 1
+                    };
+                    self.snippet_scroll_handle.scroll_to_item(self.snippet_selected);
+                    cx.notify();
+                }
+                return;
+            }
+            if key_lower == "backspace" {
+                self.snippet_query.pop();
+                self.snippet_selected = 0;
+                self.snippet_scroll_handle.scroll_to_item(0);
+                cx.notify();
+                return;
+            }
+            if let Some(ref ch) = event.keystroke.key_char {
+                if !modifiers.platform && !is_ctrl {
+                    self.snippet_query.push_str(ch);
+                    self.snippet_selected = 0;
+                    self.snippet_scroll_handle.scroll_to_item(0);
+                    cx.notify();
+                    return;
+                }
+            } else if key.len() == 1 && !modifiers.platform && !is_ctrl {
+                self.snippet_query.push_str(key);
+                self.snippet_selected = 0;
+                self.snippet_scroll_handle.scroll_to_item(0);
+                cx.notify();
+                return;
+            }
+            return;
+        }
+
+        // PR Picker Keyboard Handler (F5)
+        if self.is_pr_picker_open {
+            if key_lower == "escape" || key_lower == "esc" {
+                match self.pr_picker_mode.clone() {
+                    PrPickerMode::Actions { .. } => {
+                        self.pr_picker_mode = PrPickerMode::Browse;
+                        self.pr_picker_selected = 0;
+                        self.pr_picker_scroll_handle.scroll_to_item(0);
+                    }
+                    PrPickerMode::Browse => {
+                        self.is_pr_picker_open = false;
+                    }
+                }
+                cx.notify();
+                return;
+            }
+            let rows: Vec<PrPickerRow> = match self.pr_picker_mode.clone() {
+                PrPickerMode::Browse => {
+                    let query = self.pr_picker_query.to_lowercase();
+                    let guard = self.pr_snapshot.lock().unwrap();
+                    guard
+                        .as_ref()
+                        .map(pr_picker_rows)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|r| {
+                            query.is_empty()
+                                || fuzzy_match_str(&query, &r.title)
+                                || fuzzy_match_str(&query, &r.detail)
+                                || fuzzy_match_str(&query, &r.number.to_string())
+                        })
+                        .collect()
+                }
+                PrPickerMode::Actions { .. } => Vec::new(),
+            };
+            let count = match self.pr_picker_mode {
+                PrPickerMode::Browse => rows.len(),
+                PrPickerMode::Actions { .. } => pr_action_count(),
+            };
+
+            if key_lower == "enter" || key_lower == "return" {
+                match self.pr_picker_mode.clone() {
+                    PrPickerMode::Browse => {
+                        if let Some(row) = rows.get(self.pr_picker_selected) {
+                            self.pr_picker_mode = PrPickerMode::Actions {
+                                number: row.number,
+                                title: row.title.clone(),
+                            };
+                            self.pr_picker_selected = 0;
+                            self.pr_picker_scroll_handle.scroll_to_item(0);
+                            cx.notify();
+                        }
+                    }
+                    PrPickerMode::Actions { number, .. } => {
+                        match pr_action_for_index(self.pr_picker_selected) {
+                            PrPickerAction::Back => {
+                                self.pr_picker_mode = PrPickerMode::Browse;
+                                self.pr_picker_selected = 0;
+                                self.pr_picker_scroll_handle.scroll_to_item(0);
+                                cx.notify();
+                            }
+                            action => {
+                                if let Some(cmd) = pr_action_command(action, number) {
+                                    self.run_pr_action_command(&cmd, cx);
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            if key_lower == "down" || key_lower == "arrowdown" || key_lower == "tab" {
+                if count > 0 {
+                    self.pr_picker_selected = (self.pr_picker_selected + 1) % count;
+                    self.pr_picker_scroll_handle.scroll_to_item(self.pr_picker_selected);
+                    cx.notify();
+                }
+                return;
+            }
+            if key_lower == "up" || key_lower == "arrowup" {
+                if count > 0 {
+                    self.pr_picker_selected = if self.pr_picker_selected == 0 {
+                        count - 1
+                    } else {
+                        self.pr_picker_selected - 1
+                    };
+                    self.pr_picker_scroll_handle.scroll_to_item(self.pr_picker_selected);
+                    cx.notify();
+                }
+                return;
+            }
+            // Typing filters only in Browse mode; in Actions mode single
+            // keys must not leak into the (hidden) query.
+            if matches!(self.pr_picker_mode, PrPickerMode::Browse) {
+                if key_lower == "backspace" {
+                    self.pr_picker_query.pop();
+                    self.pr_picker_selected = 0;
+                    self.pr_picker_scroll_handle.scroll_to_item(0);
+                    cx.notify();
+                    return;
+                }
+                if let Some(ref ch) = event.keystroke.key_char {
+                    if !modifiers.platform && !is_ctrl {
+                        self.pr_picker_query.push_str(ch);
+                        self.pr_picker_selected = 0;
+                        self.pr_picker_scroll_handle.scroll_to_item(0);
+                        cx.notify();
+                        return;
+                    }
+                } else if key.len() == 1 && !modifiers.platform && !is_ctrl {
+                    self.pr_picker_query.push_str(key);
+                    self.pr_picker_selected = 0;
+                    self.pr_picker_scroll_handle.scroll_to_item(0);
+                    cx.notify();
+                    return;
+                }
+            }
+            return;
+        }
+
+        // 3. SSH Manager Keyboard Handler
         if self.is_ssh_manager_open {
             if key_lower == "escape" || key_lower == "esc" {
                 self.is_ssh_manager_open = false;
@@ -4322,6 +5122,13 @@ impl RootView {
                     let title = format!("ssh: {}", host_clone.name);
                     let (shell, args) = host_clone.resilient_shell_command();
                     self.create_tab_with_cmd(&shell, &args, Some(title), _window, cx);
+                } else {
+                    // UX5: no match (or no hosts at all): open ~/.ssh/config
+                    // so the user can add their first `Host` entry.
+                    let path = crate::ssh::ensure_ssh_config_exists();
+                    self.is_ssh_manager_open = false;
+                    open_path_or_url(&path);
+                    cx.notify();
                 }
                 return;
             }
@@ -4370,7 +5177,7 @@ impl RootView {
             return;
         }
 
-        // 3. Search Bar Keyboard Handler
+        // 4. Search Bar Keyboard Handler
         if self.is_search_open {
             if key_lower == "escape" || key_lower == "esc" {
                 self.is_search_open = false;
@@ -4432,7 +5239,7 @@ impl RootView {
             return;
         }
 
-        // 4. Git Worktree Picker Keyboard Handler
+        // 5. Git Worktree Picker Keyboard Handler
         if self.is_worktree_picker_open {
             if key_lower == "escape" || key_lower == "esc" {
                 self.is_worktree_picker_open = false;
@@ -4503,7 +5310,7 @@ impl RootView {
             return;
         }
 
-        // 5. Project / Tab Jumper Keyboard Handler
+        // 6. Project / Tab Jumper Keyboard Handler
         if self.is_project_jumper_open {
             if key_lower == "escape" || key_lower == "esc" {
                 self.is_project_jumper_open = false;
@@ -5074,6 +5881,8 @@ impl RootView {
         self.is_rename_tab_open
             || self.is_command_palette_open
             || self.is_ssh_manager_open
+            || self.is_snippet_picker_open
+            || self.is_pr_picker_open
             || self.is_search_open
             || self.is_worktree_picker_open
             || self.is_project_jumper_open
@@ -6013,6 +6822,7 @@ impl RootView {
                         let mut current_span_end_col: usize = 0;
                         let mut current_block_cat: Option<char> = None;
                         let mut current_is_emoji = false;
+                        let mut current_is_nerd = false;
                         let mut current_fg = theme.foreground;
                         let mut current_bg: Option<Hsla> = None;
                         let mut current_bold = false;
@@ -6040,6 +6850,7 @@ impl RootView {
                                             is_bold: current_bold,
                                             is_underline: current_underline,
                                             is_emoji: current_is_emoji,
+                                            is_nerd: current_is_nerd,
                                             emoji_scale: None,
                                             char_cols: current_span_char_cols,
                                         });
@@ -6047,6 +6858,7 @@ impl RootView {
                                         current_span_char_cols = Vec::new();
                                         current_block_cat = None;
                                         current_is_emoji = false;
+                                        current_is_nerd = false;
                                     }
                                     trim_row_spans(&mut current_row_spans);
                                     lines.push(current_row_spans);
@@ -6089,6 +6901,7 @@ impl RootView {
                             let is_underline = cell.flags.contains(Flags::UNDERLINE) || is_hovered_url || cell.hyperlink().is_some();
                             let code = cell.c as u32;
                             let is_emoji = is_emoji_codepoint(code);
+                            let is_nerd = is_nerd_codepoint(code);
                             let is_pua_icon = (0xE000..=0xF8FF).contains(&code)
                                 || (0xF0000..=0xFFFFD).contains(&code)
                                 || (0x100000..=0x10FFFD).contains(&code);
@@ -6123,6 +6936,7 @@ impl RootView {
                                         is_bold: current_bold,
                                         is_underline: current_underline,
                                         is_emoji: current_is_emoji,
+                                        is_nerd: current_is_nerd,
                                         emoji_scale: None,
                                         char_cols: current_span_char_cols,
                                     });
@@ -6135,6 +6949,7 @@ impl RootView {
                                 current_underline = is_underline;
                                 current_block_cat = block_cat;
                                 current_is_emoji = is_emoji;
+                                current_is_nerd = is_nerd;
                                 current_span_start_col = col;
                             }
                             current_span_text.push(cell.c);
@@ -6152,6 +6967,7 @@ impl RootView {
                                 is_bold: current_bold,
                                 is_underline: current_underline,
                                 is_emoji: current_is_emoji,
+                                is_nerd: current_is_nerd,
                                 emoji_scale: None,
                                 char_cols: current_span_char_cols,
                             });
@@ -6264,6 +7080,7 @@ impl RootView {
                             font_family: font_family.clone(),
                             font_size,
                             display_offset,
+                            nerd_font_family: self.nerd_font_family.clone(),
                         })
                     } else {
                         None
@@ -6535,15 +7352,28 @@ impl Render for RootView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
 
+        // F5: the picker fetched for another cwd: close rather than act on
+        // stale data (e.g. tab switched by mouse while open).
+        if self.is_pr_picker_open {
+            let current_cwd = self.tabs.get(self.active_tab_idx).and_then(|t| t.cwd.clone());
+            if current_cwd != self.pr_picker_cwd {
+                self.is_pr_picker_open = false;
+            }
+        }
         let tab_items: Vec<TabItem> = self
             .tabs
             .iter()
             .enumerate()
             .map(|(idx, tab)| {
                 let process_name = tab.terminal.as_ref().and_then(|t| t.get_foreground_process_name());
+                // F2: zoomed tabs carry a marker so the state is visible.
+                let mut title = tab.custom_title.clone().unwrap_or_else(|| tab.title.clone());
+                if tab.zoomed_pane.is_some() {
+                    title = format!("[Z] {title}");
+                }
                 TabItem {
                     id: tab.id,
-                    title: tab.custom_title.clone().unwrap_or_else(|| tab.title.clone()),
+                    title,
                     active: idx == self.active_tab_idx,
                     is_dirty: tab.git_status.as_ref().is_some_and(|g| g.unstaged > 0 || g.staged > 0),
                     process_name,
@@ -6585,7 +7415,7 @@ impl Render for RootView {
                 active_tab.git_checked_cwd = active_tab.cwd.clone();
                 active_tab.git_last_poll = Some(now);
                 if let Some(ref cwd) = active_tab.cwd {
-                    active_tab.git_status = crate::git::fetch_git_info(cwd);
+                    active_tab.git_status = crate::git::fetch_git_info_cached(cwd);
                 } else {
                     active_tab.git_status = None;
                 }
@@ -6604,7 +7434,11 @@ impl Render for RootView {
             (None, None, StatusInfo::default())
         };
 
-        let (left_segs, right_segs) = self.status_bar_model.render_segments(active_cwd, active_git.as_ref());
+        let (left_segs, right_segs) = self.status_bar_model.render_segments(
+            active_cwd,
+            active_git.as_ref(),
+            _window.is_window_active(),
+        );
 
         let (cell_w, line_h) = self.measure_cell_metrics(_window);
         let viewport_size = _window.viewport_size();
@@ -6615,26 +7449,85 @@ impl Render for RootView {
 
         const TAB_BAR_HEIGHT: f32 = 32.0;
         const STATUS_BAR_HEIGHT: f32 = 20.0;
-        let avail_h = (viewport_size.height.to_f64() as f32
-            - TAB_BAR_HEIGHT
-            - STATUS_BAR_HEIGHT)
-        .max(100.0);
+        // One-line notice bars (config error, onboarding) sit between the tab
+        // bar and the terminal and take real layout space, so the pane grid
+        // stays aligned with mouse coordinates.
+        const NOTICE_BAR_HEIGHT: f32 = 28.0;
+        let notice_h = ((self.config_error.is_some() as u8 + self.show_onboarding_hint as u8)
+            as f32)
+            * NOTICE_BAR_HEIGHT;
+        let top_offset = TAB_BAR_HEIGHT + notice_h;
+        let avail_h = (viewport_size.height.to_f64() as f32 - top_offset - STATUS_BAR_HEIGHT)
+            .max(100.0);
 
         let font_family = self.font_family.clone();
         let font_size = self.font_size;
 
+        // F2: a zoomed pane renders alone over the whole area. The temp leaf
+        // is a clone, so real-tree state is untouched; hidden panes lose
+        // their bounds so mouse routing can't land on them.
+        let zoomed_id = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|tab| tab.zoomed_pane);
+        let zoomed_leaf: Option<PaneNode> = zoomed_id.and_then(|id| {
+            self.tabs
+                .get(self.active_tab_idx)?
+                .pane_tree
+                .find_pane(id)
+                .cloned()
+                .map(PaneNode::Leaf)
+        });
+
         if let Some(active_tab) = self.tabs.get_mut(self.active_tab_idx) {
-            active_tab.pane_tree.update_layout_bounds(sidebar_w, TAB_BAR_HEIGHT, avail_w, avail_h);
+            if zoomed_leaf.is_some() {
+                let full = gpui::Bounds {
+                    origin: gpui::Point {
+                        x: px(sidebar_w),
+                        y: px(top_offset),
+                    },
+                    size: gpui::Size {
+                        width: px(avail_w),
+                        height: px(avail_h),
+                    },
+                };
+                for p in active_tab.pane_tree.all_panes_mut() {
+                    p.last_bounds = if Some(p.id) == zoomed_id { Some(full) } else { None };
+                }
+            } else {
+                // No zoom (or a stale zoom target): normal tree layout.
+                active_tab.zoomed_pane = None;
+                active_tab.pane_tree.update_layout_bounds(sidebar_w, top_offset, avail_w, avail_h);
+            }
         }
 
-        let terminal_area = if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
+        let terminal_area = if let Some(leaf) = zoomed_leaf.as_ref() {
+            let active_pane_id = self
+                .tabs
+                .get(self.active_tab_idx)
+                .map(|t| t.pane_tree.active_pane_id)
+                .unwrap_or(0);
+            self.render_pane_tree_node(
+                leaf,
+                Vec::new(),
+                sidebar_w,
+                top_offset,
+                avail_w,
+                avail_h,
+                cell_w,
+                line_h,
+                active_pane_id,
+                1,
+                cx,
+            )
+        } else if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
             let active_pane_id = active_tab.pane_tree.active_pane_id;
             let pane_count = active_tab.pane_tree.pane_count();
             self.render_pane_tree_node(
                 &active_tab.pane_tree.root,
                 Vec::new(),
                 sidebar_w,
-                TAB_BAR_HEIGHT,
+                top_offset,
                 avail_w,
                 avail_h,
                 cell_w,
@@ -6699,6 +7592,114 @@ impl Render for RootView {
                         this.toggle_context_menu(window, cx);
                     })),
             )
+            // UX1: a broken config file fails silently to defaults without
+            // this. One-line banner with the parse error; fixing the file
+            // clears it via the config watcher + reload_config.
+            .when_some(self.config_error.clone(), |this, err| {
+                let short: String = err.chars().take(160).collect();
+                this.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .w_full()
+                        .h(px(28.))
+                        .px(px(12.))
+                        .bg(theme.bright_red.opacity(0.12))
+                        .border_b_1()
+                        .border_color(theme.bright_red.opacity(0.45))
+                        .child(div().text_size(px(12.)).child("⚠"))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(11.5))
+                                .text_color(theme.foreground)
+                                .overflow_hidden()
+                                .child(SharedString::from(format!("Config error — {short}"))),
+                        )
+                        .child(
+                            div()
+                                .px(px(8.))
+                                .py(px(2.))
+                                .rounded(px(4.))
+                                .bg(theme.surface_raised)
+                                .text_size(px(11.))
+                                .text_color(theme.foreground)
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_down(MouseButton::Left, |_ev, _window, _cx| {
+                                    Self::open_settings_file();
+                                })
+                                .child("Open config"),
+                        )
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(2.))
+                                .rounded(px(4.))
+                                .text_size(px(11.))
+                                .text_color(theme.muted)
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(|s| s.text_color(theme.foreground))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        this.config_error = None;
+                                        cx.notify();
+                                    }),
+                                )
+                                .child("Dismiss"),
+                        ),
+                )
+            })
+            // UX7: first-run hint. Only shows when neither a config file nor
+            // a saved session exists yet; dismissed for the session.
+            .when(self.show_onboarding_hint, |this| {
+                let hints = if cfg!(target_os = "macos") {
+                    "Welcome to Fastty — ⌘P commands · ⌘O SSH hosts · ⌘, Settings"
+                } else {
+                    "Welcome to Fastty — Ctrl+Shift+P commands · Ctrl+Shift+O SSH hosts · Ctrl+, Settings"
+                };
+                this.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .w_full()
+                        .h(px(28.))
+                        .px(px(12.))
+                        .bg(theme.accent.opacity(0.10))
+                        .border_b_1()
+                        .border_color(theme.accent.opacity(0.35))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(11.5))
+                                .text_color(theme.foreground)
+                                .overflow_hidden()
+                                .child(hints.to_string()),
+                        )
+                        .child(
+                            div()
+                                .px(px(8.))
+                                .py(px(2.))
+                                .rounded(px(4.))
+                                .bg(theme.surface_raised)
+                                .text_size(px(11.))
+                                .text_color(theme.foreground)
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        this.show_onboarding_hint = false;
+                                        cx.notify();
+                                    }),
+                                )
+                                .child("Got it"),
+                        ),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -7125,8 +8126,18 @@ impl Render for RootView {
                 let sc_clear = if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl+Shift+K" };
                 let sc_search = if cfg!(target_os = "macos") { "⌘F" } else { "Ctrl+Shift+F" };
                 let has_selection = self.selection.is_some();
+                let (can_zoom, is_zoomed) = self
+                    .tabs
+                    .get(self.active_tab_idx)
+                    .map(|tab| {
+                        (
+                            tab.pane_tree.pane_count() > 1,
+                            tab.zoomed_pane == Some(target_pane_id),
+                        )
+                    })
+                    .unwrap_or((false, false));
                 let menu_w: f32 = 220.0;
-                let menu_h: f32 = if has_selection { 390.0 } else { 360.0 };
+                let menu_h: f32 = if has_selection { 420.0 } else { 390.0 };
                 let vp = _window.viewport_size();
                 let vp_w = vp.width.to_f64() as f32;
                 let vp_h = vp.height.to_f64() as f32;
@@ -7299,6 +8310,26 @@ impl Render for RootView {
                             }),
                             theme,
                         ))
+                        .when(can_zoom, |d| {
+                            d.child(render_context_menu_item(
+                                IconType::Maximize2,
+                                if is_zoomed { "Unzoom Pane" } else { "Zoom Pane" },
+                                None,
+                                cx.listener(move |this, _ev, _window, cx| {
+                                    this.is_pane_context_menu_open = false;
+                                    if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
+                                        tab.pane_tree.active_pane_id = target_pane_id;
+                                        if let Some(p) = tab.pane_tree.active_pane() {
+                                            tab.terminal = p.terminal.clone();
+                                            tab.cwd = p.cwd.clone();
+                                            tab.git_status = p.git_status.clone();
+                                        }
+                                    }
+                                    this.toggle_pane_zoom(cx);
+                                }),
+                                theme,
+                            ))
+                        })
                         .child(render_context_menu_divider(theme))
                         .child(render_context_menu_item(
                             IconType::Pencil,
@@ -7673,12 +8704,7 @@ impl Render for RootView {
             .when(self.is_command_palette_open, |this| {
                 let mut backdrop_bg = theme.black;
                 backdrop_bg.a = 0.65;
-                let query = self.command_palette_query.to_lowercase();
-                let all_cmds = get_all_palette_commands();
-                let filtered: Vec<PaletteCommand> = all_cmds
-                    .into_iter()
-                    .filter(|c| query.is_empty() || fuzzy_match_str(&query, c.title) || fuzzy_match_str(&query, c.category))
-                    .collect();
+                let filtered = self.filtered_palette_commands();
                 let selected_idx = self.command_palette_selected;
 
                 this.child(
@@ -7691,7 +8717,9 @@ impl Render for RootView {
                         .items_center()
                         .pt(px(60.))
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                            // Backdrop click: close without committing the preview.
                             this.is_command_palette_open = false;
+                            this.cancel_palette_preview(_window, cx);
                             cx.notify();
                         }))
                         .child(
@@ -7790,6 +8818,8 @@ impl Render for RootView {
                                                             .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
                                                                 if this.command_palette_selected != idx {
                                                                     this.command_palette_selected = idx;
+                                                                    // Hover previews live, like keyboard nav.
+                                                                    this.preview_palette_command(cmd_id, _window, cx);
                                                                     cx.notify();
                                                                 }
                                                             }))
@@ -7841,6 +8871,478 @@ impl Render for RootView {
                                                     .collect()
                                             }
                                         ),
+                                ),
+                        ),
+                )
+            })
+            // Snippet Picker Modal (F4)
+            .when(self.is_snippet_picker_open, |this| {
+                let mut backdrop_bg = theme.black;
+                backdrop_bg.a = 0.65;
+                let all_snips = crate::snippets::all();
+                let query = self.snippet_query.to_lowercase();
+                let filtered: Vec<(String, String)> = all_snips
+                    .into_iter()
+                    .filter(|(trigger, body)| {
+                        query.is_empty()
+                            || fuzzy_match_str(&query, trigger)
+                            || fuzzy_match_str(&query, body)
+                    })
+                    .collect();
+                let selected_idx = self.snippet_selected;
+
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(backdrop_bg)
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(60.))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                            this.is_snippet_picker_open = false;
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .w(px(560.))
+                                .rounded(px(10.))
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.border)
+                                .shadow_xl()
+                                .flex()
+                                .flex_col()
+                                .overflow_hidden()
+                                .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                // Input Box Header
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .px(px(12.))
+                                        .py(px(10.))
+                                        .border_b_1()
+                                        .border_color(theme.border)
+                                        .child(render_icon(IconType::Terminal, theme.accent, 14.0))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_size(px(13.))
+                                                .text_color(if self.snippet_query.is_empty() {
+                                                    theme.muted
+                                                } else {
+                                                    theme.foreground
+                                                })
+                                                .child(if self.snippet_query.is_empty() {
+                                                    "Type to filter snippets... (↑↓ to navigate, Enter to insert)".to_string()
+                                                } else {
+                                                    format!("{}|", self.snippet_query)
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .px(px(5.))
+                                                .py(px(2.))
+                                                .rounded(px(3.))
+                                                .bg(theme.surface_raised)
+                                                .text_size(px(10.))
+                                                .text_color(theme.muted)
+                                                .child("ESC"),
+                                        ),
+                                )
+                                // Filtered Snippets List
+                                .child(
+                                    div()
+                                        .id("snippet-picker-list")
+                                        .track_scroll(&self.snippet_scroll_handle)
+                                        .flex()
+                                        .flex_col()
+                                        .max_h(px(300.))
+                                        .overflow_y_scroll()
+                                        .p(px(4.))
+                                        .gap_1()
+                                        .children(
+                                            if filtered.is_empty() {
+                                                vec![
+                                                    div()
+                                                        .p(px(12.))
+                                                        .flex()
+                                                        .flex_col()
+                                                        .gap_1()
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(12.))
+                                                                .text_color(theme.foreground)
+                                                                .child("No snippets found"),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(11.))
+                                                                .text_color(theme.muted)
+                                                                .child("Add [snippet.NAME] entries to your snippets.toml to grow this list."),
+                                                        ),
+                                                ]
+                                            } else {
+                                                filtered
+                                                    .into_iter()
+                                                    .enumerate()
+                                                    .map(|(idx, (trigger, body))| {
+                                                        let is_selected = idx == selected_idx;
+                                                        // Placeholder-stripped preview, one line.
+                                                        let (expanded, _) = crate::snippets::expand(&body);
+                                                        let preview: String = expanded
+                                                            .lines()
+                                                            .next()
+                                                            .unwrap_or("")
+                                                            .chars()
+                                                            .take(72)
+                                                            .collect();
+                                                        div()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .gap_0p5()
+                                                            .px(px(10.))
+                                                            .py(px(6.))
+                                                            .rounded(px(6.))
+                                                            .bg(if is_selected { theme.accent } else { theme.surface })
+                                                            .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                                                if this.snippet_selected != idx {
+                                                                    this.snippet_selected = idx;
+                                                                    cx.notify();
+                                                                }
+                                                            }))
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                                                this.insert_snippet_body(&body, cx);
+                                                            }))
+                                                            .child(
+                                                                div()
+                                                                    .flex()
+                                                                    .flex_row()
+                                                                    .items_center()
+                                                                    .gap_2()
+                                                                    .child(
+                                                                        div()
+                                                                            .text_size(px(12.))
+                                                                            .font_weight(FontWeight::BOLD)
+                                                                            .text_color(if is_selected { theme.black } else { theme.accent })
+                                                                            .child(trigger),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .px(px(4.))
+                                                                            .py(px(1.))
+                                                                            .rounded(px(3.))
+                                                                            .bg(if is_selected { theme.black } else { theme.surface_raised })
+                                                                            .text_size(px(10.))
+                                                                            .text_color(if is_selected { theme.accent } else { theme.muted })
+                                                                            .child("snip"),
+                                                                    ),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(11.))
+                                                                    .text_color(if is_selected { theme.black.opacity(0.85) } else { theme.muted_strong })
+                                                                    .overflow_hidden()
+                                                                    .child(preview),
+                                                            )
+                                                    })
+                                                    .collect()
+                                            }
+                                        ),
+                                ),
+                        ),
+                )
+            })
+            // PR Picker Modal (F5)
+            .when(self.is_pr_picker_open, |this| {
+                let mut backdrop_bg = theme.black;
+                backdrop_bg.a = 0.65;
+                let mode = self.pr_picker_mode.clone();
+                let query = self.pr_picker_query.to_lowercase();
+                let has_cwd = self.pr_picker_cwd.is_some();
+                let snapshot = self.pr_snapshot.lock().unwrap().clone();
+                let rows: Vec<PrPickerRow> = snapshot
+                    .as_ref()
+                    .map(pr_picker_rows)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|r| {
+                        query.is_empty()
+                            || fuzzy_match_str(&query, &r.title)
+                            || fuzzy_match_str(&query, &r.detail)
+                            || fuzzy_match_str(&query, &r.number.to_string())
+                    })
+                    .collect();
+                let selected_idx = self.pr_picker_selected;
+                let header_text = match &mode {
+                    PrPickerMode::Browse => {
+                        if self.pr_picker_query.is_empty() {
+                            "Browse pull requests... (↑↓ to navigate, Enter for actions)".to_string()
+                        } else {
+                            format!("{}|", self.pr_picker_query)
+                        }
+                    }
+                    PrPickerMode::Actions { number, title } => {
+                        let short: String = title.chars().take(40).collect();
+                        format!("PR #{number}: {short} (Enter runs, Esc backs out)")
+                    }
+                };
+
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(backdrop_bg)
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .pt(px(60.))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                            this.is_pr_picker_open = false;
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .w(px(560.))
+                                .rounded(px(10.))
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.border)
+                                .shadow_xl()
+                                .flex()
+                                .flex_col()
+                                .overflow_hidden()
+                                .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                // Input Box Header
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .px(px(12.))
+                                        .py(px(10.))
+                                        .border_b_1()
+                                        .border_color(theme.border)
+                                        .child(render_icon(IconType::GitPullRequest, theme.accent, 14.0))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_size(px(13.))
+                                                .text_color(if matches!(mode, PrPickerMode::Browse) && self.pr_picker_query.is_empty() {
+                                                    theme.muted
+                                                } else {
+                                                    theme.foreground
+                                                })
+                                                .child(header_text),
+                                        )
+                                        .child(
+                                            div()
+                                                .px(px(5.))
+                                                .py(px(2.))
+                                                .rounded(px(3.))
+                                                .bg(theme.surface_raised)
+                                                .text_size(px(10.))
+                                                .text_color(theme.muted)
+                                                .child("ESC"),
+                                        ),
+                                )
+                                // Body
+                                .child(
+                                    div()
+                                        .id("pr-picker-list")
+                                        .track_scroll(&self.pr_picker_scroll_handle)
+                                        .flex()
+                                        .flex_col()
+                                        .max_h(px(300.))
+                                        .overflow_y_scroll()
+                                        .p(px(4.))
+                                        .gap_1()
+                                        .children(match mode {
+                                            PrPickerMode::Actions { number, .. } => {
+                                                (0..pr_action_count())
+                                                    .map(|idx| {
+                                                        let action = pr_action_for_index(idx);
+                                                        let is_selected = idx == selected_idx;
+                                                        let label = pr_action_label(action, number);
+                                                        let cmd_preview = pr_action_command(action, number);
+                                                        let action_copy = action;
+                                                        div()
+                                                            .flex()
+                                                            .flex_col()
+                                                            .gap_0p5()
+                                                            .px(px(10.))
+                                                            .py(px(6.))
+                                                            .rounded(px(6.))
+                                                            .bg(if is_selected { theme.accent } else { theme.surface })
+                                                            .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                                                if this.pr_picker_selected != idx {
+                                                                    this.pr_picker_selected = idx;
+                                                                    cx.notify();
+                                                                }
+                                                            }))
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                                                match action_copy {
+                                                                    PrPickerAction::Back => {
+                                                                        this.pr_picker_mode = PrPickerMode::Browse;
+                                                                        this.pr_picker_selected = 0;
+                                                                        this.pr_picker_scroll_handle.scroll_to_item(0);
+                                                                        cx.notify();
+                                                                    }
+                                                                    action => {
+                                                                        if let Some(cmd) = pr_action_command(action, number) {
+                                                                            this.run_pr_action_command(&cmd, cx);
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }))
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(12.))
+                                                                    .font_weight(FontWeight::BOLD)
+                                                                    .text_color(if is_selected { theme.black } else { theme.foreground })
+                                                                    .child(label),
+                                                            )
+                                                            .when_some(cmd_preview, |this, cmd| {
+                                                                this.child(
+                                                                    div()
+                                                                        .text_size(px(11.))
+                                                                        .text_color(if is_selected { theme.black.opacity(0.85) } else { theme.muted })
+                                                                        .child(cmd),
+                                                                )
+                                                            })
+                                                    })
+                                                    .collect()
+                                            }
+                                            PrPickerMode::Browse => {
+                                                if !has_cwd {
+                                                    vec![
+                                                        div()
+                                                            .p(px(12.))
+                                                            .text_size(px(12.))
+                                                            .text_color(theme.muted)
+                                                            .child("Open a git repository first, then pick PRs here."),
+                                                    ]
+                                                } else if snapshot.is_none() {
+                                                    vec![
+                                                        div()
+                                                            .p(px(12.))
+                                                            .text_size(px(12.))
+                                                            .text_color(theme.muted)
+                                                            .child("Loading pull requests..."),
+                                                    ]
+                                                } else if rows.is_empty() {
+                                                    vec![
+                                                        div()
+                                                            .p(px(12.))
+                                                            .flex()
+                                                            .flex_col()
+                                                            .gap_1()
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(12.))
+                                                                    .text_color(theme.foreground)
+                                                                    .child("No open pull requests"),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(11.))
+                                                                    .text_color(theme.muted)
+                                                                    .child("Needs `gh` authenticated in this repo."),
+                                                            ),
+                                                    ]
+                                                } else {
+                                                    rows
+                                                        .into_iter()
+                                                        .enumerate()
+                                                        .map(|(idx, row)| {
+                                                            let is_selected = idx == selected_idx;
+                                                            let number = row.number;
+                                                            let title = row.title.clone();
+                                                            div()
+                                                                .flex()
+                                                                .flex_col()
+                                                                .gap_0p5()
+                                                                .px(px(10.))
+                                                                .py(px(6.))
+                                                                .rounded(px(6.))
+                                                                .bg(if is_selected { theme.accent } else { theme.surface })
+                                                                .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
+                                                                .cursor(CursorStyle::PointingHand)
+                                                                .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                                                    if this.pr_picker_selected != idx {
+                                                                        this.pr_picker_selected = idx;
+                                                                        cx.notify();
+                                                                    }
+                                                                }))
+                                                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                                                    this.pr_picker_mode = PrPickerMode::Actions { number, title: title.clone() };
+                                                                    this.pr_picker_selected = 0;
+                                                                    this.pr_picker_scroll_handle.scroll_to_item(0);
+                                                                    cx.notify();
+                                                                }))
+                                                                .child(
+                                                                    div()
+                                                                        .flex()
+                                                                        .flex_row()
+                                                                        .items_center()
+                                                                        .gap_2()
+                                                                        .child(
+                                                                            div()
+                                                                                .text_size(px(12.))
+                                                                                .font_weight(FontWeight::BOLD)
+                                                                                .text_color(if is_selected { theme.black } else { theme.accent })
+                                                                                .child(format!("#{}", row.number)),
+                                                                        )
+                                                                        .when(row.is_current, |this| {
+                                                                            this.child(
+                                                                                div()
+                                                                                    .px(px(4.))
+                                                                                    .py(px(1.))
+                                                                                    .rounded(px(3.))
+                                                                                    .bg(if is_selected { theme.black } else { theme.surface_raised })
+                                                                                    .text_size(px(10.))
+                                                                                    .text_color(if is_selected { theme.accent } else { theme.muted })
+                                                                                    .child("current"),
+                                                                            )
+                                                                        })
+                                                                        .child(
+                                                                            div()
+                                                                                .text_size(px(10.))
+                                                                                .text_color(if is_selected { theme.black.opacity(0.85) } else { theme.muted })
+                                                                                .child(row.detail),
+                                                                        ),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(12.))
+                                                                        .text_color(if is_selected { theme.black } else { theme.foreground })
+                                                                        .overflow_hidden()
+                                                                        .child(row.title),
+                                                                )
+                                                        })
+                                                        .collect()
+                                                }
+                                            }
+                                        }),
                                 ),
                         ),
                 )
@@ -7954,7 +9456,7 @@ impl Render for RootView {
                                                             div()
                                                                 .text_size(px(11.))
                                                                 .text_color(theme.muted)
-                                                                .child("Add 'Host <name>' entries to ~/.ssh/config to launch remote sessions instantly."),
+                                                                .child("Add 'Host <name>' entries to ~/.ssh/config — or press Enter to open it."),
                                                         ),
                                                 ]
                                             } else {
@@ -9899,6 +11401,149 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_theme_palette_ids_map_to_theme_names() {
+        assert_eq!(theme_name_for_palette_id("theme_default"), Some("default"));
+        assert_eq!(theme_name_for_palette_id("theme_catppuccin"), Some("catppuccin"));
+        assert_eq!(theme_name_for_palette_id("theme_one_dark"), Some("one-dark"));
+        assert_eq!(theme_name_for_palette_id("theme_solarized"), Some("solarized-dark"));
+        assert_eq!(theme_name_for_palette_id("theme_high_contrast"), Some("high-contrast"));
+        // Non-theme commands never trigger a preview.
+        assert_eq!(theme_name_for_palette_id("new_tab"), None);
+        assert_eq!(theme_name_for_palette_id("settings"), None);
+        assert_eq!(theme_name_for_palette_id("quit"), None);
+    }
+
+    #[test]
+    fn test_find_nerd_font_prefers_mono_variant() {
+        let names = vec![
+            "Menlo".to_string(),
+            "JetBrainsMono Nerd Font".to_string(),
+            "JetBrainsMono Nerd Font Mono".to_string(),
+        ];
+        assert_eq!(
+            find_nerd_font_family(&names),
+            Some("JetBrainsMono Nerd Font Mono".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_nerd_font_case_insensitive_and_optional() {
+        let names = vec!["Menlo".to_string(), "FiraCode NERD FONT".to_string()];
+        assert_eq!(
+            find_nerd_font_family(&names),
+            Some("FiraCode NERD FONT".to_string())
+        );
+        let plain = vec!["Menlo".to_string(), "Consolas".to_string()];
+        assert_eq!(find_nerd_font_family(&plain), None);
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(find_nerd_font_family(&empty), None);
+    }
+
+    #[test]
+    fn test_is_nerd_codepoint_ranges() {
+        // Powerline, PUA icons, Font Awesome range.
+        assert!(is_nerd_codepoint(0xE0A0));
+        assert!(is_nerd_codepoint(0xE62E));
+        assert!(is_nerd_codepoint(0xF013));
+        assert!(is_nerd_codepoint(0x23FB));
+        assert!(is_nerd_codepoint(0x2B58));
+        // Ordinary text is not nerd.
+        assert!(!is_nerd_codepoint('A' as u32));
+        assert!(!is_nerd_codepoint('─' as u32));
+        assert!(!is_nerd_codepoint('●' as u32));
+    }
+
+        #[test]
+    fn test_pr_action_mapping_and_commands() {
+        assert_eq!(pr_action_count(), 4);
+        assert_eq!(pr_action_for_index(0), PrPickerAction::Checkout);
+        assert_eq!(pr_action_for_index(1), PrPickerAction::Approve);
+        assert_eq!(pr_action_for_index(2), PrPickerAction::Merge);
+        assert_eq!(pr_action_for_index(3), PrPickerAction::Back);
+        assert_eq!(pr_action_for_index(99), PrPickerAction::Back);
+        assert_eq!(
+            pr_action_command(PrPickerAction::Checkout, 12),
+            Some("gh pr checkout 12".to_string())
+        );
+        assert_eq!(
+            pr_action_command(PrPickerAction::Approve, 12),
+            Some("gh pr review 12 --approve".to_string())
+        );
+        assert_eq!(
+            pr_action_command(PrPickerAction::Merge, 12),
+            Some("gh pr merge 12 --merge".to_string())
+        );
+        assert_eq!(pr_action_command(PrPickerAction::Back, 12), None);
+        assert_eq!(pr_action_label(PrPickerAction::Checkout, 12), "Checkout PR #12");
+        assert_eq!(pr_action_label(PrPickerAction::Back, 12), "← Back to list");
+    }
+
+    #[test]
+    fn test_pr_picker_rows_pins_current_and_dedups() {
+        use crate::widgets::builtin::git_prs::{GhPrAuthor, GhPrList, GhPrView, PrsSummary};
+        let snapshot = PrsSummary {
+            current_pr: Some(GhPrView {
+                state: "OPEN".to_string(),
+                number: 7,
+                title: "Mine".to_string(),
+                url: "https://github.com/o/r/pull/7".to_string(),
+                review_decision: Some("APPROVED".to_string()),
+            }),
+            open_prs: vec![
+                GhPrList {
+                    number: 7,
+                    title: "Mine".to_string(),
+                    url: "https://github.com/o/r/pull/7".to_string(),
+                    author: None,
+                },
+                GhPrList {
+                    number: 9,
+                    title: "Theirs".to_string(),
+                    url: "https://github.com/o/r/pull/9".to_string(),
+                    author: Some(GhPrAuthor { login: "sam".to_string() }),
+                },
+            ],
+            review_requested_prs: Vec::new(),
+            cwd: std::path::PathBuf::from("/tmp"),
+        };
+        let rows = pr_picker_rows(&snapshot);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].is_current);
+        assert_eq!(rows[0].number, 7);
+        assert_eq!(rows[0].detail, "APPROVED");
+        assert!(!rows[1].is_current);
+        assert_eq!(rows[1].detail, "@sam");
+    }
+
+    #[test]
+    fn test_palette_preview_kind_covers_theme_font_and_layout() {        assert_eq!(
+            palette_preview_kind("theme_catppuccin"),
+            Some(PalettePreviewKind::Theme("catppuccin"))
+        );
+        assert_eq!(
+            palette_preview_kind("zoom_in"),
+            Some(PalettePreviewKind::FontDelta(1.0))
+        );
+        assert_eq!(
+            palette_preview_kind("zoom_out"),
+            Some(PalettePreviewKind::FontDelta(-1.0))
+        );
+        assert_eq!(palette_preview_kind("zoom_reset"), Some(PalettePreviewKind::FontReset));
+        assert_eq!(
+            palette_preview_kind("layout_horizontal"),
+            Some(PalettePreviewKind::Layout(TabLayout::Horizontal))
+        );
+        assert_eq!(
+            palette_preview_kind("layout_vertical"),
+            Some(PalettePreviewKind::Layout(TabLayout::Vertical))
+        );
+        // Plain commands preview nothing (navigating to them reverts).
+        assert_eq!(palette_preview_kind("new_tab"), None);
+        assert_eq!(palette_preview_kind("ssh"), None);
+        assert_eq!(palette_preview_kind("quit"), None);
+    }
+
+    #[test]
     fn test_geometric_block_cells_return_elements() {
         let theme = Theme::fastty_default();
         let fg = theme.foreground;
@@ -10038,6 +11683,7 @@ mod tests {
                 is_bold: false,
                 is_underline: false,
                 is_emoji: false,
+                is_nerd: false,
                 emoji_scale: None,
                 char_cols: vec![0, 1, 2, 3, 4],
             },
@@ -10050,6 +11696,7 @@ mod tests {
                 is_bold: false,
                 is_underline: false,
                 is_emoji: false,
+                is_nerd: false,
                 emoji_scale: None,
                 char_cols: vec![5, 6, 7, 8],
             },
@@ -10071,6 +11718,7 @@ mod tests {
                 is_bold: false,
                 is_underline: false,
                 is_emoji: false,
+                is_nerd: false,
                 emoji_scale: None,
                 char_cols: (0..14).collect(),
             },

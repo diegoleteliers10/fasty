@@ -106,6 +106,15 @@ pub fn get_expansion(trigger: &str) -> Option<String> {
     snippets_cell().read().get(trigger).cloned()
 }
 
+/// All snippets as `(trigger, body)` sorted by trigger. Used by the
+/// snippet picker (F4); reads the live map, so file edits appear instantly.
+pub fn all() -> Vec<(String, String)> {
+    let map = snippets_cell().read();
+    let mut out: Vec<(String, String)> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// Expand placeholders in `body`. Replaces `$0` with empty (final cursor
 /// position marker) and `$1`, `$2`, ... with empty (or `default` for
 /// `${1:default}`). Returns the resulting string and the byte offset of
@@ -235,4 +244,36 @@ where
         })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expand_strips_placeholders() {
+        let (out, cursor) = expand("git commit -m \"${1:message}\" $0");
+        assert_eq!(out, "git commit -m \"message\" ");
+        assert_eq!(cursor, Some(out.len()));
+    }
+
+    #[test]
+    fn test_expand_keeps_escaped_dollar() {
+        let (out, _) = expand("echo $$HOME");
+        assert_eq!(out, "echo $HOME");
+    }
+
+    #[test]
+    fn test_all_returns_sorted_triggers() {
+        // Only this test touches the global cell, so seeding it is safe.
+        *snippets_cell().write() = [("gst".to_string(), "git status".to_string())]
+            .into_iter()
+            .chain([("gcm".to_string(), "git commit".to_string())])
+            .collect();
+        let listed = all();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].0, "gcm");
+        assert_eq!(listed[1].0, "gst");
+        snippets_cell().write().clear();
+    }
 }

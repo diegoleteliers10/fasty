@@ -84,11 +84,31 @@ pub fn get_all_tags(hosts: &[SshHost]) -> Vec<String> {
     tags
 }
 
-pub fn parse_ssh_config() -> Vec<SshHost> {
+pub fn ssh_config_path() -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_default();
-    let path = PathBuf::from(home).join(".ssh/config");
+    PathBuf::from(home).join(".ssh/config")
+}
+
+/// Returns the ssh config path, creating `~/.ssh/` and a commented template
+/// file when missing so the user can add their first `Host` entry.
+pub fn ensure_ssh_config_exists() -> PathBuf {
+    let path = ssh_config_path();
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            &path,
+            "# fastty: add `Host <name>` entries here to launch SSH sessions instantly.\n# Example:\n#   Host myserver\n#       HostName 203.0.113.10\n#       User root\n",
+        );
+    }
+    path
+}
+
+pub fn parse_ssh_config() -> Vec<SshHost> {
+    let path = ssh_config_path();
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),

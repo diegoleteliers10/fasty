@@ -751,6 +751,16 @@ impl Config {
 
 static CONFIG_LOAD_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CONFIG_LOADED_FROM_EXISTING: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+/// Human-readable cause of the last config load failure (path + parse
+/// error), so the UI can show it instead of failing silently to defaults.
+static CONFIG_LOAD_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Returns the last config load error, if the running config is a fallback
+/// after an unreadable on-disk file. `None` means the file loaded (or there
+/// is no file yet, i.e. first launch).
+pub fn load_error() -> Option<String> {
+    CONFIG_LOAD_ERROR.lock().ok().and_then(|g| g.clone())
+}
 
 /// Loads the config, falling back to defaults on failure while remembering
 /// that the on-disk file was unreadable so a later save cannot destroy it.
@@ -760,11 +770,17 @@ pub fn load_lenient() -> Config {
             if let Ok(mut flag) = CONFIG_LOADED_FROM_EXISTING.lock() {
                 *flag = true;
             }
+            if let Ok(mut err) = CONFIG_LOAD_ERROR.lock() {
+                *err = None;
+            }
             cfg
         }
         Err(e) => {
             eprintln!("[fastty] config load failed, using defaults until restart: {e}");
             CONFIG_LOAD_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(mut err) = CONFIG_LOAD_ERROR.lock() {
+                *err = Some(e.to_string());
+            }
             Config::default()
         }
     }

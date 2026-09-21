@@ -119,6 +119,17 @@ pub struct SettingsView {
     pub ai_base_url_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     pub ai_api_key_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     pub is_dragging_input: bool,
+    /// UX3: hash of the on-disk config our in-memory state was synced from.
+    /// Our own saves re-baseline it; any other difference means an external
+    /// edit (main window action, hand-edited TOML) that our next save would
+    /// silently clobber.
+    pub synced_file_hash: Option<u64>,
+    /// File hash the user explicitly dismissed via the stale badge: the
+    /// badge stays hidden until the file changes again.
+    pub acknowledged_hash: Option<u64>,
+    /// Whether the stale badge is shown (recomputed throttled in render).
+    pub stale: bool,
+    pub last_stale_check: std::time::Instant,
 }
 
 impl SettingsView {
@@ -276,6 +287,10 @@ impl SettingsView {
             ai_base_url_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             ai_api_key_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             is_dragging_input: false,
+            synced_file_hash: Self::config_file_hash(),
+            acknowledged_hash: None,
+            stale: false,
+            last_stale_check: std::time::Instant::now(),
         }
     }
 
@@ -319,8 +334,7 @@ impl SettingsView {
     }
 
     pub fn sync_from_config(&mut self, cfg: &Config, cx: &mut Context<Self>) {
-        self.config = cfg.clone();
-        self.ai_test_status = AiTestStatus::Idle;
+        self.config = cfg.clone();        self.ai_test_status = AiTestStatus::Idle;
         self.opacity = cfg.opacity;
         self.scrollback = cfg.scrollback;
         self.cursor_blink = cfg.cursor.blink;
@@ -355,8 +369,69 @@ impl SettingsView {
         self.ai_base_url_state = crate::ui::TextInputState::new(self.ai_base_url_input.clone());
         self.ai_api_key_state = crate::ui::TextInputState::new(self.ai_api_key_input.clone());
         self.ai_model_state = crate::ui::TextInputState::new(self.ai_model_input.clone());
+        // Our state now mirrors the caller's config: whatever is on disk at
+        // this point is the new baseline (covers construction, reopen, and
+        // explicit Reload from the stale badge).
+        self.refresh_baseline();
 
         cx.notify();
+    }
+
+    /// Hash of the active config file, if it exists.
+    fn config_file_hash() -> Option<u64> {
+        std::fs::read(crate::config::Config::get_active_config_path())
+            .ok()
+            .map(|b| crate::config::content_hash(&b))
+    }
+
+    /// Re-baselines divergence tracking to the current on-disk content.
+    fn refresh_baseline(&mut self) {
+        self.synced_file_hash = Self::config_file_hash();
+        self.acknowledged_hash = None;
+        self.stale = false;
+    }
+
+    /// Single choke point for every settings save (replaces the previously
+    /// scattered `save_default` calls): persists, then re-baselines so our
+    /// own writes never read as external edits.
+    fn save_config(&mut self) {
+        let _ = self.config.save_default();
+        self.refresh_baseline();
+    }
+
+    /// Recomputes `stale`, throttled: at most one file read+hash per second.
+    /// Called from `render`, which only runs on interaction.
+    fn refresh_stale_state(&mut self) {
+        const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+        if self.last_stale_check.elapsed() < CHECK_INTERVAL {
+            return;
+        }
+        self.last_stale_check = std::time::Instant::now();
+        self.stale = Self::is_stale_state(
+            Self::config_file_hash(),
+            self.synced_file_hash,
+            self.acknowledged_hash,
+        );
+    }
+
+    /// Pure divergence decision: the view is stale when the file differs
+    /// from the synced baseline, unless the user dismissed exactly this
+    /// file content (any newer change re-shows the badge).
+    fn is_stale_state(
+        current: Option<u64>,
+        baseline: Option<u64>,
+        acknowledged: Option<u64>,
+    ) -> bool {
+        let diverged = current != baseline;
+        let acked = acknowledged.is_some() && acknowledged == current;
+        diverged && !acked
+    }
+
+    /// Reloads the on-disk config into the view (stale badge action).
+    /// Unsaved in-window edits are replaced by the file content.
+    fn reload_from_disk(&mut self, cx: &mut Context<Self>) {
+        let cfg = crate::config::load_lenient();
+        self.sync_from_config(&cfg, cx);
     }
 
     fn apply_search_filter(&mut self, cx: &mut Context<Self>) {
@@ -429,7 +504,7 @@ impl SettingsView {
             self.ai_model = None;
         }
         self.ai_test_status = AiTestStatus::Idle;
-        let _ = self.config.save_default();
+        self.save_config();
         crate::config::increment_config_version();
     }
 
@@ -759,7 +834,7 @@ impl SettingsView {
     pub fn set_theme(&mut self, theme_name: &str, cx: &mut Context<Self>) {
         self.current_theme_name = theme_name.to_string();
         self.config.theme = Some(self.current_theme_name.clone());
-        let _ = self.config.save_default();
+        self.save_config();
         crate::config::increment_config_version();
         self.theme = Theme::from_name(theme_name).with_opacity(self.config.opacity);
         cx.notify();
@@ -768,7 +843,7 @@ impl SettingsView {
     pub fn adjust_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.font_size = (self.font_size + delta).clamp(8.0, 36.0);
         self.config.font.size = self.font_size;
-        let _ = self.config.save_default();
+        self.save_config();
         crate::config::increment_config_version();
         cx.notify();
     }
@@ -776,7 +851,7 @@ impl SettingsView {
     pub fn set_font_family(&mut self, family: &str, cx: &mut Context<Self>) {
         self.font_family = family.to_string();
         self.config.font.family = family.to_string();
-        let _ = self.config.save_default();
+        self.save_config();
         crate::config::increment_config_version();
         cx.notify();
     }
@@ -784,7 +859,7 @@ impl SettingsView {
     pub fn adjust_opacity(&mut self, opacity: f32, cx: &mut Context<Self>) {
         self.opacity = opacity.clamp(0.2, 1.0);
         self.config.opacity = self.opacity;
-        let _ = self.config.save_default();
+        self.save_config();
         crate::config::increment_config_version();
         self.theme = Theme::from_name(&self.current_theme_name).with_opacity(self.config.opacity);
         cx.notify();
@@ -793,7 +868,7 @@ impl SettingsView {
     pub fn toggle_cursor_blink(&mut self, cx: &mut Context<Self>) {
         self.cursor_blink = !self.cursor_blink;
         self.config.cursor.blink = self.cursor_blink;
-        let _ = self.config.save_default();
+        self.save_config();
         crate::config::increment_config_version();
         cx.notify();
     }
@@ -801,7 +876,7 @@ impl SettingsView {
     pub fn toggle_copy_on_select(&mut self, cx: &mut Context<Self>) {
         self.copy_on_select = !self.copy_on_select;
         self.config.copy_on_select = self.copy_on_select;
-        let _ = self.config.save_default();
+        self.save_config();
         crate::config::increment_config_version();
         cx.notify();
     }
@@ -809,7 +884,7 @@ impl SettingsView {
     pub fn set_tab_layout(&mut self, layout: crate::config::TabLayout, cx: &mut Context<Self>) {
         self.tab_layout = layout;
         self.config.tab_layout = layout;
-        let _ = self.config.save_default();
+        self.save_config();
         crate::config::increment_config_version();
         cx.notify();
     }
@@ -817,7 +892,7 @@ impl SettingsView {
     pub fn set_scrollback(&mut self, scrollback: usize, cx: &mut Context<Self>) {
         self.scrollback = scrollback;
         self.config.scrollback = scrollback;
-        let _ = self.config.save_default();
+        self.save_config();
         crate::config::increment_config_version();
         cx.notify();
     }
@@ -825,7 +900,7 @@ impl SettingsView {
     pub fn set_keybinding_preset(&mut self, preset: crate::keybindings::KeybindingPreset, cx: &mut Context<Self>) {
         self.keybinding_preset = preset;
         self.config.keybinding_preset = Some(preset);
-        let _ = self.config.save_default();
+        self.save_config();
         crate::keybindings::init_resolver(self.config.keybindings.clone(), Some(preset));
         crate::config::increment_config_version();
         cx.notify();
@@ -834,7 +909,7 @@ impl SettingsView {
     pub fn set_ai_permission_mode(&mut self, mode: crate::ai::PermissionMode, cx: &mut Context<Self>) {
         self.ai_permission_mode = mode;
         self.config.ai.permission_mode = mode;
-        let _ = self.config.save_default();
+        self.save_config();
         crate::config::increment_config_version();
         cx.notify();
     }
@@ -843,7 +918,7 @@ impl SettingsView {
         let clamped = tokens.clamp(4_000, 2_000_000);
         self.ai_context_window = clamped;
         self.config.ai.context_window = clamped;
-        let _ = self.config.save_default();
+        self.save_config();
         crate::config::increment_config_version();
         cx.notify();
     }
@@ -875,7 +950,7 @@ impl SettingsView {
             }
         }
         self.ai_test_status = AiTestStatus::Idle;
-        let _ = self.config.save_default();
+        self.save_config();
         crate::config::increment_config_version();
         cx.notify();
     }
@@ -910,7 +985,7 @@ impl SettingsView {
         self.config.ai.default_model = Some(trimmed);
         self.config.ai.default = self.ai_provider.clone();
         self.ai_test_status = AiTestStatus::Idle;
-        let _ = self.config.save_default();
+        self.save_config();
         crate::config::increment_config_version();
         cx.notify();
     }
@@ -937,7 +1012,7 @@ impl SettingsView {
         self.ai_model = None;
         self.config.ai.default_model = None;
         self.ai_test_status = AiTestStatus::Idle;
-        let _ = self.config.save_default();
+        self.save_config();
         crate::config::increment_config_version();
         cx.notify();
     }
@@ -1422,6 +1497,71 @@ impl SettingsView {
                     ),
             )
             // Scrollable Content
+            // UX3: the config file changed outside this window (main-window
+            // action or hand-edited TOML). Offer Reload before the next save
+            // here silently overwrites that edit.
+            .when(self.stale, |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .w_full()
+                        .px(px(24.))
+                        .py(px(8.))
+                        .bg(theme.accent.opacity(0.10))
+                        .border_b_1()
+                        .border_color(theme.accent.opacity(0.35))
+                        .child(div().text_size(px(12.)).child("⚠"))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(11.5))
+                                .text_color(theme.foreground)
+                                .overflow_hidden()
+                                .child(
+                                    "Settings on disk changed — this view may be outdated. Reload to see it.",
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px(px(8.))
+                                .py(px(2.))
+                                .rounded(px(4.))
+                                .bg(theme.surface_raised)
+                                .text_size(px(11.))
+                                .text_color(theme.foreground)
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        this.reload_from_disk(cx);
+                                    }),
+                                )
+                                .child("Reload"),
+                        )
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(2.))
+                                .rounded(px(4.))
+                                .text_size(px(11.))
+                                .text_color(theme.muted)
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(|s| s.text_color(theme.foreground))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        this.acknowledged_hash = Self::config_file_hash();
+                                        this.stale = false;
+                                        cx.notify();
+                                    }),
+                                )
+                                .child("Dismiss"),
+                        ),
+                )
+            })
             .child(
                 div()
                     .id("settings-scroll-container")
@@ -3537,8 +3677,8 @@ impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let win_ref = &*window;
-
-        div()
+        // UX3: detect on-disk edits made outside this window (throttled).
+        self.refresh_stale_state();        div()
             .track_focus(&self.focus_handle)
             .key_context("SettingsView")
             .on_key_down(cx.listener(Self::handle_key_down))
@@ -3553,5 +3693,32 @@ impl Render for SettingsView {
             .overflow_hidden()
             .child(self.render_sidebar(&theme, win_ref, cx))
             .child(self.render_content_pane(&theme, win_ref, cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SettingsView;
+
+    #[test]
+    fn test_stale_state_same_hash_is_fresh() {
+        assert!(!SettingsView::is_stale_state(Some(1), Some(1), None));
+        assert!(!SettingsView::is_stale_state(None, None, None));
+    }
+
+    #[test]
+    fn test_stale_state_external_edit_is_stale() {
+        assert!(SettingsView::is_stale_state(Some(2), Some(1), None));
+        // File created or deleted counts as a change too.
+        assert!(SettingsView::is_stale_state(Some(1), None, None));
+        assert!(SettingsView::is_stale_state(None, Some(1), None));
+    }
+
+    #[test]
+    fn test_stale_state_dismiss_hides_until_next_change() {
+        // Dismissed exactly this content: hidden.
+        assert!(!SettingsView::is_stale_state(Some(2), Some(1), Some(2)));
+        // File changed again after dismiss: shown.
+        assert!(SettingsView::is_stale_state(Some(3), Some(1), Some(2)));
     }
 }

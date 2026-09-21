@@ -5,13 +5,16 @@
 //! and provides a context menu with the jobs/steps details when clicked.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::widgets::{Align, ClickAction, ContextMenuItem, Segment, Widget, WidgetContext};
+use crate::widgets::proc_util::{
+    FailureBackoff, NETWORK_PROC_TIMEOUT, binary_on_path, gh_authenticated, run_with_timeout,
+};
 
-const DEFAULT_INTERVAL_MS: u64 = 15000;
+const DEFAULT_INTERVAL_MS: u64 = 60_000; // 60 seconds (GitHub API is queried)
 
 pub struct GitActionsWidget {
     align: Align,
@@ -20,6 +23,13 @@ pub struct GitActionsWidget {
     state: Arc<Mutex<Option<ActionsSummary>>>,
     is_fetching: Arc<AtomicBool>,
     pending_cwd: Option<PathBuf>,
+    /// Bumped on every cwd change; in-flight threads with a stale generation
+    /// drop their result instead of overwriting fresher state.
+    generation: Arc<AtomicU64>,
+    backoff: Arc<Mutex<FailureBackoff>>,
+    /// True when the `gh` CLI is missing (not merely offline): render a
+    /// subtle install hint instead of silence.
+    gh_missing: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +94,9 @@ impl GitActionsWidget {
             state: Arc::new(Mutex::new(None)),
             is_fetching: Arc::new(AtomicBool::new(false)),
             pending_cwd: None,
+            generation: Arc::new(AtomicU64::new(0)),
+            backoff: Arc::new(Mutex::new(FailureBackoff::default())),
+            gh_missing: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -98,7 +111,10 @@ impl Widget for GitActionsWidget {
     }
 
     fn poll_interval(&self) -> Duration {
-        self.interval
+        self.backoff
+            .lock()
+            .map(|b| b.effective_interval(self.interval))
+            .unwrap_or(self.interval)
     }
 
     fn last_poll(&self) -> Instant {
@@ -110,6 +126,9 @@ impl Widget for GitActionsWidget {
     }
 
     fn poll(&mut self, ctx: &WidgetContext) {
+        if !ctx.window_focused {
+            return;
+        }
         if ctx.active_tab_git.is_none() {
             let mut guard = self.state.lock().unwrap();
             *guard = None;
@@ -122,6 +141,7 @@ impl Widget for GitActionsWidget {
             let is_new_cwd = Some(&cwd_path) != self.pending_cwd.as_ref();
             if is_new_cwd {
                 self.pending_cwd = Some(cwd_path.clone());
+                self.generation.fetch_add(1, Ordering::Relaxed);
                 let mut guard = self.state.lock().unwrap();
                 *guard = None;
             }
@@ -130,8 +150,22 @@ impl Widget for GitActionsWidget {
                 self.is_fetching.store(true, Ordering::Relaxed);
                 let state_clone = self.state.clone();
                 let is_fetching_clone = self.is_fetching.clone();
+                let generation_clone = self.generation.clone();
+                let backoff_clone = self.backoff.clone();
+                let gh_missing_clone = self.gh_missing.clone();
+                let gen = self.generation.load(Ordering::Relaxed);
                 
                 std::thread::spawn(move || {
+                    // Offline / unauthenticated fast path: keep cached state
+                    // instead of launching doomed requests.
+                    if !gh_authenticated() {
+                        if let Ok(mut b) = backoff_clone.lock() {
+                            b.record(false);
+                        }
+                        gh_missing_clone.store(!binary_on_path("gh"), Ordering::Relaxed);
+                        is_fetching_clone.store(false, Ordering::Relaxed);
+                        return;
+                    }
                     let summary = (|| -> Option<ActionsSummary> {
                         // 1. Run "gh run list" to check databaseId
                         let mut list_cmd = std::process::Command::new("gh");
@@ -142,7 +176,7 @@ impl Widget for GitActionsWidget {
                             use std::os::windows::process::CommandExt;
                             list_cmd.creation_flags(0x08000000);
                         }
-                        let list_out = list_cmd.output().ok()?;
+                        let list_out = run_with_timeout(&mut list_cmd, NETWORK_PROC_TIMEOUT)?;
                         if !list_out.status.success() {
                             return None;
                         }
@@ -159,7 +193,7 @@ impl Widget for GitActionsWidget {
                             use std::os::windows::process::CommandExt;
                             view_cmd.creation_flags(0x08000000);
                         }
-                        let view_out = view_cmd.output().ok()?;
+                        let view_out = run_with_timeout(&mut view_cmd, NETWORK_PROC_TIMEOUT)?;
                         if !view_out.status.success() {
                             return None;
                         }
@@ -220,7 +254,17 @@ impl Widget for GitActionsWidget {
                         })
                     })();
                     
+                    // Stale result (cwd changed mid-flight): drop it so it
+                    // can't overwrite fresher state.
+                    if gen != generation_clone.load(Ordering::Relaxed) {
+                        is_fetching_clone.store(false, Ordering::Relaxed);
+                        return;
+                    }
+                    if let Ok(mut b) = backoff_clone.lock() {
+                        b.record(summary.is_some());
+                    }
                     if let Some(sum) = summary {
+                        gh_missing_clone.store(false, Ordering::Relaxed);
                         let mut guard = state_clone.lock().unwrap();
                         *guard = Some(sum);
                     }
@@ -242,6 +286,18 @@ impl Widget for GitActionsWidget {
                     text: " Actions: ↻".to_string(),
                     color: [0.65, 0.65, 0.65, 1.0],
                     tooltip: Some("Fetching GitHub Actions status...".to_string()),
+                }];
+            }
+            // UX2: subtle one-glance hint instead of silence when `gh` is
+            // missing; the tooltip carries the explanation.
+            if self.gh_missing.load(Ordering::Relaxed) {
+                return vec![Segment {
+                    text: " Actions: – ".to_string(),
+                    color: [0.55, 0.55, 0.62, 1.0],
+                    tooltip: Some(
+                        "gh CLI not found on PATH — install it to show Actions status here."
+                            .to_string(),
+                    ),
                 }];
             }
             return Vec::new();

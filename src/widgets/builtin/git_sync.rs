@@ -1,7 +1,8 @@
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::widgets::{Align, ClickAction, ContextMenuItem, Segment, Widget, WidgetContext};
+use crate::widgets::proc_util::{FailureBackoff, LOCAL_PROC_TIMEOUT, run_with_timeout};
 
 const DEFAULT_INTERVAL_MS: u64 = 30_000; // 30 seconds
 
@@ -12,6 +13,10 @@ pub struct GitSyncWidget {
     state: Arc<Mutex<Option<SyncSummary>>>,
     is_fetching: Arc<AtomicBool>,
     pending_cwd: Option<std::path::PathBuf>,
+    /// Bumped on every cwd change; in-flight threads with a stale generation
+    /// drop their result instead of overwriting fresh state.
+    generation: Arc<AtomicU64>,
+    backoff: Arc<Mutex<FailureBackoff>>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +39,8 @@ impl GitSyncWidget {
             state: Arc::new(Mutex::new(None)),
             is_fetching: Arc::new(AtomicBool::new(false)),
             pending_cwd: None,
+            generation: Arc::new(AtomicU64::new(0)),
+            backoff: Arc::new(Mutex::new(FailureBackoff::default())),
         }
     }
 }
@@ -48,7 +55,10 @@ impl Widget for GitSyncWidget {
     }
 
     fn poll_interval(&self) -> Duration {
-        self.interval
+        self.backoff
+            .lock()
+            .map(|b| b.effective_interval(self.interval))
+            .unwrap_or(self.interval)
     }
 
     fn last_poll(&self) -> Instant {
@@ -60,6 +70,9 @@ impl Widget for GitSyncWidget {
     }
 
     fn poll(&mut self, ctx: &WidgetContext) {
+        if !ctx.window_focused {
+            return;
+        }
         if ctx.active_tab_git.is_none() {
             let mut guard = self.state.lock().unwrap();
             *guard = None;
@@ -72,6 +85,7 @@ impl Widget for GitSyncWidget {
             let is_new_cwd = Some(&cwd_path) != self.pending_cwd.as_ref();
             if is_new_cwd {
                 self.pending_cwd = Some(cwd_path.clone());
+                self.generation.fetch_add(1, Ordering::Relaxed);
                 let mut guard = self.state.lock().unwrap();
                 *guard = None;
             }
@@ -80,6 +94,9 @@ impl Widget for GitSyncWidget {
                 self.is_fetching.store(true, Ordering::Relaxed);
                 let state_clone = self.state.clone();
                 let is_fetching_clone = self.is_fetching.clone();
+                let generation_clone = self.generation.clone();
+                let backoff_clone = self.backoff.clone();
+                let gen = self.generation.load(Ordering::Relaxed);
 
                 std::thread::spawn(move || {
                     let summary = (|| -> Option<SyncSummary> {
@@ -92,7 +109,7 @@ impl Widget for GitSyncWidget {
                             use std::os::windows::process::CommandExt;
                             branch_cmd.creation_flags(0x08000000);
                         }
-                        let branch_out = branch_cmd.output().ok()?;
+                        let branch_out = run_with_timeout(&mut branch_cmd, LOCAL_PROC_TIMEOUT)?;
                         if !branch_out.status.success() {
                             return None;
                         }
@@ -107,7 +124,7 @@ impl Widget for GitSyncWidget {
                             use std::os::windows::process::CommandExt;
                             upstream_cmd.creation_flags(0x08000000);
                         }
-                        let upstream_out = upstream_cmd.output().ok();
+                        let upstream_out = run_with_timeout(&mut upstream_cmd, LOCAL_PROC_TIMEOUT);
                         let has_upstream = upstream_out.map(|o| o.status.success()).unwrap_or(false);
 
                         if !has_upstream {
@@ -131,7 +148,7 @@ impl Widget for GitSyncWidget {
                             use std::os::windows::process::CommandExt;
                             count_cmd.creation_flags(0x08000000);
                         }
-                        let count_out = count_cmd.output().ok()?;
+                        let count_out = run_with_timeout(&mut count_cmd, LOCAL_PROC_TIMEOUT)?;
                         let counts_str = String::from_utf8_lossy(&count_out.stdout);
                         let mut parts = counts_str.split_whitespace();
                         let ahead: usize = parts.next()?.parse().ok()?;
@@ -148,7 +165,7 @@ impl Widget for GitSyncWidget {
                                 use std::os::windows::process::CommandExt;
                                 log_cmd.creation_flags(0x08000000);
                             }
-                            if let Ok(out) = log_cmd.output() {
+                            if let Some(out) = run_with_timeout(&mut log_cmd, LOCAL_PROC_TIMEOUT) {
                                 let lines_str = String::from_utf8_lossy(&out.stdout);
                                 for line in lines_str.lines() {
                                     ahead_commits.push(line.to_string());
@@ -167,7 +184,7 @@ impl Widget for GitSyncWidget {
                                 use std::os::windows::process::CommandExt;
                                 log_cmd.creation_flags(0x08000000);
                             }
-                            if let Ok(out) = log_cmd.output() {
+                            if let Some(out) = run_with_timeout(&mut log_cmd, LOCAL_PROC_TIMEOUT) {
                                 let lines_str = String::from_utf8_lossy(&out.stdout);
                                 for line in lines_str.lines() {
                                     behind_commits.push(line.to_string());
@@ -186,6 +203,15 @@ impl Widget for GitSyncWidget {
                         })
                     })();
 
+                    // Stale result (cwd changed mid-flight): drop it so it
+                    // can't overwrite fresher state.
+                    if gen != generation_clone.load(Ordering::Relaxed) {
+                        is_fetching_clone.store(false, Ordering::Relaxed);
+                        return;
+                    }
+                    if let Ok(mut b) = backoff_clone.lock() {
+                        b.record(summary.is_some());
+                    }
                     if let Some(sum) = summary {
                         let mut guard = state_clone.lock().unwrap();
                         *guard = Some(sum);

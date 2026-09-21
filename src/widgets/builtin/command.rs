@@ -1,9 +1,12 @@
 //! Generic command widget. Runs a user-configured shell command, shows stdout
 //! in the bar. Click action configurable: `copy`, `run`, `open`.
 
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::widgets::{Align, ClickAction, Segment, Widget, WidgetContext};
+use crate::widgets::proc_util::{FailureBackoff, USER_CMD_TIMEOUT, run_with_timeout};
 
 const DEFAULT_INTERVAL_MS: u64 = 5_000;
 const MAX_OUTPUT_BYTES: usize = 4096;
@@ -15,7 +18,9 @@ pub struct CommandWidget {
     align: Align,
     last_poll: Instant,
     interval: Duration,
-    cached: CommandState,
+    state: Arc<Mutex<CommandState>>,
+    is_running: Arc<AtomicBool>,
+    backoff: Arc<Mutex<FailureBackoff>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -41,7 +46,9 @@ impl CommandWidget {
             align,
             last_poll: Instant::now() - Duration::from_secs(60),
             interval: Duration::from_millis(interval_ms.unwrap_or(DEFAULT_INTERVAL_MS)),
-            cached: CommandState::Unknown,
+            state: Arc::new(Mutex::new(CommandState::Unknown)),
+            is_running: Arc::new(AtomicBool::new(false)),
+            backoff: Arc::new(Mutex::new(FailureBackoff::default())),
         }
     }
 }
@@ -49,34 +56,65 @@ impl CommandWidget {
 impl Widget for CommandWidget {
     fn id(&self) -> &'static str { "command" }
     fn align(&self) -> Align { self.align }
-    fn poll_interval(&self) -> Duration { self.interval }
+    fn poll_interval(&self) -> Duration {
+        self.backoff
+            .lock()
+            .map(|b| b.effective_interval(self.interval))
+            .unwrap_or(self.interval)
+    }
     fn last_poll(&self) -> Instant { self.last_poll }
     fn set_last_poll(&mut self, t: Instant) { self.last_poll = t; }
 
-    fn poll(&mut self, _ctx: &WidgetContext) {
-        let mut cmd = shell_command(&self.command);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
+    fn poll(&mut self, ctx: &WidgetContext) {
+        if !ctx.window_focused {
+            return;
         }
-        self.cached = match cmd.output() {
-            Ok(out) if out.status.success() => {
-                let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
-                if s.ends_with('\n') { s.pop(); }
-                if s.len() > MAX_OUTPUT_BYTES {
-                    s.truncate(MAX_OUTPUT_BYTES - 1);
-                    s.push('\u{2026}');
-                }
-                CommandState::Ok(s)
+        // `poll()` runs on the render path: never block it, dispatch and go.
+        // The gate also prevents piling up slow user commands.
+        if self.is_running.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let command = self.command.clone();
+        let state_clone = self.state.clone();
+        let is_running_clone = self.is_running.clone();
+        let backoff_clone = self.backoff.clone();
+        std::thread::spawn(move || {
+            let mut cmd = shell_command(&command);
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000);
             }
-            Ok(_) => CommandState::Unknown,
-            Err(e) => CommandState::Error(e.to_string()),
-        };
+            let next = match run_with_timeout(&mut cmd, USER_CMD_TIMEOUT) {
+                Some(out) if out.status.success() => {
+                    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+                    if s.ends_with('\n') { s.pop(); }
+                    if s.len() > MAX_OUTPUT_BYTES {
+                        s.truncate(MAX_OUTPUT_BYTES - 1);
+                        s.push('\u{2026}');
+                    }
+                    CommandState::Ok(s)
+                }
+                Some(_) => CommandState::Unknown,
+                None => CommandState::Error(format!(
+                    "command timed out after {}s",
+                    USER_CMD_TIMEOUT.as_secs()
+                )),
+            };
+            let ok = !matches!(next, CommandState::Error(_));
+            if let Ok(mut b) = backoff_clone.lock() {
+                b.record(ok);
+            }
+            if let Ok(mut guard) = state_clone.lock() {
+                *guard = next;
+            }
+            is_running_clone.store(false, Ordering::Relaxed);
+        });
     }
 
     fn render(&mut self, _ctx: &WidgetContext) -> Vec<Segment> {
-        match &self.cached {
+        let guard = self.state.lock().unwrap();
+        match &*guard {
             CommandState::Ok(s) => vec![Segment {
                 text: format!(" {}: {} ", self.name, s),
                 color: [0.80, 0.80, 0.85, 1.0],
@@ -92,7 +130,7 @@ impl Widget for CommandWidget {
     }
 
     fn on_click(&mut self, _ctx: &WidgetContext) -> ClickAction {
-        let payload = match &self.cached {
+        let payload = match &*self.state.lock().unwrap() {
             CommandState::Ok(s) => s.clone(),
             _ => return ClickAction::None,
         };

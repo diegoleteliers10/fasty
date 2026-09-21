@@ -30,6 +30,8 @@ pub struct TerminalGridElement {
     pub font_family: gpui::SharedString,
     pub font_size: f32,
     pub display_offset: usize,
+    /// F3: Nerd Font fallback for PUA icon spans. `None` keeps OS cascade.
+    pub nerd_font_family: Option<gpui::SharedString>,
 }
 
 impl IntoElement for TerminalGridElement {
@@ -92,6 +94,12 @@ impl Element for TerminalGridElement {
         let origin = bounds.origin;
         let emoji_font = gpui::font(self.font_family.clone());
         let normal_font = gpui::font(self.font_family.clone());
+        // F3: explicit Nerd Font for icon spans when one is installed;
+        // `None` falls back to `normal_font` (today's behavior).
+        let nerd_font: Option<gpui::Font> = self
+            .nerd_font_family
+            .as_ref()
+            .map(|f| gpui::font(f.clone()));
 
         // 1. Background Pass: Render negative z-index images beneath cell backgrounds
         for img in self.visible_images.iter().filter(|i| i.z_index < 0) {
@@ -247,6 +255,7 @@ impl Element for TerminalGridElement {
                                         span.fg,
                                         span.is_underline,
                                         span.is_emoji,
+                                        span.is_nerd,
                                         font_size,
                                         self.cell_w,
                                         self.line_h,
@@ -254,6 +263,7 @@ impl Element for TerminalGridElement {
                                         y,
                                         &emoji_font,
                                         &normal_font,
+                                        nerd_font.as_ref(),
                                         is_scaled_emoji,
                                         window,
                                         cx,
@@ -275,6 +285,7 @@ impl Element for TerminalGridElement {
                                 span.fg,
                                 span.is_underline,
                                 span.is_emoji,
+                                span.is_nerd,
                                 font_size,
                                 self.cell_w,
                                 self.line_h,
@@ -282,6 +293,7 @@ impl Element for TerminalGridElement {
                                 y,
                                 &emoji_font,
                                 &normal_font,
+                                nerd_font.as_ref(),
                                 is_scaled_emoji,
                                 window,
                                 cx,
@@ -294,6 +306,7 @@ impl Element for TerminalGridElement {
                             span.fg,
                             span.is_underline,
                             span.is_emoji,
+                            span.is_nerd,
                             font_size,
                             self.cell_w,
                             self.line_h,
@@ -301,6 +314,7 @@ impl Element for TerminalGridElement {
                             y,
                             &emoji_font,
                             &normal_font,
+                            nerd_font.as_ref(),
                             is_scaled_emoji,
                             window,
                             cx,
@@ -393,6 +407,7 @@ fn paint_text_run(
     fg: gpui::Hsla,
     is_underline: bool,
     is_emoji: bool,
+    is_nerd: bool,
     font_size: f32,
     cell_w: f32,
     line_h: f32,
@@ -400,6 +415,7 @@ fn paint_text_run(
     row_y: Pixels,
     emoji_font: &gpui::Font,
     normal_font: &gpui::Font,
+    nerd_font: Option<&gpui::Font>,
     is_scaled_emoji: bool,
     window: &mut Window,
     cx: &mut App,
@@ -407,13 +423,18 @@ fn paint_text_run(
     let x_start = (start_col as f32 * cell_w).floor();
     let text_pos = point(origin.x + px(x_start), row_y);
 
+    // F3: Nerd icon spans use the auto-detected Nerd Font when one exists;
+    // otherwise they shape with the normal font (today's behavior).
+    let run_font = if is_nerd {
+        nerd_font.cloned().unwrap_or_else(|| normal_font.clone())
+    } else if is_emoji {
+        emoji_font.clone()
+    } else {
+        normal_font.clone()
+    };
     let run = TextRun {
         len: text.len(),
-        font: if is_emoji {
-            emoji_font.clone()
-        } else {
-            normal_font.clone()
-        },
+        font: run_font,
         color: fg,
         background_color: None,
         underline: if is_underline {

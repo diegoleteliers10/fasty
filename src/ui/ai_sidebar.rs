@@ -26,6 +26,9 @@ pub struct AiUiMessage {
     pub timestamp: Option<String>,
     pub images: Vec<std::path::PathBuf>,
     pub documents: Vec<std::path::PathBuf>,
+    /// UX6: provider/stream failures render as a red-tinted error card with
+    /// an actionable hint instead of a plain-text bubble.
+    pub is_error: bool,
 }
 
 impl AiUiMessage {
@@ -38,6 +41,7 @@ impl AiUiMessage {
             timestamp: None,
             images: Vec::new(),
             documents: Vec::new(),
+            is_error: false,
         }
     }
 
@@ -50,6 +54,21 @@ impl AiUiMessage {
             timestamp: None,
             images: Vec::new(),
             documents: Vec::new(),
+            is_error: false,
+        }
+    }
+
+    /// UX6: assistant-side error bubble with styling flag set.
+    pub fn error(text: impl Into<String>) -> Self {
+        Self {
+            is_user: false,
+            text: text.into(),
+            thinking: None,
+            tool_calls: Vec::new(),
+            timestamp: None,
+            images: Vec::new(),
+            documents: Vec::new(),
+            is_error: true,
         }
     }
 
@@ -2246,6 +2265,7 @@ impl RenderOnce for AiSidebar {
                                 })
                                 // Assistant prose
                                 .when(!msg.text.is_empty(), |this| {
+                                    let is_error = msg.is_error;
                                     let text_to_copy = msg.text.clone();
                                     let active_sel = if let Some((sel_msg, s, e)) = message_selection {
                                         if sel_msg == msg_idx { Some((s, e)) } else { None }
@@ -2274,6 +2294,27 @@ impl RenderOnce for AiSidebar {
                                             .w_full()
                                             .min_w(px(0.))
                                             .gap_1()
+                                            // UX6: error card styling so provider
+                                            // failures don't look like replies.
+                                            .when(is_error, |d| {
+                                                d.border_1()
+                                                    .border_color(theme.bright_red)
+                                                    .rounded(px(8.))
+                                                    .bg(theme.bright_red.opacity(0.07))
+                                                    .p(px(8.))
+                                            })
+                                            .when(is_error, |d| {
+                                                d.child(
+                                                    div()
+                                                        .flex()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap_1()
+                                                        .text_size(px(11.))
+                                                        .text_color(theme.bright_red)
+                                                        .child("⚠ Error"),
+                                                )
+                                            })
                                             .on_mouse_down(MouseButton::Left, {
                                                 let registry = registry.clone();
                                                 let on_select = on_select_cb.clone();

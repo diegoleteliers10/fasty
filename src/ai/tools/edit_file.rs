@@ -732,7 +732,19 @@ mod fuzzy_perf_tests {
         let result = find_match(&content, &query);
         let elapsed = start.elapsed();
         assert!(result.is_err(), "should not match");
-        assert!(elapsed.as_secs() < 5, "fuzzy scan took too long: {:?}", elapsed);
+        // Wall-clock guard against algorithmic blowups. Debug builds are
+        // several times slower than release and CI/parallel load varies, so
+        // the budget is profile-aware: it still catches minute-scale hangs
+        // while tolerating second-scale machine variance.
+        #[cfg(debug_assertions)]
+        let budget_secs = 15;
+        #[cfg(not(debug_assertions))]
+        let budget_secs = 5;
+        assert!(
+            elapsed.as_secs() < budget_secs,
+            "fuzzy scan took too long: {:?}",
+            elapsed
+        );
     }
 
     #[test]

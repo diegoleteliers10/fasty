@@ -11,6 +11,7 @@
 //! 3. Wire the spec → widget conversion in [`build`].
 
 pub mod builtin;
+pub mod proc_util;
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -33,6 +34,10 @@ pub struct WidgetContext<'a> {
     pub active_tab_cwd: Option<&'a Path>,
     pub active_tab_git: Option<&'a GitStatus>,
     pub opacity: f32,
+    /// False when the window is not the OS-active one. Network widgets use
+    /// this to pause polling and keep cached state instead of burning
+    /// CPU/quota on a bar nobody is looking at.
+    pub window_focused: bool,
 }
 
 /// A run of glyphs with one color, optionally carrying a hover tooltip.

@@ -1,9 +1,12 @@
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::widgets::{Align, ClickAction, ContextMenuItem, Segment, Widget, WidgetContext};
+use crate::widgets::proc_util::{
+    FailureBackoff, NETWORK_PROC_TIMEOUT, binary_on_path, gh_authenticated, run_with_timeout,
+};
 
-const DEFAULT_INTERVAL_MS: u64 = 60_000; // 60 seconds (since GitHub API is queried)
+const DEFAULT_INTERVAL_MS: u64 = 180_000; // 3 minutes: PR state changes slowly
 
 pub struct GitPrsWidget {
     align: Align,
@@ -12,39 +15,114 @@ pub struct GitPrsWidget {
     state: Arc<Mutex<Option<PrsSummary>>>,
     is_fetching: Arc<AtomicBool>,
     pending_cwd: Option<std::path::PathBuf>,
+    /// Bumped on every cwd change; in-flight threads with a stale generation
+    /// drop their result instead of overwriting fresher state.
+    generation: Arc<AtomicU64>,
+    backoff: Arc<Mutex<FailureBackoff>>,
+    /// True when the `gh` CLI is missing (not merely offline): render a
+    /// subtle install hint instead of silence.
+    gh_missing: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-struct PrsSummary {
-    current_pr: Option<GhPrView>,
-    open_prs: Vec<GhPrList>,
-    review_requested_prs: Vec<GhPrList>,
-    cwd: std::path::PathBuf,
+pub(crate) struct PrsSummary {
+    pub(crate) current_pr: Option<GhPrView>,
+    pub(crate) open_prs: Vec<GhPrList>,
+    pub(crate) review_requested_prs: Vec<GhPrList>,
+    pub(crate) cwd: std::path::PathBuf,
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
-struct GhPrAuthor {
-    login: String,
+pub(crate) struct GhPrAuthor {
+    pub(crate) login: String,
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
-struct GhPrList {
-    number: usize,
-    title: String,
-    url: String,
-    author: Option<GhPrAuthor>,
+pub(crate) struct GhPrList {
+    pub(crate) number: usize,
+    pub(crate) title: String,
+    pub(crate) url: String,
+    pub(crate) author: Option<GhPrAuthor>,
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
-struct GhPrView {
-    state: String,
-    number: usize,
-    title: String,
-    url: String,
-    review_decision: Option<String>,
+pub(crate) struct GhPrView {
+    pub(crate) state: String,
+    pub(crate) number: usize,
+    pub(crate) title: String,
+    pub(crate) url: String,
+    pub(crate) review_decision: Option<String>,
+}
+
+/// Shared `gh` fetch (F5): the widget poll and the PR picker both use it,
+/// so the query logic lives in exactly one place. Runs three `gh` calls
+/// with timeouts; returns `None` when offline/unauthenticated, when `gh`
+/// fails, or on timeout. Call only from background threads.
+pub(crate) fn fetch_prs_summary(cwd_path: &std::path::Path) -> Option<PrsSummary> {
+    // Offline / unauthenticated fast path: keep cached state instead of
+    // launching doomed requests.
+    if !gh_authenticated() {
+        return None;
+    }
+    (|| -> Option<PrsSummary> {
+        // 1. Check current branch PR status
+        let mut view_cmd = std::process::Command::new("gh");
+        view_cmd.args(["pr", "view", "--json", "state,number,title,url,reviewDecision"]);
+        view_cmd.current_dir(cwd_path);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            view_cmd.creation_flags(0x08000000);
+        }
+        let view_out = run_with_timeout(&mut view_cmd, NETWORK_PROC_TIMEOUT)?;
+        let current_pr: Option<GhPrView> = if view_out.status.success() {
+            serde_json::from_slice(&view_out.stdout).ok()
+        } else {
+            None
+        };
+
+        // 2. Get active PRs list
+        let mut list_cmd = std::process::Command::new("gh");
+        list_cmd.args(["pr", "list", "--limit", "10", "--json", "number,title,url,author"]);
+        list_cmd.current_dir(cwd_path);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            list_cmd.creation_flags(0x08000000);
+        }
+        let list_out = run_with_timeout(&mut list_cmd, NETWORK_PROC_TIMEOUT)?;
+        let open_prs: Vec<GhPrList> = if list_out.status.success() {
+            serde_json::from_slice(&list_out.stdout).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // 3. Get review requested PRs
+        let mut review_cmd = std::process::Command::new("gh");
+        review_cmd.args(["pr", "list", "--search", "review-requested:@me", "--limit", "5", "--json", "number,title,url,author"]);
+        review_cmd.current_dir(cwd_path);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            review_cmd.creation_flags(0x08000000);
+        }
+        let review_out = run_with_timeout(&mut review_cmd, NETWORK_PROC_TIMEOUT)?;
+        let review_requested_prs: Vec<GhPrList> = if review_out.status.success() {
+            serde_json::from_slice(&review_out.stdout).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        Some(PrsSummary {
+            current_pr,
+            open_prs,
+            review_requested_prs,
+            cwd: cwd_path.to_path_buf(),
+        })
+    })()
 }
 
 impl GitPrsWidget {
@@ -56,6 +134,9 @@ impl GitPrsWidget {
             state: Arc::new(Mutex::new(None)),
             is_fetching: Arc::new(AtomicBool::new(false)),
             pending_cwd: None,
+            generation: Arc::new(AtomicU64::new(0)),
+            backoff: Arc::new(Mutex::new(FailureBackoff::default())),
+            gh_missing: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -70,7 +151,10 @@ impl Widget for GitPrsWidget {
     }
 
     fn poll_interval(&self) -> Duration {
-        self.interval
+        self.backoff
+            .lock()
+            .map(|b| b.effective_interval(self.interval))
+            .unwrap_or(self.interval)
     }
 
     fn last_poll(&self) -> Instant {
@@ -82,6 +166,9 @@ impl Widget for GitPrsWidget {
     }
 
     fn poll(&mut self, ctx: &WidgetContext) {
+        if !ctx.window_focused {
+            return;
+        }
         if ctx.active_tab_git.is_none() {
             let mut guard = self.state.lock().unwrap();
             *guard = None;
@@ -94,6 +181,7 @@ impl Widget for GitPrsWidget {
             let is_new_cwd = Some(&cwd_path) != self.pending_cwd.as_ref();
             if is_new_cwd {
                 self.pending_cwd = Some(cwd_path.clone());
+                self.generation.fetch_add(1, Ordering::Relaxed);
                 let mut guard = self.state.lock().unwrap();
                 *guard = None;
             }
@@ -102,66 +190,30 @@ impl Widget for GitPrsWidget {
                 self.is_fetching.store(true, Ordering::Relaxed);
                 let state_clone = self.state.clone();
                 let is_fetching_clone = self.is_fetching.clone();
+                let generation_clone = self.generation.clone();
+                let backoff_clone = self.backoff.clone();
+                let gh_missing_clone = self.gh_missing.clone();
+                let gen = self.generation.load(Ordering::Relaxed);
 
                 std::thread::spawn(move || {
-                    let summary = (|| -> Option<PrsSummary> {
-                        // 1. Check current branch PR status
-                        let mut view_cmd = std::process::Command::new("gh");
-                        view_cmd.args(["pr", "view", "--json", "state,number,title,url,reviewDecision"]);
-                        view_cmd.current_dir(&cwd_path);
-                        #[cfg(target_os = "windows")]
-                        {
-                            use std::os::windows::process::CommandExt;
-                            view_cmd.creation_flags(0x08000000);
-                        }
-                        let view_out = view_cmd.output().ok()?;
-                        let current_pr: Option<GhPrView> = if view_out.status.success() {
-                            serde_json::from_slice(&view_out.stdout).ok()
-                        } else {
-                            None
-                        };
+                    let summary = fetch_prs_summary(&cwd_path);
 
-                        // 2. Get active PRs list
-                        let mut list_cmd = std::process::Command::new("gh");
-                        list_cmd.args(["pr", "list", "--limit", "10", "--json", "number,title,url,author"]);
-                        list_cmd.current_dir(&cwd_path);
-                        #[cfg(target_os = "windows")]
-                        {
-                            use std::os::windows::process::CommandExt;
-                            list_cmd.creation_flags(0x08000000);
-                        }
-                        let list_out = list_cmd.output().ok()?;
-                        let open_prs: Vec<GhPrList> = if list_out.status.success() {
-                            serde_json::from_slice(&list_out.stdout).unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
-
-                        // 3. Get review requested PRs
-                        let mut review_cmd = std::process::Command::new("gh");
-                        review_cmd.args(["pr", "list", "--search", "review-requested:@me", "--limit", "5", "--json", "number,title,url,author"]);
-                        review_cmd.current_dir(&cwd_path);
-                        #[cfg(target_os = "windows")]
-                        {
-                            use std::os::windows::process::CommandExt;
-                            review_cmd.creation_flags(0x08000000);
-                        }
-                        let review_out = review_cmd.output().ok()?;
-                        let review_requested_prs: Vec<GhPrList> = if review_out.status.success() {
-                            serde_json::from_slice(&review_out.stdout).unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        };
-
-                        Some(PrsSummary {
-                            current_pr,
-                            open_prs,
-                            review_requested_prs,
-                            cwd: cwd_path,
-                        })
-                    })();
-
+                    // Stale result (cwd changed mid-flight): drop it so it
+                    // can't overwrite fresher state.
+                    if gen != generation_clone.load(Ordering::Relaxed) {
+                        is_fetching_clone.store(false, Ordering::Relaxed);
+                        return;
+                    }
+                    if let Ok(mut b) = backoff_clone.lock() {
+                        b.record(summary.is_some());
+                    }
+                    if summary.is_none() {
+                        // Distinguish missing `gh` (install hint) from
+                        // offline/transient failure (silent + backoff).
+                        gh_missing_clone.store(!binary_on_path("gh"), Ordering::Relaxed);
+                    }
                     if let Some(sum) = summary {
+                        gh_missing_clone.store(false, Ordering::Relaxed);
                         let mut guard = state_clone.lock().unwrap();
                         *guard = Some(sum);
                     }
@@ -178,6 +230,18 @@ impl Widget for GitPrsWidget {
     fn render(&mut self, _ctx: &WidgetContext) -> Vec<Segment> {
         let guard = self.state.lock().unwrap();
         let Some(summary) = guard.as_ref() else {
+            // UX2: subtle one-glance hint instead of silence when `gh` is
+            // missing; the tooltip carries the explanation.
+            if self.gh_missing.load(Ordering::Relaxed) {
+                return vec![Segment {
+                    text: " PRs: – ".to_string(),
+                    color: [0.55, 0.55, 0.62, 1.0],
+                    tooltip: Some(
+                        "gh CLI not found on PATH — install it to show pull requests here."
+                            .to_string(),
+                    ),
+                }];
+            }
             return Vec::new();
         };
 
