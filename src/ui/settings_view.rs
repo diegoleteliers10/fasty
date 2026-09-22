@@ -12,6 +12,37 @@ use crate::ui::theme::Theme;
 
 pub static SETTINGS_WINDOW_HANDLE: Mutex<Option<WindowHandle<SettingsView>>> = Mutex::new(None);
 
+/// Full font list for the Appearance combobox. Enumerating fonts is
+/// expensive (DirectWrite COM walk on Windows, `reg query` / `fc-list`
+/// subprocess elsewhere), so it runs once per process on a background
+/// thread and every settings window reuses the result.
+static SYSTEM_FONTS_CACHE: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+/// Union of the text-system families and the OS-level list, deduped
+/// case-insensitively and sorted.
+fn merge_font_lists(gpui_fonts: Vec<String>, os_fonts: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+    for font in gpui_fonts.into_iter().chain(os_fonts) {
+        let trimmed = font.trim().to_string();
+        let lower = trimmed.to_lowercase();
+        if !trimmed.is_empty() && !trimmed.starts_with('.') && seen.insert(lower) {
+            merged.push(trimmed);
+        }
+    }
+    merged.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    merged
+}
+
+/// Moves `family` to the front so the combobox highlights a valid entry.
+fn pin_family_first(mut list: Vec<String>, family: &str) -> Vec<String> {
+    if let Some(pos) = list.iter().position(|f| f.eq_ignore_ascii_case(family)) {
+        let entry = list.remove(pos);
+        list.insert(0, entry);
+    }
+    list
+}
+
 #[derive(Clone)]
 pub struct ThemeCardInfo {
     pub name: String,
@@ -163,32 +194,17 @@ impl SettingsView {
 
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
-        let mut raw_fonts = cx.text_system().all_font_names();
-        for f in available_system_fonts() {
-            if !raw_fonts.iter().any(|existing| existing.eq_ignore_ascii_case(&f)) {
-                raw_fonts.push(f);
-            }
-        }
 
-        let mut system_fonts: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-
-        if !font_family.is_empty() {
-            seen.insert(font_family.to_lowercase());
-            system_fonts.push(font_family.clone());
-        }
-
-        let mut other_fonts: Vec<String> = Vec::new();
-        for font in raw_fonts {
-            let trimmed = font.trim().to_string();
-            let lower = trimmed.to_lowercase();
-            if !trimmed.is_empty() && !trimmed.starts_with('.') && !seen.contains(&lower) {
-                seen.insert(lower);
-                other_fonts.push(trimmed);
-            }
-        }
-        other_fonts.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-        system_fonts.extend(other_fonts);
+        // Full font enumeration used to run right here, before the window's
+        // first paint, and was the largest cause of the settings window
+        // opening slowly or freezing on Windows. Until background discovery
+        // lands, the combobox shows only the configured family.
+        let cached_fonts = SYSTEM_FONTS_CACHE.lock().clone();
+        let fonts_cached = cached_fonts.is_some();
+        let system_fonts = match cached_fonts {
+            Some(list) => pin_family_first(list, &font_family),
+            None => vec![font_family.clone()],
+        };
 
         let theme_cards: Vec<ThemeCardInfo> = crate::config::all_theme_names()
             .into_iter()
@@ -225,23 +241,25 @@ impl SettingsView {
             .and_then(|p| p.api_key().map(|s| s.to_string()))
             .unwrap_or_default();
 
-        let detected_ollama_models = if let Some(prov) = loaded_config.ai.providers.get("ollama") {
-            crate::ai::detect_installed_ollama_models(Some(prov.base_url()))
-        } else {
-            crate::ai::detect_installed_ollama_models(None)
-        };
+        // Ollama detection probes localhost HTTP (800ms timeout) and falls
+        // back to an `ollama list` subprocess with no timeout: cheap to hang
+        // a painting thread for seconds, so it runs on a background thread
+        // and fills the list when it lands.
+        let ollama_base_url = loaded_config
+            .ai
+            .providers
+            .get("ollama")
+            .map(|p| p.base_url().to_string());
 
         let mut ai_model = loaded_config.ai.default_model.clone();
-        if loaded_config.ai.default == "ollama" && ai_model.is_none() && !detected_ollama_models.is_empty() {
-            ai_model = detected_ollama_models.first().cloned();
-        } else if ai_model.is_none() {
+        if ai_model.is_none() {
             if let Some(prov) = loaded_config.ai.providers.get(&loaded_config.ai.default) {
                 ai_model = prov.models().first().cloned();
             }
         }
         let ai_model_input = ai_model.clone().unwrap_or_default();
 
-        Self {
+        let mut view = Self {
             opacity: loaded_config.opacity,
             cursor_blink: loaded_config.cursor.blink,
             copy_on_select: loaded_config.copy_on_select,
@@ -280,7 +298,7 @@ impl SettingsView {
             ai_api_key_input,
             ai_model_state: crate::ui::TextInputState::new(ai_model_input.clone()),
             ai_model_input,
-            detected_ollama_models,
+            detected_ollama_models: Vec::new(),
             ai_test_status: AiTestStatus::Idle,
             search_input_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             ai_model_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -291,7 +309,75 @@ impl SettingsView {
             acknowledged_hash: None,
             stale: false,
             last_stale_check: std::time::Instant::now(),
+        };
+
+        if !fonts_cached {
+            view.spawn_font_discovery(window, cx);
         }
+        view.spawn_ollama_detection(ollama_base_url, cx);
+        view
+    }
+
+    /// Enumerates fonts once per process, off the open path: the OS-level
+    /// list (subprocess) on a background thread, the text-system families
+    /// on the UI thread after the window is already visible.
+    fn spawn_font_discovery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::bounded::<Vec<String>>(1);
+        std::thread::Builder::new()
+            .name("fastty-font-discovery".into())
+            .spawn(move || {
+                let _ = tx.send_blocking(available_system_fonts());
+            })
+            .ok();
+
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(os_fonts) = rx.recv().await {
+                let _ = this.update_in(cx, |this, _window, cx| {
+                    if SYSTEM_FONTS_CACHE.lock().is_some() {
+                        return;
+                    }
+                    let merged = merge_font_lists(cx.text_system().all_font_names(), os_fonts);
+                    *SYSTEM_FONTS_CACHE.lock() = Some(merged.clone());
+                    this.system_fonts = pin_family_first(merged, &this.font_family);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Detects installed Ollama models off the UI thread.
+    fn spawn_ollama_detection(&mut self, base_url: Option<String>, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::bounded::<Vec<String>>(1);
+        std::thread::Builder::new()
+            .name("fastty-ollama-detect".into())
+            .spawn(move || {
+                let _ = tx.send_blocking(crate::ai::detect_installed_ollama_models(base_url.as_deref()));
+            })
+            .ok();
+
+        cx.spawn(async move |this, cx| {
+            if let Ok(models) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| this.apply_ollama_models(models, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn apply_ollama_models(&mut self, models: Vec<String>, cx: &mut Context<Self>) {
+        self.detected_ollama_models = models;
+        if self.ai_provider == "ollama" {
+            let should_switch = self.ai_model_input.trim().is_empty()
+                || !self.detected_ollama_models.contains(&self.ai_model_input);
+            if should_switch {
+                if let Some(first) = self.detected_ollama_models.first().cloned() {
+                    self.ai_model = Some(first.clone());
+                    self.ai_model_input = first.clone();
+                    self.ai_model_state.set_text(first);
+                }
+            }
+        }
+        cx.notify();
     }
 
     pub fn filtered_font_indices(&self) -> Vec<usize> {
@@ -926,27 +1012,32 @@ impl SettingsView {
     pub fn set_ai_provider(&mut self, provider: &str, cx: &mut Context<Self>) {
         self.ai_provider = provider.to_string();
         self.config.ai.default = self.ai_provider.clone();
-        if let Some(prov) = self.config.ai.providers.get(provider) {
-            self.ai_base_url_input = prov.base_url().to_string();
+        let prov_info = self
+            .config
+            .ai
+            .providers
+            .get(provider)
+            .map(|p| (p.base_url().to_string(), p.api_key().unwrap_or("").to_string(), p.models().first().cloned()));
+        if let Some((base_url, api_key, first_prov_model)) = prov_info {
+            self.ai_base_url_input = base_url.clone();
             self.ai_base_url_state.set_text(self.ai_base_url_input.clone());
-            self.ai_api_key_input = prov.api_key().unwrap_or("").to_string();
+            self.ai_api_key_input = api_key;
             self.ai_api_key_state.set_text(self.ai_api_key_input.clone());
 
             if provider == "ollama" {
                 if self.detected_ollama_models.is_empty() {
-                    self.detected_ollama_models = crate::ai::detect_installed_ollama_models(Some(&self.ai_base_url_input));
+                    self.spawn_ollama_detection(Some(base_url), cx);
                 }
-                let chosen = self.detected_ollama_models.first().cloned().or_else(|| prov.models().first().cloned());
+                let chosen = self.detected_ollama_models.first().cloned().or(first_prov_model);
                 self.ai_model = chosen.clone();
                 self.ai_model_input = chosen.clone().unwrap_or_default();
                 self.ai_model_state.set_text(self.ai_model_input.clone());
                 self.config.ai.default_model = chosen;
             } else {
-                let first_model = prov.models().first().cloned();
-                self.ai_model = first_model.clone();
-                self.ai_model_input = first_model.clone().unwrap_or_default();
+                self.ai_model = first_prov_model.clone();
+                self.ai_model_input = first_prov_model.clone().unwrap_or_default();
                 self.ai_model_state.set_text(self.ai_model_input.clone());
-                self.config.ai.default_model = first_model;
+                self.config.ai.default_model = first_prov_model;
             }
         }
         self.ai_test_status = AiTestStatus::Idle;
@@ -991,18 +1082,7 @@ impl SettingsView {
     }
 
     pub fn refresh_ollama_models(&mut self, cx: &mut Context<Self>) {
-        self.detected_ollama_models = crate::ai::detect_installed_ollama_models(Some(&self.ai_base_url_input));
-        if self.ai_provider == "ollama" {
-            let first_opt = self.detected_ollama_models.first().cloned();
-            let should_switch = self.ai_model_input.trim().is_empty()
-                || !self.detected_ollama_models.contains(&self.ai_model_input);
-            if let Some(first) = first_opt {
-                if should_switch {
-                    self.set_ai_model(&first, cx);
-                    return;
-                }
-            }
-        }
+        self.spawn_ollama_detection(Some(self.ai_base_url_input.clone()), cx);
         cx.notify();
     }
 

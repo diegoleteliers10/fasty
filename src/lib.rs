@@ -26,5 +26,6 @@ pub mod ssh;
 pub mod terminal_state;
 pub mod ui;
 pub mod updater;
+pub mod whats_new;
 pub mod widgets;
 pub mod server;

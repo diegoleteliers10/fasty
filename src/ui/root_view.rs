@@ -1246,6 +1246,8 @@ pub struct RootView {
     pub is_update_ready: bool,
     pub update_status: Option<String>,
     pub is_update_modal_open: bool,
+    pub is_whats_new_open: bool,
+    pub whats_new_notes: Option<String>,
     pub pending_close: Option<PendingClose>,
     pub pressed_mouse_button: Option<MouseButton>,
     pub(crate) ime_marked_text: Option<String>,
@@ -1492,6 +1494,12 @@ impl RootView {
         let sidebar_open = tab_layout == TabLayout::Vertical;
         let sidebar_anim_progress = if sidebar_open { 1.0 } else { 0.0 };
 
+        // One-shot "What's new" dialog: the running version is newer than
+        // the last one seen on this machine. Recorded immediately so it
+        // fires exactly once per version.
+        let whats_new_upgrade = crate::whats_new::pending_upgrade();
+        crate::whats_new::mark_version_seen();
+
         let mut view = Self {
             config: loaded_config,
             window_id: _window.window_handle().window_id(),
@@ -1595,6 +1603,8 @@ impl RootView {
             update_status: None,
             is_update_ready: false,
             is_update_modal_open: false,
+            is_whats_new_open: whats_new_upgrade.is_some(),
+            whats_new_notes: crate::whats_new::notes_for(env!("CARGO_PKG_VERSION")),
             pending_close: None,
             pressed_mouse_button: None,
             ime_marked_text: None,
@@ -5392,7 +5402,7 @@ impl RootView {
         }
 
         // 6. Dismiss open static overlays on Escape
-        if (self.is_settings_open || self.is_about_open || self.is_context_menu_open || self.is_git_menu_open || self.is_tab_context_menu_open || self.is_pane_context_menu_open || self.is_update_modal_open)
+        if (self.is_settings_open || self.is_about_open || self.is_context_menu_open || self.is_git_menu_open || self.is_tab_context_menu_open || self.is_pane_context_menu_open || self.is_update_modal_open || self.is_whats_new_open)
             && (key_lower == "escape" || key_lower == "esc")
         {
             self.is_settings_open = false;
@@ -5403,6 +5413,7 @@ impl RootView {
             self.is_tab_context_menu_open = false;
             self.is_pane_context_menu_open = false;
             self.is_update_modal_open = false;
+            self.is_whats_new_open = false;
             cx.notify();
             return;
         }
@@ -5891,6 +5902,7 @@ impl RootView {
             || self.is_settings_open
             || self.is_about_open
             || self.is_update_modal_open
+            || self.is_whats_new_open
             || self.pending_close.is_some()
             || (self.ai_sidebar_open && self.ai_input_focused)
     }
@@ -11144,6 +11156,108 @@ impl Render for RootView {
                                                     .child(if self.is_updating { "Hide" } else { "OK" }),
                                             )
                                         }),
+                                ),
+                        ),
+                )
+            })
+            .when(self.is_whats_new_open, |this| {
+                let notes = self
+                    .whats_new_notes
+                    .clone()
+                    .unwrap_or_else(|| "Bug fixes and improvements.".to_string());
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                            this.is_whats_new_open = false;
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .w(px(480.))
+                                .p(px(16.))
+                                .rounded(px(10.))
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.border)
+                                .shadow_xl()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .pb(px(6.))
+                                        .border_b_1()
+                                        .border_color(theme.border)
+                                        .child(
+                                            div()
+                                                .text_size(px(13.))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(theme.foreground)
+                                                .child(format!("What's new in v{}", env!("CARGO_PKG_VERSION"))),
+                                        )
+                                        .child(
+                                            div()
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                    this.is_whats_new_open = false;
+                                                    cx.notify();
+                                                }))
+                                                .child(render_icon(IconType::X, theme.accent, 12.0)),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("whats-new-notes")
+                                        .max_h(px(360.))
+                                        .overflow_y_scroll()
+                                        .child(crate::ui::markdown::render_markdown(&notes, &theme, false)),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .pt(px(2.))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .text_color(theme.accent)
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, |_ev, _window, _cx| {
+                                                    open_path_or_url("https://github.com/diegoleteliers10/fasty/releases");
+                                                })
+                                                .child("View full changelog"),
+                                        )
+                                        .child(
+                                            div()
+                                                .px(px(12.))
+                                                .py(px(5.))
+                                                .rounded(px(5.))
+                                                .bg(theme.accent)
+                                                .text_color(theme.black)
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_size(px(11.))
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                    this.is_whats_new_open = false;
+                                                    cx.notify();
+                                                }))
+                                                .child("Continue"),
+                                        ),
                                 ),
                         ),
                 )
