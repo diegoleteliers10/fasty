@@ -73,6 +73,17 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Rebuild Wasm Client
+        shell: bash
+        run: |
+          rustup target add wasm32-unknown-unknown
+          ./build-wasm.sh
+
       - name: Build Binary (Release Mode)
         run: cargo build --release --target ${{ matrix.target }}
 

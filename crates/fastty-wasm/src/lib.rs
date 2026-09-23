@@ -34,9 +34,7 @@ impl FasttyVt {
             term: &mut self.terminal,
             osc_buf: Vec::new(),
         };
-        for &b in bytes {
-            self.parser.advance(&mut handler, b);
-        }
+        self.parser.advance(&mut handler, bytes);
         self.dirty = true;
     }
 

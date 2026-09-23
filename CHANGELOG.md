@@ -3,6 +3,17 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.13.1 - 2026-09-22
+
+- Fixed the web client failing to restore the terminal screen after a
+  reconnect.
+- Upgraded the WebAssembly terminal engine to vte 0.15 and wasm-bindgen
+  0.2.128.
+- Optimized the WebAssembly binary with bulk-memory operations.
+- The release pipeline now rebuilds the web client before every release
+  build, so the gateway always serves current assets.
+- Dependabot keeps dependencies current with weekly update PRs.
+
 ## 0.13.0 - 2026-09-22
 
 - "What's new" dialog after each update, with per-version notes and a link to

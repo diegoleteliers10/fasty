@@ -1,0 +1,15 @@
+{
+  "name": "fastty-wasm",
+  "type": "module",
+  "version": "0.13.0",
+  "files": [
+    "fastty_wasm_bg.wasm",
+    "fastty_wasm.js",
+    "fastty_wasm.d.ts"
+  ],
+  "main": "fastty_wasm.js",
+  "types": "fastty_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

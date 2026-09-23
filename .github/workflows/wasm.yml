@@ -1,0 +1,53 @@
+name: Web Client
+
+# Rebuilds web/pkg whenever the wasm crate changes, so the gateway always
+# embeds a fresh client without manual steps.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/fastty-wasm/**'
+      - 'web/**'
+      - '.github/workflows/wasm.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Rebuild web/pkg
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - name: Build Wasm Client
+        run: ./build-wasm.sh
+
+      - name: Run Wasm Crate Tests
+        run: cargo test -p fastty-wasm
+
+      - name: Commit refreshed web/pkg
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [[ -n "$(git status --porcelain web/pkg)" ]]; then
+            git add web/pkg
+            git commit -m "chore(web): rebuild wasm client from crates/fastty-wasm"
+            git pull --rebase origin main
+            git push
+          else
+            echo "No changes to web/pkg"
+          fi

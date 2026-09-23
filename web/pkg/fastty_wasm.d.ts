@@ -25,6 +25,10 @@ export class FasttyVt {
      */
     render_canvas(canvas: HTMLCanvasElement, font_family: string, font_size_px: number, dpr: number): void;
     resize(cols: number, rows: number): void;
+    /**
+     * Restore the entire screen in microseconds from a binary snapshot (magic b"FST1").
+     */
+    restore_binary_snapshot(data: Uint8Array): boolean;
     rows(): number;
     /**
      * Scroll display up into history (positive delta) or down towards bottom (negative delta).
@@ -33,8 +37,8 @@ export class FasttyVt {
     scroll_offset(): number;
     scroll_page_down(): void;
     scroll_page_up(): void;
-    scroll_to(offset: number): void;
     scroll_to_bottom(): void;
+    scroll_to(offset: number): void;
     scroll_to_top(): void;
     title(): string;
 }
@@ -52,11 +56,13 @@ export interface InitOutput {
     readonly fasttyvt_cwd: (a: number, b: number) => void;
     readonly fasttyvt_encode_key: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly fasttyvt_feed_bytes: (a: number, b: number, c: number) => void;
+    readonly fasttyvt_feed_str: (a: number, b: number, c: number) => void;
     readonly fasttyvt_is_dirty: (a: number) => number;
     readonly fasttyvt_max_scroll_offset: (a: number) => number;
     readonly fasttyvt_new: (a: number, b: number, c: number) => number;
     readonly fasttyvt_render_canvas: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly fasttyvt_resize: (a: number, b: number, c: number) => void;
+    readonly fasttyvt_restore_binary_snapshot: (a: number, b: number, c: number) => number;
     readonly fasttyvt_rows: (a: number) => number;
     readonly fasttyvt_scroll_display: (a: number, b: number) => void;
     readonly fasttyvt_scroll_offset: (a: number) => number;
@@ -66,7 +72,6 @@ export interface InitOutput {
     readonly fasttyvt_scroll_to_bottom: (a: number) => void;
     readonly fasttyvt_scroll_to_top: (a: number) => void;
     readonly fasttyvt_title: (a: number, b: number) => void;
-    readonly fasttyvt_feed_str: (a: number, b: number, c: number) => void;
     readonly __wbindgen_export: (a: number) => void;
     readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number) => void;
