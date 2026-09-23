@@ -234,7 +234,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "light.exe failed with exit code $LASTEXITCODE" }
 
       - name: Upload Build Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: ${{ matrix.artifact_name }}
@@ -242,7 +242,7 @@ jobs:
 
       - name: Upload DMG Artifact
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}-dmg
           path: ${{ matrix.dmg_name }}
@@ -250,7 +250,7 @@ jobs:
 
       - name: Upload MSI Artifact
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}-msi
           path: ${{ matrix.msi_name }}
@@ -258,7 +258,7 @@ jobs:
 
       - name: Upload DEB Artifact
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}-deb
           path: ${{ matrix.deb_name }}
@@ -266,7 +266,7 @@ jobs:
 
       - name: Upload AppImage Artifact
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}-appimage
           path: ${{ matrix.appimage_name }}
