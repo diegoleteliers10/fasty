@@ -573,9 +573,7 @@ impl TerminalState {
                 match cmd {
                     OscCommand::PromptStarted => {
                         // Reset mouse tracking modes on prompt start to prevent leaked escape codes if a child exited uncleanly
-                        for &b in b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l" {
-                            parser.advance(term, b);
-                        }
+                        parser.advance(term, b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
 
                         let scrolled = (base as i64 - screen_lines as i64).max(0);
                         let absolute_line = (scrolled + cursor_line as i64).max(0) as u64;
@@ -800,9 +798,7 @@ impl TerminalState {
                                     });
 
                                     if final_ctrl.cursor_movement && rows > 0 {
-                                        for _ in 0..rows {
-                                            parser.advance(&mut *term_locked, 0x0A);
-                                        }
+                                        parser.advance(&mut *term_locked, &vec![0x0A; rows as usize]);
                                         added_lines = rows as u64;
                                     }
                                 }
@@ -865,7 +861,7 @@ impl TerminalState {
                                 local_lines += 1;
                             }
 
-                            parser.advance(&mut *term_locked, byte);
+                            parser.advance(&mut *term_locked, &[byte]);
 
                             match seq_state {
                                 SequenceParseState::Normal => {
@@ -2636,16 +2632,12 @@ mod tests {
         let mut parser: Processor = Processor::new();
 
         // Enable mouse tracking
-        for &b in b"\x1b[?1000h\x1b[?1006h" {
-            parser.advance(&mut term, b);
-        }
+        parser.advance(&mut term, b"\x1b[?1000h\x1b[?1006h");
         assert!(term.mode().contains(TermMode::MOUSE_REPORT_CLICK));
         assert!(term.mode().contains(TermMode::SGR_MOUSE));
 
         // Reset mouse tracking
-        for &b in b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l" {
-            parser.advance(&mut term, b);
-        }
+        parser.advance(&mut term, b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
         assert!(!term.mode().contains(TermMode::MOUSE_REPORT_CLICK));
         assert!(!term.mode().contains(TermMode::SGR_MOUSE));
         assert!(!term.mode().contains(TermMode::MOUSE_MOTION));
@@ -2664,9 +2656,7 @@ mod tests {
         let mut parser: Processor = Processor::new();
 
         let sample = b"Line 1: cargo build\r\nLine 2: error in file.rs\r\nLine 3: success\r\n";
-        for &b in sample {
-            parser.advance(&mut term, b);
-        }
+        parser.advance(&mut term, sample);
 
         // Test preview lines from grid
         let grid = term.grid();

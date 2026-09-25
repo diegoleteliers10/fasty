@@ -86,9 +86,9 @@ impl std::fmt::Display for KeyCombo {
             NamedKey::PageUp => write!(f, "pageup"),
             NamedKey::PageDown => write!(f, "pagedown"),
             NamedKey::Space => write!(f, "space"),
-            NamedKey::Plus => write!(f, "+"),
-            NamedKey::Minus => write!(f, "-"),
-            NamedKey::Equal => write!(f, "="),
+            NamedKey::Plus => write!(f, "plus"),
+            NamedKey::Minus => write!(f, "minus"),
+            NamedKey::Equal => write!(f, "equal"),
         }
     }
 }
@@ -142,6 +142,187 @@ pub enum Action {
     GlobalSearch,
     TabOverview,
     Quit,
+}
+
+/// Marker value in the user `[keybindings]` map that removes a preset binding.
+/// e.g. `"super+t" = "none"` unbinds the preset combo without assigning it.
+pub const UNBOUND_MARKERS: &[&str] = &["none", "unbound", "disabled"];
+
+pub fn is_unbound_marker(s: &str) -> bool {
+    UNBOUND_MARKERS.contains(&s.to_lowercase().as_str())
+}
+
+impl Action {
+    /// Every configurable action. `SelectTab` expands to 1..=9.
+    pub fn all() -> Vec<Action> {
+        let mut v = vec![
+            Action::NewTab,
+            Action::CloseTab,
+            Action::NextTab,
+            Action::PrevTab,
+        ];
+        for n in 1..=9u8 {
+            v.push(Action::SelectTab(n));
+        }
+        v.extend([
+            Action::SplitRight,
+            Action::SplitDown,
+            Action::SplitLeft,
+            Action::SplitTop,
+            Action::FocusRight,
+            Action::FocusDown,
+            Action::FocusLeft,
+            Action::FocusTop,
+            Action::ClosePane,
+            Action::PrevPrompt,
+            Action::NextPrompt,
+            Action::Copy,
+            Action::Paste,
+            Action::IncreaseFontSize,
+            Action::DecreaseFontSize,
+            Action::ResetFontSize,
+            Action::ClearScrollback,
+            Action::ToggleFullscreen,
+            Action::ToggleTabSidebar,
+            Action::ToggleAiSidebar,
+            Action::OpenSearch,
+            Action::GlobalSearch,
+            Action::TabOverview,
+            Action::CommandPalette,
+            Action::SshManager,
+            Action::ProjectJumper,
+            Action::WorktreePicker,
+            Action::NewWindow,
+            Action::OpenSettings,
+            Action::ReloadConfig,
+            Action::Quit,
+        ]);
+        v
+    }
+
+    /// Canonical id used in `fastty.toml` (`select_tab_1`..`select_tab_9`).
+    /// Inverse of [`parse_action`] for canonical ids.
+    pub fn binding_id(&self) -> String {
+        match self {
+            Action::SelectTab(n) => format!("select_tab_{n}"),
+            Action::NewTab => "new_tab".to_string(),
+            Action::CloseTab => "close_tab".to_string(),
+            Action::NewWindow => "new_window".to_string(),
+            Action::Copy => "copy".to_string(),
+            Action::Paste => "paste".to_string(),
+            Action::OpenSearch => "open_search".to_string(),
+            Action::OpenSettings => "open_settings".to_string(),
+            Action::ReloadConfig => "reload_config".to_string(),
+            Action::IncreaseFontSize => "increase_font_size".to_string(),
+            Action::DecreaseFontSize => "decrease_font_size".to_string(),
+            Action::ResetFontSize => "reset_font_size".to_string(),
+            Action::NextTab => "next_tab".to_string(),
+            Action::PrevTab => "prev_tab".to_string(),
+            Action::CommandPalette => "command_palette".to_string(),
+            Action::SshManager => "ssh_manager".to_string(),
+            Action::ProjectJumper => "project_jumper".to_string(),
+            Action::WorktreePicker => "worktree_picker".to_string(),
+            Action::PrevPrompt => "prev_prompt".to_string(),
+            Action::NextPrompt => "next_prompt".to_string(),
+            Action::ClearScrollback => "clear_scrollback".to_string(),
+            Action::ToggleFullscreen => "toggle_fullscreen".to_string(),
+            Action::ToggleTabSidebar => "toggle_tab_sidebar".to_string(),
+            Action::ToggleAiSidebar => "toggle_ai_sidebar".to_string(),
+            Action::SplitRight => "split_right".to_string(),
+            Action::SplitDown => "split_down".to_string(),
+            Action::SplitLeft => "split_left".to_string(),
+            Action::SplitTop => "split_top".to_string(),
+            Action::FocusRight => "focus_right".to_string(),
+            Action::FocusDown => "focus_down".to_string(),
+            Action::FocusLeft => "focus_left".to_string(),
+            Action::FocusTop => "focus_top".to_string(),
+            Action::ClosePane => "close_pane".to_string(),
+            Action::GlobalSearch => "global_search".to_string(),
+            Action::TabOverview => "tab_overview".to_string(),
+            Action::Quit => "quit".to_string(),
+        }
+    }
+
+    /// Short human label for Settings.
+    pub fn display_name(&self) -> String {
+        match self {
+            Action::SelectTab(n) => format!("Select Tab {n}"),
+            _ => match self {
+                Action::NewTab => "New Tab",
+                Action::CloseTab => "Close Tab",
+                Action::NewWindow => "New Window",
+                Action::Copy => "Copy",
+                Action::Paste => "Paste",
+                Action::OpenSearch => "Find in Tab",
+                Action::OpenSettings => "Open Settings",
+                Action::ReloadConfig => "Reload Config",
+                Action::IncreaseFontSize => "Increase Font Size",
+                Action::DecreaseFontSize => "Decrease Font Size",
+                Action::ResetFontSize => "Reset Font Size",
+                Action::NextTab => "Next Tab",
+                Action::PrevTab => "Previous Tab",
+                Action::SelectTab(_) => unreachable!("handled above"),
+                Action::CommandPalette => "Command Palette",
+                Action::SshManager => "SSH Manager",
+                Action::ProjectJumper => "Project Jumper",
+                Action::WorktreePicker => "Worktree Picker",
+                Action::PrevPrompt => "Previous Prompt",
+                Action::NextPrompt => "Next Prompt",
+                Action::ClearScrollback => "Clear Scrollback",
+                Action::ToggleFullscreen => "Toggle Fullscreen",
+                Action::ToggleTabSidebar => "Toggle Tab Sidebar",
+                Action::ToggleAiSidebar => "Toggle AI Sidebar",
+                Action::SplitRight => "Split Right",
+                Action::SplitDown => "Split Down",
+                Action::SplitLeft => "Split Left",
+                Action::SplitTop => "Split Top",
+                Action::FocusRight => "Focus Right Pane",
+                Action::FocusDown => "Focus Down Pane",
+                Action::FocusLeft => "Focus Left Pane",
+                Action::FocusTop => "Focus Top Pane",
+                Action::ClosePane => "Close Pane",
+                Action::GlobalSearch => "Global Search (All Tabs)",
+                Action::TabOverview => "Tab Overview",
+                Action::Quit => "Quit",
+            }
+            .to_string(),
+        }
+    }
+
+    /// Grouping for the Settings editor.
+    pub fn category(&self) -> &'static str {
+        match self {
+            Action::NewTab | Action::CloseTab | Action::NextTab | Action::PrevTab
+            | Action::SelectTab(_) => "Tabs",
+            Action::SplitRight | Action::SplitDown | Action::SplitLeft | Action::SplitTop
+            | Action::FocusRight | Action::FocusDown | Action::FocusLeft | Action::FocusTop
+            | Action::ClosePane => "Panes",
+            Action::PrevPrompt | Action::NextPrompt => "Navigation",
+            Action::Copy | Action::Paste => "Clipboard",
+            Action::IncreaseFontSize | Action::DecreaseFontSize | Action::ResetFontSize
+            | Action::ClearScrollback | Action::ToggleFullscreen | Action::ToggleTabSidebar
+            | Action::ToggleAiSidebar => "View",
+            Action::OpenSearch | Action::GlobalSearch | Action::TabOverview
+            | Action::CommandPalette => "Search",
+            Action::SshManager | Action::ProjectJumper | Action::WorktreePicker => "Tools",
+            Action::NewWindow | Action::OpenSettings | Action::ReloadConfig | Action::Quit => {
+                "Application"
+            }
+        }
+    }
+
+    pub fn categories() -> Vec<&'static str> {
+        vec![
+            "Tabs",
+            "Panes",
+            "Navigation",
+            "Clipboard",
+            "View",
+            "Search",
+            "Tools",
+            "Application",
+        ]
+    }
 }
 
 pub struct KeyBindingResolver {
@@ -372,6 +553,10 @@ impl KeyBindingResolver {
             let Some(combo) = parse_combo(&combo_str) else {
                 continue;
             };
+            if is_unbound_marker(&action_str) {
+                self.bindings.remove(&combo);
+                continue;
+            }
             let Some(action) = parse_action(&action_str) else {
                 continue;
             };
@@ -381,6 +566,23 @@ impl KeyBindingResolver {
 
     pub fn resolve(&self, combo: &KeyCombo) -> Option<Action> {
         self.bindings.get(combo).copied()
+    }
+
+    /// All combos currently bound to `action`, sorted for stable display.
+    pub fn combos_for(&self, action: Action) -> Vec<KeyCombo> {
+        let mut v: Vec<KeyCombo> = self
+            .bindings
+            .iter()
+            .filter(|(_, a)| **a == action)
+            .map(|(c, _)| *c)
+            .collect();
+        v.sort_by_key(|c| c.to_string());
+        v
+    }
+
+    /// Preset combos for `action` before user overrides.
+    pub fn preset_combos(preset: KeybindingPreset, action: Action) -> Vec<KeyCombo> {
+        Self::for_preset(preset).combos_for(action)
     }
 }
 
@@ -434,9 +636,9 @@ fn parse_key(s: &str) -> Option<NamedKey> {
         "pageup" | "page_up" => Some(NamedKey::PageUp),
         "pagedown" | "page_down" => Some(NamedKey::PageDown),
         "space" => Some(NamedKey::Space),
-        "plus" => Some(NamedKey::Char('+')),
-        "minus" => Some(NamedKey::Char('-')),
-        "equal" | "equals" => Some(NamedKey::Char('=')),
+        "plus" => Some(NamedKey::Plus),
+        "minus" => Some(NamedKey::Minus),
+        "equal" | "equals" => Some(NamedKey::Equal),
         "comma" => Some(NamedKey::Char(',')),
         _ => None,
     }
@@ -483,6 +685,124 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "tab_overview" | "mission_control" | "tab_peek" => Some(Action::TabOverview),
         "quit" => Some(Action::Quit),
         _ => None,
+    }
+}
+
+/// Merged preset + user bindings, as Settings and the key handler see them.
+pub fn effective_resolver(
+    preset: KeybindingPreset,
+    user: &HashMap<String, String>,
+) -> KeyBindingResolver {
+    let mut r = KeyBindingResolver::for_preset(preset);
+    r.apply_user(user.clone());
+    r
+}
+
+/// Drop every user entry that affects `action`: overrides pointing at it,
+/// unbind markers on its preset combos, and entries that steal one of its
+/// preset combos for another action. Preset defaults resurface.
+pub fn reset_action_bindings(
+    user: &mut HashMap<String, String>,
+    preset: KeybindingPreset,
+    action: Action,
+) {
+    let preset_combos = KeyBindingResolver::preset_combos(preset, action);
+    user.retain(|combo_str, action_str| {
+        if let Some(a) = parse_action(action_str) {
+            if a == action {
+                return false;
+            }
+        }
+        if let Some(c) = parse_combo(combo_str) {
+            if preset_combos.contains(&c) {
+                return false;
+            }
+        }
+        true
+    });
+}
+
+/// True when the user map changes anything for `action` vs the preset:
+/// an override pointing at it (aliases included), a marker on its preset
+/// combos, or a stolen preset combo.
+pub fn is_action_customized(
+    user: &HashMap<String, String>,
+    preset: KeybindingPreset,
+    action: Action,
+) -> bool {
+    let preset_combos = KeyBindingResolver::preset_combos(preset, action);
+    user.iter().any(|(k, v)| {
+        parse_action(v).is_some_and(|a| a == action)
+            || parse_combo(k).is_some_and(|c| preset_combos.contains(&c))
+    })
+}
+
+fn format_key(key: &NamedKey) -> String {
+    if cfg!(target_os = "macos") {
+        match key {
+            NamedKey::Char(c) => c.to_uppercase().to_string(),
+            NamedKey::Up => "↑".to_string(),
+            NamedKey::Down => "↓".to_string(),
+            NamedKey::Left => "←".to_string(),
+            NamedKey::Right => "→".to_string(),
+            NamedKey::Return => "↵".to_string(),
+            NamedKey::Tab => "⇥".to_string(),
+            NamedKey::Escape => "⎋".to_string(),
+            NamedKey::Backspace => "⌫".to_string(),
+            NamedKey::Delete => "⌦".to_string(),
+            NamedKey::Space => "Space".to_string(),
+            NamedKey::Plus => "+".to_string(),
+            NamedKey::Minus => "-".to_string(),
+            NamedKey::Equal => "=".to_string(),
+            _ => format!("{key:?}"),
+        }
+    } else {
+        match key {
+            NamedKey::Char(c) => c.to_uppercase().to_string(),
+            NamedKey::Space => "Space".to_string(),
+            NamedKey::Plus => "+".to_string(),
+            NamedKey::Minus => "-".to_string(),
+            NamedKey::Equal => "=".to_string(),
+            _ => format!("{key:?}"),
+        }
+    }
+}
+
+/// OS-aware combo label: `⌘⇧D` on macOS, `Ctrl+Shift+D` elsewhere.
+/// `super` shows as `⌘` / `Super`.
+pub fn format_combo(combo: &KeyCombo) -> String {
+    if cfg!(target_os = "macos") {
+        let mut s = String::new();
+        if combo.ctrl {
+            s.push('⌃');
+        }
+        if combo.alt {
+            s.push('⌥');
+        }
+        if combo.shift {
+            s.push('⇧');
+        }
+        if combo.logo {
+            s.push('⌘');
+        }
+        s.push_str(&format_key(&combo.key));
+        s
+    } else {
+        let mut parts = Vec::new();
+        if combo.ctrl {
+            parts.push("Ctrl".to_string());
+        }
+        if combo.shift {
+            parts.push("Shift".to_string());
+        }
+        if combo.alt {
+            parts.push("Alt".to_string());
+        }
+        if combo.logo {
+            parts.push("Super".to_string());
+        }
+        parts.push(format_key(&combo.key));
+        parts.join("+")
     }
 }
 
@@ -543,6 +863,93 @@ pub fn combo_from_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_binding_id_roundtrip() {
+        for a in Action::all() {
+            let id = a.binding_id();
+            assert_eq!(parse_action(&id), Some(a), "roundtrip failed for {id}");
+        }
+    }
+
+    #[test]
+    fn test_unbind_marker_removes_preset() {
+        let mut r = KeyBindingResolver::for_preset(KeybindingPreset::Default);
+        let combo = parse_combo("super+t").unwrap();
+        assert_eq!(r.resolve(&combo), Some(Action::NewTab));
+        let mut user = HashMap::new();
+        user.insert("super+t".to_string(), "none".to_string());
+        r.apply_user(user);
+        assert_eq!(r.resolve(&combo), None);
+    }
+
+    #[test]
+    fn test_reset_action_restores_preset() {
+        let mut user = HashMap::new();
+        user.insert("ctrl+t".to_string(), "new_tab".to_string());
+        user.insert("super+t".to_string(), "none".to_string());
+        reset_action_bindings(&mut user, KeybindingPreset::Default, Action::NewTab);
+        assert!(user.is_empty());
+        let r = effective_resolver(KeybindingPreset::Default, &user);
+        assert!(!r.combos_for(Action::NewTab).is_empty());
+    }
+
+    #[test]
+    fn test_is_action_customized() {
+        let user = HashMap::new();
+        assert!(!is_action_customized(
+            &user,
+            KeybindingPreset::Default,
+            Action::NewTab
+        ));
+        let mut user = HashMap::new();
+        user.insert("ctrl+t".to_string(), "new_tab".to_string());
+        assert!(is_action_customized(
+            &user,
+            KeybindingPreset::Default,
+            Action::NewTab
+        ));
+        assert!(!is_action_customized(
+            &user,
+            KeybindingPreset::Default,
+            Action::CloseTab
+        ));
+    }
+
+    #[test]
+    fn test_combo_string_roundtrip() {
+        for s in [
+            "super+t",
+            "ctrl+shift+plus",
+            "super+minus",
+            "ctrl+equal",
+            "alt+left",
+            "super+shift+[",
+            "f11",
+            "ctrl+tab",
+            "super+comma",
+        ] {
+            let combo = parse_combo(s).expect(s);
+            assert_eq!(parse_combo(&combo.to_string()), Some(combo), "{s}");
+        }
+    }
+
+    #[test]
+    fn test_reset_action_reclaims_stolen_combo() {
+        let mut user = HashMap::new();
+        user.insert("super+t".to_string(), "copy".to_string());
+        assert!(is_action_customized(
+            &user,
+            KeybindingPreset::Default,
+            Action::NewTab
+        ));
+        reset_action_bindings(&mut user, KeybindingPreset::Default, Action::NewTab);
+        assert!(user.is_empty());
+        let r = effective_resolver(KeybindingPreset::Default, &user);
+        assert!(r
+            .combos_for(Action::NewTab)
+            .contains(&parse_combo("super+t").unwrap()));
+    }
 
     #[test]
     fn test_preset_resolvers() {

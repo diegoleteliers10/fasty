@@ -3,6 +3,20 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.14.0 - 2026-09-25
+
+- Editable keyboard shortcuts in Settings: click any shortcut and press the
+  keys. All actions across Tabs, Panes, Search, Tools, and Application are
+  customizable on macOS, Linux, and Windows, with per-preset defaults
+  (Default, Ghostty, tmux, iTerm2) applied initially.
+- Shortcut conflicts ask before reassigning, with per-action reset, unbind,
+  and reset-all back to the preset defaults.
+- Upgraded terminal engine to alacritty_terminal 0.26 with rustix 1.1,
+  notify 8, notify-debouncer-mini 0.7, and criterion 0.8. The unified
+  dependency tree drops the old rustix 0.38 and vte 0.13 copies.
+- Release pipeline actions updated: checkout v7, upload-artifact v7,
+  download-artifact v8, action-gh-release v3.
+
 ## 0.13.2 - 2026-09-25
 
 - Update checks and downloads no longer depend on the system `curl`. The

@@ -104,6 +104,14 @@ pub enum AiTestStatus {
     Failed(String),
 }
 
+/// Pending reassign confirmation when a captured combo is already bound.
+#[derive(Debug, Clone, Copy)]
+pub struct BindingConflict {
+    pub target: crate::keybindings::Action,
+    pub combo: crate::keybindings::KeyCombo,
+    pub owner: crate::keybindings::Action,
+}
+
 pub struct SettingsView {
     pub config: Config,
     pub theme: Theme,
@@ -161,6 +169,10 @@ pub struct SettingsView {
     /// Whether the stale badge is shown (recomputed throttled in render).
     pub stale: bool,
     pub last_stale_check: std::time::Instant,
+    /// Action currently waiting for a keypress (press-to-capture editing).
+    pub capturing_action: Option<crate::keybindings::Action>,
+    /// Reassign confirmation for a captured combo owned by another action.
+    pub binding_conflict: Option<BindingConflict>,
 }
 
 impl SettingsView {
@@ -309,6 +321,8 @@ impl SettingsView {
             acknowledged_hash: None,
             stale: false,
             last_stale_check: std::time::Instant::now(),
+            capturing_action: None,
+            binding_conflict: None,
         };
 
         if !fonts_cached {
@@ -459,6 +473,8 @@ impl SettingsView {
         // this point is the new baseline (covers construction, reopen, and
         // explicit Reload from the stale badge).
         self.refresh_baseline();
+        self.capturing_action = None;
+        self.binding_conflict = None;
 
         cx.notify();
     }
@@ -624,6 +640,33 @@ impl SettingsView {
     }
 
     fn handle_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Press-to-capture binding editing: consume every key for the capture.
+        if self.capturing_action.is_some() {
+            let key = ev.keystroke.key.as_str();
+            let mods = &ev.keystroke.modifiers;
+            let bare_escape = key.eq_ignore_ascii_case("escape")
+                && !mods.control
+                && !mods.platform
+                && !mods.alt
+                && !mods.shift;
+            if bare_escape {
+                self.cancel_binding_capture(cx);
+                return;
+            }
+            let is_alt_gr = mods.control && !mods.platform && mods.alt;
+            let is_ctrl = mods.control && !is_alt_gr;
+            if let Some(combo) = crate::keybindings::combo_from_key(
+                key,
+                is_ctrl,
+                mods.shift,
+                mods.alt && !is_alt_gr,
+                mods.platform,
+            ) {
+                self.finish_binding_capture(combo, cx);
+            }
+            // Modifier-only or unknown keys: keep waiting.
+            return;
+        }
         if ev.keystroke.key == "escape" {
             if self.font_combobox_open {
                 self.font_combobox_open = false;
@@ -986,10 +1029,130 @@ impl SettingsView {
     pub fn set_keybinding_preset(&mut self, preset: crate::keybindings::KeybindingPreset, cx: &mut Context<Self>) {
         self.keybinding_preset = preset;
         self.config.keybinding_preset = Some(preset);
+        self.capturing_action = None;
+        self.binding_conflict = None;
         self.save_config();
         crate::keybindings::init_resolver(self.config.keybindings.clone(), Some(preset));
         crate::config::increment_config_version();
         cx.notify();
+    }
+
+    fn persist_bindings(&mut self, cx: &mut Context<Self>) {
+        self.save_config();
+        crate::keybindings::init_resolver(
+            self.config.keybindings.clone(),
+            Some(self.keybinding_preset),
+        );
+        crate::config::increment_config_version();
+        cx.notify();
+    }
+
+    fn effective_bindings(&self) -> crate::keybindings::KeyBindingResolver {
+        crate::keybindings::effective_resolver(self.keybinding_preset, &self.config.keybindings)
+    }
+
+    pub fn start_binding_capture(
+        &mut self,
+        action: crate::keybindings::Action,
+        cx: &mut Context<Self>,
+    ) {
+        if self.capturing_action == Some(action) {
+            self.capturing_action = None;
+            self.binding_conflict = None;
+        } else {
+            self.capturing_action = Some(action);
+            self.binding_conflict = None;
+            self.active_input_field = None;
+            self.font_combobox_open = false;
+        }
+        cx.notify();
+    }
+
+    fn finish_binding_capture(
+        &mut self,
+        combo: crate::keybindings::KeyCombo,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.capturing_action.take() else {
+            return;
+        };
+        let effective = self.effective_bindings();
+        match effective.resolve(&combo) {
+            None => {
+                self.config
+                    .keybindings
+                    .insert(combo.to_string(), target.binding_id());
+                self.binding_conflict = None;
+                self.persist_bindings(cx);
+            }
+            Some(owner) if owner == target => {
+                self.binding_conflict = None;
+                cx.notify();
+            }
+            Some(owner) => {
+                self.binding_conflict = Some(BindingConflict {
+                    target,
+                    combo,
+                    owner,
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn confirm_binding_conflict(&mut self, cx: &mut Context<Self>) {
+        if let Some(conflict) = self.binding_conflict.take() {
+            self.config
+                .keybindings
+                .insert(conflict.combo.to_string(), conflict.target.binding_id());
+            self.persist_bindings(cx);
+        }
+    }
+
+    pub fn cancel_binding_capture(&mut self, cx: &mut Context<Self>) {
+        self.capturing_action = None;
+        self.binding_conflict = None;
+        cx.notify();
+    }
+
+    pub fn unbind_action(
+        &mut self,
+        action: crate::keybindings::Action,
+        cx: &mut Context<Self>,
+    ) {
+        let effective = self.effective_bindings();
+        let id = action.binding_id();
+        for combo in effective.combos_for(action) {
+            let key = combo.to_string();
+            if self.config.keybindings.get(&key).is_some_and(|v| v == &id) {
+                self.config.keybindings.remove(&key);
+            } else {
+                self.config.keybindings.insert(key, "none".to_string());
+            }
+        }
+        self.binding_conflict = None;
+        self.persist_bindings(cx);
+    }
+
+    pub fn reset_action_bindings_ui(
+        &mut self,
+        action: crate::keybindings::Action,
+        cx: &mut Context<Self>,
+    ) {
+        crate::keybindings::reset_action_bindings(
+            &mut self.config.keybindings,
+            self.keybinding_preset,
+            action,
+        );
+        self.binding_conflict = None;
+        self.persist_bindings(cx);
+    }
+
+    pub fn reset_all_bindings(&mut self, cx: &mut Context<Self>) {
+        self.config.keybindings.clear();
+        self.capturing_action = None;
+        self.binding_conflict = None;
+        self.persist_bindings(cx);
     }
 
     pub fn set_ai_permission_mode(&mut self, mode: crate::ai::PermissionMode, cx: &mut Context<Self>) {
@@ -2617,16 +2780,12 @@ impl SettingsView {
             (crate::keybindings::KeybindingPreset::ITerm2, "iTerm2", "macOS iTerm2 muscle memory shortcuts"),
         ];
 
-        let shortcuts_ref = [
-            ("Toggle AI Assistant Sidebar", if cfg!(target_os = "macos") { "⌘L" } else { "Ctrl+Shift+L" }),
-            ("Command Palette", if cfg!(target_os = "macos") { "⌘P" } else { "Ctrl+Shift+P" }),
-            ("Mission Control / Tab Peek", if cfg!(target_os = "macos") { "⌘⇧O" } else { "Ctrl+Shift+M" }),
-            ("Find in All Tabs (Global Search)", if cfg!(target_os = "macos") { "⌘⇧F" } else { "Ctrl+Shift+F" }),
-            ("Split Pane Right", if cfg!(target_os = "macos") { "⌘D" } else { "Ctrl+Shift+D" }),
-            ("Split Pane Down", if cfg!(target_os = "macos") { "⌘⇧D" } else { "Ctrl+Shift+E" }),
-        ];
+        let effective = self.effective_bindings();
+        let has_custom = !self.config.keybindings.is_empty();
+        let capturing = self.capturing_action;
+        let conflict = self.binding_conflict;
 
-        div()
+        let mut root = div()
             .flex()
             .flex_col()
             .gap_6()
@@ -2690,36 +2849,295 @@ impl SettingsView {
                                 )
                         })),
                     ),
-            )
-            // Section 2: Shortcuts Quick Reference
+            );
+
+        // Section 2: editable per-action bindings, grouped by category.
+        let mut section = div()
+            .flex()
+            .flex_col()
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .child(render_section_header("Quick Shortcuts Reference", theme))
-                    .child(
-                        render_group_card(theme).children(shortcuts_ref.into_iter().enumerate().map(|(idx, (name, sc))| {
-                            let is_last = idx == shortcuts_ref.len() - 1;
-                            render_card_row(
-                                name,
-                                None::<&str>,
-                                div()
-                                    .px(px(7.))
-                                    .py(px(3.))
-                                    .rounded(px(5.))
-                                    .bg(theme.surface_raised)
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(theme.foreground)
-                                    .child(sc),
-                                is_last,
-                                theme,
-                            )
-                        })),
-                    ),
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(render_section_header("Custom Shortcuts", theme))
+                    .when(has_custom, |this| {
+                        this.child(
+                            div()
+                                .id("kb-reset-all")
+                                .px(px(10.))
+                                .py(px(4.))
+                                .rounded(px(6.))
+                                .border_1()
+                                .border_color(theme.border)
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.muted_strong)
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(|s| s.bg(theme.surface_raised))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        this.reset_all_bindings(cx);
+                                    }),
+                                )
+                                .child("Reset all"),
+                        )
+                    }),
             )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.muted)
+                    .mb(px(4.))
+                    .child("Click a shortcut, then press the keys. Esc cancels."),
+            );
+
+        for category in crate::keybindings::Action::categories() {
+            let actions: Vec<crate::keybindings::Action> = crate::keybindings::Action::all()
+                .into_iter()
+                .filter(|a| a.category() == category)
+                .collect();
+            if actions.is_empty() {
+                continue;
+            }
+            let mut card = render_group_card(theme);
+            for (row_idx, action) in actions.iter().enumerate() {
+                let combos = effective.combos_for(*action);
+                let is_capturing = capturing == Some(*action);
+                let customized = crate::keybindings::is_action_customized(
+                    &self.config.keybindings,
+                    self.keybinding_preset,
+                    *action,
+                );
+                let is_last = row_idx == actions.len() - 1
+                    && conflict.is_none_or(|c| c.target != *action);
+
+                let mut badges = div().flex().flex_row().items_center().gap_2();
+                if combos.is_empty() {
+                    let act = *action;
+                    badges = badges.child(
+                        div()
+                            .id(SharedString::from(format!("kb-badge-{}", action.binding_id())))
+                            .px(px(7.))
+                            .py(px(3.))
+                            .rounded(px(5.))
+                            .border_1()
+                            .border_color(theme.border)
+                            .border_dashed()
+                            .text_size(px(11.))
+                            .text_color(theme.muted)
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|s| s.bg(theme.surface_raised))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _ev, _window, cx| {
+                                    this.start_binding_capture(act, cx);
+                                }),
+                            )
+                            .child(if is_capturing { "Press keys…" } else { "Unbound" }),
+                    );
+                } else {
+                    for (i, combo) in combos.iter().enumerate() {
+                        let act = *action;
+                        let label = if is_capturing && i == 0 {
+                            SharedString::from("Press keys…")
+                        } else {
+                            SharedString::from(crate::keybindings::format_combo(combo))
+                        };
+                        badges = badges.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "kb-badge-{}-{i}",
+                                    action.binding_id()
+                                )))
+                                .px(px(7.))
+                                .py(px(3.))
+                                .rounded(px(5.))
+                                .bg(if is_capturing && i == 0 {
+                                    theme.accent
+                                } else {
+                                    theme.surface_raised
+                                })
+                                .border_1()
+                                .border_color(if is_capturing && i == 0 {
+                                    theme.accent
+                                } else {
+                                    theme.border
+                                })
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(if is_capturing && i == 0 {
+                                    theme.background
+                                } else {
+                                    theme.foreground
+                                })
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(|s| s.bg(theme.surface_raised))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _ev, _window, cx| {
+                                        this.start_binding_capture(act, cx);
+                                    }),
+                                )
+                                .child(label),
+                        );
+                    }
+                }
+                // Per-action reset + unbind buttons.
+                if customized {
+                    let act = *action;
+                    badges = badges.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "kb-reset-{}",
+                                action.binding_id()
+                            )))
+                            .px(px(6.))
+                            .py(px(3.))
+                            .rounded(px(5.))
+                            .text_size(px(11.))
+                            .text_color(theme.muted)
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|s| s.bg(theme.surface_raised))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _ev, _window, cx| {
+                                    this.reset_action_bindings_ui(act, cx);
+                                }),
+                            )
+                            .child("↺"),
+                    );
+                }
+                if !combos.is_empty() {
+                    let act = *action;
+                    badges = badges.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "kb-unbind-{}",
+                                action.binding_id()
+                            )))
+                            .px(px(6.))
+                            .py(px(3.))
+                            .rounded(px(5.))
+                            .text_size(px(11.))
+                            .text_color(theme.muted)
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|s| s.bg(theme.surface_raised))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _ev, _window, cx| {
+                                    this.unbind_action(act, cx);
+                                }),
+                            )
+                            .child("✕"),
+                    );
+                }
+
+                card = card.child(render_card_row(
+                    format!(
+                        "{}{}",
+                        action.display_name(),
+                        if customized { " •" } else { "" }
+                    ),
+                    None::<&str>,
+                    badges,
+                    is_last,
+                    theme,
+                ));
+
+                // Inline conflict confirmation under the target row.
+                if let Some(c) = conflict {
+                    if c.target == *action {
+                        let owner_name = c.owner.display_name();
+                        let combo_label = crate::keybindings::format_combo(&c.combo);
+                        card = card.child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .px(px(16.))
+                                .py(px(10.))
+                                .bg(theme.surface_raised)
+                                .border_b_1()
+                                .border_color(theme.border)
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.foreground)
+                                        .child(format!("{combo_label} is already assigned to {owner_name}.")),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id("kb-conflict-reassign")
+                                                .px(px(10.))
+                                                .py(px(4.))
+                                                .rounded(px(6.))
+                                                .bg(theme.accent)
+                                                .text_size(px(11.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(theme.background)
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _ev, _window, cx| {
+                                                        this.confirm_binding_conflict(cx);
+                                                    }),
+                                                )
+                                                .child("Reassign"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("kb-conflict-cancel")
+                                                .px(px(10.))
+                                                .py(px(4.))
+                                                .rounded(px(6.))
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .text_size(px(11.))
+                                                .text_color(theme.muted_strong)
+                                                .cursor(CursorStyle::PointingHand)
+                                                .hover(|s| s.bg(theme.surface))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _ev, _window, cx| {
+                                                        this.cancel_binding_capture(cx);
+                                                    }),
+                                                )
+                                                .child("Cancel"),
+                                        ),
+                                ),
+                        );
+                    }
+                }
+            }
+            section = section.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .mb(px(2.))
+                    .mt(px(8.))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme.muted_strong)
+                            .mb(px(6.))
+                            .child(category),
+                    )
+                    .child(card),
+            );
+        }
+
+        root = root.child(section);
+        root
     }
 
     fn render_tab_ai(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
