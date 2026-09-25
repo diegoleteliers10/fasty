@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "fastty"
-version = "0.13.1"
+version = "0.13.2"
 edition = "2021"
 
 [lib]
@@ -50,7 +50,7 @@ icons = "0.18.3"
 smallvec = "1"
 fff-search = { version = "0.10.6", features = ["ripgrep"] }
 miniz_oxide = "0.8"
-ureq = { version = "2.12", features = ["json"] }
+ureq = { version = "2.12", features = ["json", "proxy-from-env"] }
 schemars = { version = "0.8", features = ["derive"] }
 base64 = "0.22"
 

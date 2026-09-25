@@ -3,6 +3,15 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.13.2 - 2026-09-25
+
+- Update checks and downloads no longer depend on the system `curl`. The
+  updater now uses the built-in HTTP client, so the update button appears
+  reliably on Windows, including behind `HTTP_PROXY`/`HTTPS_PROXY` proxies.
+- The "What's new" dialog appears after an upgrade from any version older
+  than 0.13.0, not only after a previous 0.13.x run recorded itself. This
+  fixes the dialog staying silent on macOS upgrades that skipped releases.
+
 ## 0.13.1 - 2026-09-22
 
 - Fixed the web client failing to restore the terminal screen after a
