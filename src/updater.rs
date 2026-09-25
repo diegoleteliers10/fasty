@@ -1,4 +1,20 @@
+use std::time::Duration;
+
 use serde::Deserialize;
+
+/// In-process HTTP client. The updater used to shell out to `curl`, which is
+/// unreliable on Windows: the GUI subsystem has no console, `curl.exe`
+/// resolution depends on PATH, antivirus tools interfere, and foreign curl
+/// ports can hang forever. A failed or hung curl made the update check return
+/// `None`, so the update button never appeared on Windows while it worked on
+/// macOS. `ureq` (rustls) removes that whole failure class; the AI providers
+/// already use it in-process on every platform.
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(30))
+        .build()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseInfo {
@@ -158,20 +174,15 @@ pub fn check_for_update_sync() -> Option<ReleaseInfo> {
     let current_version = env!("CARGO_PKG_VERSION");
     let api_url = "https://api.github.com/repos/diegoleteliers10/fasty/releases/latest";
 
-    let mut cmd = std::process::Command::new("curl");
-    cmd.args(["-sSfL", "--max-time", "6", "-H", "User-Agent: fastty", api_url]);
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
-    let output = cmd.output().ok()?;
+    let release: GitHubRelease = http_agent()
+        .get(api_url)
+        .timeout(Duration::from_secs(15))
+        .set("User-Agent", "fastty")
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
 
-    if !output.status.success() {
-        return None;
-    }
-
-    let release: GitHubRelease = serde_json::from_slice(&output.stdout).ok()?;
     let tag = release.tag_name.trim();
     let version = tag.trim_start_matches('v').to_string();
 
@@ -217,19 +228,16 @@ pub fn apply_update_sync(release: &ReleaseInfo) -> anyhow::Result<()> {
 
     let archive_path = temp_dir.join(&release.asset_name);
 
-    // 1. Download archive
-    let mut curl_cmd = std::process::Command::new("curl");
-    curl_cmd.args(["-sSfL", "-o", archive_path.to_str().unwrap(), &release.download_url]);
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        curl_cmd.creation_flags(0x08000000);
-    }
-    let status = curl_cmd.status()?;
-
-    if !status.success() {
-        anyhow::bail!("Failed to download update asset from {}", release.download_url);
-    }
+    // 1. Download archive (streamed straight to disk; no external process)
+    let response = http_agent()
+        .get(&release.download_url)
+        .set("User-Agent", "fastty")
+        .call()
+        .map_err(|e| anyhow::anyhow!("Failed to download update asset: {e}"))?;
+    let mut reader = response.into_reader();
+    let mut archive = std::fs::File::create(&archive_path)?;
+    std::io::copy(&mut reader, &mut archive)
+        .map_err(|e| anyhow::anyhow!("Failed to write update archive: {e}"))?;
 
     // 2. Extract and Overwrite per platform
     #[cfg(target_os = "macos")]
