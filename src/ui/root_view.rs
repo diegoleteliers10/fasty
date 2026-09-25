@@ -1494,10 +1494,9 @@ impl RootView {
         let sidebar_open = tab_layout == TabLayout::Vertical;
         let sidebar_anim_progress = if sidebar_open { 1.0 } else { 0.0 };
 
-        // One-shot "What's new" dialog: the running version is newer than
-        // the last one seen on this machine. Recorded immediately so it
-        // fires exactly once per version.
-        let whats_new_upgrade = crate::whats_new::pending_upgrade();
+        // One-shot "What's new" dialog. Recorded immediately so it fires
+        // exactly once per version.
+        let show_whats_new = crate::whats_new::should_show();
         crate::whats_new::mark_version_seen();
 
         let mut view = Self {
@@ -1603,7 +1602,7 @@ impl RootView {
             update_status: None,
             is_update_ready: false,
             is_update_modal_open: false,
-            is_whats_new_open: whats_new_upgrade.is_some(),
+            is_whats_new_open: show_whats_new,
             whats_new_notes: crate::whats_new::notes_for(env!("CARGO_PKG_VERSION")),
             pending_close: None,
             pressed_mouse_button: None,

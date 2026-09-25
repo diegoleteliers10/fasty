@@ -3,9 +3,11 @@
 //! At startup the running version is compared against the last version seen
 //! on this machine (a plain-text file in the state dir). When the running
 //! version is newer, the changelog section for it, compiled into the binary
-//! from `CHANGELOG.md`, is shown once. This works for every install channel
-//! (self-update, Homebrew, .deb, MSI) because it compares the running binary
-//! against local state, not the network.
+//! from `CHANGELOG.md`, is shown once. An install with no recorded version
+//! but existing app state counts as an upgrade too, so machines coming from
+//! releases older than the tracker still see the notes. This works for every
+//! install channel (self-update, Homebrew, .deb, MSI) because it compares the
+//! running binary against local state, not the network.
 
 /// Changelog compiled into the binary: always available, also offline.
 const CHANGELOG: &str = include_str!("../CHANGELOG.md");
@@ -14,27 +16,49 @@ fn last_seen_version_path() -> std::path::PathBuf {
     crate::paths::get().state_dir.join("last_seen_version")
 }
 
-/// `Some(previous)` when the running version is newer than the last version
-/// seen on this machine. `None` on first launch and on downgrades.
-pub fn pending_upgrade() -> Option<String> {
-    let seen = std::fs::read_to_string(last_seen_version_path()).ok()?;
-    let seen = seen.trim();
-    if seen.is_empty() {
-        return None;
+/// Whether the What's new dialog should open on this launch.
+///
+/// Two cases fire it:
+/// 1. The running version is newer than the last version seen on this
+///    machine (the normal self-update / package-manager upgrade path).
+/// 2. No version was ever recorded AND the machine already has Fastty state.
+///    The tracker file only exists since 0.13.0, so an install that jumps
+///    from an older release straight past 0.13.0 has no baseline and would
+///    otherwise stay silent forever (seen on macOS: 0.12.0 -> 0.13.1 showed
+///    nothing while Windows, which had run 0.13.0 first, showed the dialog).
+///    Existing state (config file or persisted session) marks those machines
+///    as upgraders; a genuinely fresh install has neither and stays silent.
+pub fn should_show() -> bool {
+    let seen = std::fs::read_to_string(last_seen_version_path())
+        .ok()
+        .map(|content| content.trim().to_string())
+        .filter(|seen| !seen.is_empty());
+    match seen {
+        Some(seen) => is_upgrade(env!("CARGO_PKG_VERSION"), &seen),
+        None => has_existing_install(),
     }
-    let current = env!("CARGO_PKG_VERSION");
-    let is_upgrade = match (
+}
+
+fn is_upgrade(current: &str, seen: &str) -> bool {
+    match (
         crate::updater::parse_version(current),
         crate::updater::parse_version(seen),
     ) {
         (Some(c), Some(s)) => c > s,
         _ => current != seen,
-    };
-    is_upgrade.then(|| seen.to_string())
+    }
+}
+
+/// `paths::init` creates the Fastty directories on every launch, so their
+/// existence says nothing. These files only exist once the app has actually
+/// been used on this machine.
+fn has_existing_install() -> bool {
+    crate::config::Config::get_active_config_path().exists()
+        || crate::session::session_path().exists()
 }
 
 /// Records the running version as seen. Call once per launch, right after
-/// `pending_upgrade`, so the dialog fires exactly once per version.
+/// `should_show`, so the dialog fires exactly once per version.
 pub fn mark_version_seen() {
     let path = last_seen_version_path();
     if let Some(dir) = path.parent() {
@@ -86,5 +110,13 @@ mod tests {
         let md = "## 1.2.0 - 2026-01-01\n\n- A\n\n## 1.0.0\n\n\n";
         assert_eq!(section_for(md, "9.9.9"), None);
         assert_eq!(section_for(md, "1.0.0"), None);
+    }
+
+    #[test]
+    fn upgrade_detection() {
+        assert!(is_upgrade("0.13.1", "0.13.0"));
+        assert!(is_upgrade("0.14.0", "v0.13.1"));
+        assert!(!is_upgrade("0.13.0", "0.13.0"));
+        assert!(!is_upgrade("0.12.9", "0.13.0"));
     }
 }
