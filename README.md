@@ -194,12 +194,12 @@ right_widgets = ["cwd", "duration", "exit_code"]
 | **New Tab** | `⌘T` | `Ctrl+Shift+T` |
 | **Close Tab** | `⌘W` | `Ctrl+Shift+W` |
 | **Rename Tab** | `⌘⇧R` | `Ctrl+Shift+R` |
-| **Next / Previous Tab** | `⌘⇧]` / `⌘⇧[` or `Ctrl+Tab` | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| **Next / Previous Tab** | `⌘⇧]` / `⌘⇧[` | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | **Command Palette** | `⌘P` | `Ctrl+Shift+P` |
 | **SSH Manager** | `⌘O` | `Ctrl+Shift+O` |
 | **Git Worktrees** | `⌘⌥W` | `Ctrl+Alt+W` |
 | **Project Jumper** | `⌘J` | `Ctrl+Shift+J` |
-| **Insert File Path** | `⌃⇧,` / `⌃⌥,` | `Ctrl+Shift+,` / `Ctrl+Alt+,` |
+| **Insert File Path** | `⌃⇧,` | `Ctrl+Shift+,` |
 | **Search in Scrollback** | `⌘F` | `Ctrl+F` |
 | **Settings** | `⌘,` | `Ctrl+,` |
 | **Clear Scrollback** | `⌘K` | `Ctrl+Shift+K` |

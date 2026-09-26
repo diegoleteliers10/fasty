@@ -3,6 +3,15 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.14.2 - 2026-09-26
+
+- Keybindings cleanup: each action now has a single deterministic shortcut
+  across all presets (Default, Ghostty, Tmux, ITerm2) to prevent overlapping
+  and shortcut conflicts.
+- File Path Picker shortcut is standardized to `Ctrl+Shift+,` (`⌃⇧,` on macOS).
+  Removed duplicate `Ctrl+Alt+,` keybinding.
+- Removed duplicate base shortcuts for copy, paste, font adjustments, and tab navigation.
+
 ## 0.14.1 - 2026-09-25
 
 - File Path Picker (`Ctrl+Shift+,`): search workspace files and insert the

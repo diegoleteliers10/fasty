@@ -346,25 +346,16 @@ impl KeyBindingResolver {
         if cfg!(target_os = "macos") {
             insert("super+c", Action::Copy);
             insert("super+v", Action::Paste);
-            insert("shift+insert", Action::Paste);
             insert("super+equal", Action::IncreaseFontSize);
-            insert("super+plus", Action::IncreaseFontSize);
-            insert("super+shift+plus", Action::IncreaseFontSize);
-            insert("super+shift+equal", Action::IncreaseFontSize);
             insert("super+minus", Action::DecreaseFontSize);
             insert("super+0", Action::ResetFontSize);
             insert("super+q", Action::Quit);
         } else {
             insert("ctrl+shift+c", Action::Copy);
             insert("ctrl+shift+v", Action::Paste);
-            insert("shift+insert", Action::Paste);
             insert("ctrl+equal", Action::IncreaseFontSize);
-            insert("ctrl+plus", Action::IncreaseFontSize);
-            insert("ctrl+shift+plus", Action::IncreaseFontSize);
-            insert("ctrl+shift+equal", Action::IncreaseFontSize);
             insert("ctrl+minus", Action::DecreaseFontSize);
             insert("ctrl+0", Action::ResetFontSize);
-            insert("alt+f4", Action::Quit);
             insert("ctrl+q", Action::Quit);
         }
 
@@ -378,7 +369,6 @@ impl KeyBindingResolver {
                     insert("super+l", Action::ToggleAiSidebar);
                     insert("super+n", Action::NewWindow);
                     insert("super+f", Action::OpenSearch);
-                    insert("super+s", Action::OpenSettings);
                     insert("super+comma", Action::OpenSettings);
                     insert("super+r", Action::ReloadConfig);
                     insert("super+p", Action::CommandPalette);
@@ -387,22 +377,13 @@ impl KeyBindingResolver {
                     insert("super+alt+w", Action::WorktreePicker);
                     insert("super+k", Action::ClearScrollback);
                     insert("ctrl+super+f", Action::ToggleFullscreen);
-                    insert("f11", Action::ToggleFullscreen);
                     insert("super+shift+]", Action::NextTab);
                     insert("super+shift+[", Action::PrevTab);
-                    insert("ctrl+tab", Action::NextTab);
-                    insert("ctrl+shift+tab", Action::PrevTab);
                     insert("super+shift+up", Action::PrevPrompt);
-                    insert("super+shift+h", Action::PrevPrompt);
                     insert("super+shift+down", Action::NextPrompt);
                     for n in 1..=9u8 {
                         insert(&format!("super+{n}"), Action::SelectTab(n));
-                        insert(&format!("alt+{n}"), Action::SelectTab(n));
                     }
-                    insert("ctrl+shift+c", Action::Copy);
-                    insert("ctrl+shift+v", Action::Paste);
-                    insert("ctrl+shift+t", Action::NewTab);
-                    insert("ctrl+shift+w", Action::ClosePane);
                     insert("super+d", Action::SplitRight);
                     insert("super+shift+d", Action::SplitDown);
                     insert("super+alt+left", Action::FocusLeft);
@@ -412,14 +393,10 @@ impl KeyBindingResolver {
                     insert("super+shift+f", Action::GlobalSearch);
                     insert("super+shift+o", Action::TabOverview);
                     insert("ctrl+shift+comma", Action::InsertFilePath);
-                    // Alt keeps the base comma character on every keyboard
-                    // layout, unlike Shift which folds into the key.
-                    insert("ctrl+alt+comma", Action::InsertFilePath);
                 } else {
                     insert("ctrl+shift+t", Action::NewTab);
                     insert("ctrl+shift+w", Action::ClosePane);
                     insert("ctrl+shift+q", Action::CloseTab);
-                    insert("ctrl+b", Action::ToggleTabSidebar);
                     insert("ctrl+shift+b", Action::ToggleTabSidebar);
                     insert("ctrl+shift+l", Action::ToggleAiSidebar);
                     insert("ctrl+shift+n", Action::NewWindow);
@@ -433,7 +410,6 @@ impl KeyBindingResolver {
                     insert("ctrl+shift+f", Action::GlobalSearch);
                     insert("ctrl+shift+m", Action::TabOverview);
                     insert("ctrl+comma", Action::OpenSettings);
-                    insert("ctrl+shift+s", Action::OpenSettings);
                     insert("ctrl+shift+r", Action::ReloadConfig);
                     insert("ctrl+shift+p", Action::CommandPalette);
                     insert("ctrl+shift+o", Action::SshManager);
@@ -441,17 +417,11 @@ impl KeyBindingResolver {
                     insert("ctrl+alt+w", Action::WorktreePicker);
                     insert("ctrl+shift+k", Action::ClearScrollback);
                     insert("f11", Action::ToggleFullscreen);
-                    insert("f5", Action::ReloadConfig);
-                    insert("f10", Action::ReloadConfig);
                     insert("ctrl+tab", Action::NextTab);
-                    insert("ctrl+page_down", Action::NextTab);
                     insert("ctrl+shift+tab", Action::PrevTab);
-                    insert("ctrl+page_up", Action::PrevTab);
                     insert("ctrl+shift+up", Action::PrevPrompt);
-                    insert("ctrl+shift+h", Action::PrevPrompt);
                     insert("ctrl+shift+down", Action::NextPrompt);
                     insert("ctrl+shift+comma", Action::InsertFilePath);
-                    insert("ctrl+alt+comma", Action::InsertFilePath);
                     for n in 1..=9u8 {
                         insert(&format!("alt+{n}"), Action::SelectTab(n));
                     }
@@ -469,8 +439,6 @@ impl KeyBindingResolver {
                     insert("super+alt+right", Action::FocusRight);
                     insert("super+alt+up", Action::FocusTop);
                     insert("super+alt+down", Action::FocusDown);
-                    insert("super+shift+j", Action::FocusDown);
-                    insert("super+shift+k", Action::FocusTop);
                     insert("super+comma", Action::OpenSettings);
                     insert("super+shift+p", Action::CommandPalette);
                     insert("super+k", Action::ClearScrollback);
@@ -478,7 +446,6 @@ impl KeyBindingResolver {
                     insert("super+shift+f", Action::GlobalSearch);
                     insert("super+shift+o", Action::TabOverview);
                     insert("ctrl+super+f", Action::ToggleFullscreen);
-                    insert("super+enter", Action::ToggleFullscreen);
                     insert("super+shift+]", Action::NextTab);
                     insert("super+shift+[", Action::PrevTab);
                     for n in 1..=9u8 {
@@ -515,10 +482,6 @@ impl KeyBindingResolver {
                 insert("alt+right", Action::FocusRight);
                 insert("alt+up", Action::FocusTop);
                 insert("alt+down", Action::FocusDown);
-                insert("alt+h", Action::FocusLeft);
-                insert("alt+l", Action::FocusRight);
-                insert("alt+k", Action::FocusTop);
-                insert("alt+j", Action::FocusDown);
                 insert("ctrl+k", Action::ClearScrollback);
                 insert("ctrl+f", Action::OpenSearch);
                 insert("ctrl+shift+f", Action::GlobalSearch);
@@ -1039,5 +1002,33 @@ mod tests {
 
         let iterm = KeyBindingResolver::for_preset(KeybindingPreset::ITerm2);
         assert!(!iterm.bindings.is_empty());
+    }
+
+    #[test]
+    fn test_presets_have_at_most_one_combo_per_action() {
+        for preset in [
+            KeybindingPreset::Default,
+            KeybindingPreset::Ghostty,
+            KeybindingPreset::Tmux,
+            KeybindingPreset::ITerm2,
+        ] {
+            let resolver = KeyBindingResolver::for_preset(preset);
+            for action in Action::all() {
+                let combos = resolver.combos_for(action);
+                assert!(
+                    combos.len() <= 1,
+                    "Preset {preset} has {} combos for action {action:?}: {combos:?}",
+                    combos.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_file_picker_has_only_ctrl_shift_comma() {
+        let resolver = KeyBindingResolver::for_preset(KeybindingPreset::Default);
+        let combos = resolver.combos_for(Action::InsertFilePath);
+        assert_eq!(combos.len(), 1);
+        assert_eq!(combos[0], parse_combo("ctrl+shift+,").unwrap());
     }
 }
