@@ -8,6 +8,7 @@ pub mod config;
 pub mod daemon;
 pub mod daemon_client;
 pub mod event_listener;
+pub mod file_search;
 #[cfg(target_os = "macos")]
 pub mod font_discovery_macos;
 pub mod gateway;

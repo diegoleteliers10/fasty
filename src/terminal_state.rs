@@ -1373,6 +1373,13 @@ impl TerminalState {
         term.grid().display_offset()
     }
 
+    /// Cursor position in visible screen cells: (line from top, column).
+    pub fn cursor_screen_pos(&self) -> (usize, usize) {
+        let term = self.term.lock();
+        let point = term.grid().cursor.point;
+        (point.line.0.max(0) as usize, point.column.0)
+    }
+
     pub fn scroll_to_prev_prompt(&self) {
         let cur_offset = self.display_offset() as u64;
         let total_pushed = self.total_lines_pushed.load(Ordering::Relaxed);

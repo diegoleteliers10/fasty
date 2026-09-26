@@ -875,6 +875,7 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
         PaletteCommand { id: "clear", icon: IconType::Trash2, title: "Clear Scrollback", category: "Terminal", shortcut: Some(if is_mac { "⌘K" } else { "Ctrl+Shift+K" }) },
         PaletteCommand { id: "worktree", icon: IconType::GitPullRequest, title: "Git Worktree Picker", category: "Git", shortcut: Some(if is_mac { "⌘⌥W" } else { "Ctrl+Alt+W" }) },
         PaletteCommand { id: "project_jumper", icon: IconType::Folder, title: "Project / Tab Jumper", category: "Navigation", shortcut: Some(if is_mac { "⌘J" } else { "Ctrl+Shift+J" }) },
+        PaletteCommand { id: "file_picker", icon: IconType::FileCode, title: "Insert File Path (Search Workspace Files)", category: "Tools", shortcut: Some(if is_mac { "⌃⇧," } else { "Ctrl+Shift+," }) },
         PaletteCommand { id: "ssh", icon: IconType::Server, title: "SSH Host Manager", category: "Tools", shortcut: Some(if is_mac { "⌘O" } else { "Ctrl+Shift+O" }) },
         PaletteCommand { id: "snippets", icon: IconType::Terminal, title: "Snippets: Insert Snippet...", category: "Tools", shortcut: None },
         PaletteCommand { id: "prs", icon: IconType::GitPullRequest, title: "GitHub: Pull Requests (Checkout/Approve/Merge)", category: "Git", shortcut: None },
@@ -1189,6 +1190,17 @@ pub struct RootView {
     pub is_project_jumper_open: bool,
     pub project_jumper_query: String,
     pub project_jumper_selected: usize,
+    pub is_file_picker_open: bool,
+    pub file_picker_query: String,
+    pub file_picker_selected: usize,
+    pub file_picker_scroll_handle: ScrollHandle,
+    /// Search root for the file picker (focused tab working directory).
+    pub file_picker_root: Option<std::path::PathBuf>,
+    /// Cached index for `file_picker_root`, rebuilt when the picker opens.
+    pub file_picker_index: Vec<crate::file_search::FileEntry>,
+    /// Window-space pixel position of the terminal cursor line when the
+    /// picker opened; the dropdown anchors above or below it.
+    pub file_picker_anchor: Option<(f32, f32)>,
     pub is_tab_overview_open: bool,
     pub tab_overview_selected: usize,
     pub tab_overview_scroll_handle: ScrollHandle,
@@ -1553,6 +1565,13 @@ impl RootView {
             is_project_jumper_open: false,
             project_jumper_query: String::new(),
             project_jumper_selected: 0,
+            is_file_picker_open: false,
+            file_picker_query: String::new(),
+            file_picker_selected: 0,
+            file_picker_scroll_handle: ScrollHandle::new(),
+            file_picker_root: None,
+            file_picker_index: Vec::new(),
+            file_picker_anchor: None,
             is_tab_overview_open: false,
             tab_overview_selected: 0,
             tab_overview_scroll_handle: ScrollHandle::new(),
@@ -2882,6 +2901,85 @@ impl RootView {
         cx.notify();
     }
 
+    pub fn toggle_file_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.is_file_picker_open = !self.is_file_picker_open;
+        if self.is_file_picker_open {
+            self.file_picker_query.clear();
+            self.file_picker_selected = 0;
+            self.file_picker_scroll_handle.scroll_to_item(0);
+            self.is_settings_open = false;
+            self.is_context_menu_open = false;
+            self.is_about_open = false;
+            self.is_command_palette_open = false;
+            self.is_ssh_manager_open = false;
+            self.is_snippet_picker_open = false;
+            self.is_pr_picker_open = false;
+            self.is_search_open = false;
+            self.is_worktree_picker_open = false;
+            self.is_project_jumper_open = false;
+            self.is_tab_overview_open = false;
+            self.is_global_search_open = false;
+            self.file_picker_anchor = self.terminal_cursor_anchor(window);
+            self.file_picker_root = self
+                .tabs
+                .get(self.active_tab_idx)
+                .and_then(|t| t.cwd.clone());
+            self.file_picker_index = self
+                .file_picker_root
+                .as_deref()
+                .map(crate::file_search::build_index)
+                .unwrap_or_default();
+        }
+        cx.notify();
+    }
+
+    /// Window-space pixel position of the active terminal cursor line.
+    ///
+    /// Mirrors the grid math in `update_selection_endpoint`: visible row is
+    /// the cursor line plus the scrollback display offset.
+    fn terminal_cursor_anchor(&self, window: &Window) -> Option<(f32, f32)> {
+        let tab = self.tabs.get(self.active_tab_idx)?;
+        let pane = tab.pane_tree.active_pane();
+        let terminal = pane
+            .as_ref()
+            .and_then(|p| p.terminal.as_ref())
+            .or(tab.terminal.as_ref())?;
+        let bounds = pane.as_ref().and_then(|p| p.last_bounds)?;
+        let (cell_w, line_h) = self.measure_cell_metrics(window);
+        let line_h = if line_h > 0.0 { line_h } else { 18.0 };
+        let cell_w = if cell_w > 0.0 { cell_w } else { 9.0 };
+        let pane_x = bounds.origin.x.to_f64() as f32;
+        let pane_y = bounds.origin.y.to_f64() as f32;
+        let pane_h = bounds.size.height.to_f64() as f32;
+        let (cur_line, cur_col) = terminal.cursor_screen_pos();
+        let row = (cur_line as f32 + terminal.display_offset() as f32)
+            .min(((pane_h / line_h) as f32).floor());
+        let x = pane_x + cur_col as f32 * cell_w;
+        let y = pane_y + row * line_h;
+        Some((x, y))
+    }
+
+    /// Closes the picker and writes the selected file path into the focused
+    /// terminal input line, quoted when the shell needs it.
+    pub fn insert_selected_file_path(&mut self, cx: &mut Context<Self>) {
+        let matches = crate::file_search::search(
+            &self.file_picker_index,
+            &self.file_picker_query,
+            crate::file_search::MAX_RESULTS,
+        );
+        let Some(entry) = matches.get(self.file_picker_selected) else {
+            return;
+        };
+        let text = crate::paste::format_path_for_shell(std::path::Path::new(&entry.rel_path));
+        self.is_file_picker_open = false;
+        if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
+            if let Some(ref terminal) = active_tab.terminal {
+                crate::paste::paste_text_to_terminal(terminal, &text);
+            }
+        }
+        cx.notify();
+    }
+
     pub fn toggle_tab_overview(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.is_tab_overview_open = !self.is_tab_overview_open;
         if self.is_tab_overview_open {
@@ -3108,6 +3206,7 @@ impl RootView {
             "search" => self.toggle_search(_window, cx),
             "worktree" => self.toggle_worktree_picker(_window, cx),
             "project_jumper" => self.toggle_project_jumper(_window, cx),
+            "file_picker" => self.toggle_file_picker(_window, cx),
             "clear" => {
                 if let Some(tab) = self.tabs.get(self.active_tab_idx) {
                     if let Some(ref term) = tab.terminal {
@@ -5400,6 +5499,68 @@ impl RootView {
             return;
         }
 
+        // 7. File Path Picker Keyboard Handler (Ctrl+Shift+,)
+        if self.is_file_picker_open {
+            if key_lower == "escape" || key_lower == "esc" {
+                self.is_file_picker_open = false;
+                cx.notify();
+                return;
+            }
+            let count = crate::file_search::search(
+                &self.file_picker_index,
+                &self.file_picker_query,
+                crate::file_search::MAX_RESULTS,
+            )
+            .len();
+            if key_lower == "enter" || key_lower == "return" {
+                self.insert_selected_file_path(cx);
+                return;
+            }
+            if key_lower == "down" || key_lower == "arrowdown" || key_lower == "tab" {
+                if count > 0 {
+                    self.file_picker_selected = (self.file_picker_selected + 1) % count;
+                    self.file_picker_scroll_handle.scroll_to_item(self.file_picker_selected);
+                    cx.notify();
+                }
+                return;
+            }
+            if key_lower == "up" || key_lower == "arrowup" {
+                if count > 0 {
+                    self.file_picker_selected = if self.file_picker_selected == 0 {
+                        count - 1
+                    } else {
+                        self.file_picker_selected - 1
+                    };
+                    self.file_picker_scroll_handle.scroll_to_item(self.file_picker_selected);
+                    cx.notify();
+                }
+                return;
+            }
+            if key_lower == "backspace" {
+                self.file_picker_query.pop();
+                self.file_picker_selected = 0;
+                self.file_picker_scroll_handle.scroll_to_item(0);
+                cx.notify();
+                return;
+            }
+            if let Some(ref ch) = event.keystroke.key_char {
+                if !modifiers.platform && !is_ctrl {
+                    self.file_picker_query.push_str(ch);
+                    self.file_picker_selected = 0;
+                    self.file_picker_scroll_handle.scroll_to_item(0);
+                    cx.notify();
+                    return;
+                }
+            } else if key.len() == 1 && !modifiers.platform && !is_ctrl {
+                self.file_picker_query.push_str(key);
+                self.file_picker_selected = 0;
+                self.file_picker_scroll_handle.scroll_to_item(0);
+                cx.notify();
+                return;
+            }
+            return;
+        }
+
         // 6. Dismiss open static overlays on Escape
         if (self.is_settings_open || self.is_about_open || self.is_context_menu_open || self.is_git_menu_open || self.is_tab_context_menu_open || self.is_pane_context_menu_open || self.is_update_modal_open || self.is_whats_new_open)
             && (key_lower == "escape" || key_lower == "esc")
@@ -5464,6 +5625,10 @@ impl RootView {
                 }
                 Action::ProjectJumper => {
                     self.toggle_project_jumper(_window, cx);
+                    return;
+                }
+                Action::InsertFilePath => {
+                    self.toggle_file_picker(_window, cx);
                     return;
                 }
                 Action::OpenSearch => {
@@ -5896,6 +6061,7 @@ impl RootView {
             || self.is_search_open
             || self.is_worktree_picker_open
             || self.is_project_jumper_open
+            || self.is_file_picker_open
             || self.is_tab_overview_open
             || self.is_global_search_open
             || self.is_settings_open
@@ -10068,6 +10234,220 @@ impl Render for RootView {
                                         ),
                                 ),
                         ),
+                )
+            })
+            // File Path Picker Dropdown (Ctrl+Shift+,) — anchored at the
+            // input line, opens below it or flips above near the screen edge
+            .when(self.is_file_picker_open, |this| {
+                let matches = crate::file_search::search(
+                    &self.file_picker_index,
+                    &self.file_picker_query,
+                    crate::file_search::MAX_RESULTS,
+                );
+                let selected_idx = self.file_picker_selected;
+                let root_label = self
+                    .file_picker_root
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "No working directory".to_string());
+
+                let menu_w: f32 = 300.0;
+                let menu_h: f32 = 340.0;
+                let vp = _window.viewport_size();
+                let vp_w = vp.width.to_f64() as f32;
+                let vp_h = vp.height.to_f64() as f32;
+                let (anchor_x, anchor_y) = self.file_picker_anchor.unwrap_or_else(|| {
+                    ((vp_w - menu_w) / 2.0, (vp_h - 160.0).max(0.0))
+                });
+                let popup_x = if anchor_x + menu_w > vp_w - 8.0 {
+                    (vp_w - menu_w - 8.0).max(8.0)
+                } else {
+                    anchor_x.max(8.0)
+                };
+                // Open below the input line; flip above it near the screen bottom.
+                let popup_y = if anchor_y + 24.0 + menu_h > vp_h - 28.0 {
+                    (anchor_y - 8.0 - menu_h).max(36.0)
+                } else {
+                    anchor_y + 24.0
+                };
+
+                this.child(
+                    div()
+                        .id("file-picker-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .on_scroll_wheel(|_ev, _window, cx| cx.stop_propagation())
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                            this.is_file_picker_open = false;
+                            cx.notify();
+                        }))
+                        .on_mouse_down(MouseButton::Right, cx.listener(|this, _ev, _window, cx| {
+                            this.is_file_picker_open = false;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id("file-picker-popup")
+                        .absolute()
+                        .top(px(popup_y))
+                        .left(px(popup_x))
+                        .w(px(menu_w))
+                        .rounded(px(10.))
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.border)
+                                .shadow_xl()
+                                .p(px(8.))
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                // Search input
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .px(px(8.))
+                                        .py(px(6.))
+                                        .rounded(px(6.))
+                                        .bg(theme.surface_raised)
+                                        .child(render_icon(IconType::Search, theme.muted, 13.0))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_size(px(13.))
+                                                .text_color(if self.file_picker_query.is_empty() { theme.muted } else { theme.foreground })
+                                                .child(if self.file_picker_query.is_empty() {
+                                                    "Search files to insert path...".to_string()
+                                                } else {
+                                                    format!("{}|", self.file_picker_query)
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .px(px(6.))
+                                                .py(px(2.))
+                                                .rounded(px(4.))
+                                                .bg(theme.surface)
+                                                .text_size(px(10.))
+                                                .text_color(theme.muted)
+                                                .child("ESC to close"),
+                                        ),
+                                )
+                                // Search root breadcrumb
+                                .child(
+                                    div()
+                                        .px(px(8.))
+                                        .text_size(px(10.))
+                                        .whitespace_nowrap()
+                                        .overflow_hidden()
+                                        .text_color(theme.muted)
+                                        .child(format!("In {}", root_label)),
+                                )
+                                // Results list
+                                .child(
+                                    div()
+                                        .id("file-picker-list")
+                                        .track_scroll(&self.file_picker_scroll_handle)
+                                        .flex()
+                                        .flex_col()
+                                        .max_h(px(260.))
+                                        .overflow_y_scroll()
+                                        .p(px(4.))
+                                        .gap_1()
+                                        .children(
+                                            if matches.is_empty() {
+                                                vec![
+                                                    div()
+                                                        .p(px(16.))
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(12.))
+                                                                .text_color(theme.muted)
+                                                                .child(if self.file_picker_root.is_some() {
+                                                                    "No files matching search".to_string()
+                                                                } else {
+                                                                    "This tab has no working directory".to_string()
+                                                                }),
+                                                        ),
+                                                ]
+                                            } else {
+                                                matches
+                                                    .into_iter()
+                                                    .enumerate()
+                                                    .map(|(idx, entry)| {
+                                                        let is_selected = idx == selected_idx;
+                                                        let file_name = entry.file_name().to_string();
+                                                        let dir_prefix = entry.rel_path
+                                                            [..entry.rel_path.len() - file_name.len()]
+                                                            .to_string();
+                                                        let (icon, icon_color) = if entry.is_dir {
+                                                            (IconType::Folder, theme.accent)
+                                                        } else {
+                                                            (IconType::FileCode, theme.muted)
+                                                        };
+                                                        div()
+                                                            .flex()
+                                                            .flex_row()
+                                                            .items_center()
+                                                            .gap_2()
+                                                            .px(px(10.))
+                                                            .py(px(6.))
+                                                            .rounded(px(6.))
+                                                            .bg(if is_selected { theme.accent } else { theme.surface })
+                                                            .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                                                if this.file_picker_selected != idx {
+                                                                    this.file_picker_selected = idx;
+                                                                    cx.notify();
+                                                                }
+                                                            }))
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                                                this.file_picker_selected = idx;
+                                                                this.insert_selected_file_path(cx);
+                                                            }))
+                                                            .child(render_icon(
+                                                                icon,
+                                                                if is_selected { theme.black } else { icon_color },
+                                                                13.0,
+                                                            ))
+                                                            .child(
+                                                                div()
+                                                                    .flex_1()
+                                                                    .flex()
+                                                                    .flex_row()
+                                                                    .items_center()
+                                                                    .whitespace_nowrap()
+                                                                    .overflow_hidden()
+                                                                    .child(
+                                                                        div()
+                                                                            .text_size(px(11.5))
+                                                                            .text_color(if is_selected { theme.black.opacity(0.8) } else { theme.muted })
+                                                                            .child(dir_prefix),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .text_size(px(12.))
+                                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                                            .text_color(if is_selected { theme.black } else { theme.foreground })
+                                                                            .child(file_name),
+                                                                    ),
+                                                            )
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                            }
+                                        ),
+                                ),
                 )
             })
             // Git Context Menu Overlay

@@ -141,6 +141,7 @@ pub enum Action {
     ClosePane,
     GlobalSearch,
     TabOverview,
+    InsertFilePath,
     Quit,
 }
 
@@ -188,6 +189,7 @@ impl Action {
             Action::OpenSearch,
             Action::GlobalSearch,
             Action::TabOverview,
+            Action::InsertFilePath,
             Action::CommandPalette,
             Action::SshManager,
             Action::ProjectJumper,
@@ -239,6 +241,7 @@ impl Action {
             Action::ClosePane => "close_pane".to_string(),
             Action::GlobalSearch => "global_search".to_string(),
             Action::TabOverview => "tab_overview".to_string(),
+            Action::InsertFilePath => "insert_file_path".to_string(),
             Action::Quit => "quit".to_string(),
         }
     }
@@ -283,6 +286,7 @@ impl Action {
                 Action::ClosePane => "Close Pane",
                 Action::GlobalSearch => "Global Search (All Tabs)",
                 Action::TabOverview => "Tab Overview",
+                Action::InsertFilePath => "Insert File Path",
                 Action::Quit => "Quit",
             }
             .to_string(),
@@ -304,7 +308,8 @@ impl Action {
             | Action::ToggleAiSidebar => "View",
             Action::OpenSearch | Action::GlobalSearch | Action::TabOverview
             | Action::CommandPalette => "Search",
-            Action::SshManager | Action::ProjectJumper | Action::WorktreePicker => "Tools",
+            Action::SshManager | Action::ProjectJumper | Action::WorktreePicker
+            | Action::InsertFilePath => "Tools",
             Action::NewWindow | Action::OpenSettings | Action::ReloadConfig | Action::Quit => {
                 "Application"
             }
@@ -406,6 +411,10 @@ impl KeyBindingResolver {
                     insert("super+alt+down", Action::FocusDown);
                     insert("super+shift+f", Action::GlobalSearch);
                     insert("super+shift+o", Action::TabOverview);
+                    insert("ctrl+shift+comma", Action::InsertFilePath);
+                    // Alt keeps the base comma character on every keyboard
+                    // layout, unlike Shift which folds into the key.
+                    insert("ctrl+alt+comma", Action::InsertFilePath);
                 } else {
                     insert("ctrl+shift+t", Action::NewTab);
                     insert("ctrl+shift+w", Action::ClosePane);
@@ -441,6 +450,8 @@ impl KeyBindingResolver {
                     insert("ctrl+shift+up", Action::PrevPrompt);
                     insert("ctrl+shift+h", Action::PrevPrompt);
                     insert("ctrl+shift+down", Action::NextPrompt);
+                    insert("ctrl+shift+comma", Action::InsertFilePath);
+                    insert("ctrl+alt+comma", Action::InsertFilePath);
                     for n in 1..=9u8 {
                         insert(&format!("alt+{n}"), Action::SelectTab(n));
                     }
@@ -601,7 +612,35 @@ pub fn parse_combo(s: &str) -> Option<KeyCombo> {
             _ => return None,
         }
     }
-    Some(combo)
+    Some(normalize_combo(combo))
+}
+
+/// US-layout shifted punctuation folded back to its base key.
+///
+/// macOS GPUI folds Shift into the key for non-letter characters: pressing
+/// shift+comma reports the key as `<` with `shift = false`. Normalizing both
+/// event combos and config combos through this table keeps `ctrl+shift+,`
+/// matching the `<` keystroke, and makes `super+shift+[` work too.
+const SHIFTED_TO_BASE: &[(char, char)] = &[
+    ('~', '`'), ('!', '1'), ('@', '2'), ('#', '3'), ('$', '4'), ('%', '5'),
+    ('^', '6'), ('&', '7'), ('*', '8'), ('(', '9'), (')', '0'),
+    ('_', '-'), ('+', '='), ('{', '['), ('}', ']'), ('|', '\\'),
+    (':', ';'), ('"', '\''), ('<', ','), ('>', '.'), ('?', '/'),
+];
+
+/// Canonical form of a combo: uppercase and shifted punctuation fold into
+/// the base key with `shift` set.
+pub fn normalize_combo(mut combo: KeyCombo) -> KeyCombo {
+    if let NamedKey::Char(c) = combo.key {
+        if c.is_ascii_uppercase() {
+            combo.key = NamedKey::Char(c.to_ascii_lowercase());
+            combo.shift = true;
+        } else if let Some(&(_, base)) = SHIFTED_TO_BASE.iter().find(|(s, _)| *s == c) {
+            combo.key = NamedKey::Char(base);
+            combo.shift = true;
+        }
+    }
+    combo
 }
 
 fn parse_key(s: &str) -> Option<NamedKey> {
@@ -683,6 +722,7 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "close_pane" => Some(Action::ClosePane),
         "global_search" | "search_all" | "multi_tab_search" => Some(Action::GlobalSearch),
         "tab_overview" | "mission_control" | "tab_peek" => Some(Action::TabOverview),
+        "insert_file_path" | "file_picker" => Some(Action::InsertFilePath),
         "quit" => Some(Action::Quit),
         _ => None,
     }
@@ -854,10 +894,16 @@ pub fn combo_from_key(
         "+" => NamedKey::Plus,
         "-" => NamedKey::Minus,
         "=" => NamedKey::Equal,
+        // Key names some platform backends report instead of the character
+        // (xkb on Linux uses "comma", not ",").
+        "comma" => NamedKey::Char(','),
+        "period" | "dot" => NamedKey::Char('.'),
+        "semicolon" => NamedKey::Char(';'),
+        "slash" => NamedKey::Char('/'),
         s if s.chars().count() == 1 => NamedKey::Char(s.chars().next()?),
         _ => return None,
     };
-    Some(KeyCombo { ctrl, shift, alt, logo, key })
+    Some(normalize_combo(KeyCombo { ctrl, shift, alt, logo, key }))
 }
 
 #[cfg(test)]
@@ -932,6 +978,38 @@ mod tests {
             let combo = parse_combo(s).expect(s);
             assert_eq!(parse_combo(&combo.to_string()), Some(combo), "{s}");
         }
+    }
+
+    #[test]
+    fn test_shifted_punctuation_normalizes_like_macos_gpui() {
+        // macOS GPUI folds Shift into non-letter keys: ctrl+shift+comma
+        // arrives as key "<" with shift = false.
+        let event = combo_from_key("<", true, false, false, false);
+        assert_eq!(event, parse_combo("ctrl+shift+,"));
+        // The same fold applies to super+shift+] (tab switching).
+        let brace = combo_from_key("}", false, false, false, true);
+        assert_eq!(brace, parse_combo("super+shift+]"));
+        // Base keys with an explicit shift modifier stay unchanged.
+        assert_eq!(
+            parse_combo("ctrl+shift+,"),
+            Some(KeyCombo { ctrl: true, shift: true, alt: false, logo: false, key: NamedKey::Char(',') })
+        );
+    }
+
+    #[test]
+    fn test_alt_comma_works_on_any_layout() {
+        // Alt never changes the reported character, so ctrl+alt+comma
+        // resolves regardless of keyboard layout.
+        let event = combo_from_key(",", true, false, true, false);
+        assert_eq!(event, parse_combo("ctrl+alt+,"));
+    }
+
+    #[test]
+    fn test_key_word_aliases() {
+        assert_eq!(
+            combo_from_key("comma", true, false, true, false),
+            parse_combo("ctrl+alt+,")
+        );
     }
 
     #[test]
