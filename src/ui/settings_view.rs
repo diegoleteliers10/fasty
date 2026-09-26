@@ -1310,6 +1310,15 @@ impl SettingsView {
                 if let Some(p) = self.config.keybinding_preset {
                     self.keybinding_preset = p;
                 }
+                // Persist and apply right away. Without this the imported
+                // preset only lives in memory: the next unrelated settings
+                // save silently bakes it into the config file, and the new
+                // keybindings did not apply until restart.
+                self.save_config();
+                crate::keybindings::init_resolver(
+                    self.config.keybindings.clone(),
+                    self.config.keybinding_preset,
+                );
                 crate::config::increment_config_version();
                 cx.notify();
             }
