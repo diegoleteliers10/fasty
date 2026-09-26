@@ -875,7 +875,7 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
         PaletteCommand { id: "clear", icon: IconType::Trash2, title: "Clear Scrollback", category: "Terminal", shortcut: Some(if is_mac { "⌘K" } else { "Ctrl+Shift+K" }) },
         PaletteCommand { id: "worktree", icon: IconType::GitPullRequest, title: "Git Worktree Picker", category: "Git", shortcut: Some(if is_mac { "⌘⌥W" } else { "Ctrl+Alt+W" }) },
         PaletteCommand { id: "project_jumper", icon: IconType::Folder, title: "Project / Tab Jumper", category: "Navigation", shortcut: Some(if is_mac { "⌘J" } else { "Ctrl+Shift+J" }) },
-        PaletteCommand { id: "file_picker", icon: IconType::FileCode, title: "Insert File Path (Search Workspace Files)", category: "Tools", shortcut: Some(if is_mac { "⌃⇧," } else { "Ctrl+Shift+," }) },
+        PaletteCommand { id: "file_picker", icon: IconType::FileCode, title: "Insert File Path (Search Workspace Files)", category: "Tools", shortcut: Some(if is_mac { "⌃⌘," } else { "Ctrl+Super+," }) },
         PaletteCommand { id: "ssh", icon: IconType::Server, title: "SSH Host Manager", category: "Tools", shortcut: Some(if is_mac { "⌘O" } else { "Ctrl+Shift+O" }) },
         PaletteCommand { id: "snippets", icon: IconType::Terminal, title: "Snippets: Insert Snippet...", category: "Tools", shortcut: None },
         PaletteCommand { id: "prs", icon: IconType::GitPullRequest, title: "GitHub: Pull Requests (Checkout/Approve/Merge)", category: "Git", shortcut: None },
@@ -5499,7 +5499,7 @@ impl RootView {
             return;
         }
 
-        // 7. File Path Picker Keyboard Handler (Ctrl+Shift+,)
+        // 7. File Path Picker Keyboard Handler (Ctrl+Cmd+, / ⌃⌘,)
         if self.is_file_picker_open {
             if key_lower == "escape" || key_lower == "esc" {
                 self.is_file_picker_open = false;

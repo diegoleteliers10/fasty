@@ -3,6 +3,12 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.14.3 - 2026-09-26
+
+- File Path Picker keybinding is now exclusively `Ctrl+Cmd+,` (`⌃⌘,` / `Ctrl+Super+,`).
+- Shortcut capture in Settings rejects bare keys without modifiers (such as bare Return or Backspace) and cancels capture on bare Return or Escape.
+- Rebinding an action now replaces existing combinations cleanly instead of accumulating multiple shortcuts.
+
 ## 0.14.2 - 2026-09-26
 
 - Keybindings cleanup: each action now has a single deterministic shortcut

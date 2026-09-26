@@ -392,7 +392,7 @@ impl KeyBindingResolver {
                     insert("super+alt+down", Action::FocusDown);
                     insert("super+shift+f", Action::GlobalSearch);
                     insert("super+shift+o", Action::TabOverview);
-                    insert("ctrl+shift+comma", Action::InsertFilePath);
+                    insert("ctrl+super+comma", Action::InsertFilePath);
                 } else {
                     insert("ctrl+shift+t", Action::NewTab);
                     insert("ctrl+shift+w", Action::ClosePane);
@@ -421,7 +421,7 @@ impl KeyBindingResolver {
                     insert("ctrl+shift+tab", Action::PrevTab);
                     insert("ctrl+shift+up", Action::PrevPrompt);
                     insert("ctrl+shift+down", Action::NextPrompt);
-                    insert("ctrl+shift+comma", Action::InsertFilePath);
+                    insert("ctrl+super+comma", Action::InsertFilePath);
                     for n in 1..=9u8 {
                         insert(&format!("alt+{n}"), Action::SelectTab(n));
                     }
@@ -1025,10 +1025,11 @@ mod tests {
     }
 
     #[test]
-    fn test_file_picker_has_only_ctrl_shift_comma() {
+    fn test_file_picker_has_only_ctrl_cmd_comma() {
         let resolver = KeyBindingResolver::for_preset(KeybindingPreset::Default);
         let combos = resolver.combos_for(Action::InsertFilePath);
         assert_eq!(combos.len(), 1);
-        assert_eq!(combos[0], parse_combo("ctrl+shift+,").unwrap());
+        assert_eq!(combos[0], parse_combo("ctrl+super+,").unwrap());
+        assert_eq!(combos[0], parse_combo("ctrl+cmd+,").unwrap());
     }
 }

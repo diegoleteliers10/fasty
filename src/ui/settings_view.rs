@@ -644,12 +644,14 @@ impl SettingsView {
         if self.capturing_action.is_some() {
             let key = ev.keystroke.key.as_str();
             let mods = &ev.keystroke.modifiers;
-            let bare_escape = key.eq_ignore_ascii_case("escape")
+            let is_escape = key.eq_ignore_ascii_case("escape") || key.eq_ignore_ascii_case("esc");
+            let is_return = key.eq_ignore_ascii_case("return") || key.eq_ignore_ascii_case("enter");
+            if (is_escape || is_return)
                 && !mods.control
                 && !mods.platform
                 && !mods.alt
-                && !mods.shift;
-            if bare_escape {
+                && !mods.shift
+            {
                 self.cancel_binding_capture(cx);
                 return;
             }
@@ -662,9 +664,26 @@ impl SettingsView {
                 mods.alt && !is_alt_gr,
                 mods.platform,
             ) {
-                self.finish_binding_capture(combo, cx);
+                let is_f_key = matches!(
+                    combo.key,
+                    crate::keybindings::NamedKey::F1
+                        | crate::keybindings::NamedKey::F2
+                        | crate::keybindings::NamedKey::F3
+                        | crate::keybindings::NamedKey::F4
+                        | crate::keybindings::NamedKey::F5
+                        | crate::keybindings::NamedKey::F6
+                        | crate::keybindings::NamedKey::F7
+                        | crate::keybindings::NamedKey::F8
+                        | crate::keybindings::NamedKey::F9
+                        | crate::keybindings::NamedKey::F10
+                        | crate::keybindings::NamedKey::F11
+                        | crate::keybindings::NamedKey::F12
+                );
+                if combo.ctrl || combo.alt || combo.logo || is_f_key {
+                    self.finish_binding_capture(combo, cx);
+                }
             }
-            // Modifier-only or unknown keys: keep waiting.
+            // Modifier-only or non-f-key bare keys: keep waiting.
             return;
         }
         if ev.keystroke.key == "escape" {
@@ -1068,6 +1087,30 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn apply_action_binding(
+        &mut self,
+        target: crate::keybindings::Action,
+        combo: crate::keybindings::KeyCombo,
+    ) {
+        let id = target.binding_id();
+        let target_combo_str = combo.to_string();
+        // Remove existing user entries for this action
+        self.config
+            .keybindings
+            .retain(|k, v| v != &id || k == &target_combo_str);
+        // Suppress preset combos for this action that aren't the newly assigned combo
+        let preset_combos =
+            crate::keybindings::KeyBindingResolver::preset_combos(self.keybinding_preset, target);
+        for pc in preset_combos {
+            if pc != combo {
+                self.config
+                    .keybindings
+                    .insert(pc.to_string(), "none".to_string());
+            }
+        }
+        self.config.keybindings.insert(target_combo_str, id);
+    }
+
     fn finish_binding_capture(
         &mut self,
         combo: crate::keybindings::KeyCombo,
@@ -1079,15 +1122,14 @@ impl SettingsView {
         let effective = self.effective_bindings();
         match effective.resolve(&combo) {
             None => {
-                self.config
-                    .keybindings
-                    .insert(combo.to_string(), target.binding_id());
+                self.apply_action_binding(target, combo);
                 self.binding_conflict = None;
                 self.persist_bindings(cx);
             }
             Some(owner) if owner == target => {
+                self.apply_action_binding(target, combo);
                 self.binding_conflict = None;
-                cx.notify();
+                self.persist_bindings(cx);
             }
             Some(owner) => {
                 self.binding_conflict = Some(BindingConflict {
@@ -1102,9 +1144,7 @@ impl SettingsView {
 
     pub fn confirm_binding_conflict(&mut self, cx: &mut Context<Self>) {
         if let Some(conflict) = self.binding_conflict.take() {
-            self.config
-                .keybindings
-                .insert(conflict.combo.to_string(), conflict.target.binding_id());
+            self.apply_action_binding(conflict.target, conflict.combo);
             self.persist_bindings(cx);
         }
     }
@@ -1122,13 +1162,11 @@ impl SettingsView {
     ) {
         let effective = self.effective_bindings();
         let id = action.binding_id();
+        self.config.keybindings.retain(|_, v| v != &id);
         for combo in effective.combos_for(action) {
-            let key = combo.to_string();
-            if self.config.keybindings.get(&key).is_some_and(|v| v == &id) {
-                self.config.keybindings.remove(&key);
-            } else {
-                self.config.keybindings.insert(key, "none".to_string());
-            }
+            self.config
+                .keybindings
+                .insert(combo.to_string(), "none".to_string());
         }
         self.binding_conflict = None;
         self.persist_bindings(cx);
