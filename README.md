@@ -199,6 +199,7 @@ right_widgets = ["cwd", "duration", "exit_code"]
 | **SSH Manager** | `⌘O` | `Ctrl+Shift+O` |
 | **Git Worktrees** | `⌘⌥W` | `Ctrl+Alt+W` |
 | **Project Jumper** | `⌘J` | `Ctrl+Shift+J` |
+| **Insert File Path** | `⌃⇧,` / `⌃⌥,` | `Ctrl+Shift+,` / `Ctrl+Alt+,` |
 | **Search in Scrollback** | `⌘F` | `Ctrl+F` |
 | **Settings** | `⌘,` | `Ctrl+,` |
 | **Clear Scrollback** | `⌘K` | `Ctrl+Shift+K` |

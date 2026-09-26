@@ -3,6 +3,21 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.14.1 - 2026-09-25
+
+- File Path Picker (`Ctrl+Shift+,`): search workspace files and insert the
+  path straight into the terminal input line. Bounded index (20k files,
+  150 ms) skips `node_modules`, `target`, `.git` and friends; fuzzy matching
+  ranks filename and segment hits first.
+- The picker is a dropdown anchored at the cursor line: it opens below the
+  line and flips above it near the screen edge, like the context menu.
+- Shift + punctuation shortcuts now resolve on macOS (GPUI folds Shift into
+  the key). This also fixes `⌘⇧]` / `⌘⇧[` tab switching.
+- Layout-proof alias `Ctrl+Alt+,` for the picker on non-US keyboards, where
+  Shift+comma produces a different character.
+- Importing a terminal config (Ghostty, Warp, ...) now applies and persists
+  immediately; imported presets no longer leak into later settings saves.
+
 ## 0.14.0 - 2026-09-25
 
 - Editable keyboard shortcuts in Settings: click any shortcut and press the
