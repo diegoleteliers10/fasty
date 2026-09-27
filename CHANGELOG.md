@@ -3,6 +3,11 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.14.4 - 2026-09-27
+
+- Terminal context menu opens strictly on right-click (and trackpad two-finger tap).
+- Double-click and triple-click now only select words and lines without opening the context menu.
+
 ## 0.14.3 - 2026-09-26
 
 - File Path Picker keybinding is now exclusively `Ctrl+Cmd+,` (`⌃⌘,` / `Ctrl+Super+,`).

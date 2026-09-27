@@ -6246,7 +6246,7 @@ impl RootView {
             );
 
             if event.click_count == 2 {
-                // Double click: Select word under cursor and open context menu
+                // Double click: Select word under cursor
                 if let Some(term_guard) = terminal.term().try_lock() {
                     let grid = term_guard.grid();
                     if let Some((_token, start_c, end_c)) = crate::selection_classifier::extract_token(grid, start_point, screen_cols) {
@@ -6269,10 +6269,17 @@ impl RootView {
                 self.is_selecting = false;
                 self.has_selection_dragged = false;
                 self.selection_start = None;
-                self.open_pane_context_menu(target_pane_id, mouse_x, mouse_y, cx);
+                if self.config.copy_on_select {
+                    if let Some(text) = self.get_selected_text() {
+                        if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                            let _ = clip.set_text(text);
+                        }
+                    }
+                }
+                cx.notify();
                 return;
             } else if event.click_count >= 3 {
-                // Triple click: Select whole line and open context menu
+                // Triple click: Select whole line
                 let start_p = alacritty_terminal::index::Point::new(
                     alacritty_terminal::index::Line(grid_row),
                     alacritty_terminal::index::Column(0),
@@ -6288,7 +6295,14 @@ impl RootView {
                 self.is_selecting = false;
                 self.has_selection_dragged = false;
                 self.selection_start = None;
-                self.open_pane_context_menu(target_pane_id, mouse_x, mouse_y, cx);
+                if self.config.copy_on_select {
+                    if let Some(text) = self.get_selected_text() {
+                        if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                            let _ = clip.set_text(text);
+                        }
+                    }
+                }
+                cx.notify();
                 return;
             }
 
