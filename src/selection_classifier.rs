@@ -1,5 +1,6 @@
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::Point;
+use alacritty_terminal::grid::{Dimensions, Grid};
+use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::term::cell::{Cell, Flags};
 
 const DELIMITERS: &[char] = &[
     ' ', '\0', '"', '\'', '`', '<', '>', '(', ')', '{', '}', '[', ']',
@@ -201,6 +202,127 @@ pub fn extract_hyperlink(
     Some((uri, start, end))
 }
 
+/// True when a line in the terminal grid contains only whitespace or null characters.
+pub fn is_line_empty(grid: &Grid<Cell>, line_idx: i32, shell_cols: usize) -> bool {
+    let screen_lines = grid.screen_lines() as i32;
+    let history_size = grid.history_size() as i32;
+    if screen_lines == 0 || line_idx < -history_size || line_idx >= screen_lines {
+        return true;
+    }
+    let row = &grid[Line(line_idx)];
+    let cols = shell_cols.min(grid.columns()).min(row.len());
+    for col in 0..cols {
+        let c = row[Column(col)].c;
+        if !c.is_whitespace() && c != '\0' {
+            return false;
+        }
+    }
+    true
+}
+
+/// True when the given line soft-wrapped into the subsequent line.
+pub fn is_line_wrapped(grid: &Grid<Cell>, line_idx: i32) -> bool {
+    let screen_lines = grid.screen_lines() as i32;
+    let history_size = grid.history_size() as i32;
+    if screen_lines == 0 || line_idx < -history_size || line_idx >= screen_lines {
+        return false;
+    }
+    let row = &grid[Line(line_idx)];
+    if row.len() == 0 {
+        return false;
+    }
+    row[Column(row.len() - 1)].flags.contains(Flags::WRAPLINE)
+}
+
+/// Selects the full logical line at `line_idx`, expanding upwards and downwards
+/// across any lines joined by soft-wrapping (`WRAPLINE`).
+pub fn extract_logical_line(
+    grid: &Grid<Cell>,
+    line_idx: i32,
+    shell_cols: usize,
+) -> (Point, Point) {
+    if grid.screen_lines() == 0 {
+        return (
+            Point::new(Line(0), Column(0)),
+            Point::new(Line(0), Column(0)),
+        );
+    }
+    let screen_lines = grid.screen_lines() as i32;
+    let history_size = grid.history_size() as i32;
+    let min_line = -history_size;
+    let max_line = screen_lines - 1;
+
+    let clamped_line = line_idx.clamp(min_line, max_line);
+    let mut start_line = clamped_line;
+    let mut end_line = clamped_line;
+
+    while start_line > min_line && is_line_wrapped(grid, start_line - 1) {
+        start_line -= 1;
+    }
+
+    while end_line < max_line && is_line_wrapped(grid, end_line) {
+        end_line += 1;
+    }
+
+    let end_col = shell_cols.saturating_sub(1);
+    (
+        Point::new(Line(start_line), Column(0)),
+        Point::new(Line(end_line), Column(end_col)),
+    )
+}
+
+/// Selects the full paragraph at `line_idx`, expanding upwards and downwards
+/// through contiguous non-empty lines until reaching a blank line or screen edge.
+pub fn extract_paragraph(
+    grid: &Grid<Cell>,
+    line_idx: i32,
+    shell_cols: usize,
+) -> (Point, Point) {
+    if grid.screen_lines() == 0 {
+        return (
+            Point::new(Line(0), Column(0)),
+            Point::new(Line(0), Column(0)),
+        );
+    }
+    let screen_lines = grid.screen_lines() as i32;
+    let history_size = grid.history_size() as i32;
+    let min_line = -history_size;
+    let max_line = screen_lines - 1;
+
+    let clamped_line = line_idx.clamp(min_line, max_line);
+
+    if is_line_empty(grid, clamped_line, shell_cols) {
+        let end_col = shell_cols.saturating_sub(1);
+        return (
+            Point::new(Line(clamped_line), Column(0)),
+            Point::new(Line(clamped_line), Column(end_col)),
+        );
+    }
+
+    let mut start_line = clamped_line;
+    let mut end_line = clamped_line;
+
+    while start_line > min_line {
+        if is_line_empty(grid, start_line - 1, shell_cols) {
+            break;
+        }
+        start_line -= 1;
+    }
+
+    while end_line < max_line {
+        if is_line_empty(grid, end_line + 1, shell_cols) {
+            break;
+        }
+        end_line += 1;
+    }
+
+    let end_col = shell_cols.saturating_sub(1);
+    (
+        Point::new(Line(start_line), Column(0)),
+        Point::new(Line(end_line), Column(end_col)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,5 +462,92 @@ mod tests {
             Some(Classification::Url(s)) => assert_eq!(s, "https://example.com"),
             other => panic!("expected Url, got {:?}", other),
         }
+    }
+
+    fn grid_with_multi_rows(lines: &[&str], cols: usize) -> alacritty_terminal::grid::Grid<Cell> {
+        let rows = lines.len();
+        let size = TermSize::new(cols, rows);
+        let config = Config::default();
+        let mut term: Term<VoidListener> = Term::new(config, &size, VoidListener);
+        for (i, line) in lines.iter().enumerate() {
+            for ch in line.chars() {
+                term.input(ch);
+            }
+            if i + 1 < lines.len() {
+                term.linefeed();
+                term.carriage_return();
+            }
+        }
+        term.grid().clone()
+    }
+
+    #[test]
+    fn test_extract_paragraph_bounds() {
+        let lines = [
+            "# Changelog",
+            "",
+            "Notable changes per Fastty release. The newest section ships inside the app and",
+            "appears in the \"What's new\" dialog after an update.",
+            "",
+            "## 0.14.4",
+        ];
+        let cols = 80;
+        let grid = grid_with_multi_rows(&lines, cols);
+
+        // Clicking on line 2 (first line of the paragraph)
+        let (start, end) = super::extract_paragraph(&grid, 2, cols);
+        assert_eq!(start.line, Line(2));
+        assert_eq!(start.column, Column(0));
+        assert_eq!(end.line, Line(3));
+        assert_eq!(end.column, Column(cols - 1));
+
+        // Clicking on line 3 (second line of the paragraph)
+        let (start2, end2) = super::extract_paragraph(&grid, 3, cols);
+        assert_eq!(start2.line, Line(2));
+        assert_eq!(end2.line, Line(3));
+
+        // Clicking on empty line 1
+        let (start_empty, end_empty) = super::extract_paragraph(&grid, 1, cols);
+        assert_eq!(start_empty.line, Line(1));
+        assert_eq!(end_empty.line, Line(1));
+    }
+
+    #[test]
+    fn test_extract_logical_line_wrapped() {
+        let lines = ["first row", "second row", "third row"];
+        let cols = 20;
+        let mut grid = grid_with_multi_rows(&lines, cols);
+
+        // Simulate soft-wrap between line 0 and line 1
+        grid[Line(0)][Column(cols - 1)].flags.insert(Flags::WRAPLINE);
+
+        let (start, end) = super::extract_logical_line(&grid, 0, cols);
+        assert_eq!(start.line, Line(0));
+        assert_eq!(end.line, Line(1));
+
+        let (start_from_1, end_from_1) = super::extract_logical_line(&grid, 1, cols);
+        assert_eq!(start_from_1.line, Line(0));
+        assert_eq!(end_from_1.line, Line(1));
+
+        // Line 2 is not wrapped
+        let (start_2, end_2) = super::extract_logical_line(&grid, 2, cols);
+        assert_eq!(start_2.line, Line(2));
+        assert_eq!(end_2.line, Line(2));
+    }
+
+    #[test]
+    fn test_empty_screen_lines_does_not_panic() {
+        let size = TermSize::new(80, 0);
+        let config = Config::default();
+        let term: Term<VoidListener> = Term::new(config, &size, VoidListener);
+        let grid = term.grid();
+
+        let (p1, p2) = super::extract_logical_line(grid, 0, 80);
+        assert_eq!(p1, Point::new(Line(0), Column(0)));
+        assert_eq!(p2, Point::new(Line(0), Column(0)));
+
+        let (p3, p4) = super::extract_paragraph(grid, 0, 80);
+        assert_eq!(p3, Point::new(Line(0), Column(0)));
+        assert_eq!(p4, Point::new(Line(0), Column(0)));
     }
 }

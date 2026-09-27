@@ -3,6 +3,13 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.14.5 - 2026-09-27
+
+- Single-cell isolation and centered rendering for keyboard modifiers (⌘, ⌥, ⌃, ⇧) and arrows to prevent character overlap across all monospace fonts.
+- Restored 100% native font size for keyboard symbols and arrows with dynamic slot fitting for wide glyph fonts.
+- Multi-click paragraph selection (4 clicks) and soft-wrapped logical line selection (3 clicks).
+- Tab alignment normalization: tabs expanded to column-aligned spaces in grid spans and clipboard copy.
+
 ## 0.14.4 - 2026-09-27
 
 - Terminal context menu opens strictly on right-click (and trackpad two-finger tap).

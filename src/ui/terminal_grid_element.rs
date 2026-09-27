@@ -100,6 +100,12 @@ impl Element for TerminalGridElement {
             .nerd_font_family
             .as_ref()
             .map(|f| gpui::font(f.clone()));
+        #[cfg(target_os = "macos")]
+        let kbd_font = gpui::font("Menlo");
+        #[cfg(target_os = "windows")]
+        let kbd_font = gpui::font("Consolas");
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let kbd_font = gpui::font("DejaVu Sans Mono");
 
         // 1. Background Pass: Render negative z-index images beneath cell backgrounds
         for img in self.visible_images.iter().filter(|i| i.z_index < 0) {
@@ -256,6 +262,7 @@ impl Element for TerminalGridElement {
                                         span.is_underline,
                                         span.is_emoji,
                                         span.is_nerd,
+                                        span.is_kbd,
                                         font_size,
                                         self.cell_w,
                                         self.line_h,
@@ -264,6 +271,7 @@ impl Element for TerminalGridElement {
                                         &emoji_font,
                                         &normal_font,
                                         nerd_font.as_ref(),
+                                        &kbd_font,
                                         is_scaled_emoji,
                                         window,
                                         cx,
@@ -286,6 +294,7 @@ impl Element for TerminalGridElement {
                                 span.is_underline,
                                 span.is_emoji,
                                 span.is_nerd,
+                                span.is_kbd,
                                 font_size,
                                 self.cell_w,
                                 self.line_h,
@@ -294,6 +303,7 @@ impl Element for TerminalGridElement {
                                 &emoji_font,
                                 &normal_font,
                                 nerd_font.as_ref(),
+                                &kbd_font,
                                 is_scaled_emoji,
                                 window,
                                 cx,
@@ -307,6 +317,7 @@ impl Element for TerminalGridElement {
                             span.is_underline,
                             span.is_emoji,
                             span.is_nerd,
+                            span.is_kbd,
                             font_size,
                             self.cell_w,
                             self.line_h,
@@ -315,6 +326,7 @@ impl Element for TerminalGridElement {
                             &emoji_font,
                             &normal_font,
                             nerd_font.as_ref(),
+                            &kbd_font,
                             is_scaled_emoji,
                             window,
                             cx,
@@ -408,6 +420,7 @@ fn paint_text_run(
     is_underline: bool,
     is_emoji: bool,
     is_nerd: bool,
+    is_kbd: bool,
     font_size: f32,
     cell_w: f32,
     line_h: f32,
@@ -416,6 +429,7 @@ fn paint_text_run(
     emoji_font: &gpui::Font,
     normal_font: &gpui::Font,
     nerd_font: Option<&gpui::Font>,
+    kbd_font: &gpui::Font,
     is_scaled_emoji: bool,
     window: &mut Window,
     cx: &mut App,
@@ -423,9 +437,9 @@ fn paint_text_run(
     let x_start = (start_col as f32 * cell_w).floor();
     let text_pos = point(origin.x + px(x_start), row_y);
 
-    // F3: Nerd icon spans use the auto-detected Nerd Font when one exists;
-    // otherwise they shape with the normal font (today's behavior).
-    let run_font = if is_nerd {
+    let run_font = if is_kbd {
+        kbd_font.clone()
+    } else if is_nerd {
         nerd_font.cloned().unwrap_or_else(|| normal_font.clone())
     } else if is_emoji {
         emoji_font.clone()
@@ -449,29 +463,41 @@ fn paint_text_run(
         strikethrough: None,
     };
 
-    let force_width = if is_scaled_emoji || is_emoji {
+    let span_w = (text.chars().count() as f32 * cell_w).floor();
+    let force_width = if is_scaled_emoji || is_emoji || is_kbd {
         None
     } else {
         Some(px(cell_w))
     };
 
-    let align = if is_scaled_emoji {
+    let align = if is_scaled_emoji || is_kbd {
         TextAlign::Center
     } else {
         TextAlign::Left
     };
 
-    let align_width = if is_scaled_emoji {
-        let span_w = (text.chars().count() as f32 * cell_w).floor();
+    let align_width = if is_scaled_emoji || is_kbd {
         Some(px(span_w))
     } else {
         None
     };
 
-    let _ = window
+    let shaped = window
         .text_system()
-        .shape_line(gpui::SharedString::from(text), px(font_size), &[run], force_width)
-        .paint(text_pos, px(line_h), align, align_width, window, cx);
+        .shape_line(gpui::SharedString::from(text), px(font_size), &[run.clone()], force_width);
+
+    let shaped = if is_kbd && shaped.width > px(span_w) && shaped.width > px(0.0) {
+        let actual_w = shaped.width.to_f64() as f32;
+        let scale = (span_w / actual_w).min(1.0);
+        let fit_size = (font_size * scale).max(1.0);
+        window
+            .text_system()
+            .shape_line(gpui::SharedString::from(text), px(fit_size), &[run], force_width)
+    } else {
+        shaped
+    };
+
+    let _ = shaped.paint(text_pos, px(line_h), align, align_width, window, cx);
 }
 
 fn paint_geometric_char(

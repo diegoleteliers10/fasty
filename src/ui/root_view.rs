@@ -56,6 +56,8 @@ pub struct StyledSpan {
     /// Nerd Font icon span (PUA codepoints). Shaped with the auto-detected
     /// Nerd Font when one is installed, else today's cascade behavior.
     pub is_nerd: bool,
+    /// Technical keyboard shortcut symbol (⌘, ⌥, ⇧, ⌃, etc.) rendered with dedicated metrics.
+    pub is_kbd: bool,
     /// Font-size factor measured so the emoji ink fits its reserved cells.
     pub emoji_scale: Option<f32>,
     /// Terminal column for each char in `text` (including zerowidth chars,
@@ -620,7 +622,12 @@ fn is_emoji_codepoint(code: u32) -> bool {
         code,
         0x1F300..=0x1FAFF
             | 0x2600..=0x27BF
-            | 0x2300..=0x23FF
+            | 0x231A
+            | 0x231B
+            | 0x2328
+            | 0x23CF
+            | 0x23E9..=0x23F3
+            | 0x23F8..=0x23FA
             | 0x2B50..=0x2B55
     )
 }
@@ -634,6 +641,30 @@ pub fn is_nerd_codepoint(code: u32) -> bool {
         || code == 0x2B58
         || (0xF0000..=0xFFFFD).contains(&code)
         || (0x100000..=0x10FFFD).contains(&code)
+}
+
+/// Technical keyboard shortcut and modifier symbols (⌘, ⌥, ⌃, ⇧, ⎋, ⏎, etc.)
+/// that require dedicated single-cell centering and scaling to prevent overlap.
+#[inline]
+pub fn is_keyboard_symbol(code: u32) -> bool {
+    if is_emoji_codepoint(code) || is_nerd_codepoint(code) {
+        return false;
+    }
+    matches!(
+        code,
+        0x2318 // ⌘ Command
+            | 0x2325 // ⌥ Option
+            | 0x2303 // ⌃ Control
+            | 0x238B // ⎋ Escape
+            | 0x232B // ⌫ Delete / Backspace
+            | 0x2326 // ⌦ Forward delete
+            | 0x23CE // ⏎ Return
+            | 0x2423 // ␣ Space symbol
+            | 0x2190..=0x21FF // All Arrows (← ↑ → ↓ ⇧ ⇥ ⇤ ⇪ ↩ ↵ ⇄ ⇅ ⇐ ⇑ ⇒ ⇓ etc.)
+            | 0x27F0..=0x27FF // Supplemental Arrows-A
+            | 0x2900..=0x297F // Supplemental Arrows-B
+            | 0x2B00..=0x2BFF // Miscellaneous Symbols and Arrows
+    )
 }
 
 /// Finds an installed Nerd Font for icon fallback. Prefers `*Mono`
@@ -1812,6 +1843,7 @@ impl RootView {
         let grid = term_guard.grid();
         let mut text = String::new();
         use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
         for line_i in min_p.line.0..=max_p.line.0 {
             if line_i < -(grid.history_size() as i32) || line_i >= grid.screen_lines() as i32 {
                 continue;
@@ -1823,16 +1855,33 @@ impl RootView {
             } else {
                 row.len().saturating_sub(1)
             };
+            let mut line_str = String::new();
             for col_i in start_c..=end_c {
                 if col_i < row.len() {
                     let cell = &row[Column(col_i)];
                     if cell.c != '\0' {
-                        text.push(cell.c);
+                        line_str.push(if cell.c == '\t' { ' ' } else { cell.c });
                     }
                 }
             }
+            let is_wrapped = if row.len() == 0 {
+                false
+            } else {
+                row[Column(row.len() - 1)].flags.contains(Flags::WRAPLINE)
+            };
             if line_i < max_p.line.0 {
-                text.push('\n');
+                if is_wrapped {
+                    text.push_str(&line_str);
+                } else {
+                    text.push_str(line_str.trim_end_matches(' '));
+                    text.push('\n');
+                }
+            } else {
+                if max_p.column.0 >= row.len().saturating_sub(1) {
+                    text.push_str(line_str.trim_end_matches(' '));
+                } else {
+                    text.push_str(&line_str);
+                }
             }
         }
         if text.trim().is_empty() {
@@ -6278,16 +6327,56 @@ impl RootView {
                 }
                 cx.notify();
                 return;
-            } else if event.click_count >= 3 {
-                // Triple click: Select whole line
-                let start_p = alacritty_terminal::index::Point::new(
-                    alacritty_terminal::index::Line(grid_row),
-                    alacritty_terminal::index::Column(0),
-                );
-                let end_p = alacritty_terminal::index::Point::new(
-                    alacritty_terminal::index::Line(grid_row),
-                    alacritty_terminal::index::Column(screen_cols.saturating_sub(1)),
-                );
+            } else if event.click_count == 3 {
+                // Triple click: Select logical line (including soft-wrapped rows)
+                let (start_p, end_p) = if let Some(term_guard) = terminal.term().try_lock() {
+                    let grid = term_guard.grid();
+                    crate::selection_classifier::extract_logical_line(grid, grid_row, screen_cols)
+                } else {
+                    (
+                        alacritty_terminal::index::Point::new(
+                            alacritty_terminal::index::Line(grid_row),
+                            alacritty_terminal::index::Column(0),
+                        ),
+                        alacritty_terminal::index::Point::new(
+                            alacritty_terminal::index::Line(grid_row),
+                            alacritty_terminal::index::Column(screen_cols.saturating_sub(1)),
+                        ),
+                    )
+                };
+                self.selection = Some(Selection {
+                    start: start_p,
+                    end: end_p,
+                });
+                self.is_selecting = false;
+                self.has_selection_dragged = false;
+                self.selection_start = None;
+                if self.config.copy_on_select {
+                    if let Some(text) = self.get_selected_text() {
+                        if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                            let _ = clip.set_text(text);
+                        }
+                    }
+                }
+                cx.notify();
+                return;
+            } else if event.click_count >= 4 {
+                // Quadruple click: Select full paragraph (bounded by empty lines)
+                let (start_p, end_p) = if let Some(term_guard) = terminal.term().try_lock() {
+                    let grid = term_guard.grid();
+                    crate::selection_classifier::extract_paragraph(grid, grid_row, screen_cols)
+                } else {
+                    (
+                        alacritty_terminal::index::Point::new(
+                            alacritty_terminal::index::Line(grid_row),
+                            alacritty_terminal::index::Column(0),
+                        ),
+                        alacritty_terminal::index::Point::new(
+                            alacritty_terminal::index::Line(grid_row),
+                            alacritty_terminal::index::Column(screen_cols.saturating_sub(1)),
+                        ),
+                    )
+                };
                 self.selection = Some(Selection {
                     start: start_p,
                     end: end_p,
@@ -7014,6 +7103,7 @@ impl RootView {
                         let mut current_block_cat: Option<char> = None;
                         let mut current_is_emoji = false;
                         let mut current_is_nerd = false;
+                        let mut current_is_kbd = false;
                         let mut current_fg = theme.foreground;
                         let mut current_bg: Option<Hsla> = None;
                         let mut current_bold = false;
@@ -7042,6 +7132,7 @@ impl RootView {
                                             is_underline: current_underline,
                                             is_emoji: current_is_emoji,
                                             is_nerd: current_is_nerd,
+                                            is_kbd: current_is_kbd,
                                             emoji_scale: None,
                                             char_cols: current_span_char_cols,
                                         });
@@ -7050,6 +7141,7 @@ impl RootView {
                                         current_block_cat = None;
                                         current_is_emoji = false;
                                         current_is_nerd = false;
+                                        current_is_kbd = false;
                                     }
                                     trim_row_spans(&mut current_row_spans);
                                     lines.push(current_row_spans);
@@ -7091,6 +7183,7 @@ impl RootView {
                             let is_bold = cell.flags.contains(Flags::BOLD);
                             let is_underline = cell.flags.contains(Flags::UNDERLINE) || is_hovered_url || cell.hyperlink().is_some();
                             let code = cell.c as u32;
+                            let is_kbd = is_keyboard_symbol(code);
                             let is_emoji = is_emoji_codepoint(code);
                             let is_nerd = is_nerd_codepoint(code);
                             let is_pua_icon = (0xE000..=0xF8FF).contains(&code)
@@ -7101,6 +7194,7 @@ impl RootView {
                                 || (0x25A0..=0x25FF).contains(&code)
                                 || is_emoji
                                 || is_pua_icon
+                                || is_kbd
                             {
                                 Some(cell.c)
                             } else {
@@ -7115,6 +7209,8 @@ impl RootView {
                                 || is_bold != current_bold
                                 || is_underline != current_underline
                                 || block_cat != current_block_cat
+                                || current_is_kbd
+                                || is_kbd
                                 || current_span_text.is_empty()
                             {
                                 if !current_span_text.is_empty() {
@@ -7128,6 +7224,7 @@ impl RootView {
                                         is_underline: current_underline,
                                         is_emoji: current_is_emoji,
                                         is_nerd: current_is_nerd,
+                                        is_kbd: current_is_kbd,
                                         emoji_scale: None,
                                         char_cols: current_span_char_cols,
                                     });
@@ -7141,9 +7238,11 @@ impl RootView {
                                 current_block_cat = block_cat;
                                 current_is_emoji = is_emoji;
                                 current_is_nerd = is_nerd;
+                                current_is_kbd = is_kbd;
                                 current_span_start_col = col;
                             }
-                            current_span_text.push(cell.c);
+                            let display_c = if cell.c == '\t' || cell.c == '\0' { ' ' } else { cell.c };
+                            current_span_text.push(display_c);
                             current_span_char_cols.push(col);
                             current_span_end_col = end_col;
                         }
@@ -7159,6 +7258,7 @@ impl RootView {
                                 is_underline: current_underline,
                                 is_emoji: current_is_emoji,
                                 is_nerd: current_is_nerd,
+                                is_kbd: current_is_kbd,
                                 emoji_scale: None,
                                 char_cols: current_span_char_cols,
                             });
@@ -11960,6 +12060,54 @@ mod tests {
         assert!(!is_nerd_codepoint('●' as u32));
     }
 
+    #[test]
+    fn test_is_emoji_codepoint_excludes_keyboard_symbols() {
+        // macOS technical keyboard symbols must NOT be emojis so they render with monospace metrics
+        assert!(!is_emoji_codepoint('⌘' as u32));
+        assert!(!is_emoji_codepoint('⌥' as u32));
+        assert!(!is_emoji_codepoint('⌃' as u32));
+        assert!(!is_emoji_codepoint('⎋' as u32));
+        assert!(!is_emoji_codepoint('⌫' as u32));
+        assert!(!is_emoji_codepoint('⌦' as u32));
+        assert!(!is_emoji_codepoint('⏎' as u32));
+        assert!(!is_emoji_codepoint('⇧' as u32));
+
+        // Actual emojis in the 0x2300 block must still be recognized
+        assert!(is_emoji_codepoint(0x231A)); // ⌚
+        assert!(is_emoji_codepoint(0x231B)); // ⌛
+        assert!(is_emoji_codepoint(0x23F0)); // ⏰
+        assert!(is_emoji_codepoint(0x23F3)); // ⏳
+    }
+
+    #[test]
+    fn test_is_keyboard_symbol_classification() {
+        assert!(is_keyboard_symbol('⌘' as u32));
+        assert!(is_keyboard_symbol('⌥' as u32));
+        assert!(is_keyboard_symbol('⌃' as u32));
+        assert!(is_keyboard_symbol('⇧' as u32));
+        assert!(is_keyboard_symbol('⎋' as u32));
+        assert!(is_keyboard_symbol('⏎' as u32));
+        assert!(is_keyboard_symbol('←' as u32));
+        assert!(is_keyboard_symbol('→' as u32));
+        assert!(is_keyboard_symbol('↑' as u32));
+        assert!(is_keyboard_symbol('↓' as u32));
+        assert!(is_keyboard_symbol(0x27F5)); // ⟵ Long leftwards arrow (Supplemental Arrows-A)
+        assert!(is_keyboard_symbol(0x2905)); // ⤅ Rightwards two-headed arrow from bar (Supplemental Arrows-B)
+        assert!(is_keyboard_symbol(0x2B05)); // ⬅ Leftwards black arrow (Misc Symbols and Arrows)
+
+        // Regular text characters must not be keyboard symbols
+        assert!(!is_keyboard_symbol('A' as u32));
+        assert!(!is_keyboard_symbol('R' as u32));
+        assert!(!is_keyboard_symbol('W' as u32));
+        assert!(!is_keyboard_symbol('0' as u32));
+        assert!(!is_keyboard_symbol(' ' as u32));
+
+        // Emojis and Nerd Font symbols in 0x2B00 block must not be keyboard symbols
+        assert!(!is_keyboard_symbol(0x2B50)); // ⭐ Star emoji
+        assert!(!is_keyboard_symbol(0x2B55)); // ⭕ Circle emoji
+        assert!(!is_keyboard_symbol(0x2B58)); // Nerd Font icon
+    }
+
         #[test]
     fn test_pr_action_mapping_and_commands() {
         assert_eq!(pr_action_count(), 4);
@@ -12191,6 +12339,7 @@ mod tests {
                 is_underline: false,
                 is_emoji: false,
                 is_nerd: false,
+                is_kbd: false,
                 emoji_scale: None,
                 char_cols: vec![0, 1, 2, 3, 4],
             },
@@ -12204,6 +12353,7 @@ mod tests {
                 is_underline: false,
                 is_emoji: false,
                 is_nerd: false,
+                is_kbd: false,
                 emoji_scale: None,
                 char_cols: vec![5, 6, 7, 8],
             },
@@ -12226,6 +12376,7 @@ mod tests {
                 is_underline: false,
                 is_emoji: false,
                 is_nerd: false,
+                is_kbd: false,
                 emoji_scale: None,
                 char_cols: (0..14).collect(),
             },
