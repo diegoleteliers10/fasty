@@ -1132,6 +1132,20 @@ impl Drop for TerminalState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreviewSpan {
+    pub text: String,
+    pub fg: Option<alacritty_terminal::vte::ansi::Color>,
+    pub bold: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreviewLine {
+    pub spans: Vec<PreviewSpan>,
+    pub is_cursor_row: bool,
+    pub cursor_col: Option<usize>,
+}
+
 impl TerminalState {
 
     pub fn write_to_pty(&self, bytes: &[u8]) {
@@ -1528,30 +1542,149 @@ impl TerminalState {
         snippets
     }
 
-    pub fn get_screen_preview_lines(&self, max_lines: usize) -> Vec<String> {
-        use alacritty_terminal::index::Line;
+    pub fn get_screen_preview(&self, max_lines: usize) -> Vec<PreviewLine> {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        use alacritty_terminal::term::TermMode;
+
         let term = self.term.lock();
         let grid = term.grid();
         let screen_lines = grid.screen_lines();
-        if screen_lines == 0 {
+        let cols = grid.columns();
+        if screen_lines == 0 || cols == 0 || max_lines == 0 {
             return Vec::new();
         }
-        let mut lines = Vec::new();
-        let count = screen_lines.min(max_lines);
-        for line_i in 0..count {
-            let row = &grid[Line(line_i as i32)];
-            let mut line_str = String::new();
-            for cell in row.into_iter() {
-                let c = cell.c;
-                if c != '\0' {
-                    line_str.push(c);
-                } else {
-                    line_str.push(' ');
+
+        let is_alt = term.mode().contains(TermMode::ALT_SCREEN);
+        let cursor_point = grid.cursor.point;
+        let cursor_line = cursor_point.line.0.max(0) as usize;
+        let cursor_col = cursor_point.column.0.min(cols.saturating_sub(1));
+
+        let (start_row, end_row) = if is_alt {
+            let count = screen_lines.min(max_lines);
+            (0, count.saturating_sub(1))
+        } else {
+            let mut last_non_empty = 0;
+            for line_i in (0..screen_lines).rev() {
+                let row = &grid[Line(line_i as i32)];
+                let has_content = (0..cols).any(|c| {
+                    let cell = &row[Column(c)];
+                    cell.c != ' ' && cell.c != '\0' && cell.c != '\t'
+                });
+                if has_content {
+                    last_non_empty = line_i;
+                    break;
                 }
             }
-            lines.push(line_str.trim_end().to_string());
+            let anchor = cursor_line.max(last_non_empty).min(screen_lines - 1);
+            if anchor < max_lines {
+                (0, screen_lines.min(max_lines).saturating_sub(1))
+            } else {
+                let start = (anchor + 1).saturating_sub(max_lines);
+                (start, anchor)
+            }
+        };
+
+        let mut result = Vec::with_capacity(end_row.saturating_sub(start_row) + 1);
+
+        for line_i in start_row..=end_row {
+            let row = &grid[Line(line_i as i32)];
+            let is_cursor_row = line_i == cursor_line;
+
+            let mut last_used_col = 0;
+            let mut row_has_chars = false;
+            for c in (0..cols).rev() {
+                let cell = &row[Column(c)];
+                if cell.c != ' ' && cell.c != '\0' && cell.c != '\t' {
+                    last_used_col = c;
+                    row_has_chars = true;
+                    break;
+                }
+            }
+
+            let mut spans: Vec<PreviewSpan> = Vec::new();
+            if row_has_chars || is_cursor_row {
+                let limit_col = if row_has_chars {
+                    if is_cursor_row {
+                        last_used_col.max(cursor_col)
+                    } else {
+                        last_used_col
+                    }
+                } else {
+                    cursor_col
+                };
+
+                let mut cur_text = String::new();
+                let mut cur_fg: Option<alacritty_terminal::vte::ansi::Color> = None;
+                let mut cur_bold = false;
+
+                for col_i in 0..=limit_col.min(cols.saturating_sub(1)) {
+                    let cell = &row[Column(col_i)];
+                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                        continue;
+                    }
+
+                    let effective_fg = if cell.flags.contains(Flags::INVERSE) {
+                        cell.bg
+                    } else {
+                        cell.fg
+                    };
+                    let effective_bold = cell.flags.contains(Flags::BOLD);
+                    let c = if cell.c == '\t' || cell.c == '\0' { ' ' } else { cell.c };
+
+                    let cell_fg_opt = match effective_fg {
+                        alacritty_terminal::vte::ansi::Color::Named(
+                            alacritty_terminal::vte::ansi::NamedColor::Foreground,
+                        ) => None,
+                        other => Some(other),
+                    };
+
+                    if cell_fg_opt != cur_fg || effective_bold != cur_bold {
+                        if !cur_text.is_empty() {
+                            spans.push(PreviewSpan {
+                                text: std::mem::take(&mut cur_text),
+                                fg: cur_fg,
+                                bold: cur_bold,
+                            });
+                        }
+                        cur_fg = cell_fg_opt;
+                        cur_bold = effective_bold;
+                    }
+                    cur_text.push(c);
+                }
+
+                if !cur_text.is_empty() {
+                    spans.push(PreviewSpan {
+                        text: cur_text,
+                        fg: cur_fg,
+                        bold: cur_bold,
+                    });
+                }
+            }
+
+            result.push(PreviewLine {
+                spans,
+                is_cursor_row,
+                cursor_col: if is_cursor_row { Some(cursor_col) } else { None },
+            });
         }
-        lines
+
+        result
+    }
+
+    pub fn get_screen_preview_lines(&self, max_lines: usize) -> Vec<String> {
+        self.get_screen_preview(max_lines)
+            .into_iter()
+            .map(|line| {
+                let joined = line
+                    .spans
+                    .into_iter()
+                    .map(|s| s.text)
+                    .collect::<Vec<_>>()
+                    .join("");
+                joined.trim_end().to_string()
+            })
+            .collect()
     }
 
     /// Render the current screen (not scrollback) as ANSI/SGR bytes, so an
@@ -2728,5 +2861,20 @@ mod tests {
         assert_eq!(store.images.len(), 1);
         assert!(store.images.contains_key(&2));
         assert!(!store.images.contains_key(&1));
+    }
+
+    #[test]
+    fn test_get_screen_preview_anchoring() {
+        if let Ok(term) = TerminalState::new_headless("/bin/sh", &[], None, 80, 24) {
+            let preview = term.get_screen_preview(10);
+            assert!(preview.len() <= 10);
+            let lines = term.get_screen_preview_lines(10);
+            assert_eq!(lines.len(), preview.len());
+            // Lines should correspond to rendered preview spans
+            for (line_str, prev_line) in lines.iter().zip(preview.iter()) {
+                let joined = prev_line.spans.iter().map(|s| s.text.as_str()).collect::<String>();
+                assert_eq!(line_str, joined.trim_end());
+            }
+        }
     }
 }

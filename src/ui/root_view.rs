@@ -4866,16 +4866,18 @@ impl RootView {
                 cx.notify();
                 return;
             }
+            let win_w = _window.viewport_size().width.to_f64() as f32;
+            let available_w = (win_w - 64.0).max(320.0);
+            let max_cols = ((available_w + 16.0) / (300.0 + 16.0)).floor().clamp(1.0, 4.0) as usize;
+            let step_cols = max_cols.min(count);
             if key_lower == "down" || key_lower == "arrowdown" || key_lower == "j" {
-                let cols = 3.min(count);
-                self.tab_overview_selected = (self.tab_overview_selected + cols).min(count - 1);
+                self.tab_overview_selected = (self.tab_overview_selected + step_cols).min(count - 1);
                 self.tab_overview_scroll_handle.scroll_to_item(self.tab_overview_selected);
                 cx.notify();
                 return;
             }
             if key_lower == "up" || key_lower == "arrowup" || key_lower == "k" {
-                let cols = 3.min(count);
-                self.tab_overview_selected = self.tab_overview_selected.saturating_sub(cols);
+                self.tab_overview_selected = self.tab_overview_selected.saturating_sub(step_cols);
                 self.tab_overview_scroll_handle.scroll_to_item(self.tab_overview_selected);
                 cx.notify();
                 return;
@@ -10997,6 +10999,12 @@ impl Render for RootView {
                 let backdrop = gpui::hsla(0.0, 0.0, 0.0, 0.75);
                 let selected_idx = self.tab_overview_selected;
                 let font_fam = self.font_family.clone();
+                let win_w = _window.viewport_size().width.to_f64() as f32;
+                let available_w = (win_w - 64.0).max(320.0);
+                let total_items = (self.tabs.len() + 1) as f32;
+                let max_cols = ((available_w + 16.0) / (300.0 + 16.0)).floor().clamp(1.0, 4.0);
+                let active_cols = max_cols.min(total_items);
+                let container_w = active_cols * 300.0 + (active_cols - 1.0).max(0.0) * 16.0 + 8.0;
 
                 this.child(
                     div()
@@ -11021,8 +11029,8 @@ impl Render for RootView {
                                 .flex_row()
                                 .items_center()
                                 .justify_between()
-                                .w_full()
-                                .max_w(px(980.))
+                                .w(px(container_w))
+                                .max_w(px(container_w))
                                 .px(px(16.))
                                 .py(px(10.))
                                 .rounded(px(10.))
@@ -11094,9 +11102,8 @@ impl Render for RootView {
                                 .flex_row()
                                 .flex_wrap()
                                 .justify_center()
-                                .w_full()
-                                .max_w(px(980.))
-                                .max_h(px(580.))
+                                .w(px(container_w))
+                                .max_h(px(640.))
                                 .overflow_y_scroll()
                                 .gap_4()
                                 .p(px(4.))
@@ -11111,14 +11118,15 @@ impl Render for RootView {
                                         let title = tab.custom_title.clone().unwrap_or_else(|| tab.title.clone());
                                         let proc_name = tab.terminal.as_ref().and_then(|t| t.get_foreground_process_name()).unwrap_or_else(|| "terminal".to_string());
                                         let (icon_type, _) = super::icons::get_deck_process_icon(&proc_name);
-                                        let preview_lines = tab.terminal.as_ref().map(|t| t.get_screen_preview_lines(7)).unwrap_or_default();
+                                        let active_term = tab.terminal.clone().or_else(|| tab.pane_tree.all_panes().first().and_then(|p| p.terminal.clone()));
+                                        let preview_lines = active_term.as_ref().map(|t| t.get_screen_preview(10)).unwrap_or_default();
                                         let split_count = tab.pane_tree.all_panes().len();
                                         let branch_opt = tab.git_status.as_ref().map(|g| g.branch.clone());
 
                                         div()
                                             .flex()
                                             .flex_col()
-                                            .w(px(290.))
+                                            .w(px(300.))
                                             .h(px(210.))
                                             .rounded(px(10.))
                                             .bg(theme.surface)
@@ -11141,17 +11149,19 @@ impl Render for RootView {
                                             // Card Top Bar
                                             .child(
                                                 div()
+                                                    .h(px(32.))
                                                     .flex()
                                                     .flex_row()
                                                     .items_center()
                                                     .justify_between()
                                                     .px(px(10.))
-                                                    .py(px(7.))
                                                     .bg(if is_selected { theme.accent.opacity(0.12) } else { theme.surface_raised })
                                                     .border_b_1()
                                                     .border_color(theme.border)
                                                     .child(
                                                         div()
+                                                            .flex_1()
+                                                            .min_w_0()
                                                             .flex()
                                                             .flex_row()
                                                             .items_center()
@@ -11159,20 +11169,24 @@ impl Render for RootView {
                                                             .child(render_icon(icon_type, theme.accent, 13.0))
                                                             .child(
                                                                 div()
+                                                                    .flex_1()
+                                                                    .min_w_0()
                                                                     .text_size(px(11.5))
                                                                     .font_weight(FontWeight::BOLD)
                                                                     .text_color(theme.foreground)
-                                                                    .max_w(px(140.))
+                                                                    .whitespace_nowrap()
+                                                                    .text_ellipsis()
                                                                     .overflow_hidden()
                                                                     .child(title),
                                                             ),
                                                     )
                                                     .child(
                                                         div()
+                                                            .flex_shrink_0()
                                                             .flex()
                                                             .flex_row()
                                                             .items_center()
-                                                            .gap_1()
+                                                            .gap_1_5()
                                                             .when(split_count > 1, |el| {
                                                                 el.child(
                                                                     div()
@@ -11220,61 +11234,140 @@ impl Render for RootView {
                                             .child(
                                                 div()
                                                     .flex_1()
-                                                    .bg(theme.black.opacity(0.85))
-                                                    .p(px(8.))
+                                                    .bg(theme.black.opacity(0.92))
+                                                    .px(px(8.))
+                                                    .py(px(6.))
                                                     .font_family(font_fam.clone())
-                                                    .text_size(px(9.5))
-                                                    .text_color(theme.foreground.opacity(0.8))
+                                                    .text_size(px(8.0))
                                                     .overflow_hidden()
                                                     .flex()
                                                     .flex_col()
-                                                    .gap(px(1.))
+                                                    .justify_start()
+                                                    .gap(px(1.5))
                                                     .children(
-                                                        if preview_lines.is_empty() {
+                                                        if preview_lines.is_empty() || preview_lines.iter().all(|l| l.spans.is_empty()) {
                                                             vec![
                                                                 div()
-                                                                    .text_color(theme.muted)
+                                                                    .flex_1()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_center()
+                                                                    .text_size(px(9.5))
+                                                                    .text_color(theme.muted.opacity(0.6))
                                                                     .child("~ (empty buffer)")
                                                             ]
                                                         } else {
                                                             preview_lines
                                                                 .into_iter()
-                                                                .map(|l| {
+                                                                .map(|line| {
+                                                                    let is_cursor_row = line.is_cursor_row;
                                                                     div()
-                                                                        .max_w(px(270.))
+                                                                        .h(px(13.))
+                                                                        .w_full()
+                                                                        .flex()
+                                                                        .flex_row()
+                                                                        .items_center()
                                                                         .overflow_hidden()
-                                                                        .child(if l.is_empty() { " ".to_string() } else { l })
+                                                                        .whitespace_nowrap()
+                                                                        .when(line.spans.is_empty(), |el| {
+                                                                            if is_cursor_row {
+                                                                                el.child(
+                                                                                    div()
+                                                                                        .w(px(5.))
+                                                                                        .h(px(9.))
+                                                                                        .rounded(px(1.))
+                                                                                        .bg(theme.accent)
+                                                                                )
+                                                                            } else {
+                                                                                el.child(div().h(px(13.)).child(" "))
+                                                                            }
+                                                                        })
+                                                                        .when(!line.spans.is_empty(), |el| {
+                                                                            let mut row_el = el;
+                                                                            for span in line.spans {
+                                                                                let color = match span.fg {
+                                                                                    Some(ansi) => self.convert_color(ansi, true),
+                                                                                    None => theme.foreground.opacity(0.85),
+                                                                                };
+                                                                                row_el = row_el.child(
+                                                                                    div()
+                                                                                        .text_color(color)
+                                                                                        .when(span.bold, |s| s.font_weight(FontWeight::BOLD))
+                                                                                        .child(span.text),
+                                                                                );
+                                                                            }
+                                                                            if is_cursor_row {
+                                                                                row_el = row_el.child(
+                                                                                    div()
+                                                                                        .w(px(5.))
+                                                                                        .h(px(9.))
+                                                                                        .rounded(px(1.))
+                                                                                        .bg(theme.accent)
+                                                                                        .ml(px(1.)),
+                                                                                );
+                                                                            }
+                                                                            row_el
+                                                                        })
                                                                 })
                                                                 .collect()
                                                         }
                                                     ),
                                             )
                                             // Card Bottom Status Bar
-                                            .child(
+                                            .child({
+                                                let folder_name = tab.cwd.as_ref().and_then(|p| p.file_name()).map(|f| f.to_string_lossy().into_owned());
                                                 div()
+                                                    .h(px(26.))
                                                     .flex()
                                                     .flex_row()
                                                     .items_center()
                                                     .justify_between()
                                                     .px(px(8.))
-                                                    .py(px(4.))
                                                     .bg(theme.surface)
                                                     .border_t_1()
                                                     .border_color(theme.border)
                                                     .child(
                                                         div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .flex()
+                                                            .flex_row()
+                                                            .items_center()
+                                                            .gap(px(5.))
                                                             .text_size(px(9.5))
                                                             .text_color(theme.muted)
-                                                            .child(format!("cmd: {}", proc_name)),
+                                                            .whitespace_nowrap()
+                                                            .text_ellipsis()
+                                                            .overflow_hidden()
+                                                            .child(div().child(format!("cmd: {}", proc_name)))
+                                                            .when_some(folder_name, |el, folder| {
+                                                                el.child(div().text_color(theme.muted.opacity(0.5)).child("•"))
+                                                                    .child(render_icon(IconType::Folder, theme.muted, 11.0))
+                                                                    .child(div().text_ellipsis().overflow_hidden().child(folder))
+                                                            }),
                                                     )
                                                     .child(
                                                         div()
+                                                            .flex_shrink_0()
+                                                            .pl(px(6.))
+                                                            .flex()
+                                                            .flex_row()
+                                                            .items_center()
+                                                            .gap(px(4.))
                                                             .text_size(px(9.5))
                                                             .font_weight(FontWeight::MEDIUM)
                                                             .text_color(theme.accent)
-                                                            .child(branch_opt.map(|b| format!("🌿 {b}")).unwrap_or_else(|| "local".to_string())),
-                                                    ),
-                                            )
+                                                            .whitespace_nowrap()
+                                                            .map(|el| {
+                                                                if let Some(b) = branch_opt {
+                                                                    el.child(render_icon(IconType::GitBranch, theme.accent, 11.0))
+                                                                        .child(b)
+                                                                } else {
+                                                                    el.child("local")
+                                                                }
+                                                            }),
+                                                    )
+                                            })
                                     })
                                 )
                                 // Plus Card to Add Tab
@@ -11284,7 +11377,7 @@ impl Render for RootView {
                                         .flex_col()
                                         .items_center()
                                         .justify_center()
-                                        .w(px(290.))
+                                        .w(px(300.))
                                         .h(px(210.))
                                         .rounded(px(10.))
                                         .bg(theme.surface.opacity(0.5))

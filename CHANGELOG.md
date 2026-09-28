@@ -3,6 +3,14 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.14.8 - 2026-09-28
+
+- Organize tabs in a grid layout with a maximum of 4 tabs per row in Mission Control.
+- Adjust preview card size to 300px × 210px for balanced screen distribution.
+- Replace folder and git branch emojis with vector icons in preview card footers.
+- Normalize tab characters to spaces in screen previews to preserve terminal column alignment.
+- Update vertical keyboard navigation to step by row column count.
+
 ## 0.14.7 - 2026-09-28
 
 - Show changelog modal with release notes when an update is ready before restart.
