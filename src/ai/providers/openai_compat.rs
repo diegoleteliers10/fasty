@@ -418,9 +418,14 @@ pub fn detect_installed_ollama_models(base_url: Option<&str>) -> Vec<String> {
 
     // 2. If HTTP didn't find any or failed, fallback to running `ollama list` CLI
     if detected.is_empty() {
-        if let Ok(output) = std::process::Command::new("ollama")
-            .arg("list")
-            .output()
+        let mut ollama_cmd = std::process::Command::new("ollama");
+        ollama_cmd.arg("list");
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            ollama_cmd.creation_flags(0x08000000);
+        }
+        if let Ok(output) = ollama_cmd.output()
         {
             if output.status.success() {
                 let text = String::from_utf8_lossy(&output.stdout);

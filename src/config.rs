@@ -221,6 +221,8 @@ pub struct Config {
     pub cursor: CursorConfig,
     #[serde(default)]
     pub tab_layout: TabLayout,
+    #[serde(default = "default_update_channel")]
+    pub update_channel: String,
     #[serde(default)]
     pub keybinding_preset: Option<crate::keybindings::KeybindingPreset>,
     /// Treat the Option key as Alt (send `ESC` + key) instead of letting
@@ -392,6 +394,7 @@ fn default_session_restore() -> bool { true }
 fn default_opacity() -> f32 { 1.0 }
 fn default_notify_on_command_finish() -> bool { true }
 fn default_option_as_meta() -> bool { false }
+fn default_update_channel() -> String { "stable".to_string() }
 
 impl Default for Config {
     fn default() -> Self {
@@ -409,6 +412,7 @@ impl Default for Config {
             bottombar: BottombarConfig::default(),
             cursor: CursorConfig::default(),
             tab_layout: TabLayout::default(),
+            update_channel: default_update_channel(),
             option_as_meta: default_option_as_meta(),
             ai: crate::ai::AiConfig::default(),
         }
@@ -509,6 +513,7 @@ fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
         TabLayout::Vertical => "vertical",
     };
     doc["tab_layout"] = value(tab_layout_str);
+    doc["update_channel"] = value(c.update_channel.as_str());
     if let Some(ref preset) = c.keybinding_preset {
         doc["keybinding_preset"] = value(preset.to_string());
     } else {
@@ -694,6 +699,10 @@ fn parse_lenient_from_doc(doc: &DocumentMut) -> Option<Config> {
     }
     if let Some(val) = doc.get("shell").and_then(|v| v.as_str()) {
         cfg.shell = Some(val.to_string());
+        any_recognized = true;
+    }
+    if let Some(val) = doc.get("update_channel").and_then(|v| v.as_str()) {
+        cfg.update_channel = crate::updater::UpdateChannel::parse(val).as_str().to_string();
         any_recognized = true;
     }
     if let Some(val) = doc.get("keybinding_preset").and_then(|v| v.as_str()) {
@@ -1030,6 +1039,7 @@ mod tests {
                 animation_duration_ms: 80,
             },
             tab_layout: TabLayout::Horizontal,
+            update_channel: "stable".to_string(),
             keybinding_preset: Some(crate::keybindings::KeybindingPreset::Ghostty),
             option_as_meta: true,
             ai: crate::ai::AiConfig::default(),

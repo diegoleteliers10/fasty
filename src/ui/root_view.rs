@@ -762,9 +762,14 @@ pub(crate) fn available_system_fonts() -> Vec<String> {
     #[cfg(target_os = "windows")]
     {
         let mut reg_fonts = Vec::new();
-        if let Ok(output) = std::process::Command::new("reg")
-            .args(["query", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"])
-            .output()
+        let mut reg_cmd = std::process::Command::new("reg");
+        reg_cmd.args(["query", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"]);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            reg_cmd.creation_flags(0x08000000);
+        }
+        if let Ok(output) = reg_cmd.output()
         {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -912,6 +917,7 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
         PaletteCommand { id: "prs", icon: IconType::GitPullRequest, title: "GitHub: Pull Requests (Checkout/Approve/Merge)", category: "Git", shortcut: None },
         PaletteCommand { id: "settings", icon: IconType::Settings, title: "Open Settings", category: "Preferences", shortcut: Some(if is_mac { "⌘," } else { "Ctrl+," }) },
         PaletteCommand { id: "about", icon: IconType::Zap, title: "About Fastty", category: "Application", shortcut: None },
+        PaletteCommand { id: "check_updates", icon: IconType::RotateCcw, title: "Check for Updates", category: "Application", shortcut: None },
         PaletteCommand { id: "fullscreen", icon: IconType::Maximize2, title: "Toggle Fullscreen", category: "Window", shortcut: Some(if is_mac { "⌃⌘F" } else { "F11" }) },
         PaletteCommand { id: "zoom_in", icon: IconType::ZoomIn, title: "Font: Increase Size (+1)", category: "View", shortcut: Some(if is_mac { "⌘=" } else { "Ctrl=" }) },
         PaletteCommand { id: "zoom_out", icon: IconType::ZoomOut, title: "Font: Decrease Size (-1)", category: "View", shortcut: Some(if is_mac { "⌘-" } else { "Ctrl-" }) },
@@ -1700,29 +1706,36 @@ impl RootView {
 
         crate::keybindings::init_resolver(view.config.keybindings.clone(), view.config.keybinding_preset);
 
-        // Background update check and silent automatic preparation
+        // Background update check and silent automatic preparation.
+        // When a newer release exists the changelog modal opens automatically
+        // so the Skip / Update actions are always reachable (previously only
+        // a small tab-bar badge appeared, which users missed).
         enum UpdateStatus {
             Ready(crate::updater::ReleaseInfo),
             Blocked(crate::updater::ReleaseInfo, String),
             Available(crate::updater::ReleaseInfo),
         }
         let (update_tx, update_rx) = async_channel::unbounded::<UpdateStatus>();
+        let update_channel = crate::updater::UpdateChannel::parse(&view.config.update_channel);
         std::thread::spawn(move || {
-            if let Some(release) = crate::updater::check_for_update_sync() {
-                if release.self_update_blocked_reason.is_none() {
-                    // Silently download and stage update in background
-                    match crate::updater::apply_update_sync(&release) {
-                        Ok(()) => {
-                            let _ = update_tx.send_blocking(UpdateStatus::Ready(release));
+            match crate::updater::check_for_updates(update_channel, false) {
+                Ok(Some(release)) => {
+                    if release.self_update_blocked_reason.is_none() {
+                        // Silently download and stage update in background
+                        match crate::updater::apply_update_sync(&release) {
+                            Ok(()) => {
+                                let _ = update_tx.send_blocking(UpdateStatus::Ready(release));
+                            }
+                            Err(_) => {
+                                let _ = update_tx.send_blocking(UpdateStatus::Available(release));
+                            }
                         }
-                        Err(_) => {
-                            let _ = update_tx.send_blocking(UpdateStatus::Available(release));
-                        }
+                    } else {
+                        let reason = release.self_update_blocked_reason.clone().unwrap_or_default();
+                        let _ = update_tx.send_blocking(UpdateStatus::Blocked(release, reason));
                     }
-                } else {
-                    let reason = release.self_update_blocked_reason.clone().unwrap_or_default();
-                    let _ = update_tx.send_blocking(UpdateStatus::Blocked(release, reason));
                 }
+                Ok(None) | Err(_) => {}
             }
         });
 
@@ -1737,16 +1750,19 @@ impl RootView {
                                 "Fastty v{} is installed and ready to use.\nRestart Fastty to switch to the new version.",
                                 release.version
                             ));
+                            this.is_update_modal_open = true;
                         }
                         UpdateStatus::Blocked(release, reason) => {
                             this.is_update_ready = false;
                             this.update_available = Some(release);
                             this.update_status = Some(reason);
+                            this.is_update_modal_open = true;
                         }
                         UpdateStatus::Available(release) => {
                             this.is_update_ready = false;
                             this.update_available = Some(release);
                             this.update_status = None;
+                            this.is_update_modal_open = true;
                         }
                     }
                     cx.notify();
@@ -2555,6 +2571,10 @@ impl RootView {
             return;
         }
         let Some(release) = self.update_available.clone() else {
+            // No cached release (first run, 24h throttle, or a past network
+            // error): run a forced network check so the button always leads
+            // somewhere instead of silently doing nothing.
+            self.check_for_updates_manual(window, cx);
             return;
         };
 
@@ -2601,6 +2621,70 @@ impl RootView {
                 });
             }
         }).detach();
+    }
+
+    /// Forced network check (bypasses the 24h throttle and the skipped-version
+    /// gate). Always opens the changelog modal: with the release on success,
+    /// with "up to date" on no release, or with the error text on failure, so
+    /// the user never faces a dead button.
+    pub fn check_for_updates_manual(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_updating {
+            self.is_update_modal_open = true;
+            cx.notify();
+            return;
+        }
+        self.is_updating = false;
+        self.update_status = Some("Checking for updates...".to_string());
+        self.is_update_modal_open = true;
+        cx.notify();
+
+        let channel = crate::updater::UpdateChannel::parse(&self.config.update_channel);
+        let (tx, rx) = async_channel::unbounded::<Result<Option<crate::updater::ReleaseInfo>, String>>();
+        std::thread::spawn(move || {
+            let res = crate::updater::check_for_update_sync_with(channel, true).map_err(|e| e.to_string());
+            let _ = tx.send_blocking(res);
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(res) = rx.recv().await {
+                let _ = this.update_in(cx, |this, _window, cx| {
+                    match res {
+                        Ok(Some(release)) => {
+                            this.is_update_ready = false;
+                            this.update_available = Some(release);
+                            this.update_status = None;
+                            this.is_update_modal_open = true;
+                        }
+                        Ok(None) => {
+                            this.update_status = Some(format!(
+                                "Fastty v{} is up to date.",
+                                env!("CARGO_PKG_VERSION")
+                            ));
+                            this.is_update_modal_open = true;
+                        }
+                        Err(e) => {
+                            this.update_status = Some(format!("Update check failed:\n{e}"));
+                            this.is_update_modal_open = true;
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        }).detach();
+    }
+
+    /// "Skip this version": persists the dismissal so the background check
+    /// stops offering this release, then closes the modal and clears the
+    /// tab-bar badge.
+    pub fn skip_update_version(&mut self, cx: &mut Context<Self>) {
+        if let Some(release) = self.update_available.clone() {
+            crate::updater::dismiss_version(&release.tag_name);
+        }
+        self.update_available = None;
+        self.is_update_ready = false;
+        self.update_status = None;
+        self.is_update_modal_open = false;
+        cx.notify();
     }
 
     pub fn open_settings_window(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -3269,6 +3353,7 @@ impl RootView {
             "prs" => self.toggle_pr_picker(_window, cx),
             "settings" => self.toggle_settings(_window, cx),
             "about" => self.toggle_about(_window, cx),
+            "check_updates" => self.check_for_updates_manual(_window, cx),
             "fullscreen" => {
                 _window.toggle_fullscreen();
                 cx.notify();
@@ -11823,6 +11908,12 @@ impl Render for RootView {
                                                         .as_ref()
                                                         .and_then(|r| r.self_update_blocked_reason.as_ref())
                                                         .is_some();
+                                                    let has_release = self.update_available.is_some();
+                                                    let release_url = self
+                                                        .update_available
+                                                        .as_ref()
+                                                        .map(|r| r.release_url.clone())
+                                                        .unwrap_or_else(|| "https://github.com/diegoleteliers10/fasty/releases".to_string());
                                                     el.child(
                                                         div()
                                                             .px(px(12.))
@@ -11839,6 +11930,40 @@ impl Render for RootView {
                                                             }))
                                                             .child("Later"),
                                                     )
+                                                    .when(has_release, |btn| {
+                                                        btn.child(
+                                                            div()
+                                                                .px(px(12.))
+                                                                .py(px(5.))
+                                                                .rounded(px(5.))
+                                                                .bg(theme.surface_raised)
+                                                                .text_color(theme.foreground)
+                                                                .font_weight(FontWeight::NORMAL)
+                                                                .text_size(px(11.))
+                                                                .cursor(CursorStyle::PointingHand)
+                                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                                    this.skip_update_version(cx);
+                                                                }))
+                                                                .child("Skip this version"),
+                                                        )
+                                                    })
+                                                    .when(is_blocked, |btn| {
+                                                        btn.child(
+                                                            div()
+                                                                .px(px(12.))
+                                                                .py(px(5.))
+                                                                .rounded(px(5.))
+                                                                .bg(theme.accent)
+                                                                .text_color(theme.black)
+                                                                .font_weight(FontWeight::SEMIBOLD)
+                                                                .text_size(px(11.))
+                                                                .cursor(CursorStyle::PointingHand)
+                                                                .on_mouse_down(MouseButton::Left, move |_ev, _window, _cx| {
+                                                                    open_path_or_url(&release_url);
+                                                                })
+                                                                .child("Open download page"),
+                                                        )
+                                                    })
                                                     .when(!is_blocked, |btn| {
                                                         btn.child(
                                                             div()

@@ -41,6 +41,31 @@ impl UpdateChannel {
             _ => Self::Stable,
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Stable => "Stable",
+            Self::Beta => "Beta",
+        }
+    }
+}
+
+/// Channel configured via `FASTTY_UPDATE_CHANNEL` env (`stable` default,
+/// `beta` opts into prereleases). Callers that own the app `Config` should
+/// prefer `UpdateChannel::parse(&config.update_channel)` so the Settings UI
+/// selector takes effect; this helper is the fallback for contexts without
+/// config access (e.g. the startup background check).
+pub fn configured_channel() -> UpdateChannel {
+    std::env::var("FASTTY_UPDATE_CHANNEL")
+        .map(|v| UpdateChannel::parse(&v))
+        .unwrap_or(UpdateChannel::Stable)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -410,7 +435,44 @@ pub fn check_for_updates(
         return Ok(None);
     }
 
-    let target_asset = match_target_asset(&latest_rel.assets)?;
+    let notes = latest_rel
+        .body
+        .as_deref()
+        .unwrap_or("No release notes provided.");
+    let clean_notes = clean_release_notes(notes);
+
+    let version = latest_tag.trim_start_matches('v').to_string();
+    let release_url = latest_rel.html_url.unwrap_or_else(|| {
+        format!("https://github.com/{DEFAULT_GITHUB_REPO}/releases/tag/{latest_tag}")
+    });
+    let published_at = latest_rel.published_at.unwrap_or_default();
+
+    // A release without a matching asset for this OS/arch must still surface
+    // the changelog modal (with a manual-download reason) instead of
+    // erroring out: `check_for_update_sync` maps Err to None, which hides
+    // every update affordance (modal, Skip/Update buttons, tab-bar badge).
+    let target_asset = match match_target_asset(&latest_rel.assets) {
+        Ok(asset) => asset,
+        Err(asset_err) => {
+            let reason = self_update_blocked_reason().unwrap_or_else(|| {
+                format!(
+                    "No automatic update package found for this OS/arch ({asset_err}). Download it manually from the Releases page."
+                )
+            });
+            return Ok(Some(ReleaseInfo {
+                version,
+                tag_name: latest_tag,
+                release_url,
+                asset_name: String::new(),
+                download_url: String::new(),
+                release_notes: clean_notes,
+                published_at,
+                checksum_url: None,
+                signature_url: None,
+                self_update_blocked_reason: Some(reason),
+            }));
+        }
+    };
 
     let checksum_name = format!("{}.sha256", target_asset.name);
     let checksum_url = latest_rel
@@ -426,17 +488,6 @@ pub fn check_for_updates(
         .find(|a| a.name == signature_name)
         .map(|a| a.browser_download_url.clone());
 
-    let notes = latest_rel
-        .body
-        .as_deref()
-        .unwrap_or("No release notes provided.");
-    let clean_notes = clean_release_notes(notes);
-
-    let version = latest_tag.trim_start_matches('v').to_string();
-    let release_url = latest_rel.html_url.unwrap_or_else(|| {
-        format!("https://github.com/{DEFAULT_GITHUB_REPO}/releases/tag/{latest_tag}")
-    });
-
     Ok(Some(ReleaseInfo {
         version,
         tag_name: latest_tag,
@@ -444,7 +495,7 @@ pub fn check_for_updates(
         asset_name: target_asset.name,
         download_url: target_asset.browser_download_url,
         release_notes: clean_notes,
-        published_at: latest_rel.published_at.unwrap_or_default(),
+        published_at,
         checksum_url,
         signature_url,
         self_update_blocked_reason: self_update_blocked_reason(),
@@ -452,7 +503,14 @@ pub fn check_for_updates(
 }
 
 pub fn check_for_update_sync() -> Option<ReleaseInfo> {
-    check_for_updates(UpdateChannel::Stable, false).ok().flatten()
+    check_for_updates(configured_channel(), false).ok().flatten()
+}
+
+/// Sync check with an explicit channel (Settings selector) and force flag.
+/// `force = true` bypasses the 24h throttle and the skipped-version gate so
+/// a manual "Check for updates" always reaches the network.
+pub fn check_for_update_sync_with(channel: UpdateChannel, force: bool) -> Result<Option<ReleaseInfo>, UpdateError> {
+    check_for_updates(channel, force)
 }
 
 pub fn download_and_verify(
@@ -553,6 +611,9 @@ pub fn download_and_verify(
 pub fn apply_update_sync(release: &ReleaseInfo) -> anyhow::Result<()> {
     if let Some(reason) = &release.self_update_blocked_reason {
         anyhow::bail!("{reason}");
+    }
+    if release.download_url.trim().is_empty() {
+        anyhow::bail!("No automatic update package for this OS/arch. Download it from the Releases page.");
     }
 
     let cancel_flag = AtomicBool::new(false);
@@ -716,12 +777,18 @@ fn install_windows(archive_path: &Path) -> Result<(), UpdateError> {
     let _ = fs::remove_dir_all(&temp_staging_dir);
     fs::create_dir_all(&temp_staging_dir)?;
 
-    let status = Command::new("tar")
+    let mut tar_cmd = Command::new("tar");
+    tar_cmd
         .arg("-xf")
         .arg(archive_path)
         .arg("-C")
-        .arg(&temp_staging_dir)
-        .status();
+        .arg(&temp_staging_dir);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        tar_cmd.creation_flags(0x08000000);
+    }
+    let status = tar_cmd.status();
 
     if status.map(|s| !s.success()).unwrap_or(true) {
         let _ = fs::remove_dir_all(&temp_staging_dir);
@@ -766,7 +833,14 @@ fn install_windows(archive_path: &Path) -> Result<(), UpdateError> {
          start \"\" \"{target_str}\""
     );
 
-    Command::new("cmd").arg("/c").arg(script).spawn()?;
+    let mut swap_cmd = Command::new("cmd");
+    swap_cmd.arg("/c").arg(script);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        swap_cmd.creation_flags(0x08000000);
+    }
+    swap_cmd.spawn()?;
     std::process::exit(0);
 }
 

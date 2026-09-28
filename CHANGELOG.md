@@ -3,6 +3,14 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.14.9 - 2026-09-28
+
+- Fix update dialog never appearing: releases without a matching OS/arch asset now show the changelog modal with a manual download option instead of failing silently.
+- Update modal opens automatically when a new release is found, with Later, Skip this version, and Update Now actions (or Open download page when self-update is blocked).
+- Add manual "Check for Updates" command in the command palette and a Check for updates button with Stable/Beta channel selector in Settings General.
+- Add Skip this version support so dismissed releases stop being offered on all three OSes.
+- Fix console window flashing on Windows when opening Settings: font detection, Ollama detection, and update staging now run with CREATE_NO_WINDOW.
+
 ## 0.14.8 - 2026-09-28
 
 - Organize tabs in a grid layout with a maximum of 4 tabs per row in Mission Control.

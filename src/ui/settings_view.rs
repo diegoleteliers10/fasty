@@ -121,6 +121,11 @@ pub struct SettingsView {
     pub opacity: f32,
     pub cursor_blink: bool,
     pub copy_on_select: bool,
+    pub update_channel: String,
+    pub update_checking: bool,
+    pub update_status_msg: Option<String>,
+    pub update_found: Option<crate::updater::ReleaseInfo>,
+    pub update_ready: bool,
     pub tab_layout: crate::config::TabLayout,
     pub scrollback: usize,
     pub keybinding_preset: crate::keybindings::KeybindingPreset,
@@ -275,6 +280,11 @@ impl SettingsView {
             opacity: loaded_config.opacity,
             cursor_blink: loaded_config.cursor.blink,
             copy_on_select: loaded_config.copy_on_select,
+            update_channel: crate::updater::UpdateChannel::parse(&loaded_config.update_channel).as_str().to_string(),
+            update_checking: false,
+            update_status_msg: None,
+            update_found: None,
+            update_ready: false,
             tab_layout,
             scrollback,
             keybinding_preset,
@@ -439,6 +449,7 @@ impl SettingsView {
         self.scrollback = cfg.scrollback;
         self.cursor_blink = cfg.cursor.blink;
         self.copy_on_select = cfg.copy_on_select;
+        self.update_channel = crate::updater::UpdateChannel::parse(&cfg.update_channel).as_str().to_string();
         self.tab_layout = cfg.tab_layout;
         self.font_size = cfg.font.size;
         if !cfg.font.family.is_empty() && cfg.font.family != "monospace" {
@@ -1026,6 +1037,134 @@ impl SettingsView {
         self.config.copy_on_select = self.copy_on_select;
         self.save_config();
         crate::config::increment_config_version();
+        cx.notify();
+    }
+
+    pub fn set_update_channel(&mut self, channel: &str, cx: &mut Context<Self>) {
+        let normalized = crate::updater::UpdateChannel::parse(channel).as_str().to_string();
+        self.update_channel = normalized.clone();
+        self.config.update_channel = normalized;
+        self.save_config();
+        crate::config::increment_config_version();
+        cx.notify();
+    }
+
+    /// Forced update check from the Settings Updates section. Runs the
+    /// blocking network call off the UI thread and reports the result inline
+    /// (available / up to date / error) instead of failing silently.
+    pub fn check_updates_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.update_checking {
+            return;
+        }
+        self.update_checking = true;
+        self.update_ready = false;
+        self.update_found = None;
+        self.update_status_msg = Some("Checking for updates...".to_string());
+        cx.notify();
+
+        let channel = crate::updater::UpdateChannel::parse(&self.update_channel);
+        let (tx, rx) = async_channel::bounded::<Result<Option<crate::updater::ReleaseInfo>, String>>(1);
+        std::thread::Builder::new()
+            .name("fastty-update-check".into())
+            .spawn(move || {
+                let res = crate::updater::check_for_update_sync_with(channel, true)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send_blocking(res);
+            })
+            .ok();
+
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(res) = rx.recv().await {
+                let _ = this.update_in(cx, |this, _window, cx| {
+                    this.update_checking = false;
+                    match res {
+                        Ok(Some(release)) => {
+                            this.update_status_msg = if let Some(reason) = &release.self_update_blocked_reason {
+                                Some(format!("Fastty v{} is available.\n{}", release.version, reason))
+                            } else {
+                                Some(format!("Fastty v{} is available.", release.version))
+                            };
+                            this.update_found = Some(release);
+                        }
+                        Ok(None) => {
+                            this.update_status_msg = Some(format!(
+                                "Fastty v{} is up to date.",
+                                env!("CARGO_PKG_VERSION")
+                            ));
+                        }
+                        Err(e) => {
+                            this.update_status_msg = Some(format!("Update check failed: {e}"));
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Single entry point for the Settings update button. Branches on state:
+    /// restart when staged, open the download page when self-update is
+    /// blocked, download otherwise, or check when nothing is known yet.
+    pub fn update_primary_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.update_checking {
+            return;
+        }
+        if self.update_ready {
+            let _ = self.config.save_default();
+            crate::updater::relaunch_fastty();
+            return;
+        }
+        if let Some(release) = self.update_found.clone() {
+            if release.self_update_blocked_reason.is_some() {
+                open_path_or_url(&release.release_url);
+                return;
+            }
+            self.update_checking = true;
+            self.update_status_msg = Some(format!("Downloading Fastty v{}...", release.version));
+            cx.notify();
+            let (tx, rx) = async_channel::bounded::<Result<(), String>>(1);
+            std::thread::Builder::new()
+                .name("fastty-update-download".into())
+                .spawn(move || {
+                    let res = crate::updater::apply_update_sync(&release).map_err(|e| e.to_string());
+                    let _ = tx.send_blocking(res);
+                })
+                .ok();
+            cx.spawn_in(window, async move |this, cx| {
+                if let Ok(res) = rx.recv().await {
+                    let _ = this.update_in(cx, |this, _window, cx| {
+                        this.update_checking = false;
+                        match res {
+                            Ok(()) => {
+                                this.update_ready = true;
+                                this.update_status_msg = Some("Update downloaded and verified. Restart Fastty to switch to the new version.".to_string());
+                            }
+                            Err(e) => {
+                                this.update_status_msg = Some(format!("Update failed: {e}"));
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+            return;
+        }
+        self.check_updates_now(window, cx);
+    }
+
+    /// Dismisses the release found by the Settings check so neither Settings
+    /// nor the main window keeps offering it.
+    pub fn skip_found_update(&mut self, cx: &mut Context<Self>) {
+        if let Some(release) = self.update_found.take() {
+            crate::updater::dismiss_version(&release.tag_name);
+            self.update_status_msg = Some(format!(
+                "Skipped v{}. Check again to see future releases.",
+                release.version
+            ));
+        }
+        self.update_ready = false;
         cx.notify();
     }
 
@@ -2139,6 +2278,134 @@ impl SettingsView {
                                                 .child(label)
                                                 .when(is_active, |el| el.child(render_icon(IconType::Check, theme.background, 10.0)))
                                         })),
+                                    true,
+                                    theme,
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(render_section_header("Updates", theme))
+                    .child(
+                        render_group_card(theme)
+                            .child({
+                                let channels = [
+                                    ("stable", "Stable"),
+                                    ("beta", "Beta"),
+                                ];
+                                render_card_row(
+                                    "Update Channel",
+                                    Some("Beta includes prereleases"),
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .gap_1p5()
+                                        .children(channels.into_iter().map(|(id, label)| {
+                                            let is_active = self.update_channel == id;
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_1()
+                                                .px(px(8.))
+                                                .py(px(4.))
+                                                .rounded(px(5.))
+                                                .border_1()
+                                                .border_color(if is_active { theme.accent } else { theme.border })
+                                                .bg(if is_active { theme.accent } else { theme.surface_raised })
+                                                .hover(move |s| if !is_active { s.bg(theme.hover) } else { s })
+                                                .text_color(if is_active { theme.background } else { theme.foreground })
+                                                .text_size(px(11.))
+                                                .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                                    this.set_update_channel(id, cx);
+                                                }))
+                                                .child(label)
+                                                .when(is_active, |el| el.child(render_icon(IconType::Check, theme.background, 10.0)))
+                                        })),
+                                    false,
+                                    theme,
+                                )
+                            })
+                            .child(render_card_row(
+                                "Version",
+                                Some("Current installed version"),
+                                div()
+                                    .px(px(7.))
+                                    .py(px(2.))
+                                    .rounded(px(4.))
+                                    .bg(theme.surface_raised)
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(theme.muted_strong)
+                                    .child(concat!("v", env!("CARGO_PKG_VERSION"))),
+                                false,
+                                theme,
+                            ))
+                            .child({
+                                let status = self.update_status_msg.clone();
+                                let primary_label = if self.update_checking {
+                                    "Working..."
+                                } else if self.update_ready {
+                                    "Restart Now"
+                                } else if let Some(ref rel) = self.update_found {
+                                    if rel.self_update_blocked_reason.is_some() {
+                                        "Open download page"
+                                    } else {
+                                        "Update Now"
+                                    }
+                                } else {
+                                    "Check now"
+                                };
+                                let show_skip = self.update_found.is_some()
+                                    && !self.update_ready
+                                    && !self.update_checking;
+                                render_card_row(
+                                    "Check for updates",
+                                    status.as_deref(),
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .gap_1p5()
+                                        .when(show_skip, |row| {
+                                            row.child(
+                                                div()
+                                                    .px(px(10.))
+                                                    .py(px(5.))
+                                                    .rounded(px(6.))
+                                                    .bg(theme.surface_raised)
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .hover(|s| s.bg(theme.hover))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .text_size(px(11.5))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(theme.foreground)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                        this.skip_found_update(cx);
+                                                    }))
+                                                    .child("Skip this version"),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .px(px(10.))
+                                                .py(px(5.))
+                                                .rounded(px(6.))
+                                                .bg(theme.accent)
+                                                .cursor(CursorStyle::PointingHand)
+                                                .text_size(px(11.5))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(theme.background)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, window, cx| {
+                                                    this.update_primary_action(window, cx);
+                                                }))
+                                                .child(primary_label),
+                                        ),
                                     true,
                                     theme,
                                 )
