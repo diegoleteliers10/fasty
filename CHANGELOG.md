@@ -3,6 +3,14 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.14.7 - 2026-09-28
+
+- Show changelog modal with release notes when an update is ready before restart.
+- Add user choice to apply the update immediately or dismiss with "Later".
+- Retain existing user configuration and themes across updates via lenient document recovery.
+- Prioritize platform standard configuration paths over legacy paths and isolate macOS launch environment.
+- Save active sessions and user configuration before update reboot.
+
 ## 0.14.6 - 2026-09-28
 
 - Cross-platform atomic auto-updater following the Tinycast pattern.

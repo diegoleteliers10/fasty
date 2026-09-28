@@ -40,11 +40,26 @@ pub struct SessionData {
 }
 
 pub fn sessions_dir() -> PathBuf {
+    let dir = crate::paths::get().data_dir.join("sessions");
+    let _ = fs::create_dir_all(&dir);
+
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_default();
-    let dir = PathBuf::from(home).join(".config/fastty/sessions");
-    let _ = fs::create_dir_all(&dir);
+    let legacy = PathBuf::from(home).join(".config/fastty/sessions");
+    if legacy.exists() && legacy != dir {
+        if let Ok(entries) = fs::read_dir(&legacy) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let Some(name) = p.file_name() {
+                    let dest = dir.join(name);
+                    if !dest.exists() {
+                        let _ = fs::copy(&p, &dest);
+                    }
+                }
+            }
+        }
+    }
     dir
 }
 

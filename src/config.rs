@@ -442,34 +442,33 @@ fn user_legacy_json_path() -> PathBuf {
 fn candidate_toml_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    // 1. Current working directory
-    paths.push(PathBuf::from("fastty.toml"));
-    paths.push(PathBuf::from("config.toml"));
-
-    // 2. Explicit XDG_CONFIG_HOME
+    // 1. Explicit XDG_CONFIG_HOME
     if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME") {
         if !config_home.trim().is_empty() {
             let p = PathBuf::from(config_home).join("fastty");
-            paths.push(p.join("fastty.toml"));
             paths.push(p.join("config.toml"));
+            paths.push(p.join("fastty.toml"));
         }
     }
 
-    // 3. User home .config/fastty directory (all platforms)
+    // 2. Platform standard user directory (primary location)
+    paths.push(user_toml_path());
+    paths.push(user_fastty_toml_path());
+
+    // 3. User home .config/fastty directory (cross-platform fallback)
     if let Some(home) = dirs::home_dir() {
         let dot_config = home.join(".config").join("fastty");
-        paths.push(dot_config.join("fastty.toml"));
         paths.push(dot_config.join("config.toml"));
+        paths.push(dot_config.join("fastty.toml"));
         paths.push(home.join(".fastty.toml"));
     }
 
-    // 4. Platform standard user directory
-    paths.push(user_fastty_toml_path());
-    paths.push(user_toml_path());
+    // 4. Current working directory (fastty.toml only; avoid generic config.toml)
+    paths.push(PathBuf::from("fastty.toml"));
 
     // 5. System-wide /etc directory
-    paths.push(PathBuf::from("/etc/fastty/fastty.toml"));
     paths.push(PathBuf::from("/etc/fastty/config.toml"));
+    paths.push(PathBuf::from("/etc/fastty/fastty.toml"));
 
     paths
 }
@@ -648,6 +647,125 @@ fn migrate_legacy_json_to_toml(toml_path: &Path, json_path: &Path) -> anyhow::Re
     Ok(())
 }
 
+fn parse_lenient_from_doc(doc: &DocumentMut) -> Option<Config> {
+    let mut cfg = Config::default();
+    let mut any_recognized = false;
+
+    if let Some(val) = doc.get("tab_layout").and_then(|v| v.as_str()) {
+        match val {
+            "vertical" => {
+                cfg.tab_layout = TabLayout::Vertical;
+                any_recognized = true;
+            }
+            "horizontal" => {
+                cfg.tab_layout = TabLayout::Horizontal;
+                any_recognized = true;
+            }
+            _ => {}
+        }
+    }
+    if let Some(val) = doc.get("theme").and_then(|v| v.as_str()) {
+        cfg.theme = Some(val.to_string());
+        any_recognized = true;
+    }
+    if let Some(val) = doc.get("scrollback").and_then(|v| v.as_integer()) {
+        cfg.scrollback = (val as usize).clamp(500, 100_000);
+        any_recognized = true;
+    }
+    if let Some(val) = doc.get("opacity").and_then(|v| v.as_float()) {
+        cfg.opacity = val as f32;
+        any_recognized = true;
+    }
+    if let Some(val) = doc.get("session_restore").and_then(|v| v.as_bool()) {
+        cfg.session_restore = val;
+        any_recognized = true;
+    }
+    if let Some(val) = doc.get("copy_on_select").and_then(|v| v.as_bool()) {
+        cfg.copy_on_select = val;
+        any_recognized = true;
+    }
+    if let Some(val) = doc.get("notify_on_command_finish").and_then(|v| v.as_bool()) {
+        cfg.notify_on_command_finish = val;
+        any_recognized = true;
+    }
+    if let Some(val) = doc.get("option_as_meta").and_then(|v| v.as_bool()) {
+        cfg.option_as_meta = val;
+        any_recognized = true;
+    }
+    if let Some(val) = doc.get("shell").and_then(|v| v.as_str()) {
+        cfg.shell = Some(val.to_string());
+        any_recognized = true;
+    }
+    if let Some(val) = doc.get("keybinding_preset").and_then(|v| v.as_str()) {
+        if let Ok(preset) = val.parse::<crate::keybindings::KeybindingPreset>() {
+            cfg.keybinding_preset = Some(preset);
+            any_recognized = true;
+        }
+    }
+    if let Some(tbl) = doc.get("font").and_then(|v| v.as_table()) {
+        if let Some(fam) = tbl.get("family").and_then(|v| v.as_str()) {
+            cfg.font.family = fam.to_string();
+            any_recognized = true;
+        }
+        if let Some(sz) = tbl.get("size").and_then(|v| v.as_float()) {
+            cfg.font.size = sz as f32;
+            any_recognized = true;
+        }
+        if let Some(wt) = tbl.get("weight").and_then(|v| v.as_float()) {
+            cfg.font.weight = wt as f32;
+            any_recognized = true;
+        }
+        if let Some(lig) = tbl.get("ligatures").and_then(|v| v.as_bool()) {
+            cfg.font.ligatures = lig;
+            any_recognized = true;
+        }
+    }
+    if let Some(tbl) = doc.get("cursor").and_then(|v| v.as_table()) {
+        if let Some(shape) = tbl.get("shape").and_then(|v| v.as_str()) {
+            cfg.cursor.shape = match shape {
+                "block" => CursorShapeConfig::Block,
+                "beam" => CursorShapeConfig::Beam,
+                "underline" => CursorShapeConfig::Underline,
+                "hollow_block" => CursorShapeConfig::HollowBlock,
+                _ => CursorShapeConfig::Beam,
+            };
+            any_recognized = true;
+        }
+        if let Some(blk) = tbl.get("blink").and_then(|v| v.as_bool()) {
+            cfg.cursor.blink = blk;
+            any_recognized = true;
+        }
+        if let Some(sm) = tbl.get("smooth").and_then(|v| v.as_bool()) {
+            cfg.cursor.smooth = sm;
+            any_recognized = true;
+        }
+        if let Some(dur) = tbl.get("animation_duration_ms").and_then(|v| v.as_integer()) {
+            cfg.cursor.animation_duration_ms = dur as u64;
+            any_recognized = true;
+        }
+    }
+    if let Some(tbl) = doc.get("keybindings").and_then(|v| v.as_table()) {
+        for (k, v) in tbl.iter() {
+            if let Some(action) = v.as_str() {
+                cfg.keybindings.insert(k.to_string(), action.to_string());
+                any_recognized = true;
+            }
+        }
+    }
+    if doc.get("ai").is_some() {
+        if let Ok(ai_cfg) = toml_edit::de::from_str::<crate::ai::AiConfig>(&doc["ai"].to_string()) {
+            cfg.ai = ai_cfg;
+            any_recognized = true;
+        }
+    }
+
+    if any_recognized {
+        Some(cfg)
+    } else {
+        None
+    }
+}
+
 impl Config {
     pub fn load() -> anyhow::Result<Self> {
         let target = user_toml_path();
@@ -677,6 +795,15 @@ impl Config {
                     return Ok(cfg);
                 }
                 Err(e) => {
+                    if let Ok(doc) = content.parse::<DocumentMut>() {
+                        if let Some(mut cfg) = parse_lenient_from_doc(&doc) {
+                            eprintln!("[fastty] partial config parse for {}: {e}; preserved valid user settings", path.display());
+                            cfg.scrollback = cfg.scrollback.clamp(500, 100_000);
+                            *ACTIVE_THEME.write() = cfg.theme.clone().unwrap_or_else(|| "default".to_string());
+                            set_last_applied_hash(h);
+                            return Ok(cfg);
+                        }
+                    }
                     last_err = Some(anyhow::anyhow!("parse {}: {e}", path.display()));
                 }
             }
@@ -717,13 +844,20 @@ impl Config {
                 return path;
             }
         }
-        if let Some(home) = dirs::home_dir() {
-            let dot_config = home.join(".config").join("fastty");
-            if dot_config.parent().map(|p| p.exists()).unwrap_or(false) {
-                return dot_config.join("fastty.toml");
-            }
+        #[cfg(target_os = "macos")]
+        {
+            user_toml_path()
         }
-        user_fastty_toml_path()
+        #[cfg(not(target_os = "macos"))]
+        {
+            if let Some(home) = dirs::home_dir() {
+                let dot_config = home.join(".config").join("fastty");
+                if dot_config.parent().map(|p| p.exists()).unwrap_or(false) {
+                    return dot_config.join("config.toml");
+                }
+            }
+            user_toml_path()
+        }
     }
 
     pub fn save_default(&self) -> anyhow::Result<()> {
@@ -924,5 +1058,37 @@ mod tests {
         assert_eq!(deserialized.option_as_meta, true);
         assert_eq!(deserialized.keybindings.get("ctrl-shift-t").map(|s| s.as_str()), Some("new_tab"));
         assert_eq!(deserialized.keybindings.get("ctrl-shift-w").map(|s| s.as_str()), Some("close_tab"));
+    }
+
+    #[test]
+    fn test_lenient_recovery_on_invalid_fields() {
+        let invalid_toml = r#"
+            tab_layout = "vertical"
+            theme = "nord"
+            keybinding_preset = "ghostty"
+            scrollback = 12000
+            unknown_or_broken_field = { deeply = [1, 2, "broken"] }
+
+            [font]
+            family = "JetBrains Mono"
+            size = 14.0
+
+            [bottombar]
+            widgets = [
+                { type = "completely-unknown-widget-type-404" }
+            ]
+        "#;
+        // Standard strict deserialization fails because of unknown widget type
+        assert!(toml_edit::de::from_str::<Config>(invalid_toml).is_err());
+
+        // Lenient recovery recovers all valid settings cleanly!
+        let doc = invalid_toml.parse::<DocumentMut>().unwrap();
+        let recovered = parse_lenient_from_doc(&doc).unwrap();
+        assert_eq!(recovered.tab_layout, TabLayout::Vertical);
+        assert_eq!(recovered.theme.as_deref(), Some("nord"));
+        assert_eq!(recovered.keybinding_preset, Some(crate::keybindings::KeybindingPreset::Ghostty));
+        assert_eq!(recovered.scrollback, 12000);
+        assert_eq!(recovered.font.family, "JetBrains Mono");
+        assert_eq!(recovered.font.size, 14.0);
     }
 }

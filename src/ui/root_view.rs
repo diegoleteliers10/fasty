@@ -2550,8 +2550,8 @@ impl RootView {
             return;
         }
         if self.is_update_ready {
-            self.persist_session();
-            crate::updater::relaunch_fastty();
+            self.is_update_modal_open = true;
+            cx.notify();
             return;
         }
         let Some(release) = self.update_available.clone() else {
@@ -2587,9 +2587,9 @@ impl RootView {
                     match res {
                         Ok(()) => {
                             this.is_update_ready = true;
-                            this.update_status = Some(format!("Fastty v{} installed successfully!\nRestart Fastty to use the new version.", release.version));
+                            this.update_status = Some(format!("Fastty v{} is ready to install.\nRestart Fastty to switch to the new version.", release.version));
                             this.is_update_modal_open = true;
-                            this.update_available = None;
+                            this.update_available = Some(release);
                         }
                         Err(e) => {
                             this.is_update_ready = false;
@@ -11532,7 +11532,46 @@ impl Render for RootView {
                 )
             })
             .when(self.is_update_modal_open, |this| {
-                let status_msg = self.update_status.clone().unwrap_or_default();
+                let release_opt = self.update_available.clone();
+                let version = release_opt
+                    .as_ref()
+                    .map(|r| r.version.clone())
+                    .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+                let release_url = release_opt
+                    .as_ref()
+                    .map(|r| r.release_url.clone())
+                    .unwrap_or_else(|| "https://github.com/diegoleteliers10/fasty/releases".to_string());
+                let notes = release_opt
+                    .as_ref()
+                    .and_then(|r| {
+                        let trimmed = r.release_notes.trim();
+                        if !trimmed.is_empty() {
+                            Some(trimmed.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| crate::whats_new::notes_for(&version))
+                    .unwrap_or_else(|| "Bug fixes and performance improvements.".to_string());
+
+                let title = if self.is_update_ready {
+                    format!("Fastty v{} is ready to install", version)
+                } else if self.is_updating {
+                    format!("Downloading Fastty v{}...", version)
+                } else {
+                    format!("Fastty v{} is available", version)
+                };
+
+                let subtitle = if self.is_update_ready {
+                    "Update downloaded and verified. Restart Fastty to switch to the new version."
+                } else if self.is_updating {
+                    "Downloading update in the background..."
+                } else if let Some(ref status) = self.update_status {
+                    status.as_str()
+                } else {
+                    "A new update is available."
+                };
+
                 this.child(
                     div()
                         .absolute()
@@ -11547,7 +11586,7 @@ impl Render for RootView {
                         }))
                         .child(
                             div()
-                                .w(px(360.))
+                                .w(px(500.))
                                 .p(px(16.))
                                 .rounded(px(10.))
                                 .bg(theme.surface)
@@ -11571,10 +11610,22 @@ impl Render for RootView {
                                         .border_color(theme.border)
                                         .child(
                                             div()
-                                                .text_size(px(13.))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(theme.foreground)
-                                                .child("Fastty Updater"),
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .text_size(px(13.))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .text_color(theme.foreground)
+                                                        .child(title),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(11.))
+                                                        .text_color(theme.muted)
+                                                        .child(subtitle.to_string()),
+                                                ),
                                         )
                                         .child(
                                             div()
@@ -11588,67 +11639,132 @@ impl Render for RootView {
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(12.))
-                                        .text_color(theme.foreground)
-                                        .child(status_msg),
+                                        .id("update-modal-changelog")
+                                        .max_h(px(320.))
+                                        .p(px(12.))
+                                        .rounded(px(6.))
+                                        .bg(theme.surface_raised)
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .overflow_y_scroll()
+                                        .child(crate::ui::markdown::render_markdown(&notes, &theme, false)),
                                 )
                                 .child(
                                     div()
                                         .flex()
                                         .flex_row()
-                                        .justify_end()
-                                        .gap_2()
-                                        .when(self.is_update_ready, |el| {
-                                            el.child(
-                                                div()
-                                                    .px(px(12.))
-                                                    .py(px(5.))
-                                                    .rounded(px(5.))
-                                                    .bg(theme.surface_raised)
-                                                    .text_color(theme.foreground)
-                                                    .font_weight(FontWeight::NORMAL)
-                                                    .text_size(px(11.))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                        this.is_update_modal_open = false;
-                                                        cx.notify();
-                                                    }))
-                                                    .child("Later"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px(px(12.))
-                                                    .py(px(5.))
-                                                    .rounded(px(5.))
-                                                    .bg(theme.accent)
-                                                    .text_color(theme.black)
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_size(px(11.))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, |_ev, _window, _cx| {
-                                                        crate::updater::relaunch_fastty();
+                                        .items_center()
+                                        .justify_between()
+                                        .pt(px(2.))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .text_color(theme.accent)
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, move |_ev, _window, _cx| {
+                                                    open_path_or_url(&release_url);
+                                                })
+                                                .child("View full changelog"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .gap_2()
+                                                .when(self.is_update_ready, |el| {
+                                                    el.child(
+                                                        div()
+                                                            .px(px(12.))
+                                                            .py(px(5.))
+                                                            .rounded(px(5.))
+                                                            .bg(theme.surface_raised)
+                                                            .text_color(theme.foreground)
+                                                            .font_weight(FontWeight::NORMAL)
+                                                            .text_size(px(11.))
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                                this.is_update_modal_open = false;
+                                                                cx.notify();
+                                                            }))
+                                                            .child("Later"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .px(px(12.))
+                                                            .py(px(5.))
+                                                            .rounded(px(5.))
+                                                            .bg(theme.accent)
+                                                            .text_color(theme.black)
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_size(px(11.))
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, _cx| {
+                                                                this.persist_session();
+                                                                let _ = this.config.save_default();
+                                                                crate::updater::relaunch_fastty();
+                                                            }))
+                                                            .child("Restart Now"),
+                                                    )
+                                                })
+                                                .when(self.is_updating, |el| {
+                                                    el.child(
+                                                        div()
+                                                            .px(px(12.))
+                                                            .py(px(5.))
+                                                            .rounded(px(5.))
+                                                            .bg(theme.accent)
+                                                            .text_color(theme.black)
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_size(px(11.))
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                                this.is_update_modal_open = false;
+                                                                cx.notify();
+                                                            }))
+                                                            .child("Hide"),
+                                                    )
+                                                })
+                                                .when(!self.is_update_ready && !self.is_updating, |el| {
+                                                    let is_blocked = self
+                                                        .update_available
+                                                        .as_ref()
+                                                        .and_then(|r| r.self_update_blocked_reason.as_ref())
+                                                        .is_some();
+                                                    el.child(
+                                                        div()
+                                                            .px(px(12.))
+                                                            .py(px(5.))
+                                                            .rounded(px(5.))
+                                                            .bg(theme.surface_raised)
+                                                            .text_color(theme.foreground)
+                                                            .font_weight(FontWeight::NORMAL)
+                                                            .text_size(px(11.))
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                                this.is_update_modal_open = false;
+                                                                cx.notify();
+                                                            }))
+                                                            .child("Later"),
+                                                    )
+                                                    .when(!is_blocked, |btn| {
+                                                        btn.child(
+                                                            div()
+                                                                .px(px(12.))
+                                                                .py(px(5.))
+                                                                .rounded(px(5.))
+                                                                .bg(theme.accent)
+                                                                .text_color(theme.black)
+                                                                .font_weight(FontWeight::SEMIBOLD)
+                                                                .text_size(px(11.))
+                                                                .cursor(CursorStyle::PointingHand)
+                                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, window, cx| {
+                                                                    this.trigger_apply_update(window, cx);
+                                                                }))
+                                                                .child("Update Now"),
+                                                        )
                                                     })
-                                                    .child("Restart Now"),
-                                            )
-                                        })
-                                        .when(!self.is_update_ready, |el| {
-                                            el.child(
-                                                div()
-                                                    .px(px(12.))
-                                                    .py(px(5.))
-                                                    .rounded(px(5.))
-                                                    .bg(theme.accent)
-                                                    .text_color(theme.black)
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_size(px(11.))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                        this.is_update_modal_open = false;
-                                                        cx.notify();
-                                                    }))
-                                                    .child(if self.is_updating { "Hide" } else { "OK" }),
-                                            )
-                                        }),
+                                                }),
+                                        ),
                                 ),
                         ),
                 )

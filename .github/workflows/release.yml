@@ -291,10 +291,21 @@ jobs:
           find artifacts -type f -exec cp {} release-assets/ \;
           ls -la release-assets/
 
+      - name: Extract Release Notes
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          awk -v ver="## $VERSION" '
+            $0 ~ ver { flag=1; next }
+            flag && /^## / { exit }
+            flag { print }
+          ' CHANGELOG.md > release_notes.md
+          cat release_notes.md
+
       - name: Create GitHub Release and Upload Assets
         uses: softprops/action-gh-release@v3
         with:
           files: release-assets/*
+          body_path: release_notes.md
           fail_on_unmatched_files: true
           draft: false
           prerelease: false

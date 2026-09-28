@@ -695,7 +695,7 @@ fn install_macos(archive_path: &Path) -> Result<(), UpdateError> {
          mv \"{target}\" \"{target}.old\" 2>/dev/null; \
          mv \"{staging}\" \"{target}\" 2>/dev/null || true; \
          xattr -cr \"{target}\" 2>/dev/null || true; \
-         open -n \"{target}\"; \
+         cd \"$HOME\" && open -n \"{target}\"; \
          rm -rf \"{target}.old\""
     );
 
