@@ -3,6 +3,15 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.14.6 - 2026-09-28
+
+- Cross-platform atomic auto-updater following the Tinycast pattern.
+- Channel support (Stable and Beta) with 24-hour freshness cache to respect GitHub API rate limits.
+- Background streaming download to user cache directory with incremental SHA-256 verification.
+- Safe volume-local staging and detached waiter process swap after parent process terminates, preventing file-lock errors and in-place crashes.
+- Automatic startup cleanup of leftover `.old` and `.staging` files.
+- macOS App Translocation detection, Windows ProgramFiles detection, and Linux package-manager detection.
+
 ## 0.14.5 - 2026-09-27
 
 - Single-cell isolation and centered rendering for keyboard modifiers (⌘, ⌥, ⌃, ⇧) and arrows to prevent character overlap across all monospace fonts.

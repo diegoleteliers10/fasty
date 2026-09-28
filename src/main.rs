@@ -23,6 +23,7 @@ fn parse_wait_flag(arg: &str) -> Option<u64> {
 }
 
 fn main() {
+    fastty::updater::cleanup_old_installations();
     let _ = fastty::paths::init();
 
     // `sessions`/`attach` are CLI-only subcommands that talk to an already

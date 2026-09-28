@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "fastty"
-version = "0.14.5"
+version = "0.14.6"
 edition = "2021"
 
 [lib]
@@ -53,6 +53,9 @@ miniz_oxide = "0.8"
 ureq = { version = "2.12", features = ["json", "proxy-from-env"] }
 schemars = { version = "0.8", features = ["derive"] }
 base64 = "0.22"
+semver = "1.0"
+sha2 = "0.10"
+hex = "0.4"
 
 
 [build-dependencies]
