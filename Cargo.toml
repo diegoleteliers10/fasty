@@ -51,7 +51,7 @@ smallvec = "1"
 fff-search = { version = "0.10.6", features = ["ripgrep"] }
 miniz_oxide = "0.8"
 ureq = { version = "2.12", features = ["json", "proxy-from-env"] }
-schemars = { version = "0.8", features = ["derive"] }
+schemars = { version = "1.2", features = ["derive"] }
 base64 = "0.22"
 semver = "1.0"
 sha2 = "0.10"
