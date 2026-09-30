@@ -16,7 +16,12 @@ pub struct TimeWidget {
 }
 
 impl TimeWidget {
-    pub fn new(format: String, align: Align, interval_ms: Option<u64>, timezone: Option<i32>) -> Self {
+    pub fn new(
+        format: String,
+        align: Align,
+        interval_ms: Option<u64>,
+        timezone: Option<i32>,
+    ) -> Self {
         Self {
             format,
             align,
@@ -29,11 +34,21 @@ impl TimeWidget {
 }
 
 impl Widget for TimeWidget {
-    fn id(&self) -> &'static str { "time" }
-    fn align(&self) -> Align { self.align }
-    fn poll_interval(&self) -> Duration { self.interval }
-    fn last_poll(&self) -> Instant { self.last_poll }
-    fn set_last_poll(&mut self, t: Instant) { self.last_poll = t; }
+    fn id(&self) -> &'static str {
+        "time"
+    }
+    fn align(&self) -> Align {
+        self.align
+    }
+    fn poll_interval(&self) -> Duration {
+        self.interval
+    }
+    fn last_poll(&self) -> Instant {
+        self.last_poll
+    }
+    fn set_last_poll(&mut self, t: Instant) {
+        self.last_poll = t;
+    }
 
     fn poll(&mut self, _ctx: &WidgetContext) {
         self.cached = format_now(&self.format, self.timezone_offset_hours);
@@ -43,11 +58,10 @@ impl Widget for TimeWidget {
         if self.cached.is_empty() {
             return Vec::new();
         }
-        vec![Segment {
-            text: format!(" {} ", self.cached),
-            color: [0.80, 0.82, 0.88, 1.0],
-            tooltip: Some("local time".to_string()),
-        }]
+        vec![
+            Segment::text(format!(" {} ", self.cached), [0.80, 0.82, 0.88, 1.0])
+                .with_tooltip("local time"),
+        ]
     }
 }
 
@@ -68,11 +82,7 @@ fn format_now(fmt: &str, timezone_offset_hours: Option<i32>) -> String {
         secs = 0;
     }
 
-    let (h, m, s) = (
-        (secs / 3600) % 24,
-        (secs / 60) % 60,
-        secs % 60,
-    );
+    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
     let mut out = String::with_capacity(fmt.len());
     let mut chars = fmt.chars().peekable();
     while let Some(c) = chars.next() {
@@ -82,7 +92,10 @@ fn format_now(fmt: &str, timezone_offset_hours: Option<i32>) -> String {
                 Some('M') => out.push_str(&format!("{:02}", m)),
                 Some('S') => out.push_str(&format!("{:02}", s)),
                 Some('%') => out.push('%'),
-                Some(other) => { out.push('%'); out.push(other); }
+                Some(other) => {
+                    out.push('%');
+                    out.push(other);
+                }
                 None => out.push('%'),
             }
         } else {

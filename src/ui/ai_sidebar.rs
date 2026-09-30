@@ -1,9 +1,9 @@
-use gpui::*;
+use crate::ui::theme::Theme;
 use gpui::prelude::*;
+use gpui::*;
+use icons::common::IconType;
 use std::f32::consts::PI;
 use std::time::Duration;
-use icons::common::IconType;
-use crate::ui::theme::Theme;
 
 #[derive(Debug, Clone)]
 pub struct AiUiToolCall {
@@ -105,6 +105,16 @@ pub struct AiUiPendingConfirmation {
     pub input_summary: String,
 }
 
+/// Files dropped on a panel child. `.occlude()` sets `HitboxBehavior::BlockMouse`,
+/// which stops `hit_test` before it collects this element's ancestors, so a child
+/// that blocks the mouse has to carry its own `on_drop`; the panel's would never
+/// fire for a drop on it.
+pub type FileDropCallback = dyn Fn(&[std::path::PathBuf], &mut Window, &mut App);
+
+/// Rows the `@` mention menu draws and the arrow keys can reach. The candidate
+/// list, the renderer's `take` and the row count all cap at this value.
+pub const AI_AT_MENU_MAX_ROWS: usize = 20;
+
 pub type MouseDownCallback = Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>;
 pub type ConfirmCallback = Box<dyn Fn(&(bool, bool), &mut Window, &mut App) + 'static>;
 
@@ -141,15 +151,26 @@ pub struct AiSidebar {
     pub on_toggle_thinking: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
     pub attached_files: Vec<std::path::PathBuf>,
     pub on_remove_attachment: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
+    /// Routes files dropped on this panel. See [`FileDropCallback`].
+    pub on_file_drop: Option<std::rc::Rc<FileDropCallback>>,
     pub on_at_click: Option<MouseDownCallback>,
     pub on_attach_click: Option<MouseDownCallback>,
     pub at_menu_open: bool,
     pub at_matches: Vec<String>,
+    /// Row the arrow keys point at. Separate from hover: the pointer and the
+    /// keyboard move it independently, so the highlight has to read without a
+    /// mouse over the list.
+    pub at_selected: usize,
+    /// Scrolls the mention popup so the highlighted row stays in view. The popup
+    /// scrolls; the rows are taller than it.
+    pub at_scroll_handle: ScrollHandle,
     pub on_select_at_match: Option<Box<dyn Fn(&String, &mut Window, &mut App) + 'static>>,
     pub composer_bounds: Option<std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>>,
     pub message_selection: Option<(usize, usize, usize)>,
-    pub on_select_message_char: Option<std::sync::Arc<dyn Fn(&(usize, usize), &mut Window, &mut App) + 'static>>,
-    pub on_drag_message_char: Option<std::sync::Arc<dyn Fn(&(usize, usize), &mut Window, &mut App) + 'static>>,
+    pub on_select_message_char:
+        Option<std::sync::Arc<dyn Fn(&(usize, usize), &mut Window, &mut App) + 'static>>,
+    pub on_drag_message_char:
+        Option<std::sync::Arc<dyn Fn(&(usize, usize), &mut Window, &mut App) + 'static>>,
     pub scroll_handle: Option<gpui::ScrollHandle>,
     /// True while the message "Copy" button shows the "Copied" confirmation.
     pub copy_feedback: bool,
@@ -200,9 +221,12 @@ impl AiSidebar {
             on_toggle_thinking: None,
             attached_files: Vec::new(),
             on_remove_attachment: None,
+            on_file_drop: None,
             on_at_click: None,
             on_attach_click: None,
             at_menu_open: false,
+            at_selected: 0,
+            at_scroll_handle: ScrollHandle::new(),
             at_matches: Vec::new(),
             on_select_at_match: None,
             composer_bounds: None,
@@ -232,7 +256,10 @@ impl AiSidebar {
         self
     }
 
-    pub fn on_hover_context(mut self, handler: impl Fn(&bool, &mut Window, &mut App) + 'static) -> Self {
+    pub fn on_hover_context(
+        mut self,
+        handler: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    ) -> Self {
         self.on_hover_context = Some(Box::new(handler));
         self
     }
@@ -247,7 +274,10 @@ impl AiSidebar {
         self
     }
 
-    pub fn on_copied(mut self, handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static) -> Self {
+    pub fn on_copied(
+        mut self,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
         self.on_copied = Some(Box::new(handler));
         self
     }
@@ -282,7 +312,10 @@ impl AiSidebar {
         self
     }
 
-    pub fn on_click_char(mut self, handler: impl Fn(&usize, &mut Window, &mut App) + 'static) -> Self {
+    pub fn on_click_char(
+        mut self,
+        handler: impl Fn(&usize, &mut Window, &mut App) + 'static,
+    ) -> Self {
         self.on_click_char = Some(Box::new(handler));
         self
     }
@@ -314,7 +347,10 @@ impl AiSidebar {
         self
     }
 
-    pub fn composer_bounds(mut self, bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>) -> Self {
+    pub fn composer_bounds(
+        mut self,
+        bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    ) -> Self {
         self.composer_bounds = Some(bounds);
         self
     }
@@ -340,22 +376,34 @@ impl AiSidebar {
         self
     }
 
-    pub fn on_close(mut self, handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static) -> Self {
+    pub fn on_close(
+        mut self,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
         self.on_close = Some(Box::new(handler));
         self
     }
 
-    pub fn on_clear(mut self, handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static) -> Self {
+    pub fn on_clear(
+        mut self,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
         self.on_clear = Some(Box::new(handler));
         self
     }
 
-    pub fn on_cancel(mut self, handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static) -> Self {
+    pub fn on_cancel(
+        mut self,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
         self.on_cancel = Some(Box::new(handler));
         self
     }
 
-    pub fn on_submit(mut self, handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static) -> Self {
+    pub fn on_submit(
+        mut self,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
         self.on_submit = Some(Box::new(handler));
         self
     }
@@ -423,6 +471,11 @@ impl AiSidebar {
         self
     }
 
+    pub fn on_file_drop(mut self, cb: std::rc::Rc<FileDropCallback>) -> Self {
+        self.on_file_drop = Some(cb);
+        self
+    }
+
     pub fn on_remove_attachment(
         mut self,
         handler: impl Fn(&usize, &mut Window, &mut App) + 'static,
@@ -454,6 +507,16 @@ impl AiSidebar {
 
     pub fn at_matches(mut self, matches: Vec<String>) -> Self {
         self.at_matches = matches;
+        self
+    }
+
+    pub fn at_selected(mut self, selected: usize) -> Self {
+        self.at_selected = selected;
+        self
+    }
+
+    pub fn at_scroll_handle(mut self, handle: ScrollHandle) -> Self {
+        self.at_scroll_handle = handle;
         self
     }
 
@@ -648,10 +711,18 @@ fn parse_tool_row(tc: &AiUiToolCall) -> ParsedToolRow {
             let first = out.lines().next().unwrap_or("");
             if let Some(rest) = first.strip_prefix("Found ") {
                 let n: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if n.is_empty() { "done".to_string() } else { format!("{} found", n) }
+                if n.is_empty() {
+                    "done".to_string()
+                } else {
+                    format!("{} found", n)
+                }
             } else if first.starts_with("No matches") || first.starts_with("Directory") {
                 let lines = out.lines().count().saturating_sub(1);
-                if lines > 0 { format!("{} entries", lines) } else { "0 found".to_string() }
+                if lines > 0 {
+                    format!("{} entries", lines)
+                } else {
+                    "0 found".to_string()
+                }
             } else {
                 let count = out.lines().count();
                 format!("{} results", count)
@@ -682,7 +753,10 @@ fn parse_tool_row(tc: &AiUiToolCall) -> ParsedToolRow {
             } else if out.contains("wrote") {
                 let words: Vec<&str> = out.split_whitespace().collect();
                 if let Some(pos) = words.iter().position(|w| *w == "wrote") {
-                    words.get(pos + 1).map(|n| format!("{} B", n)).unwrap_or_else(|| "done".to_string())
+                    words
+                        .get(pos + 1)
+                        .map(|n| format!("{} B", n))
+                        .unwrap_or_else(|| "done".to_string())
                 } else {
                     "done".to_string()
                 }
@@ -727,13 +801,30 @@ const DIFF_MAX_ROWS: usize = 200;
 /// previews the change from the raw args; once applied it shows the real
 /// diff. When this exact tool call is awaiting permission, Accept / Reject
 /// buttons render on the card so the user can decide right there.
+/// What the AI context hovercard shows. Grouped because the values only travel
+/// together, from one place, to one function.
+struct ContextUsage {
+    used_tokens: u64,
+    max_tokens: u64,
+    last_usage: Option<(u64, u64)>,
+    pct: f32,
+}
+
+/// Callbacks a tool diff card needs. Grouped because eight positional
+/// arguments, two of them the same callback shape, are hard to read at the
+/// call site.
+struct ToolCardCallbacks {
+    on_confirm: Option<std::rc::Rc<ConfirmCallback>>,
+    on_file_drop: Option<std::rc::Rc<FileDropCallback>>,
+}
+
 fn render_tool_diff_card(
     theme: &Theme,
     diff: &crate::ai::diff::FileDiff,
     pending: bool,
     running: bool,
-    on_confirm: Option<std::rc::Rc<ConfirmCallback>>,
     card_idx: usize,
+    callbacks: ToolCardCallbacks,
 ) -> Div {
     let file_name = diff
         .path
@@ -831,9 +922,11 @@ fn render_tool_diff_card(
         };
         let (prefix, color, tint) = match line.kind {
             crate::ai::diff::DiffLineKind::Context => (" ", theme.muted_strong, None),
-            crate::ai::diff::DiffLineKind::Del => {
-                ("-", theme.bright_red, Some(gpui::Hsla::from(gpui::rgba(0xf04e4e1a))))
-            }
+            crate::ai::diff::DiffLineKind::Del => (
+                "-",
+                theme.bright_red,
+                Some(gpui::Hsla::from(gpui::rgba(0xf04e4e1a))),
+            ),
             crate::ai::diff::DiffLineKind::Add => (
                 "+",
                 theme.bright_green,
@@ -880,6 +973,11 @@ fn render_tool_diff_card(
         // diff scroll only the diff, never the messages area (GPUI applies
         // wheel deltas to every scrollable under the cursor otherwise).
         .occlude();
+    if let Some(on_drop) = callbacks.on_file_drop.clone() {
+        body = body.on_drop(move |paths: &gpui::ExternalPaths, window, cx| {
+            on_drop(paths.paths(), window, cx);
+        });
+    }
     if tall {
         body = body.h(px(240.)).overflow_y_scroll();
     }
@@ -890,7 +988,11 @@ fn render_tool_diff_card(
                 .py(px(2.))
                 .text_size(px(11.))
                 .text_color(theme.muted)
-                .child(if running { "Preparing diff…" } else { "No changes" }),
+                .child(if running {
+                    "Preparing diff…"
+                } else {
+                    "No changes"
+                }),
         );
     } else {
         body = body.child(StyledText::new(body_text).with_highlights(body_highlights));
@@ -901,7 +1003,7 @@ fn render_tool_diff_card(
     // this exact call. Allow Always registers the file path in the session
     // allowlist so later edits to the same file apply without asking.
     if pending {
-        if let Some(on_confirm) = on_confirm {
+        if let Some(on_confirm) = callbacks.on_confirm.as_ref() {
             let on_confirm_allow = on_confirm.clone();
             let on_confirm_always = on_confirm.clone();
             let on_confirm_decline = on_confirm;
@@ -923,7 +1025,12 @@ fn render_tool_diff_card(
                             .items_center()
                             .gap_2()
                             .child(render_confirm_button(
-                                "Accept", theme, true, false, (false, true), &on_confirm_allow,
+                                "Accept",
+                                theme,
+                                true,
+                                false,
+                                (false, true),
+                                &on_confirm_allow,
                             ))
                             .child(render_confirm_button(
                                 "Allow Always",
@@ -934,7 +1041,12 @@ fn render_tool_diff_card(
                                 &on_confirm_always,
                             ))
                             .child(render_confirm_button(
-                                "Reject", theme, false, true, (false, false), &on_confirm_decline,
+                                "Reject",
+                                theme,
+                                false,
+                                true,
+                                (false, false),
+                                on_confirm_decline,
                             )),
                     )
                     .child(
@@ -974,7 +1086,11 @@ fn render_confirm_button(
                 this.bg(theme.surface)
                     .border_1()
                     .border_color(theme.border)
-                    .text_color(if danger { theme.bright_red } else { theme.foreground })
+                    .text_color(if danger {
+                        theme.bright_red
+                    } else {
+                        theme.foreground
+                    })
                     .hover(move |s| s.bg(theme.hover))
             }
         })
@@ -1079,8 +1195,12 @@ fn render_confirmation_section(
                     .children(diff.rows.into_iter().map(|row| {
                         let (prefix, text, color, tint) = match row {
                             DiffRow::Context(line) => ("  ", line, theme.muted_strong, None),
-                            DiffRow::Del(line) => ("- ", line, theme.bright_red, Some(gpui::rgba(0xf04e4e1a))),
-                            DiffRow::Add(line) => ("+ ", line, theme.bright_green, Some(gpui::rgba(0x8ee0441a))),
+                            DiffRow::Del(line) => {
+                                ("- ", line, theme.bright_red, Some(gpui::rgba(0xf04e4e1a)))
+                            }
+                            DiffRow::Add(line) => {
+                                ("+ ", line, theme.bright_green, Some(gpui::rgba(0x8ee0441a)))
+                            }
                         };
                         div()
                             .w_full()
@@ -1112,8 +1232,22 @@ fn render_confirmation_section(
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(render_confirm_button("Accept", theme, true, false, (false, true), &on_confirm_allow))
-                            .child(render_confirm_button("Reject", theme, false, true, (false, false), &on_confirm_decline)),
+                            .child(render_confirm_button(
+                                "Accept",
+                                theme,
+                                true,
+                                false,
+                                (false, true),
+                                &on_confirm_allow,
+                            ))
+                            .child(render_confirm_button(
+                                "Reject",
+                                theme,
+                                false,
+                                true,
+                                (false, false),
+                                &on_confirm_decline,
+                            )),
                     )
                     .child(
                         div()
@@ -1166,9 +1300,30 @@ fn render_confirmation_section(
                         .flex()
                         .flex_row()
                         .gap_2()
-                        .child(render_confirm_button("Allow", theme, true, false, (false, true), &on_confirm_allow))
-                        .child(render_confirm_button("Allow Always", theme, false, false, (true, true), &on_confirm_always))
-                        .child(render_confirm_button("Decline", theme, false, true, (false, false), &on_confirm_decline)),
+                        .child(render_confirm_button(
+                            "Allow",
+                            theme,
+                            true,
+                            false,
+                            (false, true),
+                            &on_confirm_allow,
+                        ))
+                        .child(render_confirm_button(
+                            "Allow Always",
+                            theme,
+                            false,
+                            false,
+                            (true, true),
+                            &on_confirm_always,
+                        ))
+                        .child(render_confirm_button(
+                            "Decline",
+                            theme,
+                            false,
+                            true,
+                            (false, false),
+                            &on_confirm_decline,
+                        )),
                 )
                 .child(
                     div()
@@ -1258,7 +1413,11 @@ fn render_context_ring(pct: f32, theme: &Theme) -> impl IntoElement {
     let stroke_width = px(2.0);
     let radius = (size / 2.0) - stroke_width;
     let bg_color = theme.border;
-    let progress_color = if progress > 0.8 { theme.bright_red } else { theme.accent };
+    let progress_color = if progress > 0.8 {
+        theme.bright_red
+    } else {
+        theme.accent
+    };
 
     canvas(
         |_, _, _| {},
@@ -1268,8 +1427,20 @@ fn render_context_ring(pct: f32, theme: &Theme) -> impl IntoElement {
 
             let mut bg_builder = PathBuilder::stroke(stroke_width);
             bg_builder.move_to(point(center_x + radius, center_y));
-            bg_builder.arc_to(point(radius, radius), px(0.), false, true, point(center_x - radius, center_y));
-            bg_builder.arc_to(point(radius, radius), px(0.), false, true, point(center_x + radius, center_y));
+            bg_builder.arc_to(
+                point(radius, radius),
+                px(0.),
+                false,
+                true,
+                point(center_x - radius, center_y),
+            );
+            bg_builder.arc_to(
+                point(radius, radius),
+                px(0.),
+                false,
+                true,
+                point(center_x + radius, center_y),
+            );
             bg_builder.close();
             if let Ok(path) = bg_builder.build() {
                 window.paint_path(path, bg_color);
@@ -1279,8 +1450,20 @@ fn render_context_ring(pct: f32, theme: &Theme) -> impl IntoElement {
                 let mut progress_builder = PathBuilder::stroke(stroke_width);
                 if progress >= 0.999 {
                     progress_builder.move_to(point(center_x + radius, center_y));
-                    progress_builder.arc_to(point(radius, radius), px(0.), false, true, point(center_x - radius, center_y));
-                    progress_builder.arc_to(point(radius, radius), px(0.), false, true, point(center_x + radius, center_y));
+                    progress_builder.arc_to(
+                        point(radius, radius),
+                        px(0.),
+                        false,
+                        true,
+                        point(center_x - radius, center_y),
+                    );
+                    progress_builder.arc_to(
+                        point(radius, radius),
+                        px(0.),
+                        false,
+                        true,
+                        point(center_x + radius, center_y),
+                    );
                     progress_builder.close();
                 } else {
                     progress_builder.move_to(point(center_x, center_y - radius));
@@ -1290,7 +1473,10 @@ fn render_context_ring(pct: f32, theme: &Theme) -> impl IntoElement {
                         px(0.),
                         progress > 0.5,
                         true,
-                        point(center_x + radius * angle.cos(), center_y + radius * angle.sin()),
+                        point(
+                            center_x + radius * angle.cos(),
+                            center_y + radius * angle.sin(),
+                        ),
                     );
                 }
                 if let Ok(path) = progress_builder.build() {
@@ -1316,20 +1502,27 @@ fn format_number(n: u64) -> String {
 }
 
 fn render_context_hovercard(
-    _provider_name: &str,
     model_name: &str,
-    used_tokens: u64,
-    max_tokens: u64,
-    last_usage: Option<(u64, u64)>,
-    pct: f32,
+    usage: ContextUsage,
     theme: &Theme,
+    on_file_drop: Option<std::rc::Rc<FileDropCallback>>,
 ) -> impl IntoElement {
+    let ContextUsage {
+        used_tokens,
+        max_tokens,
+        last_usage,
+        pct,
+    } = usage;
     let progress = pct.clamp(0.0, 1.0);
     let pct_label = format!("{:.1}%", progress * 100.0);
     let remaining_tokens = max_tokens.saturating_sub(used_tokens);
-    let bar_color = if progress > 0.8 { theme.bright_red } else { theme.accent };
+    let bar_color = if progress > 0.8 {
+        theme.bright_red
+    } else {
+        theme.accent
+    };
 
-    div()
+    let mut card = div()
         .id("ai-context-hovercard")
         .absolute()
         .top(px(38.))
@@ -1374,7 +1567,11 @@ fn render_context_hovercard(
                         .flex_row()
                         .items_center()
                         .gap(px(5.))
-                        .child(crate::ui::icons::render_icon(IconType::Sparkles, theme.accent, 12.0))
+                        .child(crate::ui::icons::render_icon(
+                            IconType::Sparkles,
+                            theme.accent,
+                            12.0,
+                        ))
                         .child(
                             div()
                                 .text_size(px(11.5))
@@ -1414,15 +1611,15 @@ fn render_context_hovercard(
                         .items_center()
                         .justify_between()
                         .text_size(px(10.5))
-                        .child(
-                            div()
-                                .text_color(theme.muted_strong)
-                                .child("Capacity"),
-                        )
+                        .child(div().text_color(theme.muted_strong).child("Capacity"))
                         .child(
                             div()
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(if progress > 0.8 { theme.bright_red } else { theme.accent })
+                                .text_color(if progress > 0.8 {
+                                    theme.bright_red
+                                } else {
+                                    theme.accent
+                                })
                                 .child(pct_label),
                         ),
                 )
@@ -1463,7 +1660,11 @@ fn render_context_hovercard(
                             div()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.foreground)
-                                .child(format!("{} / {}", format_number(used_tokens), format_number(max_tokens))),
+                                .child(format!(
+                                    "{} / {}",
+                                    format_number(used_tokens),
+                                    format_number(max_tokens)
+                                )),
                         ),
                 )
                 .when_some(last_usage, |rows, (input, output)| {
@@ -1475,11 +1676,11 @@ fn render_context_hovercard(
                             .justify_between()
                             .text_size(px(10.))
                             .child(div().text_color(theme.muted).child("Prompt / Completion"))
-                            .child(
-                                div()
-                                    .text_color(theme.muted_strong)
-                                    .child(format!("{} / {}", format_number(input), format_number(output))),
-                            ),
+                            .child(div().text_color(theme.muted_strong).child(format!(
+                                "{} / {}",
+                                format_number(input),
+                                format_number(output)
+                            ))),
                     )
                 })
                 .child(
@@ -1493,11 +1694,21 @@ fn render_context_hovercard(
                         .child(
                             div()
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(if remaining_tokens < 2_000 { theme.bright_red } else { theme.muted_strong })
+                                .text_color(if remaining_tokens < 2_000 {
+                                    theme.bright_red
+                                } else {
+                                    theme.muted_strong
+                                })
                                 .child(format_number(remaining_tokens)),
                         ),
                 ),
-        )
+        );
+    if let Some(on_drop) = on_file_drop {
+        card = card.on_drop(move |paths: &gpui::ExternalPaths, window, cx| {
+            on_drop(paths.paths(), window, cx);
+        });
+    }
+    card
 }
 
 fn render_thinking_indicator(theme: &Theme) -> Div {
@@ -1567,7 +1778,10 @@ impl RenderOnce for AiSidebar {
     fn render(self, window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let win_ref = &*window;
         let theme = self.theme;
-        let sidebar_bg = Hsla { a: theme.opacity, ..theme.sidebar_bg };
+        let sidebar_bg = Hsla {
+            a: theme.opacity,
+            ..theme.sidebar_bg
+        };
         let surface_raised = theme.surface_raised;
 
         let is_focused = self.is_focused;
@@ -1589,6 +1803,7 @@ impl RenderOnce for AiSidebar {
         let on_toggle_mode = self.on_toggle_mode.map(std::rc::Rc::new);
         let on_toggle_thinking = self.on_toggle_thinking.map(std::rc::Rc::new);
         let on_remove_attachment = self.on_remove_attachment.map(std::rc::Rc::new);
+        let on_file_drop = self.on_file_drop.clone();
         let on_at_click = self.on_at_click.map(std::rc::Rc::new);
         let on_attach_click = self.on_attach_click.map(std::rc::Rc::new);
         let on_select_at_match = self.on_select_at_match.map(std::rc::Rc::new);
@@ -1608,7 +1823,6 @@ impl RenderOnce for AiSidebar {
         let ai_last_usage = self.ai_last_usage;
         let context_hovercard_open = self.context_hovercard_open;
         let on_hover_context = self.on_hover_context.map(std::rc::Rc::new);
-        let provider_name = self.provider_name.clone();
         let model_name = self.model_name.clone();
 
         // Text left edge = sidebar left + 8px scroll-area px + 4px outer-wrapper px.
@@ -1936,7 +2150,11 @@ impl RenderOnce for AiSidebar {
                                                                 .bg(theme.surface)
                                                                 .border_1()
                                                                 .border_color(theme.border)
-                                                                .child(div().text_size(px(11.)).child("🖼"))
+                                                                .child(crate::ui::icons::render_icon(
+                                                                    IconType::FileImage,
+                                                                    theme.muted,
+                                                                    12.0,
+                                                                ))
                                                                 .child(
                                                                     div()
                                                                         .text_size(px(11.))
@@ -1969,7 +2187,11 @@ impl RenderOnce for AiSidebar {
                                                                 .bg(theme.surface)
                                                                 .border_1()
                                                                 .border_color(theme.border)
-                                                                .child(div().text_size(px(11.)).child("📄"))
+                                                                .child(crate::ui::icons::render_icon(
+                                                                    IconType::File,
+                                                                    theme.muted,
+                                                                    12.0,
+                                                                ))
                                                                 .child(
                                                                     div()
                                                                         .text_size(px(11.))
@@ -2256,8 +2478,14 @@ impl RenderOnce for AiSidebar {
                                                              &card_diff,
                                                              awaiting.is_some(),
                                                              card_running,
-                                                             awaiting.as_ref().map(|_| tool_on_confirm.clone()).flatten(),
                                                              tc_idx,
+                                                             ToolCardCallbacks {
+                                                                 on_confirm: awaiting
+                                                                     .as_ref()
+                                                                     .map(|_| tool_on_confirm.clone())
+                                                                     .flatten(),
+                                                                 on_file_drop: on_file_drop.clone(),
+                                                             },
                                                          ))
                                                      })
                                               })),
@@ -2510,41 +2738,83 @@ impl RenderOnce for AiSidebar {
                                         .w_full()
                                         .max_h(px(160.))
                                         .overflow_y_scroll()
+                                        .track_scroll(&self.at_scroll_handle)
                                         .rounded(px(6.))
                                         .bg(theme.surface)
                                         .border_1()
                                         .border_color(theme.border)
                                         .mb(px(8.))
                                         .p(px(4.))
-                                        .children(self.at_matches.iter().take(20).map(|file_path| {
-                                            let fp = file_path.clone();
-                                            let on_select = on_select_at_match.clone();
-                                            div()
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap_2()
-                                                .px(px(8.))
-                                                .py(px(4.))
-                                                .rounded(px(4.))
-                                                .min_w(px(0.))
-                                                .overflow_hidden()
-                                                .cursor(CursorStyle::PointingHand)
-                                                .hover(move |s| s.bg(theme.hover))
-                                                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-                                                    if let Some(ref cb) = on_select {
-                                                        cb(&fp, window, cx);
-                                                    }
-                                                })
-                                                .child(crate::ui::icons::render_icon(IconType::FileCode, theme.muted, 12.0))
-                                                .child(
+                                        .children(
+                                            self.at_matches
+                                                .iter()
+                                                .take(AI_AT_MENU_MAX_ROWS)
+                                                .enumerate()
+                                                .map(|(idx, file_path)| {
+                                                    let fp = file_path.clone();
+                                                    let on_select = on_select_at_match.clone();
+                                                    // The keyboard selection paints on its
+                                                    // own: without a pointer over the list,
+                                                    // hover paints nothing.
+                                                    let is_selected = idx == self.at_selected;
+                                                    let row_bg = if is_selected {
+                                                        theme.accent
+                                                    } else {
+                                                        theme.surface
+                                                    };
+                                                    let row_fg = if is_selected {
+                                                        theme.black
+                                                    } else {
+                                                        theme.foreground
+                                                    };
+                                                    let row_icon = if is_selected {
+                                                        theme.black
+                                                    } else {
+                                                        theme.muted
+                                                    };
                                                     div()
-                                                        .text_size(px(12.))
-                                                        .text_color(theme.foreground)
+                                                        .id(SharedString::from(format!("ai-at-row-{}", idx)))
+                                                        .flex()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap_2()
+                                                        .px(px(8.))
+                                                        .py(px(4.))
+                                                        .rounded(px(4.))
+                                                        .min_w(px(0.))
                                                         .overflow_hidden()
-                                                        .child(SharedString::from(file_path.clone())),
-                                                )
-                                        })),
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .bg(row_bg)
+                                                        // Hover on the selected row would
+                                                        // hide the selection exactly when
+                                                        // the reader looks at it.
+                                                        .when(!is_selected, |row| {
+                                                            row.hover(move |s| s.bg(theme.hover))
+                                                        })
+                                                        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                                            if let Some(ref cb) = on_select {
+                                                                cb(&fp, window, cx);
+                                                            }
+                                                        })
+                                                        .child(crate::ui::icons::render_icon(
+                                                            IconType::FileCode,
+                                                            row_icon,
+                                                            12.0,
+                                                        ))
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(12.))
+                                                                .font_weight(if is_selected {
+                                                                    FontWeight::BOLD
+                                                                } else {
+                                                                    FontWeight::NORMAL
+                                                                })
+                                                                .text_color(row_fg)
+                                                                .overflow_hidden()
+                                                                .child(SharedString::from(file_path.clone())),
+                                                        )
+                                                }),
+                                        ),
                                 )
                             })
                             // Attached Files Chip Badges
@@ -2573,11 +2843,15 @@ impl RenderOnce for AiSidebar {
                                                 .bg(theme.surface)
                                                 .border_1()
                                                 .border_color(theme.border)
-                                                .child(
-                                                    div()
-                                                        .text_size(px(11.))
-                                                        .child(if is_img { "🖼" } else { "📄" }),
-                                                )
+                                                .child(crate::ui::icons::render_icon(
+                                                    if is_img {
+                                                        IconType::FileImage
+                                                    } else {
+                                                        IconType::File
+                                                    },
+                                                    theme.muted,
+                                                    12.0,
+                                                ))
                                                 .child(
                                                     div()
                                                         .text_size(px(11.))
@@ -2947,14 +3221,17 @@ impl RenderOnce for AiSidebar {
                     )
             )
             .when(context_hovercard_open, |container| {
+                let on_file_drop = self.on_file_drop.clone();
                 container.child(render_context_hovercard(
-                    &provider_name,
                     &model_name,
-                    context_used_tokens,
-                    context_max_tokens,
-                    ai_last_usage,
-                    context_pct,
+                    ContextUsage {
+                        used_tokens: context_used_tokens,
+                        max_tokens: context_max_tokens,
+                        last_usage: ai_last_usage,
+                        pct: context_pct,
+                    },
                     &theme,
+                    on_file_drop.clone(),
                 ))
             })
     }

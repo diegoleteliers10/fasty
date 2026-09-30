@@ -4,14 +4,18 @@
 //! and step outcomes. Shows success, failure, and skipped step counts on the bottombar,
 //! and provides a context menu with the jobs/steps details when clicked.
 
+use icons::common::IconType;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::widgets::{Align, ClickAction, ContextMenuItem, Segment, Widget, WidgetContext};
 use crate::widgets::proc_util::{
-    FailureBackoff, NETWORK_PROC_TIMEOUT, binary_on_path, gh_authenticated, run_with_timeout,
+    binary_on_path, gh_authenticated, run_with_timeout, FailureBackoff, NETWORK_PROC_TIMEOUT,
+};
+use crate::widgets::{
+    Align, ClickAction, ContextMenuItem, Segment, SegmentPart, Widget, WidgetContext,
 };
 
 const DEFAULT_INTERVAL_MS: u64 = 60_000; // 60 seconds (GitHub API is queried)
@@ -154,7 +158,7 @@ impl Widget for GitActionsWidget {
                 let backoff_clone = self.backoff.clone();
                 let gh_missing_clone = self.gh_missing.clone();
                 let gen = self.generation.load(Ordering::Relaxed);
-                
+
                 std::thread::spawn(move || {
                     // Offline / unauthenticated fast path: keep cached state
                     // instead of launching doomed requests.
@@ -183,7 +187,7 @@ impl Widget for GitActionsWidget {
                         let runs: Vec<GhRun> = serde_json::from_slice(&list_out.stdout).ok()?;
                         let run = runs.first()?;
                         let run_id = run.database_id?;
-                        
+
                         // 2. Run "gh run view <id> --json jobs"
                         let mut view_cmd = std::process::Command::new("gh");
                         view_cmd.args(["run", "view", &run_id.to_string(), "--json", "jobs"]);
@@ -197,24 +201,25 @@ impl Widget for GitActionsWidget {
                         if !view_out.status.success() {
                             return None;
                         }
-                        let view_data: GhRunViewRaw = serde_json::from_slice(&view_out.stdout).ok()?;
+                        let view_data: GhRunViewRaw =
+                            serde_json::from_slice(&view_out.stdout).ok()?;
                         let jobs_raw = view_data.jobs?;
-                        
+
                         let mut success_count = 0;
                         let mut failure_count = 0;
                         let mut skipped_count = 0;
                         let mut total_count = 0;
                         let mut in_progress = false;
                         let mut jobs = Vec::new();
-                        
+
                         for j in jobs_raw {
                             let job_url = j.url.unwrap_or_default();
                             let mut steps = Vec::new();
-                            
+
                             if j.status == "in_progress" || j.status == "queued" {
                                 in_progress = true;
                             }
-                            
+
                             if let Some(steps_raw) = j.steps {
                                 for s in steps_raw {
                                     total_count += 1;
@@ -223,7 +228,9 @@ impl Widget for GitActionsWidget {
                                     }
                                     match s.conclusion.as_deref() {
                                         Some("success") => success_count += 1,
-                                        Some("failure") | Some("timed_out") | Some("action_required") => failure_count += 1,
+                                        Some("failure")
+                                        | Some("timed_out")
+                                        | Some("action_required") => failure_count += 1,
                                         Some("skipped") => skipped_count += 1,
                                         _ => {}
                                     }
@@ -234,7 +241,7 @@ impl Widget for GitActionsWidget {
                                     });
                                 }
                             }
-                            
+
                             jobs.push(JobInfo {
                                 name: j.name,
                                 status: j.status,
@@ -243,7 +250,7 @@ impl Widget for GitActionsWidget {
                                 steps,
                             });
                         }
-                        
+
                         Some(ActionsSummary {
                             success_count,
                             failure_count,
@@ -253,7 +260,7 @@ impl Widget for GitActionsWidget {
                             jobs,
                         })
                     })();
-                    
+
                     // Stale result (cwd changed mid-flight): drop it so it
                     // can't overwrite fresher state.
                     if gen != generation_clone.load(Ordering::Relaxed) {
@@ -282,23 +289,24 @@ impl Widget for GitActionsWidget {
         let guard = self.state.lock().unwrap();
         let Some(summary) = guard.as_ref() else {
             if self.is_fetching.load(Ordering::Relaxed) {
-                return vec![Segment {
-                    text: " Actions: ↻".to_string(),
-                    color: [0.65, 0.65, 0.65, 1.0],
-                    tooltip: Some("Fetching GitHub Actions status...".to_string()),
-                }];
+                return vec![Segment::parts(
+                    vec![
+                        SegmentPart::Text("Actions:".to_string()),
+                        SegmentPart::Icon(IconType::Loader),
+                    ],
+                    [0.65, 0.65, 0.65, 1.0],
+                )
+                .with_tooltip("Fetching GitHub Actions status...")];
             }
             // UX2: subtle one-glance hint instead of silence when `gh` is
             // missing; the tooltip carries the explanation.
             if self.gh_missing.load(Ordering::Relaxed) {
-                return vec![Segment {
-                    text: " Actions: – ".to_string(),
-                    color: [0.55, 0.55, 0.62, 1.0],
-                    tooltip: Some(
+                return vec![
+                    Segment::text(" Actions: – ", [0.55, 0.55, 0.62, 1.0]).with_tooltip(
                         "gh CLI not found on PATH — install it to show Actions status here."
                             .to_string(),
                     ),
-                }];
+                ];
             }
             return Vec::new();
         };
@@ -308,42 +316,46 @@ impl Widget for GitActionsWidget {
         }
 
         let mut segs = Vec::new();
-        segs.push(Segment {
-            text: " Actions:".to_string(),
-            color: [0.85, 0.88, 0.95, 1.0],
-            tooltip: None,
-        });
+        segs.push(Segment::text(" Actions:", [0.85, 0.88, 0.95, 1.0]));
 
         if summary.success_count > 0 {
-            segs.push(Segment {
-                text: format!(" ✓{}", summary.success_count),
-                color: [0.45, 0.85, 0.55, 1.0],
-                tooltip: None,
-            });
+            segs.push(Segment::parts(
+                vec![
+                    SegmentPart::Icon(IconType::Check),
+                    SegmentPart::Text(summary.success_count.to_string()),
+                ],
+                [0.45, 0.85, 0.55, 1.0],
+            ));
         }
 
         if summary.failure_count > 0 {
-            segs.push(Segment {
-                text: format!(" ✗{}", summary.failure_count),
-                color: [0.90, 0.40, 0.40, 1.0],
-                tooltip: None,
-            });
+            segs.push(Segment::parts(
+                vec![
+                    SegmentPart::Icon(IconType::X),
+                    SegmentPart::Text(summary.failure_count.to_string()),
+                ],
+                [0.90, 0.40, 0.40, 1.0],
+            ));
         }
 
         if summary.skipped_count > 0 {
-            segs.push(Segment {
-                text: format!(" ↷{}", summary.skipped_count),
-                color: [0.65, 0.65, 0.65, 1.0],
-                tooltip: None,
-            });
+            segs.push(Segment::parts(
+                vec![
+                    SegmentPart::Icon(IconType::SkipForward),
+                    SegmentPart::Text(summary.skipped_count.to_string()),
+                ],
+                [0.65, 0.65, 0.65, 1.0],
+            ));
         }
 
         if summary.in_progress {
-            segs.push(Segment {
-                text: " ↻".to_string(),
-                color: [0.95, 0.80, 0.45, 1.0],
-                tooltip: Some("GitHub Actions run is in progress".to_string()),
-            });
+            segs.push(
+                Segment::parts(
+                    vec![SegmentPart::Icon(IconType::Loader)],
+                    [0.95, 0.80, 0.45, 1.0],
+                )
+                .with_tooltip("GitHub Actions run is in progress"),
+            );
         }
 
         segs
@@ -358,11 +370,11 @@ impl Widget for GitActionsWidget {
         if let Some(summary) = guard.as_ref() {
             let mut lines = Vec::new();
             lines.push("GitHub Actions Summary:".to_string());
-            lines.push(format!("  ✓ {} successful", summary.success_count));
-            lines.push(format!("  ✗ {} failed", summary.failure_count));
-            lines.push(format!("  ↷ {} skipped", summary.skipped_count));
+            lines.push(format!("{} successful", summary.success_count));
+            lines.push(format!("{} failed", summary.failure_count));
+            lines.push(format!("{} skipped", summary.skipped_count));
             if summary.in_progress {
-                lines.push("  ↻ Run is in progress".to_string());
+                lines.push("Run is in progress".to_string());
             }
             lines.push("\nClick to see job and step details.".to_string());
             Some(lines.join("\n"))
@@ -374,10 +386,10 @@ impl Widget for GitActionsWidget {
     fn get_context_menu_items(&self) -> Option<Vec<ContextMenuItem>> {
         let guard = self.state.lock().unwrap();
         let summary = guard.as_ref()?;
-        
+
         let mut items = Vec::new();
         let run_url = summary.jobs.first().map(|j| j.url.clone());
-        
+
         items.push(ContextMenuItem::GithubActionInfo {
             label: "GitHub Actions Run".to_string(),
             status: if summary.in_progress {
@@ -389,48 +401,174 @@ impl Widget for GitActionsWidget {
             },
             url: run_url,
         });
-        
+
         items.push(ContextMenuItem::Separator);
-        
+
         let total_steps: usize = summary.jobs.iter().map(|j| j.steps.len()).sum();
         let show_all = total_steps <= 15;
-        
+
         for (job_idx, job) in summary.jobs.iter().enumerate() {
             if job_idx > 0 {
                 items.push(ContextMenuItem::Separator);
             }
-            
+
             items.push(ContextMenuItem::GithubActionInfo {
-                label: format!("📦 Job: {}", job.name),
+                label: format!("Job: {}", job.name),
                 status: job.conclusion.clone().unwrap_or_else(|| job.status.clone()),
                 url: Some(job.url.clone()),
             });
-            
+
             let mut succeeded_count = 0;
             for step in &job.steps {
                 let is_success = step.conclusion.as_deref() == Some("success");
                 if is_success {
                     succeeded_count += 1;
                 }
-                
+
                 if show_all || !is_success {
                     items.push(ContextMenuItem::GithubActionInfo {
-                        label: format!("  ↳ {}", step.name),
-                        status: step.conclusion.clone().unwrap_or_else(|| step.status.clone()),
+                        label: step.name.clone(),
+                        status: step
+                            .conclusion
+                            .clone()
+                            .unwrap_or_else(|| step.status.clone()),
                         url: Some(job.url.clone()),
                     });
                 }
             }
-            
+
             if !show_all && succeeded_count > 0 {
                 items.push(ContextMenuItem::GithubActionInfo {
-                    label: format!("  ↳ ... ({} steps succeeded)", succeeded_count),
+                    label: format!("{} more step(s) succeeded", succeeded_count),
                     status: "success".to_string(),
                     url: Some(job.url.clone()),
                 });
             }
         }
-        
+
         Some(items)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::widgets::SegmentPart;
+
+    const CTX: WidgetContext<'static> = WidgetContext {
+        active_tab_cwd: None,
+        active_tab_git: None,
+        opacity: 1.0,
+        window_focused: true,
+    };
+
+    fn widget_with(summary: ActionsSummary) -> GitActionsWidget {
+        let widget = GitActionsWidget::new(Align::Left, None);
+        *widget.state.lock().unwrap() = Some(summary);
+        widget
+    }
+
+    fn summary(
+        success: usize,
+        failure: usize,
+        skipped: usize,
+        in_progress: bool,
+    ) -> ActionsSummary {
+        ActionsSummary {
+            success_count: success,
+            failure_count: failure,
+            skipped_count: skipped,
+            total_count: success + failure + skipped,
+            in_progress,
+            jobs: Vec::new(),
+        }
+    }
+
+    fn drawn(mut widget: GitActionsWidget) -> Vec<IconType> {
+        widget
+            .render(&CTX)
+            .into_iter()
+            .filter_map(|seg| {
+                seg.parts.into_iter().find_map(|p| match p {
+                    SegmentPart::Icon(i) => Some(i),
+                    SegmentPart::Text(_) => None,
+                })
+            })
+            .collect()
+    }
+
+    /// `✓`, `✗`, `↷` and `↻` are text-presentation, so the counts and the
+    /// spinner have to be icons.
+    #[test]
+    fn the_counts_are_icons() {
+        assert_eq!(
+            drawn(widget_with(summary(3, 0, 0, false))),
+            vec![IconType::Check]
+        );
+        assert_eq!(
+            drawn(widget_with(summary(0, 2, 0, false))),
+            vec![IconType::X]
+        );
+        assert_eq!(
+            drawn(widget_with(summary(0, 0, 5, false))),
+            vec![IconType::SkipForward]
+        );
+        assert_eq!(
+            drawn(widget_with(summary(3, 2, 5, true))),
+            vec![
+                IconType::Check,
+                IconType::X,
+                IconType::SkipForward,
+                IconType::Loader
+            ]
+        );
+    }
+
+    /// A count is an icon followed by its number, not a glyph inside a string.
+    #[test]
+    fn each_count_carries_its_number() {
+        let mut widget = widget_with(summary(3, 2, 0, false));
+        let segs = widget.render(&CTX);
+        let numbers: Vec<String> = segs
+            .iter()
+            .filter_map(|seg| {
+                seg.parts.iter().find_map(|p| match p {
+                    SegmentPart::Text(t)
+                        if t.chars().all(|c| c.is_ascii_digit()) && !t.is_empty() =>
+                    {
+                        Some(t.clone())
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+        assert_eq!(numbers, vec!["3", "2"]);
+    }
+
+    /// While `gh` is still being queried the bar shows a spinner instead of
+    /// silence.
+    #[test]
+    fn the_fetching_placeholder_is_a_spinner() {
+        let widget = GitActionsWidget::new(Align::Left, None);
+        widget.is_fetching.store(true, Ordering::Relaxed);
+        assert_eq!(drawn(widget), vec![IconType::Loader]);
+    }
+
+    /// No segment may carry a text-presentation glyph, which is how these were
+    /// all drawn before.
+    #[test]
+    fn no_segment_carries_a_status_glyph_as_text() {
+        const GLYPHS: [char; 4] = ['\u{2713}', '\u{2717}', '\u{21bb}', '\u{21b7}'];
+        let mut widget = widget_with(summary(3, 2, 5, true));
+        for seg in widget.render(&CTX) {
+            for part in &seg.parts {
+                if let SegmentPart::Text(text) = part {
+                    assert!(
+                        !GLYPHS.iter().any(|g| text.contains(*g)),
+                        "a status glyph must not come back as text: {text:?}"
+                    );
+                }
+            }
+        }
     }
 }

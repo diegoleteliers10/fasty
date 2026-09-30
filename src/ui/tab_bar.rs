@@ -533,7 +533,6 @@ impl RenderOnce for TabSidebar {
         let on_rename = self.on_rename_tab.map(std::rc::Rc::new);
         let on_tab_context = self.on_tab_context_menu.map(std::rc::Rc::new);
         let btn_hover_bg = theme.hover;
-        let tab_count = self.tabs.len();
 
         div()
             .id("vertical-tab-sidebar")
@@ -575,15 +574,6 @@ impl RenderOnce for TabSidebar {
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(theme.muted_strong)
                                             .child("TABS"),
-                                    )
-                                    .child(
-                                        div()
-                                            .px(px(2.))
-                                            .py(px(1.))
-                                            .text_size(px(9.5))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(theme.muted)
-                                            .child(format!("{tab_count}")),
                                     ),
                             )
                             .child(

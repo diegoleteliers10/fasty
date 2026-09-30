@@ -1,11 +1,13 @@
 //! Current kubectl context widget. Shells out to `kubectl config current-context`.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::widgets::proc_util::{
+    binary_on_path, run_with_timeout, FailureBackoff, LOCAL_PROC_TIMEOUT,
+};
 use crate::widgets::{Align, ClickAction, Segment, Widget, WidgetContext};
-use crate::widgets::proc_util::{FailureBackoff, LOCAL_PROC_TIMEOUT, binary_on_path, run_with_timeout};
 
 const DEFAULT_INTERVAL_MS: u64 = 60_000; // 60 seconds: context switches are rare
 
@@ -41,16 +43,24 @@ impl KubeWidget {
 }
 
 impl Widget for KubeWidget {
-    fn id(&self) -> &'static str { "kube" }
-    fn align(&self) -> Align { self.align }
+    fn id(&self) -> &'static str {
+        "kube"
+    }
+    fn align(&self) -> Align {
+        self.align
+    }
     fn poll_interval(&self) -> Duration {
         self.backoff
             .lock()
             .map(|b| b.effective_interval(self.interval))
             .unwrap_or(self.interval)
     }
-    fn last_poll(&self) -> Instant { self.last_poll }
-    fn set_last_poll(&mut self, t: Instant) { self.last_poll = t; }
+    fn last_poll(&self) -> Instant {
+        self.last_poll
+    }
+    fn set_last_poll(&mut self, t: Instant) {
+        self.last_poll = t;
+    }
 
     fn poll(&mut self, ctx: &WidgetContext) {
         if !ctx.window_focused {
@@ -74,7 +84,11 @@ impl Widget for KubeWidget {
             let next = match run_with_timeout(&mut cmd, LOCAL_PROC_TIMEOUT) {
                 Some(out) if out.status.success() => {
                     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if s.is_empty() { KubeState::Unknown } else { KubeState::Ok(s) }
+                    if s.is_empty() {
+                        KubeState::Unknown
+                    } else {
+                        KubeState::Ok(s)
+                    }
                 }
                 Some(_) => KubeState::Unknown,
                 // Missing binary stays silent (as before); a present-but-hung
@@ -96,26 +110,21 @@ impl Widget for KubeWidget {
     fn render(&mut self, _ctx: &WidgetContext) -> Vec<Segment> {
         let guard = self.state.lock().unwrap();
         match &*guard {
-            KubeState::Ok(ctx) => vec![Segment {
-                text: format!(" k8s:{} ", ctx),
-                color: [0.40, 0.75, 0.95, 1.0],
-                tooltip: Some(format!("kubectl context: {}", ctx)),
-            }],
-            KubeState::NoKubectl => vec![Segment {
-                // UX2: subtle one-glance hint instead of silence; the tooltip
-                // carries the explanation.
-                text: " k8s: – ".to_string(),
-                color: [0.55, 0.55, 0.62, 1.0],
-                tooltip: Some(
+            KubeState::Ok(ctx) => {
+                vec![
+                    Segment::text(format!(" k8s:{} ", ctx), [0.40, 0.75, 0.95, 1.0])
+                        .with_tooltip(format!("kubectl context: {}", ctx)),
+                ]
+            }
+            // UX2: subtle one-glance hint instead of silence; the tooltip
+            // carries the explanation.
+            KubeState::NoKubectl => vec![Segment::text(" k8s: – ", [0.55, 0.55, 0.62, 1.0])
+                .with_tooltip(
                     "kubectl not found on PATH — install it to show the current context here."
                         .to_string(),
-                ),
-            }],
-            KubeState::Error(e) => vec![Segment {
-                text: " k8s:err ".to_string(),
-                color: [0.90, 0.55, 0.45, 1.0],
-                tooltip: Some(format!("kubectl error: {}", e)),
-            }],
+                )],
+            KubeState::Error(e) => vec![Segment::text(" k8s:err ", [0.90, 0.55, 0.45, 1.0])
+                .with_tooltip(format!("kubectl error: {}", e))],
             KubeState::Unknown => Vec::new(),
         }
     }

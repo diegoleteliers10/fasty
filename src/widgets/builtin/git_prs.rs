@@ -1,10 +1,13 @@
-use std::time::{Duration, Instant};
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use crate::widgets::{Align, ClickAction, ContextMenuItem, Segment, Widget, WidgetContext};
 use crate::widgets::proc_util::{
-    FailureBackoff, NETWORK_PROC_TIMEOUT, binary_on_path, gh_authenticated, run_with_timeout,
+    binary_on_path, gh_authenticated, run_with_timeout, FailureBackoff, NETWORK_PROC_TIMEOUT,
 };
+use crate::widgets::{
+    Align, ClickAction, ContextMenuItem, Segment, SegmentPart, Widget, WidgetContext,
+};
+use icons::common::IconType;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const DEFAULT_INTERVAL_MS: u64 = 180_000; // 3 minutes: PR state changes slowly
 
@@ -70,7 +73,12 @@ pub(crate) fn fetch_prs_summary(cwd_path: &std::path::Path) -> Option<PrsSummary
     (|| -> Option<PrsSummary> {
         // 1. Check current branch PR status
         let mut view_cmd = std::process::Command::new("gh");
-        view_cmd.args(["pr", "view", "--json", "state,number,title,url,reviewDecision"]);
+        view_cmd.args([
+            "pr",
+            "view",
+            "--json",
+            "state,number,title,url,reviewDecision",
+        ]);
         view_cmd.current_dir(cwd_path);
         #[cfg(target_os = "windows")]
         {
@@ -86,7 +94,14 @@ pub(crate) fn fetch_prs_summary(cwd_path: &std::path::Path) -> Option<PrsSummary
 
         // 2. Get active PRs list
         let mut list_cmd = std::process::Command::new("gh");
-        list_cmd.args(["pr", "list", "--limit", "10", "--json", "number,title,url,author"]);
+        list_cmd.args([
+            "pr",
+            "list",
+            "--limit",
+            "10",
+            "--json",
+            "number,title,url,author",
+        ]);
         list_cmd.current_dir(cwd_path);
         #[cfg(target_os = "windows")]
         {
@@ -102,7 +117,16 @@ pub(crate) fn fetch_prs_summary(cwd_path: &std::path::Path) -> Option<PrsSummary
 
         // 3. Get review requested PRs
         let mut review_cmd = std::process::Command::new("gh");
-        review_cmd.args(["pr", "list", "--search", "review-requested:@me", "--limit", "5", "--json", "number,title,url,author"]);
+        review_cmd.args([
+            "pr",
+            "list",
+            "--search",
+            "review-requested:@me",
+            "--limit",
+            "5",
+            "--json",
+            "number,title,url,author",
+        ]);
         review_cmd.current_dir(cwd_path);
         #[cfg(target_os = "windows")]
         {
@@ -233,14 +257,12 @@ impl Widget for GitPrsWidget {
             // UX2: subtle one-glance hint instead of silence when `gh` is
             // missing; the tooltip carries the explanation.
             if self.gh_missing.load(Ordering::Relaxed) {
-                return vec![Segment {
-                    text: " PRs: – ".to_string(),
-                    color: [0.55, 0.55, 0.62, 1.0],
-                    tooltip: Some(
+                return vec![
+                    Segment::text(" PRs: – ", [0.55, 0.55, 0.62, 1.0]).with_tooltip(
                         "gh CLI not found on PATH — install it to show pull requests here."
                             .to_string(),
                     ),
-                }];
+                ];
             }
             return Vec::new();
         };
@@ -248,39 +270,47 @@ impl Widget for GitPrsWidget {
         let mut segs = Vec::new();
 
         if let Some(ref pr) = summary.current_pr {
-            // State indicators
-            let (status_text, color) = match pr.review_decision.as_deref() {
-                Some("APPROVED") => (" ✓", [0.45, 0.85, 0.55, 1.0]), // green
-                Some("CHANGES_REQUESTED") => (" ✗", [0.90, 0.40, 0.40, 1.0]), // red
-                Some("REVIEW_REQUIRED") => (" ↻", [0.95, 0.80, 0.45, 1.0]), // yellow
-                _ => (" ↻", [0.95, 0.80, 0.45, 1.0]), // default yellow review pending
+            // State indicators. `Check`, `X` and `Clock` are icons, not glyphs:
+            // `✓`, `✗` and `↻` are text-presentation, so they depend on the
+            // system font and differ per platform.
+            let (status_icon, color) = match pr.review_decision.as_deref() {
+                Some("APPROVED") => (IconType::Check, [0.45, 0.85, 0.55, 1.0]), // green
+                Some("CHANGES_REQUESTED") => (IconType::X, [0.90, 0.40, 0.40, 1.0]), // red
+                Some("REVIEW_REQUIRED") => (IconType::Clock, [0.95, 0.80, 0.45, 1.0]), // yellow
+                _ => (IconType::Clock, [0.95, 0.80, 0.45, 1.0]), // default yellow review pending
             };
-            segs.push(Segment {
-                text: format!(" PR #{}", pr.number),
-                color: [0.85, 0.88, 0.95, 1.0],
-                tooltip: Some(format!("PR #{}: {}\nClick to open.", pr.number, pr.title)),
-            });
-            segs.push(Segment {
-                text: status_text.to_string(),
-                color,
-                tooltip: Some(format!("Review status: {:?}", pr.review_decision)),
-            });
+            segs.push(
+                Segment::text(format!(" PR #{}", pr.number), [0.85, 0.88, 0.95, 1.0])
+                    .with_tooltip(format!("PR #{}: {}\nClick to open.", pr.number, pr.title)),
+            );
+            segs.push(
+                Segment::parts(vec![SegmentPart::Icon(status_icon)], color)
+                    .with_tooltip(format!("Review status: {:?}", pr.review_decision)),
+            );
         } else {
             // No current branch PR, display open PR count if positive
             if !summary.open_prs.is_empty() {
-                let mut text = format!(" PRs: 📥{}", summary.open_prs.len());
+                // The counts read as icon + number, not as glyphs inside a
+                // string, so they draw the same on every platform.
+                let mut parts = vec![
+                    SegmentPart::Text("PRs:".to_string()),
+                    SegmentPart::Icon(IconType::GitPullRequest),
+                    SegmentPart::Text(summary.open_prs.len().to_string()),
+                ];
                 let mut tooltip = format!("{} open PRs in repository.", summary.open_prs.len());
 
                 if !summary.review_requested_prs.is_empty() {
-                    text.push_str(&format!(" 👤{}", summary.review_requested_prs.len()));
-                    tooltip.push_str(&format!("\n{} PRs requesting your review.", summary.review_requested_prs.len()));
+                    parts.push(SegmentPart::Icon(IconType::User));
+                    parts.push(SegmentPart::Text(
+                        summary.review_requested_prs.len().to_string(),
+                    ));
+                    tooltip.push_str(&format!(
+                        "\n{} PRs requesting your review.",
+                        summary.review_requested_prs.len()
+                    ));
                 }
 
-                segs.push(Segment {
-                    text,
-                    color: [0.85, 0.88, 0.95, 1.0],
-                    tooltip: Some(tooltip),
-                });
+                segs.push(Segment::parts(parts, [0.85, 0.88, 0.95, 1.0]).with_tooltip(tooltip));
             }
         }
 
@@ -303,13 +333,13 @@ impl Widget for GitPrsWidget {
                 status: "success".to_string(),
                 url: None,
             });
-            
+
             let status_str = match pr.review_decision.as_deref() {
                 Some("APPROVED") => "approved",
                 Some("CHANGES_REQUESTED") => "failure",
                 _ => "in_progress",
             };
-            
+
             items.push(ContextMenuItem::GithubActionInfo {
                 label: format!("  #{} {}", pr.number, pr.title),
                 status: status_str.to_string(),
@@ -322,13 +352,13 @@ impl Widget for GitPrsWidget {
                 items.push(ContextMenuItem::Separator);
             }
             items.push(ContextMenuItem::GithubActionInfo {
-                label: "📥 Awaiting Your Review".to_string(),
+                label: "Awaiting Your Review".to_string(),
                 status: "failure".to_string(),
                 url: None,
             });
             for pr in &summary.review_requested_prs {
                 items.push(ContextMenuItem::GithubActionInfo {
-                    label: format!("  👤 #{} {}", pr.number, pr.title),
+                    label: format!("  #{} {}", pr.number, pr.title),
                     status: "in_progress".to_string(),
                     url: Some(pr.url.clone()),
                 });
@@ -340,12 +370,16 @@ impl Widget for GitPrsWidget {
                 items.push(ContextMenuItem::Separator);
             }
             items.push(ContextMenuItem::GithubActionInfo {
-                label: "📥 Open Pull Requests".to_string(),
+                label: "Open Pull Requests".to_string(),
                 status: "success".to_string(),
                 url: None,
             });
             for pr in &summary.open_prs {
-                let author_str = pr.author.as_ref().map(|a| format!(" by @{}", a.login)).unwrap_or_default();
+                let author_str = pr
+                    .author
+                    .as_ref()
+                    .map(|a| format!(" by @{}", a.login))
+                    .unwrap_or_default();
                 items.push(ContextMenuItem::GithubActionInfo {
                     label: format!("  #{} {}{}", pr.number, pr.title, author_str),
                     status: "skipped".to_string(),
@@ -363,5 +397,119 @@ impl Widget for GitPrsWidget {
         }
 
         Some(items)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::widgets::SegmentPart;
+
+    const CTX: WidgetContext<'static> = WidgetContext {
+        active_tab_cwd: None,
+        active_tab_git: None,
+        opacity: 1.0,
+        window_focused: true,
+    };
+
+    fn pr(number: usize, review_decision: Option<&str>) -> GhPrView {
+        GhPrView {
+            state: "OPEN".to_string(),
+            number,
+            title: format!("PR {number}"),
+            url: String::new(),
+            review_decision: review_decision.map(str::to_string),
+        }
+    }
+
+    fn widget_with(summary: PrsSummary) -> GitPrsWidget {
+        let widget = GitPrsWidget::new(Align::Left, None);
+        *widget.state.lock().unwrap() = Some(summary);
+        widget
+    }
+
+    fn summary(current_pr: Option<GhPrView>) -> PrsSummary {
+        PrsSummary {
+            current_pr,
+            open_prs: Vec::new(),
+            review_requested_prs: Vec::new(),
+            cwd: std::path::PathBuf::new(),
+        }
+    }
+
+    /// `✓`, `✗` and `↻` are text-presentation, so a font without them draws
+    /// nothing or a box. The review state has to be an icon.
+    #[test]
+    fn the_review_state_is_an_icon() {
+        for (decision, icon) in [
+            (Some("APPROVED"), IconType::Check),
+            (Some("CHANGES_REQUESTED"), IconType::X),
+            (Some("REVIEW_REQUIRED"), IconType::Clock),
+            (None, IconType::Clock),
+        ] {
+            let mut widget = widget_with(summary(Some(pr(7, decision))));
+            let segs = widget.render(&CTX);
+            let status = segs.last().expect("a review status segment must exist");
+            assert!(
+                matches!(status.parts.first(), Some(SegmentPart::Icon(actual)) if *actual == icon),
+                "review decision {decision:?} must draw {icon:?}"
+            );
+        }
+    }
+
+    /// The PR counts read as icon + number, with the icon between the two
+    /// labels rather than baked into one string.
+    #[test]
+    fn the_pr_counts_interleave_icons_and_numbers() {
+        let mut summary = summary(None);
+        summary.open_prs = (0..3)
+            .map(|n| GhPrList {
+                number: n + 1,
+                title: String::new(),
+                url: String::new(),
+                author: None,
+            })
+            .collect();
+        summary.review_requested_prs = vec![GhPrList {
+            number: 9,
+            title: String::new(),
+            url: String::new(),
+            author: None,
+        }];
+
+        let mut widget = widget_with(summary);
+        let segs = widget.render(&CTX);
+        let seg = segs.first().expect("a PR count segment must exist");
+        let shape: Vec<&str> = seg
+            .parts
+            .iter()
+            .map(|p| match p {
+                SegmentPart::Text(t) => t.as_str(),
+                SegmentPart::Icon(i) => match i {
+                    IconType::GitPullRequest => "pr",
+                    IconType::User => "user",
+                    _other => "other",
+                },
+            })
+            .collect();
+        assert_eq!(shape, vec!["PRs:", "pr", "3", "user", "1"]);
+    }
+
+    /// No segment may carry a text-presentation glyph, which is how every one of
+    /// these was drawn before. This catches a partial revert.
+    #[test]
+    fn no_segment_carries_a_status_glyph_as_text() {
+        const GLYPHS: [char; 5] = ['\u{2713}', '\u{2717}', '\u{21bb}', '\u{21b7}', '\u{25cf}'];
+        let mut widget = widget_with(summary(Some(pr(7, Some("REVIEW_REQUIRED")))));
+        for seg in widget.render(&CTX) {
+            for part in &seg.parts {
+                if let SegmentPart::Text(text) = part {
+                    assert!(
+                        !GLYPHS.iter().any(|g| text.contains(*g)),
+                        "a status glyph must not come back as text: {text:?}"
+                    );
+                }
+            }
+        }
     }
 }

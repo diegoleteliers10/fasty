@@ -1,8 +1,12 @@
-use std::time::{Duration, Instant};
-use std::sync::{Arc, Mutex};
+use icons::common::IconType;
+
+use crate::widgets::proc_util::{run_with_timeout, FailureBackoff, LOCAL_PROC_TIMEOUT};
+use crate::widgets::{
+    Align, ClickAction, ContextMenuItem, Segment, SegmentPart, Widget, WidgetContext,
+};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use crate::widgets::{Align, ClickAction, ContextMenuItem, Segment, Widget, WidgetContext};
-use crate::widgets::proc_util::{FailureBackoff, LOCAL_PROC_TIMEOUT, run_with_timeout};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const DEFAULT_INTERVAL_MS: u64 = 30_000; // 30 seconds
 
@@ -113,7 +117,9 @@ impl Widget for GitSyncWidget {
                         if !branch_out.status.success() {
                             return None;
                         }
-                        let branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+                        let branch = String::from_utf8_lossy(&branch_out.stdout)
+                            .trim()
+                            .to_string();
 
                         // 2. Check if upstream branch is configured
                         let mut upstream_cmd = std::process::Command::new("git");
@@ -125,7 +131,8 @@ impl Widget for GitSyncWidget {
                             upstream_cmd.creation_flags(0x08000000);
                         }
                         let upstream_out = run_with_timeout(&mut upstream_cmd, LOCAL_PROC_TIMEOUT);
-                        let has_upstream = upstream_out.map(|o| o.status.success()).unwrap_or(false);
+                        let has_upstream =
+                            upstream_out.map(|o| o.status.success()).unwrap_or(false);
 
                         if !has_upstream {
                             return Some(SyncSummary {
@@ -233,39 +240,41 @@ impl Widget for GitSyncWidget {
         };
 
         if !summary.has_upstream {
-            return vec![Segment {
-                text: " Sync: no remote".to_string(),
-                color: [0.65, 0.65, 0.65, 1.0],
-                tooltip: Some(format!("Branch '{}' has no upstream configured.", summary.branch)),
-            }];
+            return vec![
+                Segment::text(" Sync: no remote", [0.65, 0.65, 0.65, 1.0]).with_tooltip(format!(
+                    "Branch '{}' has no upstream configured.",
+                    summary.branch
+                )),
+            ];
         }
 
-        let mut text = String::new();
+        // One color for the whole segment, as before: when a branch is both
+        // ahead and behind, the behind color wins and the ahead count reads in
+        // it too. Splitting this into one segment per direction would give each
+        // its own color, at the cost of a wider gap between them.
+        let mut parts = vec![SegmentPart::Text("Sync:".to_string())];
         let mut color = [0.85, 0.88, 0.95, 1.0]; // standard light gray/blue
 
         if summary.ahead == 0 && summary.behind == 0 {
-            text = " Sync: ✓".to_string();
+            parts.push(SegmentPart::Icon(IconType::Check));
             color = [0.45, 0.85, 0.55, 1.0]; // green
         } else {
-            text.push_str(" Sync:");
             if summary.ahead > 0 {
-                text.push_str(&format!(" ⇡{}", summary.ahead));
+                parts.push(SegmentPart::Icon(IconType::ArrowUp));
+                parts.push(SegmentPart::Text(summary.ahead.to_string()));
                 color = [0.95, 0.80, 0.45, 1.0]; // yellow
             }
             if summary.behind > 0 {
-                text.push_str(&format!(" ⇣{}", summary.behind));
+                parts.push(SegmentPart::Icon(IconType::ArrowDown));
+                parts.push(SegmentPart::Text(summary.behind.to_string()));
                 color = [0.90, 0.40, 0.40, 1.0]; // red/orange
             }
         }
 
-        vec![Segment {
-            text,
-            color,
-            tooltip: Some(format!(
-                "Branch '{}' is ahead by {} and behind by {} relative to remote.",
-                summary.branch, summary.ahead, summary.behind
-            )),
-        }]
+        vec![Segment::parts(parts, color).with_tooltip(format!(
+            "Branch '{}' is ahead by {} and behind by {} relative to remote.",
+            summary.branch, summary.ahead, summary.behind
+        ))]
     }
 
     fn on_click(&mut self, _ctx: &WidgetContext) -> ClickAction {
@@ -304,19 +313,19 @@ impl Widget for GitSyncWidget {
 
         // Actions
         items.push(ContextMenuItem::CommandItem {
-            label: "⇣ Pull (git pull)".to_string(),
+            label: "Pull (git pull)".to_string(),
             command: "git pull".to_string(),
             cwd: cwd_str.clone(),
         });
 
         items.push(ContextMenuItem::CommandItem {
-            label: "⇡ Push (git push)".to_string(),
+            label: "Push (git push)".to_string(),
             command: "git push".to_string(),
             cwd: cwd_str.clone(),
         });
 
         items.push(ContextMenuItem::CommandItem {
-            label: "↻ Fetch (git fetch)".to_string(),
+            label: "Fetch (git fetch)".to_string(),
             command: "git fetch".to_string(),
             cwd: cwd_str.clone(),
         });
@@ -324,7 +333,7 @@ impl Widget for GitSyncWidget {
         if summary.behind > 0 {
             items.push(ContextMenuItem::Separator);
             items.push(ContextMenuItem::GithubActionInfo {
-                label: format!("⇣ Commits Behind ({})", summary.behind),
+                label: format!("Commits Behind ({})", summary.behind),
                 status: "failure".to_string(),
                 url: None,
             });
@@ -340,7 +349,7 @@ impl Widget for GitSyncWidget {
         if summary.ahead > 0 {
             items.push(ContextMenuItem::Separator);
             items.push(ContextMenuItem::GithubActionInfo {
-                label: format!("⇡ Commits Ahead ({})", summary.ahead),
+                label: format!("Commits Ahead ({})", summary.ahead),
                 status: "success".to_string(),
                 url: None,
             });
@@ -356,12 +365,89 @@ impl Widget for GitSyncWidget {
         if summary.ahead == 0 && summary.behind == 0 {
             items.push(ContextMenuItem::Separator);
             items.push(ContextMenuItem::GithubActionInfo {
-                label: "✓ Up to date with remote".to_string(),
+                label: "Up to date with remote".to_string(),
                 status: "success".to_string(),
                 url: None,
             });
         }
 
         Some(items)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::widgets::SegmentPart;
+
+    const CTX: WidgetContext<'static> = WidgetContext {
+        active_tab_cwd: None,
+        active_tab_git: None,
+        opacity: 1.0,
+        window_focused: true,
+    };
+
+    fn widget_with(summary: SyncSummary) -> GitSyncWidget {
+        let widget = GitSyncWidget::new(Align::Left, None);
+        *widget.state.lock().unwrap() = Some(summary);
+        widget
+    }
+
+    fn summary(ahead: usize, behind: usize) -> SyncSummary {
+        SyncSummary {
+            ahead,
+            behind,
+            branch: "main".to_string(),
+            has_upstream: true,
+            ahead_commits: Vec::new(),
+            behind_commits: Vec::new(),
+            cwd: std::path::PathBuf::new(),
+        }
+    }
+
+    /// `\u2713`, `\u{21e1}` and `\u{21e3}` are text-presentation and depend on the
+    /// system font, so the sync state has to be icons.
+    #[test]
+    fn the_sync_state_is_icons() {
+        for (ahead, behind, icons) in [
+            (0, 0, vec![IconType::Check]),
+            (3, 0, vec![IconType::ArrowUp]),
+            (0, 2, vec![IconType::ArrowDown]),
+            (3, 2, vec![IconType::ArrowUp, IconType::ArrowDown]),
+        ] {
+            let mut widget = widget_with(summary(ahead, behind));
+            let segs = widget.render(&CTX);
+            let seg = segs.first().expect("a sync segment must exist");
+            let drawn: Vec<IconType> = seg
+                .parts
+                .iter()
+                .filter_map(|p| match p {
+                    SegmentPart::Icon(i) => Some(*i),
+                    SegmentPart::Text(_) => None,
+                })
+                .collect();
+            assert_eq!(drawn, icons, "ahead={ahead} behind={behind}");
+        }
+    }
+
+    /// The label comes first, then each direction with its own count.
+    #[test]
+    fn the_sync_label_comes_before_the_counts() {
+        let mut widget = widget_with(summary(3, 2));
+        let segs = widget.render(&CTX);
+        let seg = segs.first().unwrap();
+        assert!(matches!(&seg.parts[0], SegmentPart::Text(t) if t == "Sync:"));
+        assert_eq!(seg.parts.len(), 5, "label, up, count, down, count");
+    }
+
+    /// A branch with no upstream says so in words, with no glyph.
+    #[test]
+    fn no_upstream_is_plain_text() {
+        let mut s = summary(0, 0);
+        s.has_upstream = false;
+        let mut widget = widget_with(s);
+        let segs = widget.render(&CTX);
+        let seg = segs.first().unwrap();
+        assert!(seg.parts.iter().all(|p| matches!(p, SegmentPart::Text(_))));
     }
 }

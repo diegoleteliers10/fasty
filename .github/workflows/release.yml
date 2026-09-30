@@ -140,9 +140,58 @@ jobs:
           mv Fastty-*.AppImage "${{ matrix.appimage_name }}"
           ls -la "${{ matrix.appimage_name }}"
 
+      # macOS signing identity.
+      #
+      # macOS records its Gatekeeper decision against the app's designated
+      # requirement. An ad-hoc signature embeds the content hash there, and the
+      # hash changes on every build, so macOS treats every update as a different
+      # app and asks the user to accept it again. A self-signed certificate with
+      # a pinned leaf hash keeps the requirement identical across builds.
+      #
+      # With no certificate configured the release falls back to an ad-hoc
+      # signature, which is the current behaviour. Run
+      # tools/setup-signing-cert.sh once and add the three secrets to switch.
+      - name: Import macOS signing identity
+        if: runner.os == 'macOS'
+        env:
+          FASTTY_CERTIFICATE_P12_BASE64: ${{ secrets.FASTTY_CERTIFICATE_P12_BASE64 }}
+          FASTTY_CERTIFICATE_PASSWORD: ${{ secrets.FASTTY_CERTIFICATE_PASSWORD }}
+          FASTTY_SIGNING_IDENTITY: ${{ secrets.FASTTY_SIGNING_IDENTITY }}
+        run: |
+          PINNED="$(grep -v '^[[:space:]]*#' assets/macos-signing-requirement.txt | grep -v '^[[:space:]]*$')"
+          if [ -z "$FASTTY_CERTIFICATE_P12_BASE64" ] || [ -z "$FASTTY_CERTIFICATE_PASSWORD" ] || [ -z "$FASTTY_SIGNING_IDENTITY" ]; then
+            if echo "$PINNED" | grep -q 'REPLACE'; then
+              echo "No signing identity configured. Falling back to an ad-hoc signature."
+              echo "Run tools/setup-signing-cert.sh and add the FASTTY_CERTIFICATE_* secrets to stop macOS re-prompting after every update."
+              exit 0
+            fi
+            # A pinned requirement makes the updater reject any bundle that does
+            # not carry it, so an ad-hoc release here would lock every user out of
+            # self-update with no in-app recovery. Fail now instead.
+            echo "assets/macos-signing-requirement.txt pins a signing identity, but the"
+            echo "FASTTY_CERTIFICATE_* secrets are missing. Restore the secrets, or put the"
+            echo "requirement file back to its REPLACE placeholder."
+            exit 1
+          fi
+          KEYCHAIN="$RUNNER_TEMP/fastty-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "$FASTTY_CERTIFICATE_P12_BASE64" | base64 -D > "$RUNNER_TEMP/fastty-signing.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KEYCHAIN"
+          security import "$RUNNER_TEMP/fastty-signing.p12" -k "$KEYCHAIN" -P "$FASTTY_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security find-identity -p codesigning "$KEYCHAIN" | grep -F "\"$FASTTY_SIGNING_IDENTITY\""
+          echo "FASTTY_SIGNING_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          rm -f "$RUNNER_TEMP/fastty-signing.p12"
+
       # Empaquetado para macOS (Creación del App Bundle profesional con su icono .icns)
       - name: Package Binary (macOS)
         if: runner.os == 'macOS'
+        env:
+          FASTTY_SIGNING_IDENTITY: ${{ secrets.FASTTY_SIGNING_IDENTITY }}
         run: |
           mkdir -p dist/Fastty.app/Contents/MacOS
           mkdir -p dist/Fastty.app/Contents/Resources
@@ -179,8 +228,23 @@ jobs:
           </plist>
           EOF
 
-          # Firma ad-hoc para macOS (evita rechazos inmediatos en Apple Silicon)
-          codesign --force --deep -s - dist/Fastty.app
+          # Firma con la identidad estable cuando existe, y ad-hoc si no.
+          # La identidad estable mantiene el mismo "designated requirement" en
+          # cada build, que es lo que evita que macOS vuelva a pedir aceptacion.
+          if [ -n "$FASTTY_SIGNING_KEYCHAIN" ] && [ -n "$FASTTY_SIGNING_IDENTITY" ]; then
+            codesign --force --deep --options runtime --keychain "$FASTTY_SIGNING_KEYCHAIN" -s "$FASTTY_SIGNING_IDENTITY" dist/Fastty.app
+            codesign --verify --deep --strict --verbose=2 dist/Fastty.app
+            ACTUAL_REQUIREMENT="$(codesign -dr - dist/Fastty.app 2>&1 | sed -n 's/^#[[:space:]]*designated => //p')"
+            EXPECTED_REQUIREMENT="$(grep -v '^[[:space:]]*#' assets/macos-signing-requirement.txt | grep -v '^[[:space:]]*$')"
+            if [ "$ACTUAL_REQUIREMENT" != "$EXPECTED_REQUIREMENT" ]; then
+              echo "Firma inesperada."
+              echo "  actual:   $ACTUAL_REQUIREMENT"
+              echo "  esperado: $EXPECTED_REQUIREMENT"
+              exit 1
+            fi
+          else
+            codesign --force --deep -s - dist/Fastty.app
+          fi
 
           # Comprimir la estructura en .tar.gz
           cd dist

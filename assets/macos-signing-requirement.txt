@@ -1,0 +1,14 @@
+# The designated requirement a signed fastty.app must carry.
+#
+# macOS records a permission grant and a Gatekeeper record against this string,
+# not against the file. An ad-hoc signature produces a requirement built from the
+# content hash, and that hash changes on every build, so macOS treats every
+# update as a different app and asks the user to accept it again. A self-signed
+# certificate with a pinned leaf hash produces the same requirement on every
+# build, so the record survives updates.
+#
+# Until this line names a real leaf hash the updater skips the identity check
+# and keeps signing ad hoc, which is the current behaviour. Generate the
+# certificate with tools/setup-signing-cert.sh, then paste the line that
+# script prints here.
+identifier "com.diegoleteliers10.fastty" and certificate leaf = H"REPLACE_WITH_YOUR_CERTIFICATE_LEAF_SHA1"

@@ -1,4 +1,6 @@
 //! fastty library - GPUI terminal emulator
+// The `#[test]` attribute expands recursively, once per test in a module. A
+// module with many tests needs more headroom than the default limit of 128.
 #![recursion_limit = "512"]
 
 pub mod ai;

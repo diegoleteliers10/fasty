@@ -723,10 +723,17 @@ fn install_macos(archive_path: &Path) -> Result<(), UpdateError> {
     fs::rename(&extracted_app, &staging_app)?;
     let _ = fs::remove_dir_all(&temp_staging_dir);
 
+    // Gatekeeper keys on the quarantine flag, so clearing it is what lets a
+    // freshly downloaded bundle run. This must run before any signature work.
     let _ = Command::new("xattr").arg("-cr").arg(&staging_app).status();
-    let _ = Command::new("codesign")
-        .args(["--force", "--deep", "-s", "-", staging_app.to_str().unwrap_or_default()])
-        .status();
+
+    // A rejected update leaves a full app bundle next to the working one. Drop it
+    // now, because the next attempt only cleans up on its way in.
+    if let Err(e) = verify_macos_update_identity(&bundle_dir, &staging_app) {
+        let _ = fs::remove_dir_all(&staging_app);
+        return Err(e);
+    }
+    ensure_macos_signature(&staging_app);
 
     if !staging_app.exists() {
         return Err(UpdateError::Io(io::Error::new(
@@ -763,6 +770,184 @@ fn install_macos(archive_path: &Path) -> Result<(), UpdateError> {
     Command::new("sh").arg("-c").arg(script).spawn()?;
     std::process::exit(0);
 }
+
+/// The designated requirement fastty is expected to carry once a stable
+/// signing identity is configured.
+///
+/// The file pins the leaf hash of a self-signed certificate, which keeps the
+/// requirement identical across builds. That is what stops macOS treating every
+/// update as a different app and asking the user to accept it again.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_REQUIREMENT_FILE: &str = include_str!("../assets/macos-signing-requirement.txt");
+
+/// Bundle identifier the release workflow writes into `Info.plist`. A bundle
+/// with a different identifier is not fastty, whatever its signature says.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_BUNDLE_ID: &str = "com.diegoleteliers10.fastty";
+
+/// True when the requirement names a real signing identity, rather than the
+/// placeholder left in place before a certificate exists.
+#[cfg(any(target_os = "macos", test))]
+fn macos_requirement_configured_shape(requirement: &str) -> bool {
+    let requirement = requirement.trim();
+    !requirement.is_empty()
+        && !requirement.contains("REPLACE")
+        && requirement.starts_with("identifier \"")
+}
+
+/// True when the pinned requirement is still a placeholder, which is the state
+/// before a signing certificate exists.
+#[cfg(any(target_os = "macos", test))]
+fn macos_requirement_configured() -> bool {
+    macos_requirement_configured_shape(MACOS_REQUIREMENT_FILE)
+}
+
+/// Extracts the designated requirement from `codesign -dr -` output.
+///
+/// `codesign` writes this to stderr, commented out, like:
+/// `# designated => identifier "com.example.app" and certificate leaf = H"abc..."`
+/// The comment marker is part of the format, not decoration, so it has to be
+/// stripped before the prefix matches.
+#[cfg(any(target_os = "macos", test))]
+fn parse_designated_requirement(codesign_output: &str) -> Option<String> {
+    codesign_output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix('#')
+            .unwrap_or(line.trim())
+            .trim_start()
+            .strip_prefix("designated => ")
+            .map(|requirement| requirement.trim().to_owned())
+    })
+}
+
+/// Reads the designated requirement macOS records for a bundle.
+///
+/// `codesign -dr -` prints the requirement on stdout and the `Executable=` line
+/// on stderr, so the requirement has to be read from stdout.
+#[cfg(target_os = "macos")]
+fn macos_designated_requirement(app: &Path) -> Option<String> {
+    let output = Command::new("codesign")
+        .args(["-dr", "-"])
+        .arg(app)
+        .output()
+        .ok()?;
+    parse_designated_requirement(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Reads the ad-hoc marker out of `codesign -dv --verbose=4` output, which
+/// reports the signature kind as `Signature=adhoc` on stderr.
+#[cfg(any(target_os = "macos", test))]
+fn parse_adhoc_flag(codesign_output: &str) -> bool {
+    codesign_output
+        .lines()
+        .any(|line| line.trim() == "Signature=adhoc")
+}
+
+/// True when the bundle carries an ad-hoc signature, whose designated
+/// requirement is the content hash. That hash changes on every build, so macOS
+/// treats the next build as a different app.
+#[cfg(target_os = "macos")]
+fn macos_has_adhoc_signature(app: &Path) -> Option<bool> {
+    let output = Command::new("codesign")
+        .args(["-dv", "--verbose=4"])
+        .arg(app)
+        .output()
+        .ok()?;
+    Some(parse_adhoc_flag(&String::from_utf8_lossy(&output.stderr)))
+}
+
+/// Checks that the downloaded bundle is the app it claims to be, and that its
+/// signing identity matches the one already installed.
+///
+/// Without a pinned requirement the check only confirms the bundle identifier,
+/// so a release signed with a stable identity works and a release still signed
+/// ad hoc keeps working. The identity comparison only runs once a requirement
+/// is pinned, so switching to a stable identity does not lock out the builds
+/// that came before it.
+#[cfg(target_os = "macos")]
+fn verify_macos_update_identity(current: &Path, staged: &Path) -> Result<(), UpdateError> {
+    // Check the signature is internally consistent before reading anything out
+    // of it. The ad-hoc fallback below re-signs a bundle that fails this, which
+    // would otherwise paper over a corrupted download.
+    let verified = Command::new("codesign")
+        .args(["--verify", "--deep", "--strict"])
+        .arg(staged)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !verified {
+        return Err(UpdateError::SignatureVerificationFailed(
+            "The downloaded app has an invalid code signature".into(),
+        ));
+    }
+
+    let bundle_id = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", "Print :CFBundleIdentifier"])
+        .arg(staged.join("Contents/Info.plist"))
+        .output()
+        .map_err(|e| {
+            UpdateError::SignatureVerificationFailed(format!("Cannot read the bundle identifier: {e}"))
+        })?;
+    if !bundle_id.status.success()
+        || String::from_utf8_lossy(&bundle_id.stdout).trim() != MACOS_BUNDLE_ID
+    {
+        return Err(UpdateError::SignatureVerificationFailed(
+            "The downloaded app has a different bundle identifier".into(),
+        ));
+    }
+
+    if !macos_requirement_configured() {
+        return Ok(());
+    }
+
+    let expected = MACOS_REQUIREMENT_FILE.trim();
+    let staged_requirement = macos_designated_requirement(staged).ok_or_else(|| {
+        UpdateError::SignatureVerificationFailed("Cannot read the app signing identity".into())
+    })?;
+    if staged_requirement != expected {
+        return Err(UpdateError::SignatureVerificationFailed(
+            "The downloaded app does not carry the expected signing identity".into(),
+        ));
+    }
+    // A bundle already carrying the stable identity must keep it. An ad-hoc
+    // installed app is allowed to move to the stable identity once.
+    if let (Some(false), Some(installed)) =
+        (macos_has_adhoc_signature(current), macos_designated_requirement(current))
+    {
+        if installed != staged_requirement {
+            return Err(UpdateError::SignatureVerificationFailed(
+                "The downloaded app is signed with a different identity than the installed one".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_macos_update_identity(_current: &Path, _staged: &Path) -> Result<(), UpdateError> {
+    Ok(())
+}
+
+/// Signs the bundle only when it carries no usable signature.
+///
+/// An ad-hoc signature is the fallback for builds with no signing certificate.
+/// Re-signing an already signed bundle would replace a stable identity with a
+/// content hash, which is the exact state that makes macOS ask the user to
+/// accept the app again after every update.
+#[cfg(target_os = "macos")]
+fn ensure_macos_signature(app: &Path) {
+    if macos_has_adhoc_signature(app) == Some(false)
+        && macos_designated_requirement(app).is_some()
+    {
+        return;
+    }
+    let _ = Command::new("codesign")
+        .args(["--force", "--deep", "-s", "-", app.to_str().unwrap_or_default()])
+        .status();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_macos_signature(_app: &Path) {}
 
 #[cfg(target_os = "windows")]
 fn install_windows(archive_path: &Path) -> Result<(), UpdateError> {
@@ -1003,5 +1188,172 @@ pub fn cleanup_old_installations() {
                 let _ = fs::remove_file(old_bin);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `codesign -dr -` stdout, recorded from an ad-hoc probe bundle. The
+    /// `# ` before `designated =>` is part of the format, not decoration.
+    /// Parsing this correctly is what stops a stable signing identity from being
+    /// silently replaced by an ad-hoc one on every update.
+    const ADHOC_REQUIREMENT_STDOUT: &str = concat!(
+        "# designated => cdhash H\"02426949f4fc198605ff2825cad7fe26ab7d17a6\"",
+        " or cdhash H\"64e3561f3401a60e6da58327d33a53cb8318745e\"",
+        " or cdhash H\"9efa319729aa84faa400592047cab1da1634557c\"\n",
+    );
+
+    /// `codesign -dr -` writes this line to stderr, not to the requirement
+    /// stream. Reading the requirement from stderr finds nothing.
+    const ADHOC_REQUIREMENT_STDERR: &str =
+        "Executable=/tmp/probe.app/Contents/MacOS/Probe\n";
+
+    /// Real `codesign -dv --verbose=4` stderr, from the same bundle. The
+    /// signature kind lives here, and this stream carries no requirement.
+    const ADHOC_VERBOSE_STDERR: &str = concat!(
+        "Executable=/tmp/probe.app/Contents/MacOS/Probe\n",
+        "Identifier=com.diegoleteliers10.fastty\n",
+        "Format=app bundle with Mach-O universal (x86_64 arm64e arm64e.x1)\n",
+        "CodeDirectory v=20400 size=308 flags=0x2(adhoc) hashes=3+3 location=embedded\n",
+        "Signature=adhoc\n",
+        "Info.plist entries=6\n",
+        "TeamIdentifier=not set\n",
+        "Sealed Resources=3\n",
+    );
+
+    #[test]
+    fn parses_the_requirement_codesign_actually_prints() {
+        let requirement = parse_designated_requirement(ADHOC_REQUIREMENT_STDOUT)
+            .expect("codesign comments the requirement out with a leading #");
+        assert!(
+            requirement.starts_with("cdhash H\""),
+            "got {requirement:?}"
+        );
+        assert!(!requirement.contains('#'), "the comment marker must be stripped");
+    }
+
+    /// The requirement is on stdout. The stderr stream holds only the
+    /// `Executable=` line, so parsing the wrong stream silently finds nothing
+    /// and the updater then re-signs every bundle it downloads.
+    #[test]
+    fn the_requirement_is_not_on_the_stderr_stream() {
+        assert_eq!(parse_designated_requirement(ADHOC_REQUIREMENT_STDERR), None);
+    }
+
+    #[test]
+    fn parses_a_requirement_without_the_comment_marker() {
+        // Some tool versions print the requirement uncommented.
+        let output = "designated => identifier \"com.example.app\" and anchor apple generic\n";
+        assert_eq!(
+            parse_designated_requirement(output).as_deref(),
+            Some("identifier \"com.example.app\" and anchor apple generic")
+        );
+    }
+
+    #[test]
+    fn requirement_parse_fails_closed_on_unrelated_output() {
+        assert_eq!(parse_designated_requirement("Executable=/tmp/x\n"), None);
+        assert_eq!(parse_designated_requirement(""), None);
+        // A line that is not a requirement must not be accepted as one.
+        assert_eq!(
+            parse_designated_requirement("# Identifier=com.example.app\n"),
+            None
+        );
+    }
+
+    /// The comment marker may be followed by any number of spaces, which is what
+    /// the shell pattern `^#[[:space:]]*designated =>` accepts. The two parsers
+    /// have to agree, or CI writes a requirement the updater then rejects.
+    #[test]
+    fn requirement_parse_tolerates_spacing_after_the_comment_marker() {
+        for spacing in ["# ", "#  ", "#\t", "#"] {
+            let output = format!("{spacing}designated => cdhash H\"aa\"\n");
+            assert_eq!(
+                parse_designated_requirement(&output).as_deref(),
+                Some("cdhash H\"aa\""),
+                "failed for {spacing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_the_adhoc_marker() {
+        assert!(parse_adhoc_flag(ADHOC_VERBOSE_STDERR));
+        assert!(!parse_adhoc_flag(
+            "Identifier=com.diegoleteliers10.fastty\nTeamIdentifier=ABCD\n"
+        ));
+    }
+
+    /// The bundle identifier lives in two places: the release workflow writes it
+    /// into `Info.plist`, and the updater checks it. A change to one and not the
+    /// other would make every update fail the identity check, so pin them
+    /// together.
+    #[test]
+    fn macos_bundle_id_matches_the_release_workflow() {
+        let workflow = include_str!("../.github/workflows/release.yml");
+        assert!(
+            workflow.contains(MACOS_BUNDLE_ID),
+            "the release workflow must write the bundle id {MACOS_BUNDLE_ID} into Info.plist"
+        );
+        let requirement = MACOS_REQUIREMENT_FILE.trim();
+        assert!(
+            requirement.contains(MACOS_BUNDLE_ID),
+            "the pinned signing requirement must name the bundle id {MACOS_BUNDLE_ID}"
+        );
+    }
+
+    /// The shell copies of the requirement parse must strip the same comment
+    /// marker. They run in CI and in the setup script, where a silent mismatch
+    /// either fails the release or writes an unusable requirement file.
+    #[test]
+    fn shell_requirement_parsers_match_the_rust_one() {
+        let requirement = parse_designated_requirement(ADHOC_REQUIREMENT_STDOUT)
+            .expect("the fixture parses in Rust");
+        for script in [
+            include_str!("../tools/setup-signing-cert.sh"),
+            include_str!("../.github/workflows/release.yml"),
+        ] {
+            assert!(
+                script.contains("s/^#[[:space:]]*designated => //p"),
+                "a shell copy is missing the # prefix in its codesign requirement parse"
+            );
+        }
+        // The recorded output is what the shell pattern has to cope with.
+        assert!(ADHOC_REQUIREMENT_STDOUT.contains("# designated => "));
+        let _ = requirement;
+    }
+
+    /// Before a certificate exists the requirement file holds a placeholder, and
+    /// the updater must fall back to the current ad-hoc behaviour rather than
+    /// reject every update.
+    #[test]
+    fn unconfigured_requirement_falls_back_to_adhoc() {
+        let placeholder = "identifier \"com.diegoleteliers10.fastty\" and certificate leaf = H\"REPLACE\"";
+        assert!(macos_requirement_configured_shape(placeholder) == false);
+        let pinned = "identifier \"com.diegoleteliers10.fastty\" and certificate leaf = H\"d2d3ed87a19d1ab0c573da9bad5aea7a12f87732\"";
+        assert!(macos_requirement_configured_shape(pinned));
+    }
+
+    /// A configured requirement has the shape macOS prints for a stable
+    /// identity. Anything else would make the release assertion and the updater
+    /// disagree.
+    #[test]
+    fn configured_requirement_has_the_expected_shape() {
+        if !macos_requirement_configured() {
+            return;
+        }
+        let requirement = MACOS_REQUIREMENT_FILE.trim();
+        let leaf = requirement
+            .split("certificate leaf = H\"")
+            .nth(1)
+            .expect("a stable identity pins the certificate leaf");
+        let hash = leaf.trim_end_matches('"');
+        assert_eq!(hash.len(), 40, "a SHA-1 leaf hash is 40 hex characters");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "the leaf hash must be hexadecimal, got {hash}"
+        );
     }
 }

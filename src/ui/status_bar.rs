@@ -1,13 +1,13 @@
-use gpui::{
-    App, FontWeight, IntoElement, MouseDownEvent, RenderOnce, SharedString, Window,
-    div, prelude::*, px,
-};
-use parking_lot::Mutex;
-use std::sync::Arc;
+use super::theme::{rgb_to_hsla, Theme};
 use crate::config::Config;
 use crate::git::GitStatus;
 use crate::widgets::{Align, Segment, Widget, WidgetContext};
-use super::theme::{Theme, rgb_to_hsla};
+use gpui::{
+    div, prelude::*, px, App, FontWeight, IntoElement, MouseDownEvent, RenderOnce, SharedString,
+    Window,
+};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 pub struct StatusBarModel {
     pub widgets: Arc<Mutex<Vec<Box<dyn Widget>>>>,
@@ -136,7 +136,10 @@ impl StatusBar {
         }
     }
 
-    pub fn on_git_context_menu(mut self, handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static) -> Self {
+    pub fn on_git_context_menu(
+        mut self,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
         self.on_git_context_menu = Some(Arc::new(handler));
         self
     }
@@ -159,11 +162,15 @@ impl RenderOnce for StatusBar {
                     let u_g = (c[1] * 255.0).clamp(0.0, 255.0) as u8;
                     let u_b = (c[2] * 255.0).clamp(0.0, 255.0) as u8;
                     let fg = rgb_to_hsla(u_r, u_g, u_b);
-                    let is_git_seg = seg.text.contains('⎇') || seg.text.contains("git");
+                    let is_git_seg = seg.opens_git_menu;
                     let git_cb = git_menu_cb.clone();
 
                     let mut el = div()
                         .id(SharedString::from(format!("w-left-{}", idx)))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
                         .text_size(px(11.))
                         .text_color(fg);
 
@@ -181,7 +188,16 @@ impl RenderOnce for StatusBar {
                         }
                     }
 
-                    el.child(SharedString::from(seg.text))
+                    el.children(seg.parts.into_iter().map(|part| -> gpui::AnyElement {
+                        match part {
+                            crate::widgets::SegmentPart::Text(text) => {
+                                div().child(SharedString::from(text)).into_any_element()
+                            }
+                            crate::widgets::SegmentPart::Icon(icon) => {
+                                super::icons::render_icon(icon, fg, 11.0).into_any_element()
+                            }
+                        }
+                    }))
                 })
                 .collect()
         } else {
@@ -200,7 +216,11 @@ impl RenderOnce for StatusBar {
                     .items_center()
                     .gap_1()
                     .cursor(gpui::CursorStyle::PointingHand)
-                    .child(super::icons::render_icon(icons::common::IconType::GitBranch, color, 12.0))
+                    .child(super::icons::render_icon(
+                        icons::common::IconType::GitBranch,
+                        color,
+                        12.0,
+                    ))
                     .child(
                         div()
                             .text_size(px(11.))
@@ -229,7 +249,11 @@ impl RenderOnce for StatusBar {
                     .flex_row()
                     .items_center()
                     .gap_1()
-                    .child(super::icons::render_icon(icons::common::IconType::Folder, theme.accent, 11.0))
+                    .child(super::icons::render_icon(
+                        icons::common::IconType::Folder,
+                        theme.accent,
+                        11.0,
+                    ))
                     .child(
                         div()
                             .text_size(px(11.))
@@ -253,9 +277,22 @@ impl RenderOnce for StatusBar {
 
                     div()
                         .id(SharedString::from(format!("w-right-{}", idx)))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
                         .text_size(px(11.))
                         .text_color(fg)
-                        .child(SharedString::from(seg.text))
+                        .children(seg.parts.into_iter().map(|part| -> gpui::AnyElement {
+                            match part {
+                                crate::widgets::SegmentPart::Text(text) => {
+                                    div().child(SharedString::from(text)).into_any_element()
+                                }
+                                crate::widgets::SegmentPart::Icon(icon) => {
+                                    super::icons::render_icon(icon, fg, 11.0).into_any_element()
+                                }
+                            }
+                        }))
                 })
                 .collect()
         } else {
@@ -275,11 +312,7 @@ impl RenderOnce for StatusBar {
                 );
             }
             if let Some(code) = self.fallback_info.last_exit_code {
-                let color = if code == 0 {
-                    theme.green
-                } else {
-                    theme.red
-                };
+                let color = if code == 0 { theme.green } else { theme.red };
                 items.push(
                     div()
                         .id("fallback-exit")

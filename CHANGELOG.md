@@ -3,6 +3,39 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.15.0 - 2026-09-30
+
+### Terminal
+
+- Fix `gh auth login` rendering `\;1R` with an empty menu: fastty answered OSC 11 twice, once from its own scanner and once from the terminal library. The manual path is gone and one answerer remains.
+
+### Mission Control
+
+- Give each card its own icon: Copy, Paste, the four split directions and Duplicate Tab shared a `+` sign, which carried no information next to each other.
+- Fill the window edge to edge with a small margin, enlarge the cells, and recompute the grid on resize.
+- Fix arrow navigation on Windows and everywhere else: Left and Right moved through a flat list and wrapped. They now move in two dimensions and stop at the edges.
+
+### Status bar
+
+- Model icons as SVG instead of emoji glyphs, so the branch marker, the pull request counts and every status indicator draw the same on macOS, Windows and Linux.
+- Replace the remaining status glyphs (review pending, run in progress, ahead, behind, staged) with icons.
+- Remove the tab count badge from the vertical tab sidebar.
+
+### AI panel
+
+- Move the `@` file mention menu with the arrow keys. Up and Down wrap, Home and End jump, Page Up and Page Down stop at the ends, and Enter or Tab commits the highlighted row.
+- Attach a file dropped on the AI panel instead of pasting its path into the shell. The panel highlights itself while a file is over it.
+- The paperclip opens the system file dialog.
+
+### Settings
+
+- Redesign the hotkey display after corvo: each key is its own keycap, and non-macOS shows `Ctrl`, `Alt` and `Super` instead of the macOS symbols.
+
+### macOS updates
+
+- Keep a stable signing identity across releases so an update does not look like a different app. Run `tools/setup-signing-cert.sh` once, then add the three `FASTTY_CERTIFICATE_*` repository secrets.
+- Stop re-signing ad hoc in the install script and the Homebrew cask, which discarded the release signature on every install.
+
 ## 0.14.9 - 2026-09-28
 
 - Fix update dialog never appearing: releases without a matching OS/arch asset now show the changelog modal with a manual download option instead of failing silently.

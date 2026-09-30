@@ -1,18 +1,18 @@
-use std::sync::Arc;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor};
 use gpui::{
-    Bounds, Context, CursorStyle, Div, FocusHandle, FontFeatures, FontWeight, Hsla, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle,
-    ScrollWheelEvent, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, div, prelude::*, px, size,
+    div, prelude::*, px, size, Bounds, Context, CursorStyle, Div, FocusHandle, FontFeatures,
+    FontWeight, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Render, ScrollHandle, ScrollWheelEvent, SharedString, TitlebarOptions, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
+use std::sync::Arc;
 
 use super::settings_view::SettingsView;
 use super::status_bar::{StatusBar, StatusBarModel, StatusInfo};
 use super::tab_bar::{TabBar, TabItem, TabSidebar};
-use super::theme::{Theme, rgb_to_hsla};
+use super::theme::{rgb_to_hsla, Theme};
 use crate::config::{self, Config, TabLayout};
 use crate::event_listener::EventSender;
 use crate::git::GitStatus;
@@ -86,7 +86,6 @@ fn trim_row_spans(spans: &mut Vec<StyledSpan>) {
         }
     }
 }
-
 
 pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
     let code = ch as u32;
@@ -245,6 +244,328 @@ fn render_quadrant(width: f32, line_h: f32, tl: Hsla, tr: Hsla, bl: Hsla, br: Hs
         )
 }
 
+/// Geometry of the Mission Control grid, derived once per frame from the
+/// window size and the cell count.
+///
+/// The renderer and the keyboard handler both read this struct. A single
+/// source keeps the painted column count and the navigation column count
+/// identical, which is what makes the arrow keys land on the cell under the
+/// highlight. Deriving them separately let the two drift apart, and a drifting
+/// column count turns Left/Right into a jump to an unrelated cell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MissionControlLayout {
+    /// Columns actually painted. `fits_cols_in_row(grid_w, cell_w)` must equal
+    /// this, because that expression is the number of cells the flex line fits.
+    cols: usize,
+    /// Painted width of one cell.
+    cell_w: f32,
+    /// Painted height of one cell.
+    cell_h: f32,
+    /// Outer width of the grid box: the cells, the gaps, and the box padding.
+    grid_w: f32,
+    /// Height the grid may use before it scrolls.
+    grid_max_h: f32,
+}
+
+/// How many bytes of a file the prompt may inline before it truncates.
+const AI_ATTACH_INLINE_MAX_BYTES: usize = 16_000;
+
+/// Cut a file down to what fits in the prompt, on a character boundary.
+///
+/// `len` is bytes, not characters, so slicing at exactly the cap panics when the
+/// cap lands inside a multi-byte character. Any source file with an accented
+/// word near the cap would abort the process on submit.
+fn truncate_for_prompt(content: &str) -> String {
+    if content.len() <= AI_ATTACH_INLINE_MAX_BYTES {
+        return content.to_string();
+    }
+    let end = (0..=AI_ATTACH_INLINE_MAX_BYTES)
+        .rev()
+        .find(|i| content.is_char_boundary(*i))
+        .unwrap_or(0);
+    format!("{}... (truncated)", &content[..end])
+}
+
+/// True when the AI composer gets the key instead of an overlay or the shell.
+///
+/// The composer is focused as a plain bool, so clicking the paperclip leaves it
+/// focused while the file picker sits above it. Without this gate the composer
+/// block runs first and swallows everything: a typed letter goes into the
+/// prompt, Enter sends the prompt, Escape closes the AI sidebar.
+fn ai_keys_own_input(ai_open: bool, ai_focused: bool, file_picker_open: bool) -> bool {
+    ai_open && ai_focused && !file_picker_open
+}
+
+/// Rows the `@` mention menu draws. The candidate list, this count and the
+/// renderer all cap at `AI_AT_MENU_MAX_ROWS`, so the selection works off the
+/// drawn count and never points at a row that is not painted.
+fn at_menu_row_count(matches: &[String]) -> usize {
+    matches
+        .len()
+        .min(crate::ui::ai_sidebar::AI_AT_MENU_MAX_ROWS)
+}
+
+/// Move the `@` mention menu selection by `delta` rows, wrapping at both ends.
+/// With no rows there is nothing to point at, so the selection goes to 0.
+fn move_at_menu_selection(selected: &mut usize, matches: &[String], delta: isize) {
+    let len = at_menu_row_count(matches) as isize;
+    if len == 0 {
+        *selected = 0;
+        return;
+    }
+    *selected = (*selected as isize + delta).rem_euclid(len) as usize;
+}
+
+/// Move the selection by `delta` rows and stop at the ends instead of
+/// wrapping. A page jump that wrapped would land the user at the other end of
+/// the list, which is the opposite of paging.
+fn move_at_menu_selection_clamped(selected: &mut usize, matches: &[String], delta: isize) {
+    let len = at_menu_row_count(matches) as isize;
+    if len == 0 {
+        *selected = 0;
+        return;
+    }
+    *selected = ((*selected as isize + delta).clamp(0, len - 1)) as usize;
+}
+
+/// The row Enter commits in the `@` mention menu.
+///
+/// `None` means the key is not ours: the menu is closed or empty, so the caller
+/// sends it to the shell. The index is clamped, because a stale selection from
+/// a list that has since shrunk would otherwise pick a row that is no longer
+/// shown.
+fn at_menu_commit_row(menu_open: bool, matches: &[String], selected: usize) -> Option<usize> {
+    if !menu_open {
+        return None;
+    }
+    let rows = at_menu_row_count(matches);
+    if rows == 0 {
+        return None;
+    }
+    Some(selected.min(rows - 1))
+}
+
+/// Decide where a drop at `drop_x` lands.
+///
+/// `sidebar_left` is the left edge of the AI composer in window coordinates.
+/// With the panel closed its width is 0, so the edge sits at the right of the
+/// window and nothing can land on it.
+fn file_drop_target_at(ai_visible: bool, sidebar_left: f32, drop_x: f32) -> FileDropTarget {
+    if ai_visible && drop_x >= sidebar_left {
+        FileDropTarget::AiAttach
+    } else {
+        FileDropTarget::Terminal
+    }
+}
+
+/// Where a dropped file goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileDropTarget {
+    /// Paste a shell-quoted path into the focused terminal.
+    #[default]
+    Terminal,
+    /// Attach the file to the next AI message. Images and PDFs go as their own
+    /// content part, anything else is inlined as text.
+    AiAttach,
+}
+
+/// Rows PageUp and PageDown move in the `@` mention menu.
+const AI_AT_MENU_PAGE_ROWS: isize = 5;
+
+/// Cells per row. Four columns fills the window edge to edge up to the cell
+/// width cap; see `cell_width_cap_threshold`. Past that the grid centres itself,
+/// because a fifth column would push every cell past the readable width.
+const MC_MAX_COLS: usize = 4;
+/// Gap between cells.
+const MC_GAP: f32 = 16.0;
+/// Padding inside the grid box. Flex wrapping measures the content box, so this
+/// padding comes out of the width the cells get.
+const MC_GRID_PAD: f32 = 4.0;
+/// Cell aspect (height / width). A card is a little shorter than it is wide:
+/// the preview shows the last screenful of a tall terminal, which reads fine
+/// in a landscape box and wastes height in a portrait one. A window too short
+/// for the height shrinks the cell, and the grid then scrolls.
+const MC_CELL_ASPECT: f32 = 0.75;
+/// Narrowest cell that still fits a usable preview. A window too narrow for
+/// this drops a column instead of shrinking cells further.
+const MC_MIN_CELL_W: f32 = 260.0;
+/// Widest cell. Past this a preview stretches without gaining readable detail.
+/// The value is high enough that four columns still fill the window on a
+/// 3440 px display, which is where a lower cap left a dead band at the edge.
+const MC_MAX_CELL_W: f32 = 900.0;
+/// Distance kept between the grid and the window edge.
+const MC_EDGE_MARGIN: f32 = 24.0;
+/// Space above the header bar.
+const MC_TOP_PAD: f32 = 56.0;
+/// Height of the header bar.
+const MC_HEADER_H: f32 = 38.0;
+/// Gap between the header bar and the grid.
+const MC_HEADER_GAP: f32 = 16.0;
+/// Space the header block takes: top padding, the bar, and the gap.
+const MC_HEADER_SPACE: f32 = MC_TOP_PAD + MC_HEADER_H + MC_HEADER_GAP;
+
+/// Height of the card's top bar plus its bottom status bar. The bars carry
+/// their own borders, which sit inside their fixed heights, so no extra is
+/// added for them. The card's 2 px border is not counted here; that makes the
+/// estimate conservative, and the sweep found no overflow from the difference.
+const MC_CARD_CHROME_H: f32 = 32.0 + 26.0;
+/// Height of one preview line, including the gap between lines. The renderer
+/// sets `.h(px(13.))` per line with `.gap(px(1.5))`.
+const MC_PREVIEW_LINE_H: f32 = 14.5;
+/// Padding inside the preview area, top and bottom. The renderer sets
+/// `.py(px(6.))`.
+const MC_PREVIEW_PAD_H: f32 = 12.0;
+
+/// Number of preview lines that fit the preview area of a `cell_h` tall card.
+///
+/// A fixed line count left the rest of the card as empty background, so the
+/// count follows the cell height. A terminal cannot supply more rows than it
+/// shows, so `available_rows` is the other bound. That bound is also what keeps
+/// the per-frame cost in check: `get_screen_preview` never returns more rows
+/// than it is asked for, and it reads at most one screen.
+fn preview_line_count(cell_h: f32, available_rows: usize) -> usize {
+    let usable = cell_h - MC_CARD_CHROME_H - MC_PREVIEW_PAD_H;
+    if !usable.is_finite() || usable < MC_PREVIEW_LINE_H {
+        // Too short for a whole line, so report none rather than one that
+        // cannot fit.
+        return 0;
+    }
+    ((usable / MC_PREVIEW_LINE_H).floor() as usize).min(available_rows)
+}
+
+/// How many cells of `cell_w` the flex line inside a `grid_w` box actually
+/// fits, given the gaps and the box padding.
+///
+/// The grid wraps with `flex_wrap`, so this is the number of cells the taffy
+/// layout engine will place before breaking the line. When it is less than
+/// `layout.cols`, the grid paints fewer cells per row than the keyboard handler
+/// navigates, and the arrow keys land on cells that are not where the layout
+/// says they are. `collect_flex_lines` breaks the line as soon as
+/// `line_length > available`, and `available` is the content box, so the box
+/// padding counts against the budget.
+///
+/// This sums the cells the way taffy does, one at a time, rather than dividing
+/// once. A single division and an incremental sum disagree by an ulp when the
+/// cells fit with no slack at all, which made some window widths paint one cell
+/// fewer than expected.
+fn fits_cols_in_row(grid_w: f32, cell_w: f32) -> usize {
+    let available = grid_w - 2.0 * MC_GRID_PAD;
+    // `is_finite` plus the positive check, rather than `> 0.0` alone, so a NaN
+    // from a degenerate window size returns 0 instead of counting a cell.
+    if !available.is_finite() || available <= 0.0 || !cell_w.is_finite() || cell_w <= 0.0 {
+        return 0;
+    }
+    let mut line_length = 0.0f32;
+    let mut count = 0usize;
+    // The loop stops on the first cell that does not fit, which is where taffy
+    // breaks the line. The cap keeps a degenerate input from looping forever.
+    while count < MC_MAX_COLS * 4 {
+        line_length += if count == 0 { cell_w } else { cell_w + MC_GAP };
+        if line_length > available {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
+impl MissionControlLayout {
+    /// `items` counts the tabs plus the trailing "New Tab" card.
+    fn new(window_w: f32, window_h: f32, items: usize) -> Self {
+        let items = items.max(1);
+        // Space the grid may use. The box padding comes off the width, because
+        // the cells live inside the padded content box.
+        let avail_w = (window_w - 2.0 * MC_EDGE_MARGIN - 2.0 * MC_GRID_PAD).max(MC_MIN_CELL_W);
+        let avail_h = (window_h - MC_HEADER_SPACE - MC_EDGE_MARGIN).max(0.0);
+
+        // A column has to fit the minimum cell width, so the window width caps
+        // the column count. Height is not a cap: the grid scrolls instead.
+        let width_limited = ((avail_w + MC_GAP) / (MC_MIN_CELL_W + MC_GAP)).floor() as usize;
+        let cols = [items, MC_MAX_COLS, width_limited.max(1)]
+            .into_iter()
+            .min()
+            .unwrap_or(1)
+            .max(1);
+
+        // The columns share the width the window gives them, so the grid grows
+        // with the window up to the widest readable cell.
+        let cell_w = ((avail_w - (cols as f32 - 1.0) * MC_GAP) / cols as f32)
+            .clamp(MC_MIN_CELL_W, MC_MAX_CELL_W);
+        // Height follows the cell aspect. A short window wins: the cell shrinks
+        // rather than pushing the last row out of view, and the grid scrolls.
+        // `min` then `max` keeps the bounds ordered, because `f32::clamp` panics
+        // when the lower bound is the larger of the two.
+        let cell_h = (cell_w * MC_CELL_ASPECT).min(avail_h).max(0.0);
+        // The box holds the cells, the gaps between them, and its own padding.
+        let mut grid_w = cell_w * cols as f32 + (cols as f32 - 1.0) * MC_GAP + 2.0 * MC_GRID_PAD;
+        // The cells must fit with room to spare. Without the slack, an
+        // incremental sum in the layout engine can land an ulp above the budget
+        // and wrap the last cell onto a second row, which would make the grid
+        // paint one cell fewer per row than the arrow keys navigate.
+        while fits_cols_in_row(grid_w, cell_w) < cols {
+            grid_w += 1.0;
+        }
+
+        Self {
+            cols,
+            cell_w,
+            cell_h,
+            grid_w,
+            grid_max_h: avail_h,
+        }
+    }
+}
+
+/// Direction of one grid move. An enum keeps a plain index delta from reaching
+/// the navigation code, where a Left press and an Up press are different moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GridStep {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Moves the selection one cell, clamped to the grid.
+///
+/// Left and Right walk the row and stop at the grid edges, so a press never
+/// teleports to an unrelated cell. Up and Down keep the column and clamp to the
+/// first or last row, so an arrow always lands on the cell the eye expects.
+/// `items` is the number of selectable cells, which is one less than the painted
+/// count because the trailing "New Tab" card takes no selection.
+fn move_grid_selection(selected: usize, step: GridStep, cols: usize, items: usize) -> usize {
+    if items == 0 || cols == 0 {
+        return 0;
+    }
+    let last = items - 1;
+    let current = selected.min(last);
+
+    match step {
+        GridStep::Left => current.saturating_sub(1),
+        GridStep::Right => (current + 1).min(last),
+        GridStep::Up | GridStep::Down => {
+            let row = current / cols;
+            let col = current % cols;
+            let target_row = match step {
+                GridStep::Down => row + 1,
+                _ => match row.checked_sub(1) {
+                    Some(r) => r,
+                    None => return current,
+                },
+            };
+            let target = target_row * cols + col;
+            // The last row is short when the cell count is not a multiple of
+            // the column count. A step into a cell that row does not have keeps
+            // the selection put, rather than sliding it into another column.
+            if target > last {
+                current
+            } else {
+                target
+            }
+        }
+    }
+}
+
 /// True for box-drawing chars with vertical strokes. Repeated spans of these
 /// must render one stroke per cell; a single element would center one stroke
 /// across the whole span.
@@ -258,11 +579,7 @@ fn box_char_has_vertical_strokes(ch: char) -> bool {
 fn geometric_shape_synthesized(ch: char) -> bool {
     matches!(
         ch as u32,
-        0x25A0 | 0x25A1
-            | 0x25AA | 0x25AB
-            | 0x25CB | 0x25C9
-            | 0x25CE | 0x25CF
-            | 0x25E6 | 0x25EF
+        0x25A0 | 0x25A1 | 0x25AA | 0x25AB | 0x25CB | 0x25C9 | 0x25CE | 0x25CF | 0x25E6 | 0x25EF
     )
 }
 
@@ -325,55 +642,79 @@ fn render_geometric_cell(
             0x2581..=0x2587 => {
                 let frac = (code - 0x2580) as f32 / 8.0;
                 let fill_h = (line_h * frac).round().max(1.0);
-                div()
-                    .relative()
-                    .w(px(width))
-                    .h(px(line_h))
-                    .bg(bg_c)
-                    .child(div().absolute().bottom_0().left_0().right_0().h(px(fill_h)).bg(fg))
+                div().relative().w(px(width)).h(px(line_h)).bg(bg_c).child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(fill_h))
+                        .bg(fg),
+                )
             }
             0x2589..=0x258F => {
                 let frac = (8 - (code - 0x2588)) as f32 / 8.0;
                 let fill_w = (width * frac).round().max(1.0);
-                div()
-                    .relative()
-                    .w(px(width))
-                    .h(px(line_h))
-                    .bg(bg_c)
-                    .child(div().absolute().top_0().bottom_0().left_0().w(px(fill_w)).bg(fg))
+                div().relative().w(px(width)).h(px(line_h)).bg(bg_c).child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .w(px(fill_w))
+                        .bg(fg),
+                )
             }
             0x2591 => {
                 let mut blended = fg;
                 blended.a = 0.25;
-                div().w(px(width)).h(px(line_h)).bg(bg_c).child(div().size_full().bg(blended))
+                div()
+                    .w(px(width))
+                    .h(px(line_h))
+                    .bg(bg_c)
+                    .child(div().size_full().bg(blended))
             }
             0x2592 => {
                 let mut blended = fg;
                 blended.a = 0.50;
-                div().w(px(width)).h(px(line_h)).bg(bg_c).child(div().size_full().bg(blended))
+                div()
+                    .w(px(width))
+                    .h(px(line_h))
+                    .bg(bg_c)
+                    .child(div().size_full().bg(blended))
             }
             0x2593 => {
                 let mut blended = fg;
                 blended.a = 0.75;
-                div().w(px(width)).h(px(line_h)).bg(bg_c).child(div().size_full().bg(blended))
+                div()
+                    .w(px(width))
+                    .h(px(line_h))
+                    .bg(bg_c)
+                    .child(div().size_full().bg(blended))
             }
             0x2594 => {
                 let fill_h = (line_h * 0.125).round().max(1.0);
-                div()
-                    .relative()
-                    .w(px(width))
-                    .h(px(line_h))
-                    .bg(bg_c)
-                    .child(div().absolute().top_0().left_0().right_0().h(px(fill_h)).bg(fg))
+                div().relative().w(px(width)).h(px(line_h)).bg(bg_c).child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(fill_h))
+                        .bg(fg),
+                )
             }
             0x2595 => {
                 let fill_w = (width * 0.125).round().max(1.0);
-                div()
-                    .relative()
-                    .w(px(width))
-                    .h(px(line_h))
-                    .bg(bg_c)
-                    .child(div().absolute().top_0().bottom_0().right_0().w(px(fill_w)).bg(fg))
+                div().relative().w(px(width)).h(px(line_h)).bg(bg_c).child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right_0()
+                        .w(px(fill_w))
+                        .bg(fg),
+                )
             }
             0x2596 => render_quadrant(width, line_h, bg_c, bg_c, fg, bg_c),
             0x2597 => render_quadrant(width, line_h, bg_c, bg_c, bg_c, fg),
@@ -406,11 +747,7 @@ fn render_geometric_cell(
         if kind == 1 {
             // Round corners (0x256D..=0x2570)
             let radius = (mid_x.min(mid_y) * 0.9).round();
-            let mut corner = div()
-                .relative()
-                .w(px(width))
-                .h(px(line_h))
-                .bg(bg_c);
+            let mut corner = div().relative().w(px(width)).h(px(line_h)).bg(bg_c);
 
             // 0x256D (╭): down & right -> top-left bend
             if code == 0x256D {
@@ -476,11 +813,7 @@ fn render_geometric_cell(
             return Some(corner.flex_shrink_0());
         }
 
-        let mut container = div()
-            .relative()
-            .w(px(width))
-            .h(px(line_h))
-            .bg(bg_c);
+        let mut container = div().relative().w(px(width)).h(px(line_h)).bg(bg_c);
 
         if left_style > 0 && right_style > 0 && left_style == right_style && left_style != 3 {
             container = container.child(
@@ -561,7 +894,14 @@ fn render_geometric_cell(
     // which fallback font would supply the glyph.
     if (0x25A0..=0x25FF).contains(&code) {
         let d = width.min(line_h).max(2.0);
-        let ring = |size: f32| div().w(px(size)).h(px(size)).rounded_full().border_1().border_color(fg);
+        let ring = |size: f32| {
+            div()
+                .w(px(size))
+                .h(px(size))
+                .rounded_full()
+                .border_1()
+                .border_color(fg)
+        };
         let dot = |size: f32| div().w(px(size)).h(px(size)).rounded_full().bg(fg);
         let square = |side: f32| div().w(px(side)).h(px(side));
         let centered = |child: Div| {
@@ -587,13 +927,29 @@ fn render_geometric_cell(
             // ◦ WHITE BULLET
             0x25E6 => centered(ring(d * 0.40)),
             // ◉ FISHEYE — ring plus filled center
-            0x25C9 => centered(ring(d * 0.78).child(
-                div().flex().flex_row().items_center().justify_center().size_full().child(dot(d * 0.36)),
-            )),
+            0x25C9 => centered(
+                ring(d * 0.78).child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .size_full()
+                        .child(dot(d * 0.36)),
+                ),
+            ),
             // ◎ BULLSEYE — two concentric rings
-            0x25CE => centered(ring(d * 0.78).child(
-                div().flex().flex_row().items_center().justify_center().size_full().child(ring(d * 0.42)),
-            )),
+            0x25CE => centered(
+                ring(d * 0.78).child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .size_full()
+                        .child(ring(d * 0.42)),
+                ),
+            ),
             // ■ □ squares
             0x25A0 => centered(square(d * 0.72).bg(fg)),
             0x25A1 => centered(square(d * 0.72).border_1().border_color(fg)),
@@ -763,14 +1119,16 @@ pub(crate) fn available_system_fonts() -> Vec<String> {
     {
         let mut reg_fonts = Vec::new();
         let mut reg_cmd = std::process::Command::new("reg");
-        reg_cmd.args(["query", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"]);
+        reg_cmd.args([
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts",
+        ]);
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
             reg_cmd.creation_flags(0x08000000);
         }
-        if let Ok(output) = reg_cmd.output()
-        {
+        if let Ok(output) = reg_cmd.output() {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines() {
@@ -840,7 +1198,10 @@ pub fn send_system_notification(title: &str, body: &str) {
         {
             let escaped_title = summary.replace('\\', "\\\\").replace('"', "\\\"");
             let escaped_body = body.replace('\\', "\\\\").replace('"', "\\\"");
-            let script = format!(r#"display notification "{}" with title "{}""#, escaped_body, escaped_title);
+            let script = format!(
+                r#"display notification "{}" with title "{}""#,
+                escaped_body, escaped_title
+            );
             let _ = std::process::Command::new("osascript")
                 .arg("-e")
                 .arg(script)
@@ -849,8 +1210,8 @@ pub fn send_system_notification(title: &str, body: &str) {
     }
 }
 
-use icons::common::IconType;
 use super::icons::{render_app_logo, render_icon};
+use icons::common::IconType;
 
 #[derive(Clone, Debug)]
 pub struct GlobalSearchResult {
@@ -899,51 +1260,321 @@ pub fn fuzzy_match_str(pattern: &str, target: &str) -> bool {
 pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
     let is_mac = cfg!(target_os = "macos");
     vec![
-        PaletteCommand { id: "tab_overview", icon: IconType::Layers, title: "Mission Control / Tab Peek Overview", category: "Navigation", shortcut: Some(if is_mac { "⌘⇧O" } else { "Ctrl+Shift+M" }) },
-        PaletteCommand { id: "global_search", icon: IconType::Search, title: "Find in All Tabs (Global Search)", category: "Terminal", shortcut: Some(if is_mac { "⌘⇧F" } else { "Ctrl+Shift+F" }) },
-        PaletteCommand { id: "save_session", icon: IconType::Folder, title: "Session: Save Current Workspace Snapshot", category: "Session", shortcut: None },
-        PaletteCommand { id: "restore_session", icon: IconType::RotateCcw, title: "Session: Attach / Restore Last Workspace", category: "Session", shortcut: None },
-        PaletteCommand { id: "new_tab", icon: IconType::Plus, title: "New Tab", category: "Terminal", shortcut: Some(if is_mac { "⌘T" } else { "Ctrl+Shift+T" }) },
-        PaletteCommand { id: "new_window", icon: IconType::ExternalLink, title: "New Window", category: "Window", shortcut: Some(if is_mac { "⌘⇧N" } else { "Ctrl+Shift+N" }) },
-        PaletteCommand { id: "rename_tab", icon: IconType::Pencil, title: "Rename Active Tab", category: "Terminal", shortcut: Some(if is_mac { "⌘⇧R" } else { "Ctrl+Shift+R" }) },
-        PaletteCommand { id: "close_tab", icon: IconType::X, title: "Close Active Tab", category: "Terminal", shortcut: Some(if is_mac { "⌘⇧W" } else { "Ctrl+Shift+Q" }) },
-        PaletteCommand { id: "search", icon: IconType::Search, title: "Search in Buffer", category: "Terminal", shortcut: Some(if is_mac { "⌘F" } else { "Ctrl+Shift+F" }) },
-        PaletteCommand { id: "clear", icon: IconType::Trash2, title: "Clear Scrollback", category: "Terminal", shortcut: Some(if is_mac { "⌘K" } else { "Ctrl+Shift+K" }) },
-        PaletteCommand { id: "worktree", icon: IconType::GitPullRequest, title: "Git Worktree Picker", category: "Git", shortcut: Some(if is_mac { "⌘⌥W" } else { "Ctrl+Alt+W" }) },
-        PaletteCommand { id: "project_jumper", icon: IconType::Folder, title: "Project / Tab Jumper", category: "Navigation", shortcut: Some(if is_mac { "⌘J" } else { "Ctrl+Shift+J" }) },
-        PaletteCommand { id: "file_picker", icon: IconType::FileCode, title: "Insert File Path (Search Workspace Files)", category: "Tools", shortcut: Some(if is_mac { "⌃⌘," } else { "Ctrl+Super+," }) },
-        PaletteCommand { id: "ssh", icon: IconType::Server, title: "SSH Host Manager", category: "Tools", shortcut: Some(if is_mac { "⌘O" } else { "Ctrl+Shift+O" }) },
-        PaletteCommand { id: "snippets", icon: IconType::Terminal, title: "Snippets: Insert Snippet...", category: "Tools", shortcut: None },
-        PaletteCommand { id: "prs", icon: IconType::GitPullRequest, title: "GitHub: Pull Requests (Checkout/Approve/Merge)", category: "Git", shortcut: None },
-        PaletteCommand { id: "settings", icon: IconType::Settings, title: "Open Settings", category: "Preferences", shortcut: Some(if is_mac { "⌘," } else { "Ctrl+," }) },
-        PaletteCommand { id: "about", icon: IconType::Zap, title: "About Fastty", category: "Application", shortcut: None },
-        PaletteCommand { id: "check_updates", icon: IconType::RotateCcw, title: "Check for Updates", category: "Application", shortcut: None },
-        PaletteCommand { id: "fullscreen", icon: IconType::Maximize2, title: "Toggle Fullscreen", category: "Window", shortcut: Some(if is_mac { "⌃⌘F" } else { "F11" }) },
-        PaletteCommand { id: "zoom_in", icon: IconType::ZoomIn, title: "Font: Increase Size (+1)", category: "View", shortcut: Some(if is_mac { "⌘=" } else { "Ctrl=" }) },
-        PaletteCommand { id: "zoom_out", icon: IconType::ZoomOut, title: "Font: Decrease Size (-1)", category: "View", shortcut: Some(if is_mac { "⌘-" } else { "Ctrl-" }) },
-        PaletteCommand { id: "zoom_reset", icon: IconType::RotateCcw, title: "Font: Reset Size (Default)", category: "View", shortcut: Some(if is_mac { "⌘0" } else { "Ctrl+0" }) },
-        PaletteCommand { id: "theme_default", icon: IconType::Palette, title: "Theme: Switch to Default (Fastty)", category: "Theme", shortcut: None },
-        PaletteCommand { id: "theme_catppuccin", icon: IconType::Palette, title: "Theme: Switch to Catppuccin", category: "Theme", shortcut: None },
-        PaletteCommand { id: "theme_one_dark", icon: IconType::Palette, title: "Theme: Switch to One Dark", category: "Theme", shortcut: None },
-        PaletteCommand { id: "theme_solarized", icon: IconType::Palette, title: "Theme: Switch to Solarized Dark", category: "Theme", shortcut: None },
-        PaletteCommand { id: "theme_high_contrast", icon: IconType::Palette, title: "Theme: Switch to High Contrast", category: "Theme", shortcut: None },
-        PaletteCommand { id: "open_config", icon: IconType::FolderOpen, title: "Open Config Folder", category: "Preferences", shortcut: None },
-        PaletteCommand { id: "edit_config", icon: IconType::FileCode, title: "Edit config.toml", category: "Preferences", shortcut: None },
-        PaletteCommand { id: "split_right", icon: IconType::Plus, title: "Split Pane Right", category: "Panes", shortcut: Some(if is_mac { "⌘D" } else { "Ctrl+Shift+E" }) },
-        PaletteCommand { id: "split_down", icon: IconType::Plus, title: "Split Pane Down", category: "Panes", shortcut: Some(if is_mac { "⌘⇧D" } else { "Ctrl+Shift+O" }) },
-        PaletteCommand { id: "split_left", icon: IconType::Plus, title: "Split Pane Left", category: "Panes", shortcut: None },
-        PaletteCommand { id: "split_top", icon: IconType::Plus, title: "Split Pane Top", category: "Panes", shortcut: None },
-        PaletteCommand { id: "focus_left", icon: IconType::ChevronLeft, title: "Focus Pane Left", category: "Panes", shortcut: Some(if is_mac { "⌥⌘←" } else { "Alt+←" }) },
-        PaletteCommand { id: "focus_right", icon: IconType::ChevronRight, title: "Focus Pane Right", category: "Panes", shortcut: Some(if is_mac { "⌥⌘→" } else { "Alt+→" }) },
-        PaletteCommand { id: "focus_top", icon: IconType::ChevronUp, title: "Focus Pane Top", category: "Panes", shortcut: Some(if is_mac { "⌥⌘↑" } else { "Alt+↑" }) },
-        PaletteCommand { id: "focus_down", icon: IconType::ChevronDown, title: "Focus Pane Down", category: "Panes", shortcut: Some(if is_mac { "⌥⌘↓" } else { "Alt+↓" }) },
-        PaletteCommand { id: "close_pane", icon: IconType::X, title: "Close Active Pane", category: "Panes", shortcut: Some(if is_mac { "⌘W" } else { "Ctrl+Shift+W" }) },
-        PaletteCommand { id: "zoom_pane", icon: IconType::Maximize2, title: "Zoom Active Pane (Toggle)", category: "Panes", shortcut: None },
-        PaletteCommand { id: "toggle_tab_sidebar", icon: IconType::Folder, title: "Toggle Tabs Sidebar", category: "View", shortcut: Some(if is_mac { "⌘B" } else { "Ctrl+B" }) },
-        PaletteCommand { id: "toggle_ai_sidebar", icon: IconType::Sparkles, title: "Fastty AI: Toggle Assistant Sidebar", category: "AI", shortcut: Some(if is_mac { "⌘L" } else { "Ctrl+Shift+L" }) },
-        PaletteCommand { id: "layout_horizontal", icon: IconType::Folder, title: "Tabs Layout: Horizontal Top Bar", category: "View", shortcut: None },
-        PaletteCommand { id: "layout_vertical", icon: IconType::Folder, title: "Tabs Layout: Vertical Sidebar", category: "View", shortcut: None },
-        PaletteCommand { id: "quit", icon: IconType::LogOut, title: "Quit Fastty", category: "Application", shortcut: Some(if is_mac { "⌘Q" } else { "Alt+F4" }) },
+        PaletteCommand {
+            id: "tab_overview",
+            icon: IconType::Layers,
+            title: "Mission Control / Tab Peek Overview",
+            category: "Navigation",
+            shortcut: Some(if is_mac { "⌘⇧O" } else { "Ctrl+Shift+M" }),
+        },
+        PaletteCommand {
+            id: "global_search",
+            icon: IconType::TextSearch,
+            title: "Find in All Tabs (Global Search)",
+            category: "Terminal",
+            shortcut: Some(if is_mac { "⌘⇧F" } else { "Ctrl+Shift+F" }),
+        },
+        PaletteCommand {
+            id: "save_session",
+            icon: IconType::Folder,
+            title: "Session: Save Current Workspace Snapshot",
+            category: "Session",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "restore_session",
+            icon: IconType::RotateCcw,
+            title: "Session: Attach / Restore Last Workspace",
+            category: "Session",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "new_tab",
+            icon: IconType::Plus,
+            title: "New Tab",
+            category: "Terminal",
+            shortcut: Some(if is_mac { "⌘T" } else { "Ctrl+Shift+T" }),
+        },
+        PaletteCommand {
+            id: "new_window",
+            icon: IconType::ExternalLink,
+            title: "New Window",
+            category: "Window",
+            shortcut: Some(if is_mac { "⌘⇧N" } else { "Ctrl+Shift+N" }),
+        },
+        PaletteCommand {
+            id: "rename_tab",
+            icon: IconType::Pencil,
+            title: "Rename Active Tab",
+            category: "Terminal",
+            shortcut: Some(if is_mac { "⌘⇧R" } else { "Ctrl+Shift+R" }),
+        },
+        PaletteCommand {
+            id: "close_tab",
+            icon: IconType::X,
+            title: "Close Active Tab",
+            category: "Terminal",
+            shortcut: Some(if is_mac { "⌘⇧W" } else { "Ctrl+Shift+Q" }),
+        },
+        PaletteCommand {
+            id: "search",
+            icon: IconType::Search,
+            title: "Search in Buffer",
+            category: "Terminal",
+            shortcut: Some(if is_mac { "⌘F" } else { "Ctrl+Shift+F" }),
+        },
+        PaletteCommand {
+            id: "clear",
+            icon: IconType::Trash2,
+            title: "Clear Scrollback",
+            category: "Terminal",
+            shortcut: Some(if is_mac { "⌘K" } else { "Ctrl+Shift+K" }),
+        },
+        PaletteCommand {
+            id: "worktree",
+            icon: IconType::FolderGit2,
+            title: "Git Worktree Picker",
+            category: "Git",
+            shortcut: Some(if is_mac { "⌘⌥W" } else { "Ctrl+Alt+W" }),
+        },
+        PaletteCommand {
+            id: "project_jumper",
+            icon: IconType::Folder,
+            title: "Project / Tab Jumper",
+            category: "Navigation",
+            shortcut: Some(if is_mac { "⌘J" } else { "Ctrl+Shift+J" }),
+        },
+        PaletteCommand {
+            id: "file_picker",
+            icon: IconType::FileCode,
+            title: "Insert File Path (Search Workspace Files)",
+            category: "Tools",
+            shortcut: Some(if is_mac { "⌃⌘," } else { "Ctrl+Super+," }),
+        },
+        PaletteCommand {
+            id: "ssh",
+            icon: IconType::Server,
+            title: "SSH Host Manager",
+            category: "Tools",
+            shortcut: Some(if is_mac { "⌘O" } else { "Ctrl+Shift+O" }),
+        },
+        PaletteCommand {
+            id: "snippets",
+            icon: IconType::Terminal,
+            title: "Snippets: Insert Snippet...",
+            category: "Tools",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "prs",
+            icon: IconType::GitPullRequest,
+            title: "GitHub: Pull Requests (Checkout/Approve/Merge)",
+            category: "Git",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "settings",
+            icon: IconType::Settings,
+            title: "Open Settings",
+            category: "Preferences",
+            shortcut: Some(if is_mac { "⌘," } else { "Ctrl+," }),
+        },
+        PaletteCommand {
+            id: "about",
+            icon: IconType::Zap,
+            title: "About Fastty",
+            category: "Application",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "check_updates",
+            icon: IconType::RotateCcw,
+            title: "Check for Updates",
+            category: "Application",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "fullscreen",
+            icon: IconType::Maximize2,
+            title: "Toggle Fullscreen",
+            category: "Window",
+            shortcut: Some(if is_mac { "⌃⌘F" } else { "F11" }),
+        },
+        PaletteCommand {
+            id: "zoom_in",
+            icon: IconType::ZoomIn,
+            title: "Font: Increase Size (+1)",
+            category: "View",
+            shortcut: Some(if is_mac { "⌘=" } else { "Ctrl=" }),
+        },
+        PaletteCommand {
+            id: "zoom_out",
+            icon: IconType::ZoomOut,
+            title: "Font: Decrease Size (-1)",
+            category: "View",
+            shortcut: Some(if is_mac { "⌘-" } else { "Ctrl-" }),
+        },
+        PaletteCommand {
+            id: "zoom_reset",
+            icon: IconType::RotateCcw,
+            title: "Font: Reset Size (Default)",
+            category: "View",
+            shortcut: Some(if is_mac { "⌘0" } else { "Ctrl+0" }),
+        },
+        PaletteCommand {
+            id: "theme_default",
+            icon: IconType::Palette,
+            title: "Theme: Switch to Default (Fastty)",
+            category: "Theme",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "theme_catppuccin",
+            icon: IconType::Palette,
+            title: "Theme: Switch to Catppuccin",
+            category: "Theme",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "theme_one_dark",
+            icon: IconType::Palette,
+            title: "Theme: Switch to One Dark",
+            category: "Theme",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "theme_solarized",
+            icon: IconType::Palette,
+            title: "Theme: Switch to Solarized Dark",
+            category: "Theme",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "theme_high_contrast",
+            icon: IconType::Palette,
+            title: "Theme: Switch to High Contrast",
+            category: "Theme",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "open_config",
+            icon: IconType::FolderOpen,
+            title: "Open Config Folder",
+            category: "Preferences",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "edit_config",
+            icon: IconType::FileCode,
+            title: "Edit config.toml",
+            category: "Preferences",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "split_right",
+            icon: IconType::PanelRight,
+            title: "Split Pane Right",
+            category: "Panes",
+            shortcut: Some(if is_mac { "⌘D" } else { "Ctrl+Shift+E" }),
+        },
+        PaletteCommand {
+            id: "split_down",
+            icon: IconType::PanelBottom,
+            title: "Split Pane Down",
+            category: "Panes",
+            shortcut: Some(if is_mac { "⌘⇧D" } else { "Ctrl+Shift+O" }),
+        },
+        PaletteCommand {
+            id: "split_left",
+            icon: IconType::PanelLeft,
+            title: "Split Pane Left",
+            category: "Panes",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "split_top",
+            icon: IconType::PanelTop,
+            title: "Split Pane Top",
+            category: "Panes",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "focus_left",
+            icon: IconType::ChevronLeft,
+            title: "Focus Pane Left",
+            category: "Panes",
+            shortcut: Some(if is_mac { "⌥⌘←" } else { "Alt+←" }),
+        },
+        PaletteCommand {
+            id: "focus_right",
+            icon: IconType::ChevronRight,
+            title: "Focus Pane Right",
+            category: "Panes",
+            shortcut: Some(if is_mac { "⌥⌘→" } else { "Alt+→" }),
+        },
+        PaletteCommand {
+            id: "focus_top",
+            icon: IconType::ChevronUp,
+            title: "Focus Pane Top",
+            category: "Panes",
+            shortcut: Some(if is_mac { "⌥⌘↑" } else { "Alt+↑" }),
+        },
+        PaletteCommand {
+            id: "focus_down",
+            icon: IconType::ChevronDown,
+            title: "Focus Pane Down",
+            category: "Panes",
+            shortcut: Some(if is_mac { "⌥⌘↓" } else { "Alt+↓" }),
+        },
+        PaletteCommand {
+            id: "close_pane",
+            icon: IconType::X,
+            title: "Close Active Pane",
+            category: "Panes",
+            shortcut: Some(if is_mac { "⌘W" } else { "Ctrl+Shift+W" }),
+        },
+        PaletteCommand {
+            id: "zoom_pane",
+            icon: IconType::Maximize2,
+            title: "Zoom Active Pane (Toggle)",
+            category: "Panes",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "toggle_tab_sidebar",
+            icon: IconType::Folder,
+            title: "Toggle Tabs Sidebar",
+            category: "View",
+            shortcut: Some(if is_mac { "⌘B" } else { "Ctrl+B" }),
+        },
+        PaletteCommand {
+            id: "toggle_ai_sidebar",
+            icon: IconType::Sparkles,
+            title: "Fastty AI: Toggle Assistant Sidebar",
+            category: "AI",
+            shortcut: Some(if is_mac { "⌘L" } else { "Ctrl+Shift+L" }),
+        },
+        PaletteCommand {
+            id: "layout_horizontal",
+            icon: IconType::LayoutPanelTop,
+            title: "Tabs Layout: Horizontal Top Bar",
+            category: "View",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "layout_vertical",
+            icon: IconType::LayoutPanelLeft,
+            title: "Tabs Layout: Vertical Sidebar",
+            category: "View",
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "quit",
+            icon: IconType::LogOut,
+            title: "Quit Fastty",
+            category: "Application",
+            shortcut: Some(if is_mac { "⌘Q" } else { "Alt+F4" }),
+        },
     ]
 }
 
@@ -1216,7 +1847,8 @@ pub struct RootView {
     pub pr_picker_selected: usize,
     pub pr_picker_mode: PrPickerMode,
     pub pr_picker_cwd: Option<std::path::PathBuf>,
-    pub(crate) pr_snapshot: Arc<std::sync::Mutex<Option<crate::widgets::builtin::git_prs::PrsSummary>>>,
+    pub(crate) pr_snapshot:
+        Arc<std::sync::Mutex<Option<crate::widgets::builtin::git_prs::PrsSummary>>>,
     pub is_search_open: bool,
     pub search_query: String,
     pub search_match_idx: usize,
@@ -1337,6 +1969,17 @@ pub struct RootView {
     pub ai_attached_files: Vec<std::path::PathBuf>,
     pub ai_at_menu_open: bool,
     pub ai_at_matches: Vec<String>,
+    /// Row the arrow keys point at in the `@` mention menu. Clamped to the
+    /// drawn row count, which is `AI_AT_MENU_MAX_ROWS`, not the whole match list.
+    pub ai_at_selected: usize,
+    /// True while a file drag from another app is over the AI composer, so the
+    /// panel can show it will take the file. A drop over the panel bubbles to
+    /// the root container, not to the terminal area, which is why the user saw
+    /// the path pasted into the shell with nothing on screen to explain it.
+    pub ai_file_drag_hover: bool,
+    /// Scrolls the `@` mention popup so the highlighted row stays in view. The
+    /// popup is 160px tall and holds up to `AI_AT_MENU_MAX_ROWS` rows.
+    pub ai_at_scroll_handle: ScrollHandle,
     /// Incoming stream deltas not yet revealed in the UI. Drained at ~28fps by the ticker.
     pub ai_pending_text: String,
     pub ai_pending_thinking: String,
@@ -1347,7 +1990,6 @@ pub struct RootView {
     pub ai_message_selection_anchor: Option<(usize, usize)>,
     pub is_dragging_message_selection: bool,
 }
-
 
 impl RootView {
     #[inline]
@@ -1370,8 +2012,13 @@ impl RootView {
 
     #[inline]
     fn measure_cell_metrics(&self, window: &Window) -> (f32, f32) {
-        let font_id = window.text_system().resolve_font(&gpui::font(self.font_family.clone()));
-        let cell_w = window.text_system().layout_width(font_id, px(self.font_size), '0').to_f64() as f32;
+        let font_id = window
+            .text_system()
+            .resolve_font(&gpui::font(self.font_family.clone()));
+        let cell_w = window
+            .text_system()
+            .layout_width(font_id, px(self.font_size), '0')
+            .to_f64() as f32;
         // Integer line height keeps every row origin on the whole-pixel grid,
         // so synthesized strokes connect across rows without half-pixel gaps
         // (fractional 1.32em heights drift by n*0.16px per row).
@@ -1388,7 +2035,11 @@ impl RootView {
         Self::with_options(window, crate::cli::CliOptions::default(), cx)
     }
 
-    pub fn with_options(_window: &mut Window, cli_opts: crate::cli::CliOptions, cx: &mut Context<Self>) -> Self {
+    pub fn with_options(
+        _window: &mut Window,
+        cli_opts: crate::cli::CliOptions,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self::with_options_internal(_window, cli_opts, None, cx)
     }
 
@@ -1401,7 +2052,11 @@ impl RootView {
         config::load_custom_themes();
         crate::snippets::load();
         let loaded_config = crate::config::load_lenient();
-        let theme_name = loaded_config.theme.as_deref().unwrap_or("default").to_string();
+        let theme_name = loaded_config
+            .theme
+            .as_deref()
+            .unwrap_or("default")
+            .to_string();
         let theme = Theme::from_name(&theme_name).with_opacity(loaded_config.opacity);
 
         let status_bar_model = StatusBarModel::new(&loaded_config, theme);
@@ -1409,22 +2064,23 @@ impl RootView {
         _window.focus(&focus_handle, cx);
 
         let font_size = loaded_config.font.size;
-        let font_family: SharedString = if loaded_config.font.family.is_empty() || loaded_config.font.family == "monospace" {
-            #[cfg(target_os = "macos")]
-            {
-                "Menlo".into()
-            }
-            #[cfg(target_os = "windows")]
-            {
-                "Cascadia Code".into()
-            }
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            {
-                "monospace".into()
-            }
-        } else {
-            loaded_config.font.family.clone().into()
-        };
+        let font_family: SharedString =
+            if loaded_config.font.family.is_empty() || loaded_config.font.family == "monospace" {
+                #[cfg(target_os = "macos")]
+                {
+                    "Menlo".into()
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    "Cascadia Code".into()
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                {
+                    "monospace".into()
+                }
+            } else {
+                loaded_config.font.family.clone().into()
+            };
 
         // F3: auto-detect an installed Nerd Font for PUA icon fallback.
         // Only used when one exists; otherwise rendering is unchanged.
@@ -1435,7 +2091,9 @@ impl RootView {
         cx.spawn_in(_window, async move |this, cx| {
             let mut blink_counter = 0u32;
             loop {
-                cx.background_executor().timer(std::time::Duration::from_millis(35)).await;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(35))
+                    .await;
                 let res = this.update_in(cx, |this, _window, cx| {
                     let mut needs_notify = false;
 
@@ -1469,7 +2127,9 @@ impl RootView {
                     if blink_counter >= 15 {
                         blink_counter = 0;
                         if this.config.cursor.blink {
-                            if this.last_cursor_activity.elapsed() >= std::time::Duration::from_millis(500) {
+                            if this.last_cursor_activity.elapsed()
+                                >= std::time::Duration::from_millis(500)
+                            {
                                 this.cursor_blink_visible = !this.cursor_blink_visible;
                                 needs_notify = true;
                             }
@@ -1493,10 +2153,13 @@ impl RootView {
                         // or text_len / 4 to smoothly catch up if a large chunk arrives.
                         let drain_size = 6.max(text_len / 4).min(text_len);
                         let mut actual_drain = drain_size;
-                        while actual_drain < text_len && !this.ai_pending_text.is_char_boundary(actual_drain) {
+                        while actual_drain < text_len
+                            && !this.ai_pending_text.is_char_boundary(actual_drain)
+                        {
                             actual_drain += 1;
                         }
-                        this.ai_streaming_text.extend(this.ai_pending_text.drain(..actual_drain));
+                        this.ai_streaming_text
+                            .extend(this.ai_pending_text.drain(..actual_drain));
                         needs_notify = true;
                     }
 
@@ -1504,10 +2167,13 @@ impl RootView {
                     if think_len > 0 {
                         let drain_size = 12.max(think_len / 3).min(think_len);
                         let mut actual_drain = drain_size;
-                        while actual_drain < think_len && !this.ai_pending_thinking.is_char_boundary(actual_drain) {
+                        while actual_drain < think_len
+                            && !this.ai_pending_thinking.is_char_boundary(actual_drain)
+                        {
                             actual_drain += 1;
                         }
-                        this.ai_streaming_thinking.extend(this.ai_pending_thinking.drain(..actual_drain));
+                        this.ai_streaming_thinking
+                            .extend(this.ai_pending_thinking.drain(..actual_drain));
                         needs_notify = true;
                     }
 
@@ -1532,7 +2198,10 @@ impl RootView {
                     restored_ai_sidebar_open = win.ai_sidebar_open;
                     for tab_info in &win.tabs {
                         let cwd_path = tab_info.cwd.clone();
-                        let title = tab_info.title_override.clone().or_else(|| tab_info.custom_name.clone());
+                        let title = tab_info
+                            .title_override
+                            .clone()
+                            .or_else(|| tab_info.custom_name.clone());
                         restored_tabs.push((cwd_path, title));
                     }
                 }
@@ -1688,11 +2357,16 @@ impl RootView {
             ai_cancel_token: None,
             ai_pending_confirmation: None,
             ai_confirm_reply_tx: None,
-            ai_permission_checker: std::sync::Arc::new(crate::ai::PermissionChecker::new(ai_permission_mode)),
+            ai_permission_checker: std::sync::Arc::new(crate::ai::PermissionChecker::new(
+                ai_permission_mode,
+            )),
             ai_agent_mode: "Agent".to_string(),
             ai_expanded_thinkings: std::collections::HashSet::new(),
             ai_attached_files: Vec::new(),
             ai_at_menu_open: false,
+            ai_at_selected: 0,
+            ai_file_drag_hover: false,
+            ai_at_scroll_handle: ScrollHandle::new(),
             ai_at_matches: Vec::new(),
             ai_pending_text: String::new(),
             ai_pending_thinking: String::new(),
@@ -1703,8 +2377,10 @@ impl RootView {
             is_dragging_message_selection: false,
         };
 
-
-        crate::keybindings::init_resolver(view.config.keybindings.clone(), view.config.keybinding_preset);
+        crate::keybindings::init_resolver(
+            view.config.keybindings.clone(),
+            view.config.keybinding_preset,
+        );
 
         // Background update check and silent automatic preparation.
         // When a newer release exists the changelog modal opens automatically
@@ -1731,7 +2407,10 @@ impl RootView {
                             }
                         }
                     } else {
-                        let reason = release.self_update_blocked_reason.clone().unwrap_or_default();
+                        let reason = release
+                            .self_update_blocked_reason
+                            .clone()
+                            .unwrap_or_default();
                         let _ = update_tx.send_blocking(UpdateStatus::Blocked(release, reason));
                     }
                 }
@@ -1772,7 +2451,10 @@ impl RootView {
 
         if let Some(tab_data) = initial_tab {
             view.attach_tab(tab_data, _window, cx);
-        } else if cli_opts.command.is_some() || cli_opts.working_dir.is_some() || cli_opts.title.is_some() {
+        } else if cli_opts.command.is_some()
+            || cli_opts.working_dir.is_some()
+            || cli_opts.title.is_some()
+        {
             let is_exec_invocation = cli_opts.command.is_some();
             let shell = cli_opts.command.unwrap_or_else(|| {
                 view.config
@@ -1865,7 +2547,11 @@ impl RootView {
                 continue;
             }
             let row = &grid[Line(line_i)];
-            let start_c = if line_i == min_p.line.0 { min_p.column.0 } else { 0 };
+            let start_c = if line_i == min_p.line.0 {
+                min_p.column.0
+            } else {
+                0
+            };
             let end_c = if line_i == max_p.line.0 {
                 max_p.column.0.min(row.len().saturating_sub(1))
             } else {
@@ -1965,45 +2651,77 @@ impl RootView {
                     }
                 }
 
-                let res = this.update_in(cx, |this, _window, cx| {
-                    match event {
-                        AppEvent::Wakeup => {
-                            cx.notify();
-                        }
-                        AppEvent::TitleChanged(title) => {
-                            for tab in &mut this.tabs {
-                                if let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) {
-                                    pane.title = title.clone();
-                                    if tab.pane_tree.active_pane_id == pane_id {
-                                        tab.title = title.clone();
-                                    }
+                let res = this.update_in(cx, |this, _window, cx| match event {
+                    AppEvent::Wakeup => {
+                        cx.notify();
+                    }
+                    AppEvent::TitleChanged(title) => {
+                        for tab in &mut this.tabs {
+                            if let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) {
+                                pane.title = title.clone();
+                                if tab.pane_tree.active_pane_id == pane_id {
+                                    tab.title = title.clone();
                                 }
                             }
-                            this.persist_session();
-                            cx.notify();
                         }
-                        AppEvent::CwdChanged(cwd) => {
-                            let p = std::path::PathBuf::from(&cwd);
-                            let now = std::time::Instant::now();
-                            for tab in &mut this.tabs {
-                                if let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) {
-                                    pane.git_checked_cwd = Some(p.clone());
-                                    pane.git_last_poll = Some(now);
-                                    pane.cwd = Some(p.clone());
-                                    if tab.pane_tree.active_pane_id == pane_id {
-                                        tab.git_checked_cwd = Some(p.clone());
-                                        tab.git_last_poll = Some(now);
-                                        tab.cwd = Some(p.clone());
-                                    }
+                        this.persist_session();
+                        cx.notify();
+                    }
+                    AppEvent::CwdChanged(cwd) => {
+                        let p = std::path::PathBuf::from(&cwd);
+                        let now = std::time::Instant::now();
+                        for tab in &mut this.tabs {
+                            if let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) {
+                                pane.git_checked_cwd = Some(p.clone());
+                                pane.git_last_poll = Some(now);
+                                pane.cwd = Some(p.clone());
+                                if tab.pane_tree.active_pane_id == pane_id {
+                                    tab.git_checked_cwd = Some(p.clone());
+                                    tab.git_last_poll = Some(now);
+                                    tab.cwd = Some(p.clone());
                                 }
                             }
-                            this.persist_session();
-                            cx.notify();
+                        }
+                        this.persist_session();
+                        cx.notify();
 
+                        let sender_bg = event_sender_loop.clone();
+                        let p_bg = p.clone();
+                        std::thread::spawn(move || {
+                            if let Some(git) = crate::git::fetch_git_info_cached(&p_bg) {
+                                sender_bg.send(AppEvent::GitStatusUpdated {
+                                    window_id: None,
+                                    tab_idx: pane_id,
+                                    status: Some(git),
+                                });
+                            }
+                        });
+                    }
+                    AppEvent::CommandFinished {
+                        duration_ms,
+                        exit_code,
+                    } => {
+                        let mut cwd_to_poll = None;
+                        for tab in &mut this.tabs {
+                            let is_active = tab.pane_tree.active_pane_id == pane_id;
+                            if let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) {
+                                pane.last_duration_ms = Some(duration_ms);
+                                pane.last_exit_code = exit_code;
+                                if let Some(ref cwd) = pane.cwd {
+                                    cwd_to_poll = Some(cwd.clone());
+                                }
+                                if is_active {
+                                    tab.last_duration_ms = Some(duration_ms);
+                                    tab.last_exit_code = exit_code;
+                                }
+                            }
+                        }
+                        cx.notify();
+
+                        if let Some(cwd) = cwd_to_poll {
                             let sender_bg = event_sender_loop.clone();
-                            let p_bg = p.clone();
                             std::thread::spawn(move || {
-                                if let Some(git) = crate::git::fetch_git_info_cached(&p_bg) {
+                                if let Some(git) = crate::git::fetch_git_info_cached(&cwd) {
                                     sender_bg.send(AppEvent::GitStatusUpdated {
                                         window_id: None,
                                         tab_idx: pane_id,
@@ -2012,72 +2730,47 @@ impl RootView {
                                 }
                             });
                         }
-                        AppEvent::CommandFinished { duration_ms, exit_code } => {
-                            let mut cwd_to_poll = None;
-                            for tab in &mut this.tabs {
-                                let is_active = tab.pane_tree.active_pane_id == pane_id;
-                                if let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) {
-                                    pane.last_duration_ms = Some(duration_ms);
-                                    pane.last_exit_code = exit_code;
-                                    if let Some(ref cwd) = pane.cwd {
-                                        cwd_to_poll = Some(cwd.clone());
-                                    }
-                                    if is_active {
-                                        tab.last_duration_ms = Some(duration_ms);
-                                        tab.last_exit_code = exit_code;
-                                    }
-                                }
-                            }
-                            cx.notify();
-
-                            if let Some(cwd) = cwd_to_poll {
-                                let sender_bg = event_sender_loop.clone();
-                                std::thread::spawn(move || {
-                                    if let Some(git) = crate::git::fetch_git_info_cached(&cwd) {
-                                        sender_bg.send(AppEvent::GitStatusUpdated {
-                                            window_id: None,
-                                            tab_idx: pane_id,
-                                            status: Some(git),
-                                        });
-                                    }
-                                });
-                            }
-                        }
-                        AppEvent::PromptStarted { .. } => {
-                            cx.notify();
-                        }
-                        AppEvent::GitStatusUpdated { tab_idx, status, .. } => {
-                            for tab in &mut this.tabs {
-                                if let Some(pane) = tab.pane_tree.find_pane_mut(tab_idx) {
-                                    pane.git_status = status.clone();
-                                    pane.git_last_poll = Some(std::time::Instant::now());
-                                    if tab.pane_tree.active_pane_id == tab_idx {
-                                        tab.git_status = status.clone();
-                                        tab.git_last_poll = Some(std::time::Instant::now());
-                                    }
-                                }
-                            }
-                            cx.notify();
-                        }
-                        AppEvent::Notification { title, body } => {
-                            send_system_notification(&title, &body);
-                        }
-                        AppEvent::Exit { .. } => {
-                            if this.exec_pane_id == Some(pane_id) {
-                                cx.quit();
-                            } else if let Some(tab) = this.tabs.iter().find(|t| t.pane_tree.find_pane(pane_id).is_some()) {
-                                let tab_id = tab.id;
-                                let pane_count = tab.pane_tree.pane_count();
-                                if pane_count > 1 {
-                                    this.force_close_pane(tab_id, pane_id, cx);
-                                } else {
-                                    this.close_tab(tab_id, _window, cx);
+                    }
+                    AppEvent::PromptStarted { .. } => {
+                        cx.notify();
+                    }
+                    AppEvent::GitStatusUpdated {
+                        tab_idx, status, ..
+                    } => {
+                        for tab in &mut this.tabs {
+                            if let Some(pane) = tab.pane_tree.find_pane_mut(tab_idx) {
+                                pane.git_status = status.clone();
+                                pane.git_last_poll = Some(std::time::Instant::now());
+                                if tab.pane_tree.active_pane_id == tab_idx {
+                                    tab.git_status = status.clone();
+                                    tab.git_last_poll = Some(std::time::Instant::now());
                                 }
                             }
                         }
-                        _ => {
-                            cx.notify();
+                        cx.notify();
+                    }
+                    AppEvent::Notification { title, body } => {
+                        send_system_notification(&title, &body);
+                    }
+                    AppEvent::Exit { .. } => {
+                        if this.exec_pane_id == Some(pane_id) {
+                            cx.quit();
+                        } else if let Some(tab) = this
+                            .tabs
+                            .iter()
+                            .find(|t| t.pane_tree.find_pane(pane_id).is_some())
+                        {
+                            let tab_id = tab.id;
+                            let pane_count = tab.pane_tree.pane_count();
+                            if pane_count > 1 {
+                                this.force_close_pane(tab_id, pane_id, cx);
+                            } else {
+                                this.close_tab(tab_id, _window, cx);
+                            }
                         }
+                    }
+                    _ => {
+                        cx.notify();
                     }
                 });
                 if res.is_err() {
@@ -2087,9 +2780,7 @@ impl RootView {
         })
         .detach();
 
-        let initial_cwd = cwd
-            .map(|p| p.to_path_buf())
-            .or_else(dirs::home_dir);
+        let initial_cwd = cwd.map(|p| p.to_path_buf()).or_else(dirs::home_dir);
         let default_shell_name = std::path::Path::new(cmd)
             .file_name()
             .and_then(|n| n.to_str())
@@ -2172,10 +2863,28 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(active_tab) = self.tabs.get(self.active_tab_idx) else { return; };
-        let current_cwd = active_tab.pane_tree.active_pane().and_then(|p| p.cwd.clone()).or_else(|| active_tab.cwd.clone());
-        let default_shell = self.config.shell.clone().or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(crate::paths::default_system_shell);
-        let new_pane = self.spawn_terminal_pane(&default_shell, &[], current_cwd.as_deref(), None, window, cx);
+        let Some(active_tab) = self.tabs.get(self.active_tab_idx) else {
+            return;
+        };
+        let current_cwd = active_tab
+            .pane_tree
+            .active_pane()
+            .and_then(|p| p.cwd.clone())
+            .or_else(|| active_tab.cwd.clone());
+        let default_shell = self
+            .config
+            .shell
+            .clone()
+            .or_else(|| std::env::var("SHELL").ok())
+            .unwrap_or_else(crate::paths::default_system_shell);
+        let new_pane = self.spawn_terminal_pane(
+            &default_shell,
+            &[],
+            current_cwd.as_deref(),
+            None,
+            window,
+            cx,
+        );
         if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
             tab.pane_tree.split_active_pane(new_pane, direction);
             // A new split exits zoom: the tree changed under it.
@@ -2190,11 +2899,7 @@ impl RootView {
         cx.notify();
     }
 
-    pub fn focus_pane_in_direction(
-        &mut self,
-        direction: Direction,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn focus_pane_in_direction(&mut self, direction: Direction, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
             if let Some(_target_id) = tab.pane_tree.focus_direction(direction) {
                 if let Some(pane) = tab.pane_tree.active_pane() {
@@ -2213,8 +2918,14 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let tab_opt = self.tabs.iter().find(|t| t.pane_tree.find_pane(pane_id).is_some()).map(|t| (t.id, t.pane_tree.pane_count()));
-        let Some((tab_id, pane_count)) = tab_opt else { return; };
+        let tab_opt = self
+            .tabs
+            .iter()
+            .find(|t| t.pane_tree.find_pane(pane_id).is_some())
+            .map(|t| (t.id, t.pane_tree.pane_count()));
+        let Some((tab_id, pane_count)) = tab_opt else {
+            return;
+        };
 
         if pane_count <= 1 {
             self.close_tab(tab_id, window, cx);
@@ -2223,7 +2934,9 @@ impl RootView {
                 if let Some(pane) = tab.pane_tree.find_pane(pane_id) {
                     if let Some(term) = &pane.terminal {
                         if term.is_process_running() {
-                            let name = term.get_foreground_process_name().unwrap_or_else(|| "process".to_string());
+                            let name = term
+                                .get_foreground_process_name()
+                                .unwrap_or_else(|| "process".to_string());
                             let pid = term.shell_pid().unwrap_or(0);
                             self.pending_close = Some(PendingClose {
                                 target: CloseTarget::Pane { tab_id, pane_id },
@@ -2243,11 +2956,7 @@ impl RootView {
         }
     }
 
-    pub fn close_active_pane(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn close_active_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get(self.active_tab_idx) {
             let active_id = tab.pane_tree.active_pane_id;
             self.close_pane_by_id(active_id, window, cx);
@@ -2302,7 +3011,12 @@ impl RootView {
         cx.notify();
     }
 
-    pub fn with_initial_tab(window: &mut Window, cli_opts: crate::cli::CliOptions, tab_data: TabData, cx: &mut Context<Self>) -> Self {
+    pub fn with_initial_tab(
+        window: &mut Window,
+        cli_opts: crate::cli::CliOptions,
+        tab_data: TabData,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self::with_options_internal(window, cli_opts, Some(tab_data), cx)
     }
 
@@ -2347,33 +3061,58 @@ impl RootView {
                     }
                 }
 
-                let res = this.update_in(cx, |this, _window, cx| {
-                    match event {
-                        AppEvent::Wakeup => {
-                            cx.notify();
+                let res = this.update_in(cx, |this, _window, cx| match event {
+                    AppEvent::Wakeup => {
+                        cx.notify();
+                    }
+                    AppEvent::TitleChanged(title) => {
+                        if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
+                            tab.title = title;
                         }
-                        AppEvent::TitleChanged(title) => {
-                            if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
-                                tab.title = title;
-                            }
-                            this.persist_session();
-                            cx.notify();
+                        this.persist_session();
+                        cx.notify();
+                    }
+                    AppEvent::CwdChanged(cwd) => {
+                        let p = std::path::PathBuf::from(&cwd);
+                        let now = std::time::Instant::now();
+                        if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
+                            tab.git_checked_cwd = Some(p.clone());
+                            tab.git_last_poll = Some(now);
+                            tab.cwd = Some(p.clone());
                         }
-                        AppEvent::CwdChanged(cwd) => {
-                            let p = std::path::PathBuf::from(&cwd);
-                            let now = std::time::Instant::now();
-                            if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
-                                tab.git_checked_cwd = Some(p.clone());
-                                tab.git_last_poll = Some(now);
-                                tab.cwd = Some(p.clone());
-                            }
-                            this.persist_session();
-                            cx.notify();
+                        this.persist_session();
+                        cx.notify();
 
+                        let sender_bg = event_sender.clone();
+                        let p_bg = p.clone();
+                        std::thread::spawn(move || {
+                            if let Some(git) = crate::git::fetch_git_info_cached(&p_bg) {
+                                sender_bg.send(AppEvent::GitStatusUpdated {
+                                    window_id: None,
+                                    tab_idx: tab_id,
+                                    status: Some(git),
+                                });
+                            }
+                        });
+                    }
+                    AppEvent::CommandFinished {
+                        duration_ms,
+                        exit_code,
+                    } => {
+                        let mut cwd_to_poll = None;
+                        if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
+                            tab.last_duration_ms = Some(duration_ms);
+                            tab.last_exit_code = exit_code;
+                            if let Some(ref cwd) = tab.cwd {
+                                cwd_to_poll = Some(cwd.clone());
+                            }
+                        }
+                        cx.notify();
+
+                        if let Some(cwd) = cwd_to_poll {
                             let sender_bg = event_sender.clone();
-                            let p_bg = p.clone();
                             std::thread::spawn(move || {
-                                if let Some(git) = crate::git::fetch_git_info_cached(&p_bg) {
+                                if let Some(git) = crate::git::fetch_git_info_cached(&cwd) {
                                     sender_bg.send(AppEvent::GitStatusUpdated {
                                         window_id: None,
                                         tab_idx: tab_id,
@@ -2382,46 +3121,24 @@ impl RootView {
                                 }
                             });
                         }
-                        AppEvent::CommandFinished { duration_ms, exit_code } => {
-                            let mut cwd_to_poll = None;
-                            if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
-                                tab.last_duration_ms = Some(duration_ms);
-                                tab.last_exit_code = exit_code;
-                                if let Some(ref cwd) = tab.cwd {
-                                    cwd_to_poll = Some(cwd.clone());
-                                }
-                            }
-                            cx.notify();
-
-                            if let Some(cwd) = cwd_to_poll {
-                                let sender_bg = event_sender.clone();
-                                std::thread::spawn(move || {
-                                    if let Some(git) = crate::git::fetch_git_info_cached(&cwd) {
-                                        sender_bg.send(AppEvent::GitStatusUpdated {
-                                            window_id: None,
-                                            tab_idx: tab_id,
-                                            status: Some(git),
-                                        });
-                                    }
-                                });
-                            }
+                    }
+                    AppEvent::PromptStarted { .. } => {
+                        cx.notify();
+                    }
+                    AppEvent::GitStatusUpdated {
+                        tab_idx, status, ..
+                    } => {
+                        if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_idx) {
+                            tab.git_status = status.clone();
+                            tab.git_last_poll = Some(std::time::Instant::now());
                         }
-                        AppEvent::PromptStarted { .. } => {
-                            cx.notify();
-                        }
-                        AppEvent::GitStatusUpdated { tab_idx, status, .. } => {
-                            if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_idx) {
-                                tab.git_status = status.clone();
-                                tab.git_last_poll = Some(std::time::Instant::now());
-                            }
-                            cx.notify();
-                        }
-                        AppEvent::Notification { title, body } => {
-                            send_system_notification(&title, &body);
-                        }
-                        _ => {
-                            cx.notify();
-                        }
+                        cx.notify();
+                    }
+                    AppEvent::Notification { title, body } => {
+                        send_system_notification(&title, &body);
+                    }
+                    _ => {
+                        cx.notify();
                     }
                 });
                 if res.is_err() {
@@ -2468,12 +3185,16 @@ impl RootView {
 
     pub fn close_tab(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
-            let running: Vec<RunningProcessInfo> = tab.pane_tree.all_panes()
+            let running: Vec<RunningProcessInfo> = tab
+                .pane_tree
+                .all_panes()
                 .into_iter()
                 .filter_map(|pane| {
                     if let Some(term) = &pane.terminal {
                         if term.is_process_running() {
-                            let name = term.get_foreground_process_name().unwrap_or_else(|| "process".to_string());
+                            let name = term
+                                .get_foreground_process_name()
+                                .unwrap_or_else(|| "process".to_string());
                             let pid = term.shell_pid().unwrap_or(0);
                             return Some(RunningProcessInfo {
                                 pane_id: pane.id,
@@ -2518,13 +3239,22 @@ impl RootView {
             } else if self.active_tab_idx >= self.tabs.len() {
                 self.active_tab_idx = self.tabs.len() - 1;
             }
+            // A close can be deferred to the confirmation dialog, so this runs
+            // after the tab is actually gone. The Mission Control highlight
+            // reads the field on the next paint, and it has to stay a valid
+            // index.
+            self.tab_overview_selected = self
+                .tab_overview_selected
+                .min(self.tabs.len().saturating_sub(1));
             self.persist_session();
             cx.notify();
         }
     }
 
     pub fn confirm_pending_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pending) = self.pending_close.take() else { return; };
+        let Some(pending) = self.pending_close.take() else {
+            return;
+        };
         match pending.target {
             CloseTarget::Tab { tab_id } => {
                 if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
@@ -2639,9 +3369,11 @@ impl RootView {
         cx.notify();
 
         let channel = crate::updater::UpdateChannel::parse(&self.config.update_channel);
-        let (tx, rx) = async_channel::unbounded::<Result<Option<crate::updater::ReleaseInfo>, String>>();
+        let (tx, rx) =
+            async_channel::unbounded::<Result<Option<crate::updater::ReleaseInfo>, String>>();
         std::thread::spawn(move || {
-            let res = crate::updater::check_for_update_sync_with(channel, true).map_err(|e| e.to_string());
+            let res = crate::updater::check_for_update_sync_with(channel, true)
+                .map_err(|e| e.to_string());
             let _ = tx.send_blocking(res);
         });
 
@@ -2670,7 +3402,8 @@ impl RootView {
                     cx.notify();
                 });
             }
-        }).detach();
+        })
+        .detach();
     }
 
     /// "Skip this version": persists the dismissal so the background check
@@ -2769,7 +3502,13 @@ impl RootView {
         cx.notify();
     }
 
-    pub fn open_pane_context_menu(&mut self, pane_id: usize, x: f32, y: f32, cx: &mut Context<Self>) {
+    pub fn open_pane_context_menu(
+        &mut self,
+        pane_id: usize,
+        x: f32,
+        y: f32,
+        cx: &mut Context<Self>,
+    ) {
         self.is_pane_context_menu_open = true;
         self.pane_context_menu_pane_id = pane_id;
         self.pane_context_menu_pos = (x, y);
@@ -2784,15 +3523,23 @@ impl RootView {
         cx.notify();
     }
 
-    pub fn close_other_tabs(&mut self, keep_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let other_running: Vec<RunningProcessInfo> = self.tabs
+    pub fn close_other_tabs(
+        &mut self,
+        keep_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let other_running: Vec<RunningProcessInfo> = self
+            .tabs
             .iter()
             .filter(|t| t.id != keep_id)
             .flat_map(|t| t.pane_tree.all_panes())
             .filter_map(|pane| {
                 if let Some(term) = &pane.terminal {
                     if term.is_process_running() {
-                        let name = term.get_foreground_process_name().unwrap_or_else(|| "process".to_string());
+                        let name = term
+                            .get_foreground_process_name()
+                            .unwrap_or_else(|| "process".to_string());
                         let pid = term.shell_pid().unwrap_or(0);
                         return Some(RunningProcessInfo {
                             pane_id: pane.id,
@@ -2817,7 +3564,12 @@ impl RootView {
         self.force_close_other_tabs(keep_id, window, cx);
     }
 
-    pub fn force_close_other_tabs(&mut self, keep_id: usize, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn force_close_other_tabs(
+        &mut self,
+        keep_id: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         for tab in self.tabs.iter().filter(|t| t.id != keep_id) {
             for pane in tab.pane_tree.all_panes() {
                 if let Some(ref term) = pane.terminal {
@@ -2933,7 +3685,10 @@ impl RootView {
             self.pr_picker_selected = 0;
             self.pr_picker_scroll_handle.scroll_to_item(0);
             self.pr_picker_mode = PrPickerMode::Browse;
-            let cwd = self.tabs.get(self.active_tab_idx).and_then(|t| t.cwd.clone());
+            let cwd = self
+                .tabs
+                .get(self.active_tab_idx)
+                .and_then(|t| t.cwd.clone());
             self.pr_picker_cwd = cwd.clone();
             self.is_settings_open = false;
             self.is_context_menu_open = false;
@@ -3035,34 +3790,42 @@ impl RootView {
     }
 
     pub fn toggle_file_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.is_file_picker_open = !self.is_file_picker_open;
         if self.is_file_picker_open {
-            self.file_picker_query.clear();
-            self.file_picker_selected = 0;
-            self.file_picker_scroll_handle.scroll_to_item(0);
-            self.is_settings_open = false;
-            self.is_context_menu_open = false;
-            self.is_about_open = false;
-            self.is_command_palette_open = false;
-            self.is_ssh_manager_open = false;
-            self.is_snippet_picker_open = false;
-            self.is_pr_picker_open = false;
-            self.is_search_open = false;
-            self.is_worktree_picker_open = false;
-            self.is_project_jumper_open = false;
-            self.is_tab_overview_open = false;
-            self.is_global_search_open = false;
-            self.file_picker_anchor = self.terminal_cursor_anchor(window);
-            self.file_picker_root = self
-                .tabs
-                .get(self.active_tab_idx)
-                .and_then(|t| t.cwd.clone());
-            self.file_picker_index = self
-                .file_picker_root
-                .as_deref()
-                .map(crate::file_search::build_index)
-                .unwrap_or_default();
+            self.is_file_picker_open = false;
+            cx.notify();
+            return;
         }
+        self.open_file_picker(window, cx);
+    }
+
+    /// Open the file picker over the active tab's working directory.
+    pub fn open_file_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.is_file_picker_open = true;
+        self.file_picker_query.clear();
+        self.file_picker_selected = 0;
+        self.file_picker_scroll_handle.scroll_to_item(0);
+        self.is_settings_open = false;
+        self.is_context_menu_open = false;
+        self.is_about_open = false;
+        self.is_command_palette_open = false;
+        self.is_ssh_manager_open = false;
+        self.is_snippet_picker_open = false;
+        self.is_pr_picker_open = false;
+        self.is_search_open = false;
+        self.is_worktree_picker_open = false;
+        self.is_project_jumper_open = false;
+        self.is_tab_overview_open = false;
+        self.is_global_search_open = false;
+        self.file_picker_anchor = self.terminal_cursor_anchor(window);
+        self.file_picker_root = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|t| t.cwd.clone());
+        self.file_picker_index = self
+            .file_picker_root
+            .as_deref()
+            .map(crate::file_search::build_index)
+            .unwrap_or_default();
         cx.notify();
     }
 
@@ -3113,10 +3876,68 @@ impl RootView {
         cx.notify();
     }
 
+    /// Route dropped files to the AI composer when they landed on it, and to
+    /// the focused terminal otherwise.
+    pub fn handle_file_drop(
+        &mut self,
+        paths: &[std::path::PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.route_file_drop(
+            paths,
+            window.viewport_size().width.to_f64() as f32,
+            window.mouse_position().x.to_f64() as f32,
+        );
+        cx.notify();
+    }
+
+    /// The routing itself, with the geometry handed in.
+    ///
+    /// No `Window`, because a panel child that blocks the mouse has to carry
+    /// its own `on_drop` and reach this through a weak entity, which cannot
+    /// hand over a `&mut Window`.
+    ///
+    /// `drop_x` comes from `window.mouse_position()`. That is the drop position:
+    /// the platform input loop sets it immediately before it synthesises the
+    /// mouse-up that triggers `on_drop`.
+    ///
+    /// The terminal area and the AI composer are children of the same div, which
+    /// carries the `on_drop`. An earlier version pasted every file into the shell
+    /// because the handler never looked at the position, not because the drop
+    /// travelled somewhere unexpected. Both `on_drop` sites call this, so the
+    /// routing does not depend on which one the hitbox picks.
+    pub fn route_file_drop(&mut self, paths: &[std::path::PathBuf], viewport_w: f32, drop_x: f32) {
+        self.ai_file_drag_hover = false;
+        let sidebar_w = self.current_ai_sidebar_width();
+        match file_drop_target_at(sidebar_w > 0.0, viewport_w - sidebar_w, drop_x) {
+            FileDropTarget::AiAttach => {
+                for path in paths {
+                    self.attach_ai_file(path.clone());
+                }
+            }
+            FileDropTarget::Terminal => {
+                if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
+                    if let Some(ref terminal) = active_tab.terminal {
+                        crate::paste::handle_dropped_paths(terminal, paths);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn attach_ai_file(&mut self, path: std::path::PathBuf) {
+        if !self.ai_attached_files.contains(&path) {
+            self.ai_attached_files.push(path);
+        }
+    }
+
     pub fn toggle_tab_overview(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.is_tab_overview_open = !self.is_tab_overview_open;
         if self.is_tab_overview_open {
-            self.tab_overview_selected = self.active_tab_idx;
+            // Clamp on open, so the field is a valid tab index before the first
+            // frame paints or the first key press reads it.
+            self.tab_overview_selected = self.active_tab_idx.min(self.tabs.len().saturating_sub(1));
             self.is_global_search_open = false;
             self.is_command_palette_open = false;
             self.is_ssh_manager_open = false;
@@ -3127,7 +3948,8 @@ impl RootView {
             self.is_project_jumper_open = false;
             self.is_settings_open = false;
             self.is_about_open = false;
-            self.tab_overview_scroll_handle.scroll_to_item(self.tab_overview_selected);
+            self.tab_overview_scroll_handle
+                .scroll_to_item(self.tab_overview_selected);
         }
         cx.notify();
     }
@@ -3163,8 +3985,14 @@ impl RootView {
         }
 
         for (tab_idx, tab) in self.tabs.iter().enumerate() {
-            let proc = tab.terminal.as_ref().and_then(|t| t.get_foreground_process_name());
-            let tab_title = tab.custom_title.clone().unwrap_or_else(|| tab.title.clone());
+            let proc = tab
+                .terminal
+                .as_ref()
+                .and_then(|t| t.get_foreground_process_name());
+            let tab_title = tab
+                .custom_title
+                .clone()
+                .unwrap_or_else(|| tab.title.clone());
 
             // Check main terminal
             if let Some(ref term) = tab.terminal {
@@ -3191,7 +4019,10 @@ impl RootView {
                         self.global_search_results.push(GlobalSearchResult {
                             tab_idx,
                             tab_id: tab.id,
-                            tab_title: pane.custom_title.clone().unwrap_or_else(|| pane.title.clone()),
+                            tab_title: pane
+                                .custom_title
+                                .clone()
+                                .unwrap_or_else(|| pane.title.clone()),
                             process_name: term.get_foreground_process_name(),
                             pane_id: pane.id,
                             offset: snip.offset,
@@ -3218,7 +4049,10 @@ impl RootView {
             });
         }
 
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let data = crate::session_manager::SessionData {
             name: session_name.to_string(),
             created_at: now,
@@ -3229,9 +4063,19 @@ impl RootView {
         crate::session_manager::save_session(&data)
     }
 
-    pub fn restore_workspace_session(&mut self, session_name: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn restore_workspace_session(
+        &mut self,
+        session_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(session) = crate::session_manager::load_session(session_name) {
-            let shell = self.config.shell.clone().or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(crate::paths::default_system_shell);
+            let shell = self
+                .config
+                .shell
+                .clone()
+                .or_else(|| std::env::var("SHELL").ok())
+                .unwrap_or_else(crate::paths::default_system_shell);
             for tab_data in session.tabs {
                 let tab_id = self.next_tab_id;
                 self.next_tab_id += 1;
@@ -3239,23 +4083,36 @@ impl RootView {
                 let pane_tree = if let Some(ref persisted_layout) = tab_data.layout {
                     let root_node = crate::pane_tree::PaneNode::restore_from_persisted(
                         persisted_layout,
-                        &mut |cwd, title| self.spawn_terminal_pane(&shell, &[], cwd, title, window, cx),
+                        &mut |cwd, title| {
+                            self.spawn_terminal_pane(&shell, &[], cwd, title, window, cx)
+                        },
                     );
-                    let first_pane_id = root_node.all_panes().first().map(|p| p.id).unwrap_or(tab_id);
+                    let first_pane_id = root_node
+                        .all_panes()
+                        .first()
+                        .map(|p| p.id)
+                        .unwrap_or(tab_id);
                     crate::pane_tree::PaneTree {
                         root: root_node,
                         active_pane_id: first_pane_id,
                     }
                 } else {
                     let cwd = tab_data.cwd.as_deref().map(std::path::Path::new);
-                    let title = tab_data.custom_title.clone().or(Some(tab_data.title.clone()));
+                    let title = tab_data
+                        .custom_title
+                        .clone()
+                        .or(Some(tab_data.title.clone()));
                     let pane = self.spawn_terminal_pane(&shell, &[], cwd, title, window, cx);
                     crate::pane_tree::PaneTree::new(pane)
                 };
 
                 let active_pane = pane_tree.active_pane();
-                let pane_title = active_pane.map(|p| p.title.clone()).unwrap_or(tab_data.title);
-                let pane_cwd = active_pane.and_then(|p| p.cwd.clone()).or_else(|| tab_data.cwd.map(std::path::PathBuf::from));
+                let pane_title = active_pane
+                    .map(|p| p.title.clone())
+                    .unwrap_or(tab_data.title);
+                let pane_cwd = active_pane
+                    .and_then(|p| p.cwd.clone())
+                    .or_else(|| tab_data.cwd.map(std::path::PathBuf::from));
                 let pane_term = active_pane.and_then(|p| p.terminal.clone());
 
                 self.tabs.push(TabData {
@@ -3282,7 +4139,12 @@ impl RootView {
         }
     }
 
-    pub fn execute_palette_command(&mut self, cmd_id: &str, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn execute_palette_command(
+        &mut self,
+        cmd_id: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.is_command_palette_open = false;
         self.record_palette_recent(cmd_id);
         // Leaving the palette on a non-preview command discards any preview;
@@ -3304,7 +4166,10 @@ impl RootView {
             }
             "new_tab" => self.create_tab(_window, cx),
             "new_window" => {
-                let cwd = self.tabs.get(self.active_tab_idx).and_then(|t| t.cwd.clone());
+                let cwd = self
+                    .tabs
+                    .get(self.active_tab_idx)
+                    .and_then(|t| t.cwd.clone());
                 let cli_opts = crate::cli::CliOptions {
                     working_dir: cwd,
                     ..Default::default()
@@ -3327,7 +4192,8 @@ impl RootView {
                         w.set_background_appearance(WindowBackgroundAppearance::Blurred);
                         cx.new(|cx| RootView::with_options(w, cli_opts, cx))
                     },
-                ).ok();
+                )
+                .ok();
             }
             "rename_tab" => self.open_rename_tab(self.active_tab_idx, cx),
             "close_tab" => {
@@ -3385,7 +4251,9 @@ impl RootView {
             "theme_solarized" => self.set_theme("solarized-dark", cx),
             "theme_high_contrast" => self.set_theme("high-contrast", cx),
             "open_config" => {
-                let config_dir = dirs::home_dir().map(|h| h.join(".config/fastty")).unwrap_or_default();
+                let config_dir = dirs::home_dir()
+                    .map(|h| h.join(".config/fastty"))
+                    .unwrap_or_default();
                 let _ = std::fs::create_dir_all(&config_dir);
                 if let Some(path_str) = config_dir.to_str() {
                     open_path_or_url(path_str);
@@ -3451,7 +4319,9 @@ impl RootView {
         cx.spawn_in(window, async move |this, cx| {
             let start_time = std::time::Instant::now();
             let duration = std::time::Duration::from_millis(160);
-            let initial = this.update_in(cx, |this, _window, _cx| this.ai_sidebar_anim_progress).unwrap_or(0.0);
+            let initial = this
+                .update_in(cx, |this, _window, _cx| this.ai_sidebar_anim_progress)
+                .unwrap_or(0.0);
 
             loop {
                 let elapsed = start_time.elapsed();
@@ -3468,9 +4338,12 @@ impl RootView {
                 if res.is_err() || done {
                     break;
                 }
-                cx.background_executor().timer(std::time::Duration::from_millis(8)).await;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(8))
+                    .await;
             }
-        }).detach();
+        })
+        .detach();
     }
 
     pub fn cancel_ai_stream(&mut self) {
@@ -3488,7 +4361,8 @@ impl RootView {
             self.ai_pending_text.clear();
         }
         if !self.ai_pending_thinking.is_empty() {
-            self.ai_streaming_thinking.push_str(&self.ai_pending_thinking);
+            self.ai_streaming_thinking
+                .push_str(&self.ai_pending_thinking);
             self.ai_pending_thinking.clear();
         }
         self.ai_accumulated_usage.0 += self.ai_current_turn_usage.0;
@@ -3531,14 +4405,50 @@ impl RootView {
 
         let q = query.to_lowercase();
         if q.is_empty() {
-            self.ai_at_matches = all_files.into_iter().take(20).collect();
+            self.ai_at_matches = all_files
+                .into_iter()
+                .take(crate::ui::ai_sidebar::AI_AT_MENU_MAX_ROWS)
+                .collect();
         } else {
             self.ai_at_matches = all_files
                 .into_iter()
                 .filter(|f| f.to_lowercase().contains(&q))
-                .take(20)
+                .take(crate::ui::ai_sidebar::AI_AT_MENU_MAX_ROWS)
                 .collect();
         }
+        // The list just changed under the selection. Typing filters it, so an
+        // index from before can point past the end.
+        self.ai_at_selected = 0;
+        // The handle outlives the popup and keeps its offset, so a reopened menu
+        // would start scrolled away from the row that is now highlighted.
+        self.ai_at_scroll_handle.set_offset(gpui::Point::default());
+    }
+
+    /// Rows the mention menu draws, which is what the arrow keys move over.
+    pub fn ai_at_row_count(&self) -> usize {
+        at_menu_row_count(&self.ai_at_matches)
+    }
+
+    /// Move the mention menu selection by `delta` rows, wrapping at both ends.
+    pub fn move_ai_at_selection(&mut self, delta: isize) {
+        move_at_menu_selection(&mut self.ai_at_selected, &self.ai_at_matches, delta);
+    }
+
+    /// True when the AI composer gets the key instead of an overlay or the shell.
+    pub fn ai_keys_own_input(&self) -> bool {
+        ai_keys_own_input(
+            self.ai_sidebar_open,
+            self.ai_input_focused,
+            self.is_file_picker_open,
+        )
+    }
+
+    /// Bring the highlighted mention row into view. The popup scrolls; the rows
+    /// are taller than it.
+    fn scroll_at_menu_selection_into_view(&mut self) {
+        let last = self.ai_at_row_count().saturating_sub(1);
+        self.ai_at_scroll_handle
+            .scroll_to_item(self.ai_at_selected.min(last));
     }
 
     pub fn insert_ai_at_path(&mut self, path: &str) {
@@ -3554,7 +4464,8 @@ impl RootView {
             let before_at = &before_cursor[..at_idx];
             let new_text = format!("{}@{} {}", before_at, path, after_cursor);
             let new_cursor = before_at.chars().count() + 1 + path.chars().count() + 1;
-            self.ai_input_state.set_text_with_cursor(new_text, new_cursor);
+            self.ai_input_state
+                .set_text_with_cursor(new_text, new_cursor);
         } else {
             let insertion = format!("@{} ", path);
             self.ai_input_state.insert_str(&insertion);
@@ -3580,6 +4491,11 @@ impl RootView {
         self.ai_at_menu_open = false;
     }
 
+    /// Native OS file dialog for the AI composer.
+    ///
+    /// It runs a blocking external process, so it goes on its own thread and
+    /// comes back through a channel. The path it returns is absolute, which is
+    /// what [`attach_ai_file`] needs.
     pub fn open_ai_file_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (tx, rx) = async_channel::bounded::<Option<std::path::PathBuf>>(1);
         std::thread::spawn(move || {
@@ -3589,9 +4505,7 @@ impl RootView {
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Some(path)) = rx.recv().await {
                 let _ = this.update_in(cx, |this, _window, cx| {
-                    if !this.ai_attached_files.contains(&path) {
-                        this.ai_attached_files.push(path);
-                    }
+                    this.attach_ai_file(path);
                     cx.notify();
                 });
             }
@@ -3620,18 +4534,18 @@ impl RootView {
         // 1. Parse @path references from user input
         for word in text.split_whitespace() {
             if let Some(path_part) = word.strip_prefix('@') {
-                let clean = path_part.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '/' && c != '_' && c != '-');
+                let clean = path_part.trim_matches(|c: char| {
+                    !c.is_alphanumeric() && c != '.' && c != '/' && c != '_' && c != '-'
+                });
                 if !clean.is_empty() {
                     let path = active_cwd.join(clean);
                     if path.is_file() {
                         if let Ok(content) = std::fs::read_to_string(&path) {
-                            let max_chars = 16_000;
-                            let snippet = if content.len() > max_chars {
-                                format!("{}... (truncated)", &content[..max_chars])
-                            } else {
-                                content
-                            };
-                            augmented_content.push_str(&format!("\n\n[Referenced file: {}]\n```\n{}\n```", clean, snippet));
+                            let snippet = truncate_for_prompt(&content);
+                            augmented_content.push_str(&format!(
+                                "\n\n[Referenced file: {}]\n```\n{}\n```",
+                                clean, snippet
+                            ));
                         }
                     }
                 }
@@ -3651,15 +4565,15 @@ impl RootView {
                 attached_documents.push(path);
             } else if path.is_file() {
                 if let Ok(content) = std::fs::read_to_string(&path) {
-                    let max_chars = 16_000;
-                    let snippet = if content.len() > max_chars {
-                        format!("{}... (truncated)", &content[..max_chars])
-                    } else {
-                        content
-                    };
-                    augmented_content.push_str(&format!("\n\n[Attached file: {}]\n```\n{}\n```", path.display(), snippet));
+                    let snippet = truncate_for_prompt(&content);
+                    augmented_content.push_str(&format!(
+                        "\n\n[Attached file: {}]\n```\n{}\n```",
+                        path.display(),
+                        snippet
+                    ));
                 } else {
-                    augmented_content.push_str(&format!("\n\n[Attached binary file: {}]", path.display()));
+                    augmented_content
+                        .push_str(&format!("\n\n[Attached binary file: {}]", path.display()));
                 }
             }
         }
@@ -3748,14 +4662,8 @@ impl RootView {
             cwd: active_cwd.clone(),
         };
 
-        let mut agent = crate::ai::Agent::new(
-            model,
-            default_model,
-            tools,
-            checker,
-            perm_handler,
-            ctx_tool,
-        );
+        let mut agent =
+            crate::ai::Agent::new(model, default_model, tools, checker, perm_handler, ctx_tool);
 
         let cancel_tok = agent.cancel_token();
         self.ai_cancel_token = Some(cancel_tok);
@@ -3784,7 +4692,11 @@ impl RootView {
                             match crate::ai::load_and_prepare_image(img_path) {
                                 Ok(part) => parts.push(part),
                                 Err(e) => {
-                                    augmented_content.push_str(&format!("\n\n[Attached image error {}: {}]", img_path.display(), e));
+                                    augmented_content.push_str(&format!(
+                                        "\n\n[Attached image error {}: {}]",
+                                        img_path.display(),
+                                        e
+                                    ));
                                 }
                             }
                         }
@@ -3792,7 +4704,11 @@ impl RootView {
                             match crate::ai::load_and_prepare_document(doc_path) {
                                 Ok(part) => parts.push(part),
                                 Err(e) => {
-                                    augmented_content.push_str(&format!("\n\n[Attached PDF error {}: {}]", doc_path.display(), e));
+                                    augmented_content.push_str(&format!(
+                                        "\n\n[Attached PDF error {}: {}]",
+                                        doc_path.display(),
+                                        e
+                                    ));
                                 }
                             }
                         }
@@ -3902,7 +4818,8 @@ impl RootView {
                                 this.ai_pending_text.clear();
                             }
                             if !this.ai_pending_thinking.is_empty() {
-                                this.ai_streaming_thinking.push_str(&this.ai_pending_thinking);
+                                this.ai_streaming_thinking
+                                    .push_str(&this.ai_pending_thinking);
                                 this.ai_pending_thinking.clear();
                             }
                             let text = std::mem::take(&mut this.ai_streaming_text);
@@ -3933,7 +4850,7 @@ impl RootView {
                                         output: None,
                                         is_error: false,
                                         is_running: true,
-                                    diff: None,
+                                        diff: None,
                                     });
                                 } else {
                                     this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
@@ -3947,7 +4864,7 @@ impl RootView {
                                             output: None,
                                             is_error: false,
                                             is_running: true,
-                                        diff: None,
+                                            diff: None,
                                         }],
                                         timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
                                         images: Vec::new(),
@@ -3986,7 +4903,8 @@ impl RootView {
                                 this.ai_pending_text.clear();
                             }
                             if !this.ai_pending_thinking.is_empty() {
-                                this.ai_streaming_thinking.push_str(&this.ai_pending_thinking);
+                                this.ai_streaming_thinking
+                                    .push_str(&this.ai_pending_thinking);
                                 this.ai_pending_thinking.clear();
                             }
 
@@ -4031,12 +4949,20 @@ impl RootView {
                             let effective_input = if input > 0 {
                                 input
                             } else {
-                                let chars: usize = this.ai_messages.iter().map(|m| m.text.len() + m.thinking.as_deref().unwrap_or("").len()).sum();
+                                let chars: usize = this
+                                    .ai_messages
+                                    .iter()
+                                    .map(|m| {
+                                        m.text.len() + m.thinking.as_deref().unwrap_or("").len()
+                                    })
+                                    .sum();
                                 ((chars / 4).max(50)) as u64
                             };
                             this.ai_current_turn_usage = (effective_input, output);
-                            let total_in = this.ai_accumulated_usage.0 + this.ai_current_turn_usage.0;
-                            let total_out = this.ai_accumulated_usage.1 + this.ai_current_turn_usage.1;
+                            let total_in =
+                                this.ai_accumulated_usage.0 + this.ai_current_turn_usage.0;
+                            let total_out =
+                                this.ai_accumulated_usage.1 + this.ai_current_turn_usage.1;
                             this.ai_last_usage = Some((total_in, total_out));
                             return;
                         }
@@ -4052,7 +4978,8 @@ impl RootView {
                                 this.ai_pending_text.clear();
                             }
                             if !this.ai_pending_thinking.is_empty() {
-                                this.ai_streaming_thinking.push_str(&this.ai_pending_thinking);
+                                this.ai_streaming_thinking
+                                    .push_str(&this.ai_pending_thinking);
                                 this.ai_pending_thinking.clear();
                             }
 
@@ -4089,9 +5016,16 @@ impl RootView {
             .get(self.active_tab_idx)
             .and_then(|t| t.cwd.as_ref().map(|p| p.to_string_lossy().to_string()))
             .unwrap_or_else(|| "~".to_string());
-        let active_branch = self.tabs.get(self.active_tab_idx).and_then(|t| t.git_status.as_ref().map(|g| g.branch.clone()));
+        let active_branch = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|t| t.git_status.as_ref().map(|g| g.branch.clone()));
 
-        let total_chars: usize = self.ai_messages.iter().map(|m| m.text.len() + m.thinking.as_deref().unwrap_or("").len()).sum();
+        let total_chars: usize = self
+            .ai_messages
+            .iter()
+            .map(|m| m.text.len() + m.thinking.as_deref().unwrap_or("").len())
+            .sum();
         let max_context_u64 = self.config.ai.context_window.max(1_000) as u64;
         let total_in = self.ai_accumulated_usage.0 + self.ai_current_turn_usage.0;
         let total_out = self.ai_accumulated_usage.1 + self.ai_current_turn_usage.1;
@@ -4147,28 +5081,32 @@ impl RootView {
         .is_focused(self.ai_input_focused)
         .composer_bounds(self.ai_composer_bounds.clone())
         .message_selection(self.ai_message_selection)
-        .on_select_message_char(cx.listener(|this, (msg_idx, target): &(usize, usize), _window, cx| {
-            this.ai_input_state.selection = None;
-            // The sidebar keyboard handler (Cmd+C, Escape, ⌘↵) only runs when
-            // the panel owns focus, so selecting a message takes focus here.
-            this.ai_input_focused = true;
-            this.ai_message_selection_anchor = Some((*msg_idx, *target));
-            this.ai_message_selection = Some((*msg_idx, *target, *target));
-            this.is_dragging_message_selection = true;
-            cx.notify();
-        }))
-        .on_drag_message_char(cx.listener(|this, (msg_idx, target): &(usize, usize), _window, cx| {
-            if this.is_dragging_message_selection {
-                if let Some((anchor_msg, anchor_char)) = this.ai_message_selection_anchor {
-                    if anchor_msg == *msg_idx {
-                        let s = anchor_char.min(*target);
-                        let e = anchor_char.max(*target);
-                        this.ai_message_selection = Some((*msg_idx, s, e));
-                        cx.notify();
+        .on_select_message_char(cx.listener(
+            |this, (msg_idx, target): &(usize, usize), _window, cx| {
+                this.ai_input_state.selection = None;
+                // The sidebar keyboard handler (Cmd+C, Escape, ⌘↵) only runs when
+                // the panel owns focus, so selecting a message takes focus here.
+                this.ai_input_focused = true;
+                this.ai_message_selection_anchor = Some((*msg_idx, *target));
+                this.ai_message_selection = Some((*msg_idx, *target, *target));
+                this.is_dragging_message_selection = true;
+                cx.notify();
+            },
+        ))
+        .on_drag_message_char(cx.listener(
+            |this, (msg_idx, target): &(usize, usize), _window, cx| {
+                if this.is_dragging_message_selection {
+                    if let Some((anchor_msg, anchor_char)) = this.ai_message_selection_anchor {
+                        if anchor_msg == *msg_idx {
+                            let s = anchor_char.min(*target);
+                            let e = anchor_char.max(*target);
+                            this.ai_message_selection = Some((*msg_idx, s, e));
+                            cx.notify();
+                        }
                     }
                 }
-            }
-        }))
+            },
+        ))
         .copy_feedback(self.ai_copy_feedback_until.is_some())
         .on_copied(cx.listener(|this, _ev, _window, cx| {
             this.ai_copy_feedback_until =
@@ -4196,6 +5134,11 @@ impl RootView {
         }))
         .at_menu_open(self.ai_at_menu_open)
         .at_matches(self.ai_at_matches.clone())
+        .at_selected(
+            self.ai_at_selected
+                .min(self.ai_at_row_count().saturating_sub(1)),
+        )
+        .at_scroll_handle(self.ai_at_scroll_handle.clone())
         .on_select_at_match(cx.listener(|this, path: &String, _window, cx| {
             this.insert_ai_at_path(path);
             this.ai_at_menu_open = false;
@@ -4211,6 +5154,21 @@ impl RootView {
         .on_attach_click(cx.listener(|this, _ev, window, cx| {
             this.open_ai_file_dialog(window, cx);
         }))
+        // The diff card and the hovercard block the mouse, so they carry their
+        // own `on_drop` and hand the paths back through a weak entity.
+        .on_file_drop({
+            let entity = cx.entity();
+            std::rc::Rc::new(
+                move |paths: &[std::path::PathBuf], window: &mut Window, cx: &mut gpui::App| {
+                    let viewport_w = window.viewport_size().width.to_f64() as f32;
+                    let drop_x = window.mouse_position().x.to_f64() as f32;
+                    entity.update(cx, |this, cx| {
+                        this.route_file_drop(paths, viewport_w, drop_x);
+                        cx.notify();
+                    });
+                },
+            )
+        })
         .on_new_chat(cx.listener(|this, _ev, _window, cx| {
             this.cancel_ai_stream(); // also clears ai_pending_confirmation + ai_confirm_reply_tx
             this.ai_messages.clear();
@@ -4277,33 +5235,72 @@ impl RootView {
         .on_submit(cx.listener(|this, _ev, window, cx| {
             this.submit_ai_prompt(window, cx);
         }))
-        .on_confirm(cx.listener(|this, (always, allow): &(bool, bool), _window, cx| {
-            if *always && *allow {
-                if let Some(ref pending) = this.ai_pending_confirmation {
-                    this.ai_permission_checker.allow_always_tool(&pending.tool_name, &pending.input_summary);
+        .on_confirm(
+            cx.listener(|this, (always, allow): &(bool, bool), _window, cx| {
+                if *always && *allow {
+                    if let Some(ref pending) = this.ai_pending_confirmation {
+                        this.ai_permission_checker
+                            .allow_always_tool(&pending.tool_name, &pending.input_summary);
+                    }
                 }
-            }
-            if let Some(tx) = this.ai_confirm_reply_tx.take() {
-                let dec = if *allow {
-                    crate::ai::PermissionDecision::Allow
-                } else {
-                    crate::ai::PermissionDecision::Deny
-                };
-                let _ = tx.send_blocking(dec);
-            }
-            this.ai_pending_confirmation = None;
-            cx.notify();
-        }));
+                if let Some(tx) = this.ai_confirm_reply_tx.take() {
+                    let dec = if *allow {
+                        crate::ai::PermissionDecision::Allow
+                    } else {
+                        crate::ai::PermissionDecision::Deny
+                    };
+                    let _ = tx.send_blocking(dec);
+                }
+                this.ai_pending_confirmation = None;
+                cx.notify();
+            }),
+        );
 
         div()
             .relative()
             .h_full()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                if !this.ai_input_focused {
-                    this.ai_input_focused = true;
+            // A file drag over this panel means the file lands on the message,
+            // not in the shell. Say so before the user lets go.
+            .when(self.ai_file_drag_hover, |d| {
+                d.border_l_2()
+                    .border_color(self.theme.accent)
+                    .bg(self.theme.accent.opacity(0.06))
+            })
+            // gpui calls `on_drag_move` for every move event while a drag is
+            // active, inside this element or not, and this wrapper is a flex
+            // child with no width so it stretches across the window. Without the
+            // position test the tint would cover the whole terminal and claim a
+            // drop there attaches, when it does not.
+            .on_drag_move::<gpui::ExternalPaths>(cx.listener(
+                |this, ev: &gpui::DragMoveEvent<gpui::ExternalPaths>, window, cx| {
+                    let over_composer = file_drop_target_at(
+                        this.ai_sidebar_open,
+                        window.viewport_size().width.to_f64() as f32
+                            - this.current_ai_sidebar_width(),
+                        ev.event.position.x.to_f64() as f32,
+                    ) == FileDropTarget::AiAttach;
+                    let hover = this.ai_sidebar_open && over_composer;
+                    if hover != this.ai_file_drag_hover {
+                        this.ai_file_drag_hover = hover;
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_file_drop_exit(cx.listener(|this, _ev: &gpui::FileDropEvent, _window, cx| {
+                if this.ai_file_drag_hover {
+                    this.ai_file_drag_hover = false;
                     cx.notify();
                 }
             }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _window, cx| {
+                    if !this.ai_input_focused {
+                        this.ai_input_focused = true;
+                        cx.notify();
+                    }
+                }),
+            )
             .child(sidebar)
             .child(
                 div()
@@ -4314,15 +5311,22 @@ impl RootView {
                     .bottom_0()
                     .w(px(7.))
                     .cursor(CursorStyle::ResizeColumn)
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
-                        this.is_dragging_ai_sidebar = true;
-                        cx.notify();
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                            this.is_dragging_ai_sidebar = true;
+                            cx.notify();
+                        }),
+                    ),
             )
     }
 
-
-    pub fn set_tab_layout_mode(&mut self, layout: TabLayout, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn set_tab_layout_mode(
+        &mut self,
+        layout: TabLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Committed selection: persist. Any in-flight preview ends here.
         self.palette_preview_original = None;
         if self.tab_layout == layout {
@@ -4353,7 +5357,9 @@ impl RootView {
         cx.spawn_in(window, async move |this, cx| {
             let start_time = std::time::Instant::now();
             let duration = std::time::Duration::from_millis(160);
-            let initial = this.update_in(cx, |this, _window, _cx| this.sidebar_anim_progress).unwrap_or(0.0);
+            let initial = this
+                .update_in(cx, |this, _window, _cx| this.sidebar_anim_progress)
+                .unwrap_or(0.0);
 
             loop {
                 let elapsed = start_time.elapsed();
@@ -4370,9 +5376,12 @@ impl RootView {
                 if res.is_err() || done {
                     break;
                 }
-                cx.background_executor().timer(std::time::Duration::from_millis(8)).await;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(8))
+                    .await;
             }
-        }).detach();
+        })
+        .detach();
     }
 
     pub fn reload_config(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -4381,26 +5390,31 @@ impl RootView {
         // refreshes the config-error banner (fixing the file clears it).
         self.palette_preview_original = None;
         self.config_error = crate::config::load_error();
-        let theme_name = loaded_config.theme.as_deref().unwrap_or("default").to_string();
+        let theme_name = loaded_config
+            .theme
+            .as_deref()
+            .unwrap_or("default")
+            .to_string();
         self.current_theme_name = theme_name.clone();
         self.theme = Theme::from_name(&theme_name).with_opacity(loaded_config.opacity);
         self.font_size = loaded_config.font.size;
-        let new_family: SharedString = if loaded_config.font.family.is_empty() || loaded_config.font.family == "monospace" {
-            #[cfg(target_os = "macos")]
-            {
-                "Menlo".into()
-            }
-            #[cfg(target_os = "windows")]
-            {
-                "Cascadia Code".into()
-            }
-            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            {
-                "monospace".into()
-            }
-        } else {
-            loaded_config.font.family.clone().into()
-        };
+        let new_family: SharedString =
+            if loaded_config.font.family.is_empty() || loaded_config.font.family == "monospace" {
+                #[cfg(target_os = "macos")]
+                {
+                    "Menlo".into()
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    "Cascadia Code".into()
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                {
+                    "monospace".into()
+                }
+            } else {
+                loaded_config.font.family.clone().into()
+            };
         self.font_family = new_family;
         self.status_bar_model = StatusBarModel::new(&loaded_config, self.theme);
         if self.tab_layout != loaded_config.tab_layout {
@@ -4418,7 +5432,10 @@ impl RootView {
                 term.update_scrollback(loaded_config.scrollback);
             });
         }
-        crate::keybindings::init_resolver(loaded_config.keybindings.clone(), loaded_config.keybinding_preset);
+        crate::keybindings::init_resolver(
+            loaded_config.keybindings.clone(),
+            loaded_config.keybinding_preset,
+        );
         self.config = loaded_config;
         cx.notify();
     }
@@ -4505,8 +5522,7 @@ impl RootView {
                 self.font_size = original.font_size;
                 changed = true;
             }
-            if self.tab_layout != original.tab_layout
-                || self.sidebar_open != original.sidebar_open
+            if self.tab_layout != original.tab_layout || self.sidebar_open != original.sidebar_open
             {
                 self.tab_layout = original.tab_layout;
                 self.sidebar_open = original.sidebar_open;
@@ -4568,7 +5584,10 @@ impl RootView {
     pub fn open_rename_tab(&mut self, idx: usize, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get(idx) {
             self.rename_tab_idx = idx;
-            self.rename_tab_input = tab.custom_title.clone().unwrap_or_else(|| tab.title.clone());
+            self.rename_tab_input = tab
+                .custom_title
+                .clone()
+                .unwrap_or_else(|| tab.title.clone());
             self.is_rename_tab_open = true;
             cx.notify();
         }
@@ -4678,15 +5697,27 @@ impl RootView {
         hsla
     }
 
-    fn handle_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if !self.any_input_overlay_open() && super::ime::defers_to_ime(event, self.config.option_as_meta) {
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.any_input_overlay_open()
+            && super::ime::defers_to_ime(event, self.config.option_as_meta)
+        {
             return;
         }
         self.process_key_down(event, _window, cx);
         cx.stop_propagation();
     }
 
-    fn process_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn process_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let key = &event.keystroke.key;
         let key_lower = key.to_lowercase();
         let modifiers = &event.keystroke.modifiers;
@@ -4699,7 +5730,7 @@ impl RootView {
         let is_ctrl = modifiers.control && !is_alt_gr;
 
         // AI Sidebar Input Keyboard Handler
-        if self.ai_sidebar_open && self.ai_input_focused {
+        if self.ai_keys_own_input() {
             if key_lower == "escape" || key_lower == "esc" {
                 if self.ai_at_menu_open {
                     self.ai_at_menu_open = false;
@@ -4714,13 +5745,69 @@ impl RootView {
                 cx.notify();
                 return;
             }
-            if (modifiers.platform && key_lower == "l") || (modifiers.shift && is_ctrl && key_lower == "l") {
+            if (modifiers.platform && key_lower == "l")
+                || (modifiers.shift && is_ctrl && key_lower == "l")
+            {
                 self.toggle_ai_sidebar(_window, cx);
                 return;
             }
+
+            // Arrow keys move the `@` mention menu while it is open. Without
+            // this they fall through to the PTY below and the shell receives
+            // \x1b[A / \x1b[B, so the cursor jumps in the composer and the
+            // history-search hint of the shell fires behind it.
+            // `check_ai_at_trigger` leaves the menu open with an empty match
+            // list when the query hits nothing. Nothing is painted then, so the
+            // arrows must not fall through to the shell either.
+            if self.ai_at_menu_open {
+                // Paging stops at the ends; the arrows below wrap.
+                if key_lower == "pageup" {
+                    move_at_menu_selection_clamped(
+                        &mut self.ai_at_selected,
+                        &self.ai_at_matches,
+                        -AI_AT_MENU_PAGE_ROWS,
+                    );
+                    self.scroll_at_menu_selection_into_view();
+                    cx.notify();
+                    return;
+                }
+                if key_lower == "pagedown" {
+                    move_at_menu_selection_clamped(
+                        &mut self.ai_at_selected,
+                        &self.ai_at_matches,
+                        AI_AT_MENU_PAGE_ROWS,
+                    );
+                    self.scroll_at_menu_selection_into_view();
+                    cx.notify();
+                    return;
+                }
+                let moved = if key_lower == "up" || key_lower == "arrowup" {
+                    Some(-1)
+                } else if key_lower == "down" || key_lower == "arrowdown" {
+                    Some(1)
+                } else if key_lower == "home" {
+                    self.ai_at_selected = 0;
+                    Some(0)
+                } else if key_lower == "end" {
+                    self.ai_at_selected = self.ai_at_row_count() - 1;
+                    Some(0)
+                } else {
+                    None
+                };
+                if let Some(delta) = moved {
+                    if delta != 0 {
+                        self.move_ai_at_selection(delta);
+                    }
+                    self.scroll_at_menu_selection_into_view();
+                    cx.notify();
+                    return;
+                }
+            }
+
             // Select All: Cmd+A (macOS) or Ctrl+A (Linux/Windows)
-            let is_select_all = (cfg!(target_os = "macos") && modifiers.platform && key_lower == "a")
-                || (!cfg!(target_os = "macos") && is_ctrl && key_lower == "a");
+            let is_select_all =
+                (cfg!(target_os = "macos") && modifiers.platform && key_lower == "a")
+                    || (!cfg!(target_os = "macos") && is_ctrl && key_lower == "a");
             if is_select_all {
                 self.ai_input_state.select_all();
                 cx.notify();
@@ -4740,7 +5827,9 @@ impl RootView {
                     if s < e {
                         let text = if msg_idx < self.ai_messages.len() {
                             Some(self.ai_messages[msg_idx].text.as_str())
-                        } else if msg_idx == self.ai_messages.len() && !self.ai_streaming_text.is_empty() {
+                        } else if msg_idx == self.ai_messages.len()
+                            && !self.ai_streaming_text.is_empty()
+                        {
                             Some(self.ai_streaming_text.as_str())
                         } else {
                             None
@@ -4792,10 +5881,15 @@ impl RootView {
                 }
                 return;
             }
-            if key_lower == "enter" || key_lower == "return" {
-                if self.ai_at_menu_open && !self.ai_at_matches.is_empty() {
-                    let first = self.ai_at_matches[0].clone();
-                    self.insert_ai_at_path(&first);
+            if key_lower == "enter" || key_lower == "return" || key_lower == "tab" {
+                if let Some(row) = at_menu_commit_row(
+                    self.ai_at_menu_open,
+                    &self.ai_at_matches,
+                    self.ai_at_selected,
+                ) {
+                    self.ai_at_selected = row;
+                    let path = self.ai_at_matches[row].clone();
+                    self.insert_ai_at_path(&path);
                     cx.notify();
                     return;
                 }
@@ -4921,60 +6015,93 @@ impl RootView {
                 cx.notify();
                 return;
             }
-            let count = self.tabs.len();
-            if count == 0 {
+            let tab_count = self.tabs.len();
+            if tab_count == 0 {
                 self.is_tab_overview_open = false;
                 cx.notify();
                 return;
             }
+            // The grid also paints a trailing "New Tab" card. It takes part in
+            // layout, so it takes part in navigation too: the selection stops
+            // one cell short of it, and `t` still creates a tab from anywhere.
+            let items = tab_count + 1;
+            let viewport = _window.viewport_size();
+            let layout = MissionControlLayout::new(
+                viewport.width.to_f64() as f32,
+                viewport.height.to_f64() as f32,
+                items,
+            );
+            let cols = layout.cols;
+            let selectable = tab_count;
+            // The grid paints a trailing "New Tab" card at index `tab_count`,
+            // which takes no selection. Clamping here means Enter, the close
+            // keys, the arrows, and the painted highlight all read the same
+            // index, so a stale value can never highlight a cell the keys
+            // cannot act on.
+            let selected = self.tab_overview_selected.min(selectable - 1);
+            self.tab_overview_selected = selected;
+
             if key_lower == "enter" || key_lower == "return" {
-                if let Some(tab) = self.tabs.get(self.tab_overview_selected) {
+                if let Some(tab) = self.tabs.get(selected) {
                     let id = tab.id;
                     self.is_tab_overview_open = false;
                     self.select_tab(id, cx);
                 }
                 return;
             }
-            if key_lower == "right" || key_lower == "arrowright" || key_lower == "l" || key_lower == "tab" {
-                self.tab_overview_selected = (self.tab_overview_selected + 1) % count;
-                self.tab_overview_scroll_handle.scroll_to_item(self.tab_overview_selected);
-                cx.notify();
+
+            let moved = if key_lower == "right"
+                || key_lower == "arrowright"
+                || key_lower == "l"
+                || key_lower == "tab"
+            {
+                Some(move_grid_selection(
+                    selected,
+                    GridStep::Right,
+                    cols,
+                    selectable,
+                ))
+            } else if key_lower == "left" || key_lower == "arrowleft" || key_lower == "h" {
+                Some(move_grid_selection(
+                    selected,
+                    GridStep::Left,
+                    cols,
+                    selectable,
+                ))
+            } else if key_lower == "down" || key_lower == "arrowdown" || key_lower == "j" {
+                Some(move_grid_selection(
+                    selected,
+                    GridStep::Down,
+                    cols,
+                    selectable,
+                ))
+            } else if key_lower == "up" || key_lower == "arrowup" || key_lower == "k" {
+                Some(move_grid_selection(
+                    selected,
+                    GridStep::Up,
+                    cols,
+                    selectable,
+                ))
+            } else {
+                None
+            };
+            if let Some(next) = moved {
+                if next != selected {
+                    self.tab_overview_selected = next;
+                    self.tab_overview_scroll_handle.scroll_to_item(next);
+                    cx.notify();
+                }
                 return;
             }
-            if key_lower == "left" || key_lower == "arrowleft" || key_lower == "h" {
-                self.tab_overview_selected = if self.tab_overview_selected == 0 {
-                    count - 1
-                } else {
-                    self.tab_overview_selected - 1
-                };
-                self.tab_overview_scroll_handle.scroll_to_item(self.tab_overview_selected);
-                cx.notify();
-                return;
-            }
-            let win_w = _window.viewport_size().width.to_f64() as f32;
-            let available_w = (win_w - 64.0).max(320.0);
-            let max_cols = ((available_w + 16.0) / (300.0 + 16.0)).floor().clamp(1.0, 4.0) as usize;
-            let step_cols = max_cols.min(count);
-            if key_lower == "down" || key_lower == "arrowdown" || key_lower == "j" {
-                self.tab_overview_selected = (self.tab_overview_selected + step_cols).min(count - 1);
-                self.tab_overview_scroll_handle.scroll_to_item(self.tab_overview_selected);
-                cx.notify();
-                return;
-            }
-            if key_lower == "up" || key_lower == "arrowup" || key_lower == "k" {
-                self.tab_overview_selected = self.tab_overview_selected.saturating_sub(step_cols);
-                self.tab_overview_scroll_handle.scroll_to_item(self.tab_overview_selected);
-                cx.notify();
-                return;
-            }
+
             if key_lower == "d" || key_lower == "x" || key_lower == "backspace" {
-                if let Some(tab) = self.tabs.get(self.tab_overview_selected) {
+                if let Some(tab) = self.tabs.get(selected) {
                     let id = tab.id;
                     self.close_tab(id, _window, cx);
                     if self.tabs.is_empty() {
                         self.is_tab_overview_open = false;
                     } else {
-                        self.tab_overview_selected = self.tab_overview_selected.min(self.tabs.len() - 1);
+                        self.tab_overview_selected = selected.min(self.tabs.len() - 1);
                     }
                     cx.notify();
                 }
@@ -5021,7 +6148,8 @@ impl RootView {
             if key_lower == "down" || key_lower == "arrowdown" || key_lower == "tab" {
                 if count > 0 {
                     self.global_search_selected = (self.global_search_selected + 1) % count;
-                    self.global_search_scroll_handle.scroll_to_item(self.global_search_selected);
+                    self.global_search_scroll_handle
+                        .scroll_to_item(self.global_search_selected);
                     cx.notify();
                 }
                 return;
@@ -5033,7 +6161,8 @@ impl RootView {
                     } else {
                         self.global_search_selected - 1
                     };
-                    self.global_search_scroll_handle.scroll_to_item(self.global_search_selected);
+                    self.global_search_scroll_handle
+                        .scroll_to_item(self.global_search_selected);
                     cx.notify();
                 }
                 return;
@@ -5078,7 +6207,8 @@ impl RootView {
             if key_lower == "down" || key_lower == "arrowdown" || key_lower == "tab" {
                 if count > 0 {
                     self.command_palette_selected = (self.command_palette_selected + 1) % count;
-                    self.command_palette_scroll_handle.scroll_to_item(self.command_palette_selected);
+                    self.command_palette_scroll_handle
+                        .scroll_to_item(self.command_palette_selected);
                     let selected_id = filtered.get(self.command_palette_selected).map(|c| c.id);
                     if let Some(id) = selected_id {
                         self.preview_palette_command(id, _window, cx);
@@ -5094,7 +6224,8 @@ impl RootView {
                     } else {
                         self.command_palette_selected - 1
                     };
-                    self.command_palette_scroll_handle.scroll_to_item(self.command_palette_selected);
+                    self.command_palette_scroll_handle
+                        .scroll_to_item(self.command_palette_selected);
                     let selected_id = filtered.get(self.command_palette_selected).map(|c| c.id);
                     if let Some(id) = selected_id {
                         self.preview_palette_command(id, _window, cx);
@@ -5182,7 +6313,8 @@ impl RootView {
             if key_lower == "down" || key_lower == "arrowdown" || key_lower == "tab" {
                 if count > 0 {
                     self.snippet_selected = (self.snippet_selected + 1) % count;
-                    self.snippet_scroll_handle.scroll_to_item(self.snippet_selected);
+                    self.snippet_scroll_handle
+                        .scroll_to_item(self.snippet_selected);
                     cx.notify();
                 }
                 return;
@@ -5194,7 +6326,8 @@ impl RootView {
                     } else {
                         self.snippet_selected - 1
                     };
-                    self.snippet_scroll_handle.scroll_to_item(self.snippet_selected);
+                    self.snippet_scroll_handle
+                        .scroll_to_item(self.snippet_selected);
                     cx.notify();
                 }
                 return;
@@ -5298,7 +6431,8 @@ impl RootView {
             if key_lower == "down" || key_lower == "arrowdown" || key_lower == "tab" {
                 if count > 0 {
                     self.pr_picker_selected = (self.pr_picker_selected + 1) % count;
-                    self.pr_picker_scroll_handle.scroll_to_item(self.pr_picker_selected);
+                    self.pr_picker_scroll_handle
+                        .scroll_to_item(self.pr_picker_selected);
                     cx.notify();
                 }
                 return;
@@ -5310,7 +6444,8 @@ impl RootView {
                     } else {
                         self.pr_picker_selected - 1
                     };
-                    self.pr_picker_scroll_handle.scroll_to_item(self.pr_picker_selected);
+                    self.pr_picker_scroll_handle
+                        .scroll_to_item(self.pr_picker_selected);
                     cx.notify();
                 }
                 return;
@@ -5355,7 +6490,13 @@ impl RootView {
             let query = self.ssh_manager_query.to_lowercase();
             let filtered: Vec<&crate::ssh::SshHost> = hosts
                 .iter()
-                .filter(|h| query.is_empty() || fuzzy_match_str(&query, &h.name) || fuzzy_match_str(&query, &h.hostname) || fuzzy_match_str(&query, &h.user) || fuzzy_match_str(&query, &h.tag))
+                .filter(|h| {
+                    query.is_empty()
+                        || fuzzy_match_str(&query, &h.name)
+                        || fuzzy_match_str(&query, &h.hostname)
+                        || fuzzy_match_str(&query, &h.user)
+                        || fuzzy_match_str(&query, &h.tag)
+                })
                 .collect();
             let count = filtered.len();
 
@@ -5379,7 +6520,8 @@ impl RootView {
             if key_lower == "down" || key_lower == "arrowdown" || key_lower == "tab" {
                 if count > 0 {
                     self.ssh_manager_selected = (self.ssh_manager_selected + 1) % count;
-                    self.ssh_manager_scroll_handle.scroll_to_item(self.ssh_manager_selected);
+                    self.ssh_manager_scroll_handle
+                        .scroll_to_item(self.ssh_manager_selected);
                     cx.notify();
                 }
                 return;
@@ -5391,7 +6533,8 @@ impl RootView {
                     } else {
                         self.ssh_manager_selected - 1
                     };
-                    self.ssh_manager_scroll_handle.scroll_to_item(self.ssh_manager_selected);
+                    self.ssh_manager_scroll_handle
+                        .scroll_to_item(self.ssh_manager_selected);
                     cx.notify();
                 }
                 return;
@@ -5439,7 +6582,8 @@ impl RootView {
                                     self.search_match_idx - 1
                                 };
                             } else {
-                                self.search_match_idx = (self.search_match_idx + 1) % self.search_matches.len();
+                                self.search_match_idx =
+                                    (self.search_match_idx + 1) % self.search_matches.len();
                             }
                             let offset = self.search_matches[self.search_match_idx];
                             term.scroll_to_offset(offset);
@@ -5490,29 +6634,51 @@ impl RootView {
                 cx.notify();
                 return;
             }
-            let active_cwd = self.tabs.get(self.active_tab_idx).and_then(|t| t.cwd.as_deref());
-            let worktrees = active_cwd.map(crate::git::list_worktrees).unwrap_or_default();
+            let active_cwd = self
+                .tabs
+                .get(self.active_tab_idx)
+                .and_then(|t| t.cwd.as_deref());
+            let worktrees = active_cwd
+                .map(crate::git::list_worktrees)
+                .unwrap_or_default();
             let query = self.worktree_picker_query.to_lowercase();
             let filtered: Vec<&crate::git::Worktree> = worktrees
                 .iter()
-                .filter(|w| query.is_empty() || w.short_branch().to_lowercase().contains(&query) || w.path.to_string_lossy().to_lowercase().contains(&query))
+                .filter(|w| {
+                    query.is_empty()
+                        || w.short_branch().to_lowercase().contains(&query)
+                        || w.path.to_string_lossy().to_lowercase().contains(&query)
+                })
                 .collect();
             let count = filtered.len();
 
             if key_lower == "enter" || key_lower == "return" {
                 if let Some(wt) = filtered.get(self.worktree_picker_selected) {
-                    let shell = self.config.shell.clone().or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(crate::paths::default_system_shell);
+                    let shell = self
+                        .config
+                        .shell
+                        .clone()
+                        .or_else(|| std::env::var("SHELL").ok())
+                        .unwrap_or_else(crate::paths::default_system_shell);
                     let title = wt.short_branch().to_string();
                     let path = wt.path.clone();
                     self.is_worktree_picker_open = false;
-                    self.create_tab_with_cmd_and_cwd(&shell, &[], Some(&path), Some(title), _window, cx);
+                    self.create_tab_with_cmd_and_cwd(
+                        &shell,
+                        &[],
+                        Some(&path),
+                        Some(title),
+                        _window,
+                        cx,
+                    );
                 }
                 return;
             }
             if key_lower == "down" || key_lower == "arrowdown" || key_lower == "tab" {
                 if count > 0 {
                     self.worktree_picker_selected = (self.worktree_picker_selected + 1) % count;
-                    self.worktree_picker_scroll_handle.scroll_to_item(self.worktree_picker_selected);
+                    self.worktree_picker_scroll_handle
+                        .scroll_to_item(self.worktree_picker_selected);
                     cx.notify();
                 }
                 return;
@@ -5524,7 +6690,8 @@ impl RootView {
                     } else {
                         self.worktree_picker_selected - 1
                     };
-                    self.worktree_picker_scroll_handle.scroll_to_item(self.worktree_picker_selected);
+                    self.worktree_picker_scroll_handle
+                        .scroll_to_item(self.worktree_picker_selected);
                     cx.notify();
                 }
                 return;
@@ -5571,8 +6738,12 @@ impl RootView {
                     let branch_str = t.git_status.as_ref().map(|g| g.branch.clone());
                     let matches = query.is_empty()
                         || t.title.to_lowercase().contains(&query)
-                        || cwd_str.as_ref().is_some_and(|c| c.to_lowercase().contains(&query))
-                        || branch_str.as_ref().is_some_and(|b| b.to_lowercase().contains(&query));
+                        || cwd_str
+                            .as_ref()
+                            .is_some_and(|c| c.to_lowercase().contains(&query))
+                        || branch_str
+                            .as_ref()
+                            .is_some_and(|b| b.to_lowercase().contains(&query));
                     if matches {
                         Some((idx, t.id, t.title.clone(), cwd_str))
                     } else {
@@ -5593,7 +6764,8 @@ impl RootView {
             if key_lower == "down" || key_lower == "arrowdown" || key_lower == "tab" {
                 if count > 0 {
                     self.project_jumper_selected = (self.project_jumper_selected + 1) % count;
-                    self.project_jumper_scroll_handle.scroll_to_item(self.project_jumper_selected);
+                    self.project_jumper_scroll_handle
+                        .scroll_to_item(self.project_jumper_selected);
                     cx.notify();
                 }
                 return;
@@ -5605,7 +6777,8 @@ impl RootView {
                     } else {
                         self.project_jumper_selected - 1
                     };
-                    self.project_jumper_scroll_handle.scroll_to_item(self.project_jumper_selected);
+                    self.project_jumper_scroll_handle
+                        .scroll_to_item(self.project_jumper_selected);
                     cx.notify();
                 }
                 return;
@@ -5655,7 +6828,8 @@ impl RootView {
             if key_lower == "down" || key_lower == "arrowdown" || key_lower == "tab" {
                 if count > 0 {
                     self.file_picker_selected = (self.file_picker_selected + 1) % count;
-                    self.file_picker_scroll_handle.scroll_to_item(self.file_picker_selected);
+                    self.file_picker_scroll_handle
+                        .scroll_to_item(self.file_picker_selected);
                     cx.notify();
                 }
                 return;
@@ -5667,7 +6841,8 @@ impl RootView {
                     } else {
                         self.file_picker_selected - 1
                     };
-                    self.file_picker_scroll_handle.scroll_to_item(self.file_picker_selected);
+                    self.file_picker_scroll_handle
+                        .scroll_to_item(self.file_picker_selected);
                     cx.notify();
                 }
                 return;
@@ -5698,7 +6873,14 @@ impl RootView {
         }
 
         // 6. Dismiss open static overlays on Escape
-        if (self.is_settings_open || self.is_about_open || self.is_context_menu_open || self.is_git_menu_open || self.is_tab_context_menu_open || self.is_pane_context_menu_open || self.is_update_modal_open || self.is_whats_new_open)
+        if (self.is_settings_open
+            || self.is_about_open
+            || self.is_context_menu_open
+            || self.is_git_menu_open
+            || self.is_tab_context_menu_open
+            || self.is_pane_context_menu_open
+            || self.is_update_modal_open
+            || self.is_whats_new_open)
             && (key_lower == "escape" || key_lower == "esc")
         {
             self.is_settings_open = false;
@@ -5921,7 +7103,9 @@ impl RootView {
                         if s < e {
                             let text = if msg_idx < self.ai_messages.len() {
                                 Some(self.ai_messages[msg_idx].text.as_str())
-                            } else if msg_idx == self.ai_messages.len() && !self.ai_streaming_text.is_empty() {
+                            } else if msg_idx == self.ai_messages.len()
+                                && !self.ai_streaming_text.is_empty()
+                            {
                                 Some(self.ai_streaming_text.as_str())
                             } else {
                                 None
@@ -5929,7 +7113,9 @@ impl RootView {
                             if let Some(txt) = text {
                                 let selected: String = txt.chars().skip(s).take(e - s).collect();
                                 if !selected.is_empty() {
-                                    if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                                    if let Some(mut clip) =
+                                        crate::event_listener::clipboard_helper()
+                                    {
                                         let _ = clip.set_text(selected);
                                     }
                                     return;
@@ -5948,7 +7134,9 @@ impl RootView {
                     if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
                         if let Some(ref terminal) = active_tab.terminal {
                             if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                                if let Some(content) = crate::paste::get_clipboard_paste_content(&mut clip) {
+                                if let Some(content) =
+                                    crate::paste::get_clipboard_paste_content(&mut clip)
+                                {
                                     crate::paste::paste_text_to_terminal(terminal, &content);
                                     cx.notify();
                                     return;
@@ -6083,8 +7271,11 @@ impl RootView {
                         Some(b"\x1b[Z".to_vec())
                     } else {
                         // Snippet Tab expansion
-                        if let Some(trigger_len) = crate::snippets::match_trigger(&self.typed_prompt_buf) {
-                            let trigger = &self.typed_prompt_buf[self.typed_prompt_buf.len() - trigger_len..];
+                        if let Some(trigger_len) =
+                            crate::snippets::match_trigger(&self.typed_prompt_buf)
+                        {
+                            let trigger =
+                                &self.typed_prompt_buf[self.typed_prompt_buf.len() - trigger_len..];
                             if let Some(body) = crate::snippets::get_expansion(trigger) {
                                 let (expanded, _) = crate::snippets::expand(&body);
                                 let mut erase_bytes = Vec::new();
@@ -6208,7 +7399,6 @@ impl RootView {
             || (self.ai_sidebar_open && self.ai_input_focused)
     }
 
-
     pub fn ime_commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.ime_marked_text = None;
         if self.any_input_overlay_open() {
@@ -6246,7 +7436,12 @@ impl RootView {
         }
     }
 
-    fn handle_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.focus(&self.focus_handle, cx);
         let Some(active_tab) = self.tabs.get(self.active_tab_idx) else {
             return;
@@ -6266,17 +7461,22 @@ impl RootView {
         let mouse_y = event.position.y.to_f64() as f32;
 
         // Find which pane was clicked based on its rendered bounds
-        let clicked_pane = active_tab.pane_tree.all_panes().into_iter().find(|p| {
-            if let Some(b) = p.last_bounds {
-                let bx = b.origin.x.to_f64() as f32;
-                let by = b.origin.y.to_f64() as f32;
-                let bw = b.size.width.to_f64() as f32;
-                let bh = b.size.height.to_f64() as f32;
-                mouse_x >= bx && mouse_x <= bx + bw && mouse_y >= by && mouse_y <= by + bh
-            } else {
-                false
-            }
-        }).or_else(|| active_tab.pane_tree.active_pane());
+        let clicked_pane = active_tab
+            .pane_tree
+            .all_panes()
+            .into_iter()
+            .find(|p| {
+                if let Some(b) = p.last_bounds {
+                    let bx = b.origin.x.to_f64() as f32;
+                    let by = b.origin.y.to_f64() as f32;
+                    let bw = b.size.width.to_f64() as f32;
+                    let bh = b.size.height.to_f64() as f32;
+                    mouse_x >= bx && mouse_x <= bx + bw && mouse_y >= by && mouse_y <= by + bh
+                } else {
+                    false
+                }
+            })
+            .or_else(|| active_tab.pane_tree.active_pane());
 
         let clicked_pane_id = clicked_pane.as_ref().map(|p| p.id);
         let clicked_bounds = clicked_pane.as_ref().and_then(|p| p.last_bounds);
@@ -6300,28 +7500,33 @@ impl RootView {
             return;
         };
         let active_pane = active_tab.pane_tree.active_pane();
-        let Some(ref terminal) = active_pane.as_ref().and_then(|p| p.terminal.as_ref()).or(active_tab.terminal.as_ref()) else {
+        let Some(ref terminal) = active_pane
+            .as_ref()
+            .and_then(|p| p.terminal.as_ref())
+            .or(active_tab.terminal.as_ref())
+        else {
             return;
         };
 
         let (cell_w, line_h) = self.measure_cell_metrics(window);
-        let (pane_origin_x, pane_origin_y, pane_w, pane_h) = if let Some(b) = clicked_bounds.or_else(|| active_pane.and_then(|p| p.last_bounds)) {
-            (
-                b.origin.x.to_f64() as f32,
-                b.origin.y.to_f64() as f32,
-                b.size.width.to_f64() as f32,
-                b.size.height.to_f64() as f32,
-            )
-        } else {
-            let sidebar_w = self.current_sidebar_width();
-            let v = window.viewport_size();
-            (
-                sidebar_w + 1.0,
-                32.0,
-                (v.width.to_f64() as f32 - sidebar_w).max(100.0),
-                (v.height.to_f64() as f32 - 56.0).max(100.0),
-            )
-        };
+        let (pane_origin_x, pane_origin_y, pane_w, pane_h) =
+            if let Some(b) = clicked_bounds.or_else(|| active_pane.and_then(|p| p.last_bounds)) {
+                (
+                    b.origin.x.to_f64() as f32,
+                    b.origin.y.to_f64() as f32,
+                    b.size.width.to_f64() as f32,
+                    b.size.height.to_f64() as f32,
+                )
+            } else {
+                let sidebar_w = self.current_sidebar_width();
+                let v = window.viewport_size();
+                (
+                    sidebar_w + 1.0,
+                    32.0,
+                    (v.width.to_f64() as f32 - sidebar_w).max(100.0),
+                    (v.height.to_f64() as f32 - 56.0).max(100.0),
+                )
+            };
 
         let local_x = (mouse_x - pane_origin_x).max(0.0);
         let local_y = (mouse_y - pane_origin_y).max(0.0);
@@ -6375,7 +7580,8 @@ impl RootView {
             let screen_cols = ((pane_w / cell_w) as usize).max(1);
             let display_offset = terminal.display_offset();
             let grid_col = ((local_x / cell_w).floor() as usize).min(screen_cols.saturating_sub(1));
-            let grid_row = (((local_y / line_h).floor() as i32) - (display_offset as i32)).clamp(-(history_size as i32), screen_rows - 1);
+            let grid_row = (((local_y / line_h).floor() as i32) - (display_offset as i32))
+                .clamp(-(history_size as i32), screen_rows - 1);
             let start_point = alacritty_terminal::index::Point::new(
                 alacritty_terminal::index::Line(grid_row),
                 alacritty_terminal::index::Column(grid_col),
@@ -6385,7 +7591,9 @@ impl RootView {
                 // Double click: Select word under cursor
                 if let Some(term_guard) = terminal.term().try_lock() {
                     let grid = term_guard.grid();
-                    if let Some((_token, start_c, end_c)) = crate::selection_classifier::extract_token(grid, start_point, screen_cols) {
+                    if let Some((_token, start_c, end_c)) =
+                        crate::selection_classifier::extract_token(grid, start_point, screen_cols)
+                    {
                         let start_p = alacritty_terminal::index::Point::new(
                             alacritty_terminal::index::Line(grid_row),
                             alacritty_terminal::index::Column(start_c),
@@ -6496,8 +7704,10 @@ impl RootView {
                 let screen_rows = ((pane_h / line_h) as i32).max(1);
                 let screen_cols = ((pane_w / cell_w) as usize).max(1);
                 let display_offset = terminal.display_offset();
-                let grid_col = ((local_x / cell_w).floor() as usize).min(screen_cols.saturating_sub(1));
-                let grid_row = (((local_y / line_h).floor() as i32) - (display_offset as i32)).clamp(-(history_size as i32), screen_rows - 1);
+                let grid_col =
+                    ((local_x / cell_w).floor() as usize).min(screen_cols.saturating_sub(1));
+                let grid_row = (((local_y / line_h).floor() as i32) - (display_offset as i32))
+                    .clamp(-(history_size as i32), screen_rows - 1);
                 let point = alacritty_terminal::index::Point::new(
                     alacritty_terminal::index::Line(grid_row),
                     alacritty_terminal::index::Column(grid_col),
@@ -6505,7 +7715,9 @@ impl RootView {
 
                 if let Some(term_guard) = terminal.term().try_lock() {
                     let grid = term_guard.grid();
-                    if let Some((_token, start_c, end_c)) = crate::selection_classifier::extract_token(grid, point, screen_cols) {
+                    if let Some((_token, start_c, end_c)) =
+                        crate::selection_classifier::extract_token(grid, point, screen_cols)
+                    {
                         let start_p = alacritty_terminal::index::Point::new(
                             alacritty_terminal::index::Line(grid_row),
                             alacritty_terminal::index::Column(start_c),
@@ -6528,7 +7740,12 @@ impl RootView {
         }
     }
 
-    fn handle_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let cur_x = event.position.x.to_f64() as f32;
         let cur_y = event.position.y.to_f64() as f32;
         let prev_pos = self.cursor_window_pos;
@@ -6543,7 +7760,10 @@ impl RootView {
                     let bw = b.size.width.to_f64() as f32;
                     let bh = b.size.height.to_f64() as f32;
                     let right_edge = bx + bw;
-                    cur_y >= (by - 4.0) && cur_y <= (by + bh + 4.0) && cur_x >= (right_edge - 48.0) && cur_x <= (right_edge + 8.0)
+                    cur_y >= (by - 4.0)
+                        && cur_y <= (by + bh + 4.0)
+                        && cur_x >= (right_edge - 48.0)
+                        && cur_x <= (right_edge + 8.0)
                 } else {
                     false
                 }
@@ -6556,7 +7776,10 @@ impl RootView {
                         let bw = b.size.width.to_f64() as f32;
                         let bh = b.size.height.to_f64() as f32;
                         let right_edge = bx + bw;
-                        py >= (by - 4.0) && py <= (by + bh + 4.0) && px >= (right_edge - 48.0) && px <= (right_edge + 8.0)
+                        py >= (by - 4.0)
+                            && py <= (by + bh + 4.0)
+                            && px >= (right_edge - 48.0)
+                            && px <= (right_edge + 8.0)
                     } else {
                         false
                     }
@@ -6581,12 +7804,15 @@ impl RootView {
 
             let avail_w = (self.current_ai_sidebar_width() - 44.0).max(80.0);
             let max_cols = ((avail_w / 7.2).floor() as usize).max(10);
-            let lines = crate::ui::text_input::wrap_text_into_lines(&self.ai_input_state.text, max_cols);
+            let lines =
+                crate::ui::text_input::wrap_text_into_lines(&self.ai_input_state.text, max_cols);
             let line_h = 18.0;
             let line_idx = ((rel_y / line_h).floor() as usize).min(lines.len().saturating_sub(1));
             if let Some(target_line) = lines.get(line_idx) {
-                let col = crate::ui::text_input::index_for_x(&target_line.text, rel_x, 13.0, _window);
-                let char_idx = (target_line.start_char + col).min(target_line.start_char + target_line.text.chars().count());
+                let col =
+                    crate::ui::text_input::index_for_x(&target_line.text, rel_x, 13.0, _window);
+                let char_idx = (target_line.start_char + col)
+                    .min(target_line.start_char + target_line.text.chars().count());
                 self.ai_input_state.update_drag(char_idx);
                 self.ai_input_text = self.ai_input_state.text.clone();
                 cx.notify();
@@ -6621,7 +7847,8 @@ impl RootView {
                 }
             };
             if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
-                tab.pane_tree.set_split_ratio_by_path(&self.dragging_split_path, new_ratio);
+                tab.pane_tree
+                    .set_split_ratio_by_path(&self.dragging_split_path, new_ratio);
                 cx.notify();
             }
             return;
@@ -6643,13 +7870,21 @@ impl RootView {
                     if let Some(ref term) = pane.terminal {
                         let history_size = term.history_size();
                         if history_size > 0 {
-                            let track_h = pane.last_bounds.map_or(300.0, |b| b.size.height.to_f64() as f32).max(50.0);
+                            let track_h = pane
+                                .last_bounds
+                                .map_or(300.0, |b| b.size.height.to_f64() as f32)
+                                .max(50.0);
                             let target_rows = ((track_h / line_h) as usize).max(5);
                             let total_rows = (history_size + target_rows) as f32;
-                            let thumb_h = (track_h * (target_rows as f32 / total_rows)).clamp(24.0, track_h);
+                            let thumb_h =
+                                (track_h * (target_rows as f32 / total_rows)).clamp(24.0, track_h);
                             let scrollable_track = (track_h - thumb_h).max(1.0);
                             let offset_delta = (delta_y / scrollable_track) * history_size as f32;
-                            let new_offset = (self.scrollbar_drag_start_offset as f32 - offset_delta).round().clamp(0.0, history_size as f32) as usize;
+                            let new_offset = (self.scrollbar_drag_start_offset as f32
+                                - offset_delta)
+                                .round()
+                                .clamp(0.0, history_size as f32)
+                                as usize;
                             term.scroll_to_offset(new_offset);
                             cx.notify();
                         }
@@ -6659,7 +7894,9 @@ impl RootView {
             return;
         }
 
-        let Some(active_tab) = self.tabs.get(self.active_tab_idx) else { return; };
+        let Some(active_tab) = self.tabs.get(self.active_tab_idx) else {
+            return;
+        };
 
         // Find hovered pane based on rendered bounds
         let hovered_pane = active_tab.pane_tree.all_panes().into_iter().find(|p| {
@@ -6680,7 +7917,9 @@ impl RootView {
         let motion_pane = if self.pressed_mouse_button.is_some() {
             active_tab.pane_tree.active_pane()
         } else {
-            hovered_pane.clone().or_else(|| active_tab.pane_tree.active_pane())
+            hovered_pane
+                .clone()
+                .or_else(|| active_tab.pane_tree.active_pane())
         };
 
         if let Some(ref pane) = motion_pane {
@@ -6788,7 +8027,8 @@ impl RootView {
         let screen_rows = ((bh / line_h) as i32).max(1);
         let display_offset = terminal.display_offset();
         let grid_col = (local_x / cell_w).floor() as usize;
-        let grid_row = (((local_y / line_h).floor() as i32) - (display_offset as i32)).clamp(-(history_size as i32), screen_rows - 1);
+        let grid_row = (((local_y / line_h).floor() as i32) - (display_offset as i32))
+            .clamp(-(history_size as i32), screen_rows - 1);
         let current_point = alacritty_terminal::index::Point::new(
             alacritty_terminal::index::Line(grid_row),
             alacritty_terminal::index::Column(grid_col),
@@ -6799,7 +8039,9 @@ impl RootView {
             let grid = term_guard.grid();
             let cols = grid.columns();
             // 1. Explicit OSC 8 hyperlink check
-            if let Some((url, start_c, end_c)) = crate::selection_classifier::extract_hyperlink(grid, current_point, cols) {
+            if let Some((url, start_c, end_c)) =
+                crate::selection_classifier::extract_hyperlink(grid, current_point, cols)
+            {
                 self.hovered_url = Some(url);
                 self.hovered_url_range = Some((grid_row, start_c, end_c));
                 cx.notify();
@@ -6807,7 +8049,9 @@ impl RootView {
             }
 
             // 2. Pattern-based URL / path / email classifier fallback
-            if let Some((token, start_c, end_c)) = crate::selection_classifier::extract_token(grid, current_point, cols) {
+            if let Some((token, start_c, end_c)) =
+                crate::selection_classifier::extract_token(grid, current_point, cols)
+            {
                 if let Some(classification) = crate::selection_classifier::classify_token(&token) {
                     match classification {
                         crate::selection_classifier::Classification::Url(u) => {
@@ -6841,7 +8085,12 @@ impl RootView {
         }
     }
 
-    fn handle_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.pressed_mouse_button = None;
         self.is_dragging_scrollbar = false;
         self.dragging_scrollbar_pane_id = None;
@@ -6916,32 +8165,43 @@ impl RootView {
         if !self.is_selecting || !self.has_selection_dragged {
             return;
         }
-        let Some((raw_x, raw_y)) = self.selection_mouse_pos else { return; };
-        let Some(active_tab) = self.tabs.get(self.active_tab_idx) else { return; };
+        let Some((raw_x, raw_y)) = self.selection_mouse_pos else {
+            return;
+        };
+        let Some(active_tab) = self.tabs.get(self.active_tab_idx) else {
+            return;
+        };
         let active_pane = active_tab.pane_tree.active_pane();
-        let Some(terminal) = active_pane.as_ref().and_then(|p| p.terminal.as_ref()).or(active_tab.terminal.as_ref()) else { return; };
+        let Some(terminal) = active_pane
+            .as_ref()
+            .and_then(|p| p.terminal.as_ref())
+            .or(active_tab.terminal.as_ref())
+        else {
+            return;
+        };
 
         let (cell_w, line_h) = self.measure_cell_metrics(window);
         let px_per_line = if line_h > 0.0 { line_h } else { 18.0 };
         let cell_width = if cell_w > 0.0 { cell_w } else { 9.0 };
 
-        let (pane_x, pane_y, pane_w, pane_h) = if let Some(b) = active_pane.as_ref().and_then(|p| p.last_bounds) {
-            (
-                b.origin.x.to_f64() as f32,
-                b.origin.y.to_f64() as f32,
-                b.size.width.to_f64() as f32,
-                b.size.height.to_f64() as f32,
-            )
-        } else {
-            let v = window.viewport_size();
-            let sidebar_w = self.current_sidebar_width();
-            (
-                sidebar_w + 1.0,
-                32.0,
-                (v.width.to_f64() as f32 - sidebar_w).max(100.0),
-                (v.height.to_f64() as f32 - 56.0).max(100.0),
-            )
-        };
+        let (pane_x, pane_y, pane_w, pane_h) =
+            if let Some(b) = active_pane.as_ref().and_then(|p| p.last_bounds) {
+                (
+                    b.origin.x.to_f64() as f32,
+                    b.origin.y.to_f64() as f32,
+                    b.size.width.to_f64() as f32,
+                    b.size.height.to_f64() as f32,
+                )
+            } else {
+                let v = window.viewport_size();
+                let sidebar_w = self.current_sidebar_width();
+                (
+                    sidebar_w + 1.0,
+                    32.0,
+                    (v.width.to_f64() as f32 - sidebar_w).max(100.0),
+                    (v.height.to_f64() as f32 - 56.0).max(100.0),
+                )
+            };
 
         let top_edge = pane_y;
         let bottom_edge = pane_y + pane_h;
@@ -6959,7 +8219,8 @@ impl RootView {
             let rel_y = (raw_y - top_edge).clamp(0.0, pane_h - 1.0);
             let row_in_screen = (rel_y / px_per_line).floor() as i32;
             row_in_screen - (display_offset as i32)
-        }.clamp(-(history_size as i32), screen_rows - 1);
+        }
+        .clamp(-(history_size as i32), screen_rows - 1);
 
         let local_x = (raw_x - pane_x).max(0.0);
         let updated_col = if raw_y < top_edge && raw_x < pane_x + 5.0 {
@@ -7000,22 +8261,31 @@ impl RootView {
             self.selection_autoscroll_accum = 0.0;
             return;
         };
-        let Some(active_tab) = self.tabs.get(self.active_tab_idx) else { return; };
+        let Some(active_tab) = self.tabs.get(self.active_tab_idx) else {
+            return;
+        };
         let active_pane = active_tab.pane_tree.active_pane();
-        let Some(terminal) = active_pane.as_ref().and_then(|p| p.terminal.as_ref()).or(active_tab.terminal.as_ref()) else { return; };
+        let Some(terminal) = active_pane
+            .as_ref()
+            .and_then(|p| p.terminal.as_ref())
+            .or(active_tab.terminal.as_ref())
+        else {
+            return;
+        };
 
         let (_, line_h) = self.measure_cell_metrics(window);
         let px_per_line = if line_h > 0.0 { line_h } else { 18.0 };
 
-        let (top_edge, bottom_edge) = if let Some(b) = active_pane.as_ref().and_then(|p| p.last_bounds) {
-            let by = b.origin.y.to_f64() as f32;
-            let bh = b.size.height.to_f64() as f32;
-            (by, by + bh)
-        } else {
-            let v = window.viewport_size();
-            let avail_h = (v.height.to_f64() as f32 - 56.0).max(100.0);
-            (32.0, 32.0 + avail_h)
-        };
+        let (top_edge, bottom_edge) =
+            if let Some(b) = active_pane.as_ref().and_then(|p| p.last_bounds) {
+                let by = b.origin.y.to_f64() as f32;
+                let bh = b.size.height.to_f64() as f32;
+                (by, by + bh)
+            } else {
+                let v = window.viewport_size();
+                let avail_h = (v.height.to_f64() as f32 - 56.0).max(100.0);
+                (32.0, 32.0 + avail_h)
+            };
 
         // Auto-scroll triggers near or past the top/bottom edges
         let top_scroll_zone = top_edge + px_per_line * 1.5;
@@ -7050,7 +8320,12 @@ impl RootView {
         }
     }
 
-    fn handle_scroll(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(active_tab) = self.tabs.get(self.active_tab_idx) else {
             return;
         };
@@ -7058,17 +8333,22 @@ impl RootView {
         let mouse_x = event.position.x.to_f64() as f32;
         let mouse_y = event.position.y.to_f64() as f32;
 
-        let target_pane = active_tab.pane_tree.all_panes().into_iter().find(|p| {
-            if let Some(b) = p.last_bounds {
-                let bx = b.origin.x.to_f64() as f32;
-                let by = b.origin.y.to_f64() as f32;
-                let bw = b.size.width.to_f64() as f32;
-                let bh = b.size.height.to_f64() as f32;
-                mouse_x >= bx && mouse_x <= bx + bw && mouse_y >= by && mouse_y <= by + bh
-            } else {
-                false
-            }
-        }).or_else(|| active_tab.pane_tree.active_pane());
+        let target_pane = active_tab
+            .pane_tree
+            .all_panes()
+            .into_iter()
+            .find(|p| {
+                if let Some(b) = p.last_bounds {
+                    let bx = b.origin.x.to_f64() as f32;
+                    let by = b.origin.y.to_f64() as f32;
+                    let bw = b.size.width.to_f64() as f32;
+                    let bh = b.size.height.to_f64() as f32;
+                    mouse_x >= bx && mouse_x <= bx + bw && mouse_y >= by && mouse_y <= by + bh
+                } else {
+                    false
+                }
+            })
+            .or_else(|| active_tab.pane_tree.active_pane());
         let target_pane_id = target_pane.as_ref().map(|p| p.id);
         let target_bounds = target_pane.as_ref().and_then(|p| p.last_bounds);
         let Some(terminal) = target_pane.as_ref().and_then(|p| p.terminal.as_ref()) else {
@@ -7128,7 +8408,8 @@ impl RootView {
                 if lines != 0 {
                     self.scroll_accum -= (lines as f32) * px_per_line;
 
-                    let new_offset = (display_offset as isize + lines).clamp(0, history_size as isize) as usize;
+                    let new_offset =
+                        (display_offset as isize + lines).clamp(0, history_size as isize) as usize;
                     if new_offset != display_offset {
                         terminal.scroll_to_offset(new_offset);
                         cx.notify();
@@ -7250,17 +8531,19 @@ impl RootView {
                                 continue;
                             }
 
-                            let is_hovered_url = if let Some((h_row, h_start, h_end)) = self.hovered_url_range {
-                                row == h_row && col >= h_start && col < h_end
-                            } else {
-                                false
-                            };
+                            let is_hovered_url =
+                                if let Some((h_row, h_start, h_end)) = self.hovered_url_range {
+                                    row == h_row && col >= h_start && col < h_end
+                                } else {
+                                    false
+                                };
 
-                            let (effective_fg, effective_bg) = if cell.flags.contains(Flags::INVERSE) {
-                                (cell.bg, cell.fg)
-                            } else {
-                                (cell.fg, cell.bg)
-                            };
+                            let (effective_fg, effective_bg) =
+                                if cell.flags.contains(Flags::INVERSE) {
+                                    (cell.bg, cell.fg)
+                                } else {
+                                    (cell.fg, cell.bg)
+                                };
                             let fg = self.convert_color(effective_fg, true);
                             let bg = match effective_bg {
                                 AnsiColor::Named(NamedColor::Background) => None,
@@ -7268,7 +8551,9 @@ impl RootView {
                             };
 
                             let is_bold = cell.flags.contains(Flags::BOLD);
-                            let is_underline = cell.flags.contains(Flags::UNDERLINE) || is_hovered_url || cell.hyperlink().is_some();
+                            let is_underline = cell.flags.contains(Flags::UNDERLINE)
+                                || is_hovered_url
+                                || cell.hyperlink().is_some();
                             let code = cell.c as u32;
                             let is_kbd = is_keyboard_symbol(code);
                             let is_emoji = is_emoji_codepoint(code);
@@ -7288,7 +8573,11 @@ impl RootView {
                                 None
                             };
 
-                            let cell_cols = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+                            let cell_cols = if cell.flags.contains(Flags::WIDE_CHAR) {
+                                2
+                            } else {
+                                1
+                            };
                             let end_col = (col + cell_cols).min(target_cols);
 
                             if fg != current_fg
@@ -7328,7 +8617,11 @@ impl RootView {
                                 current_is_kbd = is_kbd;
                                 current_span_start_col = col;
                             }
-                            let display_c = if cell.c == '\t' || cell.c == '\0' { ' ' } else { cell.c };
+                            let display_c = if cell.c == '\t' || cell.c == '\0' {
+                                ' '
+                            } else {
+                                cell.c
+                            };
                             current_span_text.push(display_c);
                             current_span_char_cols.push(col);
                             current_span_end_col = end_col;
@@ -7361,16 +8654,20 @@ impl RootView {
                             content.cursor.shape
                         };
 
-                        let cursor_info = if cursor_visible && is_active && self.cursor_blink_visible {
-                            Some((cursor_point.line.0, cursor_point.column.0, effective_shape))
-                        } else {
-                            None
-                        };
+                        let cursor_info =
+                            if cursor_visible && is_active && self.cursor_blink_visible {
+                                Some((cursor_point.line.0, cursor_point.column.0, effective_shape))
+                            } else {
+                                None
+                            };
 
                         let mut visible_images = Vec::new();
-                        let total_pushed = terminal.total_lines_pushed.load(std::sync::atomic::Ordering::Relaxed);
+                        let total_pushed = terminal
+                            .total_lines_pushed
+                            .load(std::sync::atomic::Ordering::Relaxed);
                         let screen_rows = lines.len();
-                        let viewport_start_abs = (total_pushed + screen_rows as u64).saturating_sub(display_offset as u64 + screen_rows as u64);
+                        let viewport_start_abs = (total_pushed + screen_rows as u64)
+                            .saturating_sub(display_offset as u64 + screen_rows as u64);
                         let viewport_end_abs = viewport_start_abs + screen_rows as u64;
 
                         let store = terminal.image_store.lock();
@@ -7379,22 +8676,26 @@ impl RootView {
                             let p_end = placement.absolute_line + placement.rows as u64;
                             if p_end > viewport_start_abs && p_start < viewport_end_abs {
                                 let screen_row = (p_start as i64) - (viewport_start_abs as i64);
-                                visible_images.push(crate::ui::terminal_grid_element::VisibleImage {
-                                    row: screen_row,
-                                    col: placement.col,
-                                    cols: placement.cols,
-                                    rows: placement.rows,
-                                    z_index: placement.z_index,
-                                    image: placement.image.clone(),
-                                });
+                                visible_images.push(
+                                    crate::ui::terminal_grid_element::VisibleImage {
+                                        row: screen_row,
+                                        col: placement.col,
+                                        cols: placement.cols,
+                                        rows: placement.rows,
+                                        z_index: placement.z_index,
+                                        image: placement.image.clone(),
+                                    },
+                                );
                             }
                         }
                         drop(store);
 
                         let selection_range = if is_active { self.selection } else { None };
-                        let search_open = is_active && self.is_search_open && !self.search_query.is_empty();
+                        let search_open =
+                            is_active && self.is_search_open && !self.search_query.is_empty();
                         let search_query_str = self.search_query.to_lowercase();
-                        let active_search_offset = self.search_matches.get(self.search_match_idx).copied();
+                        let active_search_offset =
+                            self.search_matches.get(self.search_match_idx).copied();
                         let num_lines = lines.len();
                         let row_width = (target_cols as f32 * cell_w).round();
 
@@ -7409,8 +8710,10 @@ impl RootView {
                                 for s in spans {
                                     for (i, c) in s.text.chars().enumerate() {
                                         full_line.push(c);
-                                        let col_start = s.char_cols.get(i).copied().unwrap_or(s.start_col);
-                                        let col_end = s.char_cols.get(i + 1).copied().unwrap_or(s.end_col);
+                                        let col_start =
+                                            s.char_cols.get(i).copied().unwrap_or(s.start_col);
+                                        let col_end =
+                                            s.char_cols.get(i + 1).copied().unwrap_or(s.end_col);
                                         char_to_col.push(col_start);
                                         char_to_end_col.push(col_end);
                                     }
@@ -7418,25 +8721,33 @@ impl RootView {
 
                                 let line_lower = full_line.to_lowercase();
                                 let mut start_b = 0;
-                                while let Some(found_b) = line_lower[start_b..].find(&search_query_str) {
+                                while let Some(found_b) =
+                                    line_lower[start_b..].find(&search_query_str)
+                                {
                                     let match_start_b = start_b + found_b;
                                     let match_end_b = match_start_b + search_query_str.len();
-                                    let match_start_char = line_lower[..match_start_b].chars().count();
+                                    let match_start_char =
+                                        line_lower[..match_start_b].chars().count();
                                     let match_end_char = line_lower[..match_end_b].chars().count();
 
                                     if match_start_char < char_to_col.len() && match_end_char > 0 {
                                         let col_start = char_to_col[match_start_char];
-                                        let last_char_idx = (match_end_char - 1).min(char_to_end_col.len() - 1);
+                                        let last_char_idx =
+                                            (match_end_char - 1).min(char_to_end_col.len() - 1);
                                         let col_end = char_to_end_col[last_char_idx];
                                         let col_len = col_end.saturating_sub(col_start).max(1);
 
-                                        let is_active_match = active_search_offset.is_some_and(|off| {
-                                            off == (display_offset + (num_lines.saturating_sub(1 + row_idx)))
-                                        });
+                                        let is_active_match =
+                                            active_search_offset.is_some_and(|off| {
+                                                off == (display_offset
+                                                    + (num_lines.saturating_sub(1 + row_idx)))
+                                            });
                                         row_highlights.push((col_start, col_len, is_active_match));
                                     }
                                     start_b = match_end_b;
-                                    if search_query_str.is_empty() { break; }
+                                    if search_query_str.is_empty() {
+                                        break;
+                                    }
                                 }
                                 all_search_highlights.push(row_highlights);
                             }
@@ -7475,22 +8786,30 @@ impl RootView {
 
                 let pane_scrollbar_thumb = if history_size > 0 {
                     let elapsed_ms = self.last_scroll_activity.elapsed().as_millis();
-                    let is_this_dragging = self.is_dragging_scrollbar && self.dragging_scrollbar_pane_id == Some(pane.id);
-                    let is_this_scrolling = (self.last_scrolled_pane_id == Some(pane.id) || (self.last_scrolled_pane_id.is_none() && is_active)) && elapsed_ms < 1500;
+                    let is_this_dragging = self.is_dragging_scrollbar
+                        && self.dragging_scrollbar_pane_id == Some(pane.id);
+                    let is_this_scrolling = (self.last_scrolled_pane_id == Some(pane.id)
+                        || (self.last_scrolled_pane_id.is_none() && is_active))
+                        && elapsed_ms < 1500;
 
                     // Proximity check against this pane's right edge
                     let right_edge = container_x + avail_w;
                     let bottom_edge = container_y + avail_h;
-                    let (is_in_proximity, dist_from_right) = if let Some((mx, my)) = self.cursor_window_pos {
-                        if my >= (container_y - 4.0) && my <= (bottom_edge + 4.0) && mx >= (right_edge - 48.0) && mx <= (right_edge + 8.0) {
-                            let dist = (right_edge - mx).max(0.0);
-                            (true, dist)
+                    let (is_in_proximity, dist_from_right) =
+                        if let Some((mx, my)) = self.cursor_window_pos {
+                            if my >= (container_y - 4.0)
+                                && my <= (bottom_edge + 4.0)
+                                && mx >= (right_edge - 48.0)
+                                && mx <= (right_edge + 8.0)
+                            {
+                                let dist = (right_edge - mx).max(0.0);
+                                (true, dist)
+                            } else {
+                                (false, 999.0)
+                            }
                         } else {
                             (false, 999.0)
-                        }
-                    } else {
-                        (false, 999.0)
-                    };
+                        };
 
                     if is_this_dragging || is_this_scrolling || is_in_proximity {
                         let (alpha_mult, visual_w) = if is_this_dragging {
@@ -7509,13 +8828,24 @@ impl RootView {
 
                         let track_h = avail_h;
                         let total_rows = (history_size + target_rows) as f32;
-                        let thumb_h = (track_h * (target_rows as f32 / total_rows)).clamp(24.0, track_h);
-                        let progress = 1.0 - (display_offset as f32 / history_size as f32).clamp(0.0, 1.0);
-                        let thumb_top = ((track_h - thumb_h) * progress).clamp(0.0, track_h - thumb_h);
+                        let thumb_h =
+                            (track_h * (target_rows as f32 / total_rows)).clamp(24.0, track_h);
+                        let progress =
+                            1.0 - (display_offset as f32 / history_size as f32).clamp(0.0, 1.0);
+                        let thumb_top =
+                            ((track_h - thumb_h) * progress).clamp(0.0, track_h - thumb_h);
 
-                        let mut thumb_bg = if is_this_dragging { theme.accent } else { theme.muted };
+                        let mut thumb_bg = if is_this_dragging {
+                            theme.accent
+                        } else {
+                            theme.muted
+                        };
                         thumb_bg.a = 0.50 * alpha_mult;
-                        let mut thumb_hover_bg = if is_this_dragging { theme.accent } else { theme.muted_strong };
+                        let mut thumb_hover_bg = if is_this_dragging {
+                            theme.accent
+                        } else {
+                            theme.muted_strong
+                        };
                         thumb_hover_bg.a = 0.90 * alpha_mult;
 
                         Some(
@@ -7535,17 +8865,20 @@ impl RootView {
                                         .h_full()
                                         .rounded_full()
                                         .bg(thumb_bg)
-                                        .hover(move |s| s.bg(thumb_hover_bg))
+                                        .hover(move |s| s.bg(thumb_hover_bg)),
                                 )
-                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
-                                    this.is_dragging_scrollbar = true;
-                                    this.dragging_scrollbar_pane_id = Some(pane_id);
-                                    this.last_scrolled_pane_id = Some(pane_id);
-                                    this.scrollbar_drag_start_y = ev.position.y.to_f64() as f32;
-                                    this.scrollbar_drag_start_offset = display_offset;
-                                    this.last_scroll_activity = std::time::Instant::now();
-                                    cx.notify();
-                                }))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                                        this.is_dragging_scrollbar = true;
+                                        this.dragging_scrollbar_pane_id = Some(pane_id);
+                                        this.last_scrolled_pane_id = Some(pane_id);
+                                        this.scrollbar_drag_start_y = ev.position.y.to_f64() as f32;
+                                        this.scrollbar_drag_start_offset = display_offset;
+                                        this.last_scroll_activity = std::time::Instant::now();
+                                        cx.notify();
+                                    }),
+                                ),
                         )
                     } else {
                         None
@@ -7558,45 +8891,63 @@ impl RootView {
                     .size_full()
                     .relative()
                     .overflow_hidden()
-                    .when(pane_count > 1 && is_active, |d| d.border_1().border_color(theme.accent))
-                    .when(pane_count > 1 && !is_active, |d| d.border_1().border_color(theme.border))
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                        if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
-                            tab.pane_tree.active_pane_id = pane_id;
-                            if let Some(p) = tab.pane_tree.active_pane() {
-                                tab.terminal = p.terminal.clone();
-                                tab.cwd = p.cwd.clone();
-                                tab.git_status = p.git_status.clone();
+                    .when(pane_count > 1 && is_active, |d| {
+                        d.border_1().border_color(theme.accent)
+                    })
+                    .when(pane_count > 1 && !is_active, |d| {
+                        d.border_1().border_color(theme.border)
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
+                                tab.pane_tree.active_pane_id = pane_id;
+                                if let Some(p) = tab.pane_tree.active_pane() {
+                                    tab.terminal = p.terminal.clone();
+                                    tab.cwd = p.cwd.clone();
+                                    tab.git_status = p.git_status.clone();
+                                }
+                                cx.notify();
                             }
-                            cx.notify();
-                        }
-                    }))
-                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, _ev, _window, cx| {
-                        if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
-                            tab.pane_tree.active_pane_id = pane_id;
-                            if let Some(p) = tab.pane_tree.active_pane() {
-                                tab.terminal = p.terminal.clone();
-                                tab.cwd = p.cwd.clone();
-                                tab.git_status = p.git_status.clone();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
+                                tab.pane_tree.active_pane_id = pane_id;
+                                if let Some(p) = tab.pane_tree.active_pane() {
+                                    tab.terminal = p.terminal.clone();
+                                    tab.cwd = p.cwd.clone();
+                                    tab.git_status = p.git_status.clone();
+                                }
+                                cx.notify();
                             }
-                            cx.notify();
-                        }
-                    }))
-                    .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _ev, _window, cx| {
-                        if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
-                            tab.pane_tree.active_pane_id = pane_id;
-                            if let Some(p) = tab.pane_tree.active_pane() {
-                                tab.terminal = p.terminal.clone();
-                                tab.cwd = p.cwd.clone();
-                                tab.git_status = p.git_status.clone();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
+                                tab.pane_tree.active_pane_id = pane_id;
+                                if let Some(p) = tab.pane_tree.active_pane() {
+                                    tab.terminal = p.terminal.clone();
+                                    tab.cwd = p.cwd.clone();
+                                    tab.git_status = p.git_status.clone();
+                                }
+                                cx.notify();
                             }
-                            cx.notify();
-                        }
-                    }))
+                        }),
+                    )
                     .when_some(grid_el, |d, el| d.child(el))
                     .when_some(pane_scrollbar_thumb, |d, thumb| d.child(thumb))
             }
-            PaneNode::Split { direction, ratio, first, second } => {
+            PaneNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
                 let mut container = div().size_full().flex();
                 container = match direction {
                     SplitDirection::Horizontal => container.flex_row(),
@@ -7607,73 +8958,90 @@ impl RootView {
                     SplitDirection::Horizontal => {
                         let w1 = avail_w * *ratio;
                         let w2 = avail_w * (1.0 - *ratio);
-                        (w1, avail_h, w2, avail_h, container_x, container_y, container_x + w1, container_y)
+                        (
+                            w1,
+                            avail_h,
+                            w2,
+                            avail_h,
+                            container_x,
+                            container_y,
+                            container_x + w1,
+                            container_y,
+                        )
                     }
                     SplitDirection::Vertical => {
                         let h1 = avail_h * *ratio;
                         let h2 = avail_h * (1.0 - *ratio);
-                        (avail_w, h1, avail_w, h2, container_x, container_y, container_x, container_y + h1)
+                        (
+                            avail_w,
+                            h1,
+                            avail_w,
+                            h2,
+                            container_x,
+                            container_y,
+                            container_x,
+                            container_y + h1,
+                        )
                     }
                 };
 
-                let is_dragging_this = self.is_dragging_pane_split && self.dragging_split_path == path;
-                let divider_line_color = if is_dragging_this { theme.accent } else { theme.border };
+                let is_dragging_this =
+                    self.is_dragging_pane_split && self.dragging_split_path == path;
+                let divider_line_color = if is_dragging_this {
+                    theme.accent
+                } else {
+                    theme.border
+                };
                 let split_path_clone = path.clone();
                 let dir_val = *direction;
 
                 let divider = match direction {
-                    SplitDirection::Horizontal => {
-                        div()
-                            .id(SharedString::from(format!("h-split-divider-{:?}", path)))
-                            .relative()
-                            .w(px(7.))
-                            .h_full()
-                            .mx(px(-3.))
-                            .cursor(CursorStyle::ResizeColumn)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(move |s| s.bg(gpui::transparent_black()))
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                    SplitDirection::Horizontal => div()
+                        .id(SharedString::from(format!("h-split-divider-{:?}", path)))
+                        .relative()
+                        .w(px(7.))
+                        .h_full()
+                        .mx(px(-3.))
+                        .cursor(CursorStyle::ResizeColumn)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .hover(move |s| s.bg(gpui::transparent_black()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
                                 this.is_dragging_pane_split = true;
                                 this.dragging_split_path = split_path_clone.clone();
                                 this.dragging_split_direction = dir_val;
-                                this.dragging_split_bounds = (container_x, container_y, avail_w, avail_h);
+                                this.dragging_split_bounds =
+                                    (container_x, container_y, avail_w, avail_h);
                                 cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .w(px(1.))
-                                    .h_full()
-                                    .bg(divider_line_color)
-                            )
-                    }
-                    SplitDirection::Vertical => {
-                        div()
-                            .id(SharedString::from(format!("v-split-divider-{:?}", path)))
-                            .relative()
-                            .h(px(7.))
-                            .w_full()
-                            .my(px(-3.))
-                            .cursor(CursorStyle::ResizeRow)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(move |s| s.bg(gpui::transparent_black()))
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            }),
+                        )
+                        .child(div().w(px(1.)).h_full().bg(divider_line_color)),
+                    SplitDirection::Vertical => div()
+                        .id(SharedString::from(format!("v-split-divider-{:?}", path)))
+                        .relative()
+                        .h(px(7.))
+                        .w_full()
+                        .my(px(-3.))
+                        .cursor(CursorStyle::ResizeRow)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .hover(move |s| s.bg(gpui::transparent_black()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
                                 this.is_dragging_pane_split = true;
                                 this.dragging_split_path = split_path_clone.clone();
                                 this.dragging_split_direction = dir_val;
-                                this.dragging_split_bounds = (container_x, container_y, avail_w, avail_h);
+                                this.dragging_split_bounds =
+                                    (container_x, container_y, avail_w, avail_h);
                                 cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .h(px(1.))
-                                    .w_full()
-                                    .bg(divider_line_color)
-                            )
-                    }
+                            }),
+                        )
+                        .child(div().h(px(1.)).w_full().bg(divider_line_color)),
                 };
 
                 let mut path_first = path.clone();
@@ -7733,7 +9101,10 @@ impl Render for RootView {
         // F5: the picker fetched for another cwd: close rather than act on
         // stale data (e.g. tab switched by mouse while open).
         if self.is_pr_picker_open {
-            let current_cwd = self.tabs.get(self.active_tab_idx).and_then(|t| t.cwd.clone());
+            let current_cwd = self
+                .tabs
+                .get(self.active_tab_idx)
+                .and_then(|t| t.cwd.clone());
             if current_cwd != self.pr_picker_cwd {
                 self.is_pr_picker_open = false;
             }
@@ -7743,9 +9114,15 @@ impl Render for RootView {
             .iter()
             .enumerate()
             .map(|(idx, tab)| {
-                let process_name = tab.terminal.as_ref().and_then(|t| t.get_foreground_process_name());
+                let process_name = tab
+                    .terminal
+                    .as_ref()
+                    .and_then(|t| t.get_foreground_process_name());
                 // F2: zoomed tabs carry a marker so the state is visible.
-                let mut title = tab.custom_title.clone().unwrap_or_else(|| tab.title.clone());
+                let mut title = tab
+                    .custom_title
+                    .clone()
+                    .unwrap_or_else(|| tab.title.clone());
                 if tab.zoomed_pane.is_some() {
                     title = format!("[Z] {title}");
                 }
@@ -7753,7 +9130,10 @@ impl Render for RootView {
                     id: tab.id,
                     title,
                     active: idx == self.active_tab_idx,
-                    is_dirty: tab.git_status.as_ref().is_some_and(|g| g.unstaged > 0 || g.staged > 0),
+                    is_dirty: tab
+                        .git_status
+                        .as_ref()
+                        .is_some_and(|g| g.unstaged > 0 || g.staged > 0),
                     process_name,
                 }
             })
@@ -7784,33 +9164,36 @@ impl Render for RootView {
             self.persist_session();
         }
 
-        let (active_cwd, active_git, fallback_info) = if let Some(active_tab) = self.tabs.get_mut(self.active_tab_idx) {
-            let now = std::time::Instant::now();
-            let should_poll = active_tab.git_checked_cwd.as_ref() != active_tab.cwd.as_ref()
-                || active_tab.git_last_poll.is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_secs(2));
+        let (active_cwd, active_git, fallback_info) =
+            if let Some(active_tab) = self.tabs.get_mut(self.active_tab_idx) {
+                let now = std::time::Instant::now();
+                let should_poll = active_tab.git_checked_cwd.as_ref() != active_tab.cwd.as_ref()
+                    || active_tab.git_last_poll.is_none_or(|last| {
+                        now.duration_since(last) >= std::time::Duration::from_secs(2)
+                    });
 
-            if should_poll {
-                active_tab.git_checked_cwd = active_tab.cwd.clone();
-                active_tab.git_last_poll = Some(now);
-                if let Some(ref cwd) = active_tab.cwd {
-                    active_tab.git_status = crate::git::fetch_git_info_cached(cwd);
-                } else {
-                    active_tab.git_status = None;
+                if should_poll {
+                    active_tab.git_checked_cwd = active_tab.cwd.clone();
+                    active_tab.git_last_poll = Some(now);
+                    if let Some(ref cwd) = active_tab.cwd {
+                        active_tab.git_status = crate::git::fetch_git_info_cached(cwd);
+                    } else {
+                        active_tab.git_status = None;
+                    }
                 }
-            }
-            let cwd_path = active_tab.cwd.as_deref();
-            let git = active_tab.git_status.as_ref();
-            let info = StatusInfo {
-                git_branch: git.map(|g| g.branch.clone()),
-                git_dirty: git.map(|g| g.unstaged > 0 || g.staged > 0).unwrap_or(false),
-                cwd: cwd_path.map(|p| p.to_string_lossy().into_owned()),
-                last_duration_ms: active_tab.last_duration_ms,
-                last_exit_code: active_tab.last_exit_code,
+                let cwd_path = active_tab.cwd.as_deref();
+                let git = active_tab.git_status.as_ref();
+                let info = StatusInfo {
+                    git_branch: git.map(|g| g.branch.clone()),
+                    git_dirty: git.map(|g| g.unstaged > 0 || g.staged > 0).unwrap_or(false),
+                    cwd: cwd_path.map(|p| p.to_string_lossy().into_owned()),
+                    last_duration_ms: active_tab.last_duration_ms,
+                    last_exit_code: active_tab.last_exit_code,
+                };
+                (cwd_path, git.cloned(), info)
+            } else {
+                (None, None, StatusInfo::default())
             };
-            (cwd_path, git.cloned(), info)
-        } else {
-            (None, None, StatusInfo::default())
-        };
 
         let (left_segs, right_segs) = self.status_bar_model.render_segments(
             active_cwd,
@@ -7835,8 +9218,8 @@ impl Render for RootView {
             as f32)
             * NOTICE_BAR_HEIGHT;
         let top_offset = TAB_BAR_HEIGHT + notice_h;
-        let avail_h = (viewport_size.height.to_f64() as f32 - top_offset - STATUS_BAR_HEIGHT)
-            .max(100.0);
+        let avail_h =
+            (viewport_size.height.to_f64() as f32 - top_offset - STATUS_BAR_HEIGHT).max(100.0);
 
         let font_family = self.font_family.clone();
         let font_size = self.font_size;
@@ -7870,12 +9253,18 @@ impl Render for RootView {
                     },
                 };
                 for p in active_tab.pane_tree.all_panes_mut() {
-                    p.last_bounds = if Some(p.id) == zoomed_id { Some(full) } else { None };
+                    p.last_bounds = if Some(p.id) == zoomed_id {
+                        Some(full)
+                    } else {
+                        None
+                    };
                 }
             } else {
                 // No zoom (or a stale zoom target): normal tree layout.
                 active_tab.zoomed_pane = None;
-                active_tab.pane_tree.update_layout_bounds(sidebar_w, top_offset, avail_w, avail_h);
+                active_tab
+                    .pane_tree
+                    .update_layout_bounds(sidebar_w, top_offset, avail_w, avail_h);
             }
         }
 
@@ -7926,13 +9315,8 @@ impl Render for RootView {
             .text_color(theme.foreground)
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
-            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _window, cx| {
-                if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
-                    if let Some(ref terminal) = active_tab.terminal {
-                        crate::paste::handle_dropped_paths(terminal, paths.paths());
-                        cx.notify();
-                    }
-                }
+            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                this.handle_file_drop(paths.paths(), window, cx);
             }))
             .child(
                 TabBar::new(tab_items.clone(), theme)
@@ -8124,13 +9508,8 @@ impl Render for RootView {
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
                             .on_mouse_up(MouseButton::Right, cx.listener(Self::handle_mouse_up))
                             .on_mouse_up(MouseButton::Middle, cx.listener(Self::handle_mouse_up))
-                            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _window, cx| {
-                                if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
-                                    if let Some(ref terminal) = active_tab.terminal {
-                                        crate::paste::handle_dropped_paths(terminal, paths.paths());
-                                        cx.notify();
-                                    }
-                                }
+                            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                                this.handle_file_drop(paths.paths(), window, cx);
                             }))
                             .flex()
                             .flex_1()
@@ -8408,7 +9787,7 @@ impl Render for RootView {
                             theme,
                         ))
                         .child(render_context_menu_item(
-                            IconType::Plus,
+                            IconType::CopyPlus,
                             "Duplicate Tab",
                             None,
                             cx.listener(move |this, _ev, window, cx| {
@@ -8580,7 +9959,7 @@ impl Render for RootView {
                         })
                         .when(has_selection, |d| {
                             d.child(render_context_menu_item(
-                                IconType::Plus,
+                                IconType::ClipboardCopy,
                                 "Copy",
                                 Some(sc_copy),
                                 cx.listener(|this, _ev, _window, cx| {
@@ -8596,7 +9975,7 @@ impl Render for RootView {
                             ))
                         })
                         .child(render_context_menu_item(
-                            IconType::Plus,
+                            IconType::ClipboardPaste,
                             "Paste",
                             Some(sc_paste),
                             cx.listener(move |this, _ev, _window, cx| {
@@ -8617,7 +9996,7 @@ impl Render for RootView {
                         ))
                         .child(render_context_menu_divider(theme))
                         .child(render_context_menu_item(
-                            IconType::Plus,
+                            IconType::PanelRight,
                             "Split Pane Right",
                             Some(sc_split_right),
                             cx.listener(move |this, _ev, window, cx| {
@@ -8635,7 +10014,7 @@ impl Render for RootView {
                             theme,
                         ))
                         .child(render_context_menu_item(
-                            IconType::Plus,
+                            IconType::PanelBottom,
                             "Split Pane Down",
                             Some(sc_split_down),
                             cx.listener(move |this, _ev, window, cx| {
@@ -8653,7 +10032,7 @@ impl Render for RootView {
                             theme,
                         ))
                         .child(render_context_menu_item(
-                            IconType::Plus,
+                            IconType::PanelLeft,
                             "Split Pane Left",
                             None,
                             cx.listener(move |this, _ev, window, cx| {
@@ -8671,7 +10050,7 @@ impl Render for RootView {
                             theme,
                         ))
                         .child(render_context_menu_item(
-                            IconType::Plus,
+                            IconType::PanelTop,
                             "Split Pane Top",
                             None,
                             cx.listener(move |this, _ev, window, cx| {
@@ -10404,18 +11783,40 @@ impl Render for RootView {
                                                                 div()
                                                                     .flex()
                                                                     .flex_col()
+                                                                    .min_w_0()
+                                                                    .flex_1()
                                                                     .child(
                                                                         div()
                                                                             .text_size(px(12.))
                                                                             .font_weight(FontWeight::BOLD)
                                                                             .text_color(if is_selected { theme.black } else { theme.foreground })
+                                                                            .whitespace_nowrap()
+                                                                            .text_ellipsis()
+                                                                            .overflow_hidden()
                                                                             .child(title),
                                                                     )
                                                                     .child(
                                                                         div()
+                                                                            .flex()
+                                                                            .flex_row()
+                                                                            .items_center()
+                                                                            .gap_1()
+                                                                            .min_w_0()
                                                                             .text_size(px(10.5))
                                                                             .text_color(if is_selected { theme.black.opacity(0.85) } else { theme.muted })
-                                                                            .child(cwd_str.unwrap_or_else(|| "~".to_string())),
+                                                                            .child(render_icon(
+                                                                                IconType::Folder,
+                                                                                if is_selected { theme.black.opacity(0.85) } else { theme.muted },
+                                                                                10.0,
+                                                                            ))
+                                                                            .child(
+                                                                                div()
+                                                                                    .min_w_0()
+                                                                                    .whitespace_nowrap()
+                                                                                    .text_ellipsis()
+                                                                                    .overflow_hidden()
+                                                                                    .child(cwd_str.unwrap_or_else(|| "~".to_string())),
+                                                                            ),
                                                                     ),
                                                             )
                                                             .child(
@@ -10423,11 +11824,22 @@ impl Render for RootView {
                                                                     .px(px(6.))
                                                                     .py(px(2.))
                                                                     .rounded(px(3.))
+                                                                    .flex()
+                                                                    .flex_row()
+                                                                    .items_center()
+                                                                    .gap_1()
                                                                     .bg(if is_selected { theme.black } else { theme.surface_raised })
                                                                     .text_size(px(10.))
                                                                     .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::MEDIUM })
                                                                     .text_color(if is_selected { theme.accent } else { theme.muted })
-                                                                    .child(branch_str.map(|b| format!("🌿 {}", b)).unwrap_or_else(|| "Tab".to_string())),
+                                                                    .when(branch_str.is_some(), |el| {
+                                                                        el.child(render_icon(
+                                                                            IconType::GitBranch,
+                                                                            if is_selected { theme.accent } else { theme.muted },
+                                                                            10.0,
+                                                                        ))
+                                                                    })
+                                                                    .child(branch_str.unwrap_or_else(|| "Tab".to_string())),
                                                             )
                                                     })
                                                     .collect()
@@ -10528,7 +11940,8 @@ impl Render for RootView {
                                                 .text_size(px(13.))
                                                 .text_color(if self.file_picker_query.is_empty() { theme.muted } else { theme.foreground })
                                                 .child(if self.file_picker_query.is_empty() {
-                                                    "Search files to insert path...".to_string()
+                                                    "Search files to insert a path..."
+                                                        .to_string()
                                                 } else {
                                                     format!("{}|", self.file_picker_query)
                                                 }),
@@ -10707,10 +12120,18 @@ impl Render for RootView {
                                         .justify_between()
                                         .child(
                                             div()
-                                                .text_size(px(11.))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(theme.foreground)
-                                                .child(format!("⎇ {}", branch_name)),
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_1()
+                                                .child(render_icon(IconType::GitBranch, theme.foreground, 11.0))
+                                                .child(
+                                                    div()
+                                                        .text_size(px(11.))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .text_color(theme.foreground)
+                                                        .child(branch_name.clone()),
+                                                ),
                                         )
                                         .child(
                                             div()
@@ -11084,12 +12505,24 @@ impl Render for RootView {
                 let backdrop = gpui::hsla(0.0, 0.0, 0.0, 0.75);
                 let selected_idx = self.tab_overview_selected;
                 let font_fam = self.font_family.clone();
-                let win_w = _window.viewport_size().width.to_f64() as f32;
-                let available_w = (win_w - 64.0).max(320.0);
-                let total_items = (self.tabs.len() + 1) as f32;
-                let max_cols = ((available_w + 16.0) / (300.0 + 16.0)).floor().clamp(1.0, 4.0);
-                let active_cols = max_cols.min(total_items);
-                let container_w = active_cols * 300.0 + (active_cols - 1.0).max(0.0) * 16.0 + 8.0;
+                let viewport = _window.viewport_size();
+                let items = self.tabs.len() + 1;
+                // Same struct the keyboard handler uses, so the painted column
+                // count and the navigation column count cannot disagree. The
+                // grid box is built from the same numbers it was derived from,
+                // so the flex line fits exactly `layout.cols` cells.
+                let layout = MissionControlLayout::new(
+                    viewport.width.to_f64() as f32,
+                    viewport.height.to_f64() as f32,
+                    items,
+                );
+                // The grid box is built from the same numbers the column count
+                // came from, so this cannot fire. The invariant is covered by
+                // `mission_control_cells_fit_with_slack` rather than by a panic
+                // in the render path.
+                let cell_w = layout.cell_w;
+                let cell_h = layout.cell_h;
+                let container_w = layout.grid_w;
 
                 this.child(
                     div()
@@ -11099,10 +12532,10 @@ impl Render for RootView {
                         .flex()
                         .flex_col()
                         .items_center()
-                        .pt(px(56.))
-                        .pb(px(24.))
-                        .px(px(24.))
-                        .gap_4()
+                        .pt(px(MC_TOP_PAD))
+                        .pb(px(MC_EDGE_MARGIN))
+                        .px(px(MC_EDGE_MARGIN))
+                        .gap(px(MC_HEADER_GAP))
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                             this.is_tab_overview_open = false;
                             cx.notify();
@@ -11116,9 +12549,10 @@ impl Render for RootView {
                                 .justify_between()
                                 .w(px(container_w))
                                 .max_w(px(container_w))
+                                .h(px(MC_HEADER_H))
                                 .px(px(16.))
-                                .py(px(10.))
                                 .rounded(px(10.))
+                                .overflow_hidden()
                                 .bg(theme.surface)
                                 .border_1()
                                 .border_color(theme.border)
@@ -11132,6 +12566,8 @@ impl Render for RootView {
                                         .flex_row()
                                         .items_center()
                                         .gap_2()
+                                        .min_w_0()
+                                        .flex_shrink_0()
                                         .child(render_icon(IconType::Layers, theme.accent, 16.0))
                                         .child(
                                             div()
@@ -11158,10 +12594,14 @@ impl Render for RootView {
                                         .flex_row()
                                         .items_center()
                                         .gap_3()
+                                        .min_w_0()
                                         .child(
                                             div()
                                                 .text_size(px(11.))
                                                 .text_color(theme.muted)
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .overflow_hidden()
                                                 .child("← → ↑ ↓ Navigate • Enter Select • D Close • T New • ESC Exit"),
                                         )
                                         .child(
@@ -11188,10 +12628,10 @@ impl Render for RootView {
                                 .flex_wrap()
                                 .justify_center()
                                 .w(px(container_w))
-                                .max_h(px(640.))
+                                .max_h(px(layout.grid_max_h))
                                 .overflow_y_scroll()
-                                .gap_4()
-                                .p(px(4.))
+                                .gap(px(MC_GAP))
+                                .p(px(MC_GRID_PAD))
                                 .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
                                     cx.stop_propagation();
                                 })
@@ -11204,15 +12644,34 @@ impl Render for RootView {
                                         let proc_name = tab.terminal.as_ref().and_then(|t| t.get_foreground_process_name()).unwrap_or_else(|| "terminal".to_string());
                                         let (icon_type, _) = super::icons::get_deck_process_icon(&proc_name);
                                         let active_term = tab.terminal.clone().or_else(|| tab.pane_tree.all_panes().first().and_then(|p| p.terminal.clone()));
-                                        let preview_lines = active_term.as_ref().map(|t| t.get_screen_preview(10)).unwrap_or_default();
+                                        // The preview fills the card, so the line
+                                        // count follows the cell height instead
+                                        // of a fixed number. A fixed count left
+                                        // most of a tall card as empty black. A
+                                        // terminal cannot supply more rows than
+                                        // it shows, so the count is also bounded
+                                        // by that.
+                                        let available_rows = active_term
+                                            .as_ref()
+                                            .map(|t| t.screen_line_count())
+                                            .unwrap_or(0);
+                                        let preview_lines = active_term
+                                            .as_ref()
+                                            .map(|t| {
+                                                t.get_screen_preview(preview_line_count(
+                                                    cell_h,
+                                                    available_rows,
+                                                ))
+                                            })
+                                            .unwrap_or_default();
                                         let split_count = tab.pane_tree.all_panes().len();
                                         let branch_opt = tab.git_status.as_ref().map(|g| g.branch.clone());
 
                                         div()
                                             .flex()
                                             .flex_col()
-                                            .w(px(300.))
-                                            .h(px(210.))
+                                            .w(px(cell_w))
+                                            .h(px(cell_h))
                                             .rounded(px(10.))
                                             .bg(theme.surface)
                                             .border_2()
@@ -11462,8 +12921,8 @@ impl Render for RootView {
                                         .flex_col()
                                         .items_center()
                                         .justify_center()
-                                        .w(px(300.))
-                                        .h(px(210.))
+                                        .w(px(cell_w))
+                                        .h(px(cell_h))
                                         .rounded(px(10.))
                                         .bg(theme.surface.opacity(0.5))
                                         .border_2()
@@ -12309,11 +13768,7 @@ fn render_context_menu_item(
 }
 
 fn render_context_menu_divider(theme: Theme) -> Div {
-    div()
-        .h(px(1.))
-        .w_full()
-        .bg(theme.border)
-        .my(px(2.))
+    div().h(px(1.)).w_full().bg(theme.border).my(px(2.))
 }
 
 fn render_about_spec_row(label: &'static str, value: &str, theme: Theme) -> Div {
@@ -12324,11 +13779,7 @@ fn render_about_spec_row(label: &'static str, value: &str, theme: Theme) -> Div 
         .justify_between()
         .py(px(2.))
         .text_size(px(11.))
-        .child(
-            div()
-                .text_color(theme.muted)
-                .child(label),
-        )
+        .child(div().text_color(theme.muted).child(label))
         .child(
             div()
                 .font_weight(FontWeight::MEDIUM)
@@ -12341,13 +13792,340 @@ fn render_about_spec_row(label: &'static str, value: &str, theme: Theme) -> Div 
 mod tests {
     use super::*;
 
+    /// Every icon the tab rows, the project jumper and the attachment chips draw
+    /// must produce real SVG geometry, not an empty path list. An empty list
+    /// yields a valid but blank SVG, which reads as a layout bug.
+    ///
+    /// This does not catch a misspelt variant, which fails to compile. It
+    /// catches a registry entry that stops carrying geometry, such as an
+    /// `icons` upgrade that empties a list.
+    ///
+    /// The check lives here rather than in `icons.rs` because that file glob
+    /// imports `gpui::*`, and a test module there does not compile.
+    #[test]
+    fn rendered_icons_have_svg_data() {
+        for (label, icon) in [
+            ("file image", ::icons::common::IconType::FileImage),
+            ("file", ::icons::common::IconType::File),
+            ("folder", ::icons::common::IconType::Folder),
+            ("git branch", icons::common::IconType::GitBranch),
+            ("terminal", ::icons::common::IconType::Terminal),
+            ("file code", ::icons::common::IconType::FileCode),
+            (
+                "git pull request",
+                ::icons::common::IconType::GitPullRequest,
+            ),
+            ("user", ::icons::common::IconType::User),
+            ("git commit", ::icons::common::IconType::GitCommitHorizontal),
+            // Status bar markers that used to be text-presentation glyphs.
+            ("check", ::icons::common::IconType::Check),
+            ("x", ::icons::common::IconType::X),
+            ("clock", ::icons::common::IconType::Clock),
+            ("skip forward", ::icons::common::IconType::SkipForward),
+            ("loader", ::icons::common::IconType::Loader),
+            ("arrow up", ::icons::common::IconType::ArrowUp),
+            ("arrow down", ::icons::common::IconType::ArrowDown),
+            ("dot", ::icons::common::IconType::Dot),
+            // Menu icons: two identical icons in one list tell the reader
+            // nothing, so each action gets its own.
+            ("clipboard copy", ::icons::common::IconType::ClipboardCopy),
+            ("clipboard paste", ::icons::common::IconType::ClipboardPaste),
+            ("copy plus", ::icons::common::IconType::CopyPlus),
+            ("panel right", ::icons::common::IconType::PanelRight),
+            ("panel bottom", ::icons::common::IconType::PanelBottom),
+            ("panel left", ::icons::common::IconType::PanelLeft),
+            ("panel top", ::icons::common::IconType::PanelTop),
+            ("text search", ::icons::common::IconType::TextSearch),
+            ("folder git", ::icons::common::IconType::FolderGit2),
+            (
+                "layout panel top",
+                ::icons::common::IconType::LayoutPanelTop,
+            ),
+            (
+                "layout panel left",
+                ::icons::common::IconType::LayoutPanelLeft,
+            ),
+        ] {
+            let data = crate::ui::icons::get_icon_svg_bytes(icon);
+            // Not every icon is a path: the commit markers are a circle and two
+            // lines. Check for any drawable element, or the check would reject
+            // valid icons and pass a genuinely empty one.
+            const SHAPES: [&[u8]; 7] = [
+                b"<path",
+                b"<circle",
+                b"<line",
+                b"<rect",
+                b"<polyline",
+                b"<polygon",
+                b"<ellipse",
+            ];
+            let drawable = SHAPES
+                .iter()
+                .any(|tag| data.windows(tag.len()).any(|w| w == *tag));
+            assert!(
+                drawable,
+                "the {label} icon has no drawable shape, so it would render blank"
+            );
+        }
+    }
+
+    /// Two rows with the same icon next to each other say nothing: the reader
+    /// has to read both labels to tell them apart. Icons are the fastest signal
+    /// in a list, so a repeated one is a bug.
+    ///
+    /// The Theme category is excluded. Its rows differ by theme, not by action,
+    /// so they want a swatch of the theme's own colour rather than a distinct
+    /// icon per theme.
+    #[test]
+    fn no_two_palette_commands_in_a_category_share_an_icon() {
+        let cmds = get_all_palette_commands();
+        let mut by_category: std::collections::HashMap<&str, Vec<(&str, String)>> =
+            std::collections::HashMap::new();
+        for cmd in cmds.iter().filter(|c| c.category != "Theme") {
+            by_category
+                .entry(cmd.category)
+                .or_default()
+                .push((cmd.title, format!("{:?}", cmd.icon)));
+        }
+        let mut clashes: Vec<String> = Vec::new();
+        for (category, items) in &by_category {
+            let mut seen: std::collections::HashMap<&str, Vec<&str>> =
+                std::collections::HashMap::new();
+            for (title, icon) in items {
+                seen.entry(icon.as_str()).or_default().push(title);
+            }
+            for (icon, titles) in seen.iter().filter(|(_, t)| t.len() > 1) {
+                clashes.push(format!("{category}: {icon} is used by {titles:?}"));
+            }
+        }
+        assert!(
+            clashes.is_empty(),
+            "duplicate icons: {}",
+            clashes.join("; ")
+        );
+    }
+
+    /// Wrapping up from the first row lands on the last one, so the arrow keys
+    /// can reach every candidate without stopping at an edge.
+    #[test]
+    fn the_mention_selection_wraps_at_both_ends() {
+        let matches = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut selected = 0;
+
+        move_at_menu_selection(&mut selected, &matches, -1);
+        assert_eq!(selected, 2, "up from the top wraps to the bottom");
+        move_at_menu_selection(&mut selected, &matches, 1);
+        assert_eq!(selected, 0, "down from the bottom wraps to the top");
+        move_at_menu_selection(&mut selected, &matches, 1);
+        assert_eq!(selected, 1);
+        move_at_menu_selection(&mut selected, &matches, -1);
+        assert_eq!(selected, 0);
+    }
+
+    /// An empty candidate list has no row to point at. Without this, a stale
+    /// index would survive and Enter would insert a path that is no longer in
+    /// the list.
+    #[test]
+    fn moving_with_no_rows_clears_the_selection() {
+        let matches: Vec<String> = Vec::new();
+        let mut selected = 3;
+        move_at_menu_selection(&mut selected, &matches, 1);
+        assert_eq!(selected, 0);
+        move_at_menu_selection(&mut selected, &matches, -1);
+        assert_eq!(selected, 0);
+    }
+
+    /// Typing filters the candidate list, so the selection has to come back into
+    /// range when the list shrinks under it.
+    /// The renderer draws at most `AI_AT_MENU_MAX_ROWS` rows and the arrow keys
+    /// must not reach past the last one drawn.
+    /// The renderer draws at most `AI_AT_MENU_MAX_ROWS` rows, so no jump can
+    /// leave the selection pointing at a row that is not painted.
+    #[test]
+    fn no_jump_points_past_the_last_drawn_row() {
+        let matches: Vec<String> = (0..40).map(|i| format!("f{i}")).collect();
+        let max = crate::ui::ai_sidebar::AI_AT_MENU_MAX_ROWS;
+        assert_eq!(at_menu_row_count(&matches), max);
+
+        let mut selected = 0;
+        for delta in [1, 5, 19, 20, 21, 100] {
+            move_at_menu_selection(&mut selected, &matches, delta);
+            assert!(
+                selected < max,
+                "a jump of {delta} landed on row {selected}, past the last drawn row"
+            );
+            move_at_menu_selection_clamped(&mut selected, &matches, delta);
+            assert!(
+                selected < max,
+                "a page of {delta} landed on row {selected}, past the last drawn row"
+            );
+        }
+    }
+
+    /// Arrow keys wrap so the whole list stays reachable, but a page jump stops
+    /// at the ends. Wrapping a page jump puts the user at the opposite end.
+    #[test]
+    fn a_page_jump_stops_at_the_ends_while_an_arrow_wraps() {
+        let matches: Vec<String> = (0..40).map(|i| format!("f{i}")).collect();
+        let last = crate::ui::ai_sidebar::AI_AT_MENU_MAX_ROWS - 1;
+
+        let mut selected = last;
+        move_at_menu_selection(&mut selected, &matches, 1);
+        assert_eq!(selected, 0, "down from the last row wraps to the top");
+
+        let mut selected = last;
+        move_at_menu_selection_clamped(&mut selected, &matches, 5);
+        assert_eq!(selected, last, "paging down from the last row stays put");
+
+        let mut selected = 0;
+        move_at_menu_selection_clamped(&mut selected, &matches, -5);
+        assert_eq!(selected, 0, "paging up from the first row stays put");
+    }
+
+    /// A file dropped on the AI composer must attach to the message. Before this
+    /// the composer was a sibling of the terminal area, so the drop bubbled to
+    /// the root container and pasted the path into the shell.
+    #[test]
+    fn a_drop_on_the_ai_composer_attaches_instead_of_pasting() {
+        assert_eq!(
+            file_drop_target_at(true, 900.0, 950.0),
+            FileDropTarget::AiAttach
+        );
+        assert_eq!(
+            file_drop_target_at(true, 900.0, 900.0),
+            FileDropTarget::AiAttach,
+            "the left edge of the composer belongs to the composer"
+        );
+        assert_eq!(
+            file_drop_target_at(true, 900.0, 899.0),
+            FileDropTarget::Terminal,
+            "one pixel left of the composer is the terminal"
+        );
+    }
+
+    /// With the panel closed its width is 0, so the edge is at the right of the
+    /// window. A drop can never attach to a panel that is not there.
+    #[test]
+    fn a_closed_composer_never_takes_the_drop() {
+        assert_eq!(
+            file_drop_target_at(false, 1280.0, 1279.0),
+            FileDropTarget::Terminal
+        );
+        assert_eq!(
+            file_drop_target_at(false, 1280.0, 1279.9),
+            FileDropTarget::Terminal
+        );
+    }
+
+    /// A wide terminal next to the composer: everything left of the split goes
+    /// to the shell.
+    #[test]
+    fn the_terminal_side_of_the_split_pastes() {
+        for x in [0.0, 1.0, 400.0, 899.0] {
+            assert_eq!(
+                file_drop_target_at(true, 900.0, x),
+                FileDropTarget::Terminal
+            );
+        }
+    }
+
+    /// Enter commits the row the arrows pointed at, not always the first one.
+    /// This is the whole point of the keyboard selection: the user arrows down
+    /// three rows and expects the third.
+    #[test]
+    fn enter_commits_the_highlighted_row() {
+        let matches: Vec<String> = (0..5).map(|i| format!("f{i}")).collect();
+        for selected in 0..5 {
+            assert_eq!(at_menu_commit_row(true, &matches, selected), Some(selected));
+        }
+    }
+
+    /// A selection left over from a list that has since shrunk must not pick a
+    /// row that is no longer shown.
+    #[test]
+    fn enter_clamps_a_stale_selection() {
+        let matches = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(at_menu_commit_row(true, &matches, 9), Some(1));
+    }
+
+    /// With the menu closed or empty, Enter is not ours and has to reach the
+    /// shell, which is how sending a message works.
+    #[test]
+    fn enter_falls_through_when_the_menu_has_nothing_to_pick() {
+        let matches = vec!["a".to_string()];
+        assert_eq!(at_menu_commit_row(false, &matches, 0), None);
+        assert_eq!(at_menu_commit_row(true, &[], 0), None);
+    }
+
+    /// An overlay opened from the AI panel has to get the keys first. The
+    /// composer is focused as a plain bool, so clicking the paperclip leaves it
+    /// focused with the picker above it.
+    #[test]
+    fn an_open_overlay_takes_the_keys_from_the_ai_composer() {
+        // Panel focused, picker closed: the composer owns the key.
+        assert!(ai_keys_own_input(true, true, false));
+        // Panel focused, picker open: the picker owns it, or a typed letter goes
+        // into the prompt and Enter sends the prompt.
+        assert!(!ai_keys_own_input(true, true, true));
+        // Panel closed: the shell owns it.
+        assert!(!ai_keys_own_input(false, true, false));
+        // Panel open but not focused: the shell owns it.
+        assert!(!ai_keys_own_input(true, false, false));
+    }
+
+    /// `is_char_boundary` is what stops a 16 KB cap from slicing through an
+    /// accented character and aborting the process on submit.
+    #[test]
+    fn the_inline_cap_never_splits_a_character() {
+        // A 3-byte euro sign straddling the cap, so slicing at exactly the cap
+        // lands in the middle of it.
+        let filler = "a".repeat(AI_ATTACH_INLINE_MAX_BYTES - 1);
+        let content = format!("{filler}\u{20ac}{}", "b".repeat(50));
+        assert!(!content.is_char_boundary(AI_ATTACH_INLINE_MAX_BYTES));
+        let out = truncate_for_prompt(&content);
+        assert!(out.ends_with("... (truncated)"), "{}", &out[out.len()..]);
+        let kept = out.strip_suffix("... (truncated)").unwrap();
+        assert!(content.starts_with(kept));
+        assert!(kept.len() <= AI_ATTACH_INLINE_MAX_BYTES);
+    }
+
+    /// A short file comes through whole, with no truncation marker.
+    #[test]
+    fn a_short_file_is_not_truncated() {
+        let content = "line\n".repeat(10);
+        assert_eq!(truncate_for_prompt(&content), content);
+        assert_eq!(truncate_for_prompt(""), "");
+    }
+
+    /// The mention list, the row count and the renderer have to agree on the
+    /// cap, or the arrows would reach a row that is never painted.
+    #[test]
+    fn the_mention_cap_is_one_value() {
+        assert_eq!(crate::ui::ai_sidebar::AI_AT_MENU_MAX_ROWS, 20);
+        let over: Vec<String> = (0..40).map(|i| format!("f{i}")).collect();
+        assert_eq!(at_menu_row_count(&over), 20);
+        assert_eq!(over.iter().take(20).count(), at_menu_row_count(&over));
+    }
+
     #[test]
     fn test_theme_palette_ids_map_to_theme_names() {
         assert_eq!(theme_name_for_palette_id("theme_default"), Some("default"));
-        assert_eq!(theme_name_for_palette_id("theme_catppuccin"), Some("catppuccin"));
-        assert_eq!(theme_name_for_palette_id("theme_one_dark"), Some("one-dark"));
-        assert_eq!(theme_name_for_palette_id("theme_solarized"), Some("solarized-dark"));
-        assert_eq!(theme_name_for_palette_id("theme_high_contrast"), Some("high-contrast"));
+        assert_eq!(
+            theme_name_for_palette_id("theme_catppuccin"),
+            Some("catppuccin")
+        );
+        assert_eq!(
+            theme_name_for_palette_id("theme_one_dark"),
+            Some("one-dark")
+        );
+        assert_eq!(
+            theme_name_for_palette_id("theme_solarized"),
+            Some("solarized-dark")
+        );
+        assert_eq!(
+            theme_name_for_palette_id("theme_high_contrast"),
+            Some("high-contrast")
+        );
         // Non-theme commands never trigger a preview.
         assert_eq!(theme_name_for_palette_id("new_tab"), None);
         assert_eq!(theme_name_for_palette_id("settings"), None);
@@ -12442,7 +14220,7 @@ mod tests {
         assert!(!is_keyboard_symbol(0x2B58)); // Nerd Font icon
     }
 
-        #[test]
+    #[test]
     fn test_pr_action_mapping_and_commands() {
         assert_eq!(pr_action_count(), 4);
         assert_eq!(pr_action_for_index(0), PrPickerAction::Checkout);
@@ -12463,7 +14241,10 @@ mod tests {
             Some("gh pr merge 12 --merge".to_string())
         );
         assert_eq!(pr_action_command(PrPickerAction::Back, 12), None);
-        assert_eq!(pr_action_label(PrPickerAction::Checkout, 12), "Checkout PR #12");
+        assert_eq!(
+            pr_action_label(PrPickerAction::Checkout, 12),
+            "Checkout PR #12"
+        );
         assert_eq!(pr_action_label(PrPickerAction::Back, 12), "← Back to list");
     }
 
@@ -12489,7 +14270,9 @@ mod tests {
                     number: 9,
                     title: "Theirs".to_string(),
                     url: "https://github.com/o/r/pull/9".to_string(),
-                    author: Some(GhPrAuthor { login: "sam".to_string() }),
+                    author: Some(GhPrAuthor {
+                        login: "sam".to_string(),
+                    }),
                 },
             ],
             review_requested_prs: Vec::new(),
@@ -12505,7 +14288,8 @@ mod tests {
     }
 
     #[test]
-    fn test_palette_preview_kind_covers_theme_font_and_layout() {        assert_eq!(
+    fn test_palette_preview_kind_covers_theme_font_and_layout() {
+        assert_eq!(
             palette_preview_kind("theme_catppuccin"),
             Some(PalettePreviewKind::Theme("catppuccin"))
         );
@@ -12517,7 +14301,10 @@ mod tests {
             palette_preview_kind("zoom_out"),
             Some(PalettePreviewKind::FontDelta(-1.0))
         );
-        assert_eq!(palette_preview_kind("zoom_reset"), Some(PalettePreviewKind::FontReset));
+        assert_eq!(
+            palette_preview_kind("zoom_reset"),
+            Some(PalettePreviewKind::FontReset)
+        );
         assert_eq!(
             palette_preview_kind("layout_horizontal"),
             Some(PalettePreviewKind::Layout(TabLayout::Horizontal))
@@ -12542,17 +14329,32 @@ mod tests {
         let line_h = 18.0;
 
         // Block elements
-        let block_chars = ['█', '▀', '▄', '▌', '▐', '░', '▒', '▓', '▖', '▗', '▘', '▙', '▚', '▛', '▜', '▝', '▞', '▟'];
+        let block_chars = [
+            '█', '▀', '▄', '▌', '▐', '░', '▒', '▓', '▖', '▗', '▘', '▙', '▚', '▛', '▜', '▝', '▞',
+            '▟',
+        ];
         for ch in block_chars {
             let res = render_geometric_cell(ch, cell_w, line_h, fg, bg, theme_bg);
-            assert!(res.is_some(), "Character {:?} (U+{:04X}) must produce a geometric element", ch, ch as u32);
+            assert!(
+                res.is_some(),
+                "Character {:?} (U+{:04X}) must produce a geometric element",
+                ch,
+                ch as u32
+            );
         }
 
         // Box drawing
-        let box_chars = ['─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼', '╭', '╮', '╯', '╰', '═', '║'];
+        let box_chars = [
+            '─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼', '╭', '╮', '╯', '╰', '═', '║',
+        ];
         for ch in box_chars {
             let res = render_geometric_cell(ch, cell_w, line_h, fg, bg, theme_bg);
-            assert!(res.is_some(), "Box character {:?} (U+{:04X}) must produce a geometric element", ch, ch as u32);
+            assert!(
+                res.is_some(),
+                "Box character {:?} (U+{:04X}) must produce a geometric element",
+                ch,
+                ch as u32
+            );
         }
     }
 
@@ -12567,7 +14369,12 @@ mod tests {
         let shape_chars = ['○', '◯', '●', '◦', '◉', '◎', '■', '□', '▪', '▫'];
         for ch in shape_chars {
             let res = render_geometric_cell(ch, 8.0, 17.0, fg, bg, theme_bg);
-            assert!(res.is_some(), "Shape {:?} (U+{:04X}) must produce a geometric element", ch, ch as u32);
+            assert!(
+                res.is_some(),
+                "Shape {:?} (U+{:04X}) must produce a geometric element",
+                ch,
+                ch as u32
+            );
         }
 
         // Wide-cell large circle gets the full two-cell span width
@@ -12636,7 +14443,11 @@ mod tests {
                     continue;
                 }
                 let res = render_geometric_cell(ch, cell_w, line_h, fg, bg, theme_bg);
-                assert!(res.is_some(), "Banner character {:?} must render geometrically", ch);
+                assert!(
+                    res.is_some(),
+                    "Banner character {:?} must render geometrically",
+                    ch
+                );
             }
         }
     }
@@ -12699,22 +14510,20 @@ mod tests {
         assert_eq!(spans[0].end_col, 5);
 
         // Spans with background are preserved even with trailing spaces
-        let mut spans_with_bg = vec![
-            StyledSpan {
-                text: "highlighted   ".to_string(),
-                start_col: 0,
-                end_col: 14,
-                fg: theme.foreground,
-                bg: Some(theme.accent),
-                is_bold: false,
-                is_underline: false,
-                is_emoji: false,
-                is_nerd: false,
-                is_kbd: false,
-                emoji_scale: None,
-                char_cols: (0..14).collect(),
-            },
-        ];
+        let mut spans_with_bg = vec![StyledSpan {
+            text: "highlighted   ".to_string(),
+            start_col: 0,
+            end_col: 14,
+            fg: theme.foreground,
+            bg: Some(theme.accent),
+            is_bold: false,
+            is_underline: false,
+            is_emoji: false,
+            is_nerd: false,
+            is_kbd: false,
+            emoji_scale: None,
+            char_cols: (0..14).collect(),
+        }];
         trim_row_spans(&mut spans_with_bg);
         assert_eq!(spans_with_bg.len(), 1);
         assert_eq!(spans_with_bg[0].text, "highlighted   ");
@@ -12737,5 +14546,540 @@ mod tests {
             assert!(quad_w >= cell_w);
             assert!(line_h > 0.0);
         }
+    }
+}
+
+/// Mission Control grid geometry and navigation.
+///
+/// Its own module because `#[test]` expands recursively, once per test, and one
+/// module holding every test in this file runs past the crate's recursion limit.
+#[cfg(test)]
+mod mission_control_tests {
+    use super::*;
+
+    /// The grid must keep every cell at or above the minimum readable size, so
+    /// a narrow window drops a column instead of shrinking cells.
+    ///
+    /// Width is checked across the whole range because the app allows a window
+    /// down to 640 px. Height is checked at a size that leaves room for the
+    /// minimum cell: below that the grid scrolls by design, which
+    /// `mission_control_layout_fits_window` covers.
+    #[test]
+    fn mission_control_layout_keeps_cells_readable() {
+        for width in [640.0, 900.0, 1280.0, 1920.0, 2560.0, 3440.0] {
+            for items in 1..=12 {
+                let layout = MissionControlLayout::new(width, 800.0, items);
+                assert!(layout.cols >= 1, "cols must be at least 1");
+                assert!(layout.cols <= items, "cols cannot exceed the cell count");
+                assert!(layout.cols <= MC_MAX_COLS);
+                assert!(
+                    layout.cell_w >= MC_MIN_CELL_W,
+                    "cell_w {} below the minimum at width {width} with {items} items",
+                    layout.cell_w
+                );
+                assert!(
+                    layout.cell_h >= 0.0 && layout.cell_h.is_finite(),
+                    "cell_h {} is not usable at width {width} with {items} items",
+                    layout.cell_h
+                );
+                assert!(
+                    layout.grid_w <= width,
+                    "grid_w {} overflows window width {width}",
+                    layout.grid_w
+                );
+                assert!(layout.grid_max_h >= 0.0);
+            }
+        }
+    }
+
+    /// The grid must stay inside the window, otherwise the last row is cut off
+    /// instead of scrolling.
+    #[test]
+    fn mission_control_layout_fits_window() {
+        for (width, height) in [
+            (1920.0, 400.0),
+            (1280.0, 600.0),
+            (900.0, 700.0),
+            (1920.0, 1400.0),
+            (2560.0, 1440.0),
+        ] {
+            for items in 1..=40 {
+                let layout = MissionControlLayout::new(width, height, items);
+                assert!(
+                    layout.grid_w <= width,
+                    "grid_w {} overflows window width {width}",
+                    layout.grid_w
+                );
+                assert!(
+                    layout.grid_max_h <= height,
+                    "grid_max_h {} overflows window height {height}",
+                    layout.grid_max_h
+                );
+                assert!(layout.cell_w > 0.0 && layout.cell_h > 0.0);
+            }
+        }
+    }
+
+    /// The painted cells per row must equal the column count the keyboard
+    /// handler navigates by.
+    ///
+    /// The grid wraps with `flex_wrap`, and the layout engine measures the
+    /// content box, so the box padding comes out of the width the cells get. A
+    /// `grid_w` that omits the padding makes the engine wrap one column early:
+    /// the grid then paints `cols - 1` cells per row while the handler steps by
+    /// `cols`, and every arrow key lands on the wrong cell. This is the check
+    /// that would have caught the original bug.
+    #[test]
+    fn mission_control_painted_columns_match_navigation() {
+        for (width, height) in [
+            (640.0, 420.0),
+            (900.0, 700.0),
+            (1280.0, 600.0),
+            (1280.0, 1400.0),
+            (1920.0, 1080.0),
+            (2560.0, 1440.0),
+            (3440.0, 1440.0),
+        ] {
+            for items in 1..=24 {
+                let layout = MissionControlLayout::new(width, height, items);
+                assert_eq!(
+                    fits_cols_in_row(layout.grid_w, layout.cell_w),
+                    layout.cols,
+                    "at {width}x{height} with {items} items the grid paints a different \
+                     number of cells per row than the arrow keys step over"
+                );
+            }
+        }
+    }
+
+    /// The grid must use the window width it is given, right up to the point
+    /// where the cell width cap takes over. A grid that stops growing early
+    /// leaves a dead band at the edge.
+    ///
+    /// The cap binds at `MC_MAX_COLS` cells of `MC_MAX_CELL_W`. Below that
+    /// width the grid must fill the window exactly; the sweep ends just under
+    /// the threshold so a lowered cap fails here rather than in the app.
+    #[test]
+    fn mission_control_grid_uses_available_width() {
+        let threshold = MC_MAX_COLS as f32 * MC_MAX_CELL_W
+            + (MC_MAX_COLS as f32 - 1.0) * MC_GAP
+            + 2.0 * MC_GRID_PAD
+            + 2.0 * MC_EDGE_MARGIN;
+        for width in [
+            900.0,
+            1280.0,
+            1600.0,
+            1920.0,
+            2560.0,
+            3440.0,
+            threshold - 1.0,
+        ] {
+            let layout = MissionControlLayout::new(width, 900.0, 8);
+            let slack = (width - 2.0 * MC_EDGE_MARGIN) - layout.grid_w;
+            assert!(
+                slack.abs() < 1.0,
+                "grid_w {} leaves {slack} px unused at width {width}",
+                layout.grid_w
+            );
+        }
+    }
+
+    /// Past the cell width cap the grid centres itself rather than stretching a
+    /// cell past a readable width. A fifth column is not an option: it would
+    /// push every cell below `MC_MIN_CELL_W`.
+    #[test]
+    fn mission_control_grid_caps_cell_width() {
+        let threshold = MC_MAX_COLS as f32 * MC_MAX_CELL_W
+            + (MC_MAX_COLS as f32 - 1.0) * MC_GAP
+            + 2.0 * MC_GRID_PAD
+            + 2.0 * MC_EDGE_MARGIN;
+        for width in [threshold, 5000.0, 7680.0] {
+            let layout = MissionControlLayout::new(width, 2160.0, 8);
+            assert_eq!(layout.cols, MC_MAX_COLS);
+            assert!(
+                layout.cell_w <= MC_MAX_CELL_W,
+                "cell_w {} exceeds the cap at width {width}",
+                layout.cell_w
+            );
+        }
+    }
+
+    /// A card must be a little shorter than it is wide, at every window size.
+    /// The preview shows the last screenful of a terminal, which reads fine in a
+    /// landscape box, and a portrait box wastes height.
+    ///
+    /// A window too short for the aspect shrinks the cell instead, because
+    /// fitting the cell matters more than the aspect there.
+    #[test]
+    fn mission_control_cell_is_shorter_than_wide() {
+        for (width, height) in [
+            (640.0, 420.0),
+            (1280.0, 800.0),
+            (1920.0, 1080.0),
+            (2560.0, 1440.0),
+            (3440.0, 1440.0),
+            (1920.0, 2160.0),
+        ] {
+            let layout = MissionControlLayout::new(width, height, 8);
+            let aspect_h = layout.cell_w * MC_CELL_ASPECT;
+            let expected = aspect_h.min(layout.grid_max_h);
+            assert!(
+                (layout.cell_h - expected).abs() < 0.01,
+                "cell_h {} at {width}x{height} is neither the aspect height {aspect_h} \
+                 nor the window limit {}",
+                layout.cell_h,
+                layout.grid_max_h
+            );
+            assert!(
+                layout.cell_h < layout.cell_w,
+                "cell {}x{} is not shorter than wide at {width}x{height}",
+                layout.cell_w,
+                layout.cell_h
+            );
+        }
+    }
+
+    /// The exact geometry at three reference window sizes.
+    ///
+    /// This pins the numbers so a change to the layout constants shows up as a
+    /// failing test rather than a different card. It does not by itself prove
+    /// platform parity: the layout takes no platform input, so a Windows run
+    /// asserts the same values because the same arithmetic runs, not because
+    /// this test compares two platforms.
+    #[test]
+    fn mission_control_geometry_is_identical_on_every_platform() {
+        for (width, height, expected_cols, expected_cell_w, expected_cell_h) in [
+            (1512.0_f32, 982.0_f32, 4_usize, 352.0_f32, 264.0_f32),
+            (1920.0, 1080.0, 4, 454.0, 340.5),
+            (1280.0, 800.0, 4, 294.0, 220.5),
+        ] {
+            let layout = MissionControlLayout::new(width, height, 8);
+            assert_eq!(layout.cols, expected_cols, "cols at {width}x{height}");
+            assert!(
+                (layout.cell_w - expected_cell_w).abs() < 1.0,
+                "cell_w {} differs from the pinned {expected_cell_w} at {width}x{height}",
+                layout.cell_w
+            );
+            assert!(
+                (layout.cell_h - expected_cell_h).abs() < 1.0,
+                "cell_h {} differs from the pinned {expected_cell_h} at {width}x{height}",
+                layout.cell_h
+            );
+        }
+    }
+
+    /// The card must stay big enough to hold the top bar, the status bar, and a
+    /// few preview lines. A short card would show a status bar and no terminal.
+    #[test]
+    fn mission_control_cell_holds_a_usable_preview() {
+        for (width, height) in [
+            (640.0, 420.0),
+            (1280.0, 800.0),
+            (1920.0, 1080.0),
+            (3440.0, 1440.0),
+        ] {
+            let layout = MissionControlLayout::new(width, height, 8);
+            let lines = preview_line_count(layout.cell_h, 200);
+            assert!(
+                lines >= 6,
+                "a {}x{} card at {width}x{height} holds only {lines} preview lines",
+                layout.cell_w,
+                layout.cell_h
+            );
+        }
+    }
+
+    /// A short window flattens the cell, and the grid then scrolls. It must not
+    /// panic, and the cell must still be a usable size.
+    #[test]
+    fn mission_control_survives_a_short_window() {
+        for height in [0.0, 50.0, 134.0, 200.0, 334.0, 420.0] {
+            for width in [640.0, 1920.0] {
+                let layout = MissionControlLayout::new(width, height, 8);
+                assert!(
+                    layout.cell_h >= 0.0 && layout.cell_h.is_finite(),
+                    "cell_h {} is not usable at {width}x{height}",
+                    layout.cell_h
+                );
+                assert!(
+                    layout.cell_w >= MC_MIN_CELL_W,
+                    "cell_w {} fell below the minimum at {width}x{height}",
+                    layout.cell_w
+                );
+                assert!(layout.grid_max_h >= 0.0);
+            }
+        }
+    }
+
+    /// The preview must fill the card. A fixed line count leaves the rest of a
+    /// tall cell as empty background, so the count follows the cell height.
+    ///
+    /// The count is also bounded by the rows the terminal shows, because
+    /// `get_screen_preview` cannot return more. The test uses a tall terminal so
+    /// the cell height is the binding limit, which is the case a fixed count
+    /// used to get wrong.
+    #[test]
+    fn mission_control_preview_fills_the_cell() {
+        let tall_terminal = 200;
+        for (width, height) in [
+            (640.0, 420.0),
+            (1280.0, 800.0),
+            (1920.0, 1080.0),
+            (2560.0, 1440.0),
+            (3440.0, 1440.0),
+        ] {
+            let layout = MissionControlLayout::new(width, height, 8);
+            let lines = preview_line_count(layout.cell_h, tall_terminal);
+            let used = MC_CARD_CHROME_H + MC_PREVIEW_PAD_H + lines as f32 * MC_PREVIEW_LINE_H;
+            let fill = used / layout.cell_h;
+            assert!(
+                fill > 0.85,
+                "preview fills only {fill:.0}% of the {} px cell at {width}x{height} \
+                 ({lines} lines)",
+                layout.cell_h
+            );
+            assert!(
+                used <= layout.cell_h,
+                "{lines} preview lines need {used} px but the cell is {} px",
+                layout.cell_h
+            );
+        }
+    }
+
+    /// A short terminal cannot fill a tall cell, because the preview has one
+    /// line per visible row. The count must reflect that rather than asking for
+    /// rows that will never come.
+    #[test]
+    fn mission_control_preview_respects_the_terminal_row_count() {
+        let cell_h = 1209.0;
+        let full = preview_line_count(cell_h, 200);
+        let short = preview_line_count(cell_h, 24);
+        assert_eq!(
+            short, 24,
+            "a 24 row terminal must not yield more than 24 lines"
+        );
+        assert!(full > short);
+        // Asking for zero rows yields an empty preview rather than a panic.
+        assert_eq!(preview_line_count(cell_h, 0), 0);
+    }
+
+    #[test]
+    fn mission_control_preview_line_count_stays_within_the_cell() {
+        // Below one line height there is nothing to draw, and reporting one
+        // would overflow the card.
+        assert_eq!(preview_line_count(0.0, 100), 0);
+        assert_eq!(preview_line_count(MC_CARD_CHROME_H, 100), 0);
+        assert_eq!(
+            preview_line_count(MC_CARD_CHROME_H + MC_PREVIEW_PAD_H + MC_PREVIEW_LINE_H, 100),
+            1
+        );
+        // A normal cell gets a useful number of lines.
+        assert!(preview_line_count(286.0, 100) >= 10);
+        // The count never exceeds what the cell can hold, whatever the terminal
+        // reports.
+        for height in 200..2000 {
+            for available in [0usize, 1, 24, 100, 200] {
+                let lines = preview_line_count(height as f32, available);
+                let used = MC_CARD_CHROME_H + MC_PREVIEW_PAD_H + lines as f32 * MC_PREVIEW_LINE_H;
+                assert!(
+                    used <= height as f32,
+                    "{lines} lines need {used} px in a {} px cell",
+                    height
+                );
+            }
+        }
+    }
+
+    /// The cells must fit their row with room to spare, at every window width.
+    ///
+    /// An exact fit is not enough: the layout engine sums the cells one at a
+    /// time in `f32`, so a fit with no slack can land an ulp over the budget and
+    /// wrap the last cell onto a second row. That makes the grid paint one cell
+    /// fewer per row than the arrow keys navigate, which is the reported bug.
+    #[test]
+    fn mission_control_cells_fit_with_slack() {
+        for width in 640..=3900 {
+            for items in 1..=8 {
+                let layout = MissionControlLayout::new(width as f32, 900.0, items);
+                assert_eq!(
+                    fits_cols_in_row(layout.grid_w, layout.cell_w),
+                    layout.cols,
+                    "at width {width} with {items} items the cells do not fit \
+                     {} columns of {} px in {} px",
+                    layout.cols,
+                    layout.cell_w,
+                    layout.grid_w
+                );
+            }
+        }
+    }
+
+    /// The widths where the cells fit with no slack, so the grid box has to grow
+    /// past the exact sum. Without the extra width the layout engine sums the
+    /// cells in `f32` and lands an ulp over the budget, which wraps the last
+    /// cell and makes the grid paint fewer columns than the keys navigate.
+    #[test]
+    fn mission_control_gives_the_last_cell_slack() {
+        // Width 1577 with three items is one such case: the exact sum leaves no
+        // room for the floating point error in the layout engine.
+        let exact = {
+            let layout = MissionControlLayout::new(1577.0, 900.0, 3);
+            layout.cell_w * 3.0 + 2.0 * MC_GAP + 2.0 * MC_GRID_PAD
+        };
+        assert_eq!(
+            fits_cols_in_row(exact, exact / 3.0),
+            2,
+            "the exact three column sum must be the failing case this guards"
+        );
+
+        let layout = MissionControlLayout::new(1577.0, 900.0, 3);
+        assert_eq!(layout.cols, 3);
+        assert!(
+            layout.grid_w > exact,
+            "grid_w {} must exceed the exact sum {exact} to leave slack",
+            layout.grid_w
+        );
+    }
+
+    /// A wider window must give the cells more room, which is what makes the
+    /// overlay fill the width on resize.
+    #[test]
+    fn mission_control_layout_grows_with_window() {
+        let narrow = MissionControlLayout::new(900.0, 800.0, 6);
+        let wide = MissionControlLayout::new(1920.0, 800.0, 6);
+        assert!(wide.cell_w > narrow.cell_w);
+        assert!(wide.grid_w > narrow.grid_w);
+    }
+
+    /// The layout must be a pure function of its inputs, so the renderer and the
+    /// keyboard handler cannot disagree about the grid shape.
+    #[test]
+    fn mission_control_layout_is_deterministic() {
+        for (width, height, items) in [(640.0, 420.0, 1), (1600.0, 900.0, 7), (3440.0, 1440.0, 40)]
+        {
+            let a = MissionControlLayout::new(width, height, items);
+            let b = MissionControlLayout::new(width, height, items);
+            assert_eq!(a, b);
+        }
+    }
+
+    /// Right and Left walk the row in order and never teleport. A grid of 7
+    /// tabs over 4 columns: 0 1 2 3 / 4 5 6.
+    #[test]
+    fn mission_control_navigation_walks_row_in_order() {
+        let cols = 4;
+        let selectable = 7;
+
+        let mut idx = 0;
+        for want in [1, 2, 3, 4, 5, 6, 6] {
+            idx = move_grid_selection(idx, GridStep::Right, cols, selectable);
+            assert_eq!(idx, want, "right step landed on the wrong cell");
+        }
+        for want in [5, 4, 3, 2, 1, 0, 0] {
+            idx = move_grid_selection(idx, GridStep::Left, cols, selectable);
+            assert_eq!(idx, want, "left step landed on the wrong cell");
+        }
+    }
+
+    /// Up and Down keep the column, so the highlight stays in the same column.
+    #[test]
+    fn mission_control_navigation_keeps_the_column() {
+        let cols = 4;
+        let selectable = 7;
+
+        assert_eq!(move_grid_selection(0, GridStep::Down, cols, selectable), 4);
+        assert_eq!(move_grid_selection(1, GridStep::Down, cols, selectable), 5);
+        assert_eq!(move_grid_selection(2, GridStep::Down, cols, selectable), 6);
+        assert_eq!(move_grid_selection(4, GridStep::Up, cols, selectable), 0);
+        assert_eq!(move_grid_selection(5, GridStep::Up, cols, selectable), 1);
+        assert_eq!(move_grid_selection(6, GridStep::Up, cols, selectable), 2);
+    }
+
+    /// Up and Down clamp at the first and last row instead of wrapping.
+    #[test]
+    fn mission_control_navigation_clamps_at_row_edges() {
+        // Two full rows: Up on the first row and Down on the last stay put.
+        assert_eq!(move_grid_selection(0, GridStep::Up, 4, 8), 0);
+        assert_eq!(move_grid_selection(4, GridStep::Down, 4, 8), 4);
+        // A single row: neither direction has anywhere to go.
+        assert_eq!(move_grid_selection(2, GridStep::Up, 4, 3), 2);
+        assert_eq!(move_grid_selection(2, GridStep::Down, 4, 3), 2);
+        // A single cell grid.
+        assert_eq!(move_grid_selection(0, GridStep::Down, 4, 1), 0);
+        assert_eq!(move_grid_selection(0, GridStep::Up, 4, 1), 0);
+    }
+
+    /// A short last row must not slide the selection into another column.
+    #[test]
+    fn mission_control_navigation_handles_short_last_row() {
+        // 3 columns, 7 cells: rows are 0 1 2 / 3 4 5 / 6.
+        let cols = 3;
+        let selectable = 7;
+
+        assert_eq!(move_grid_selection(1, GridStep::Down, cols, selectable), 4);
+        assert_eq!(move_grid_selection(2, GridStep::Down, cols, selectable), 5);
+        // Up from the short row keeps the column when the row above has one.
+        assert_eq!(move_grid_selection(6, GridStep::Up, cols, selectable), 3);
+        // Column 1 has no cell in the last row, so the selection stays put
+        // rather than jumping to column 0 or to the end of the grid.
+        assert_eq!(move_grid_selection(4, GridStep::Down, cols, selectable), 4);
+        assert_eq!(move_grid_selection(5, GridStep::Down, cols, selectable), 5);
+    }
+
+    /// An out-of-range selection must not read past the end of the tabs. The
+    /// trailing "New Tab" card uses index == tabs.len(), so a press from it
+    /// lands on the last real tab.
+    #[test]
+    fn mission_control_navigation_clamps_stale_selection() {
+        let selectable = 5;
+        assert_eq!(move_grid_selection(5, GridStep::Left, 3, selectable), 3);
+        assert_eq!(move_grid_selection(99, GridStep::Right, 3, selectable), 4);
+        assert_eq!(move_grid_selection(99, GridStep::Down, 3, selectable), 4);
+    }
+
+    #[test]
+    fn mission_control_navigation_handles_empty_grid() {
+        assert_eq!(move_grid_selection(0, GridStep::Right, 0, 0), 0);
+        assert_eq!(move_grid_selection(0, GridStep::Left, 4, 0), 0);
+        assert_eq!(move_grid_selection(0, GridStep::Down, 4, 0), 0);
+    }
+
+    /// The property that matters: no arrow key can ever move the selection off
+    /// a real tab, for any grid shape the layout can produce.
+    #[test]
+    fn mission_control_navigation_never_escapes_the_grid() {
+        for cols in 1..=6 {
+            for items in 1..=40 {
+                for start in 0..items {
+                    for step in [
+                        GridStep::Left,
+                        GridStep::Right,
+                        GridStep::Up,
+                        GridStep::Down,
+                    ] {
+                        let next = move_grid_selection(start, step, cols, items);
+                        assert!(
+                            next < items,
+                            "step {step:?} from {start} gave {next}, outside 0..{items} \
+                             at cols {cols}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// With one column every cell is its own row, so all four arrows walk the
+    /// list and stop at its ends.
+    #[test]
+    fn mission_control_navigation_single_column() {
+        assert_eq!(move_grid_selection(0, GridStep::Right, 1, 3), 1);
+        assert_eq!(move_grid_selection(0, GridStep::Left, 1, 3), 0);
+        assert_eq!(move_grid_selection(0, GridStep::Down, 1, 3), 1);
+        assert_eq!(move_grid_selection(2, GridStep::Right, 1, 3), 2);
+        assert_eq!(move_grid_selection(2, GridStep::Down, 1, 3), 2);
+        assert_eq!(move_grid_selection(2, GridStep::Up, 1, 3), 1);
+        assert_eq!(move_grid_selection(2, GridStep::Left, 1, 3), 1);
+        assert_eq!(move_grid_selection(0, GridStep::Up, 1, 3), 0);
     }
 }

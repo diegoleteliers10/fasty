@@ -20,14 +20,14 @@ cask "fastty" do
   app "Fastty.app"
   binary "#{appdir}/Fastty.app/Contents/MacOS/fastty"
 
-  # Fastty is ad-hoc signed. The postflight removes quarantine attributes
-  # and refreshes the ad-hoc signature to prevent Gatekeeper damage alerts.
+  # The release bundle already carries its signature. The postflight only
+  # removes the quarantine attribute that triggers the Gatekeeper prompt.
+  # Re-signing here would replace a stable signing identity with an ad-hoc one,
+  # whose content hash changes on every build, and macOS would then ask the user
+  # to accept the app again after every update.
   postflight do
     system_command "/usr/bin/xattr",
                    args: ["-cr", "#{appdir}/Fastty.app"],
-                   sudo: false
-    system_command "/usr/bin/codesign",
-                   args: ["--force", "--deep", "-s", "-", "#{appdir}/Fastty.app"],
                    sudo: false
   end
 

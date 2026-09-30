@@ -194,9 +194,11 @@ if [ "$OS" = "darwin" ]; then
         sudo ln -sf "$INSTALL_DIR/Fastty.app/Contents/MacOS/fastty" "$BIN_DIR/fastty"
     fi
 
-    # Remove macOS quarantine attributes, ensure ad-hoc code signature, and refresh LaunchServices
+    # Remove macOS quarantine attributes and refresh LaunchServices.
+    # Do not re-sign here. An ad-hoc signature embeds the content hash, so
+    # re-signing would replace a stable signing identity with a per-build one and
+    # make macOS ask the user to accept the app again after every update.
     xattr -cr "$INSTALL_DIR/Fastty.app" 2>/dev/null || true
-    codesign --force --deep -s - "$INSTALL_DIR/Fastty.app" 2>/dev/null || true
     /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$INSTALL_DIR/Fastty.app" 2>/dev/null || true
 
     echo "$APP_NAME installed successfully at $INSTALL_DIR/Fastty.app"

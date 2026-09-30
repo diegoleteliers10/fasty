@@ -595,55 +595,6 @@ impl TerminalState {
                         let _ = w.write_all(resp.as_bytes());
                         let _ = w.flush();
                     }
-                    OscCommand::ColorQuery { code } => {
-                        let theme_name = crate::config::ACTIVE_THEME.read().clone();
-                        let theme = crate::ui::theme::Theme::from_name(&theme_name);
-                        let hsla = match code {
-                            10 => theme.foreground,
-                            11 => theme.background,
-                            12 => theme.cursor,
-                            _ => theme.foreground,
-                        };
-                        let rgba: gpui::Rgba = hsla.into();
-                        let r = (rgba.r * 255.0).clamp(0.0, 255.0) as u8;
-                        let g = (rgba.g * 255.0).clamp(0.0, 255.0) as u8;
-                        let b = (rgba.b * 255.0).clamp(0.0, 255.0) as u8;
-                        let resp = format!("\x1b]{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\", code, r, r, g, g, b, b);
-                        let mut w = writer_clone.lock();
-                        let _ = w.write_all(resp.as_bytes());
-                        let _ = w.flush();
-                    }
-                    OscCommand::PaletteQuery { index } => {
-                        let theme_name = crate::config::ACTIVE_THEME.read().clone();
-                        let theme = crate::ui::theme::Theme::from_name(&theme_name);
-                        let hsla = match index {
-                            0 => theme.black,
-                            1 => theme.red,
-                            2 => theme.green,
-                            3 => theme.yellow,
-                            4 => theme.blue,
-                            5 => theme.magenta,
-                            6 => theme.cyan,
-                            7 => theme.white,
-                            8 => theme.bright_black,
-                            9 => theme.bright_red,
-                            10 => theme.bright_green,
-                            11 => theme.bright_yellow,
-                            12 => theme.bright_blue,
-                            13 => theme.bright_magenta,
-                            14 => theme.bright_cyan,
-                            15 => theme.bright_white,
-                            _ => theme.foreground,
-                        };
-                        let rgba: gpui::Rgba = hsla.into();
-                        let r = (rgba.r * 255.0).clamp(0.0, 255.0) as u8;
-                        let g = (rgba.g * 255.0).clamp(0.0, 255.0) as u8;
-                        let b = (rgba.b * 255.0).clamp(0.0, 255.0) as u8;
-                        let resp = format!("\x1b]4;{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}\x1b\\", index, r, r, g, g, b, b);
-                        let mut w = writer_clone.lock();
-                        let _ = w.write_all(resp.as_bytes());
-                        let _ = w.flush();
-                    }
                     OscCommand::NotificationFragment { id, p_type, done, payload } => {
                         if let Some(query_id) = id {
                             let entry = pending_notifications.entry(query_id.clone()).or_insert_with(|| PendingNotification {
@@ -1542,6 +1493,12 @@ impl TerminalState {
         snippets
     }
 
+    /// Rows the terminal shows. A preview cannot have more lines than this, so a
+    /// caller sizing a preview area needs it to know the real upper bound.
+    pub fn screen_line_count(&self) -> usize {
+        self.term.lock().grid().screen_lines()
+    }
+
     pub fn get_screen_preview(&self, max_lines: usize) -> Vec<PreviewLine> {
         use alacritty_terminal::index::{Column, Line};
         use alacritty_terminal::term::cell::Flags;
@@ -2114,12 +2071,17 @@ enum OscCommand {
         done: bool,
         payload: String,
     },
-    ColorQuery { code: u8 },
-    PaletteQuery { index: u8 },
     ResetPalette,
     ResetColor { code: u8 },
 }
 
+/// Decodes the OSC sequences fastty acts on itself.
+///
+/// Color and palette queries (`OSC 4;n;?`, `OSC 10;?`, `OSC 11;?`, `OSC 12;?`)
+/// are deliberately absent. `alacritty_terminal` already answers them through
+/// `Event::ColorRequest`, and a second reply leaves the cursor position report
+/// (`CSI 6 n`) unclaimed in the app's input stream. Go prompt libraries (`gh`,
+/// `survey`) then print the report as literal text and abort the prompt.
 fn parse_osc(
     buf: &[u8],
     cmd_start_time: &mut Option<std::time::Instant>,
@@ -2135,22 +2097,6 @@ fn parse_osc(
             } else {
                 None
             }
-        }
-        b"4" => {
-            let s = std::str::from_utf8(payload).ok()?;
-            let parts: Vec<&str> = s.split(';').collect();
-            if parts.len() >= 2 {
-                if let Ok(index) = parts[0].parse::<u8>() {
-                    if parts[1] == "?" {
-                        return Some(OscCommand::PaletteQuery { index });
-                    }
-                } else if parts[0] == "?" {
-                    if let Ok(index) = parts[1].parse::<u8>() {
-                        return Some(OscCommand::PaletteQuery { index });
-                    }
-                }
-            }
-            None
         }
         b"6" | b"7" | b"176" => {
             if let Ok(s) = std::str::from_utf8(payload) {
@@ -2176,19 +2122,6 @@ fn parse_osc(
                     title: title.to_string(),
                     body: body.to_string(),
                 })
-            } else {
-                None
-            }
-        }
-        b"10" | b"11" | b"12" => {
-            let code_num = match code {
-                b"10" => 10,
-                b"11" => 11,
-                b"12" => 12,
-                _ => 10,
-            };
-            if payload.starts_with(b"?") || payload == b"?" {
-                Some(OscCommand::ColorQuery { code: code_num })
             } else {
                 None
             }
@@ -2425,8 +2358,6 @@ fn dispatch_osc_action(
         }
         OscCommand::NotificationQuery { .. }
         | OscCommand::NotificationFragment { .. }
-        | OscCommand::ColorQuery { .. }
-        | OscCommand::PaletteQuery { .. }
         | OscCommand::ResetPalette
         | OscCommand::ResetColor { .. } => {}
     }
@@ -2748,16 +2679,166 @@ mod tests {
         let cmd = parse_osc(b"633;P;Cwd=/opt/app", &mut cmd_start).unwrap();
         assert!(matches!(cmd, super::OscCommand::Cwd(p) if p == "/opt/app"));
 
-        // OSC 10/11/12 - Color Query
-        let cmd = parse_osc(b"10;?", &mut cmd_start).unwrap();
-        assert!(matches!(cmd, super::OscCommand::ColorQuery { code: 10 }));
+        // OSC 10/11/12 (color) and OSC 4 (palette) queries are answered by
+        // alacritty_terminal through `Event::ColorRequest`. fastty's own
+        // scanner must stay silent for them: a second reply leaves the cursor
+        // position report in the app's input stream, and Go prompt libraries
+        // (`gh`, `survey`) then print it and abort the prompt.
+        assert!(parse_osc(b"10;?", &mut cmd_start).is_none());
+        assert!(parse_osc(b"11;?", &mut cmd_start).is_none());
+        assert!(parse_osc(b"12;?", &mut cmd_start).is_none());
+        assert!(parse_osc(b"4;2;?", &mut cmd_start).is_none());
+        assert!(parse_osc(b"4;?;2", &mut cmd_start).is_none());
+    }
 
-        let cmd = parse_osc(b"11;?", &mut cmd_start).unwrap();
-        assert!(matches!(cmd, super::OscCommand::ColorQuery { code: 11 }));
+    /// A color query must produce exactly one reply.
+    ///
+    /// `gh auth login` and other Go prompt libraries send `OSC 11;?` followed by
+    /// `CSI 6 n`, then read both replies. Two replies to the color query leave
+    /// the cursor position report in the input stream: the prompt echoes it as
+    /// literal text and aborts with "unexpected escape sequence from terminal".
+    #[test]
+    fn color_query_gets_exactly_one_reply() {
+        use alacritty_terminal::term::test::TermSize;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::Processor;
+        use parking_lot::Mutex;
+        use std::io::Write;
+        use std::sync::Arc;
 
-        // OSC 4 - Palette Query
-        let cmd = parse_osc(b"4;2;?", &mut cmd_start).unwrap();
-        assert!(matches!(cmd, super::OscCommand::PaletteQuery { index: 2 }));
+        /// Collects every byte written back to the PTY.
+        #[derive(Clone, Default)]
+        struct CapturedPty(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for CapturedPty {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // The reversed palette form (`OSC 4;?;n`) is not answered by
+        // alacritty_terminal, so it only has to stay silent on fastty's side.
+        assert!(parse_osc(b"4;?;2", &mut None).is_none());
+
+        for (name, query) in [
+            ("OSC 10 BEL", &b"\x1b]10;?\x07"[..]),
+            ("OSC 10 ST", &b"\x1b]10;?\x1b\\"[..]),
+            ("OSC 11 BEL", &b"\x1b]11;?\x07"[..]),
+            ("OSC 11 ST", &b"\x1b]11;?\x1b\\"[..]),
+            ("OSC 12 BEL", &b"\x1b]12;?\x07"[..]),
+            ("OSC 12 ST", &b"\x1b]12;?\x1b\\"[..]),
+            // The palette query and the multi-index form a colour-reporting
+            // reader sends. The multi-index form is the one most likely to
+            // desynchronise a prompt's reply reader.
+            ("OSC 4 n;? BEL", &b"\x1b]4;2;?\x07"[..]),
+            ("OSC 4 n;? ST", &b"\x1b]4;2;?\x1b\\"[..]),
+            ("OSC 4 multi", &b"\x1b]4;1;?;2;?;3;?\x1b\\"[..]),
+        ] {
+            // fastty's own scanner must not claim these codes. This is the
+            // assertion that guards the fix: alacritty_terminal is the single
+            // answerer, so any second reply path has to start here.
+            let body = query
+                .strip_prefix(b"\x1b]")
+                .and_then(|rest| {
+                    rest.strip_suffix(b"\x07").or_else(|| rest.strip_suffix(b"\x1b\\"))
+                })
+                .unwrap_or(query);
+            assert!(
+                parse_osc(body, &mut None).is_none(),
+                "fastty's OSC scanner must not answer {name}"
+            );
+
+            // alacritty_terminal answers through the event listener. One reply
+            // per queried colour: a multi-index query reports each index once.
+            let captured = CapturedPty::default();
+            let writer: Box<dyn Write + Send> = Box::new(captured.clone());
+            let proxy = EventListenerProxy::from_arc(Arc::new(Mutex::new(writer)));
+            let size = TermSize::new(80, 24);
+            let mut term = Term::new(Config::default(), &size, proxy);
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut term, query);
+
+            let written = captured.0.lock().clone();
+            // Split into replies. A reply ends at BEL or at the ESC of an
+            // ST terminator, so an ST-terminated reply keeps a trailing ESC
+            // and must be trimmed before the text is checked.
+            let replies: Vec<String> = written
+                .split(|b| *b == 0x07)
+                .flat_map(|bell_terminated| {
+                    bell_terminated
+                        .split(|b| *b == b'\\')
+                        .map(|st_terminated| String::from_utf8_lossy(st_terminated).to_string())
+                })
+                .filter(|chunk| chunk.starts_with("\x1b]"))
+                .collect();
+
+            // One reply per queried colour: the multi-index `OSC 4` form asks
+            // for several, and each needs its own answer.
+            let expected = if name.starts_with("OSC 4") {
+                String::from_utf8_lossy(body)
+                    .split(';')
+                    .filter(|part| *part == "?")
+                    .count()
+            } else {
+                1
+            };
+            assert_eq!(
+                replies.len(),
+                expected,
+                "{name} produced {} replies, expected {expected}: {written:?}",
+                replies.len()
+            );
+
+            // Each reply must be a well-formed colour response, not just any
+            // `OSC` write: the program parses it before it trusts the value.
+            let query_code = String::from_utf8_lossy(body)
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            for reply in &replies {
+                let trimmed = reply.trim_end_matches('\x1b');
+                let expected_prefix = format!("\x1b]{query_code};");
+                assert!(
+                    trimmed.starts_with(&expected_prefix),
+                    "{name} reply {trimmed:?} does not answer code {query_code}"
+                );
+                // `OSC 4` carries its index between the code and the colour, as
+                // in `\x1b]4;2;rgb:...`. `OSC 10|11|12` does not.
+                let value = if query_code == "4" {
+                    trimmed
+                        .splitn(3, ';')
+                        .nth(2)
+                        .unwrap_or_default()
+                } else {
+                    trimmed
+                        .split_once(';')
+                        .map(|(_, rest)| rest)
+                        .unwrap_or_default()
+                };
+                assert!(
+                    value.starts_with("rgb:"),
+                    "{name} reply {trimmed:?} is not in rgb form"
+                );
+                let components: Vec<&str> = value["rgb:".len()..].split('/').collect();
+                assert_eq!(
+                    components.len(),
+                    3,
+                    "{name} reply {trimmed:?} needs three colour components"
+                );
+                for component in components {
+                    assert!(
+                        component.len() == 4
+                            && component.chars().all(|c| c.is_ascii_hexdigit()),
+                        "{name} reply {trimmed:?} has a malformed component {component:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

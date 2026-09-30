@@ -740,6 +740,12 @@ pub fn is_action_customized(
     })
 }
 
+/// The label for the main key of a combo, on this platform.
+///
+/// macOS draws arrows, Enter and Escape as glyphs, because that is how its own
+/// keycaps are labelled. Windows and Linux draw them as words, because `Enter`
+/// and `Esc` are how their keycaps are labelled. A reader of either platform
+/// recognises its own form.
 fn format_key(key: &NamedKey) -> String {
     if cfg!(target_os = "macos") {
         match key {
@@ -762,6 +768,15 @@ fn format_key(key: &NamedKey) -> String {
     } else {
         match key {
             NamedKey::Char(c) => c.to_uppercase().to_string(),
+            NamedKey::Up => "Up".to_string(),
+            NamedKey::Down => "Down".to_string(),
+            NamedKey::Left => "Left".to_string(),
+            NamedKey::Right => "Right".to_string(),
+            NamedKey::Return => "Enter".to_string(),
+            NamedKey::Tab => "Tab".to_string(),
+            NamedKey::Escape => "Esc".to_string(),
+            NamedKey::Backspace => "Backspace".to_string(),
+            NamedKey::Delete => "Delete".to_string(),
             NamedKey::Space => "Space".to_string(),
             NamedKey::Plus => "+".to_string(),
             NamedKey::Minus => "-".to_string(),
@@ -771,41 +786,51 @@ fn format_key(key: &NamedKey) -> String {
     }
 }
 
+/// The label for one modifier, on this platform.
+///
+/// macOS uses the modifier glyphs from its own keyboard. Windows and Linux use
+/// words, because `Ctrl` is how those keyboards are labelled and the control
+/// glyph is Mac typography.
+fn format_modifier(combo: &KeyCombo) -> Vec<String> {
+    let macos = cfg!(target_os = "macos");
+    let mut labels = Vec::new();
+    if combo.ctrl {
+        labels.push(if macos { "⌃" } else { "Ctrl" }.to_string());
+    }
+    if combo.alt {
+        labels.push(if macos { "⌥" } else { "Alt" }.to_string());
+    }
+    if combo.shift {
+        labels.push(if macos { "⇧" } else { "Shift" }.to_string());
+    }
+    if combo.logo {
+        labels.push(if macos { "⌘" } else { "Super" }.to_string());
+    }
+    labels
+}
+
+/// One label per key of the combo, in press order.
+///
+/// The settings screen draws a keycap per entry, so a shortcut reads the way
+/// the user presses it. `format_combo` is the same list joined for the places
+/// that need one string.
+pub fn combo_keycaps(combo: &KeyCombo) -> Vec<String> {
+    let mut labels = format_modifier(combo);
+    labels.push(format_key(&combo.key));
+    labels
+}
+
 /// OS-aware combo label: `⌘⇧D` on macOS, `Ctrl+Shift+D` elsewhere.
 /// `super` shows as `⌘` / `Super`.
+///
+/// This is the same key list as [`combo_keycaps`], joined. The settings screen
+/// uses the keycaps; the command palette and conflict messages use this.
 pub fn format_combo(combo: &KeyCombo) -> String {
+    let keycaps = combo_keycaps(combo);
     if cfg!(target_os = "macos") {
-        let mut s = String::new();
-        if combo.ctrl {
-            s.push('⌃');
-        }
-        if combo.alt {
-            s.push('⌥');
-        }
-        if combo.shift {
-            s.push('⇧');
-        }
-        if combo.logo {
-            s.push('⌘');
-        }
-        s.push_str(&format_key(&combo.key));
-        s
+        keycaps.concat()
     } else {
-        let mut parts = Vec::new();
-        if combo.ctrl {
-            parts.push("Ctrl".to_string());
-        }
-        if combo.shift {
-            parts.push("Shift".to_string());
-        }
-        if combo.alt {
-            parts.push("Alt".to_string());
-        }
-        if combo.logo {
-            parts.push("Super".to_string());
-        }
-        parts.push(format_key(&combo.key));
-        parts.join("+")
+        keycaps.join("+")
     }
 }
 
@@ -872,6 +897,96 @@ pub fn combo_from_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact keycaps for a set of combos on this platform.
+    ///
+    /// Golden values, not a relation between two functions: a relation would
+    /// pass even if both drifted together. macOS draws modifier glyphs, Windows
+    /// and Linux draw words.
+    #[test]
+    fn test_combo_keycaps_are_the_expected_labels() {
+        let macos = cfg!(target_os = "macos");
+        let cases: &[(&KeyCombo, &[&str])] = &[
+            (
+                &KeyCombo { ctrl: false, shift: false, alt: false, logo: false, key: NamedKey::Char('j') },
+                &["J"],
+            ),
+            (
+                &KeyCombo { ctrl: true, shift: false, alt: false, logo: false, key: NamedKey::Char('k') },
+                if macos { &["⌃", "K"] } else { &["Ctrl", "K"] },
+            ),
+            (
+                &KeyCombo { ctrl: true, shift: true, alt: false, logo: true, key: NamedKey::Char('d') },
+                if macos { &["⌃", "⇧", "⌘", "D"] } else { &["Ctrl", "Shift", "Super", "D"] },
+            ),
+            (
+                &KeyCombo { ctrl: false, shift: false, alt: false, logo: false, key: NamedKey::Return },
+                if macos { &["↵"] } else { &["Enter"] },
+            ),
+            (
+                &KeyCombo { ctrl: true, shift: false, alt: false, logo: false, key: NamedKey::Escape },
+                if macos { &["⌃", "⎋"] } else { &["Ctrl", "Esc"] },
+            ),
+        ];
+        for (combo, expected) in cases {
+            assert_eq!(combo_keycaps(combo), *expected, "combo {combo}");
+        }
+    }
+
+    /// The joined string the command palette and the conflict message use must
+    /// match the keycaps the settings screen draws.
+    #[test]
+    fn test_format_combo_is_the_keycaps_joined() {
+        let combo = KeyCombo {
+            ctrl: true,
+            shift: true,
+            alt: false,
+            logo: true,
+            key: NamedKey::Char('d'),
+        };
+        let keycaps = combo_keycaps(&combo);
+        let expected = if cfg!(target_os = "macos") {
+            "⌃⇧⌘D"
+        } else {
+            "Ctrl+Shift+Super+D"
+        };
+        assert_eq!(format_combo(&combo), expected);
+        if cfg!(target_os = "macos") {
+            assert_eq!(expected, keycaps.concat());
+        } else {
+            assert_eq!(expected, keycaps.join("+"));
+        }
+    }
+
+    /// The main key is always the last cap, and the modifiers come before it, so
+    /// the caps read in press order.
+    #[test]
+    fn test_combo_keycaps_are_in_press_order() {
+        let combo = KeyCombo {
+            ctrl: true,
+            shift: true,
+            alt: true,
+            logo: true,
+            key: NamedKey::Char('x'),
+        };
+        let keycaps = combo_keycaps(&combo);
+        assert_eq!(keycaps.len(), 5);
+        assert_eq!(keycaps.last().map(String::as_str), Some("X"));
+    }
+
+    /// A bare key produces one cap, so a shortcut with no modifier still renders
+    /// a keycap rather than an empty control.
+    #[test]
+    fn test_bare_key_is_one_keycap() {
+        let combo = KeyCombo {
+            ctrl: false,
+            shift: false,
+            alt: false,
+            logo: false,
+            key: NamedKey::Char('j'),
+        };
+        assert_eq!(combo_keycaps(&combo), vec!["J".to_string()]);
+    }
 
     #[test]
     fn test_binding_id_roundtrip() {

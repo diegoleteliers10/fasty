@@ -1611,6 +1611,11 @@ fn render_card_row(
         .child(
             div()
                 .flex_shrink_0()
+                // Let a control that is wider than the row wrap inside itself
+                // rather than overflow the card. A row of keycaps with long
+                // modifier names is the case that reaches this.
+                .max_w_full()
+                .min_w_0()
                 .child(control),
         )
 }
@@ -3228,7 +3233,9 @@ impl SettingsView {
                 let is_last = row_idx == actions.len() - 1
                     && conflict.is_none_or(|c| c.target != *action);
 
-                let mut badges = div().flex().flex_row().items_center().gap_2();
+                // Wrap, so a second combo and the reset and unbind buttons move
+                // to a second line instead of running off the card.
+                let mut badges = div().flex().flex_row().flex_wrap().items_center().gap_2();
                 if combos.is_empty() {
                     let act = *action;
                     badges = badges.child(
@@ -3255,38 +3262,24 @@ impl SettingsView {
                 } else {
                     for (i, combo) in combos.iter().enumerate() {
                         let act = *action;
-                        let label = if is_capturing && i == 0 {
-                            SharedString::from("Press keys…")
-                        } else {
-                            SharedString::from(crate::keybindings::format_combo(combo))
-                        };
+                        let is_recording = is_capturing && i == 0;
+                        let keycaps = crate::keybindings::combo_keycaps(combo);
                         badges = badges.child(
                             div()
                                 .id(SharedString::from(format!(
                                     "kb-badge-{}-{i}",
                                     action.binding_id()
                                 )))
-                                .px(px(7.))
-                                .py(px(3.))
-                                .rounded(px(5.))
-                                .bg(if is_capturing && i == 0 {
-                                    theme.accent
-                                } else {
-                                    theme.surface_raised
-                                })
+                                .px(px(5.))
+                                .py(px(4.))
+                                .rounded(px(6.))
+                                .bg(theme.surface)
                                 .border_1()
-                                .border_color(if is_capturing && i == 0 {
-                                    theme.accent
-                                } else {
-                                    theme.border
-                                })
-                                .text_size(px(11.))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(if is_capturing && i == 0 {
-                                    theme.background
-                                } else {
-                                    theme.foreground
-                                })
+                                .border_color(if is_recording { theme.accent } else { theme.border })
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
                                 .cursor(CursorStyle::PointingHand)
                                 .hover(|s| s.bg(theme.surface_raised))
                                 .on_mouse_down(
@@ -3295,7 +3288,46 @@ impl SettingsView {
                                         this.start_binding_capture(act, cx);
                                     }),
                                 )
-                                .child(label),
+                                .when(is_recording, |el| {
+                                    el.child(
+                                        div()
+                                            .h(px(18.))
+                                            .px(px(5.))
+                                            .rounded(px(4.))
+                                            .bg(theme.accent)
+                                            .flex()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(theme.background)
+                                                    .child("Press keys…"),
+                                            ),
+                                    )
+                                })
+                                .when(!is_recording, |el| {
+                                    // One keycap per key, in press order, so the
+                                    // shortcut reads the way it is typed.
+                                    el.children(keycaps.into_iter().map(|cap| {
+                                        div()
+                                            .h(px(18.))
+                                            .min_w(px(18.))
+                                            .px(px(5.))
+                                            .rounded(px(4.))
+                                            .bg(theme.surface_raised)
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(theme.foreground)
+                                                    .child(cap),
+                                            )
+                                    }))
+                                }),
                         );
                     }
                 }

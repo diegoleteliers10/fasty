@@ -4,8 +4,8 @@ pub mod aws;
 pub mod command;
 pub mod git;
 pub mod git_actions;
-pub mod git_sync;
 pub mod git_prs;
+pub mod git_sync;
 pub mod kube;
 pub mod time;
 
@@ -20,10 +20,12 @@ pub fn build(spec: &WidgetSpec) -> Option<Box<dyn Widget>> {
             align.unwrap_or(crate::config::AlignSpec::Left).into(),
             *interval_ms,
         )),
-        WidgetSpec::GitActions { align, interval_ms } => Box::new(git_actions::GitActionsWidget::new(
-            align.unwrap_or(crate::config::AlignSpec::Left).into(),
-            *interval_ms,
-        )),
+        WidgetSpec::GitActions { align, interval_ms } => {
+            Box::new(git_actions::GitActionsWidget::new(
+                align.unwrap_or(crate::config::AlignSpec::Left).into(),
+                *interval_ms,
+            ))
+        }
         WidgetSpec::GitSync { align, interval_ms } => Box::new(git_sync::GitSyncWidget::new(
             align.unwrap_or(crate::config::AlignSpec::Left).into(),
             *interval_ms,
@@ -32,7 +34,12 @@ pub fn build(spec: &WidgetSpec) -> Option<Box<dyn Widget>> {
             align.unwrap_or(crate::config::AlignSpec::Left).into(),
             *interval_ms,
         )),
-        WidgetSpec::Time { format, align, interval_ms, timezone } => Box::new(time::TimeWidget::new(
+        WidgetSpec::Time {
+            format,
+            align,
+            interval_ms,
+            timezone,
+        } => Box::new(time::TimeWidget::new(
             format.clone().unwrap_or_else(|| "%H:%M:%S".to_string()),
             align.unwrap_or(crate::config::AlignSpec::Right).into(),
             *interval_ms,
@@ -46,14 +53,18 @@ pub fn build(spec: &WidgetSpec) -> Option<Box<dyn Widget>> {
             align.unwrap_or(crate::config::AlignSpec::Left).into(),
             *interval_ms,
         )),
-        WidgetSpec::Command { name, command, on_click, align, interval_ms } => {
-            Box::new(command::CommandWidget::new(
-                name.clone(),
-                command.clone(),
-                on_click.clone(),
-                align.unwrap_or(crate::config::AlignSpec::Left).into(),
-                *interval_ms,
-            ))
-        }
+        WidgetSpec::Command {
+            name,
+            command,
+            on_click,
+            align,
+            interval_ms,
+        } => Box::new(command::CommandWidget::new(
+            name.clone(),
+            command.clone(),
+            on_click.clone(),
+            align.unwrap_or(crate::config::AlignSpec::Left).into(),
+            *interval_ms,
+        )),
     })
 }

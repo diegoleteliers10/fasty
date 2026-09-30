@@ -1,12 +1,12 @@
 //! Generic command widget. Runs a user-configured shell command, shows stdout
 //! in the bar. Click action configurable: `copy`, `run`, `open`.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::widgets::proc_util::{run_with_timeout, FailureBackoff, USER_CMD_TIMEOUT};
 use crate::widgets::{Align, ClickAction, Segment, Widget, WidgetContext};
-use crate::widgets::proc_util::{FailureBackoff, USER_CMD_TIMEOUT, run_with_timeout};
 
 const DEFAULT_INTERVAL_MS: u64 = 5_000;
 const MAX_OUTPUT_BYTES: usize = 4096;
@@ -54,16 +54,24 @@ impl CommandWidget {
 }
 
 impl Widget for CommandWidget {
-    fn id(&self) -> &'static str { "command" }
-    fn align(&self) -> Align { self.align }
+    fn id(&self) -> &'static str {
+        "command"
+    }
+    fn align(&self) -> Align {
+        self.align
+    }
     fn poll_interval(&self) -> Duration {
         self.backoff
             .lock()
             .map(|b| b.effective_interval(self.interval))
             .unwrap_or(self.interval)
     }
-    fn last_poll(&self) -> Instant { self.last_poll }
-    fn set_last_poll(&mut self, t: Instant) { self.last_poll = t; }
+    fn last_poll(&self) -> Instant {
+        self.last_poll
+    }
+    fn set_last_poll(&mut self, t: Instant) {
+        self.last_poll = t;
+    }
 
     fn poll(&mut self, ctx: &WidgetContext) {
         if !ctx.window_focused {
@@ -88,7 +96,9 @@ impl Widget for CommandWidget {
             let next = match run_with_timeout(&mut cmd, USER_CMD_TIMEOUT) {
                 Some(out) if out.status.success() => {
                     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
-                    if s.ends_with('\n') { s.pop(); }
+                    if s.ends_with('\n') {
+                        s.pop();
+                    }
                     if s.len() > MAX_OUTPUT_BYTES {
                         s.truncate(MAX_OUTPUT_BYTES - 1);
                         s.push('\u{2026}');
@@ -115,16 +125,18 @@ impl Widget for CommandWidget {
     fn render(&mut self, _ctx: &WidgetContext) -> Vec<Segment> {
         let guard = self.state.lock().unwrap();
         match &*guard {
-            CommandState::Ok(s) => vec![Segment {
-                text: format!(" {}: {} ", self.name, s),
-                color: [0.80, 0.80, 0.85, 1.0],
-                tooltip: Some(self.command.clone()),
-            }],
-            CommandState::Error(e) => vec![Segment {
-                text: format!(" {}:err ", self.name),
-                color: [0.90, 0.55, 0.45, 1.0],
-                tooltip: Some(e.clone()),
-            }],
+            CommandState::Ok(s) => {
+                vec![
+                    Segment::text(format!(" {}: {} ", self.name, s), [0.80, 0.80, 0.85, 1.0])
+                        .with_tooltip(self.command.clone()),
+                ]
+            }
+            CommandState::Error(e) => {
+                vec![
+                    Segment::text(format!(" {}:err ", self.name), [0.90, 0.55, 0.45, 1.0])
+                        .with_tooltip(e.clone()),
+                ]
+            }
             CommandState::Unknown => Vec::new(),
         }
     }

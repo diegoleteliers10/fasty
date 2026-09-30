@@ -166,4 +166,3 @@ pub fn render_paperclip_icon(color: Hsla, size_px: f32) -> impl IntoElement {
         .h(px(size_px))
         .flex_shrink_0()
 }
-

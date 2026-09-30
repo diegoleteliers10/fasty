@@ -1,13 +1,13 @@
 //! AWS profile widget. Shells out to `aws sts get-caller-identity`.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::widgets::{Align, ClickAction, Segment, Widget, WidgetContext};
 use crate::widgets::proc_util::{
-    FailureBackoff, NETWORK_PROC_TIMEOUT, binary_on_path, run_with_timeout,
+    binary_on_path, run_with_timeout, FailureBackoff, NETWORK_PROC_TIMEOUT,
 };
+use crate::widgets::{Align, ClickAction, Segment, Widget, WidgetContext};
 
 const DEFAULT_INTERVAL_MS: u64 = 300_000;
 
@@ -24,7 +24,10 @@ pub struct AwsWidget {
 enum AwsState {
     #[default]
     Unknown,
-    Ok { profile: Option<String>, identity: String },
+    Ok {
+        profile: Option<String>,
+        identity: String,
+    },
     NoAws,
     Error(String),
 }
@@ -43,16 +46,24 @@ impl AwsWidget {
 }
 
 impl Widget for AwsWidget {
-    fn id(&self) -> &'static str { "aws" }
-    fn align(&self) -> Align { self.align }
+    fn id(&self) -> &'static str {
+        "aws"
+    }
+    fn align(&self) -> Align {
+        self.align
+    }
     fn poll_interval(&self) -> Duration {
         self.backoff
             .lock()
             .map(|b| b.effective_interval(self.interval))
             .unwrap_or(self.interval)
     }
-    fn last_poll(&self) -> Instant { self.last_poll }
-    fn set_last_poll(&mut self, t: Instant) { self.last_poll = t; }
+    fn last_poll(&self) -> Instant {
+        self.last_poll
+    }
+    fn set_last_poll(&mut self, t: Instant) {
+        self.last_poll = t;
+    }
 
     fn poll(&mut self, ctx: &WidgetContext) {
         if !ctx.window_focused {
@@ -68,7 +79,14 @@ impl Widget for AwsWidget {
         let backoff_clone = self.backoff.clone();
         std::thread::spawn(move || {
             let mut cmd = std::process::Command::new("aws");
-            cmd.args(["sts", "get-caller-identity", "--query", "Arn", "--output", "text"]);
+            cmd.args([
+                "sts",
+                "get-caller-identity",
+                "--query",
+                "Arn",
+                "--output",
+                "text",
+            ]);
             #[cfg(target_os = "windows")]
             {
                 use std::os::windows::process::CommandExt;
@@ -80,7 +98,10 @@ impl Widget for AwsWidget {
                     if id.is_empty() {
                         AwsState::Unknown
                     } else {
-                        AwsState::Ok { profile, identity: id }
+                        AwsState::Ok {
+                            profile,
+                            identity: id,
+                        }
                     }
                 }
                 Some(_) => AwsState::Unknown,
@@ -108,28 +129,21 @@ impl Widget for AwsWidget {
                     Some(p) => format!("aws:{} ", p),
                     None => "aws:default ".to_string(),
                 };
-                vec![Segment {
-                    text: format!(" {} ", label),
-                    color: [0.95, 0.65, 0.30, 1.0],
-                    tooltip: Some(identity.clone()),
-                }]
+                vec![
+                    Segment::text(format!(" {} ", label), [0.95, 0.65, 0.30, 1.0])
+                        .with_tooltip(identity.clone()),
+                ]
             }
             AwsState::Unknown => Vec::new(),
             // UX2: subtle one-glance hint instead of silence; the tooltip
             // carries the explanation.
-            AwsState::NoAws => vec![Segment {
-                text: " aws: – ".to_string(),
-                color: [0.55, 0.55, 0.62, 1.0],
-                tooltip: Some(
+            AwsState::NoAws => vec![Segment::text(" aws: – ", [0.55, 0.55, 0.62, 1.0])
+                .with_tooltip(
                     "AWS CLI not found on PATH — install it to show caller identity here."
                         .to_string(),
-                ),
-            }],
-            AwsState::Error(e) => vec![Segment {
-                text: " aws:err ".to_string(),
-                color: [0.90, 0.55, 0.45, 1.0],
-                tooltip: Some(format!("aws error: {}", e)),
-            }],
+                )],
+            AwsState::Error(e) => vec![Segment::text(" aws:err ", [0.90, 0.55, 0.45, 1.0])
+                .with_tooltip(format!("aws error: {}", e))],
         }
     }
 
