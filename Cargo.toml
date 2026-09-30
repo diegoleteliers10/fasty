@@ -54,7 +54,7 @@ ureq = { version = "2.12", features = ["json", "proxy-from-env"] }
 schemars = { version = "0.8", features = ["derive"] }
 base64 = "0.22"
 semver = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 
