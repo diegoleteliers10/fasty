@@ -98,6 +98,98 @@ pub fn list_session_ids() -> Vec<PaneId> {
     registry().lock().keys().copied().collect()
 }
 
+/// A request from the daemon to the in-process GUI. `OpenSession` is
+/// fire-and-forget; the pane-control requests carry a reply channel so the
+/// daemon's client can get the result (new pane id, layout snapshot, ...).
+pub enum GuiRequest {
+    OpenSession {
+        id: PaneId,
+        terminal: Arc<TerminalState>,
+    },
+    SplitPane {
+        target: PaneId,
+        direction: crate::pane_tree::Direction,
+        command: Option<String>,
+        args: Vec<String>,
+        cwd: Option<String>,
+        reply: std::sync::mpsc::Sender<Result<PaneId, String>>,
+    },
+    ResizePane {
+        target: PaneId,
+        direction: crate::pane_tree::Direction,
+        delta: f32,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    FocusPane {
+        target: PaneId,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    Layout {
+        reply: std::sync::mpsc::Sender<Result<Vec<TabLayout>, String>>,
+    },
+    ResizeWindow {
+        cols: usize,
+        rows: usize,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+}
+
+type GuiSender = async_channel::Sender<GuiRequest>;
+
+static GUI_SENDER: OnceLock<Mutex<Option<GuiSender>>> = OnceLock::new();
+
+/// Called by the GUI (`RootView`) at startup so the daemon can ask it to
+/// surface sessions; passing `None` detaches (e.g. when the view goes away).
+/// Sends after detach fail silently, which is the desired behavior: with no
+/// GUI there is nothing to show and the session stays headless.
+pub fn set_gui_sender(sender: Option<GuiSender>) {
+    *GUI_SENDER
+        .get_or_init(Default::default)
+        .lock() = sender;
+}
+
+fn notify_gui_open(id: PaneId, terminal: Arc<TerminalState>) -> bool {
+    if let Some(sender) = GUI_SENDER.get_or_init(Default::default).lock().as_ref() {
+        sender
+            .send_blocking(GuiRequest::OpenSession { id, terminal })
+            .is_ok()
+    } else {
+        false
+    }
+}
+
+/// Send a pane-control request to the GUI and block for its reply.
+/// Connection handlers run on their own thread, so waiting here (bounded)
+/// is safe. Fails fast when no GUI is attached to this daemon.
+fn call_gui<T>(
+    build: impl FnOnce(std::sync::mpsc::Sender<Result<T, String>>) -> GuiRequest,
+) -> Result<T, String> {
+    let Some(sender) = GUI_SENDER.get_or_init(Default::default).lock().clone() else {
+        return Err("no fastty window is running".to_string());
+    };
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Result<T, String>>();
+    sender
+        .send_blocking(build(reply_tx))
+        .map_err(|_| "fastty window is not responding".to_string())?;
+    match reply_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(message)) => Err(message),
+        Err(_) => Err("timed out waiting for the fastty window".to_string()),
+    }
+}
+
+/// Error code for a failed GUI-side pane operation, from `call_gui`'s
+/// error text (kept intentionally coarse: the message carries the detail).
+fn gui_error_code(message: &str) -> &'static str {
+    if message.contains("no fastty window") {
+        "no_gui"
+    } else if message.contains("timed out") || message.contains("not responding") {
+        "gui_timeout"
+    } else {
+        "gui_error"
+    }
+}
+
 /// Path to the daemon's control socket: `<state_dir>/fasttyd.sock`.
 pub fn socket_path() -> std::path::PathBuf {
     crate::paths::get().state_dir.join("fasttyd.sock")
@@ -158,10 +250,51 @@ pub enum Request {
         cols: Option<usize>,
         #[serde(default)]
         rows: Option<usize>,
+        /// Open the new session as a visible tab in the running fastty GUI
+        /// (silently ignored when no GUI is attached to this daemon).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        open: bool,
     },
     Close {
         id: PaneId,
+        /// Also close GUI-owned tabs: their running process is killed, the
+        /// same as closing the tab in the window. Without `force` a GUI
+        /// session answers `not_closable` — the tab belongs to the user.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
     },
+    /// Split a visible GUI pane: create a new pane next to it (same tab)
+    /// running a shell (or `command`), and return the new pane's session id.
+    SplitPane {
+        id: PaneId,
+        /// `"left" | "right" | "top" | "down"` — which side of the target.
+        direction: String,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
+    /// Move the divider on one side of a visible GUI pane, growing or
+    /// shrinking it inside its tab.
+    ResizePane {
+        id: PaneId,
+        direction: String,
+        /// Fraction of the split axis to move the divider by (e.g. 0.05).
+        #[serde(default = "default_resize_delta")]
+        delta: f32,
+    },
+    /// Bring a pane's tab to the front and make the pane active.
+    FocusPane { id: PaneId },
+    /// Full GUI layout: every tab with its panes, so a client can see which
+    /// sessions share a tab before splitting/focusing. Headless sessions
+    /// (spawned without a tab) are not part of any tab — see `list`.
+    Layout,
+    /// Best-effort resize of the fastty window so the (single-pane) active
+    /// tab renders at `cols` x `rows`. With splits the result is
+    /// approximate; use `resize_pane` to move dividers.
+    ResizeWindow { cols: usize, rows: usize },
     /// Fast microsecond binary snapshot of terminal state (magic b"FST1").
     BinarySnapshot {
         id: PaneId,
@@ -189,6 +322,43 @@ pub struct SessionInfo {
     pub alive: bool,
     #[serde(default)]
     pub history_size: usize,
+}
+
+/// One pane inside a tab, as reported by `layout`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PaneLayoutInfo {
+    pub id: PaneId,
+    pub title: String,
+    pub cwd: Option<String>,
+    pub active: bool,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+/// One tab of the GUI layout, as reported by `layout`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TabLayout {
+    pub tab_id: usize,
+    pub title: String,
+    pub active: bool,
+    pub active_pane: PaneId,
+    pub zoomed_pane: Option<PaneId>,
+    pub panes: Vec<PaneLayoutInfo>,
+}
+
+/// Parses the protocol's direction strings ("left"/"right"/"top"/"down").
+fn parse_direction(s: &str) -> Option<crate::pane_tree::Direction> {
+    match s {
+        "left" => Some(crate::pane_tree::Direction::Left),
+        "right" => Some(crate::pane_tree::Direction::Right),
+        "top" => Some(crate::pane_tree::Direction::Top),
+        "down" => Some(crate::pane_tree::Direction::Down),
+        _ => None,
+    }
+}
+
+fn default_resize_delta() -> f32 {
+    0.05
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -262,7 +432,15 @@ pub enum Response {
     },
     Spawned {
         id: PaneId,
+        /// Whether `open: true` reached a running GUI (false when no GUI is
+        /// attached to this daemon, or when the spawn didn't ask to open).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        opened: bool,
     },
+    /// The reply to `split_pane`: the new pane's session id.
+    PaneSplit { id: PaneId },
+    /// The reply to `layout`.
+    Layout { tabs: Vec<TabLayout> },
     /// Ack for `write` / `resize` requests that opted in with `ack: true`.
     /// `cmd` echoes the request name (`"write"` / `"resize"`). Clients that
     /// never set `ack` never receive this event.
@@ -699,6 +877,7 @@ mod unix_impl {
                 cwd,
                 cols,
                 rows,
+                open,
             } => {
                 if conn.read_only {
                     send(
@@ -712,7 +891,14 @@ mod unix_impl {
                 }
                 match spawn_headless_session(command.as_deref(), &args, cwd.as_deref(), cols, rows) {
                     Ok(id) => {
-                        send(&conn.out, &Response::Spawned { id });
+                        let opened = if open {
+                            get_session(id)
+                                .map(|terminal| notify_gui_open(id, terminal))
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        send(&conn.out, &Response::Spawned { id, opened });
                     }
                     Err(e) => {
                         send(
@@ -725,7 +911,7 @@ mod unix_impl {
                     }
                 }
             }
-            Request::Close { id } => {
+            Request::Close { id, force } => {
                 if conn.read_only {
                     send(
                         &conn.out,
@@ -739,16 +925,19 @@ mod unix_impl {
                 let entry = registry().lock().get(&id).cloned();
                 match entry {
                     Some(entry) => {
-                        if entry.kind == SessionKind::Gui {
+                        if entry.kind == SessionKind::Gui && !force {
                             send(
                                 &conn.out,
                                 &Response::Error {
                                     code: "not_closable".to_string(),
-                                    message: "GUI session cannot be closed via daemon without force".to_string(),
+                                    message: "GUI session cannot be closed via daemon; retry with force: true to kill it".to_string(),
                                 },
                             );
                             return;
                         }
+                        // For GUI sessions this kills the process group; the
+                        // GUI's own exit handling then closes the tab (its
+                        // unregister of this id is a no-op at that point).
                         entry.terminal.terminate_process();
                         unregister(id);
                         send(&conn.out, &Response::Closed { id });
@@ -763,6 +952,137 @@ mod unix_impl {
                         );
                     }
                 }
+            }
+            Request::SplitPane {
+                id,
+                direction,
+                command,
+                args,
+                cwd,
+            } => {
+                if conn.read_only {
+                    send(
+                        &conn.out,
+                        &Response::Error {
+                            code: "read_only".to_string(),
+                            message: "connection is in read-only mode".to_string(),
+                        },
+                    );
+                    return;
+                }
+                let Some(dir) = parse_direction(&direction) else {
+                    send(
+                        &conn.out,
+                        &Response::Error {
+                            code: "bad_request".to_string(),
+                            message: format!(
+                                "invalid direction {direction:?}: use left/right/top/down"
+                            ),
+                        },
+                    );
+                    return;
+                };
+                match call_gui(move |reply| GuiRequest::SplitPane {
+                    target: id,
+                    direction: dir,
+                    command,
+                    args,
+                    cwd,
+                    reply,
+                }) {
+                    Ok(new_id) => send(&conn.out, &Response::PaneSplit { id: new_id }),
+                    Err(message) => send(
+                        &conn.out,
+                        &Response::Error {
+                            code: gui_error_code(&message).to_string(),
+                            message: format!("split_pane {id}: {message}"),
+                        },
+                    ),
+                };
+            }
+            Request::ResizePane {
+                id,
+                direction,
+                delta,
+            } => {
+                if conn.read_only {
+                    send(
+                        &conn.out,
+                        &Response::Error {
+                            code: "read_only".to_string(),
+                            message: "connection is in read-only mode".to_string(),
+                        },
+                    );
+                    return;
+                }
+                let Some(dir) = parse_direction(&direction) else {
+                    send(
+                        &conn.out,
+                        &Response::Error {
+                            code: "bad_request".to_string(),
+                            message: format!(
+                                "invalid direction {direction:?}: use left/right/top/down"
+                            ),
+                        },
+                    );
+                    return;
+                };
+                let delta = delta.clamp(-0.5, 0.5);
+                match call_gui(move |reply| GuiRequest::ResizePane {
+                    target: id,
+                    direction: dir,
+                    delta,
+                    reply,
+                }) {
+                    Ok(()) => send(&conn.out, &Response::Done { cmd: "resize_pane".to_string() }),
+                    Err(message) => send(
+                        &conn.out,
+                        &Response::Error {
+                            code: gui_error_code(&message).to_string(),
+                            message: format!("resize_pane {id}: {message}"),
+                        },
+                    ),
+                };
+            }
+            Request::FocusPane { id } => {
+                match call_gui(|reply| GuiRequest::FocusPane { target: id, reply }) {
+                    Ok(()) => send(&conn.out, &Response::Done { cmd: "focus_pane".to_string() }),
+                    Err(message) => send(
+                        &conn.out,
+                        &Response::Error {
+                            code: gui_error_code(&message).to_string(),
+                            message: format!("focus_pane {id}: {message}"),
+                        },
+                    ),
+                };
+            }
+            Request::Layout => {
+                match call_gui(|reply| GuiRequest::Layout { reply }) {
+                    Ok(tabs) => send(&conn.out, &Response::Layout { tabs }),
+                    Err(message) => send(
+                        &conn.out,
+                        &Response::Error {
+                            code: gui_error_code(&message).to_string(),
+                            message,
+                        },
+                    ),
+                };
+            }
+            Request::ResizeWindow { cols, rows } => {
+                let cols = cols.max(20);
+                let rows = rows.max(5);
+                match call_gui(move |reply| GuiRequest::ResizeWindow { cols, rows, reply }) {
+                    Ok(()) => {
+                        send(&conn.out, &Response::Done { cmd: "resize_window".to_string() })
+                    }
+                    Err(message) => send(
+                        &conn.out,
+                        &Response::Error {
+                            code: gui_error_code(&message).to_string(),
+                            message: format!("resize_window: {message}"),
+                        },
+                    ),
+                };
             }
             Request::BinarySnapshot { id } => {
                 if let Some(entry) = registry().lock().get(&id) {
@@ -930,8 +1250,24 @@ mod tests {
                 cwd: Some("/tmp".to_string()),
                 cols: Some(100),
                 rows: Some(30),
+                open: true,
             },
-            Request::Close { id: 42 },
+            Request::Close { id: 42, force: true },
+            Request::SplitPane {
+                id: 7,
+                direction: "right".to_string(),
+                command: Some("zsh".to_string()),
+                args: vec!["-l".to_string()],
+                cwd: Some("/tmp".to_string()),
+            },
+            Request::ResizePane {
+                id: 7,
+                direction: "left".to_string(),
+                delta: 0.1,
+            },
+            Request::FocusPane { id: 7 },
+            Request::Layout,
+            Request::ResizeWindow { cols: 120, rows: 40 },
         ];
 
         for req in reqs {
@@ -980,6 +1316,7 @@ mod tests {
                         cwd: cw1,
                         cols: co1,
                         rows: r1,
+                        open: o1,
                     },
                     Request::Spawn {
                         command: c2,
@@ -987,6 +1324,7 @@ mod tests {
                         cwd: cw2,
                         cols: co2,
                         rows: r2,
+                        open: o2,
                     },
                 ) => {
                     assert_eq!(c1, c2);
@@ -994,8 +1332,59 @@ mod tests {
                     assert_eq!(cw1, cw2);
                     assert_eq!(co1, co2);
                     assert_eq!(r1, r2);
+                    assert_eq!(o1, o2);
                 }
-                (Request::Close { id: a }, Request::Close { id: b }) => assert_eq!(a, b),
+                (Request::Close { id: a, force: f1 }, Request::Close { id: b, force: f2 }) => {
+                    assert_eq!(a, b);
+                    assert_eq!(f1, f2);
+                }
+                (
+                    Request::SplitPane {
+                        id: a,
+                        direction: d1,
+                        command: c1,
+                        args: a1,
+                        cwd: cw1,
+                    },
+                    Request::SplitPane {
+                        id: b,
+                        direction: d2,
+                        command: c2,
+                        args: a2,
+                        cwd: cw2,
+                    },
+                ) => {
+                    assert_eq!(a, b);
+                    assert_eq!(d1, d2);
+                    assert_eq!(c1, c2);
+                    assert_eq!(a1, a2);
+                    assert_eq!(cw1, cw2);
+                }
+                (
+                    Request::ResizePane {
+                        id: a,
+                        direction: d1,
+                        delta: dl1,
+                    },
+                    Request::ResizePane {
+                        id: b,
+                        direction: d2,
+                        delta: dl2,
+                    },
+                ) => {
+                    assert_eq!(a, b);
+                    assert_eq!(d1, d2);
+                    assert_eq!(dl1, dl2);
+                }
+                (Request::FocusPane { id: a }, Request::FocusPane { id: b }) => assert_eq!(a, b),
+                (Request::Layout, Request::Layout) => {}
+                (
+                    Request::ResizeWindow { cols: c1, rows: r1 },
+                    Request::ResizeWindow { cols: c2, rows: r2 },
+                ) => {
+                    assert_eq!(c1, c2);
+                    assert_eq!(r1, r2);
+                }
                 _ => panic!("mismatched variant: {req:?} vs {parsed:?}"),
             }
         }
@@ -1104,6 +1493,7 @@ mod tests {
                 cwd: None,
                 cols: None,
                 rows: None,
+                open: false,
             },
             &mut conn,
         );
@@ -1112,7 +1502,7 @@ mod tests {
         assert!(line.contains(r#""code":"read_only""#));
 
         // 5. Close command rejected with code "read_only"
-        handle_request(Request::Close { id: 1 }, &mut conn);
+        handle_request(Request::Close { id: 1, force: true }, &mut conn);
         line.clear();
         client_reader.read_line(&mut line).unwrap();
         assert!(line.contains(r#""code":"read_only""#));
@@ -1136,34 +1526,96 @@ mod tests {
         let mut client_reader = BufReader::new(client);
 
         // 1. Non-existent session
-        handle_request(Request::Close { id: 999_999 }, &mut conn);
+        handle_request(Request::Close { id: 999_999, force: false }, &mut conn);
         let mut line = String::new();
         client_reader.read_line(&mut line).unwrap();
         assert!(line.contains(r#""code":"no_such_session""#));
 
-        // 2. GUI session
+        // 2. GUI session without force answers not_closable and stays
         if let Ok(gui_term) = TerminalState::new_headless("/bin/sh", &[], None, 80, 24) {
             let gui_id = 999_001;
             register(gui_id, Arc::new(gui_term));
-            handle_request(Request::Close { id: gui_id }, &mut conn);
+            handle_request(Request::Close { id: gui_id, force: false }, &mut conn);
             line.clear();
             client_reader.read_line(&mut line).unwrap();
             assert!(line.contains(r#""code":"not_closable""#));
             assert!(is_registered(gui_id));
-            unregister(gui_id);
+
+            // 3. The same session with force closes and unregisters
+            handle_request(Request::Close { id: gui_id, force: true }, &mut conn);
+            line.clear();
+            client_reader.read_line(&mut line).unwrap();
+            assert!(line.contains(r#""event":"closed""#));
+            assert!(!is_registered(gui_id));
         }
 
-        // 3. Headless session
+        // 4. Headless session closes without force
         if let Ok(headless_term) = TerminalState::new_headless("/bin/sh", &[], None, 80, 24) {
             let headless_id = 999_002;
             register_headless(headless_id, Arc::new(headless_term));
             assert!(is_registered(headless_id));
-            handle_request(Request::Close { id: headless_id }, &mut conn);
+            handle_request(Request::Close { id: headless_id, force: false }, &mut conn);
             line.clear();
             client_reader.read_line(&mut line).unwrap();
             assert!(line.contains(r#""event":"closed""#));
             assert!(!is_registered(headless_id));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pane_control_without_gui_answers_no_gui() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::AtomicBool;
+        use unix_impl::{handle_request, Conn};
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut conn = Conn {
+            out: Arc::new(Mutex::new(server)),
+            conn_alive: Arc::new(AtomicBool::new(true)),
+            read_only: false,
+            attachments: HashMap::new(),
+        };
+        let mut client_reader = BufReader::new(client);
+
+        // No GUI attached to this daemon process: pane ops fail fast.
+        handle_request(Request::Layout, &mut conn);
+        let mut line = String::new();
+        client_reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""code":"no_gui""#), "{line}");
+
+        handle_request(
+            Request::SplitPane {
+                id: 1,
+                direction: "right".to_string(),
+                command: None,
+                args: vec![],
+                cwd: None,
+            },
+            &mut conn,
+        );
+        line.clear();
+        client_reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""code":"no_gui""#), "{line}");
+
+        handle_request(Request::FocusPane { id: 1 }, &mut conn);
+        line.clear();
+        client_reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""code":"no_gui""#), "{line}");
+
+        // An invalid direction is rejected before the GUI is involved.
+        handle_request(
+            Request::ResizePane {
+                id: 1,
+                direction: "sideways".to_string(),
+                delta: 0.05,
+            },
+            &mut conn,
+        );
+        line.clear();
+        client_reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""code":"bad_request""#), "{line}");
     }
 
     #[test]

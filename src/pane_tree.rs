@@ -420,6 +420,90 @@ impl PaneTree {
         self.active_pane_id = new_id;
     }
 
+    /// Split an arbitrary pane (not necessarily the active one) — the
+    /// daemon-facing twin of `split_active_pane`. Returns false when
+    /// `target_id` is not in this tree.
+    pub fn split_pane_at(
+        &mut self,
+        target_id: PaneId,
+        new_pane: TerminalPane,
+        direction: Direction,
+    ) -> bool {
+        if self.find_pane(target_id).is_none() {
+            return false;
+        }
+        let new_id = new_pane.id;
+        let root = std::mem::replace(
+            &mut self.root,
+            PaneNode::Leaf(TerminalPane {
+                id: 0,
+                terminal: None,
+                title: String::new(),
+                custom_title: None,
+                cwd: None,
+                git_status: None,
+                git_checked_cwd: None,
+                git_last_poll: None,
+                last_duration_ms: None,
+                last_exit_code: None,
+                last_bounds: None,
+            }),
+        );
+        self.root = root.split_at_target(target_id, new_pane, direction);
+        self.active_pane_id = new_id;
+        true
+    }
+
+    /// Move the divider on `direction`'s side of `target` by `delta` (a
+    /// fraction of that split's axis), so the pane grows when the divider
+    /// moves away from it. Applies at the deepest split on the path to the
+    /// target whose axis matches; returns false when there is no divider on
+    /// that side (or the pane isn't in this tree).
+    pub fn resize_pane(&mut self, target: PaneId, direction: Direction, delta: f32) -> bool {
+        fn adjust(node: &mut PaneNode, target: PaneId, direction: Direction, delta: f32) -> bool {
+            let PaneNode::Split {
+                direction: split_dir,
+                ratio,
+                first,
+                second,
+            } = node
+            else {
+                return false;
+            };
+            // Deepest-first: a nested split below this one gets first dibs.
+            if adjust(first, target, direction, delta) || adjust(second, target, direction, delta)
+            {
+                return true;
+            }
+            let axis_matches = match (split_dir, direction) {
+                (SplitDirection::Horizontal, Direction::Left | Direction::Right)
+                | (SplitDirection::Vertical, Direction::Top | Direction::Down) => true,
+                _ => false,
+            };
+            if !axis_matches {
+                return false;
+            }
+            let target_in_first = first.find_pane(target).is_some();
+            let target_in_second = !target_in_first && second.find_pane(target).is_some();
+            if !target_in_first && !target_in_second {
+                return false;
+            }
+            // The divider sits between `first` and `second` and `ratio` is
+            // first's share: moving it toward `second` grows first. Growing
+            // the target therefore means moving the divider toward its
+            // sibling, which flips sign depending on the target's side.
+            let new_ratio = match (target_in_first, direction) {
+                (true, Direction::Right) | (true, Direction::Down) => *ratio + delta,
+                (true, Direction::Left) | (true, Direction::Top) => *ratio - delta,
+                (false, Direction::Left) | (false, Direction::Top) => *ratio - delta,
+                (false, _) => *ratio + delta,
+            };
+            *ratio = new_ratio.clamp(0.1, 0.9);
+            true
+        }
+        adjust(&mut self.root, target, direction, delta)
+    }
+
     pub fn close_pane(&mut self, target_id: PaneId) -> bool {
         let root = std::mem::replace(
             &mut self.root,
@@ -548,6 +632,56 @@ mod tests {
             last_exit_code: None,
             last_bounds: None,
         }
+    }
+
+    #[test]
+    fn test_split_pane_at_targets_arbitrary_pane() {
+        let mut tree = PaneTree::new(dummy_pane(1));
+        assert!(tree.split_pane_at(1, dummy_pane(2), Direction::Right));
+        assert!(tree.split_pane_at(1, dummy_pane(3), Direction::Down));
+        assert_eq!(tree.all_panes().len(), 3);
+        assert_eq!(tree.active_pane_id, 3);
+        // splitting an unknown pane is refused, not silently ignored
+        assert!(!tree.split_pane_at(99, dummy_pane(4), Direction::Left));
+        assert_eq!(tree.all_panes().len(), 3);
+    }
+
+    #[test]
+    fn test_resize_pane_moves_the_matching_divider() {
+        // 1 | (2 / 3): pane 1 left, 2 top, 3 bottom.
+        let mut tree = PaneTree::new(dummy_pane(1));
+        tree.split_pane_at(1, dummy_pane(2), Direction::Right);
+        tree.split_pane_at(2, dummy_pane(3), Direction::Down);
+
+        // Grow pane 1 rightward: the outer horizontal divider moves.
+        assert!(tree.resize_pane(1, Direction::Right, 0.1));
+        let PaneNode::Split { ratio, second, .. } = &tree.root else { unreachable!() };
+        assert!(( *ratio - 0.6).abs() < 1e-6, "outer ratio {ratio}");
+        assert!(second.find_pane(3).is_some());
+
+        // Grow pane 3 upward: the inner vertical divider (within the right
+        // column) moves, not the outer one.
+        let outer_before = match &tree.root {
+            PaneNode::Split { ratio, .. } => *ratio,
+            _ => unreachable!(),
+        };
+        assert!(tree.resize_pane(3, Direction::Top, 0.1));
+        let PaneNode::Split { ratio, second, .. } = &tree.root else { unreachable!() };
+        assert_eq!(*ratio, outer_before, "outer divider must not move");
+        let PaneNode::Split { ratio: inner, first, .. } = &**second else { unreachable!() };
+        assert!((*inner - 0.4).abs() < 1e-6, "inner ratio {inner}");
+        assert!(first.find_pane(2).is_some());
+
+        // Pane 1 has no vertical divider anywhere above it: refused.
+        assert!(!tree.resize_pane(1, Direction::Down, 0.1));
+        assert!(!tree.resize_pane(99, Direction::Right, 0.1));
+
+        // Ratios clamp instead of collapsing a pane to zero.
+        for _ in 0..20 {
+            tree.resize_pane(1, Direction::Right, 0.1);
+        }
+        let PaneNode::Split { ratio, .. } = &tree.root else { unreachable!() };
+        assert!(*ratio <= 0.9 && *ratio >= 0.1, "clamped ratio {ratio}");
     }
 
     #[test]

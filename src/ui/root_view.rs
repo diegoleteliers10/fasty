@@ -2366,6 +2366,58 @@ impl RootView {
             view.config.keybinding_preset,
         );
 
+        // Daemon → GUI requests: a `spawn { open: true }` (e.g. from an MCP
+        // agent's `fastty_spawn_session`) surfaces as a visible tab. The
+        // channel detaches with the view — after that, sends fail silently
+        // and spawned sessions just stay headless.
+        let (daemon_req_tx, daemon_req_rx) =
+            async_channel::unbounded::<crate::daemon::GuiRequest>();
+        crate::daemon::set_gui_sender(Some(daemon_req_tx));
+        cx.spawn_in(_window, async move |this, cx| {
+            while let Ok(req) = daemon_req_rx.recv().await {
+                let res = this.update_in(cx, |this, window, cx| match req {
+                    crate::daemon::GuiRequest::OpenSession { id, terminal } => {
+                        this.adopt_daemon_session(id, terminal, window, cx);
+                    }
+                    crate::daemon::GuiRequest::SplitPane {
+                        target,
+                        direction,
+                        command,
+                        args,
+                        cwd,
+                        reply,
+                    } => {
+                        let _ = reply.send(
+                            this.daemon_split_pane(target, direction, command, &args, cwd, window, cx),
+                        );
+                    }
+                    crate::daemon::GuiRequest::ResizePane {
+                        target,
+                        direction,
+                        delta,
+                        reply,
+                    } => {
+                        let _ = reply
+                            .send(this.daemon_resize_pane(target, direction, delta, cx));
+                    }
+                    crate::daemon::GuiRequest::FocusPane { target, reply } => {
+                        let _ = reply.send(this.daemon_focus_pane(target, cx));
+                    }
+                    crate::daemon::GuiRequest::Layout { reply } => {
+                        let _ = reply.send(Ok(this.daemon_layout()));
+                    }
+                    crate::daemon::GuiRequest::ResizeWindow { cols, rows, reply } => {
+                        let _ =
+                            reply.send(this.daemon_resize_window(cols, rows, window, cx));
+                    }
+                });
+                if res.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         // Background update check and silent automatic preparation.
         // When a newer release exists the changelog modal opens automatically
         // so the Skip / Update actions are always reachable (previously only
@@ -3004,6 +3056,254 @@ impl RootView {
         Self::with_options_internal(window, cli_opts, Some(tab_data), cx)
     }
 
+    /// Surface a daemon-spawned session (`spawn { open: true }`, e.g. an MCP
+    /// agent's `fastty_spawn_session`) as a new tab. The pane keeps the
+    /// daemon-assigned id so IPC clients keep addressing the same session:
+    /// `fastty_write_session` types into this tab and `fastty_close_session`
+    /// closes it. Rendering resizes the terminal to the tab's real geometry
+    /// on the first frame (`render_pane_tree_node`).
+    pub fn adopt_daemon_session(
+        &mut self,
+        id: PaneId,
+        terminal: Arc<TerminalState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A session the agent spawned and closed immediately: its Exit event
+        // was emitted before this tab existed (with no event sender wired)
+        // and would never arrive, leaving a dead tab. Nothing to show.
+        if !terminal.is_alive() {
+            return;
+        }
+
+        // Keep future GUI pane ids clear of the daemon's id space (>= 100).
+        if id >= self.next_pane_id {
+            self.next_pane_id = id + 1;
+        }
+
+        let cwd = terminal.get_current_working_directory();
+        let title = terminal
+            .get_foreground_process_name()
+            .or_else(|| {
+                cwd.as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| format!("session {id}"));
+
+        let pane = TerminalPane {
+            id,
+            terminal: Some(terminal.clone()),
+            title: title.clone(),
+            custom_title: None,
+            cwd: cwd.clone(),
+            git_status: None,
+            git_checked_cwd: cwd.clone(),
+            git_last_poll: Some(std::time::Instant::now()),
+            last_duration_ms: None,
+            last_exit_code: None,
+            last_bounds: None,
+        };
+
+        let tab_data = TabData {
+            id: 0, // assigned by `attach_tab`
+            pane_tree: crate::pane_tree::PaneTree::new(pane),
+            title,
+            custom_title: None,
+            terminal: Some(terminal),
+            cwd,
+            git_status: None,
+            git_checked_cwd: None,
+            git_last_poll: None,
+            last_duration_ms: None,
+            last_exit_code: None,
+            zoomed_pane: None,
+        };
+
+        self.attach_tab(tab_data, window, cx);
+    }
+
+    fn tab_index_of_pane(&self, pane_id: PaneId) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|t| t.pane_tree.find_pane(pane_id).is_some())
+    }
+
+    /// Daemon-facing `split_pane`: create a new pane next to `target`
+    /// inside its tab (the daemon protocol's way for agents to build
+    /// layouts). The new pane registers as a GUI session, so list/close/
+    /// write keep working on it.
+    pub fn daemon_split_pane(
+        &mut self,
+        target: PaneId,
+        direction: Direction,
+        command: Option<String>,
+        args: &[String],
+        cwd: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<PaneId, String> {
+        let tab_idx = self
+            .tab_index_of_pane(target)
+            .ok_or_else(|| format!("pane {target} is not visible in the fastty window"))?;
+
+        let shell = command.unwrap_or_else(|| {
+            self.config
+                .shell
+                .clone()
+                .or_else(|| std::env::var("SHELL").ok())
+                .unwrap_or_else(crate::paths::default_system_shell)
+        });
+        let cwd = cwd
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                self.tabs[tab_idx]
+                    .pane_tree
+                    .find_pane(target)
+                    .and_then(|p| p.cwd.clone())
+            })
+            .or_else(|| self.tabs[tab_idx].cwd.clone());
+
+        let new_pane = self.spawn_terminal_pane(&shell, args, cwd.as_deref(), None, window, cx);
+        let new_id = new_pane.id;
+
+        if let Some(tab) = self.tabs.get_mut(tab_idx) {
+            if tab.pane_tree.split_pane_at(target, new_pane, direction) {
+                // A new split exits zoom: the tree changed under it.
+                tab.zoomed_pane = None;
+                if let Some(pane) = tab.pane_tree.active_pane() {
+                    tab.terminal = pane.terminal.clone();
+                    tab.cwd = pane.cwd.clone();
+                    tab.git_status = pane.git_status.clone();
+                }
+            }
+        }
+        self.persist_session();
+        cx.notify();
+        Ok(new_id)
+    }
+
+    /// Daemon-facing `resize_pane`: move the divider on one side of a pane.
+    pub fn daemon_resize_pane(
+        &mut self,
+        target: PaneId,
+        direction: Direction,
+        delta: f32,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let tab_idx = self
+            .tab_index_of_pane(target)
+            .ok_or_else(|| format!("pane {target} is not visible in the fastty window"))?;
+        let side = match direction {
+            Direction::Left => "left",
+            Direction::Right => "right",
+            Direction::Top => "top",
+            Direction::Down => "down",
+        };
+        let moved = self.tabs[tab_idx]
+            .pane_tree
+            .resize_pane(target, direction, delta);
+        if !moved {
+            return Err(format!("pane {target} has no divider on its {side} side"));
+        }
+        self.persist_session();
+        cx.notify();
+        Ok(())
+    }
+
+    /// Daemon-facing `focus_pane`: bring the pane's tab to the front and
+    /// make the pane the active one, so the user sees what the agent is
+    /// touching.
+    pub fn daemon_focus_pane(&mut self, target: PaneId, cx: &mut Context<Self>) -> Result<(), String> {
+        let tab_idx = self
+            .tab_index_of_pane(target)
+            .ok_or_else(|| format!("pane {target} is not visible in the fastty window"))?;
+        self.active_tab_idx = tab_idx;
+        self.selection = None;
+        self.is_selecting = false;
+        self.selection_start = None;
+        if let Some(tab) = self.tabs.get_mut(tab_idx) {
+            tab.pane_tree.active_pane_id = target;
+            if let Some(pane) = tab.pane_tree.active_pane() {
+                tab.terminal = pane.terminal.clone();
+                tab.cwd = pane.cwd.clone();
+                tab.git_status = pane.git_status.clone();
+            }
+        }
+        self.persist_session();
+        cx.notify();
+        Ok(())
+    }
+
+    /// Daemon-facing `layout`: the full window structure (tabs → panes), so
+    /// IPC clients can see which sessions share a tab before splitting.
+    pub fn daemon_layout(&self) -> Vec<crate::daemon::TabLayout> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(idx, tab)| crate::daemon::TabLayout {
+                tab_id: tab.id,
+                title: tab.title.clone(),
+                active: idx == self.active_tab_idx,
+                active_pane: tab.pane_tree.active_pane_id,
+                zoomed_pane: tab.zoomed_pane,
+                panes: tab
+                    .pane_tree
+                    .all_panes()
+                    .iter()
+                    .map(|p| {
+                        let (cols, rows) = p
+                            .terminal
+                            .as_ref()
+                            .map(|t| t.dimensions())
+                            .unwrap_or((0, 0));
+                        crate::daemon::PaneLayoutInfo {
+                            id: p.id,
+                            title: p.title.clone(),
+                            cwd: p
+                                .cwd
+                                .clone()
+                                .map(|c| c.to_string_lossy().into_owned()),
+                            active: p.id == tab.pane_tree.active_pane_id,
+                            cols,
+                            rows,
+                        }
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Daemon-facing `resize_window`: best-effort resize of the OS window so
+    /// the active pane renders at `cols` x `rows`. Chrome is derived from
+    /// the active pane, so with splits the result is approximate — dividers
+    /// are `resize_pane`'s job.
+    pub fn daemon_resize_window(
+        &mut self,
+        cols: usize,
+        rows: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let (cur_cols, cur_rows) = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|t| t.pane_tree.active_pane())
+            .and_then(|p| p.terminal.as_ref())
+            .map(|t| t.dimensions())
+            .ok_or_else(|| "no active pane to size against".to_string())?;
+        let (cell_w, line_h) = self.measure_cell_metrics(window);
+        let d_w = (cols as isize - cur_cols as isize) as f32 * cell_w;
+        let d_h = (rows as isize - cur_rows as isize) as f32 * line_h;
+        let mut size = window.bounds().size;
+        size.width += px(d_w);
+        size.height += px(d_h);
+        window.resize(size);
+        cx.notify();
+        Ok(())
+    }
+
     pub fn attach_tab(
         &mut self,
         mut tab_data: TabData,
@@ -3120,6 +3420,43 @@ impl RootView {
                     }
                     AppEvent::Notification { title, body } => {
                         send_system_notification(&title, &body);
+                    }
+                    AppEvent::Exit { shell_pid } => {
+                        // Mirror `spawn_terminal_pane`'s exit handling for
+                        // restored and daemon-adopted tabs. One pump serves
+                        // every pane in the tab, so match the exited pane by
+                        // shell pid; close that pane, or the whole tab when
+                        // it was the only one.
+                        let exited_pane = this
+                            .tabs
+                            .iter()
+                            .find(|t| t.id == tab_id)
+                            .and_then(|tab| {
+                                tab.pane_tree.all_panes().iter().find_map(|p| {
+                                    let matches = p
+                                        .terminal
+                                        .as_ref()
+                                        .map(|t| t.shell_pid() == shell_pid)
+                                        .unwrap_or(false);
+                                    matches.then_some(p.id)
+                                })
+                            });
+                        if let Some(pane_id) = exited_pane {
+                            if this.exec_pane_id == Some(pane_id) {
+                                cx.quit();
+                            } else if let Some(tab) = this
+                                .tabs
+                                .iter()
+                                .find(|t| t.id == tab_id)
+                            {
+                                let pane_count = tab.pane_tree.pane_count();
+                                if pane_count > 1 {
+                                    this.force_close_pane(tab_id, pane_id, cx);
+                                } else {
+                                    this.close_tab(tab_id, _window, cx);
+                                }
+                            }
+                        }
                     }
                     _ => {
                         cx.notify();
@@ -8519,10 +8856,27 @@ impl RootView {
                         let mut current_span_char_cols: Vec<usize> = Vec::new();
                         let theme_bg_rgb = Self::hsla_to_rgb_tuple(theme.background);
                         let theme_fg_rgb = Self::hsla_to_rgb_tuple(theme.foreground);
+                        // Selected cells get their fg corrected against what
+                        // they will actually sit on: their background blended
+                        // with the accent selection tint painted under the
+                        // text (see `TerminalGridElement`'s selection pass).
+                        // Without this, dim explicit colors (TUI grays) that
+                        // read on the plain background vanish on the tint.
+                        let selection = if is_active { self.selection } else { None };
+                        let selection_accent_rgb = Self::hsla_to_rgb_tuple(theme.accent);
+                        let mut current_sel_cols: Option<(usize, usize)> = None;
 
                         for cell in content.display_iter {
                             let row = cell.point.line.0;
                             let col = cell.point.column.0;
+
+                            if last_row != Some(row) {
+                                current_sel_cols = selection.as_ref().and_then(|sel| {
+                                    crate::ui::terminal_grid_element::selection_columns_on_line(
+                                        sel, row,
+                                    )
+                                });
+                            }
 
                             if col >= target_cols {
                                 continue;
@@ -8589,7 +8943,18 @@ impl RootView {
                                 AnsiColor::Named(NamedColor::Background) => theme_bg_rgb,
                                 other => Self::explicit_color_rgb(other).unwrap_or(theme_bg_rgb),
                             };
-                            let fg = self.convert_fg_harmonized(effective_fg, cell_bg_rgb);
+                            let in_selection = current_sel_cols
+                                .is_some_and(|(c0, c1)| col >= c0 && col < c1);
+                            let correction_base = if in_selection {
+                                crate::ui::color_harmony::alpha_blend(
+                                    cell_bg_rgb,
+                                    selection_accent_rgb,
+                                    crate::ui::terminal_grid_element::SELECTION_OVERLAY_ALPHA,
+                                )
+                            } else {
+                                cell_bg_rgb
+                            };
+                            let fg = self.convert_fg_harmonized(effective_fg, correction_base);
                             let bg = match effective_bg {
                                 AnsiColor::Named(NamedColor::Background) => None,
                                 other => {

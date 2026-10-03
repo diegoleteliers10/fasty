@@ -96,33 +96,26 @@ fn correct_against(color: Rgb, other: Rgb, target: f32) -> Rgb {
     let other_light = relative_luminance(other) > 0.5;
     // Search direction: darken the color on light surroundings, brighten it
     // on dark ones. Luminance rises monotonically with Oklab L in practice,
-    // so a plain bisection over [lo, hi] finds the boundary.
-    let (mut lo, mut hi) = if other_light {
-        (L_MIN, l0.max(L_MIN + 1e-3))
+    // so a plain bisection finds the boundary.
+    let (mut fail, mut pass) = if other_light {
+        (l0.max(L_MIN + 1e-3), L_MIN)
     } else {
         (l0.min(L_MAX - 1e-3), L_MAX)
     };
-    // The current L already fails; keep it as the failing end and shrink
-    // toward the passing extreme for ~18 iterations.
-    let mut best = if other_light {
-        oklab_to_rgb(L_MIN, a, b)
-    } else {
-        oklab_to_rgb(L_MAX, a, b)
-    };
+    // Invariant: `fail` never reaches `target`, `pass` always does. Bisect
+    // toward the boundary and keep the last passing candidate: the SMALLEST
+    // move away from the background that restores contrast. Correcting any
+    // further blows dim TUI grays out to near-white (dark themes) or
+    // near-black (light themes) and erases the app's visual hierarchy.
+    let mut best = oklab_to_rgb(pass, a, b);
     for _ in 0..18 {
-        let mid = (lo + hi) / 2.0;
+        let mid = (fail + pass) / 2.0;
         let candidate = oklab_to_rgb(mid, a, b);
         if contrast_ratio(candidate, other) >= target {
+            pass = mid;
             best = candidate;
-            if other_light {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        } else if other_light {
-            lo = mid;
         } else {
-            hi = mid;
+            fail = mid;
         }
     }
     best
@@ -218,6 +211,13 @@ pub fn indexed_to_rgb(idx: u8) -> Option<Rgb> {
     }
 }
 
+/// sRGB-space "over" blend, matching how the GPU composites the quad
+/// overlays painted under text (selection tint, search highlights).
+pub fn alpha_blend(base: Rgb, over: Rgb, alpha: f32) -> Rgb {
+    let mix = |b: u8, o: u8| (b as f32 * (1.0 - alpha) + o as f32 * alpha).round() as u8;
+    (mix(base.0, over.0), mix(base.1, over.1), mix(base.2, over.2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +235,66 @@ mod tests {
             assert!((g as i32 - g2 as i32).abs() <= 1, "g {g} vs {g2}");
             assert!((b as i32 - b2 as i32).abs() <= 1, "b {b} vs {b2}");
         }
+    }
+
+    #[test]
+    fn alpha_blend_matches_quad_compositing() {
+        assert_eq!(alpha_blend((0, 0, 0), (255, 255, 255), 0.35), (89, 89, 89));
+        assert_eq!(alpha_blend((10, 20, 30), (200, 100, 0), 0.5), (105, 60, 15));
+        // alpha 0 and 1 are the endpoints
+        assert_eq!(alpha_blend((1, 2, 3), (9, 9, 9), 0.0), (1, 2, 3));
+        assert_eq!(alpha_blend((1, 2, 3), (9, 9, 9), 1.0), (9, 9, 9));
+    }
+
+    #[test]
+    fn corrected_fg_stays_readable_under_selection_tint() {
+        // Fastty default theme: background #151515, accent #FDA906. Selected
+        // cells paint the accent at SELECTION_OVERLAY_ALPHA over the cell
+        // background, under the glyphs — so the background a corrected fg
+        // must read against is the blend, not the plain cell background.
+        let bg = (0x15, 0x15, 0x15);
+        let accent = (0xFD, 0xA9, 0x06);
+        let tint = alpha_blend(bg, accent, 0.35);
+
+        // TUI dim grays (Claude Code / opencode use these constantly).
+        for dim in [(0x5A, 0x5A, 0x5A), (0x58, 0x58, 0x58), (0x76, 0x76, 0x76)] {
+            let fixed = correct_fg(dim, tint);
+            assert!(
+                contrast_ratio(fixed, tint) >= LEAVE_UNTOUCHED_RATIO,
+                "corrected {dim:?} must read on the selection tint, got {fixed:?} at {:?}",
+                contrast_ratio(fixed, tint)
+            );
+        }
+
+        // The invisible-selection repro, pinned: #767676 passes the ≥3:1
+        // check against the plain background (so correction lets it
+        // through untouched) but sinks below readable once the selection
+        // tint lands on top of it — the span builder must correct against
+        // the tint instead (see `render_pane_tree_node`).
+        let passthrough = correct_fg((0x76, 0x76, 0x76), bg);
+        assert_eq!(passthrough, (0x76, 0x76, 0x76)); // ≥3:1 on bg → untouched
+        assert!(contrast_ratio(passthrough, tint) < LEAVE_UNTOUCHED_RATIO);
+
+        // And correcting that same color against the tint rescues it —
+        // minimally, not by blowing it out to near-white.
+        let rescued = correct_fg((0x76, 0x76, 0x76), tint);
+        assert!(contrast_ratio(rescued, tint) >= LEAVE_UNTOUCHED_RATIO);
+        assert!(contrast_ratio(rescued, tint) <= TARGET_RATIO + 1.0);
+    }
+
+    #[test]
+    fn correction_is_minimal_not_blown_out() {
+        // A dim TUI gray on the dark default background: brightened just
+        // enough to read, staying a mid gray. The old bisection converged
+        // to the passing extreme instead of the boundary and returned
+        // near-white, erasing dim/bright hierarchy in TUIs.
+        let bg = (0x15, 0x15, 0x15);
+        let dim = (0x5A, 0x5A, 0x5A);
+        let fixed = correct_fg(dim, bg);
+        let r = contrast_ratio(fixed, bg);
+        assert!(r >= TARGET_RATIO - 0.3, "must reach the target, got {r}");
+        assert!(r <= TARGET_RATIO + 1.0, "must stop near the target, got {r} for {fixed:?}");
+        assert!(relative_luminance(fixed) < 0.5, "stays a mid gray, got {fixed:?}");
     }
 
     #[test]
@@ -300,3 +360,4 @@ mod tests {
         assert_eq!(indexed_to_rgb(15), None);
     }
 }
+

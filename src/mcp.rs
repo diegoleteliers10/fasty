@@ -48,13 +48,14 @@ fn tools_json() -> Vec<Value> {
         ),
         tool(
             "fastty_spawn_session",
-            "Start a new headless terminal session inside fastty's daemon and return its id. Without a command it runs the user's shell. Use fastty_write_session to type into it and fastty_read_screen to see it.",
+            "Start a new terminal session inside fastty and return its id. Without a command it runs the user's shell. By default (open=true) the session also opens as a visible tab in the user's fastty window, so the user can watch and join in; set open=false to keep it headless. Use fastty_write_session to type into it and fastty_read_screen to see it.",
             json!({
                 "command": { "type": "string", "description": "Program to run (defaults to the user's shell)." },
                 "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments for the program." },
                 "cwd": { "type": "string", "description": "Working directory (defaults to the home directory)." },
                 "cols": { "type": "integer", "description": "Terminal width (default 80)." },
                 "rows": { "type": "integer", "description": "Terminal height (default 24)." },
+                "open": { "type": "boolean", "description": "Open the session as a visible tab in the running fastty window (default true)." },
             }),
             &[],
         ),
@@ -79,7 +80,7 @@ fn tools_json() -> Vec<Value> {
         ),
         tool(
             "fastty_resize_session",
-            "Resize a session's terminal grid.",
+            "Resize a headless session's terminal grid. GUI panes always follow the window size, so this only matters for headless sessions; to change on-screen layout use fastty_resize_pane or fastty_resize_window.",
             json!({
                 "id": { "type": "integer", "description": "Session id." },
                 "cols": { "type": "integer", "description": "New width in columns." },
@@ -88,10 +89,56 @@ fn tools_json() -> Vec<Value> {
             &["id", "cols", "rows"],
         ),
         tool(
+            "fastty_layout",
+            "Describe the fastty window layout: every tab with its panes (id, title, cwd, size, which is active). Use this to see which sessions share a tab before splitting or focusing. Returns an empty list when no fastty window is running.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "fastty_split_pane",
+            "Split a visible pane in the fastty window: create a new pane next to it (same tab) and return its session id. The new pane behaves like any session — read, write, resize, close all work on it. Requires a running fastty window.",
+            json!({
+                "id": { "type": "integer", "description": "Existing pane/session id to split (from fastty_layout or fastty_list_sessions)." },
+                "direction": { "type": "string", "enum": ["left", "right", "top", "down"], "description": "Which side of the target the new pane takes." },
+                "command": { "type": "string", "description": "Program to run in the new pane (defaults to the user's shell)." },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments for the program." },
+                "cwd": { "type": "string", "description": "Working directory (defaults to the target pane's cwd)." },
+            }),
+            &["id", "direction"],
+        ),
+        tool(
+            "fastty_resize_pane",
+            "Grow or shrink a visible pane by moving the divider on one of its sides. delta is a fraction of the split axis (0.05 moves it 5%). Requires a running fastty window.",
+            json!({
+                "id": { "type": "integer", "description": "Pane/session id." },
+                "direction": { "type": "string", "enum": ["left", "right", "top", "down"], "description": "Which divider to move — the side of the pane to push." },
+                "delta": { "type": "number", "description": "How far to move the divider, as a fraction of the axis (default 0.05)." },
+            }),
+            &["id", "direction"],
+        ),
+        tool(
+            "fastty_focus_pane",
+            "Bring a pane's tab to the front of the fastty window and make the pane active, so the user sees what you're working on. Requires a running fastty window.",
+            json!({
+                "id": { "type": "integer", "description": "Pane/session id." },
+            }),
+            &["id"],
+        ),
+        tool(
+            "fastty_resize_window",
+            "Resize the fastty window itself, approximately to cols x rows for the active pane. For moving pane dividers use fastty_resize_pane. Requires a running fastty window.",
+            json!({
+                "cols": { "type": "integer", "description": "Target width in columns (min 20)." },
+                "rows": { "type": "integer", "description": "Target height in rows (min 5)." },
+            }),
+            &["cols", "rows"],
+        ),
+        tool(
             "fastty_close_session",
-            "Terminate a headless session and free it. GUI panes can't be closed through MCP.",
+            "Terminate a session and free it. Headless sessions close directly. GUI tabs (the user's own panes) answer not_closable; retry with force=true to close them too, killing their running process.",
             json!({
                 "id": { "type": "integer", "description": "Session id." },
+                "force": { "type": "boolean", "description": "Also close GUI-owned tabs, killing their running process (default false)." },
             }),
             &["id"],
         ),
@@ -296,10 +343,17 @@ fn call_tool(name: &str, args: &Value) -> Result<String, String> {
             let cwd = args.get("cwd").and_then(Value::as_str);
             let cols = args.get("cols").and_then(Value::as_u64).map(|v| v as usize);
             let rows = args.get("rows").and_then(Value::as_u64).map(|v| v as usize);
-            match send_and_read(&Request::Spawn { command: command.map(str::to_string), args: tool_args, cwd: cwd.map(str::to_string), cols, rows })? {
-                Response::Spawned { id } => Ok(json!({
+            let open = args.get("open").and_then(Value::as_bool).unwrap_or(true);
+            match send_and_read(&Request::Spawn { command: command.map(str::to_string), args: tool_args, cwd: cwd.map(str::to_string), cols, rows, open })? {
+                Response::Spawned { id, opened } => Ok(json!({
                     "id": id,
-                    "note": "session started; type with fastty_write_session, read with fastty_read_screen"
+                    "note": if open && opened {
+                        "session started and opened as a tab in the fastty window; type with fastty_write_session, read with fastty_read_screen"
+                    } else if open {
+                        "session started headless (no fastty window is running); type with fastty_write_session, read with fastty_read_screen"
+                    } else {
+                        "headless session started; type with fastty_write_session, read with fastty_read_screen"
+                    }
                 })
                 .to_string()),
                 Response::Error { code, message } => Err(format!("{code}: {message}")),
@@ -349,10 +403,91 @@ fn call_tool(name: &str, args: &Value) -> Result<String, String> {
         }
         "fastty_close_session" => {
             let id = args.get("id").and_then(Value::as_u64).ok_or("missing id")? as usize;
-            match send_and_read(&Request::Close { id })? {
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            match send_and_read(&Request::Close { id, force })? {
                 Response::Closed { id } => Ok(json!({ "closed": id }).to_string()),
                 Response::Error { code, message } => Err(format!("{code}: {message}")),
                 _ => Err("unexpected daemon response to close".to_string()),
+            }
+        }
+        "fastty_layout" => {
+            match send_and_read(&Request::Layout)? {
+                Response::Layout { tabs } => {
+                    Ok(serde_json::to_string_pretty(&tabs).unwrap_or_else(|_| "[]".to_string()))
+                }
+                Response::Error { code, message } => Err(format!("{code}: {message}")),
+                _ => Err("unexpected daemon response to layout".to_string()),
+            }
+        }
+        "fastty_split_pane" => {
+            let id = args.get("id").and_then(Value::as_u64).ok_or("missing id")? as usize;
+            let direction = args
+                .get("direction")
+                .and_then(Value::as_str)
+                .ok_or("missing direction")?
+                .to_string();
+            let command = args.get("command").and_then(Value::as_str);
+            let empty_args: Vec<String> = Vec::new();
+            let split_args = args
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or(empty_args);
+            let cwd = args.get("cwd").and_then(Value::as_str);
+            match send_and_read(&Request::SplitPane {
+                id,
+                direction,
+                command: command.map(str::to_string),
+                args: split_args,
+                cwd: cwd.map(str::to_string),
+            })? {
+                Response::PaneSplit { id } => Ok(json!({
+                    "id": id,
+                    "note": "pane created next to the target; it is a normal session (read/write/close work)"
+                })
+                .to_string()),
+                Response::Error { code, message } => Err(format!("{code}: {message}")),
+                _ => Err("unexpected daemon response to split_pane".to_string()),
+            }
+        }
+        "fastty_resize_pane" => {
+            let id = args.get("id").and_then(Value::as_u64).ok_or("missing id")? as usize;
+            let direction = args
+                .get("direction")
+                .and_then(Value::as_str)
+                .ok_or("missing direction")?
+                .to_string();
+            let delta = args
+                .get("delta")
+                .and_then(Value::as_f64)
+                .map(|v| v as f32)
+                .unwrap_or(0.05);
+            match send_and_read(&Request::ResizePane { id, direction, delta })? {
+                Response::Done { .. } => Ok(json!({ "ok": true }).to_string()),
+                Response::Error { code, message } => Err(format!("{code}: {message}")),
+                _ => Err("unexpected daemon response to resize_pane".to_string()),
+            }
+        }
+        "fastty_focus_pane" => {
+            let id = args.get("id").and_then(Value::as_u64).ok_or("missing id")? as usize;
+            match send_and_read(&Request::FocusPane { id })? {
+                Response::Done { .. } => Ok(json!({ "ok": true }).to_string()),
+                Response::Error { code, message } => Err(format!("{code}: {message}")),
+                _ => Err("unexpected daemon response to focus_pane".to_string()),
+            }
+        }
+        "fastty_resize_window" => {
+            let cols = args.get("cols").and_then(Value::as_u64).ok_or("missing cols")? as usize;
+            let rows = args.get("rows").and_then(Value::as_u64).ok_or("missing rows")? as usize;
+            match send_and_read(&Request::ResizeWindow { cols, rows })? {
+                Response::Done { .. } => Ok(json!({ "ok": true }).to_string()),
+                Response::Error { code, message } => Err(format!("{code}: {message}")),
+                _ => Err("unexpected daemon response to resize_window".to_string()),
             }
         }
         "fastty_run_command" => {
@@ -386,8 +521,9 @@ fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<Stri
         cwd: cwd.map(str::to_string),
         cols: Some(RUN_COMMAND_COLS),
         rows: Some(RUN_COMMAND_ROWS),
+        open: false,
     })? {
-        Response::Spawned { id } => id,
+        Response::Spawned { id, .. } => id,
         Response::Error { code, message } => return Err(format!("{code}: {message}")),
         _ => return Err("unexpected daemon response to spawn".to_string()),
     };
@@ -437,7 +573,7 @@ fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<Stri
 
 #[cfg(unix)]
 fn close_session_quietly(id: usize) -> Result<(), String> {
-    match send_and_read(&Request::Close { id })? {
+    match send_and_read(&Request::Close { id, force: false })? {
         Response::Closed { .. } => Ok(()),
         Response::Error { code, message } => Err(format!("{code}: {message}")),
         _ => Ok(()),
@@ -825,11 +961,32 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_lists_seven_tools_with_schemas() {
+    fn dispatch_lists_all_tools_with_schemas() {
         let msg = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" });
         let resp = dispatch(&msg).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        let expected = [
+            "fastty_list_sessions",
+            "fastty_spawn_session",
+            "fastty_write_session",
+            "fastty_read_screen",
+            "fastty_resize_session",
+            "fastty_close_session",
+            "fastty_run_command",
+            "fastty_layout",
+            "fastty_split_pane",
+            "fastty_resize_pane",
+            "fastty_focus_pane",
+            "fastty_resize_window",
+        ];
+        assert_eq!(tools.len(), expected.len());
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for name in expected {
+            assert!(names.contains(&name), "missing tool {name}");
+        }
         for t in tools {
             assert!(t["inputSchema"]["properties"].is_object(), "tool {} schema", t["name"]);
         }

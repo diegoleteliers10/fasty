@@ -35,8 +35,14 @@ Un objeto JSON por línea (`\n`-terminated) en ambas direcciones.
 {"cmd": "detach", "id": 1}
 {"cmd": "write", "id": 1, "data": "<base64>"}
 {"cmd": "resize", "id": 1, "cols": 80, "rows": 24}
-{"cmd": "spawn", "command": "zsh", "args": ["-l"], "cwd": "/home/user", "cols": 80, "rows": 24}
+{"cmd": "spawn", "command": "zsh", "args": ["-l"], "cwd": "/home/user", "cols": 80, "rows": 24, "open": true}
 {"cmd": "close", "id": 1}
+{"cmd": "close", "id": 1, "force": true}
+{"cmd": "split_pane", "id": 1, "direction": "right", "cwd": "/home/user"}
+{"cmd": "resize_pane", "id": 3, "direction": "left", "delta": 0.05}
+{"cmd": "focus_pane", "id": 3}
+{"cmd": "layout"}
+{"cmd": "resize_window", "cols": 120, "rows": 40}
 ```
 
 - `id` es el `PaneId` de fastty (un `usize`, único por proceso — cada split
@@ -61,8 +67,13 @@ Un objeto JSON por línea (`\n`-terminated) en ambas direcciones.
   a la misma sesión desde otra conexión.
 - `resize`: actualiza dinámicamente las dimensiones en columnas y filas de la
   terminal (`cols`, `rows`) y emite `SIGWINCH` en el kernel PTY.
-- `spawn`: crea una nueva sesión de terminal headless/remota y devuelve `{"event": "spawned", "id": <id>}`.
-- `close`: cierra y desregistra la sesión especificada por `id`. Solo se pueden cerrar sesiones headless creadas remotamente vía `spawn`. Las sesiones GUI abiertas en la ventana devuelven error `not_closable`.
+- `spawn`: crea una nueva sesión de terminal headless/remota y devuelve `{"event": "spawned", "id": <id>, "opened": <bool>}`. Con `"open": true` la sesión además se abre como un tab visible en la ventana de fastty; `"opened"` en la respuesta indica si eso sucedió (`false` cuando no hay ventana corriendo o no se pidió `open`). La sesión sigue siendo la misma — mismo `id`, cerrable vía `close` — y el renderizado la redimensiona a la geometría real del tab.
+- `close`: cierra y desregistra la sesión especificada por `id`. Las sesiones headless (creadas vía `spawn`, con o sin `open`) se cierran directo. Las sesiones GUI abiertas por el usuario en la ventana devuelven error `not_closable` — son tabs del usuario — salvo que se mande `"force": true`, que mata su proceso (igual que cerrar el tab en la ventana) y la desregistra.
+- `split_pane`: parte un pane visible de la ventana creando un pane nuevo a su lado (mismo tab, `"direction"`: `left`/`right`/`top`/`down`) y devuelve `{"event": "pane_split", "id": <nuevo id>}`. El pane nuevo es una sesión GUI normal (list/write/close funcionan). `command`/`args`/`cwd` opcionales (por defecto el shell del usuario y el cwd del pane objetivo). Sin ventana corriendo: error `no_gui`.
+- `resize_pane`: mueve el divisor del lado indicado (`"direction"`) del pane, `delta` es una fracción del eje del split (default 0.05, se clampea a ±0.5). Responde `done` con `cmd: "resize_pane"`.
+- `focus_pane`: trae el tab del pane al frente y lo hace activo, para que el usuario vea lo que el agente está tocando.
+- `layout`: devuelve `{"event": "layout", "tabs": [...]}` con la estructura completa de la ventana — cada tab con sus panes (id, title, cwd, activo, tamaño). Sesiones headless sin tab no aparecen aquí; están en `list`.
+- `resize_window`: redimensiona la ventana de fastty aproximándose a `cols` x `rows` del pane activo (con splits es aproximado; para mover divisores usar `resize_pane`). Responde `done` con `cmd: "resize_window"`.
 - `binary_snapshot`: solicita un snapshot binario ultrarrápido con cabecera `FST1` (comprimido con Deflate).
 
 ### Responses (daemon → cliente)
@@ -138,7 +149,7 @@ sesión real (poniendo la terminal local en modo raw, igual que `ssh`/`tmux atta
 `Ctrl+\` hace `detach` limpio sin cerrar la sesión. En modo `--read-only`, el input
 local se descarta excepto por `Ctrl+\` para desadjuntarse.
 
-### Control desde el CLI (`spawn` / `close` / `resize` / `write` / `list`)
+### Control desde el CLI (`spawn` / `close` / `split` / `resize` / `write` / `list`)
 
 El mismo binario expone subcomandos de control sobre el daemon, pensados
 para scripts y agentes:
@@ -149,6 +160,9 @@ id=$(fastty spawn --cwd ~/api -- bun run dev)
 
 # Escribir en su PTY (con --enter agrega \r y submita la línea)
 fastty write $id --enter 'git status'
+
+# Partir un pane visible de la ventana (imprime el id del pane nuevo)
+new=$(fastty split $id --direction right)
 
 # Redimensionar y cerrar
 fastty resize $id 120 40
@@ -161,8 +175,10 @@ fastty list --json
 `resize` y `write` usan el campo opt-in `ack: true` de sus requests y
 esperan la respuesta `done` (o `error`) antes de salir, así el exit code
 del CLI refleja si la operación llegó. Los clientes que omiten `ack`
-mantienen el comportamiento silencioso original. `close` sobre una sesión
-GUI devuelve `not_closable` (solo las headless se cierran por protocolo);
+mantienen el comportamiento silencioso original. `fastty close <id>` sobre
+una sesión GUI devuelve `not_closable` (solo las headless se cierran por
+protocolo); `fastty close <id> --force` también cierra tabs GUI matando su
+proceso. `fastty spawn --open` abre la sesión como tab en la ventana.
 `spawn` fallido devuelve `spawn_failed`.
 
 Viven en `src/daemon_client.rs`, usando los mismos tipos `Request`/`Response`

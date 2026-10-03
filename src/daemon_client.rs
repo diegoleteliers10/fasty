@@ -445,22 +445,24 @@ pub fn run_attach_command(id: usize, read_only: bool, wait_secs: Option<u64>) ->
     }
 }
 
-/// `fastty spawn [--cwd DIR] [--cols N] [--rows N] [--json] [--wait[=N]] [--] [COMMAND [ARGS...]]`
+/// `fastty spawn [--cwd DIR] [--cols N] [--rows N] [--open] [--json] [--wait[=N]] [--] [COMMAND [ARGS...]]`
 ///
-/// Starts a headless session in the running fastty daemon and prints its
-/// id. Without a command the session runs the default shell.
+/// Starts a session in the running fastty daemon and prints its id.
+/// Without a command the session runs the default shell. With `--open` it
+/// also surfaces as a tab in the fastty window (when one is running).
 pub fn run_spawn_command(
     command: Option<String>,
     args: Vec<String>,
     cwd: Option<String>,
     cols: Option<usize>,
     rows: Option<usize>,
+    open: bool,
     wait_secs: Option<u64>,
     json: bool,
 ) -> ! {
     #[cfg(not(unix))]
     {
-        let _ = (command, args, cwd, cols, rows, wait_secs, json);
+        let _ = (command, args, cwd, cols, rows, open, wait_secs, json);
         eprintln!("fastty spawn: not supported on this platform yet.");
         std::process::exit(1);
     }
@@ -473,18 +475,18 @@ pub fn run_spawn_command(
                 std::process::exit(1);
             }
         };
-        let req = Request::Spawn { command, args, cwd, cols, rows };
+        let req = Request::Spawn { command, args, cwd, cols, rows, open };
         if let Err(e) = send_request(&mut stream, &req) {
             eprintln!("fastty spawn: {e}");
             std::process::exit(1);
         }
         let mut reader = std::io::BufReader::new(stream);
         match read_response(&mut reader) {
-            Ok(Response::Spawned { id }) => {
+            Ok(Response::Spawned { id, opened }) => {
                 if json {
                     println!(
                         "{}",
-                        serde_json::json!({ "event": "spawned", "id": id })
+                        serde_json::json!({ "event": "spawned", "id": id, "opened": opened })
                     );
                 } else {
                     println!("{id}");
@@ -507,12 +509,80 @@ pub fn run_spawn_command(
     }
 }
 
-/// `fastty close <id>` — terminates a headless session in the daemon.
-/// GUI panes cannot be closed from the CLI (`not_closable`).
-pub fn run_close_command(id: usize, wait_secs: Option<u64>) -> ! {
+/// `fastty split <pane-id> [--direction left|right|top|down] [--cwd DIR]
+/// [--json] [--wait[=N]] [--] [COMMAND [ARGS...]]` — splits a visible pane
+/// in the running fastty GUI and prints the new pane's session id.
+pub fn run_split_pane_command(
+    pane_id: usize,
+    direction: String,
+    command: Option<String>,
+    args: Vec<String>,
+    cwd: Option<String>,
+    wait_secs: Option<u64>,
+    json: bool,
+) -> ! {
     #[cfg(not(unix))]
     {
-        let _ = (id, wait_secs);
+        let _ = (pane_id, direction, command, args, cwd, wait_secs, json);
+        eprintln!("fastty split: not supported on this platform yet.");
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        let mut stream = match connect_with_retry(wait_secs) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("fastty split: {e}");
+                std::process::exit(1);
+            }
+        };
+        let req = Request::SplitPane {
+            id: pane_id,
+            direction,
+            command,
+            args,
+            cwd,
+        };
+        if let Err(e) = send_request(&mut stream, &req) {
+            eprintln!("fastty split: {e}");
+            std::process::exit(1);
+        }
+        let mut reader = std::io::BufReader::new(stream);
+        match read_response(&mut reader) {
+            Ok(Response::PaneSplit { id }) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "event": "pane_split", "id": id })
+                    );
+                } else {
+                    println!("{id}");
+                }
+                std::process::exit(0);
+            }
+            Ok(Response::Error { code, message }) => {
+                eprintln!("fastty split: {code}: {message}");
+                std::process::exit(1);
+            }
+            Ok(_) => {
+                eprintln!("fastty split: unexpected response from fastty");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("fastty split: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// `fastty close <id> [--force]` — terminates a headless session in the
+/// daemon. GUI panes answer `not_closable` unless `--force` is given, which
+/// kills their process and closes the tab.
+pub fn run_close_command(id: usize, force: bool, wait_secs: Option<u64>) -> ! {
+    #[cfg(not(unix))]
+    {
+        let _ = (id, force, wait_secs);
         eprintln!("fastty close: not supported on this platform yet.");
         std::process::exit(1);
     }
@@ -525,7 +595,7 @@ pub fn run_close_command(id: usize, wait_secs: Option<u64>) -> ! {
                 std::process::exit(1);
             }
         };
-        if let Err(e) = send_request(&mut stream, &Request::Close { id }) {
+        if let Err(e) = send_request(&mut stream, &Request::Close { id, force }) {
             eprintln!("fastty close: {e}");
             std::process::exit(1);
         }

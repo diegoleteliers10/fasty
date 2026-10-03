@@ -6,6 +6,37 @@ use gpui::{
 
 use crate::ui::root_view::{Selection, StyledSpan};
 
+/// Opacity of the accent-tint quad painted over selected cells. Kept next to
+/// the selection math because the span builder blends the same tint into the
+/// background it corrects program colors against (see
+/// `RootView::render_pane_tree_node`) — the two must stay in sync or
+/// corrected text stops reading exactly where the user is looking.
+pub const SELECTION_OVERLAY_ALPHA: f32 = 0.35;
+
+/// Column range of the selection on a given grid line, in selection
+/// coordinates (line 0 = top of the live viewport, negative = scrollback).
+/// `None` when the line has no selected cells. Shared by the element's
+/// paint pass and the span builder's contrast correction so both agree on
+/// what "selected" means.
+pub fn selection_columns_on_line(sel: &Selection, line: i32) -> Option<(usize, usize)> {
+    let (min_p, max_p) = if sel.start <= sel.end {
+        (sel.start, sel.end)
+    } else {
+        (sel.end, sel.start)
+    };
+    if line < min_p.line.0 || line > max_p.line.0 {
+        None
+    } else if min_p.line.0 == max_p.line.0 {
+        Some((min_p.column.0, max_p.column.0 + 1))
+    } else if line == min_p.line.0 {
+        Some((min_p.column.0, usize::MAX))
+    } else if line == max_p.line.0 {
+        Some((0, max_p.column.0 + 1))
+    } else {
+        Some((0, usize::MAX))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct VisibleImage {
     pub row: i64,
@@ -151,25 +182,7 @@ impl Element for TerminalGridElement {
 
             // 2. Selection
             if let Some(sel) = self.selection_range {
-                let (min_p, max_p) = if sel.start <= sel.end {
-                    (sel.start, sel.end)
-                } else {
-                    (sel.end, sel.start)
-                };
-                let sel_col_range = if grid_line_idx < min_p.line.0 || grid_line_idx > max_p.line.0
-                {
-                    None
-                } else if min_p.line.0 == max_p.line.0 {
-                    Some((min_p.column.0, max_p.column.0 + 1))
-                } else if grid_line_idx == min_p.line.0 {
-                    Some((min_p.column.0, 300))
-                } else if grid_line_idx == max_p.line.0 {
-                    Some((0, max_p.column.0 + 1))
-                } else {
-                    Some((0, 300))
-                };
-
-                if let Some((c_start, c_end)) = sel_col_range {
+                if let Some((c_start, c_end)) = selection_columns_on_line(&sel, grid_line_idx) {
                     let x_start = (c_start as f32 * self.cell_w).floor();
                     let x_end = (c_end as f32 * self.cell_w).floor();
                     let quad_w = if x_end >= self.row_width - 1.0 {
@@ -181,7 +194,7 @@ impl Element for TerminalGridElement {
                         point(origin.x + px(x_start), y),
                         size(px(quad_w), px(self.line_h)),
                     );
-                    window.paint_quad(fill(sel_bounds, self.theme.accent.opacity(0.35)));
+                    window.paint_quad(fill(sel_bounds, self.theme.accent.opacity(SELECTION_OVERLAY_ALPHA)));
                 }
             }
 

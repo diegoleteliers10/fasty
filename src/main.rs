@@ -144,6 +144,7 @@ fn main() {
             let mut cols: Option<usize> = None;
             let mut rows: Option<usize> = None;
             let mut json = false;
+            let mut open = false;
             let mut wait: Option<u64> = None;
             let mut rest: Vec<String> = Vec::new();
             while let Some(arg) = subcommand_args.next() {
@@ -154,6 +155,8 @@ fn main() {
                         wait = Some(w);
                     } else if arg == "--json" {
                         json = true;
+                    } else if arg == "--open" {
+                        open = true;
                     } else if arg == "--cwd" {
                         cwd = subcommand_args.next();
                     } else if let Some(v) = arg.strip_prefix("--cwd=") {
@@ -180,24 +183,75 @@ fn main() {
             if rest.len() > 1 {
                 args = rest[1..].to_vec();
             }
-            fastty::daemon_client::run_spawn_command(command, args, cwd, cols, rows, wait, json);
+            fastty::daemon_client::run_spawn_command(command, args, cwd, cols, rows, open, wait, json);
+        }
+        Some("split") => {
+            // `fastty split <pane-id> --direction right [--cwd DIR] [-- COMMAND]`
+            let Some(pane_id) = subcommand_args.next().and_then(|s| s.parse::<usize>().ok()) else {
+                eprintln!("Usage: fastty split <pane-id> --direction <left|right|top|down> [--cwd DIR] [--json] [--wait[=SECONDS]] [--] [COMMAND [ARGS...]]");
+                std::process::exit(1);
+            };
+            let mut direction = String::new();
+            let mut command: Option<String> = None;
+            let mut args: Vec<String> = Vec::new();
+            let mut cwd: Option<String> = None;
+            let mut json = false;
+            let mut wait: Option<u64> = None;
+            let mut rest: Vec<String> = Vec::new();
+            while let Some(arg) = subcommand_args.next() {
+                if rest.is_empty() {
+                    if arg == "--" {
+                        continue;
+                    } else if let Some(w) = parse_wait_flag(&arg) {
+                        wait = Some(w);
+                    } else if arg == "--json" {
+                        json = true;
+                    } else if let Some(v) = arg.strip_prefix("--direction=") {
+                        direction = v.to_string();
+                    } else if arg == "--direction" {
+                        direction = subcommand_args.next().unwrap_or_default();
+                    } else if arg == "--cwd" {
+                        cwd = subcommand_args.next();
+                    } else if let Some(v) = arg.strip_prefix("--cwd=") {
+                        cwd = Some(v.to_string());
+                    } else if arg.starts_with('-') && arg.len() > 1 {
+                        eprintln!("fastty split: unknown flag {arg}");
+                        std::process::exit(1);
+                    } else {
+                        rest.push(arg);
+                    }
+                } else {
+                    rest.push(arg);
+                }
+            }
+            if !matches!(direction.as_str(), "left" | "right" | "top" | "down") {
+                eprintln!("fastty split: --direction must be left, right, top, or down");
+                std::process::exit(1);
+            }
+            command = rest.first().cloned();
+            if rest.len() > 1 {
+                args = rest[1..].to_vec();
+            }
+            fastty::daemon_client::run_split_pane_command(pane_id, direction, command, args, cwd, wait, json);
         }
         Some("close") => {
             let Some(id) = subcommand_args.next().and_then(|s| s.parse::<usize>().ok()) else {
-                eprintln!("Usage: fastty close <session-id> [--wait[=SECONDS]]");
+                eprintln!("Usage: fastty close <session-id> [--force] [--wait[=SECONDS]]");
                 std::process::exit(1);
             };
             let mut wait: Option<u64> = None;
+            let mut force = false;
             for arg in subcommand_args {
                 match parse_wait_flag(&arg) {
                     Some(w) => wait = Some(w),
+                    None if arg == "--force" => force = true,
                     None => {
                         eprintln!("fastty close: unknown flag {arg}");
                         std::process::exit(1);
                     }
                 }
             }
-            fastty::daemon_client::run_close_command(id, wait);
+            fastty::daemon_client::run_close_command(id, force, wait);
         }
         Some("resize") => {
             let mut rest: Vec<String> = Vec::new();
