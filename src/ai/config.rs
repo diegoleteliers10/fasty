@@ -145,6 +145,14 @@ pub struct AiConfig {
     /// Used to compute context usage % in the agent panel.
     #[serde(default = "default_context_window")]
     pub context_window: u32,
+    /// Learned auto-allow: count manual approvals of the same command
+    /// family and offer to auto-allow it after enough confirmations.
+    #[serde(default = "default_learned_allow")]
+    pub learned_allow: bool,
+}
+
+fn default_learned_allow() -> bool {
+    true
 }
 
 fn default_context_window() -> u32 {
@@ -272,6 +280,7 @@ impl Default for AiConfig {
             permission_mode: default_permission_mode(),
             providers: default_providers(),
             context_window: default_context_window(),
+            learned_allow: default_learned_allow(),
         }
     }
 }

@@ -1,5 +1,6 @@
 //! ANSI parser — wrapper around `vte::Parser` for VT sequence parsing.
 
+pub mod kitty_clipboard;
 pub mod kitty_graphics;
 
 use alacritty_terminal::vte::{Params, Parser, Perform};

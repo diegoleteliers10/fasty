@@ -3,6 +3,7 @@ pub mod config;
 pub mod diff;
 pub mod document;
 pub mod image;
+pub mod learned_allow;
 pub mod model;
 pub mod permissions;
 pub mod prompt;

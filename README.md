@@ -17,7 +17,7 @@ Fastty is a modern, high-performance terminal emulator designed for speed, low m
 - **Cross-Platform**: First-class support for macOS, Linux (Wayland/X11), and Windows with automatic shell detection (`zsh`, `fish`, `bash`, `powershell`, `pwsh`, `cmd`).
 - **Built-in Status Bar & Git Integration**: Branch indicator, worktree switcher (`⌘⌥W` / `Ctrl+Alt+W`), sync status, and command execution timer.
 - **Command Palette & SSH Manager**: Fast command navigation (`⌘P` / `Ctrl+Shift+P`) and SSH connection manager (`⌘O` / `Ctrl+Shift+O`).
-- **Config & Theming**: TOML configuration (`fastty.toml`) with live reload and built-in themes (*Default*, *Catppuccin*, *One Dark*, *Solarized Dark*, *High Contrast*).
+- **Config & Theming**: TOML configuration (`fastty.toml`) with live reload and 20 built-in themes — Catppuccin (Mocha/Frappé/Macchiato/Latte), Dracula, Nord, Tokyo Night, Gruvbox, Rosé Pine, One, Solarized, Kanagawa — including light variants, plus user JSON themes in `themes/`.
 
 ---
 
@@ -199,7 +199,7 @@ right_widgets = ["cwd", "duration", "exit_code"]
 | **SSH Manager** | `⌘O` | `Ctrl+Shift+O` |
 | **Git Worktrees** | `⌘⌥W` | `Ctrl+Alt+W` |
 | **Project Jumper** | `⌘J` | `Ctrl+Shift+J` |
-| **Insert File Path** | `⌃⌘,` | `Ctrl+Super+,` |
+| **Universal Insert** | `⌃⌘,` | `Ctrl+Super+,` |
 | **Search in Scrollback** | `⌘F` | `Ctrl+F` |
 | **Settings** | `⌘,` | `Ctrl+,` |
 | **Clear Scrollback** | `⌘K` | `Ctrl+Shift+K` |

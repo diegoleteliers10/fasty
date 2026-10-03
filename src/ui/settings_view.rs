@@ -1,8 +1,10 @@
 use gpui::{
-    canvas, Context, CursorStyle, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Render, ScrollHandle, ScrollStrategy, SharedString, UniformListScrollHandle, Window,
-    WindowControlArea, WindowHandle, div, prelude::*, px, uniform_list,
+    canvas, Context, CursorStyle, FontWeight, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Render, ScrollHandle, ScrollStrategy, SharedString,
+    UniformListScrollHandle, Window, WindowControlArea, WindowHandle, div,
+    prelude::*, px, uniform_list, Animation, AnimationExt, DefiniteLength,
 };
+use std::time::Duration;
 use icons::common::IconType;
 use parking_lot::Mutex;
 use crate::config::{self, Config};
@@ -11,6 +13,61 @@ use crate::ui::root_view::{available_system_fonts, open_path_or_url};
 use crate::ui::theme::Theme;
 
 pub static SETTINGS_WINDOW_HANDLE: Mutex<Option<WindowHandle<SettingsView>>> = Mutex::new(None);
+
+/// One confetti particle for the config-import celebration ("software
+/// should be fun"). Positions are viewport fractions; the overlay's
+/// animation interpolates them with simple projectile physics from a
+/// center burst, so the whole thing is stateless per frame.
+#[derive(Clone)]
+pub(crate) struct CelebrationParticle {
+    x0: f32,
+    y0: f32,
+    vx: f32,
+    vy: f32,
+    g: f32,
+    w: f32,
+    h: f32,
+    round: bool,
+    color: Hsla,
+}
+
+impl CelebrationParticle {
+    fn burst(seed: u64, theme: &Theme) -> Vec<Self> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut rnd = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as f32 / (1u64 << 31) as f32
+        };
+        let palette = [
+            theme.red,
+            theme.green,
+            theme.yellow,
+            theme.blue,
+            theme.magenta,
+            theme.cyan,
+            theme.accent,
+        ];
+        (0..90)
+            .map(|_| {
+                let round = rnd() > 0.5;
+                let size = 5.0 + rnd() * 4.0;
+                Self {
+                    x0: 0.5 + (rnd() - 0.5) * 0.05,
+                    y0: 0.42 + (rnd() - 0.5) * 0.05,
+                    vx: (rnd() - 0.5) * 0.95,
+                    vy: -(0.22 + rnd() * 0.42),
+                    g: 1.35 + rnd() * 0.55,
+                    w: size,
+                    h: if round { size } else { size + rnd() * 6.0 },
+                    round,
+                    color: palette[(rnd() * palette.len() as f32) as usize % palette.len()],
+                }
+            })
+            .collect()
+    }
+}
 
 /// Full font list for the Appearance combobox. Enumerating fonts is
 /// expensive (DirectWrite COM walk on Windows, `reg query` / `fc-list`
@@ -121,6 +178,11 @@ pub struct SettingsView {
     pub opacity: f32,
     pub cursor_blink: bool,
     pub copy_on_select: bool,
+    pub contrast_correction: bool,
+    /// Confetti generation counter: bumped on every successful config
+    /// import so the overlay remounts and replays its one-shot animation.
+    pub(crate) celebration_generation: u64,
+    pub(crate) celebration_particles: Vec<CelebrationParticle>,
     pub update_channel: String,
     pub update_checking: bool,
     pub update_status_msg: Option<String>,
@@ -148,7 +210,18 @@ pub struct SettingsView {
     pub font_search_state: crate::ui::TextInputState,
     pub font_highlighted_index: usize,
     pub font_scroll_handle: UniformListScrollHandle,
+    /// Theme picker dropdown (Appearance): open flag, highlighted row, and
+    /// its scroll container. Each row is the theme's badge (color dots +
+    /// label), replacing the old wrapping grid of cards.
+    pub theme_dropdown_open: bool,
+    pub theme_dropdown_selected: usize,
+    pub theme_scroll_handle: ScrollHandle,
     pub font_trigger_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
+    /// Window-space bounds of the theme dropdown trigger, measured every
+    /// paint; the dropdown itself renders as a window-level overlay (last
+    /// child of `render`), so group cards with `overflow_hidden` and later
+    /// sections can never clip or cover it.
+    pub theme_trigger_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     pub font_search_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     pub ai_base_url_input: String,
     pub ai_base_url_state: crate::ui::TextInputState,
@@ -227,14 +300,7 @@ impl SettingsView {
             .into_iter()
             .map(|name| {
                 let t = Theme::from_name(&name);
-                let label = match name.as_str() {
-                    "default" => "Fastty Default".to_string(),
-                    "catppuccin" => "Catppuccin Mocha".to_string(),
-                    "one-dark" => "One Dark Pro".to_string(),
-                    "solarized-dark" => "Solarized Dark".to_string(),
-                    "high-contrast" => "High Contrast".to_string(),
-                    other => other.to_string(),
-                };
+        let label = crate::config::pretty_theme_label(&name).to_string();
                 ThemeCardInfo {
                     name,
                     label,
@@ -280,6 +346,9 @@ impl SettingsView {
             opacity: loaded_config.opacity,
             cursor_blink: loaded_config.cursor.blink,
             copy_on_select: loaded_config.copy_on_select,
+            contrast_correction: loaded_config.contrast_correction,
+            celebration_generation: 0,
+            celebration_particles: Vec::new(),
             update_channel: crate::updater::UpdateChannel::parse(&loaded_config.update_channel).as_str().to_string(),
             update_checking: false,
             update_status_msg: None,
@@ -310,9 +379,13 @@ impl SettingsView {
             font_combobox_open: false,
             font_search_query: String::new(),
             font_search_state: crate::ui::TextInputState::default(),
+            theme_dropdown_open: false,
+            theme_dropdown_selected: 0,
+            theme_scroll_handle: ScrollHandle::new(),
             font_highlighted_index: 0,
             font_scroll_handle: UniformListScrollHandle::new(),
             font_trigger_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
+            theme_trigger_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             font_search_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             ai_base_url_state: crate::ui::TextInputState::new(ai_base_url_input.clone()),
             ai_base_url_input,
@@ -449,6 +522,7 @@ impl SettingsView {
         self.scrollback = cfg.scrollback;
         self.cursor_blink = cfg.cursor.blink;
         self.copy_on_select = cfg.copy_on_select;
+        self.contrast_correction = cfg.contrast_correction;
         self.update_channel = crate::updater::UpdateChannel::parse(&cfg.update_channel).as_str().to_string();
         self.tab_layout = cfg.tab_layout;
         self.font_size = cfg.font.size;
@@ -696,6 +770,41 @@ impl SettingsView {
             }
             // Modifier-only or non-f-key bare keys: keep waiting.
             return;
+        }
+        // Theme dropdown: navigate with arrows, commit with Enter, Esc to
+        // close. Runs before the generic escape handling below.
+        if self.theme_dropdown_open {
+            let key_lower = ev.keystroke.key.to_lowercase();
+            let count = self.theme_cards.len();
+            match key_lower.as_str() {
+                "escape" | "esc" => {
+                    self.theme_dropdown_open = false;
+                    cx.notify();
+                    return;
+                }
+                "down" | "arrowdown" if count > 0 => {
+                    self.theme_dropdown_selected = (self.theme_dropdown_selected + 1) % count;
+                    self.theme_scroll_handle.scroll_to_item(self.theme_dropdown_selected);
+                    cx.notify();
+                    return;
+                }
+                "up" | "arrowup" if count > 0 => {
+                    self.theme_dropdown_selected = if self.theme_dropdown_selected == 0 {
+                        count - 1
+                    } else {
+                        self.theme_dropdown_selected - 1
+                    };
+                    self.theme_scroll_handle.scroll_to_item(self.theme_dropdown_selected);
+                    cx.notify();
+                    return;
+                }
+                "enter" | "return" => {
+                    let idx = self.theme_dropdown_selected;
+                    self.select_theme_at(idx, cx);
+                    return;
+                }
+                _ => {}
+            }
         }
         if ev.keystroke.key == "escape" {
             if self.font_combobox_open {
@@ -999,6 +1108,31 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// Opens/closes the theme dropdown; on open, the highlighted row starts
+    /// on the active theme and scrolls it into view.
+    pub fn toggle_theme_dropdown(&mut self, cx: &mut Context<Self>) {
+        self.theme_dropdown_open = !self.theme_dropdown_open;
+        if self.theme_dropdown_open {
+            self.theme_dropdown_selected = self
+                .theme_cards
+                .iter()
+                .position(|c| c.name == self.current_theme_name)
+                .unwrap_or(0);
+            self.theme_scroll_handle.scroll_to_item(self.theme_dropdown_selected);
+        }
+        cx.notify();
+    }
+
+    /// Applies the highlighted theme from the dropdown and closes it.
+    pub fn select_theme_at(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let name = self.theme_cards.get(idx).map(|c| c.name.clone());
+        if let Some(name) = name {
+            self.set_theme(&name, cx);
+        }
+        self.theme_dropdown_open = false;
+        cx.notify();
+    }
+
     pub fn adjust_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.font_size = (self.font_size + delta).clamp(8.0, 36.0);
         self.config.font.size = self.font_size;
@@ -1038,6 +1172,59 @@ impl SettingsView {
         self.save_config();
         crate::config::increment_config_version();
         cx.notify();
+    }
+
+    pub fn toggle_contrast_correction(&mut self, cx: &mut Context<Self>) {
+        self.contrast_correction = !self.contrast_correction;
+        self.config.contrast_correction = self.contrast_correction;
+        self.save_config();
+        crate::config::increment_config_version();
+        cx.notify();
+    }
+
+    /// Fire the confetti: regenerate particles from the current theme and
+    /// bump the generation so the animation element remounts and replays.
+    fn start_celebration(&mut self) {
+        self.celebration_generation += 1;
+        let theme = self.theme;
+        self.celebration_particles =
+            CelebrationParticle::burst(self.celebration_generation, &theme);
+    }
+
+    /// Full-window, click-through confetti overlay. Stateless physics:
+    /// every frame recomputes positions from the animation delta, and the
+    /// particles fade out as `delta` approaches 1.
+    fn render_celebration(&self) -> impl IntoElement {
+        let particles = self.celebration_particles.clone();
+        let gen = self.celebration_generation;
+        div()
+            .absolute()
+            .inset_0()
+            .overflow_hidden()
+            .with_animation(
+                format!("confetti-{gen}"),
+                Animation::new(Duration::from_millis(1800)),
+                move |el, delta| {
+                    let mut out = el;
+                    for p in &particles {
+                        let x = p.x0 + p.vx * delta;
+                        let y = p.y0 + p.vy * delta + 0.5 * p.g * delta * delta;
+                        let opacity = (1.0 - delta).max(0.0).powi(2);
+                        let piece = div()
+                            .absolute()
+                            .top(DefiniteLength::Fraction(y))
+                            .left(DefiniteLength::Fraction(x))
+                            .opacity(opacity)
+                            .bg(p.color)
+                            .when(p.round, |piece| piece.rounded_full())
+                            .when(!p.round, |piece| piece.rounded(px(1.)))
+                            .w(px(p.w))
+                            .h(px(p.h));
+                        out = out.child(piece);
+                    }
+                    out
+                },
+            )
     }
 
     pub fn set_update_channel(&mut self, channel: &str, cx: &mut Context<Self>) {
@@ -1497,6 +1684,10 @@ impl SettingsView {
                     self.config.keybinding_preset,
                 );
                 crate::config::increment_config_version();
+                // "Software should be fun": the migration moment gets its
+                // celebration, a nod to the config-import confetti that
+                // made the rounds in September.
+                self.start_celebration();
                 cx.notify();
             }
             Err(e) => {
@@ -2244,6 +2435,17 @@ impl SettingsView {
                                 false,
                                 theme,
                             ))
+                            .child(render_card_row(
+                                "Automatic Contrast Correction",
+                                Some("Fix program-requested colors that clash with the theme (Oklab lightness, hue preserved)"),
+                                div()
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                        this.toggle_contrast_correction(cx);
+                                    }))
+                                    .child(render_toggle_switch(self.contrast_correction, theme)),
+                                false,
+                                theme,
+                            ))
                             .child({
                                 let scrollback_pills = [
                                     (5000, "5,000"),
@@ -2486,71 +2688,110 @@ impl SettingsView {
                                             ),
                                     ),
                             )
-                            .child(
+                            .child({
+                                let is_open = self.theme_dropdown_open;
+                                // The trigger is the active theme's badge.
+                                let active_card = self
+                                    .theme_cards
+                                    .iter()
+                                    .find(|c| c.name == self.current_theme_name);
+                                let (trig_bg, trig_surf, trig_acc, trig_label) = match active_card
+                                {
+                                    Some(c) => {
+                                        (c.bg_color, c.surf_color, c.acc_color, c.label.clone())
+                                    }
+                                    None => (
+                                        theme.background,
+                                        theme.surface,
+                                        theme.accent,
+                                        self.current_theme_name.clone(),
+                                    ),
+                                };
                                 div()
                                     .p(px(14.))
                                     .flex()
-                                    .flex_row()
-                                    .flex_wrap()
-                                    .gap_2()
-                                    .children(self.theme_cards.iter().map(|card| {
-                                        let is_active = self.current_theme_name == card.name;
-                                        let theme_name_str = card.name.clone();
-                                        let bg_color = card.bg_color;
-                                        let surf_color = card.surf_color;
-                                        let acc_color = card.acc_color;
-                                        let label = card.label.clone();
+                                    .flex_col()
+                                    .child(
                                         div()
-                                            .id(SharedString::from(format!("theme-card-{}", card.name)))
+                                            .relative()
+                                            .w_full()
                                             .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .justify_between()
-                                            .px(px(12.))
-                                            .py(px(8.))
-                                            .rounded(px(8.))
-                                            .bg(if is_active { theme.surface_raised } else { theme.surface })
-                                            .border_1()
-                                            .border_color(if is_active { theme.accent } else { theme.border })
-                                            .hover(move |s| s.bg(theme.surface_raised))
-                                            .cursor(CursorStyle::PointingHand)
-                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                                this.set_theme(&theme_name_str, cx);
-                                            }))
+                                            .flex_col()
+                                            // Trigger: current theme badge + chevron
                                             .child(
                                                 div()
+                                                    .id("theme-dropdown-trigger")
+                                                    .relative()
+                                                    .w_full()
+                                                    .h(px(34.))
+                                                    .px(px(10.))
+                                                    .rounded(px(6.))
+                                                    .bg(if is_open { theme.surface_raised } else { theme.surface })
+                                                    .border_1()
+                                                    .border_color(if is_open { theme.accent } else { theme.border })
+                                                    .hover(move |s| {
+                                                        s.bg(theme.surface_raised)
+                                                            .border_color(theme.accent)
+                                                    })
+                                                    .cursor(CursorStyle::PointingHand)
                                                     .flex()
                                                     .flex_row()
                                                     .items_center()
-                                                    .gap_2p5()
+                                                    .justify_between()
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _ev, _window, cx| {
+                                                            this.toggle_theme_dropdown(cx);
+                                                        }),
+                                                    )
+                                                    .child({
+                                                        let bounds_cell = self.theme_trigger_bounds.clone();
+                                                        canvas(
+                                                            |_, _, _| {},
+                                                            move |bounds, _, _, _| {
+                                                                bounds_cell.set(Some(bounds));
+                                                            },
+                                                        )
+                                                        .absolute()
+                                                        .size_full()
+                                                    })
                                                     .child(
                                                         div()
                                                             .flex()
                                                             .flex_row()
                                                             .items_center()
-                                                            .gap_1()
-                                                            .p(px(2.))
-                                                            .rounded(px(4.))
-                                                            .bg(bg_color)
-                                                            .border_1()
-                                                            .border_color(surf_color)
-                                                            .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(bg_color))
-                                                            .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(surf_color))
-                                                            .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(acc_color)),
+                                                            .gap_2()
+                                                            .child(
+                                                                div()
+                                                                    .flex()
+                                                                    .flex_row()
+                                                                    .items_center()
+                                                                    .gap_1()
+                                                                    .p(px(2.))
+                                                                    .rounded(px(4.))
+                                                                    .bg(trig_bg)
+                                                                    .border_1()
+                                                                    .border_color(trig_surf)
+                                                                    .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(trig_bg))
+                                                                    .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(trig_surf))
+                                                                    .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(trig_acc)),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(12.))
+                                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                                    .text_color(theme.foreground)
+                                                                    .child(trig_label),
+                                                            ),
                                                     )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(11.5))
-                                                            .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                                                            .text_color(if is_active { theme.foreground } else { theme.muted_strong })
-                                                            .child(label),
-                                                    ),
+                                                    .child(render_icon(
+                                                        if is_open { IconType::ChevronUp } else { IconType::ChevronDown },
+                                                        if is_open { theme.accent } else { theme.muted_strong },
+                                                        12.0,
+                                                    )),
                                             )
-                                            .when(is_active, |this| {
-                                                this.child(render_icon(IconType::Check, theme.accent, 12.0))
-                                            })
-                                    })),
-                            ),
+                                    )
+                            }),
                     ),
             )
             // Section 2: Window Transparency
@@ -4537,6 +4778,165 @@ impl Render for SettingsView {
             .overflow_hidden()
             .child(self.render_sidebar(&theme, win_ref, cx))
             .child(self.render_content_pane(&theme, win_ref, cx))
+            .when(self.celebration_generation > 0, |this| {
+                this.child(self.render_celebration())
+            })
+            // Mounted last: the theme dropdown paints above every section
+            // and ignores the group cards' `overflow_hidden`, positioned
+            // from the trigger's measured window-space bounds.
+            .when(self.theme_dropdown_open, |this| {
+                this.child(self.render_theme_dropdown_overlay(&theme, window, cx))
+            })
+    }
+}
+
+impl SettingsView {
+    /// Full-window overlay hosting the theme dropdown list. A transparent
+    /// backdrop closes it on any click; the list anchors to the trigger
+    /// bounds and flips above them when there is more room up there.
+    fn render_theme_dropdown_overlay(
+        &self,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let vp = window.viewport_size();
+        let vp_h = vp.height.to_f64() as f32;
+        let vp_w = vp.width.to_f64() as f32;
+
+        let (left, top, width, open_upward) = match self.theme_trigger_bounds.get() {
+            Some(b) => {
+                let space_below = vp_h - b.bottom().to_f64() as f32;
+                let space_above = b.top().to_f64() as f32;
+                let open_up = space_below < 280.0 && space_above > space_below;
+                (
+                    b.left().to_f64() as f32,
+                    b.top().to_f64() as f32,
+                    b.size.width.to_f64() as f32,
+                    open_up,
+                )
+            }
+            None => (((vp_w - 320.0) / 2.0).max(16.0), vp_h - 300.0, 320.0, false),
+        };
+        let max_list_h = if open_upward {
+            (top - 12.0).clamp(120.0, 280.0)
+        } else {
+            (vp_h - top - 16.0).clamp(120.0, 280.0)
+        };
+
+        div()
+            .id("theme-dropdown-backdrop")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_scroll_wheel(|_ev, _window, cx| {
+                cx.stop_propagation();
+            })
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                this.theme_dropdown_open = false;
+                cx.notify();
+            }))
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, _ev, _window, cx| {
+                this.theme_dropdown_open = false;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("theme-dropdown-popover")
+                    .absolute()
+                    .when(open_upward, |el| el.bottom(px(vp_h - top + 4.0)))
+                    .when(!open_upward, |el| el.top(px(top + 4.0)))
+                    .left(px(left))
+                    .w(px(width.max(300.0)))
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_scroll_wheel(|_ev, _window, cx| {
+                        cx.stop_propagation();
+                    })
+                    .rounded(px(8.))
+                    .bg({
+                        let mut bg = theme.surface_raised;
+                        bg.a = 1.0;
+                        bg
+                    })
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow_lg()
+                    .p(px(6.))
+                    .child(
+                        div()
+                            .id("theme-dropdown-scroll")
+                            .track_scroll(&self.theme_scroll_handle)
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .max_h(px(max_list_h))
+                            .overflow_y_scroll()
+                            .children(self.theme_cards.iter().enumerate().map(|(idx, card)| {
+                                let is_active = self.current_theme_name == card.name;
+                                let is_hovered = idx == self.theme_dropdown_selected;
+                                let bg_color = card.bg_color;
+                                let surf_color = card.surf_color;
+                                let acc_color = card.acc_color;
+                                let label = card.label.clone();
+                                div()
+                                    .id(SharedString::from(format!("theme-option-{}", card.name)))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .px(px(8.))
+                                    .py(px(6.))
+                                    .rounded(px(6.))
+                                    .bg(if is_active { theme.accent.opacity(0.12) } else { theme.surface })
+                                    .when(is_hovered && !is_active, |row| row.bg(theme.hover))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                        if this.theme_dropdown_selected != idx {
+                                            this.theme_dropdown_selected = idx;
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                        this.select_theme_at(idx, cx);
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap_1()
+                                                    .p(px(2.))
+                                                    .rounded(px(4.))
+                                                    .bg(bg_color)
+                                                    .border_1()
+                                                    .border_color(surf_color)
+                                                    .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(bg_color))
+                                                    .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(surf_color))
+                                                    .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(acc_color)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.5))
+                                                    .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                                    .text_color(if is_active { theme.foreground } else { theme.muted_strong })
+                                                    .child(label),
+                                            ),
+                                    )
+                                    .when(is_active, |row| {
+                                        row.child(render_icon(IconType::Check, theme.accent, 12.0))
+                                    })
+                            })),
+                    ),
+            )
     }
 }
 

@@ -54,6 +54,8 @@ pub enum CsiEvent {
     SyncOutputBegin,
     /// `CSI ? ... 2026 ... l` — Synchronized Output frame ends.
     SyncOutputEnd,
+    /// `CSI ? 5522 $ p` — DECRQM probe for the kitty clipboard protocol.
+    QueryKittyClipboard,
 }
 
 /// Byte-level watcher for the CSI sequences fastty handles outside the
@@ -69,6 +71,7 @@ pub struct CsiWatcher {
     params: [u32; 8],
     param_count: usize,
     digit_acc: u32,
+    intermediate: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -86,6 +89,7 @@ impl CsiWatcher {
             params: [0; 8],
             param_count: 0,
             digit_acc: 0,
+            intermediate: None,
         }
     }
 
@@ -104,6 +108,7 @@ impl CsiWatcher {
                     self.params = [0; 8];
                     self.param_count = 0;
                     self.digit_acc = 0;
+                    self.intermediate = None;
                     None
                 } else {
                     self.state = CsiState::Ground;
@@ -123,6 +128,10 @@ impl CsiWatcher {
                 } else if byte == b';' || byte == b':' {
                     self.push_param();
                     None
+                } else if (0x20..=0x2F).contains(&byte) {
+                    // Intermediate byte, e.g. the `$` of a DECRQM query.
+                    self.intermediate = Some(byte);
+                    None
                 } else {
                     self.push_param();
                     let params = &self.params[..self.param_count];
@@ -132,6 +141,12 @@ impl CsiWatcher {
                         Some(CsiEvent::SyncOutputBegin)
                     } else if self.private && byte == b'l' && params.contains(&2026) {
                         Some(CsiEvent::SyncOutputEnd)
+                    } else if self.private
+                        && byte == b'p'
+                        && self.intermediate == Some(b'$')
+                        && params.contains(&5522)
+                    {
+                        Some(CsiEvent::QueryKittyClipboard)
                     } else {
                         None
                     };
@@ -543,6 +558,7 @@ impl TerminalState {
             let mut osc_buf: Vec<u8> = Vec::new();
             let mut apc_buf: Vec<u8> = Vec::new();
             let mut kitty_reassembler = crate::parser::kitty_graphics::KittyReassembler::new();
+            let mut kitty_clip_write: Option<crate::parser::kitty_clipboard::WriteSession> = None;
             let mut cmd_start_time: Option<std::time::Instant> = None;
 
             // CSI detection: see `CsiWatcher` (module level). The watcher
@@ -630,6 +646,63 @@ impl TerminalState {
                                 base,
                                 screen_lines,
                             );
+                        }
+                    }
+                    OscCommand::KittyClipboard { metadata, payload } => {
+                        use crate::parser::kitty_clipboard as kclip;
+                        let Some(msg) = kclip::parse(&metadata, &payload) else {
+                            return;
+                        };
+                        let write_resp = |resp: String| {
+                            let mut w = writer_clone.lock();
+                            let _ = w.write_all(resp.as_bytes());
+                            let _ = w.flush();
+                        };
+                        match msg {
+                            kclip::Message::WriteBegin { id } => {
+                                kitty_clip_write = Some(kclip::WriteSession::new(id));
+                            }
+                            kclip::Message::WriteData { id, mime, data } => match (mime, kitty_clip_write.as_mut()) {
+                                (Some(mime), Some(session)) => {
+                                    if session.push(mime, data).is_err() {
+                                        let id = kitty_clip_write.take().and_then(|s| s.id);
+                                        write_resp(kclip::response("write", "EFBIG", id.as_deref()));
+                                    }
+                                }
+                                (None, Some(_)) => {
+                                    // End of transmission: apply to the clipboard.
+                                    if let Some(session) = kitty_clip_write.take() {
+                                        let id = session.id.clone();
+                                        let status = if session.finish().is_ok() {
+                                            "DONE"
+                                        } else {
+                                            "EIO"
+                                        };
+                                        write_resp(kclip::response("write", status, id.as_deref()));
+                                    }
+                                }
+                                (_, None) => {
+                                    write_resp(kclip::response("write", "EINVAL", id.as_deref()));
+                                }
+                            },
+                            kclip::Message::Read { id, request } => {
+                                if !crate::config::clipboard_read_allowed() {
+                                    write_resp(kclip::response("read", "EPERM", id.as_deref()));
+                                    return;
+                                }
+                                write_resp(kclip::response("read", "OK", id.as_deref()));
+                                for (mime, data) in kclip::read(&request) {
+                                    let chunks: Vec<&[u8]> = if data.is_empty() {
+                                        vec![&[][..]]
+                                    } else {
+                                        data.chunks(kclip::MAX_DATA_CHUNK).collect()
+                                    };
+                                    for chunk in chunks {
+                                        write_resp(kclip::response_data(&mime, chunk, id.as_deref()));
+                                    }
+                                }
+                                write_resp(kclip::response("read", "DONE", id.as_deref()));
+                            }
                         }
                     }
                     _ => {
@@ -907,6 +980,15 @@ impl TerminalState {
                             // scrollback wipes and Synchronized Output.
                             match csi_watcher.feed(byte) {
                                 Some(CsiEvent::ClearHistory) => clear_history_flag = true,
+                                Some(CsiEvent::QueryKittyClipboard) => {
+                                    // DECRQM for mode 5522: reply "set" —
+                                    // fastty implements the kitty clipboard
+                                    // protocol (reads, writes, images).
+                                    let resp = b"\x1b[?5522;1$y";
+                                    let mut w = writer_clone.lock();
+                                    let _ = w.write_all(resp);
+                                    let _ = w.flush();
+                                }
                                 Some(CsiEvent::SyncOutputBegin) => {
                                     sync_output_active = true;
                                     sync_started = Some(std::time::Instant::now());
@@ -1818,51 +1900,78 @@ impl TerminalState {
             BINARY_SNAPSHOT_MAGIC, BINARY_SNAPSHOT_VERSION,
             CELL_FLAG_BOLD, CELL_FLAG_DIM, CELL_FLAG_ITALIC, CELL_FLAG_UNDERLINE,
             CELL_FLAG_INVERSE, CELL_FLAG_HIDDEN, CELL_FLAG_STRIKETHROUGH,
+            CELL_FLAG_WIDE_CHAR, CELL_FLAG_WIDE_CHAR_SPACER,
             SNAPSHOT_FLAG_ALT_SCREEN, SNAPSHOT_FLAG_CURSOR_VISIBLE,
         };
 
-        fn color_to_rgb(color: AnsiColor, default: u32) -> u32 {
+        // Named and 0-15 indexed colors resolve against the ACTIVE theme —
+        // snapshots used to hardcode Catppuccin Mocha, feeding web clients
+        // wrong colors under any other theme. Built once per snapshot.
+        let theme_name = crate::config::ACTIVE_THEME.read().clone();
+        let theme = crate::ui::theme::Theme::from_name(&theme_name);
+        let hsla_to_rgb = |c: gpui::Hsla| -> u32 {
+            let rgba = gpui::Rgba::from(c);
+            let ch = |v: f32| ((v.clamp(0.0, 1.0)) * 255.0).round() as u32;
+            (ch(rgba.r) << 16) | (ch(rgba.g) << 8) | ch(rgba.b)
+        };
+        let palette: [u32; 16] = [
+            hsla_to_rgb(theme.black),
+            hsla_to_rgb(theme.red),
+            hsla_to_rgb(theme.green),
+            hsla_to_rgb(theme.yellow),
+            hsla_to_rgb(theme.blue),
+            hsla_to_rgb(theme.magenta),
+            hsla_to_rgb(theme.cyan),
+            hsla_to_rgb(theme.white),
+            hsla_to_rgb(theme.bright_black),
+            hsla_to_rgb(theme.bright_red),
+            hsla_to_rgb(theme.bright_green),
+            hsla_to_rgb(theme.bright_yellow),
+            hsla_to_rgb(theme.bright_blue),
+            hsla_to_rgb(theme.bright_magenta),
+            hsla_to_rgb(theme.bright_cyan),
+            hsla_to_rgb(theme.bright_white),
+        ];
+        let default_fg = hsla_to_rgb(theme.foreground);
+        let default_bg = hsla_to_rgb(theme.background);
+        let named_to_rgb = |named: NamedColor| -> u32 {
+            match named {
+                NamedColor::Black => palette[0],
+                NamedColor::Red => palette[1],
+                NamedColor::Green => palette[2],
+                NamedColor::Yellow => palette[3],
+                NamedColor::Blue => palette[4],
+                NamedColor::Magenta => palette[5],
+                NamedColor::Cyan => palette[6],
+                NamedColor::White => palette[7],
+                NamedColor::BrightBlack => palette[8],
+                NamedColor::BrightRed => palette[9],
+                NamedColor::BrightGreen => palette[10],
+                NamedColor::BrightYellow => palette[11],
+                NamedColor::BrightBlue => palette[12],
+                NamedColor::BrightMagenta => palette[13],
+                NamedColor::BrightCyan => palette[14],
+                NamedColor::BrightWhite => palette[15],
+                _ => 0,
+            }
+        };
+
+        fn color_to_rgb(
+            color: AnsiColor,
+            palette: &[u32; 16],
+            default: u32,
+            named_to_rgb: &dyn Fn(NamedColor) -> u32,
+        ) -> u32 {
             match color {
-                AnsiColor::Named(n) => match n {
-                    NamedColor::Black => 0x001E1E2E,
-                    NamedColor::Red => 0x00F38BA8,
-                    NamedColor::Green => 0x00A6E3A1,
-                    NamedColor::Yellow => 0x00F9E2AF,
-                    NamedColor::Blue => 0x0089B4FA,
-                    NamedColor::Magenta => 0x00F5C2E7,
-                    NamedColor::Cyan => 0x0094E2D5,
-                    NamedColor::White => 0x00BAC2DE,
-                    NamedColor::BrightBlack => 0x00585B70,
-                    NamedColor::BrightRed => 0x00F38BA8,
-                    NamedColor::BrightGreen => 0x00A6E3A1,
-                    NamedColor::BrightYellow => 0x00F9E2AF,
-                    NamedColor::BrightBlue => 0x0089B4FA,
-                    NamedColor::BrightMagenta => 0x00F5C2E7,
-                    NamedColor::BrightCyan => 0x0094E2D5,
-                    NamedColor::BrightWhite => 0x00A6ADC8,
-                    _ => default,
-                },
+                AnsiColor::Named(n) => {
+                    let mapped = named_to_rgb(n);
+                    // Foreground/Background/Dim resolve per channel via the
+                    // caller's default (theme fg for fg, theme bg for bg).
+                    if mapped == 0 { default } else { mapped }
+                }
                 AnsiColor::Indexed(i) => {
                     if i < 16 {
-                        match i {
-                            0 => 0x001E1E2E,
-                            1 => 0x00F38BA8,
-                            2 => 0x00A6E3A1,
-                            3 => 0x00F9E2AF,
-                            4 => 0x0089B4FA,
-                            5 => 0x00F5C2E7,
-                            6 => 0x0094E2D5,
-                            7 => 0x00BAC2DE,
-                            8 => 0x00585B70,
-                            9 => 0x00F38BA8,
-                            10 => 0x00A6E3A1,
-                            11 => 0x00F9E2AF,
-                            12 => 0x0089B4FA,
-                            13 => 0x00F5C2E7,
-                            14 => 0x0094E2D5,
-                            15 => 0x00A6ADC8,
-                            _ => default,
-                        }
+                        palette[i as usize]
                     } else if i >= 232 {
                         let gray = ((i - 232) as u32) * 10 + 8;
                         (gray << 16) | (gray << 8) | gray
@@ -1883,38 +1992,57 @@ impl TerminalState {
             }
         }
 
+        let cell_to_packed = |cell: &alacritty_terminal::term::cell::Cell| -> FasttyPackedCell {
+            let mut flags = 0u16;
+            if cell.flags.contains(Flags::BOLD) { flags |= CELL_FLAG_BOLD; }
+            if cell.flags.contains(Flags::DIM) { flags |= CELL_FLAG_DIM; }
+            if cell.flags.contains(Flags::ITALIC) { flags |= CELL_FLAG_ITALIC; }
+            if cell.flags.intersects(Flags::ALL_UNDERLINES) { flags |= CELL_FLAG_UNDERLINE; }
+            if cell.flags.contains(Flags::INVERSE) { flags |= CELL_FLAG_INVERSE; }
+            if cell.flags.contains(Flags::HIDDEN) { flags |= CELL_FLAG_HIDDEN; }
+            if cell.flags.contains(Flags::STRIKEOUT) { flags |= CELL_FLAG_STRIKETHROUGH; }
+            if cell.flags.contains(Flags::WIDE_CHAR) { flags |= CELL_FLAG_WIDE_CHAR; }
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) { flags |= CELL_FLAG_WIDE_CHAR_SPACER; }
+
+            let c = if cell.c == '\0' { ' ' as u32 } else { cell.c as u32 };
+            FasttyPackedCell {
+                c,
+                fg: color_to_rgb(cell.fg, &palette, default_fg, &named_to_rgb),
+                bg: color_to_rgb(cell.bg, &palette, default_bg, &named_to_rgb),
+                flags,
+                _reserved: 0,
+            }
+        };
+
         let term = self.term.lock();
         let grid = term.grid();
         let screen_lines = grid.screen_lines();
         let cols = grid.columns();
+        let snapshot_is_alt = term
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
+        // Alt-screen apps don't have history; the alternate grid replaces it.
+        let history_rows = if snapshot_is_alt {
+            0
+        } else {
+            grid.total_lines().saturating_sub(screen_lines)
+        };
 
-        let total_cells = screen_lines * cols;
+        let total_cells = (history_rows + screen_lines) * cols;
         let mut cells = Vec::with_capacity(total_cells);
 
+        // History rows, oldest first, then the visible screen top to bottom.
+        for i in 0..history_rows {
+            let line = Line(-((history_rows - i) as i32));
+            let row = &grid[line];
+            for col in 0..cols {
+                cells.push(cell_to_packed(&row[alacritty_terminal::index::Column(col)]));
+            }
+        }
         for line_i in 0..screen_lines {
             let row = &grid[Line(line_i as i32)];
             for col in 0..cols {
-                let cell = &row[alacritty_terminal::index::Column(col)];
-                let mut flags = 0u16;
-                if cell.flags.contains(Flags::BOLD) { flags |= CELL_FLAG_BOLD; }
-                if cell.flags.contains(Flags::DIM) { flags |= CELL_FLAG_DIM; }
-                if cell.flags.contains(Flags::ITALIC) { flags |= CELL_FLAG_ITALIC; }
-                if cell.flags.intersects(Flags::ALL_UNDERLINES) { flags |= CELL_FLAG_UNDERLINE; }
-                if cell.flags.contains(Flags::INVERSE) { flags |= CELL_FLAG_INVERSE; }
-                if cell.flags.contains(Flags::HIDDEN) { flags |= CELL_FLAG_HIDDEN; }
-                if cell.flags.contains(Flags::STRIKEOUT) { flags |= CELL_FLAG_STRIKETHROUGH; }
-
-                let c = if cell.c == '\0' { ' ' as u32 } else { cell.c as u32 };
-                let fg = color_to_rgb(cell.fg, 0x00CDD6F4);
-                let bg = color_to_rgb(cell.bg, 0x001E1E2E);
-
-                cells.push(FasttyPackedCell {
-                    c,
-                    fg,
-                    bg,
-                    flags,
-                    _reserved: 0,
-                });
+                cells.push(cell_to_packed(&row[alacritty_terminal::index::Column(col)]));
             }
         }
 
@@ -1930,7 +2058,7 @@ impl TerminalState {
         let cursor_line = grid.cursor.point.line.0.max(0) as u16;
         let cursor_col = grid.cursor.point.column.0 as u16;
 
-        let header = FasttyBinarySnapshotHeader {
+        let mut header = FasttyBinarySnapshotHeader {
             magic: BINARY_SNAPSHOT_MAGIC,
             version: BINARY_SNAPSHOT_VERSION,
             flags: snapshot_flags,
@@ -1943,6 +2071,7 @@ impl TerminalState {
             cell_count: cells.len() as u32,
             _reserved2: [0; 10],
         };
+        header.set_history_rows(history_rows as u32);
 
         (header, cells)
     }
@@ -1959,6 +2088,56 @@ impl TerminalState {
         crate::server::binary_snapshot::encode_snapshot_compressed(&header, &cells)
     }
 
+    /// Rebuilds the terminal from a binary snapshot (FST1 v2): scrollback
+    /// history, screen cells, cursor position and alt-screen state. The
+    /// running shell keeps going and prints at the restored cursor — the
+    /// same semantics as tmux's `respawn-pane`. Returns false on malformed
+    /// input, leaving the terminal untouched.
+    pub fn restore_binary_snapshot(&self, data: &[u8]) -> bool {
+        use alacritty_terminal::term::TermMode;
+        use crate::server::binary_snapshot::{
+            decode_snapshot,
+        };
+
+        let Some((header, cells)) = decode_snapshot(data) else {
+            return false;
+        };
+        let cols = header.cols as usize;
+        let rows = header.rows as usize;
+        if cols == 0 || rows == 0 {
+            return false;
+        }
+        let Some(screen_cells) = cols.checked_mul(rows) else {
+            return false;
+        };
+        if cells.len() < screen_cells {
+            return false;
+        }
+        let history_cells = cells.len() - screen_cells;
+        if history_cells % cols != 0 {
+            return false;
+        }
+
+        // Match the snapshot's size; the PTY resize signals the shell so it
+        // redraws at the restored dimensions.
+        self.resize(cols, rows);
+
+        let mut term = self.term.lock();
+        // The replay targets the main grid (that's where scrollback lives).
+        // A snapshot taken inside an alt-screen app restores its visible
+        // content into the main grid — visually identical, and the next
+        // full-screen app takes over the alt grid as usual.
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            term.swap_alt();
+        }
+        let ok = apply_snapshot_to_grid(&mut term, &header, &cells);
+        drop(term);
+        if ok {
+            self.render_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        ok
+    }
+
     pub fn render_generation(&self) -> u64 {
         self.render_generation.load(Ordering::Relaxed)
     }
@@ -1973,6 +2152,120 @@ pub struct SearchSnippet {
     pub offset: usize,
     pub line_index: i32,
     pub text: String,
+}
+
+/// Replays a decoded FST1 snapshot into an alacritty `Term`: resets the
+/// active grid and feeds the snapshot's scrollback + screen cells through
+/// the VT parser as ANSI, so history grows through alacritty's own scroll
+/// machinery and the cursor lands where the snapshot says. Free function
+/// so tests can drive a bare `Term` without a PTY.
+fn apply_snapshot_to_grid(
+    term: &mut alacritty_terminal::term::Term<EventListenerProxy>,
+    header: &crate::server::binary_snapshot::FasttyBinarySnapshotHeader,
+    cells: &[crate::server::binary_snapshot::FasttyPackedCell],
+) -> bool {
+    use alacritty_terminal::vte::ansi::Processor;
+    use crate::server::binary_snapshot::{
+        CELL_FLAG_BOLD, CELL_FLAG_DIM, CELL_FLAG_ITALIC, CELL_FLAG_UNDERLINE,
+        CELL_FLAG_INVERSE, CELL_FLAG_HIDDEN, CELL_FLAG_STRIKETHROUGH,
+        CELL_FLAG_WIDE_CHAR_SPACER, SNAPSHOT_FLAG_CURSOR_VISIBLE,
+    };
+
+    let cols = header.cols as usize;
+    let rows = header.rows as usize;
+    let screen_cells = cols * rows;
+    if cols == 0 || rows == 0 || cells.len() < screen_cells {
+        return false;
+    }
+    let history_cells = cells.len() - screen_cells;
+
+    // Clear history, screen, cursor, display offset and scroll region of
+    // the active grid; leave alt-screen to the caller.
+    term.grid_mut().reset();
+
+    let mut out = Vec::with_capacity(cells.len() * 4 + 64);
+    out.extend_from_slice(b"\x1b[r");
+
+    // One SGR block per style run, matching the packed cell's colors.
+    let mut cur_fg = u32::MAX;
+    let mut cur_bg = u32::MAX;
+    let mut cur_flags = u16::MAX;
+    let mut emit_sgr = |out: &mut Vec<u8>, fg: u32, bg: u32, flags: u16| {
+        out.extend_from_slice(b"\x1b[0m");
+        if flags & CELL_FLAG_BOLD != 0 { out.extend_from_slice(b"\x1b[1m"); }
+        if flags & CELL_FLAG_DIM != 0 { out.extend_from_slice(b"\x1b[2m"); }
+        if flags & CELL_FLAG_ITALIC != 0 { out.extend_from_slice(b"\x1b[3m"); }
+        if flags & CELL_FLAG_UNDERLINE != 0 { out.extend_from_slice(b"\x1b[4m"); }
+        if flags & CELL_FLAG_INVERSE != 0 { out.extend_from_slice(b"\x1b[7m"); }
+        if flags & CELL_FLAG_HIDDEN != 0 { out.extend_from_slice(b"\x1b[8m"); }
+        if flags & CELL_FLAG_STRIKETHROUGH != 0 { out.extend_from_slice(b"\x1b[9m"); }
+        if fg != 0 {
+            out.extend_from_slice(
+                format!("\x1b[38;2;{};{};{}m", (fg >> 16) & 0xff, (fg >> 8) & 0xff, fg & 0xff)
+                    .as_bytes(),
+            );
+        }
+        if bg != 0 {
+            out.extend_from_slice(
+                format!("\x1b[48;2;{};{};{}m", (bg >> 16) & 0xff, (bg >> 8) & 0xff, bg & 0xff)
+                    .as_bytes(),
+            );
+        }
+    };
+
+    let mut emit_row = |out: &mut Vec<u8>, row_cells: &[crate::server::binary_snapshot::FasttyPackedCell], newline: bool| {
+        for pc in row_cells {
+            // Wide-char spacers are drawn by the parser's own width handling.
+            if pc.flags & CELL_FLAG_WIDE_CHAR_SPACER != 0 {
+                continue;
+            }
+            if pc.fg != cur_fg || pc.bg != cur_bg || pc.flags != cur_flags {
+                emit_sgr(out, pc.fg, pc.bg, pc.flags);
+                cur_fg = pc.fg;
+                cur_bg = pc.bg;
+                cur_flags = pc.flags;
+            }
+            let ch = char::from_u32(pc.c).unwrap_or(' ');
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+        if newline {
+            // Blank the run state at line boundaries: simpler and safe.
+            cur_fg = u32::MAX;
+            cur_bg = u32::MAX;
+            cur_flags = u16::MAX;
+            out.extend_from_slice(b"\r\n");
+        }
+    };
+
+    // Scrollback rows first: each newline scrolls one line into history.
+    for r in 0..history_cells / cols {
+        emit_row(&mut out, &cells[r * cols..(r + 1) * cols], true);
+    }
+    // Screen rows, no trailing newline on the last one.
+    let screen_start = history_cells;
+    for r in 0..rows {
+        let last = r + 1 == rows;
+        emit_row(
+            &mut out,
+            &cells[screen_start + r * cols..screen_start + (r + 1) * cols],
+            !last,
+        );
+    }
+
+    // Restore cursor position and visibility.
+    let cursor_row = (header.cursor_row as usize).min(rows - 1) + 1;
+    let cursor_col = (header.cursor_col as usize).min(cols - 1) + 1;
+    out.extend_from_slice(format!("\x1b[{cursor_row};{cursor_col}H").as_bytes());
+    if header.flags & SNAPSHOT_FLAG_CURSOR_VISIBLE != 0 {
+        out.extend_from_slice(b"\x1b[?25h");
+    } else {
+        out.extend_from_slice(b"\x1b[?25l");
+    }
+
+    let mut parser: Processor<StdSyncHandler> = Processor::new();
+    parser.advance(term, &out);
+    true
 }
 
 /// Decode a `file://` URL or plain directory path to a local filesystem path.
@@ -2073,6 +2366,11 @@ enum OscCommand {
     },
     ResetPalette,
     ResetColor { code: u8 },
+    /// Kitty clipboard protocol (OSC 5522): metadata + raw payload halves.
+    KittyClipboard {
+        metadata: String,
+        payload: Vec<u8>,
+    },
 }
 
 /// Decodes the OSC sequences fastty acts on itself.
@@ -2125,6 +2423,18 @@ fn parse_osc(
             } else {
                 None
             }
+        }
+        b"5522" => {
+            // Kitty clipboard protocol: the payload is itself
+            // "metadata;payload" of the 5522 packet format.
+            let (meta, rest) = match payload.iter().position(|&b| b == b';') {
+                Some(pos) => (&payload[..pos], &payload[pos + 1..]),
+                None => (payload, &[][..]),
+            };
+            Some(OscCommand::KittyClipboard {
+                metadata: String::from_utf8_lossy(meta).into_owned(),
+                payload: rest.to_vec(),
+            })
         }
         b"99" => {
             let (metadata_bytes, payload_bytes) = if let Some(idx) = payload.iter().position(|&b| b == b';') {
@@ -2326,6 +2636,9 @@ fn dispatch_osc_action(
     screen_lines: i32,
 ) {
     match cmd {
+        // The kitty clipboard protocol is fully handled in the reader
+        // thread (`handle_cmd`): it needs the PTY writer to reply.
+        OscCommand::KittyClipboard { .. } => {}
         OscCommand::Cwd(path) => {
             if let Some(p) = file_url_to_path(path.as_bytes()) {
                 sender.send_app_event(AppEvent::CwdChanged(p));
@@ -2957,5 +3270,72 @@ mod tests {
                 assert_eq!(line_str, joined.trim_end());
             }
         }
+    }
+
+    #[test]
+    fn test_apply_snapshot_to_grid_restores_history_and_cursor() {
+        use alacritty_terminal::term::{Config as AlacrittyTestConfig, Term as TestTerm};
+        use parking_lot::Mutex as ParkingMutex;
+        use crate::server::binary_snapshot::{
+            encode_snapshot, FasttyBinarySnapshotHeader, FasttyPackedCell,
+        };
+
+        struct NullWriter;
+        impl std::io::Write for NullWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { Ok(buf.len()) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+
+        let writer: Box<dyn Write + Send> = Box::new(NullWriter);
+        let proxy = EventListenerProxy::from_arc(Arc::new(ParkingMutex::new(writer)));
+        let size = TermSize::new(4, 2);
+        let mut term = TestTerm::new(AlacrittyTestConfig::default(), &size, proxy);
+
+        // Snapshot: 3 history rows ('a','b','c') + 2 screen rows ('x','y'),
+        // 4 cols each, cursor at screen row 1, col 2.
+        let cell = |ch: char| FasttyPackedCell {
+            c: ch as u32,
+            fg: 0x00FFFFFF,
+            bg: 0x00000000,
+            flags: 0,
+            _reserved: 0,
+        };
+        let mut cells = Vec::new();
+        for ch in ['a', 'b', 'c'] {
+            for _ in 0..4 {
+                cells.push(cell(ch));
+            }
+        }
+        for ch in ['x', 'y'] {
+            for _ in 0..4 {
+                cells.push(cell(ch));
+            }
+        }
+        let mut header = FasttyBinarySnapshotHeader::default();
+        header.cols = 4;
+        header.rows = 2;
+        header.cell_count = cells.len() as u32;
+        header.set_history_rows(3);
+        header.cursor_col = 2;
+        header.cursor_row = 1;
+
+        // The encoded form round-trips through the real decoder path.
+        let encoded = encode_snapshot(&header, &cells);
+        let (decoded_header, decoded_cells) =
+            crate::server::binary_snapshot::decode_snapshot(&encoded).unwrap();
+        assert_eq!(decoded_header.history_rows(), 3);
+
+        assert!(apply_snapshot_to_grid(&mut term, &decoded_header, &decoded_cells));
+
+        let grid = term.grid();
+        // Newest history row sits directly above the screen.
+        assert_eq!(grid[alacritty_terminal::index::Line(-1)][alacritty_terminal::index::Column(0)].c, 'c');
+        assert_eq!(grid[alacritty_terminal::index::Line(-3)][alacritty_terminal::index::Column(0)].c, 'a');
+        // Screen rows land top to bottom.
+        assert_eq!(grid[alacritty_terminal::index::Line(0)][alacritty_terminal::index::Column(0)].c, 'x');
+        assert_eq!(grid[alacritty_terminal::index::Line(1)][alacritty_terminal::index::Column(0)].c, 'y');
+        // Cursor restored.
+        assert_eq!(grid.cursor.point.line.0, 1);
+        assert_eq!(grid.cursor.point.column.0, 2);
     }
 }

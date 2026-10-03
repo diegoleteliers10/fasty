@@ -161,4 +161,80 @@ mod tests {
         assert_eq!(term.grid().cells[0][1].c, 'Y');
         assert_eq!(term.cursor.col, 1);
     }
+
+    /// Builds an FST1 v2 header for a 2-col grid with `history_rows`
+    /// scrollback rows and 1 screen row.
+    fn v2_header(history_rows: u32, cell_count: u32, flags: u16) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"FST1");
+        data.extend_from_slice(&2u16.to_le_bytes()); // version
+        data.extend_from_slice(&flags.to_le_bytes());
+        data.extend_from_slice(&2u16.to_le_bytes()); // cols
+        data.extend_from_slice(&1u16.to_le_bytes()); // rows
+        data.extend_from_slice(&1u16.to_le_bytes()); // cursor_col
+        data.extend_from_slice(&0u16.to_le_bytes()); // cursor_row
+        data.extend_from_slice(&cell_count.to_le_bytes());
+        data.push(0); // cursor_style
+        data.push(0); // reserved1
+        data.extend_from_slice(&history_rows.to_le_bytes()); // history rows
+        data.extend_from_slice(&[0u8; 6]); // reserved
+        data
+    }
+
+    fn cell_bytes(c: char) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(c as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn test_restore_binary_snapshot_v2_with_history() {
+        let mut term = Terminal::new(80, 24, 100);
+        // 2 history rows + 1 screen row, 2 cols each, deflated.
+        let mut raw = Vec::new();
+        for ch in ['a', '0', 'b', '1'] {
+            raw.extend(cell_bytes(ch));
+        }
+        raw.extend(cell_bytes('A'));
+        raw.extend(cell_bytes('B'));
+
+        let mut data = v2_header(2, 6, 6); // flags: cursor visible | deflate
+        data.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(&raw, 6));
+
+        assert!(term.restore_binary_snapshot(&data));
+        assert_eq!(term.main_grid.scrollback.len(), 2);
+        // Oldest first: row 0 is 'a0', the newest history row is 'b1'.
+        assert_eq!(term.main_grid.scrollback[0][0].c, 'a');
+        assert_eq!(term.main_grid.scrollback[0][1].c, '0');
+        assert_eq!(term.main_grid.scrollback[1][0].c, 'b');
+        // Screen cells land after the history rows in the payload.
+        assert_eq!(term.grid().cells[0][0].c, 'A');
+        assert_eq!(term.grid().cells[0][1].c, 'B');
+    }
+
+    #[test]
+    fn test_restore_binary_snapshot_v2_caps_history() {
+        let mut term = Terminal::new(80, 24, 3); // max_scrollback = 3
+        // 5 history rows + 1 screen row.
+        let mut raw = Vec::new();
+        for ch in ['0', 'x', '1', 'x', '2', 'x', '3', 'x', '4', 'x'] {
+            raw.extend(cell_bytes(ch));
+        }
+        raw.extend(cell_bytes('S'));
+        raw.extend(cell_bytes('S'));
+
+        let mut data = v2_header(5, 12, 6);
+        data.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(&raw, 6));
+
+        assert!(term.restore_binary_snapshot(&data));
+        // Only the newest 3 history rows fit.
+        assert_eq!(term.main_grid.scrollback.len(), 3);
+        assert_eq!(term.main_grid.scrollback[0][0].c, '2');
+        assert_eq!(term.main_grid.scrollback[2][0].c, '4');
+        assert_eq!(term.grid().cells[0][0].c, 'S');
+    }
 }

@@ -12,12 +12,22 @@ use serde::{Deserialize, Serialize};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 pub static ACTIVE_THEME: RwLock<String> = RwLock::new(String::new());
+
+/// Whether terminal programs may READ the clipboard through the kitty
+/// clipboard protocol (OSC 5522). Writes are always allowed. Mirrored from
+/// `Config::clipboard_read` on every load so the PTY reader thread can
+/// check it without touching the config machinery.
+pub static CLIPBOARD_READ: AtomicBool = AtomicBool::new(true);
+
+pub fn clipboard_read_allowed() -> bool {
+    CLIPBOARD_READ.load(Ordering::Relaxed)
+}
 
 static CONFIG_VERSION: AtomicU64 = AtomicU64::new(1);
 
@@ -49,18 +59,60 @@ pub fn set_active_theme(theme: &str) {
     *ACTIVE_THEME.write() = theme.to_string();
 }
 
-pub const BUILTIN_THEMES: &[&str] = &[
-    "default",
-    "catppuccin",
-    "one-dark",
-    "solarized-dark",
-    "high-contrast",
+/// Mirrors load-bearing config fields into the statics other threads read.
+fn sync_runtime_statics(cfg: &Config) {
+    *ACTIVE_THEME.write() = cfg.theme.clone().unwrap_or_else(|| "default".to_string());
+    CLIPBOARD_READ.store(cfg.clipboard_read, Ordering::Relaxed);
+    crate::ai::learned_allow::set_enabled(cfg.ai.learned_allow);
+}
+
+/// Registry of every built-in theme: (config name, palette command id,
+/// palette title, settings label). One table drives `all_theme_names`, the
+/// command palette entries, palette dispatch + live preview, and the
+/// Settings theme cards — adding a theme touches this and `Theme::from_name`
+/// only.
+pub const THEME_REGISTRY: &[(&str, &str, &str, &str)] = &[
+    ("default", "theme_default", "Theme: Switch to Default (Fastty)", "Fastty Default"),
+    ("catppuccin", "theme_catppuccin", "Theme: Switch to Catppuccin Mocha", "Catppuccin Mocha"),
+    ("catppuccin-frappe", "theme_catppuccin_frappe", "Theme: Switch to Catppuccin Frappé", "Catppuccin Frappé"),
+    ("catppuccin-macchiato", "theme_catppuccin_macchiato", "Theme: Switch to Catppuccin Macchiato", "Catppuccin Macchiato"),
+    ("catppuccin-latte", "theme_catppuccin_latte", "Theme: Switch to Catppuccin Latte", "Catppuccin Latte"),
+    ("dracula", "theme_dracula", "Theme: Switch to Dracula", "Dracula"),
+    ("nord", "theme_nord", "Theme: Switch to Nord", "Nord"),
+    ("tokyo-night", "theme_tokyo_night", "Theme: Switch to Tokyo Night", "Tokyo Night"),
+    ("tokyo-night-storm", "theme_tokyo_night_storm", "Theme: Switch to Tokyo Night Storm", "Tokyo Night Storm"),
+    ("gruvbox-dark", "theme_gruvbox_dark", "Theme: Switch to Gruvbox Dark", "Gruvbox Dark"),
+    ("gruvbox-light", "theme_gruvbox_light", "Theme: Switch to Gruvbox Light", "Gruvbox Light"),
+    ("rose-pine", "theme_rose_pine", "Theme: Switch to Rosé Pine", "Rosé Pine"),
+    ("rose-pine-moon", "theme_rose_pine_moon", "Theme: Switch to Rosé Pine Moon", "Rosé Pine Moon"),
+    ("rose-pine-dawn", "theme_rose_pine_dawn", "Theme: Switch to Rosé Pine Dawn", "Rosé Pine Dawn"),
+    ("one-dark", "theme_one_dark", "Theme: Switch to One Dark", "One Dark Pro"),
+    ("one-light", "theme_one_light", "Theme: Switch to One Light", "One Light"),
+    ("solarized-dark", "theme_solarized", "Theme: Switch to Solarized Dark", "Solarized Dark"),
+    ("solarized-light", "theme_solarized_light", "Theme: Switch to Solarized Light", "Solarized Light"),
+    ("kanagawa", "theme_kanagawa", "Theme: Switch to Kanagawa Wave", "Kanagawa Wave"),
+    ("high-contrast", "theme_high_contrast", "Theme: Switch to High Contrast", "High Contrast"),
 ];
+
+/// The config names of every built-in theme, in registry order.
+pub fn builtin_theme_names() -> Vec<&'static str> {
+    THEME_REGISTRY.iter().map(|(name, _, _, _)| *name).collect()
+}
+
+/// Human label for a theme name (Settings cards, palette previews).
+/// Falls back to the name itself for custom themes.
+pub fn pretty_theme_label(name: &str) -> &str {
+    THEME_REGISTRY
+        .iter()
+        .find(|(n, _, _, _)| *n == name)
+        .map(|(_, _, _, label)| *label)
+        .unwrap_or(name)
+}
 
 /// In-memory cache of user-supplied themes, loaded once at startup.
 pub static CUSTOM_THEMES: OnceLock<RwLock<HashMap<String, ThemeFile>>> = OnceLock::new();
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThemeFile {
     pub background: String,
     pub foreground: String,
@@ -138,7 +190,10 @@ pub fn load_custom_themes() {
 }
 
 pub fn all_theme_names() -> Vec<String> {
-    let mut names: Vec<String> = BUILTIN_THEMES.iter().map(|s| s.to_string()).collect();
+    let mut names: Vec<String> = builtin_theme_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     if let Some(custom) = CUSTOM_THEMES.get() {
         let c = custom.read();
         for k in c.keys() {
@@ -211,6 +266,16 @@ pub struct Config {
     pub session_restore: bool,
     #[serde(default)]
     pub copy_on_select: bool,
+    /// Automatic contrast correction: explicit truecolor/256-color values
+    /// requested by programs are adjusted in Oklab (lightness only, hue and
+    /// chroma preserved) when their contrast against the theme is too low.
+    #[serde(default = "default_contrast_correction")]
+    pub contrast_correction: bool,
+    /// Allow terminal programs to READ the clipboard via the kitty
+    /// clipboard protocol (OSC 5522), including images. Writes are always
+    /// allowed.
+    #[serde(default = "default_clipboard_read")]
+    pub clipboard_read: bool,
     #[serde(default = "default_opacity")]
     pub opacity: f32,
     #[serde(default = "default_notify_on_command_finish")]
@@ -394,6 +459,10 @@ fn default_session_restore() -> bool { true }
 fn default_opacity() -> f32 { 1.0 }
 fn default_notify_on_command_finish() -> bool { true }
 fn default_option_as_meta() -> bool { false }
+
+fn default_contrast_correction() -> bool { true }
+
+fn default_clipboard_read() -> bool { true }
 fn default_update_channel() -> String { "stable".to_string() }
 
 impl Default for Config {
@@ -407,6 +476,8 @@ impl Default for Config {
             keybinding_preset: None,
             session_restore: default_session_restore(),
             copy_on_select: false,
+            contrast_correction: default_contrast_correction(),
+            clipboard_read: default_clipboard_read(),
             opacity: default_opacity(),
             notify_on_command_finish: default_notify_on_command_finish(),
             bottombar: BottombarConfig::default(),
@@ -507,6 +578,8 @@ fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
     doc["option_as_meta"] = value(c.option_as_meta);
     doc["session_restore"] = value(c.session_restore);
     doc["copy_on_select"] = value(c.copy_on_select);
+    doc["contrast_correction"] = value(c.contrast_correction);
+    doc["clipboard_read"] = value(c.clipboard_read);
     doc["notify_on_command_finish"] = value(c.notify_on_command_finish);
     let tab_layout_str = match c.tab_layout {
         TabLayout::Horizontal => "horizontal",
@@ -566,6 +639,7 @@ fn apply_ai_to_doc(doc: &mut DocumentMut, ai_cfg: &crate::ai::AiConfig) {
             ai.remove("default_model");
         }
         ai["permission_mode"] = value(ai_cfg.permission_mode.to_string());
+        ai["learned_allow"] = value(ai_cfg.learned_allow);
 
         if !ai.contains_key("providers") || !ai["providers"].is_table() {
             ai["providers"] = Item::Table(Table::new());
@@ -689,6 +763,14 @@ fn parse_lenient_from_doc(doc: &DocumentMut) -> Option<Config> {
         cfg.copy_on_select = val;
         any_recognized = true;
     }
+    if let Some(val) = doc.get("contrast_correction").and_then(|v| v.as_bool()) {
+        cfg.contrast_correction = val;
+        any_recognized = true;
+    }
+    if let Some(val) = doc.get("clipboard_read").and_then(|v| v.as_bool()) {
+        cfg.clipboard_read = val;
+        any_recognized = true;
+    }
     if let Some(val) = doc.get("notify_on_command_finish").and_then(|v| v.as_bool()) {
         cfg.notify_on_command_finish = val;
         any_recognized = true;
@@ -799,7 +881,7 @@ impl Config {
             match toml_edit::de::from_str::<Config>(&content) {
                 Ok(mut cfg) => {
                     cfg.scrollback = cfg.scrollback.clamp(500, 100_000);
-                    *ACTIVE_THEME.write() = cfg.theme.clone().unwrap_or_else(|| "default".to_string());
+                    sync_runtime_statics(&cfg);
                     set_last_applied_hash(h);
                     return Ok(cfg);
                 }
@@ -808,7 +890,7 @@ impl Config {
                         if let Some(mut cfg) = parse_lenient_from_doc(&doc) {
                             eprintln!("[fastty] partial config parse for {}: {e}; preserved valid user settings", path.display());
                             cfg.scrollback = cfg.scrollback.clamp(500, 100_000);
-                            *ACTIVE_THEME.write() = cfg.theme.clone().unwrap_or_else(|| "default".to_string());
+                            sync_runtime_statics(&cfg);
                             set_last_applied_hash(h);
                             return Ok(cfg);
                         }
@@ -825,7 +907,7 @@ impl Config {
         }
 
         let def = Config::default();
-        *ACTIVE_THEME.write() = def.theme.clone().unwrap_or_else(|| "default".to_string());
+        sync_runtime_statics(&def);
         set_last_applied_hash(0);
         Ok(def)
     }
@@ -1029,6 +1111,8 @@ mod tests {
             keybindings,
             session_restore: true,
             copy_on_select: true,
+            contrast_correction: true,
+            clipboard_read: false,
             opacity: 0.95,
             notify_on_command_finish: true,
             bottombar: BottombarConfig::default(),
@@ -1057,6 +1141,8 @@ mod tests {
         assert_eq!(deserialized.theme.as_deref(), Some("tokyo-night"));
         assert_eq!(deserialized.session_restore, true);
         assert_eq!(deserialized.copy_on_select, true);
+        assert_eq!(deserialized.contrast_correction, true);
+        assert_eq!(deserialized.clipboard_read, false);
         assert_eq!(deserialized.notify_on_command_finish, true);
         assert_eq!(deserialized.opacity, 0.95);
         assert_eq!(deserialized.cursor.shape, CursorShapeConfig::Beam);

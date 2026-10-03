@@ -8,6 +8,11 @@ pub struct PersistedPane {
     pub title: String,
     pub custom_title: Option<String>,
     pub cwd: Option<String>,
+    /// Compressed binary terminal snapshot (FST1 v2, base64): scrollback
+    /// history + screen + cursor, restored into the freshly spawned pane.
+    /// Absent in sessions saved before content restore existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,12 +142,14 @@ mod tests {
                         title: "Left".to_string(),
                         custom_title: None,
                         cwd: Some("/tmp/left".to_string()),
+                        snapshot: None,
                     })),
                     second: Box::new(PersistedPaneNode::Leaf(PersistedPane {
                         id: 2,
                         title: "Right".to_string(),
                         custom_title: None,
                         cwd: Some("/tmp/right".to_string()),
+                        snapshot: None,
                     })),
                 }),
             }],

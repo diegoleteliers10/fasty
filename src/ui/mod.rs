@@ -1,5 +1,6 @@
 pub mod ai_sidebar;
 pub mod button;
+pub mod color_harmony;
 pub mod icons;
 pub mod ime;
 pub mod root_view;

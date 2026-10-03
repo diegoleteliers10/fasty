@@ -165,8 +165,23 @@ pub fn import_external_config(app: ExternalApp, path: &Path, cfg: &mut Config) -
                         "theme" => {
                             if !val.is_empty() {
                                 let mapped_theme = match val.to_lowercase().as_str() {
+                                    s if s.contains("catppuccin") && s.contains("frappe") => "catppuccin-frappe",
+                                    s if s.contains("catppuccin") && s.contains("macchiato") => "catppuccin-macchiato",
+                                    s if s.contains("catppuccin") && s.contains("latte") => "catppuccin-latte",
                                     s if s.contains("catppuccin") => "catppuccin",
+                                    s if s.contains("tokyo") && s.contains("storm") => "tokyo-night-storm",
+                                    s if s.contains("tokyo") => "tokyo-night",
+                                    s if s.contains("gruvbox") && s.contains("light") => "gruvbox-light",
+                                    s if s.contains("gruvbox") => "gruvbox-dark",
+                                    s if s.contains("rose") && s.contains("dawn") => "rose-pine-dawn",
+                                    s if s.contains("rose") && s.contains("moon") => "rose-pine-moon",
+                                    s if s.contains("rose") => "rose-pine",
+                                    s if s.contains("dracula") => "dracula",
+                                    s if s.contains("nord") => "nord",
+                                    s if s.contains("kanagawa") => "kanagawa",
                                     s if s.contains("one dark") || s.contains("onedark") => "one-dark",
+                                    s if s.contains("one light") || s.contains("onelight") => "one-light",
+                                    s if s.contains("solarized") && s.contains("light") => "solarized-light",
                                     s if s.contains("solarized") => "solarized-dark",
                                     _ => "default",
                                 };

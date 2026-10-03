@@ -9,7 +9,13 @@ use std::mem::size_of;
 
 /// Magic header bytes identifying a Fastty binary terminal snapshot.
 pub const BINARY_SNAPSHOT_MAGIC: [u8; 4] = *b"FST1";
-pub const BINARY_SNAPSHOT_VERSION: u16 = 1;
+/// v2 adds scrollback history: `history_rows` rides in the header (bytes
+/// 22..26, previously reserved-zero in v1, so v1 payloads decode as
+/// screen-only with no branching) and `cell_count` covers history + screen.
+pub const BINARY_SNAPSHOT_VERSION: u16 = 2;
+/// Versions this decoder accepts. v1 snapshots (screen only) decode with
+/// zero history rows because v1 left the history field zeroed.
+pub const SUPPORTED_SNAPSHOT_VERSIONS: [u16; 2] = [1, 2];
 
 /// Flags for terminal display attributes in FasttyPackedCell.
 pub const CELL_FLAG_BOLD: u16 = 1 << 0;
@@ -19,6 +25,10 @@ pub const CELL_FLAG_UNDERLINE: u16 = 1 << 3;
 pub const CELL_FLAG_INVERSE: u16 = 1 << 4;
 pub const CELL_FLAG_HIDDEN: u16 = 1 << 5;
 pub const CELL_FLAG_STRIKETHROUGH: u16 = 1 << 6;
+/// First half of a double-width glyph (the glyph cell itself).
+pub const CELL_FLAG_WIDE_CHAR: u16 = 1 << 7;
+/// The blank spacer cell that follows a double-width glyph.
+pub const CELL_FLAG_WIDE_CHAR_SPACER: u16 = 1 << 8;
 
 /// Flat 16-byte cell representation with explicit memory alignment.
 #[repr(C)]
@@ -57,7 +67,24 @@ pub struct FasttyBinarySnapshotHeader {
     pub cell_count: u32,
     pub cursor_style: u8,
     pub _reserved1: u8,
+    /// Bytes 22..32 of the wire header. Bytes 0..4 of this array carry the
+    /// scrollback (history) row count as little-endian u32 — v1 snapshots
+    /// left them zeroed, so v1 decodes as screen-only with no branching.
+    /// Kept as a raw array (not a `u32` field) to preserve the exact
+    /// 32-byte `repr(C)` layout without interior padding.
     pub _reserved2: [u8; 10],
+}
+
+impl FasttyBinarySnapshotHeader {
+    /// Scrollback (history) rows preceding the screen rows in the cell
+    /// payload, ordered oldest row first.
+    pub fn history_rows(&self) -> u32 {
+        u32::from_le_bytes(self._reserved2[0..4].try_into().unwrap_or([0; 4]))
+    }
+
+    pub fn set_history_rows(&mut self, rows: u32) {
+        self._reserved2[0..4].copy_from_slice(&rows.to_le_bytes());
+    }
 }
 
 const _: () = assert!(size_of::<FasttyBinarySnapshotHeader>() == 32);
@@ -106,7 +133,7 @@ impl FasttyBinarySnapshotHeader {
             return None;
         }
         let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-        if version != BINARY_SNAPSHOT_VERSION {
+        if !SUPPORTED_SNAPSHOT_VERSIONS.contains(&version) {
             return None;
         }
         let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
@@ -326,5 +353,142 @@ mod tests {
         assert_eq!(dec_header.cols, header.cols);
         assert_eq!(dec_header.rows, header.rows);
         assert_eq!(dec_cells, cells);
+    }
+
+    #[test]
+    fn test_v2_header_carries_history_rows() {
+        let mut header = FasttyBinarySnapshotHeader::default();
+        header.cols = 80;
+        header.rows = 24;
+        header.cell_count = (80 * (24 + 10)) as u32;
+        header.set_history_rows(10);
+
+        let bytes = header.to_bytes();
+        // History rides in bytes 22..26, previously reserved.
+        let raw_history = u32::from_le_bytes([bytes[22], bytes[23], bytes[24], bytes[25]]);
+        assert_eq!(raw_history, 10);
+        assert_eq!(bytes.len(), 32);
+
+        let decoded = FasttyBinarySnapshotHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.history_rows(), 10);
+        assert_eq!(decoded, header);
+    }
+
+    #[test]
+    fn test_v1_payload_decodes_with_zero_history() {
+        // A v1 payload: version 1, history bytes zeroed.
+        let mut header = FasttyBinarySnapshotHeader::default();
+        header.version = 1;
+        header.cols = 2;
+        header.rows = 1;
+        header.cell_count = 2;
+        let cells = vec![FasttyPackedCell::default(); 2];
+        let encoded = encode_snapshot(&header, &cells);
+
+        let (dec_header, dec_cells) = decode_snapshot(&encoded).unwrap();
+        assert_eq!(dec_header.version, 1);
+        assert_eq!(dec_header.history_rows(), 0);
+        assert_eq!(dec_cells, cells);
+    }
+
+    #[test]
+    fn test_v2_roundtrip_with_history() {
+        const COLS: usize = 4;
+        const HISTORY: usize = 5;
+        const ROWS: usize = 2;
+        let cell = |ch: char| FasttyPackedCell {
+            c: ch as u32,
+            fg: 0x00ABCDEF,
+            bg: 0x00123456,
+            flags: 0,
+            _reserved: 0,
+        };
+        // History rows 'a'..'e', screen rows 'x'/'y'.
+        let mut cells = Vec::new();
+        for ch in ['a', 'b', 'c', 'd', 'e'] {
+            for c in 0..COLS {
+                cells.push(cell(ch));
+            }
+        }
+        for ch in ['x', 'y'] {
+            for c in 0..COLS {
+                cells.push(cell(ch));
+            }
+        }
+        let mut header = FasttyBinarySnapshotHeader {
+            magic: BINARY_SNAPSHOT_MAGIC,
+            version: BINARY_SNAPSHOT_VERSION,
+            flags: SNAPSHOT_FLAG_CURSOR_VISIBLE | SNAPSHOT_FLAG_DEFLATE,
+            cols: COLS as u16,
+            rows: ROWS as u16,
+            cursor_col: 1,
+            cursor_row: 1,
+            cursor_style: 0,
+            _reserved1: 0,
+            cell_count: cells.len() as u32,
+            _reserved2: [0; 10],
+        };
+        header.set_history_rows(HISTORY as u32);
+
+        let encoded = encode_snapshot_compressed(&header, &cells);
+        let (dec_header, dec_cells) = decode_snapshot(&encoded).unwrap();
+        assert_eq!(dec_header.history_rows(), HISTORY as u32);
+        assert_eq!(dec_header.cell_count, ((HISTORY + ROWS) * COLS) as u32);
+        assert_eq!(dec_cells, cells);
+        // Newest history row is 'e'.
+        assert_eq!(dec_cells[(HISTORY - 1) * COLS].c, 'e' as u32);
+        // First screen row follows the history.
+        assert_eq!(dec_cells[HISTORY * COLS].c, 'x' as u32);
+    }
+
+    /// Benchmark: snapshot of a 2000x200 grid (~3.2MB of cells) — realistic
+    /// scrollback content compresses well; run with --release for real
+    /// numbers. Asserts correctness at scale and prints timings.
+    #[test]
+    fn benchmark_snapshot_2000x200_compressed() {
+        const COLS: usize = 200;
+        const HISTORY: usize = 2000;
+        const ROWS: usize = 40;
+        let mut cells = Vec::with_capacity((HISTORY + ROWS) * COLS);
+        for r in 0..HISTORY + ROWS {
+            let text = format!("$ cargo build --release # row {r} [finished in 12.34s]");
+            for c in 0..COLS {
+                cells.push(FasttyPackedCell {
+                    c: if c < text.len() { text.as_bytes()[c] as u32 } else { ' ' as u32 },
+                    fg: 0x00CDD6F4,
+                    bg: 0x001E1E2E,
+                    flags: if r % 7 == 0 { CELL_FLAG_BOLD } else { 0 },
+                    _reserved: 0,
+                });
+            }
+        }
+        let mut header = FasttyBinarySnapshotHeader::default();
+        header.cols = COLS as u16;
+        header.rows = ROWS as u16;
+        header.cell_count = cells.len() as u32;
+        header.set_history_rows(HISTORY as u32);
+
+        let start = std::time::Instant::now();
+        let encoded = encode_snapshot_compressed(&header, &cells);
+        let encode_elapsed = start.elapsed();
+        let start = std::time::Instant::now();
+        let (dec_header, dec_cells) = decode_snapshot(&encoded).unwrap();
+        let decode_elapsed = start.elapsed();
+
+        assert_eq!(dec_header.history_rows(), HISTORY as u32);
+        assert_eq!(dec_cells.len(), cells.len());
+        assert_eq!(dec_cells[12345], cells[12345]);
+
+        println!(
+            "benchmark 2000x200: raw {:.1}MB -> compressed {:.1}KB ({:.0}x), encode {:?}, decode {:?}",
+            (cells.len() * 16) as f64 / 1_048_576.0,
+            encoded.len() as f64 / 1024.0,
+            (cells.len() * 16) as f64 / encoded.len() as f64,
+            encode_elapsed,
+            decode_elapsed,
+        );
+        // Generous debug-build bound; release runs are orders faster.
+        assert!(encode_elapsed < std::time::Duration::from_secs(5));
+        assert!(decode_elapsed < std::time::Duration::from_secs(5));
     }
 }

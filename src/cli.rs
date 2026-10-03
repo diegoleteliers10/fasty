@@ -43,11 +43,23 @@ impl CliOptions {
                         -h, --help                            Print this help message\n\n\
                         SUBCOMMANDS (talk to an already running fastty over its local\n    \
                         IPC daemon -- see docs/daemon-protocol.md):\n    \
-                        sessions [--watch] [--wait[=SECS]] List live tabs/splits (or stream\n    \
+                        sessions | list [--watch] [--wait[=SECS]]\n    \
+                                                           List live tabs/splits (or stream\n    \
                                                            changes with --watch)\n    \
                         attach <id> [--read-only] [--wait[=SECS]]\n    \
                                                            Attach interactively; --wait retries\n    \
                                                            until fastty/that session shows up\n    \
+                        spawn [--cwd DIR] [--cols N] [--rows N] [-- COMMAND...]\n    \
+                                                           Start a headless session in the\n    \
+                                                           daemon; prints its id\n    \
+                        close <id>                            Terminate a headless session\n    \
+                        resize <id> <cols> <rows>             Resize a session's PTY\n    \
+                        write <id> [--enter] <TEXT...>        Type text into a session\n    \
+                        mcp [setup [AGENT]]                   Run the MCP server over stdio for AI\n    \
+                                                              agents (Claude Code, OpenCode, Codex,\n    \
+                                                              ...), or register it into an agent's\n    \
+                                                              config: claude-code, opencode, codex,\n    \
+                                                              gemini, cursor, zed, claude-desktop\n    \
                         gateway [--port <PORT>] [--host <ADDR>]\n    \
                                                            Serve the embedded web/Wasm client and\n    \
                                                            bridge WebSocket traffic to the daemon\n\n\
@@ -58,6 +70,10 @@ impl CliOptions {
                         fastty sessions --watch\n    \
                         fastty attach 1 --read-only\n    \
                         fastty attach 1 --wait=30\n    \
+                        id=$(fastty spawn --cwd ~/api -- bun run dev)\n    \
+                        fastty write $id --enter 'git status'\n    \
+                        fastty resize $id 120 40\n    \
+                        fastty close $id\n    \
                         fastty gateway --port 8765"
                     );
                     std::process::exit(0);

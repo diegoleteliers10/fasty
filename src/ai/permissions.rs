@@ -84,6 +84,13 @@ impl PermissionChecker {
             }
         }
 
+        // 1.5. Learned auto-allow: the user approved this command family
+        //      enough times and accepted the suggestion. Runs after the
+        //      hard-deny layer so learned rules can never unlock it.
+        if crate::ai::learned_allow::is_learned(tool_name, input_summary) {
+            return PermissionDecision::Allow;
+        }
+
         // 2. Session allowlist check — an explicit "Allow Always" from an
         //    earlier edit or command silences future calls with the same scope.
         let cache_key = format!("{}:{}", tool_name, Self::scope_for(tool_name, input_summary));

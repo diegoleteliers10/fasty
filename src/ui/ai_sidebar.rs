@@ -1261,7 +1261,7 @@ fn render_confirmation_section(
 
     let on_confirm_allow = on_confirm.clone();
     let on_confirm_always = on_confirm.clone();
-    let on_confirm_decline = on_confirm;
+    let on_confirm_decline = on_confirm.clone();
     div()
         .flex()
         .flex_col()
@@ -1331,6 +1331,86 @@ fn render_confirmation_section(
                         .text_color(theme.muted)
                         .child("⌘↵ Allow"),
                 ),
+        )
+        // Learned auto-allow: once the user approved this command family
+        // enough times, offer to stop asking for it. Purely opt-in per
+        // family; the hard-deny layer still runs first.
+        .when_some(
+            crate::ai::learned_allow::suggestion_for(&conf.tool_name, &conf.input_summary),
+            |card, family| {
+                let family_accept = family.clone();
+                let on_accept = on_confirm.clone();
+                card.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .mt(px(6.))
+                        .px(px(6.))
+                        .py(px(5.))
+                        .rounded(px(6.))
+                        .bg(theme.accent.opacity(0.08))
+                        .border_1()
+                        .border_color(theme.accent.opacity(0.35))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(11.))
+                                .text_color(theme.foreground)
+                                .child(format!(
+                                    "Approved '{family}' 3 times — auto-allow it from now on?"
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .px(px(8.))
+                                        .py(px(3.))
+                                        .rounded(px(5.))
+                                        .bg(theme.accent)
+                                        .text_size(px(10.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme.black)
+                                        .cursor(CursorStyle::PointingHand)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_ev, window, cx| {
+                                                crate::ai::learned_allow::accept_suggestion(&family_accept);
+                                                on_accept(&(true, true), window, cx);
+                                            },
+                                        )
+                                        .child("Auto-allow"),
+                                )
+                                .child(
+                                    div()
+                                        .px(px(8.))
+                                        .py(px(3.))
+                                        .rounded(px(5.))
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .text_size(px(10.5))
+                                        .text_color(theme.muted)
+                                        .cursor(CursorStyle::PointingHand)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_ev, window, _cx| {
+                                                crate::ai::learned_allow::decline_suggestion(&family);
+                                                // The suggestion state lives in a global;
+                                                // a repaint drops the offer from the card.
+                                                window.refresh();
+                                            },
+                                        )
+                                        .child("No"),
+                                ),
+                        ),
+                )
+            },
         )
         .into_any_element()
 }

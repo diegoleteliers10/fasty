@@ -15,7 +15,7 @@
 use crate::daemon::{AttachMode, Request, Response};
 
 #[cfg(unix)]
-fn connect() -> Result<std::os::unix::net::UnixStream, String> {
+pub(crate) fn connect() -> Result<std::os::unix::net::UnixStream, String> {
     let path = crate::daemon::socket_path();
     std::os::unix::net::UnixStream::connect(&path).map_err(|e| {
         format!(
@@ -383,6 +383,7 @@ pub fn run_attach_command(id: usize, read_only: bool, wait_secs: Option<u64>) ->
                         let req = Request::Write {
                             id,
                             data: crate::daemon::base64_encode(chunk),
+                            ack: false,
                         };
                         if send_request(&mut write_half, &req).is_err() {
                             break;
@@ -394,6 +395,7 @@ pub fn run_attach_command(id: usize, read_only: bool, wait_secs: Option<u64>) ->
                     let req = Request::Write {
                         id,
                         data: crate::daemon::base64_encode(&chunk[..detach_at]),
+                        ack: false,
                     };
                     if send_request(&mut write_half, &req).is_err() {
                         break;
@@ -440,5 +442,204 @@ pub fn run_attach_command(id: usize, read_only: bool, wait_secs: Option<u64>) ->
         }
 
         std::process::exit(exit_code);
+    }
+}
+
+/// `fastty spawn [--cwd DIR] [--cols N] [--rows N] [--json] [--wait[=N]] [--] [COMMAND [ARGS...]]`
+///
+/// Starts a headless session in the running fastty daemon and prints its
+/// id. Without a command the session runs the default shell.
+pub fn run_spawn_command(
+    command: Option<String>,
+    args: Vec<String>,
+    cwd: Option<String>,
+    cols: Option<usize>,
+    rows: Option<usize>,
+    wait_secs: Option<u64>,
+    json: bool,
+) -> ! {
+    #[cfg(not(unix))]
+    {
+        let _ = (command, args, cwd, cols, rows, wait_secs, json);
+        eprintln!("fastty spawn: not supported on this platform yet.");
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        let mut stream = match connect_with_retry(wait_secs) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("fastty spawn: {e}");
+                std::process::exit(1);
+            }
+        };
+        let req = Request::Spawn { command, args, cwd, cols, rows };
+        if let Err(e) = send_request(&mut stream, &req) {
+            eprintln!("fastty spawn: {e}");
+            std::process::exit(1);
+        }
+        let mut reader = std::io::BufReader::new(stream);
+        match read_response(&mut reader) {
+            Ok(Response::Spawned { id }) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "event": "spawned", "id": id })
+                    );
+                } else {
+                    println!("{id}");
+                }
+                std::process::exit(0);
+            }
+            Ok(Response::Error { code, message }) => {
+                eprintln!("fastty spawn: {code}: {message}");
+                std::process::exit(1);
+            }
+            Ok(_) => {
+                eprintln!("fastty spawn: unexpected response from fastty");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("fastty spawn: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// `fastty close <id>` — terminates a headless session in the daemon.
+/// GUI panes cannot be closed from the CLI (`not_closable`).
+pub fn run_close_command(id: usize, wait_secs: Option<u64>) -> ! {
+    #[cfg(not(unix))]
+    {
+        let _ = (id, wait_secs);
+        eprintln!("fastty close: not supported on this platform yet.");
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        let mut stream = match connect_with_retry(wait_secs) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("fastty close: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = send_request(&mut stream, &Request::Close { id }) {
+            eprintln!("fastty close: {e}");
+            std::process::exit(1);
+        }
+        let mut reader = std::io::BufReader::new(stream);
+        match read_response(&mut reader) {
+            Ok(Response::Closed { id: closed }) => {
+                println!("closed {closed}");
+                std::process::exit(0);
+            }
+            Ok(Response::Error { code, message }) => {
+                eprintln!("fastty close: {code}: {message}");
+                std::process::exit(1);
+            }
+            Ok(_) => {
+                eprintln!("fastty close: unexpected response from fastty");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("fastty close: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// `fastty resize <id> <cols> <rows>` — resizes a session, acked.
+pub fn run_resize_command(id: usize, cols: usize, rows: usize, wait_secs: Option<u64>) -> ! {
+    #[cfg(not(unix))]
+    {
+        let _ = (id, cols, rows, wait_secs);
+        eprintln!("fastty resize: not supported on this platform yet.");
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        let mut stream = match connect_with_retry(wait_secs) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("fastty resize: {e}");
+                std::process::exit(1);
+            }
+        };
+        let req = Request::Resize { id, cols, rows, ack: true };
+        if let Err(e) = send_request(&mut stream, &req) {
+            eprintln!("fastty resize: {e}");
+            std::process::exit(1);
+        }
+        let mut reader = std::io::BufReader::new(stream);
+        match read_response(&mut reader) {
+            Ok(Response::Done { .. }) => {
+                println!("resized {id} to {cols}x{rows}");
+                std::process::exit(0);
+            }
+            Ok(Response::Error { code, message }) => {
+                eprintln!("fastty resize: {code}: {message}");
+                std::process::exit(1);
+            }
+            Ok(_) => {
+                eprintln!("fastty resize: unexpected response from fastty");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("fastty resize: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// `fastty write <id> [--enter] <TEXT...>` — types text into a session's
+/// PTY. With `--enter` a carriage return is appended, submitting the line.
+pub fn run_write_command(id: usize, text: String, enter: bool, wait_secs: Option<u64>) -> ! {
+    #[cfg(not(unix))]
+    {
+        let _ = (id, text, enter, wait_secs);
+        eprintln!("fastty write: not supported on this platform yet.");
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        let mut stream = match connect_with_retry(wait_secs) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("fastty write: {e}");
+                std::process::exit(1);
+            }
+        };
+        let payload = if enter { format!("{text}\r") } else { text };
+        let req = Request::Write {
+            id,
+            data: crate::daemon::base64_encode(payload.as_bytes()),
+            ack: true,
+        };
+        if let Err(e) = send_request(&mut stream, &req) {
+            eprintln!("fastty write: {e}");
+            std::process::exit(1);
+        }
+        let mut reader = std::io::BufReader::new(stream);
+        match read_response(&mut reader) {
+            Ok(Response::Done { .. }) => {
+                std::process::exit(0);
+            }
+            Ok(Response::Error { code, message }) => {
+                eprintln!("fastty write: {code}: {message}");
+                std::process::exit(1);
+            }
+            Ok(_) => {
+                eprintln!("fastty write: unexpected response from fastty");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("fastty write: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 }

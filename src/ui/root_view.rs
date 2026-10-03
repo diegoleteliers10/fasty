@@ -1,6 +1,6 @@
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 use gpui::{
     div, prelude::*, px, size, Bounds, Context, CursorStyle, Div, FocusHandle, FontFeatures,
     FontWeight, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
@@ -1211,6 +1211,7 @@ pub fn send_system_notification(title: &str, body: &str) {
 }
 
 use super::icons::{render_app_logo, render_icon};
+use crate::universal_picker::ItemKind;
 use icons::common::IconType;
 
 #[derive(Clone, Debug)]
@@ -1346,8 +1347,8 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
         },
         PaletteCommand {
             id: "file_picker",
-            icon: IconType::FileCode,
-            title: "Insert File Path (Search Workspace Files)",
+            icon: IconType::Sparkles,
+            title: "Universal Insert (Files, SSH, Git, Snippets)",
             category: "Tools",
             shortcut: Some(if is_mac { "⌃⌘," } else { "Ctrl+Super+," }),
         },
@@ -1425,34 +1426,6 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
             id: "theme_default",
             icon: IconType::Palette,
             title: "Theme: Switch to Default (Fastty)",
-            category: "Theme",
-            shortcut: None,
-        },
-        PaletteCommand {
-            id: "theme_catppuccin",
-            icon: IconType::Palette,
-            title: "Theme: Switch to Catppuccin",
-            category: "Theme",
-            shortcut: None,
-        },
-        PaletteCommand {
-            id: "theme_one_dark",
-            icon: IconType::Palette,
-            title: "Theme: Switch to One Dark",
-            category: "Theme",
-            shortcut: None,
-        },
-        PaletteCommand {
-            id: "theme_solarized",
-            icon: IconType::Palette,
-            title: "Theme: Switch to Solarized Dark",
-            category: "Theme",
-            shortcut: None,
-        },
-        PaletteCommand {
-            id: "theme_high_contrast",
-            icon: IconType::Palette,
-            title: "Theme: Switch to High Contrast",
             category: "Theme",
             shortcut: None,
         },
@@ -1576,20 +1549,30 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
             shortcut: Some(if is_mac { "⌘Q" } else { "Alt+F4" }),
         },
     ]
+    .into_iter()
+    // Theme switch commands come from the registry: one entry per built-in
+    // theme, sharing the table the palette preview and dispatch read.
+    .chain(crate::config::THEME_REGISTRY.iter().filter(|(name, _, _, _)| {
+        // `default` already has its hand-written entry above.
+        *name != "default"
+    }).map(|(_, id, title, _)| PaletteCommand {
+        id,
+        icon: IconType::Palette,
+        title,
+        category: "Theme",
+        shortcut: None,
+    }))
+    .collect()
 }
 
 /// Maps a palette command id to the theme it switches to, if any.
 /// Used for live preview: navigating to the row previews the theme,
 /// `Enter` commits it, `Esc` reverts to the previous one.
 pub fn theme_name_for_palette_id(cmd_id: &str) -> Option<&'static str> {
-    match cmd_id {
-        "theme_default" => Some("default"),
-        "theme_catppuccin" => Some("catppuccin"),
-        "theme_one_dark" => Some("one-dark"),
-        "theme_solarized" => Some("solarized-dark"),
-        "theme_high_contrast" => Some("high-contrast"),
-        _ => None,
-    }
+    crate::config::THEME_REGISTRY
+        .iter()
+        .find(|(_, id, _, _)| *id == cmd_id)
+        .map(|(name, _, _, _)| *name)
 }
 
 /// Snapshot of the visual settings a palette preview may touch.
@@ -1863,10 +1846,11 @@ pub struct RootView {
     pub file_picker_query: String,
     pub file_picker_selected: usize,
     pub file_picker_scroll_handle: ScrollHandle,
-    /// Search root for the file picker (focused tab working directory).
+    /// Search root for the universal picker (focused tab working directory).
     pub file_picker_root: Option<std::path::PathBuf>,
-    /// Cached index for `file_picker_root`, rebuilt when the picker opens.
-    pub file_picker_index: Vec<crate::file_search::FileEntry>,
+    /// Cached multi-source index for `file_picker_root`, rebuilt when the
+    /// picker opens: files, git branches, ssh hosts, snippets, containers.
+    pub file_picker_index: Vec<crate::universal_picker::UniversalItem>,
     /// Window-space pixel position of the terminal cursor line when the
     /// picker opened; the dropdown anchors above or below it.
     pub file_picker_anchor: Option<(f32, f32)>,
@@ -3817,15 +3801,15 @@ impl RootView {
         self.is_tab_overview_open = false;
         self.is_global_search_open = false;
         self.file_picker_anchor = self.terminal_cursor_anchor(window);
-        self.file_picker_root = self
-            .tabs
-            .get(self.active_tab_idx)
-            .and_then(|t| t.cwd.clone());
-        self.file_picker_index = self
-            .file_picker_root
-            .as_deref()
-            .map(crate::file_search::build_index)
-            .unwrap_or_default();
+        let active_tab = self.tabs.get(self.active_tab_idx);
+        self.file_picker_root = active_tab.and_then(|t| t.cwd.clone());
+        let current_branch = active_tab
+            .and_then(|t| t.git_status.as_ref())
+            .map(|g| g.branch.clone());
+        self.file_picker_index = crate::universal_picker::build_sources(
+            self.file_picker_root.as_deref(),
+            current_branch.as_deref(),
+        );
         cx.notify();
     }
 
@@ -3855,21 +3839,27 @@ impl RootView {
         Some((x, y))
     }
 
-    /// Closes the picker and writes the selected file path into the focused
-    /// terminal input line, quoted when the shell needs it.
+    /// Closes the picker and inserts the selected item into the focused
+    /// pane's prompt: paths quoted, commands pre-filled with a trailing
+    /// space, snippet bodies expanded.
     pub fn insert_selected_file_path(&mut self, cx: &mut Context<Self>) {
-        let matches = crate::file_search::search(
+        let matches = crate::universal_picker::search(
             &self.file_picker_index,
             &self.file_picker_query,
-            crate::file_search::MAX_RESULTS,
+            crate::universal_picker::MAX_RESULTS,
         );
-        let Some(entry) = matches.get(self.file_picker_selected) else {
+        let Some(item) = matches.get(self.file_picker_selected) else {
             return;
         };
-        let text = crate::paste::format_path_for_shell(std::path::Path::new(&entry.rel_path));
+        let text = item.insert.clone();
         self.is_file_picker_open = false;
         if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
-            if let Some(ref terminal) = active_tab.terminal {
+            let terminal = active_tab
+                .pane_tree
+                .active_pane()
+                .and_then(|p| p.terminal.clone())
+                .or_else(|| active_tab.terminal.clone());
+            if let Some(ref terminal) = terminal {
                 crate::paste::paste_text_to_terminal(terminal, &text);
             }
         }
@@ -4246,10 +4236,14 @@ impl RootView {
                 self.commit_font_size(cx);
             }
             "theme_default" => self.set_theme("default", cx),
-            "theme_catppuccin" => self.set_theme("catppuccin", cx),
-            "theme_one_dark" => self.set_theme("one-dark", cx),
-            "theme_solarized" => self.set_theme("solarized-dark", cx),
-            "theme_high_contrast" => self.set_theme("high-contrast", cx),
+            theme_cmd if crate::config::THEME_REGISTRY.iter().any(|(_, id, _, _)| *id == theme_cmd) => {
+                let theme_name = crate::config::THEME_REGISTRY
+                    .iter()
+                    .find(|(_, id, _, _)| *id == theme_cmd)
+                    .map(|(name, _, _, _)| *name)
+                    .unwrap_or("default");
+                self.set_theme(theme_name, cx);
+            }
             "open_config" => {
                 let config_dir = dirs::home_dir()
                     .map(|h| h.join(".config/fastty"))
@@ -5243,6 +5237,17 @@ impl RootView {
                             .allow_always_tool(&pending.tool_name, &pending.input_summary);
                     }
                 }
+                if *allow {
+                    // Learned auto-allow: count the manual approval toward
+                    // its command family; the sidebar offers the rule once
+                    // the family crosses the threshold.
+                    if let Some(ref pending) = this.ai_pending_confirmation {
+                        let _ = crate::ai::learned_allow::record_approval(
+                            &pending.tool_name,
+                            &pending.input_summary,
+                        );
+                    }
+                }
                 if let Some(tx) = this.ai_confirm_reply_tx.take() {
                     let dec = if *allow {
                         crate::ai::PermissionDecision::Allow
@@ -5623,6 +5628,40 @@ impl RootView {
             let _ = std::fs::write(&path, "# Fastty configuration\n");
         }
         open_path_or_url(&path);
+    }
+
+    /// RGB of an explicitly-requested program color — truecolor `Spec`, or
+    /// a 256-color index above the theme-owned palette (16..=255). Named
+    /// colors belong to the theme and are never correction candidates.
+    fn explicit_color_rgb(color: AnsiColor) -> Option<(u8, u8, u8)> {
+        match color {
+            AnsiColor::Spec(rgb) => Some((rgb.r, rgb.g, rgb.b)),
+            AnsiColor::Indexed(idx) => crate::ui::color_harmony::indexed_to_rgb(idx),
+            _ => None,
+        }
+    }
+
+    fn ansi_spec(rgb: (u8, u8, u8)) -> AnsiColor {
+        AnsiColor::Spec(Rgb { r: rgb.0, g: rgb.1, b: rgb.2 })
+    }
+
+    fn hsla_to_rgb_tuple(c: Hsla) -> (u8, u8, u8) {
+        let rgba = gpui::Rgba::from(c);
+        let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        (to_u8(rgba.r), to_u8(rgba.g), to_u8(rgba.b))
+    }
+
+    /// Foreground conversion with automatic contrast correction: explicit
+    /// colors that clash with `bg_rgb` (the cell background, or the theme
+    /// background) get their Oklab lightness adjusted, hue preserved.
+    fn convert_fg_harmonized(&self, color: AnsiColor, bg_rgb: (u8, u8, u8)) -> Hsla {
+        if self.config.contrast_correction {
+            if let Some(rgb) = Self::explicit_color_rgb(color) {
+                let fixed = crate::ui::color_harmony::correct_fg(rgb, bg_rgb);
+                return self.convert_color(Self::ansi_spec(fixed), true);
+            }
+        }
+        self.convert_color(color, true)
     }
 
     fn convert_color(&self, color: AnsiColor, is_fg: bool) -> Hsla {
@@ -6815,10 +6854,10 @@ impl RootView {
                 cx.notify();
                 return;
             }
-            let count = crate::file_search::search(
+            let count = crate::universal_picker::search(
                 &self.file_picker_index,
                 &self.file_picker_query,
-                crate::file_search::MAX_RESULTS,
+                crate::universal_picker::MAX_RESULTS,
             )
             .len();
             if key_lower == "enter" || key_lower == "return" {
@@ -8478,6 +8517,8 @@ impl RootView {
                         let mut current_underline = false;
                         let mut last_row: Option<i32> = None;
                         let mut current_span_char_cols: Vec<usize> = Vec::new();
+                        let theme_bg_rgb = Self::hsla_to_rgb_tuple(theme.background);
+                        let theme_fg_rgb = Self::hsla_to_rgb_tuple(theme.foreground);
 
                         for cell in content.display_iter {
                             let row = cell.point.line.0;
@@ -8544,10 +8585,27 @@ impl RootView {
                                 } else {
                                     (cell.fg, cell.bg)
                                 };
-                            let fg = self.convert_color(effective_fg, true);
+                            let cell_bg_rgb = match effective_bg {
+                                AnsiColor::Named(NamedColor::Background) => theme_bg_rgb,
+                                other => Self::explicit_color_rgb(other).unwrap_or(theme_bg_rgb),
+                            };
+                            let fg = self.convert_fg_harmonized(effective_fg, cell_bg_rgb);
                             let bg = match effective_bg {
                                 AnsiColor::Named(NamedColor::Background) => None,
-                                _ => Some(self.convert_color(effective_bg, false)),
+                                other => {
+                                    let hsla = if self.config.contrast_correction {
+                                        Self::explicit_color_rgb(other)
+                                            .map(|rgb| {
+                                                let fixed =
+                                                    crate::ui::color_harmony::correct_bg(rgb, theme_fg_rgb);
+                                                self.convert_color(Self::ansi_spec(fixed), false)
+                                            })
+                                            .unwrap_or_else(|| self.convert_color(other, false))
+                                    } else {
+                                        self.convert_color(other, false)
+                                    };
+                                    Some(hsla)
+                                }
                             };
 
                             let is_bold = cell.flags.contains(Flags::BOLD);
@@ -11852,10 +11910,10 @@ impl Render for RootView {
             // File Path Picker Dropdown (Ctrl+Shift+,) — anchored at the
             // input line, opens below it or flips above near the screen edge
             .when(self.is_file_picker_open, |this| {
-                let matches = crate::file_search::search(
+                let matches = crate::universal_picker::search(
                     &self.file_picker_index,
                     &self.file_picker_query,
-                    crate::file_search::MAX_RESULTS,
+                    crate::universal_picker::MAX_RESULTS,
                 );
                 let selected_idx = self.file_picker_selected;
                 let root_label = self
@@ -11937,10 +11995,12 @@ impl Render for RootView {
                                         .child(
                                             div()
                                                 .flex_1()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
                                                 .text_size(px(13.))
                                                 .text_color(if self.file_picker_query.is_empty() { theme.muted } else { theme.foreground })
                                                 .child(if self.file_picker_query.is_empty() {
-                                                    "Search files to insert a path..."
+                                                    "Insert anything: files, ssh, git…"
                                                         .to_string()
                                                 } else {
                                                     format!("{}|", self.file_picker_query)
@@ -11987,10 +12047,10 @@ impl Render for RootView {
                                                             div()
                                                                 .text_size(px(12.))
                                                                 .text_color(theme.muted)
-                                                                .child(if self.file_picker_root.is_some() {
-                                                                    "No files matching search".to_string()
+                                                                .child(if self.file_picker_index.is_empty() {
+                                                                    "No sources available yet".to_string()
                                                                 } else {
-                                                                    "This tab has no working directory".to_string()
+                                                                    "Nothing matching".to_string()
                                                                 }),
                                                         ),
                                                 ]
@@ -11998,17 +12058,23 @@ impl Render for RootView {
                                                 matches
                                                     .into_iter()
                                                     .enumerate()
-                                                    .map(|(idx, entry)| {
+                                                    .map(|(idx, item)| {
                                                         let is_selected = idx == selected_idx;
-                                                        let file_name = entry.file_name().to_string();
-                                                        let dir_prefix = entry.rel_path
-                                                            [..entry.rel_path.len() - file_name.len()]
-                                                            .to_string();
-                                                        let (icon, icon_color) = if entry.is_dir {
-                                                            (IconType::Folder, theme.accent)
-                                                        } else {
-                                                            (IconType::FileCode, theme.muted)
+                                                        let (icon, icon_color) = match item.kind {
+                                                            ItemKind::Dir => (IconType::Folder, theme.accent),
+                                                            ItemKind::File => (IconType::FileCode, theme.muted),
+                                                            ItemKind::SshHost => (IconType::Server, theme.accent),
+                                                            ItemKind::GitBranch => (IconType::GitBranch, theme.accent),
+                                                            ItemKind::Snippet => (IconType::Terminal, theme.muted),
+                                                            ItemKind::DockerContainer => (IconType::Container, theme.accent),
                                                         };
+                                                        let file_name = item.title.clone();
+                                                        let dir_prefix = item.detail.clone();
+                                                        let kind_label = item.kind.label();
+                                                        let show_kind_label = !matches!(
+                                                            item.kind,
+                                                            ItemKind::File | ItemKind::Dir
+                                                        );
                                                         div()
                                                             .flex()
                                                             .flex_row()
@@ -12057,6 +12123,20 @@ impl Render for RootView {
                                                                             .child(file_name),
                                                                     ),
                                                             )
+                                                            .when(show_kind_label, |row| {
+                                                                row.child(
+                                                                    div()
+                                                                        .ml_auto()
+                                                                        .pl(px(6.))
+                                                                        .text_size(px(9.5))
+                                                                        .text_color(if is_selected {
+                                                                            theme.black.opacity(0.6)
+                                                                        } else {
+                                                                            theme.muted
+                                                                        })
+                                                                        .child(kind_label),
+                                                                )
+                                                            })
                                                     })
                                                     .collect::<Vec<_>>()
                                             }
@@ -12830,7 +12910,10 @@ impl Render for RootView {
                                                                             let mut row_el = el;
                                                                             for span in line.spans {
                                                                                 let color = match span.fg {
-                                                                                    Some(ansi) => self.convert_color(ansi, true),
+                                                                                    Some(ansi) => self.convert_fg_harmonized(
+                                                                                        ansi,
+                                                                                        Self::hsla_to_rgb_tuple(theme.background),
+                                                                                    ),
                                                                                     None => theme.foreground.opacity(0.85),
                                                                                 };
                                                                                 row_el = row_el.child(
@@ -14109,23 +14192,10 @@ mod tests {
 
     #[test]
     fn test_theme_palette_ids_map_to_theme_names() {
-        assert_eq!(theme_name_for_palette_id("theme_default"), Some("default"));
-        assert_eq!(
-            theme_name_for_palette_id("theme_catppuccin"),
-            Some("catppuccin")
-        );
-        assert_eq!(
-            theme_name_for_palette_id("theme_one_dark"),
-            Some("one-dark")
-        );
-        assert_eq!(
-            theme_name_for_palette_id("theme_solarized"),
-            Some("solarized-dark")
-        );
-        assert_eq!(
-            theme_name_for_palette_id("theme_high_contrast"),
-            Some("high-contrast")
-        );
+        // Every registry entry round-trips: palette id -> theme name.
+        for (name, id, _, _) in crate::config::THEME_REGISTRY {
+            assert_eq!(theme_name_for_palette_id(id), Some(*name), "id {id}");
+        }
         // Non-theme commands never trigger a preview.
         assert_eq!(theme_name_for_palette_id("new_tab"), None);
         assert_eq!(theme_name_for_palette_id("settings"), None);

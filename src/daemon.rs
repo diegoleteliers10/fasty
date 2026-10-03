@@ -133,11 +133,19 @@ pub enum Request {
     Write {
         id: PaneId,
         data: String,
+        /// Opt-in ack: when true the daemon replies `done` after the write
+        /// lands (or `error`). Older clients omit it and keep the silent
+        /// streaming behavior.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        ack: bool,
     },
     Resize {
         id: PaneId,
         cols: usize,
         rows: usize,
+        /// Opt-in ack, same semantics as on `write`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        ack: bool,
     },
     Spawn {
         #[serde(default)]
@@ -255,10 +263,17 @@ pub enum Response {
     Spawned {
         id: PaneId,
     },
+    /// Ack for `write` / `resize` requests that opted in with `ack: true`.
+    /// `cmd` echoes the request name (`"write"` / `"resize"`). Clients that
+    /// never set `ack` never receive this event.
+    Done {
+        cmd: String,
+    },
     Error {
         /// Stable, machine-matchable reason: `"bad_request"`,
         /// `"no_such_session"`, `"invalid_base64"`, `"not_attached"`,
-        /// `"read_only"`, or `"unsupported"`. New codes may be added over
+        /// `"read_only"`, `"spawn_failed"`, `"not_closable"`, or
+        /// `"unsupported"`. New codes may be added over
         /// time; treat an unrecognized one the same as a generic failure.
         code: String,
         message: String,
@@ -550,7 +565,7 @@ mod unix_impl {
                     );
                 }
             }
-            Request::Write { id, data } => {
+            Request::Write { id, data, ack } => {
                 if conn.read_only {
                     send(
                         &conn.out,
@@ -585,6 +600,9 @@ mod unix_impl {
                 };
                 if let Some(entry) = registry().lock().get(&id) {
                     entry.terminal.write_to_pty(&bytes);
+                    if ack {
+                        send(&conn.out, &Response::Done { cmd: "write".to_string() });
+                    }
                 } else {
                     send(
                         &conn.out,
@@ -659,9 +677,12 @@ mod unix_impl {
                     }
                 });
             }
-            Request::Resize { id, cols, rows } => {
+            Request::Resize { id, cols, rows, ack } => {
                 if let Some(entry) = registry().lock().get(&id) {
                     entry.terminal.resize(cols, rows);
+                    if ack {
+                        send(&conn.out, &Response::Done { cmd: "resize".to_string() });
+                    }
                 } else {
                     send(
                         &conn.out,
@@ -895,11 +916,13 @@ mod tests {
             Request::Write {
                 id: 42,
                 data: "aGVsbG8=".to_string(),
+                ack: false,
             },
             Request::Resize {
                 id: 42,
                 cols: 80,
                 rows: 24,
+                ack: false,
             },
             Request::Spawn {
                 command: Some("bash".to_string()),
@@ -925,7 +948,10 @@ mod tests {
                     assert_eq!(m1, m2);
                 }
                 (Request::Detach { id: a }, Request::Detach { id: b }) => assert_eq!(a, b),
-                (Request::Write { id: a, data: d1 }, Request::Write { id: b, data: d2 }) => {
+                (
+                    Request::Write { id: a, data: d1, .. },
+                    Request::Write { id: b, data: d2, .. },
+                ) => {
                     assert_eq!(a, b);
                     assert_eq!(d1, d2);
                 }
@@ -934,11 +960,13 @@ mod tests {
                         id: a,
                         cols: c1,
                         rows: r1,
+                        ..
                     },
                     Request::Resize {
                         id: b,
                         cols: c2,
                         rows: r2,
+                        ..
                     },
                 ) => {
                     assert_eq!(a, b);
@@ -1060,6 +1088,7 @@ mod tests {
             Request::Write {
                 id: 1,
                 data: base64_encode(b"test"),
+                ack: false,
             },
             &mut conn,
         );

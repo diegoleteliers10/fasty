@@ -138,6 +138,33 @@ sesión real (poniendo la terminal local en modo raw, igual que `ssh`/`tmux atta
 `Ctrl+\` hace `detach` limpio sin cerrar la sesión. En modo `--read-only`, el input
 local se descarta excepto por `Ctrl+\` para desadjuntarse.
 
+### Control desde el CLI (`spawn` / `close` / `resize` / `write` / `list`)
+
+El mismo binario expone subcomandos de control sobre el daemon, pensados
+para scripts y agentes:
+
+```bash
+# Crear una sesión headless (imprime el id; sin comando corre el shell)
+id=$(fastty spawn --cwd ~/api -- bun run dev)
+
+# Escribir en su PTY (con --enter agrega \r y submita la línea)
+fastty write $id --enter 'git status'
+
+# Redimensionar y cerrar
+fastty resize $id 120 40
+fastty close $id
+
+# `list` es alias de `sessions` (mismos flags)
+fastty list --json
+```
+
+`resize` y `write` usan el campo opt-in `ack: true` de sus requests y
+esperan la respuesta `done` (o `error`) antes de salir, así el exit code
+del CLI refleja si la operación llegó. Los clientes que omiten `ack`
+mantienen el comportamiento silencioso original. `close` sobre una sesión
+GUI devuelve `not_closable` (solo las headless se cierran por protocolo);
+`spawn` fallido devuelve `spawn_failed`.
+
 Viven en `src/daemon_client.rs`, usando los mismos tipos `Request`/`Response`
 que `src/daemon.rs` serializa — no hay una copia separada del protocolo del
 lado del cliente que se pueda desincronizar.

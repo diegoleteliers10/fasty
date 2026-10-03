@@ -265,12 +265,22 @@ impl PaneNode {
 
     pub fn to_persisted(&self) -> crate::session_manager::PersistedPaneNode {
         match self {
-            PaneNode::Leaf(pane) => crate::session_manager::PersistedPaneNode::Leaf(crate::session_manager::PersistedPane {
-                id: pane.id,
-                title: pane.title.clone(),
-                custom_title: pane.custom_title.clone(),
-                cwd: pane.cwd.as_ref().map(|c| c.to_string_lossy().to_string()),
-            }),
+            PaneNode::Leaf(pane) => {
+                // Freeze the pane's terminal content (scrollback + screen +
+                // cursor) into a compressed binary snapshot so restoring the
+                // session brings the output back, not just the cwd.
+                let snapshot = pane.terminal.as_ref().map(|term| {
+                    use base64::prelude::*;
+                    BASE64_STANDARD.encode(term.snapshot_binary_compressed())
+                });
+                crate::session_manager::PersistedPaneNode::Leaf(crate::session_manager::PersistedPane {
+                    id: pane.id,
+                    title: pane.title.clone(),
+                    custom_title: pane.custom_title.clone(),
+                    cwd: pane.cwd.as_ref().map(|c| c.to_string_lossy().to_string()),
+                    snapshot,
+                })
+            }
             PaneNode::Split { direction, ratio, first, second } => crate::session_manager::PersistedPaneNode::Split {
                 direction: match direction {
                     SplitDirection::Horizontal => "Horizontal".to_string(),
@@ -292,6 +302,17 @@ impl PaneNode {
                 let cwd = p.cwd.as_deref().map(std::path::Path::new);
                 let title = p.custom_title.clone().or(Some(p.title.clone()));
                 let pane = spawn_pane(cwd, title);
+                // Replay the saved terminal content into the fresh shell:
+                // scrollback reappears above, the prompt prints at the
+                // restored cursor (tmux respawn-pane semantics).
+                if let Some(ref b64) = p.snapshot {
+                    use base64::prelude::*;
+                    if let Ok(bytes) = BASE64_STANDARD.decode(b64) {
+                        if let Some(ref term) = pane.terminal {
+                            term.restore_binary_snapshot(&bytes);
+                        }
+                    }
+                }
                 PaneNode::Leaf(pane)
             }
             crate::session_manager::PersistedPaneNode::Split { direction, ratio, first, second } => {

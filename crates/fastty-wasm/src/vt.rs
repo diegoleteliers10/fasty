@@ -235,6 +235,11 @@ impl Terminal {
     }
 
     /// Restore full terminal state in microseconds from raw binary snapshot.
+    ///
+    /// FST1 v2 carries scrollback history (rows preceding the screen cells,
+    /// oldest first) in header bytes 22..26; v1 payloads decode as
+    /// screen-only. History lands in `main_grid.scrollback` so the existing
+    /// scrollbar and scrolled rendering pick it up unchanged.
     pub fn restore_binary_snapshot(&mut self, data: &[u8]) -> bool {
         if data.len() < 32 {
             return false;
@@ -242,6 +247,11 @@ impl Terminal {
         if &data[0..4] != b"FST1" {
             return false;
         }
+        let version = u16::from_le_bytes([data[4], data[5]]);
+        if version != 1 && version != 2 {
+            return false;
+        }
+        let history_rows = u32::from_le_bytes([data[22], data[23], data[24], data[25]]) as usize;
         let cols = u16::from_le_bytes([data[8], data[9]]) as usize;
         let rows = u16::from_le_bytes([data[10], data[11]]) as usize;
         let cursor_col = u16::from_le_bytes([data[12], data[13]]) as usize;
@@ -252,7 +262,11 @@ impl Terminal {
         let cursor_visible = (flags & (1 << 1)) != 0;
         let is_deflated = (flags & (1 << 2)) != 0;
 
-        if cols == 0 || rows == 0 || cell_count != cols * rows {
+        if cols == 0 || rows == 0 || cell_count < cols * rows {
+            return false;
+        }
+        let history_cells = cell_count - cols * rows;
+        if history_cells % cols != 0 {
             return false;
         }
 
@@ -275,39 +289,57 @@ impl Terminal {
             &data[32..32 + cell_count * 16]
         };
 
+        fn parse_cell(chunk: &[u8]) -> Cell {
+            let cp = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let fg = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            let bg = u32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
+            let cell_flags_raw = u16::from_le_bytes([chunk[12], chunk[13]]);
+
+            let mut flags = 0u8;
+            if (cell_flags_raw & (1 << 0)) != 0 { flags |= FLAG_BOLD; }
+            if (cell_flags_raw & (1 << 1)) != 0 { flags |= FLAG_DIM; }
+            if (cell_flags_raw & (1 << 2)) != 0 { flags |= FLAG_ITALIC; }
+            if (cell_flags_raw & (1 << 3)) != 0 { flags |= FLAG_UNDERLINE; }
+            if (cell_flags_raw & (1 << 4)) != 0 { flags |= FLAG_INVERSE; }
+            if (cell_flags_raw & (1 << 5)) != 0 { flags |= FLAG_HIDDEN; }
+            if (cell_flags_raw & (1 << 6)) != 0 { flags |= FLAG_STRIKETHROUGH; }
+            // Wide-spacer cells render as blanks: the wide glyph cell right
+            // before them already draws at the shared column span.
+            let ch = if (cell_flags_raw & (1 << 8)) != 0 {
+                ' '
+            } else {
+                std::char::from_u32(cp).unwrap_or(' ')
+            };
+            Cell { c: ch, fg, bg, flags }
+        }
+
         self.resize(cols, rows);
         self.is_alt = is_alt;
         self.cursor.col = cursor_col.min(cols.saturating_sub(1));
         self.cursor.row = cursor_row.min(rows.saturating_sub(1));
         self.cursor.visible = cursor_visible;
 
+        // History back into the main grid's scrollback, oldest first (the
+        // same order `scroll_up` fills it with), capped to the max.
+        let history_rows = history_cells / cols;
+        if history_rows > 0 {
+            let sb = &mut self.main_grid.scrollback;
+            sb.clear();
+            for hr in history_rows.saturating_sub(self.main_grid.max_scrollback)..history_rows {
+                let src = hr * cols;
+                sb.push_back(payload[src * 16..(src + cols) * 16]
+                    .chunks_exact(16)
+                    .map(parse_cell)
+                    .collect());
+            }
+        }
+
         let grid = self.grid_mut();
 
         for r in 0..rows {
             for c in 0..cols {
-                let offset = (r * cols + c) * 16;
-                let chunk = &payload[offset..offset + 16];
-                let cp = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                let fg = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-                let bg = u32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
-                let cell_flags_raw = u16::from_le_bytes([chunk[12], chunk[13]]);
-
-                let mut flags = 0u8;
-                if (cell_flags_raw & (1 << 0)) != 0 { flags |= FLAG_BOLD; }
-                if (cell_flags_raw & (1 << 1)) != 0 { flags |= FLAG_DIM; }
-                if (cell_flags_raw & (1 << 2)) != 0 { flags |= FLAG_ITALIC; }
-                if (cell_flags_raw & (1 << 3)) != 0 { flags |= FLAG_UNDERLINE; }
-                if (cell_flags_raw & (1 << 4)) != 0 { flags |= FLAG_INVERSE; }
-                if (cell_flags_raw & (1 << 5)) != 0 { flags |= FLAG_HIDDEN; }
-                if (cell_flags_raw & (1 << 6)) != 0 { flags |= FLAG_STRIKETHROUGH; }
-
-                let ch = std::char::from_u32(cp).unwrap_or(' ');
-                grid.cells[r][c] = Cell {
-                    c: ch,
-                    fg,
-                    bg,
-                    flags,
-                };
+                let offset = ((history_rows * cols) + r * cols + c) * 16;
+                grid.cells[r][c] = parse_cell(&payload[offset..offset + 16]);
             }
         }
 

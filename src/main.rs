@@ -32,7 +32,7 @@ fn main() {
     // and exit the process themselves.
     let mut subcommand_args = std::env::args().skip(1);
     match subcommand_args.next().as_deref() {
-        Some("sessions") => {
+        Some("sessions") | Some("list") => {
             let mut watch = false;
             let mut json = false;
             let mut wait: Option<u64> = None;
@@ -135,9 +135,131 @@ fn main() {
             }
             fastty::daemon_client::run_attach_command(id, read_only, wait);
         }
+        Some("spawn") => {
+            // Flags before the command; `--` (or the first non-flag) hands
+            // the rest over verbatim, so `fastty spawn -- bash -c 'x'` works.
+            let mut command: Option<String> = None;
+            let mut args: Vec<String> = Vec::new();
+            let mut cwd: Option<String> = None;
+            let mut cols: Option<usize> = None;
+            let mut rows: Option<usize> = None;
+            let mut json = false;
+            let mut wait: Option<u64> = None;
+            let mut rest: Vec<String> = Vec::new();
+            while let Some(arg) = subcommand_args.next() {
+                if rest.is_empty() {
+                    if arg == "--" {
+                        continue;
+                    } else if let Some(w) = parse_wait_flag(&arg) {
+                        wait = Some(w);
+                    } else if arg == "--json" {
+                        json = true;
+                    } else if arg == "--cwd" {
+                        cwd = subcommand_args.next();
+                    } else if let Some(v) = arg.strip_prefix("--cwd=") {
+                        cwd = Some(v.to_string());
+                    } else if arg == "--cols" {
+                        cols = subcommand_args.next().and_then(|v| v.parse().ok());
+                    } else if let Some(v) = arg.strip_prefix("--cols=") {
+                        cols = v.parse().ok();
+                    } else if arg == "--rows" {
+                        rows = subcommand_args.next().and_then(|v| v.parse().ok());
+                    } else if let Some(v) = arg.strip_prefix("--rows=") {
+                        rows = v.parse().ok();
+                    } else if arg.starts_with('-') && arg.len() > 1 {
+                        eprintln!("fastty spawn: unknown flag {arg}");
+                        std::process::exit(1);
+                    } else {
+                        rest.push(arg);
+                    }
+                } else {
+                    rest.push(arg);
+                }
+            }
+            command = rest.first().cloned();
+            if rest.len() > 1 {
+                args = rest[1..].to_vec();
+            }
+            fastty::daemon_client::run_spawn_command(command, args, cwd, cols, rows, wait, json);
+        }
+        Some("close") => {
+            let Some(id) = subcommand_args.next().and_then(|s| s.parse::<usize>().ok()) else {
+                eprintln!("Usage: fastty close <session-id> [--wait[=SECONDS]]");
+                std::process::exit(1);
+            };
+            let mut wait: Option<u64> = None;
+            for arg in subcommand_args {
+                match parse_wait_flag(&arg) {
+                    Some(w) => wait = Some(w),
+                    None => {
+                        eprintln!("fastty close: unknown flag {arg}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            fastty::daemon_client::run_close_command(id, wait);
+        }
+        Some("resize") => {
+            let mut rest: Vec<String> = Vec::new();
+            let mut wait: Option<u64> = None;
+            for arg in subcommand_args {
+                if let Some(w) = parse_wait_flag(&arg) {
+                    wait = Some(w);
+                } else {
+                    rest.push(arg);
+                }
+            }
+            let (Some(id), Some(cols), Some(rows)) = (
+                rest.first().and_then(|s| s.parse::<usize>().ok()),
+                rest.get(1).and_then(|s| s.parse::<usize>().ok()),
+                rest.get(2).and_then(|s| s.parse::<usize>().ok()),
+            ) else {
+                eprintln!("Usage: fastty resize <session-id> <cols> <rows> [--wait[=SECONDS]]");
+                std::process::exit(1);
+            };
+            fastty::daemon_client::run_resize_command(id, cols, rows, wait);
+        }
+        Some("write") => {
+            let mut rest: Vec<String> = Vec::new();
+            let mut enter = false;
+            let mut wait: Option<u64> = None;
+            for arg in subcommand_args {
+                if let Some(w) = parse_wait_flag(&arg) {
+                    wait = Some(w);
+                } else if arg == "--enter" {
+                    enter = true;
+                } else {
+                    rest.push(arg);
+                }
+            }
+            let Some(id) = rest.first().and_then(|s| s.parse::<usize>().ok()) else {
+                eprintln!("Usage: fastty write <session-id> [--enter] <TEXT...>");
+                std::process::exit(1);
+            };
+            if rest.len() < 2 {
+                eprintln!("Usage: fastty write <session-id> [--enter] <TEXT...>");
+                std::process::exit(1);
+            }
+            let text = rest[1..].join(" ");
+            fastty::daemon_client::run_write_command(id, text, enter, wait);
+        }
         Some("ask") => {
             run_ask_command(subcommand_args);
             std::process::exit(0);
+        }
+        Some("mcp") => {
+            let mcp_args: Vec<String> = subcommand_args.collect();
+            if mcp_args.first().map(String::as_str) == Some("setup") {
+                let code = fastty::mcp::run_mcp_setup(mcp_args.get(1).map(String::as_str));
+                std::process::exit(code);
+            }
+            if let Some(arg) = mcp_args.first() {
+                eprintln!("fastty mcp: unknown argument {arg}");
+                eprintln!("Usage: fastty mcp [setup [AGENT]]");
+                std::process::exit(1);
+            }
+            // MCP server over stdio: stdout carries JSON-RPC only.
+            fastty::mcp::run_mcp_server();
         }
         _ => {}
     }

@@ -286,7 +286,7 @@ impl Action {
                 Action::ClosePane => "Close Pane",
                 Action::GlobalSearch => "Global Search (All Tabs)",
                 Action::TabOverview => "Tab Overview",
-                Action::InsertFilePath => "Insert File Path",
+                Action::InsertFilePath => "Universal Insert (Files, SSH, Git, Snippets)",
                 Action::Quit => "Quit",
             }
             .to_string(),
