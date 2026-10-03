@@ -3,6 +3,59 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.16.0 - 2026-10-03
+
+### MCP Server
+
+- New `fastty mcp` subcommand: a local MCP (Model Context Protocol) server over stdio that connects AI agents (Claude Code, Codex, Cursor, …) to fastty's daemon. Seven tools: list/spawn/write/read/resize/close sessions plus `fastty_run_command`, which runs a command in a throwaway headless session, waits for exit, and returns the terminal's real rendered output (last 300 lines of scrollback + screen). When fastty's GUI is open the agents share its live sessions; when it isn't, the MCP process embeds its own daemon — agents work headless with no app running. Registration one-liners in `docs/mcp.md` (`claude mcp add fastty -- fastty mcp`); `fastty --help` lists the subcommand. Unix only (daemon sockets).
+
+### Binary Snapshots (FST1 v2)
+
+- The binary snapshot format grows to v2: it now carries the full terminal state — scrollback history (oldest first), screen cells, cursor position, and cursor visibility — compressed with Deflate. Measured on a 2000-row × 200-col grid with realistic shell output: 6.2MB of raw cells compress to ~35KB (~184x), sub-100ms encode/decode even in debug builds. The web client now restores your scrollback on reconnect, not just the visible screen.
+- New native `restore_binary_snapshot` on TerminalState: replays a decoded snapshot into the alacritty grid through the VT parser (history grows through alacritty's own scroll machinery, cursor lands where the snapshot says, cursor visibility restored). This powers session content restore below and is the groundwork for persistent sessions.
+- v1 payloads keep decoding everywhere (the history field rides in previously-reserved header bytes that v1 left zeroed); wide-char and wide-spacer cells are now preserved exactly.
+- Fix: binary snapshots hardcoded Catppuccin Mocha's palette for program-requested named/indexed colors — web clients got wrong colors under any other theme. Named and 0-15 indexed colors now resolve against the active theme at snapshot time.
+
+### Session Content Restore
+
+- "Session: Save Workspace" now freezes each pane's terminal content (scrollback + screen + cursor) as a compressed binary snapshot alongside the layout and cwd; "Session: Restore Workspace" respawns the shells and replays the saved content — output comes back, not just the directory. New shells print at the restored cursor, tmux `respawn-pane` style. Old session JSON files (without snapshots) keep loading untouched.
+
+### Themes
+
+- The built-in suite grows from 5 to 20 themes: Catppuccin Frappé/Macchiato/Latte, Dracula, Nord, Tokyo Night (+ Storm), Gruvbox Dark/Light, Rosé Pine (+ Moon/Dawn), One Light, Solarized Light, and Kanagawa Wave — including six light themes, fastty's first. Palette families live as compact `ThemeSpec`s and chrome (surfaces, borders, hover, selection) is derived from the background's lightness, so light themes get light chrome; this also fixes user JSON themes with light palettes, which previously inherited the dark default chrome.
+- One registry (`THEME_REGISTRY`) now feeds the command palette, palette live preview, Settings theme cards, and labels — switching themes via `⌘P` previews each of the 20 entries live.
+- Settings → Appearance swaps the wrapping grid of theme cards for a dropdown: the trigger shows the active theme's badge (color dots + label), and the list offers every theme as the same badge row — checkmark on the active one, keyboard navigation (↑/↓ to move, Enter to apply, Esc to close), hover-to-highlight, and scroll for the full 20. The list renders as a window-level overlay anchored to the trigger (flipping above it when there's more room), so it floats above every section and can't be clipped by the group cards.
+- The config importer maps theme names from all new families (e.g. a Ghostty `theme = tokyo-night-storm` now lands on the matching fastty theme instead of the default).
+
+### AI Permissions
+
+- Learned auto-allow: every manual approval of a `run_command` family (`git status`, `cargo build`, …) is counted; after 3 approvals the confirmation card offers to auto-allow that family from then on. The suggestion is per family — subcommand-aware for git/cargo/npm/docker-style tools so `git status` never unlocks `git push` — and shells, interpreters, and sudo-style launchers are never suggested. The hardcoded danger layer still runs first, so a learned rule can never unlock `rm -rf /`-class commands. Rules persist across restarts in `state_dir/ai_learned_allow.json`; disable with `[ai] learned_allow = false`.
+
+### CLI (daemon control)
+
+- New subcommands over the local daemon: `fastty spawn [--cwd DIR] [--cols N] [--rows N] [-- COMMAND...]` starts a headless session and prints its id, `fastty write <id> [--enter] <TEXT...>` types into it, `fastty resize <id> <cols> <rows>`, `fastty close <id>`, and `fastty list` (alias of `sessions`). `write`/`resize` opt into a new `done` ack so exit codes are truthful; the ack is a protocol addition that older clients simply never request. Examples in `fastty --help` and `docs/daemon-protocol.md`.
+
+### Universal Insert
+
+- The file path picker (`⌃⌘,` / `Ctrl+Super+,`) is now a multi-source picker: one anchored fuzzy search inserts workspace files, ssh hosts from `~/.ssh/config`, local git branches, snippet bodies, and running docker containers straight into the focused pane's prompt. Files insert as quoted paths, hosts/branches/containers pre-fill their command (`ssh … `, `git checkout … `, `docker exec -it … `), snippets insert their expanded body. Docker containers are fetched in the background so a slow or missing daemon never blocks the picker.
+- Insertion now targets the focused split pane instead of the tab's main terminal, and always goes through bracketed paste when the shell supports it.
+- The empty picker no longer says "no working directory" when the tab has no cwd: ssh, snippet, and docker sources are still offered.
+- Fix: the placeholder and long queries no longer overflow the popup block; the input row clips them.
+
+### Automatic Contrast Correction
+
+- Programs bias to dark mode: explicit truecolor/256-color values designed against dark backgrounds turn invisible on light themes (and vice versa). When such a color's WCAG contrast against what it sits on drops below 3:1, fastty now binary-searches its Oklab lightness away from the background — hue and chroma preserved — until the pair reads (~4.5:1). Backgrounds are corrected against the theme foreground the same way. Theme-owned named ANSI colors are never touched, and corrections are cached per (color, background) pair so the render loop pays one hash lookup per colored cell.
+- Toggle in Settings → Terminal Behavior, or `contrast_correction` in `fastty.toml` (default on). The palette/search previews are corrected too.
+
+### Kitty Clipboard Protocol (OSC 5522)
+
+- fastty answers the `CSI ? 5522 $ p` probe and speaks kitty's multi-format clipboard protocol: chunked multi-MIME writes, and reads that return `text/plain` and images (as PNG) in ≤4KB DATA packets — the mechanism tools like Claude Code use to paste images into the terminal. Writes land on the system clipboard through arboard (text or image).
+- Reads are permission-gated by `clipboard_read` in `fastty.toml` (default on; denied reads reply `EPERM`). Writes are always allowed. The classic text-only OSC 52 write path keeps working as before.
+
+### Migration
+
+- Importing another terminal's config now celebrates: a theme-colored confetti burst plays over the settings window. Software should be fun.
+
 ## 0.15.0 - 2026-09-30
 
 ### Terminal
