@@ -3,6 +3,22 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.17.0 - 2026-10-03
+
+### Agent-Driven Layout Control (MCP)
+
+- Five new daemon operations, exposed as MCP tools, that let an agent drive the fastty window itself: `fastty_layout` (the full window structure — every tab with its panes, ids, titles, cwds and sizes), `fastty_split_pane` (create a new pane beside any visible pane in the same tab, running the shell or a custom command; returns its session id), `fastty_resize_pane` (move a pane divider by a fraction of the split axis), `fastty_focus_pane` (bring the pane's tab to the front and activate it, so the user sees what the agent touches), and `fastty_resize_window` (resize the window to approximately cols × rows). CLI: `fastty split <pane-id> --direction right`. Requests are answered over a correlated daemon→GUI channel with a 5-second timeout; with no window running they fail fast with `no_gui` instead of hanging.
+- Sessions spawned through the daemon now open as visible tabs. `fastty_spawn_session` defaults to `open: true` (and `fastty spawn --open` on the CLI), so a session an agent creates appears in the fastty window: the pane adopts the same `TerminalState` — same id — meaning the agent types into the tab the user is watching. Event wiring is re-attached on adoption, so title/cwd changes and shell exit close the tab exactly like a hand-opened one. `fastty_run_command` stays headless.
+- `close { force: true }` (and `fastty_close_session` with `force`, `fastty close <id> --force`) closes GUI tabs too: the process group is killed exactly as when closing the tab in the window, and the tab disappears. Without `force`, GUI sessions still answer `not_closable` — those tabs belong to the user — but the error now says what to do.
+- `spawned` responses report `opened: bool` (and `fastty spawn --json` prints it), so callers can tell a visible tab from a headless session when no window is running.
+- Session-resize semantics clarified: `resize` only affects headless grids — GUI panes always follow the window; dividers are `resize_pane`'s job and the window itself is `resize_window`'s.
+
+### Contrast Correction Fixes
+
+- Fixed invisible text under selection. Selected cells now correct explicit program colors against the accent selection tint actually painted under the glyphs (shared `SELECTION_OVERLAY_ALPHA`), not the plain cell background — dim TUI grays (Claude Code, opencode) that read on the background used to sink to ~1.6:1 under the tint and vanish; they now re-correct in place.
+- Fixed the Oklab bisection converging to the fully-corrected extreme: it brightened every failing gray to near-white (or near-black on light themes), flattening dim/bright hierarchy in TUIs. Corrections are now minimal — the smallest lightness move that restores the target contrast — so dim text stays dim.
+- The selection's per-line column math is shared between the painter and the span builder (`selection_columns_on_line`), so both always agree on what "selected" means.
+
 ## 0.16.0 - 2026-10-03
 
 ### MCP Server
