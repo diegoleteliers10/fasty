@@ -44,6 +44,15 @@ pub enum ProviderConfig {
         #[serde(default = "default_anthropic_models")]
         models: Vec<String>,
     },
+    #[serde(rename = "opencode")]
+    Opencode {
+        #[serde(default = "default_opencode_command")]
+        command: String,
+        #[serde(default)]
+        models: Vec<String>,
+        #[serde(default)]
+        variants: HashMap<String, Vec<String>>,
+    },
 }
 
 impl ProviderConfig {
@@ -51,6 +60,7 @@ impl ProviderConfig {
         match self {
             Self::OpenaiCompat { models, .. } => models.as_slice(),
             Self::Anthropic { models, .. } => models.as_slice(),
+            Self::Opencode { models, .. } => models.as_slice(),
         }
     }
 
@@ -58,6 +68,7 @@ impl ProviderConfig {
         match self {
             Self::OpenaiCompat { base_url, .. } => base_url.as_str(),
             Self::Anthropic { base_url, .. } => base_url.as_str(),
+            Self::Opencode { .. } => "",
         }
     }
 
@@ -65,6 +76,7 @@ impl ProviderConfig {
         match self {
             Self::OpenaiCompat { base_url, .. } => *base_url = new_url,
             Self::Anthropic { base_url, .. } => *base_url = new_url,
+            Self::Opencode { .. } => {},
         }
     }
 
@@ -72,6 +84,7 @@ impl ProviderConfig {
         match self {
             Self::OpenaiCompat { api_key_env, .. } => api_key_env.as_deref(),
             Self::Anthropic { api_key_env, .. } => Some(api_key_env.as_str()),
+            Self::Opencode { .. } => None,
         }
     }
 
@@ -79,6 +92,7 @@ impl ProviderConfig {
         match self {
             Self::OpenaiCompat { api_key, .. } => api_key.as_deref(),
             Self::Anthropic { api_key, .. } => api_key.as_deref(),
+            Self::Opencode { .. } => None,
         }
     }
 
@@ -86,6 +100,7 @@ impl ProviderConfig {
         match self {
             Self::OpenaiCompat { api_key, .. } => *api_key = new_key,
             Self::Anthropic { api_key, .. } => *api_key = new_key,
+            Self::Opencode { .. } => {},
         }
     }
 
@@ -93,6 +108,34 @@ impl ProviderConfig {
         match self {
             Self::OpenaiCompat { models, .. } => models,
             Self::Anthropic { models, .. } => models,
+            Self::Opencode { models, .. } => models,
+        }
+    }
+
+    pub fn command(&self) -> Option<&str> {
+        match self { Self::Opencode { command, .. } => Some(command), _ => None }
+    }
+
+    pub fn set_command(&mut self, value: String) {
+        if let Self::Opencode { command, .. } = self { *command = value; }
+    }
+
+    pub fn remember_models(&mut self, discovered: Vec<String>) {
+        if let Self::Opencode { models, .. } = self {
+            *models = discovered.into_iter().map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty()).collect();
+        }
+    }
+
+    pub fn set_opencode_catalog(
+        &mut self,
+        models: Vec<String>,
+        variants: HashMap<String, Vec<String>>,
+    ) {
+        if let Self::Opencode { models: stored_models, variants: stored_variants, .. } = self {
+            *stored_models = models.into_iter().map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty()).collect();
+            *stored_variants = variants;
         }
     }
 
@@ -106,6 +149,8 @@ impl ProviderConfig {
         list.insert(0, trimmed.to_string());
     }
 }
+
+fn default_opencode_command() -> String { "opencode".to_string() }
 
 fn default_anthropic_base_url() -> String {
     "https://api.anthropic.com/v1".to_string()
@@ -205,6 +250,7 @@ impl AiConfig {
                 "qwen2.5-coder-7b-instruct".to_string(),
                 "deepseek-r1-distill-qwen-7b".to_string(),
             ],
+            "opencode" => vec![],
             _ => vec![],
         }
     }
@@ -234,6 +280,9 @@ fn default_providers() -> HashMap<String, ProviderConfig> {
             models: default_anthropic_models(),
         },
     );
+    map.insert("opencode".to_string(), ProviderConfig::Opencode {
+        command: default_opencode_command(), models: Vec::new(), variants: HashMap::new(),
+    });
     map.insert(
         "openai".to_string(),
         ProviderConfig::OpenaiCompat {

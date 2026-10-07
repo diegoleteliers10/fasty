@@ -2190,7 +2190,7 @@ fn apply_snapshot_to_grid(
     let mut cur_fg = u32::MAX;
     let mut cur_bg = u32::MAX;
     let mut cur_flags = u16::MAX;
-    let mut emit_sgr = |out: &mut Vec<u8>, fg: u32, bg: u32, flags: u16| {
+    let emit_sgr = |out: &mut Vec<u8>, fg: u32, bg: u32, flags: u16| {
         out.extend_from_slice(b"\x1b[0m");
         if flags & CELL_FLAG_BOLD != 0 { out.extend_from_slice(b"\x1b[1m"); }
         if flags & CELL_FLAG_DIM != 0 { out.extend_from_slice(b"\x1b[2m"); }

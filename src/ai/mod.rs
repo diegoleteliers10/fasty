@@ -1,10 +1,12 @@
 pub mod agent;
 pub mod config;
+pub mod conversations;
 pub mod diff;
 pub mod document;
 pub mod image;
 pub mod learned_allow;
 pub mod model;
+pub mod opencode;
 pub mod permissions;
 pub mod prompt;
 pub mod providers;

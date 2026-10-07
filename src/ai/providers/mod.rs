@@ -70,6 +70,9 @@ pub fn create_model_from_config(
             let provider = AnthropicProvider::new(base_url.clone(), api_key, resolved_model.clone());
             Ok((Arc::new(provider), resolved_model))
         }
+        ProviderConfig::Opencode { .. } => Err(anyhow::anyhow!(
+            "OpenCode uses ACP and does not provide chat completions. Start it through the OpenCode agent runtime."
+        )),
     }
 }
 

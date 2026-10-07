@@ -29,6 +29,10 @@ pub enum PersistedPaneNode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedTab {
     pub id: usize,
+    #[serde(default)]
+    pub ai_tab_key: Option<String>,
+    #[serde(default)]
+    pub ai_conversation_id: Option<String>,
     pub title: String,
     pub custom_title: Option<String>,
     pub cwd: Option<String>,
@@ -131,6 +135,8 @@ mod tests {
             active_tab_idx: 0,
             tabs: vec![PersistedTab {
                 id: 1,
+                ai_tab_key: None,
+                ai_conversation_id: None,
                 title: "Terminal".to_string(),
                 custom_title: Some("Dev Split".to_string()),
                 cwd: Some("/tmp".to_string()),

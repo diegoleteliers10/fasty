@@ -5,7 +5,7 @@ use icons::common::IconType;
 use std::f32::consts::PI;
 use std::time::Duration;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AiUiToolCall {
     pub id: String,
     pub name: String,
@@ -17,7 +17,7 @@ pub struct AiUiToolCall {
     pub diff: Option<crate::ai::diff::FileDiff>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AiUiMessage {
     pub is_user: bool,
     pub text: String,
@@ -103,6 +103,14 @@ pub struct AiUiPendingConfirmation {
     pub tool_id: String,
     pub tool_name: String,
     pub input_summary: String,
+    pub options: Vec<AiUiPermissionOption>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AiUiPermissionOption {
+    pub option_id: String,
+    pub name: String,
+    pub kind: Option<String>,
 }
 
 /// Files dropped on a panel child. `.occlude()` sets `HitboxBehavior::BlockMouse`,
@@ -116,14 +124,13 @@ pub type FileDropCallback = dyn Fn(&[std::path::PathBuf], &mut Window, &mut App)
 pub const AI_AT_MENU_MAX_ROWS: usize = 20;
 
 pub type MouseDownCallback = Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>;
-pub type ConfirmCallback = Box<dyn Fn(&(bool, bool), &mut Window, &mut App) + 'static>;
+pub type ConfirmCallback = Box<dyn Fn(&String, &mut Window, &mut App) + 'static>;
 
 #[derive(IntoElement)]
 pub struct AiSidebar {
     pub theme: Theme,
     pub width: f32,
     pub provider_name: String,
-    pub model_name: String,
     pub cwd: String,
     pub git_branch: Option<String>,
     pub context_pct: f32,
@@ -145,6 +152,11 @@ pub struct AiSidebar {
     pub on_focus: Option<MouseDownCallback>,
     pub on_click_char: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
     pub on_new_chat: Option<MouseDownCallback>,
+    pub history_open: bool,
+    pub history_items: Vec<(String, String, u64)>,
+    pub on_toggle_history: Option<MouseDownCallback>,
+    pub on_select_history: Option<Box<dyn Fn(&String, &mut Window, &mut App) + 'static>>,
+    pub on_delete_history: Option<Box<dyn Fn(&String, &mut Window, &mut App) + 'static>>,
     pub on_model_click: Option<MouseDownCallback>,
     pub on_toggle_mode: Option<Box<dyn Fn(&String, &mut Window, &mut App) + 'static>>,
     pub expanded_thinkings: std::collections::HashSet<usize>,
@@ -154,8 +166,15 @@ pub struct AiSidebar {
     /// Routes files dropped on this panel. See [`FileDropCallback`].
     pub on_file_drop: Option<std::rc::Rc<FileDropCallback>>,
     pub on_at_click: Option<MouseDownCallback>,
+    pub on_dismiss_at_menu: Option<MouseDownCallback>,
     pub on_attach_click: Option<MouseDownCallback>,
+    pub opencode_variants: Vec<String>,
+    pub opencode_variant: String,
+    pub opencode_variants_open: bool,
+    pub on_toggle_opencode_variants: Option<MouseDownCallback>,
+    pub on_select_opencode_variant: Option<Box<dyn Fn(&String, &mut Window, &mut App) + 'static>>,
     pub at_menu_open: bool,
+    pub at_is_skill_menu: bool,
     pub at_matches: Vec<String>,
     /// Row the arrow keys point at. Separate from hover: the pointer and the
     /// keyboard move it independently, so the highlight has to read without a
@@ -180,6 +199,7 @@ pub struct AiSidebar {
     pub ai_last_usage: Option<(u64, u64)>,
     pub context_hovercard_open: bool,
     pub on_hover_context: Option<Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>>,
+    pub on_set_context_window: Option<Box<dyn Fn(&u64, &mut Window, &mut App) + 'static>>,
 }
 
 impl AiSidebar {
@@ -187,13 +207,11 @@ impl AiSidebar {
         theme: Theme,
         width: f32,
         provider_name: impl Into<String>,
-        model_name: impl Into<String>,
     ) -> Self {
         Self {
             theme,
             width,
             provider_name: provider_name.into(),
-            model_name: model_name.into(),
             cwd: "~".to_string(),
             git_branch: None,
             context_pct: 0.0,
@@ -215,6 +233,11 @@ impl AiSidebar {
             on_focus: None,
             on_click_char: None,
             on_new_chat: None,
+            history_open: false,
+            history_items: Vec::new(),
+            on_toggle_history: None,
+            on_select_history: None,
+            on_delete_history: None,
             on_model_click: None,
             on_toggle_mode: None,
             expanded_thinkings: std::collections::HashSet::new(),
@@ -223,8 +246,15 @@ impl AiSidebar {
             on_remove_attachment: None,
             on_file_drop: None,
             on_at_click: None,
+            on_dismiss_at_menu: None,
             on_attach_click: None,
+            opencode_variants: Vec::new(),
+            opencode_variant: "default".to_string(),
+            opencode_variants_open: false,
+            on_toggle_opencode_variants: None,
+            on_select_opencode_variant: None,
             at_menu_open: false,
+            at_is_skill_menu: false,
             at_selected: 0,
             at_scroll_handle: ScrollHandle::new(),
             at_matches: Vec::new(),
@@ -241,6 +271,7 @@ impl AiSidebar {
             ai_last_usage: None,
             context_hovercard_open: false,
             on_hover_context: None,
+            on_set_context_window: None,
         }
     }
 
@@ -261,6 +292,14 @@ impl AiSidebar {
         handler: impl Fn(&bool, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_hover_context = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_set_context_window(
+        mut self,
+        handler: impl Fn(&u64, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_set_context_window = Some(Box::new(handler));
         self
     }
 
@@ -410,7 +449,7 @@ impl AiSidebar {
 
     pub fn on_confirm(
         mut self,
-        handler: impl Fn(&(bool, bool), &mut Window, &mut App) + 'static,
+        handler: impl Fn(&String, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_confirm = Some(Box::new(handler));
         self
@@ -434,6 +473,27 @@ impl AiSidebar {
         handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_new_chat = Some(Box::new(handler));
+        self
+    }
+
+    pub fn history(mut self, open: bool, items: Vec<(String, String, u64)>) -> Self {
+        self.history_open = open;
+        self.history_items = items;
+        self
+    }
+
+    pub fn on_toggle_history(mut self, handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static) -> Self {
+        self.on_toggle_history = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_select_history(mut self, handler: impl Fn(&String, &mut Window, &mut App) + 'static) -> Self {
+        self.on_select_history = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_delete_history(mut self, handler: impl Fn(&String, &mut Window, &mut App) + 'static) -> Self {
+        self.on_delete_history = Some(Box::new(handler));
         self
     }
 
@@ -500,8 +560,48 @@ impl AiSidebar {
         self
     }
 
+    pub fn opencode_variants(mut self, variants: Vec<String>, selected: String) -> Self {
+        self.opencode_variants = variants;
+        self.opencode_variant = selected;
+        self
+    }
+
+    pub fn opencode_variants_open(mut self, open: bool) -> Self {
+        self.opencode_variants_open = open;
+        self
+    }
+
+    pub fn on_toggle_opencode_variants(
+        mut self,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_toggle_opencode_variants = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_select_opencode_variant(
+        mut self,
+        handler: impl Fn(&String, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_select_opencode_variant = Some(Box::new(handler));
+        self
+    }
+
     pub fn at_menu_open(mut self, open: bool) -> Self {
         self.at_menu_open = open;
+        self
+    }
+
+    pub fn on_dismiss_at_menu(
+        mut self,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_dismiss_at_menu = Some(Box::new(handler));
+        self
+    }
+
+    pub fn at_is_skill_menu(mut self, is_skill_menu: bool) -> Self {
+        self.at_is_skill_menu = is_skill_menu;
         self
     }
 
@@ -1025,27 +1125,27 @@ fn render_tool_diff_card(
                             .items_center()
                             .gap_2()
                             .child(render_confirm_button(
-                                "Accept",
+                                "Accept".to_string(),
                                 theme,
                                 true,
                                 false,
-                                (false, true),
+                                "allow_once".to_string(),
                                 &on_confirm_allow,
                             ))
                             .child(render_confirm_button(
-                                "Allow Always",
+                                "Allow Always".to_string(),
                                 theme,
                                 false,
                                 false,
-                                (true, true),
+                                "allow_always".to_string(),
                                 &on_confirm_always,
                             ))
                             .child(render_confirm_button(
-                                "Reject",
+                                "Reject".to_string(),
                                 theme,
                                 false,
                                 true,
-                                (false, false),
+                                "reject_once".to_string(),
                                 on_confirm_decline,
                             )),
                     )
@@ -1063,11 +1163,11 @@ fn render_tool_diff_card(
 }
 
 fn render_confirm_button(
-    label: &'static str,
+    label: String,
     theme: &Theme,
     primary: bool,
     danger: bool,
-    decision: (bool, bool),
+    option_id: String,
     on_confirm: &std::rc::Rc<ConfirmCallback>,
 ) -> Div {
     let on_confirm = on_confirm.clone();
@@ -1094,9 +1194,9 @@ fn render_confirm_button(
                     .hover(move |s| s.bg(theme.hover))
             }
         })
-        .child(label)
+        .child(SharedString::from(label))
         .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-            on_confirm(&decision, window, cx);
+            on_confirm(&option_id, window, cx);
         })
 }
 
@@ -1108,6 +1208,27 @@ fn render_confirmation_section(
     let Some(on_confirm) = on_confirm else {
         return div().into_any_element();
     };
+
+    if !conf.options.is_empty() {
+        let options = conf.options.clone();
+        return div()
+            .flex()
+            .flex_col()
+            .p(px(10.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(theme.accent)
+            .bg(theme.surface_raised)
+            .gap_2()
+            .child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.accent).child(format!("OpenCode requests permission for '{}'", conf.tool_name)))
+            .child(div().p(px(6.)).rounded(px(4.)).bg(theme.main_bg).text_size(px(11.5)).text_color(theme.foreground).overflow_hidden().child(SharedString::from(conf.input_summary.clone())))
+            .child(div().flex().flex_row().items_center().gap_2().children(options.into_iter().map(|option| {
+                let is_reject = option.kind.as_deref().map(|kind| kind.starts_with("reject")).unwrap_or(false);
+                let is_allow = option.kind.as_deref().map(|kind| kind.starts_with("allow")).unwrap_or(false);
+                render_confirm_button(option.name, theme, is_allow, is_reject, option.option_id, &on_confirm)
+            })))
+            .into_any_element();
+    }
 
     // edit_file confirmations render inline on the tool row's diff card
     // (Accept / Reject buttons next to the diff), never as a separate card.
@@ -1233,19 +1354,19 @@ fn render_confirmation_section(
                             .items_center()
                             .gap_2()
                             .child(render_confirm_button(
-                                "Accept",
+                                "Accept".to_string(),
                                 theme,
                                 true,
                                 false,
-                                (false, true),
+                                "allow_once".to_string(),
                                 &on_confirm_allow,
                             ))
                             .child(render_confirm_button(
-                                "Reject",
+                                "Reject".to_string(),
                                 theme,
                                 false,
                                 true,
-                                (false, false),
+                                "reject_once".to_string(),
                                 &on_confirm_decline,
                             )),
                     )
@@ -1301,27 +1422,27 @@ fn render_confirmation_section(
                         .flex_row()
                         .gap_2()
                         .child(render_confirm_button(
-                            "Allow",
+                            "Allow".to_string(),
                             theme,
                             true,
                             false,
-                            (false, true),
+                            "allow_once".to_string(),
                             &on_confirm_allow,
                         ))
                         .child(render_confirm_button(
-                            "Allow Always",
+                            "Allow Always".to_string(),
                             theme,
                             false,
                             false,
-                            (true, true),
+                            "allow_always".to_string(),
                             &on_confirm_always,
                         ))
                         .child(render_confirm_button(
-                            "Decline",
+                            "Decline".to_string(),
                             theme,
                             false,
                             true,
-                            (false, false),
+                            "reject_once".to_string(),
                             &on_confirm_decline,
                         )),
                 )
@@ -1382,7 +1503,7 @@ fn render_confirmation_section(
                                             MouseButton::Left,
                                             move |_ev, window, cx| {
                                                 crate::ai::learned_allow::accept_suggestion(&family_accept);
-                                                on_accept(&(true, true), window, cx);
+                                                on_accept(&"allow_always".to_string(), window, cx);
                                             },
                                         )
                                         .child("Auto-allow"),
@@ -1582,10 +1703,10 @@ fn format_number(n: u64) -> String {
 }
 
 fn render_context_hovercard(
-    model_name: &str,
     usage: ContextUsage,
     theme: &Theme,
     on_file_drop: Option<std::rc::Rc<FileDropCallback>>,
+    on_set_context_window: Option<std::rc::Rc<Box<dyn Fn(&u64, &mut Window, &mut App) + 'static>>>,
 ) -> impl IntoElement {
     let ContextUsage {
         used_tokens,
@@ -1594,7 +1715,11 @@ fn render_context_hovercard(
         pct,
     } = usage;
     let progress = pct.clamp(0.0, 1.0);
-    let pct_label = format!("{:.1}%", progress * 100.0);
+    let pct_label = if last_usage.is_some() {
+        format!("{:.1}%", progress * 100.0)
+    } else {
+        "—".to_string()
+    };
     let remaining_tokens = max_tokens.saturating_sub(used_tokens);
     let bar_color = if progress > 0.8 {
         theme.bright_red
@@ -1634,13 +1759,13 @@ fn render_context_hovercard(
         .on_scroll_wheel(|_, _, cx| {
             cx.stop_propagation();
         })
-        // Card Header: Title & Model Pill
+        // Card Header
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_between()
+                .justify_start()
                 .child(
                     div()
                         .flex()
@@ -1659,24 +1784,30 @@ fn render_context_hovercard(
                                 .text_color(theme.foreground)
                                 .child("Context Window"),
                         ),
-                )
-                .child(
-                    div()
-                        .px(px(5.))
-                        .py(px(1.5))
-                        .rounded(px(4.))
-                        .bg({
-                            let mut bg = theme.surface;
-                            bg.a = 1.0;
-                            bg
-                        })
-                        .border_1()
-                        .border_color(theme.border)
-                        .text_size(px(9.5))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.muted)
-                        .child(model_name.to_string()),
                 ),
+        )
+        .child(
+            div().flex().flex_row().gap(px(4.)).children(
+                [4_000u64, 32_000, 64_000, 128_000, 200_000, 1_000_000]
+                    .into_iter().map(|size| {
+                        let selected = size == max_tokens;
+                        let label = match size {
+                            4_000 => "4k", 32_000 => "32k", 64_000 => "64k",
+                            128_000 => "128k", 200_000 => "200k", _ => "1M",
+                        };
+                        let callback = on_set_context_window.clone();
+                        div().id(SharedString::from(format!("ai-context-size-{size}")))
+                            .px(px(5.)).py(px(3.)).rounded(px(4.))
+                            .text_size(px(9.5))
+                            .bg(if selected { theme.accent } else { theme.surface })
+                            .text_color(if selected { theme.black } else { theme.muted_strong })
+                            .cursor(CursorStyle::PointingHand)
+                            .child(label)
+                            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                if let Some(callback) = callback.as_ref() { callback(&size, window, cx); }
+                            })
+                    })
+            )
         )
         // Progress Bar & Percentage
         .child(
@@ -1740,11 +1871,11 @@ fn render_context_hovercard(
                             div()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.foreground)
-                                .child(format!(
-                                    "{} / {}",
-                                    format_number(used_tokens),
-                                    format_number(max_tokens)
-                                )),
+                                .child(if last_usage.is_some() {
+                                    format!("{} / {}", format_number(used_tokens), format_number(max_tokens))
+                                } else {
+                                    format!("— / {}", format_number(max_tokens))
+                                }),
                         ),
                 )
                 .when_some(last_usage, |rows, (input, output)| {
@@ -1763,7 +1894,7 @@ fn render_context_hovercard(
                             ))),
                     )
                 })
-                .child(
+                .when_some(last_usage, |rows, _| rows.child(
                     div()
                         .flex()
                         .flex_row()
@@ -1781,7 +1912,7 @@ fn render_context_hovercard(
                                 })
                                 .child(format_number(remaining_tokens)),
                         ),
-                ),
+                )),
         );
     if let Some(on_drop) = on_file_drop {
         card = card.on_drop(move |paths: &gpui::ExternalPaths, window, cx| {
@@ -1879,14 +2010,24 @@ impl RenderOnce for AiSidebar {
         let on_focus = self.on_focus.map(std::rc::Rc::new);
         let on_click_char = self.on_click_char.map(std::rc::Rc::new);
         let on_new_chat = self.on_new_chat.map(std::rc::Rc::new);
+        let history_open = self.history_open;
+        let variants_open = self.opencode_variants_open;
+        let history_items = self.history_items.clone();
+        let on_toggle_history = self.on_toggle_history.map(std::rc::Rc::new);
+        let on_select_history = self.on_select_history.map(std::rc::Rc::new);
+        let on_delete_history = self.on_delete_history.map(std::rc::Rc::new);
         let _on_model_click = self.on_model_click.map(std::rc::Rc::new);
         let on_toggle_mode = self.on_toggle_mode.map(std::rc::Rc::new);
         let on_toggle_thinking = self.on_toggle_thinking.map(std::rc::Rc::new);
         let on_remove_attachment = self.on_remove_attachment.map(std::rc::Rc::new);
         let on_file_drop = self.on_file_drop.clone();
         let on_at_click = self.on_at_click.map(std::rc::Rc::new);
+        let on_dismiss_at_menu = self.on_dismiss_at_menu.map(std::rc::Rc::new);
         let on_attach_click = self.on_attach_click.map(std::rc::Rc::new);
+        let on_toggle_opencode_variants = self.on_toggle_opencode_variants.map(std::rc::Rc::new);
+        let on_select_opencode_variant = self.on_select_opencode_variant.map(std::rc::Rc::new);
         let on_select_at_match = self.on_select_at_match.map(std::rc::Rc::new);
+        let at_is_skill_menu = self.at_is_skill_menu;
         let composer_bounds = self.composer_bounds.clone();
         let message_selection = self.message_selection;
         let on_select_message_char = self.on_select_message_char.clone();
@@ -1903,7 +2044,7 @@ impl RenderOnce for AiSidebar {
         let ai_last_usage = self.ai_last_usage;
         let context_hovercard_open = self.context_hovercard_open;
         let on_hover_context = self.on_hover_context.map(std::rc::Rc::new);
-        let model_name = self.model_name.clone();
+        let on_set_context_window = self.on_set_context_window.map(std::rc::Rc::new);
 
         // Text left edge = sidebar left + 8px scroll-area px + 4px outer-wrapper px.
         // Mouse events use window-absolute X, so we subtract this to get text-relative X.
@@ -1911,6 +2052,10 @@ impl RenderOnce for AiSidebar {
         let sidebar_w = self.width;
         let msg_text_left = win_w - sidebar_w + 12.0;
         let streaming_text_left = win_w - sidebar_w + 8.0; // scroll-area px only (no inner px wrapper for streaming)
+        let dismiss_history = on_toggle_history.clone();
+        let dismiss_variants = on_toggle_opencode_variants.clone();
+        let dismiss_at_menu = on_dismiss_at_menu.clone();
+        let at_menu_open = self.at_menu_open;
 
         div()
             .id("ai-sidebar-container")
@@ -1922,6 +2067,23 @@ impl RenderOnce for AiSidebar {
             .bg(sidebar_bg)
             .border_l_1()
             .border_color(theme.border)
+            .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                if history_open {
+                    if let Some(callback) = dismiss_history.as_ref() {
+                        callback(event, window, cx);
+                    }
+                }
+                if variants_open {
+                    if let Some(callback) = dismiss_variants.as_ref() {
+                        callback(event, window, cx);
+                    }
+                }
+                if at_menu_open {
+                    if let Some(callback) = dismiss_at_menu.as_ref() {
+                        callback(event, window, cx);
+                    }
+                }
+            })
             .child(
                 // 1. Header: Sleek, compact single toolbar (h: 36px) matching Fastty's design system
                 div()
@@ -2000,6 +2162,70 @@ impl RenderOnce for AiSidebar {
                             .items_center()
                             .gap(px(2.))
                             .flex_shrink_0()
+                            .child(
+                                div().id("ai-history-trigger").relative().flex().items_center().justify_center()
+                                    .w(px(22.)).h(px(22.)).rounded(px(4.))
+                                    .cursor(CursorStyle::PointingHand).text_color(theme.muted)
+                                    .hover(move |style| style.bg(theme.hover).text_color(theme.foreground))
+                                    .child(crate::ui::icons::render_icon(IconType::Clock, theme.muted, 12.0))
+                                    .on_mouse_down(MouseButton::Left, {
+                                        let callback = on_toggle_history.clone();
+                                        move |event, window, cx| {
+                                            if let Some(callback) = callback.as_ref() { callback(event, window, cx); }
+                                            cx.stop_propagation();
+                                        }
+                                    })
+                                    .when(history_open, |button| {
+                                        let callback = on_select_history.clone();
+                                        let on_delete = on_delete_history.clone();
+                                        button.child(gpui::deferred(div().id("ai-history-menu").absolute().top(px(26.)).right(px(0.))
+                                            .w(px(240.)).max_h(px(260.)).overflow_y_scroll().p(px(5.))
+                                            .rounded(px(7.)).bg(theme.surface_raised).border_1().border_color(theme.border).shadow_xl().occlude()
+                                            .flex().flex_col().gap(px(3.))
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                                            .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                                            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                                            .when(history_items.is_empty(), |menu| {
+                                                menu.child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .h(px(92.))
+                                                        .text_size(px(11.))
+                                                        .text_color(theme.muted)
+                                                        .child("No hay conversaciones"),
+                                                )
+                                            })
+                                            .when(!history_items.is_empty(), |menu| menu.children(history_items.iter().map(|(id, title, _updated)| {
+                                                let id = id.clone();
+                                                let callback = callback.clone();
+                                                let on_delete = on_delete.clone();
+                                                let title = if title.trim().is_empty() { "New chat".to_string() } else { title.clone() };
+                                                div().id(SharedString::from(format!("ai-history-{id}"))).flex().flex_row().items_center()
+                                                    .px(px(7.)).py(px(6.)).rounded(px(5.)).truncate()
+                                                    .text_size(px(11.)).text_color(theme.foreground).hover(move |style| style.bg(theme.hover))
+                                                    .child(div().flex_1().min_w(px(0.)).truncate().child(SharedString::from(title))
+                                                        .on_mouse_down(MouseButton::Left, {
+                                                            let id = id.clone();
+                                                            move |_event, window, cx| {
+                                                                if let Some(callback) = callback.as_ref() { callback(&id, window, cx); }
+                                                            }
+                                                        }))
+                                                    .child(div().id(SharedString::from(format!("ai-history-delete-{id}")))
+                                                        .flex().items_center().justify_center().w(px(22.)).h(px(22.))
+                                                        .rounded(px(4.)).cursor(CursorStyle::PointingHand).text_color(theme.muted)
+                                                        .hover(move |style| style.bg(theme.bright_red).text_color(theme.foreground))
+                                                        .child(crate::ui::icons::render_icon(IconType::Trash2, theme.muted, 11.0))
+                                                        .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                                            cx.stop_propagation();
+                                                            if let Some(callback) = on_delete.as_ref() { callback(&id, window, cx); }
+                                                        }))
+                                            })))
+                                        ).with_priority(100))
+                                    })
+                            )
                             // Context usage + HoverCard
                             .child(
                                 div()
@@ -2025,7 +2251,11 @@ impl RenderOnce for AiSidebar {
                                         div()
                                             .text_size(px(10.5))
                                             .text_color(theme.muted)
-                                            .child(SharedString::from(format!("{:.0}%", context_pct * 100.0))),
+                                            .child(SharedString::from(if ai_last_usage.is_some() {
+                                                format!("{:.0}%", context_pct * 100.0)
+                                            } else {
+                                                "—".to_string()
+                                            })),
                                     ),
                             )
                             // New Chat '+'
@@ -2787,6 +3017,7 @@ impl RenderOnce for AiSidebar {
                 div()
                     .flex()
                     .flex_col()
+                    .relative()
                     .p(px(12.))
                     .pt(px(6.))
                     .child(
@@ -2812,7 +3043,7 @@ impl RenderOnce for AiSidebar {
                             // @ Mention Popup
                             .when(self.at_menu_open && !self.at_matches.is_empty(), |d| {
                                 let on_select_at_match = on_select_at_match.clone();
-                                d.child(
+                                d.child(gpui::deferred(
                                     div()
                                         .id("ai-at-mention-popup")
                                         .w_full()
@@ -2825,6 +3056,11 @@ impl RenderOnce for AiSidebar {
                                         .border_color(theme.border)
                                         .mb(px(8.))
                                         .p(px(4.))
+                                        .when(at_is_skill_menu, |menu| menu.child(
+                                            div().px(px(8.)).py(px(4.)).text_size(px(10.))
+                                                .font_weight(FontWeight::BOLD).text_color(theme.muted_strong)
+                                                .child("Skills and commands")
+                                        ))
                                         .children(
                                             self.at_matches
                                                 .iter()
@@ -2832,6 +3068,14 @@ impl RenderOnce for AiSidebar {
                                                 .enumerate()
                                                 .map(|(idx, file_path)| {
                                                     let fp = file_path.clone();
+                                                    let display_name = if let Some(rest) = file_path.strip_prefix("skill::") {
+                                                        let mut parts = rest.splitn(2, "::");
+                                                        format!("/{} · {}", parts.next().unwrap_or("skill"), parts.next().unwrap_or("project"))
+                                                    } else if let Some(name) = file_path.strip_prefix("acp::") {
+                                                        format!("/{}", name)
+                                                    } else {
+                                                        file_path.clone()
+                                                    };
                                                     let on_select = on_select_at_match.clone();
                                                     // The keyboard selection paints on its
                                                     // own: without a pointer over the list,
@@ -2891,11 +3135,11 @@ impl RenderOnce for AiSidebar {
                                                                 })
                                                                 .text_color(row_fg)
                                                                 .overflow_hidden()
-                                                                .child(SharedString::from(file_path.clone())),
+                                                                .child(SharedString::from(display_name)),
                                                         )
                                                 }),
                                         ),
-                                )
+                                ).with_priority(100))
                             })
                             // Attached Files Chip Badges
                             .when(!self.attached_files.is_empty(), |d| {
@@ -3206,11 +3450,14 @@ impl RenderOnce for AiSidebar {
                                                         }
                                                     })
                                                     .child(crate::ui::icons::render_paperclip_icon(theme.muted, 14.0)),
-                                            ),
+                                            )
                                     )
                                     .child(
                                         if self.is_streaming {
                                             div()
+                                                .flex()
+                                                .items_center()
+                                                .child(div()
                                                 .id("ai-stop-btn")
                                                 .flex()
                                                 .flex_row()
@@ -3245,10 +3492,10 @@ impl RenderOnce for AiSidebar {
                                                             cb(ev, window, cx);
                                                         }
                                                     }
-                                                })
+                                                }))
                                         } else {
                                             let is_empty = input_val.trim().is_empty() && self.attached_files.is_empty();
-                                            div()
+                                            let submit = div()
                                                 .id("ai-submit-btn")
                                                 .flex()
                                                 .flex_row()
@@ -3294,16 +3541,107 @@ impl RenderOnce for AiSidebar {
                                                             cb(ev, window, cx);
                                                         }
                                                     }
+                                                });
+                                            let controls = div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(6.))
+                                                .when(!self.opencode_variants.is_empty(), |row| {
+                                                    let on_toggle = on_toggle_opencode_variants.clone();
+                                                    row.child(
+                                                        div()
+                                                            .id("ai-opencode-effort-control")
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .w(px(24.))
+                                                            .h(px(24.))
+                                                            .rounded(px(5.))
+                                                            .border_1()
+                                                            .border_color(if self.opencode_variants_open { theme.accent } else { theme.border })
+                                                            .bg(if self.opencode_variants_open { theme.surface_raised } else { sidebar_bg })
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .hover(move |style| style.bg(theme.surface_raised))
+                                                            .child(crate::ui::icons::render_icon(IconType::Brain, theme.muted, 14.0))
+                                                            .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                                                                if let Some(callback) = on_toggle.as_ref() {
+                                                                    callback(ev, window, cx);
+                                                                }
+                                                                cx.stop_propagation();
+                                                            }),
+                                                    )
                                                 })
+                                                .child(submit);
+                                            div().child(controls)
                                         },
                                     ),
                             ),
                     )
+                    .when(self.opencode_variants_open && !self.opencode_variants.is_empty(), |composer| {
+                        let selected = self.opencode_variant.clone();
+                        let variants = self.opencode_variants.clone();
+                        let on_select = on_select_opencode_variant.clone();
+                        let on_toggle = on_toggle_opencode_variants.clone();
+                        composer.child(gpui::deferred(
+                            div()
+                                .id("ai-opencode-effort-backdrop")
+                                .absolute()
+                                .inset_0()
+                                .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                                    if let Some(callback) = on_toggle.as_ref() {
+                                        callback(ev, window, cx);
+                                    }
+                                    cx.stop_propagation();
+                                })
+                                .child(div()
+                                .id("ai-opencode-effort-menu")
+                                .absolute()
+                                .bottom(px(48.))
+                                .right(px(12.))
+                                .w(px(150.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .p(px(5.))
+                                .rounded(px(7.))
+                                .bg({ let mut bg = theme.surface_raised; bg.a = 1.0; bg })
+                                .border_1()
+                                .border_color(theme.border)
+                                .shadow_xl()
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                                .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                                .child(
+                                    div().px(px(8.)).py(px(5.)).text_size(px(10.))
+                                        .font_weight(FontWeight::SEMIBOLD).text_color(theme.muted)
+                                        .child("Reasoning"),
+                                )
+                                .children(variants.into_iter().map(|variant| {
+                                    let is_selected = variant == selected;
+                                    let label = if variant == "default" { "Default".to_string() } else { variant.clone() };
+                                    let chosen = variant.clone();
+                                    let on_select = on_select.clone();
+                                    div()
+                                        .id(SharedString::from(format!("ai-opencode-effort-{variant}")))
+                                        .flex().items_center().justify_between()
+                                        .px(px(8.)).py(px(6.)).rounded(px(5.))
+                                        .bg(if is_selected { theme.surface_raised } else { theme.surface })
+                                        .hover(move |style| style.bg(theme.hover))
+                                        .cursor(CursorStyle::PointingHand)
+                                        .text_size(px(11.5)).text_color(theme.foreground)
+                                        .child(label)
+                                        .when(is_selected, |row| row.child(crate::ui::icons::render_icon(IconType::Check, theme.accent, 11.0)))
+                                        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                            if let Some(callback) = on_select.as_ref() { callback(&chosen, window, cx); }
+                                        })
+                                }))),
+                        ).with_priority(100))
+                    })
             )
             .when(context_hovercard_open, |container| {
                 let on_file_drop = self.on_file_drop.clone();
                 container.child(render_context_hovercard(
-                    &model_name,
                     ContextUsage {
                         used_tokens: context_used_tokens,
                         max_tokens: context_max_tokens,
@@ -3312,6 +3650,7 @@ impl RenderOnce for AiSidebar {
                     },
                     &theme,
                     on_file_drop.clone(),
+                    on_set_context_window.clone(),
                 ))
             })
     }

@@ -138,7 +138,6 @@ fn main() {
         Some("spawn") => {
             // Flags before the command; `--` (or the first non-flag) hands
             // the rest over verbatim, so `fastty spawn -- bash -c 'x'` works.
-            let mut command: Option<String> = None;
             let mut args: Vec<String> = Vec::new();
             let mut cwd: Option<String> = None;
             let mut cols: Option<usize> = None;
@@ -179,7 +178,7 @@ fn main() {
                     rest.push(arg);
                 }
             }
-            command = rest.first().cloned();
+            let command = rest.first().cloned();
             if rest.len() > 1 {
                 args = rest[1..].to_vec();
             }
@@ -192,7 +191,6 @@ fn main() {
                 std::process::exit(1);
             };
             let mut direction = String::new();
-            let mut command: Option<String> = None;
             let mut args: Vec<String> = Vec::new();
             let mut cwd: Option<String> = None;
             let mut json = false;
@@ -228,7 +226,7 @@ fn main() {
                 eprintln!("fastty split: --direction must be left, right, top, or down");
                 std::process::exit(1);
             }
-            command = rest.first().cloned();
+            let command = rest.first().cloned();
             if rest.len() > 1 {
                 args = rest[1..].to_vec();
             }
@@ -468,6 +466,9 @@ fn run_ask_command(mut args: impl Iterator<Item = String>) {
             println!();
         }
         fastty::ai::AgentEvent::Usage { .. } => {}
+        fastty::ai::AgentEvent::ContextWindow { .. }
+        | fastty::ai::AgentEvent::ConversationSession(_)
+        | fastty::ai::AgentEvent::AvailableCommands(_) => {}
         fastty::ai::AgentEvent::Error(err) => {
             eprintln!("\n\x1b[31m[fastty-ai error]: {}\x1b[0m", err);
         }
@@ -476,4 +477,3 @@ fn run_ask_command(mut args: impl Iterator<Item = String>) {
         std::process::exit(1);
     }
 }
-

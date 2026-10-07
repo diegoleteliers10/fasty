@@ -94,6 +94,10 @@ pub struct WindowSession {
 pub struct TabInfo {
     pub cwd: Option<PathBuf>,
     #[serde(default)]
+    pub ai_tab_key: Option<String>,
+    #[serde(default)]
+    pub ai_conversation_id: Option<String>,
+    #[serde(default)]
     pub custom_name: Option<String>,
     #[serde(default)]
     pub title_override: Option<String>,

@@ -193,6 +193,7 @@ pub struct SettingsView {
     pub keybinding_preset: crate::keybindings::KeybindingPreset,
     pub ai_permission_mode: crate::ai::PermissionMode,
     pub ai_context_window: u32,
+    pub ai_context_window_error: Option<String>,
     pub ai_provider: String,
     pub ai_model: Option<String>,
     pub detected_external_configs: Vec<crate::importer::DetectedConfig>,
@@ -257,6 +258,7 @@ impl SettingsView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         config::load_custom_themes();
         let loaded_config = crate::config::load_lenient();
+        let auto_discover_opencode = loaded_config.ai.default == "opencode";
         let theme_name = loaded_config.theme.as_deref().unwrap_or("default").to_string();
         let theme = Theme::from_name(&theme_name).with_opacity(loaded_config.opacity);
         let tab_layout = loaded_config.tab_layout;
@@ -315,8 +317,8 @@ impl SettingsView {
             .ai
             .providers
             .get(&loaded_config.ai.default)
-            .map(|p| p.base_url().to_string())
-            .unwrap_or_else(|| "http://localhost:11434/v1".to_string());
+            .map(|p| p.command().unwrap_or_else(|| p.base_url()).to_string())
+            .unwrap_or_else(|| if loaded_config.ai.default == "opencode" { "opencode".to_string() } else { "http://localhost:11434/v1".to_string() });
         let ai_api_key_input = loaded_config
             .ai
             .providers
@@ -359,6 +361,7 @@ impl SettingsView {
             keybinding_preset,
             ai_permission_mode: loaded_config.ai.permission_mode,
             ai_context_window: loaded_config.ai.context_window,
+            ai_context_window_error: None,
             ai_provider: loaded_config.ai.default.clone(),
             ai_model,
             detected_external_configs,
@@ -412,6 +415,9 @@ impl SettingsView {
             view.spawn_font_discovery(window, cx);
         }
         view.spawn_ollama_detection(ollama_base_url, cx);
+        if auto_discover_opencode {
+            view.test_ai_connection(window, cx);
+        }
         view
     }
 
@@ -532,6 +538,7 @@ impl SettingsView {
         self.keybinding_preset = cfg.keybinding_preset.unwrap_or_default();
         self.ai_permission_mode = cfg.ai.permission_mode;
         self.ai_context_window = cfg.ai.context_window;
+        self.ai_context_window_error = None;
         self.ai_provider = cfg.ai.default.clone();
         self.ai_model = cfg.ai.default_model.clone();
         if let Some(ref t) = cfg.theme {
@@ -540,8 +547,11 @@ impl SettingsView {
         self.theme = Theme::from_name(&self.current_theme_name).with_opacity(self.opacity);
 
         if let Some(prov) = cfg.ai.providers.get(&self.ai_provider) {
-            self.ai_base_url_input = prov.base_url().to_string();
+            self.ai_base_url_input = prov.command().unwrap_or_else(|| prov.base_url()).to_string();
             self.ai_api_key_input = prov.api_key().unwrap_or("").to_string();
+        } else if self.ai_provider == "opencode" {
+            self.ai_base_url_input = "opencode".to_string();
+            self.ai_api_key_input.clear();
         }
 
         self.ai_model_input = self.ai_model.clone().unwrap_or_else(|| {
@@ -675,7 +685,11 @@ impl SettingsView {
     fn save_ai_provider_config(&mut self) {
         self.config.ai.default = self.ai_provider.clone();
         if let Some(prov) = self.config.ai.providers.get_mut(&self.ai_provider) {
-            prov.set_base_url(self.ai_base_url_input.clone());
+            if prov.command().is_some() {
+                prov.set_command(self.ai_base_url_input.clone());
+            } else {
+                prov.set_base_url(self.ai_base_url_input.clone());
+            }
             let key = if self.ai_api_key_input.trim().is_empty() {
                 None
             } else {
@@ -806,7 +820,9 @@ impl SettingsView {
                 _ => {}
             }
         }
-        if ev.keystroke.key == "escape" {
+        if ev.keystroke.key.eq_ignore_ascii_case("escape")
+            || ev.keystroke.key.eq_ignore_ascii_case("esc")
+        {
             if self.font_combobox_open {
                 self.font_combobox_open = false;
                 if self.active_input_field == Some(ActiveInputField::FontSearch) {
@@ -1529,22 +1545,48 @@ impl SettingsView {
 
     pub fn set_ai_context_window(&mut self, tokens: u32, cx: &mut Context<Self>) {
         let clamped = tokens.clamp(4_000, 2_000_000);
-        self.ai_context_window = clamped;
+        let previous = self.config.ai.context_window;
         self.config.ai.context_window = clamped;
-        self.save_config();
-        crate::config::increment_config_version();
+        match self.config.save_default() {
+            Ok(()) => {
+                self.ai_context_window = clamped;
+                self.ai_context_window_error = None;
+                crate::config::set_ai_context_window(clamped);
+                self.refresh_baseline();
+            }
+            Err(error) => {
+                self.config.ai.context_window = previous;
+                self.ai_context_window = previous;
+                self.ai_context_window_error = Some(format!("Could not save: {error}"));
+                eprintln!("[fastty] could not save AI context window: {error}");
+            }
+        }
         cx.notify();
     }
 
-    pub fn set_ai_provider(&mut self, provider: &str, cx: &mut Context<Self>) {
+    pub fn set_ai_provider(
+        &mut self,
+        provider: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.ai_provider = provider.to_string();
         self.config.ai.default = self.ai_provider.clone();
+        if provider == "opencode" {
+            self.config.ai.providers.entry("opencode".to_string()).or_insert_with(|| {
+                crate::ai::ProviderConfig::Opencode {
+                    command: "opencode".to_string(),
+                    models: Vec::new(),
+                    variants: std::collections::HashMap::new(),
+                }
+            });
+        }
         let prov_info = self
             .config
             .ai
             .providers
             .get(provider)
-            .map(|p| (p.base_url().to_string(), p.api_key().unwrap_or("").to_string(), p.models().first().cloned()));
+            .map(|p| (p.command().unwrap_or_else(|| p.base_url()).to_string(), p.api_key().unwrap_or("").to_string(), p.models().first().cloned()));
         if let Some((base_url, api_key, first_prov_model)) = prov_info {
             self.ai_base_url_input = base_url.clone();
             self.ai_base_url_state.set_text(self.ai_base_url_input.clone());
@@ -1571,6 +1613,9 @@ impl SettingsView {
         self.save_config();
         crate::config::increment_config_version();
         cx.notify();
+        if provider == "opencode" {
+            self.test_ai_connection(window, cx);
+        }
     }
 
     pub fn reset_ai_base_url(&mut self, cx: &mut Context<Self>) {
@@ -1580,6 +1625,7 @@ impl SettingsView {
             "openai" => "https://api.openai.com/v1",
             "openrouter" => "https://openrouter.ai/api/v1",
             "lm-studio" => "http://localhost:1234/v1",
+            "opencode" => "opencode",
             _ => "http://localhost:11434/v1",
         };
         self.ai_base_url_input = default_url.to_string();
@@ -1630,6 +1676,63 @@ impl SettingsView {
         }
         self.ai_test_status = AiTestStatus::Testing;
         cx.notify();
+
+        if self.ai_provider == "opencode" {
+            let command = self.config.ai.providers.get("opencode")
+                .and_then(crate::ai::ProviderConfig::command).unwrap_or("opencode").to_string();
+            let command_for_check = command.clone();
+            let (tx, rx) = async_channel::bounded::<Result<(std::time::Duration, Vec<String>, std::collections::HashMap<String, Vec<String>>), String>>(1);
+            let worker = std::thread::Builder::new().name("fastty-opencode-discovery".into()).spawn(move || {
+                let start = std::time::Instant::now();
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let result = crate::ai::opencode::discover_catalog(command, cwd)
+                    .map(|(models, variants)| (start.elapsed(), models, variants))
+                    .map_err(|error| error.to_string());
+                let _ = tx.send_blocking(result);
+            });
+            if let Err(error) = worker {
+                self.ai_test_status = AiTestStatus::Failed(error.to_string());
+                cx.notify();
+                return;
+            }
+            cx.spawn_in(window, async move |this, cx| {
+                if let Ok(result) = rx.recv().await {
+                    let _ = this.update_in(cx, |this, _window, cx| {
+                        let current_command = this.config.ai.providers.get("opencode")
+                            .and_then(crate::ai::ProviderConfig::command).unwrap_or("opencode");
+                        if this.ai_provider != "opencode" || current_command != command_for_check {
+                            return;
+                        }
+                        match result {
+                            Ok((duration, models, variants)) => {
+                                let current_model = this.ai_model_input.trim();
+                                let selected = models.iter().find(|model| model.as_str() == current_model).cloned()
+                                    .or_else(|| models.iter().find(|model| {
+                                        current_model.strip_prefix(&format!("{}/", model))
+                                            .is_some_and(|effort| variants.get(model.as_str()).is_some_and(|values| values.iter().any(|value| value == effort)))
+                                    }).cloned())
+                                    .or_else(|| models.first().cloned());
+                                if let Some(provider) = this.config.ai.providers.get_mut("opencode") {
+                                    provider.set_opencode_catalog(models.clone(), variants);
+                                }
+                                if let Some(model) = selected {
+                                    this.ai_model = Some(model.clone());
+                                    this.ai_model_input = model.clone();
+                                    this.ai_model_state.set_text(model.clone());
+                                    this.config.ai.default_model = Some(model);
+                                }
+                                this.ai_test_status = AiTestStatus::Success(duration);
+                                this.save_config();
+                                crate::config::increment_config_version();
+                            }
+                            Err(error) => this.ai_test_status = AiTestStatus::Failed(error),
+                        }
+                        cx.notify();
+                    });
+                }
+            }).detach();
+            return;
+        }
 
         let cfg = self.config.ai.clone();
         let provider = self.ai_provider.clone();
@@ -3056,7 +3159,7 @@ impl SettingsView {
                             false
                         };
 
-                        combobox.child(
+                        combobox.child(gpui::deferred(
                             div()
                                 .id("font-combobox-dropdown")
                                 .absolute()
@@ -3327,7 +3430,7 @@ impl SettingsView {
                                                 .child("↑↓ navigate • ↵ select • esc close"),
                                         ),
                                  ),
-                        )
+                        ).with_priority(100))
                     }),
             )
     }
@@ -3734,11 +3837,15 @@ impl SettingsView {
             ("openai", "OpenAI", "Cloud API", "GPT-4o, GPT-4o-mini & o3-mini"),
             ("openrouter", "OpenRouter", "Unified API", "Hundreds of open & proprietary models"),
             ("lm-studio", "LM Studio", "Local Server", "Local LLM server on localhost:1234"),
+            ("opencode", "OpenCode", "ACP Agent", "Native agent with tools, MCP, and permissions"),
         ];
 
         let is_ollama = self.ai_provider == "ollama";
         let default_presets = crate::ai::AiConfig::default_preset_models(&self.ai_provider);
-        let chips_to_render: Vec<String> = if is_ollama {
+        let chips_to_render: Vec<String> = if self.ai_provider == "opencode" {
+            self.config.ai.providers.get("opencode")
+                .map(|provider| provider.models().to_vec()).unwrap_or_default()
+        } else if is_ollama {
             if !self.detected_ollama_models.is_empty() {
                 self.detected_ollama_models.clone()
             } else {
@@ -3798,8 +3905,8 @@ impl SettingsView {
                                 .when(!is_last, |this| this.border_b_1().border_color(theme.border))
                                 .hover(move |s| s.bg(theme.surface_raised))
                                 .cursor(CursorStyle::PointingHand)
-                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                    this.set_ai_provider(id, cx);
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
+                                    this.set_ai_provider(id, window, cx);
                                 }))
                                 .child(
                                     div()
@@ -3863,7 +3970,7 @@ impl SettingsView {
                 div()
                     .flex()
                     .flex_col()
-                    .child(render_section_header("Model Configuration (BYOK)", theme))
+                    .child(render_section_header(if self.ai_provider == "opencode" { "OpenCode Models" } else { "Model Configuration (BYOK)" }, theme))
                     .child(
                         render_group_card(theme)
                             .child(render_card_row(
@@ -3989,6 +4096,8 @@ impl SettingsView {
                                                     .text_color(theme.foreground)
                                                     .child(if is_ollama {
                                                         "Installed Local Models"
+                                                    } else if self.ai_provider == "opencode" {
+                                                        "Available OpenCode Models"
                                                     } else {
                                                         "Preset & Recent Models"
                                                     }),
@@ -4052,8 +4161,8 @@ impl SettingsView {
                                                     .when(is_active, |this| {
                                                         this.child(render_icon(IconType::Check, theme.accent, 11.0))
                                                     })
-                                            })),
-                                    ),
+                                            }))
+                                    )
                             ),
                     )
             })
@@ -4067,12 +4176,12 @@ impl SettingsView {
                 div()
                     .flex()
                     .flex_col()
-                    .child(render_section_header("Endpoint & Authentication", theme))
+                    .child(render_section_header(if self.ai_provider == "opencode" { "OpenCode Agent" } else { "Endpoint & Authentication" }, theme))
                     .child(
                         render_group_card(theme)
                             .child(render_card_row(
-                                "Endpoint URL",
-                                Some("HTTP API base address for model requests"),
+                                if self.ai_provider == "opencode" { "Executable Command" } else { "Endpoint URL" },
+                                Some(if self.ai_provider == "opencode" { "Path or command used to start OpenCode" } else { "HTTP API base address for model requests" }),
                                 div()
                                     .flex()
                                     .flex_row()
@@ -4129,7 +4238,7 @@ impl SettingsView {
                                                         div()
                                                             .text_size(px(11.))
                                                             .text_color(theme.muted)
-                                                            .child("e.g. http://localhost:11434/v1"),
+                                                    .child(if self.ai_provider == "opencode" { "e.g. opencode" } else { "e.g. http://localhost:11434/v1" }),
                                                     )
                                             } else {
                                                 crate::ui::text_input::render_line_spans(
@@ -4155,7 +4264,7 @@ impl SettingsView {
                                             .cursor(CursorStyle::PointingHand)
                                             .text_size(px(10.5))
                                             .text_color(theme.muted_strong)
-                                            .child("Reset")
+                                            .child(if self.ai_provider == "opencode" { "Default" } else { "Reset" })
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                                                 this.reset_ai_base_url(cx);
                                             })),
@@ -4163,7 +4272,7 @@ impl SettingsView {
                                 false,
                                 theme,
                             ))
-                            .child(render_card_row(
+                            .when(self.ai_provider != "opencode", |card| card.child(render_card_row(
                                 "API Secret Key",
                                 Some("Custom key stored in fastty.toml (overrides env)"),
                                 div()
@@ -4268,8 +4377,8 @@ impl SettingsView {
                                     }),
                                 false,
                                 theme,
-                            ))
-                            .child(render_card_row(
+                            )))
+                            .when(self.ai_provider != "opencode", |card| card.child(render_card_row(
                                 "Authentication Status",
                                 Some(SharedString::from(auth_desc)),
                                 div()
@@ -4287,10 +4396,10 @@ impl SettingsView {
                                     ),
                                 false,
                                 theme,
-                            ))
+                            )))
                             .child(render_card_row(
                                 "Test Connection",
-                                Some("Test endpoint reachability and model response"),
+                                Some(if self.ai_provider == "opencode" { "Refresh the model catalog from OpenCode" } else { "Test endpoint reachability and model response" }),
                                 div()
                                     .flex()
                                     .flex_row()
@@ -4384,7 +4493,7 @@ impl SettingsView {
                                             .text_size(px(11.))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(if is_testing { theme.muted } else { theme.background })
-                                            .child(if is_testing { "Testing..." } else { "Test Connection" })
+                                            .child(if is_testing { "Testing..." } else if self.ai_provider == "opencode" { "Refresh Models" } else { "Test Connection" })
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, window, cx| {
                                                 this.test_ai_connection(window, cx);
                                             }))
@@ -4467,41 +4576,54 @@ impl SettingsView {
                                 "Token Budget",
                                 Some("Max tokens the model context holds before compaction triggers."),
                                 {
-                                    let current = self.ai_context_window;
+                                    let current = crate::config::ai_context_window();
                                     div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
+                                        .flex_col()
                                         .gap_1()
-                                        .children(
-                                            [4_000u32, 32_000, 64_000, 128_000, 200_000, 1_000_000]
-                                                .into_iter()
-                                                .map(|size| {
-                                                    let label = if size >= 1_000_000 {
-                                                        format!("{}M", size / 1_000_000)
-                                                    } else {
-                                                        format!("{}k", size / 1_000)
-                                                    };
-                                                    let is_sel = current == size;
-                                                    div()
-                                                        .id(SharedString::from(format!("ctx-win-{}", size)))
-                                                        .px(px(8.))
-                                                        .py(px(4.))
-                                                        .rounded(px(5.))
-                                                        .cursor(CursorStyle::PointingHand)
-                                                        .bg(if is_sel { theme.accent } else { theme.surface_raised })
-                                                        .border_1()
-                                                        .border_color(if is_sel { theme.accent } else { theme.border })
-                                                        .text_size(px(11.))
-                                                        .font_weight(if is_sel { FontWeight::BOLD } else { FontWeight::NORMAL })
-                                                        .text_color(if is_sel { theme.background } else { theme.muted_strong })
-                                                        .hover(move |s| if is_sel { s } else { s.bg(theme.hover) })
-                                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                                            this.set_ai_context_window(size, cx);
-                                                        }))
-                                                        .child(label)
-                                                })
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_1()
+                                                .children(
+                                                    [4_000u32, 32_000, 64_000, 128_000, 200_000, 1_000_000]
+                                                        .into_iter()
+                                                        .map(|size| {
+                                                            let label = if size >= 1_000_000 {
+                                                                format!("{}M", size / 1_000_000)
+                                                            } else {
+                                                                format!("{}k", size / 1_000)
+                                                            };
+                                                            let is_sel = current == size;
+                                                            div()
+                                                                .id(SharedString::from(format!("ctx-win-{}", size)))
+                                                                .px(px(8.))
+                                                                .py(px(4.))
+                                                                .rounded(px(5.))
+                                                                .cursor(CursorStyle::PointingHand)
+                                                                .bg(if is_sel { theme.accent } else { theme.surface_raised })
+                                                                .border_1()
+                                                                .border_color(if is_sel { theme.accent } else { theme.border })
+                                                                .text_size(px(11.))
+                                                                .font_weight(if is_sel { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                                                .text_color(if is_sel { theme.background } else { theme.muted_strong })
+                                                                .hover(move |s| if is_sel { s } else { s.bg(theme.hover) })
+                                                                .on_click(cx.listener(move |this, _ev, _window, cx| {
+                                                                    this.set_ai_context_window(size, cx);
+                                                                }))
+                                                                .child(label)
+                                                        })
+                                                ),
                                         )
+                                        .when_some(self.ai_context_window_error.as_ref(), |control, error| {
+                                            control.child(
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .text_color(theme.bright_red)
+                                                    .child(error.clone()),
+                                            )
+                                        })
                                 },
                                 true,
                                 theme,
@@ -4745,6 +4867,32 @@ impl SettingsView {
         }
     }
 
+    fn handle_menu_outside_click(
+        &mut self,
+        ev: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.font_combobox_open {
+            return;
+        }
+        let is_font_trigger = self.font_trigger_bounds.get().is_some_and(|bounds| {
+            let x = ev.position.x.to_f64();
+            let y = ev.position.y.to_f64();
+            x >= bounds.left().to_f64()
+                && x <= bounds.right().to_f64()
+                && y >= bounds.top().to_f64()
+                && y <= bounds.bottom().to_f64()
+        });
+        if !is_font_trigger {
+            self.font_combobox_open = false;
+            if self.active_input_field == Some(ActiveInputField::FontSearch) {
+                self.active_input_field = None;
+            }
+            cx.notify();
+        }
+    }
+
     fn handle_mouse_up(&mut self, _ev: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.is_dragging_input {
             self.is_dragging_input = false;
@@ -4767,6 +4915,8 @@ impl Render for SettingsView {
             .track_focus(&self.focus_handle)
             .key_context("SettingsView")
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_menu_outside_click))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::handle_menu_outside_click))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
             .w_full()

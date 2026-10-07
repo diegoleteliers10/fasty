@@ -16,6 +16,7 @@ Fastty is a modern, high-performance terminal emulator designed for speed, low m
 - **Native Web Gateway & Fastty-Wasm**: Embedded zero-dependency HTTP & WebSocket server (`fastty gateway`) and pure WebAssembly VT emulator to access your active terminals from any browser, tablet, or mobile device.
 - **Cross-Platform**: First-class support for macOS, Linux (Wayland/X11), and Windows with automatic shell detection (`zsh`, `fish`, `bash`, `powershell`, `pwsh`, `cmd`).
 - **Built-in Status Bar & Git Integration**: Branch indicator, worktree switcher (`⌘⌥W` / `Ctrl+Alt+W`), sync status, and command execution timer.
+- **Native OpenCode Agent**: Run OpenCode through ACP with tab-scoped sessions, streamed tool activity, model discovery, and permission prompts.
 - **Command Palette & SSH Manager**: Fast command navigation (`⌘P` / `Ctrl+Shift+P`) and SSH connection manager (`⌘O` / `Ctrl+Shift+O`).
 - **Config & Theming**: TOML configuration (`fastty.toml`) with live reload and 20 built-in themes — Catppuccin (Mocha/Frappé/Macchiato/Latte), Dracula, Nord, Tokyo Night, Gruvbox, Rosé Pine, One, Solarized, Kanagawa — including light variants, plus user JSON themes in `themes/`.
 

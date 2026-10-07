@@ -2,14 +2,14 @@
 /// prefix/suffix keeps the common case (a targeted replacement inside a file)
 /// cheap and the result readable.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffLineKind {
     Context,
     Add,
     Del,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiffLine {
     pub kind: DiffLineKind,
     pub text: String,
@@ -19,7 +19,7 @@ pub struct DiffLine {
     pub new_line: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileDiff {
     pub path: String,
     pub lines: Vec<DiffLine>,

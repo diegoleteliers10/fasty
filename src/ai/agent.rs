@@ -29,6 +29,9 @@ pub enum AgentEvent {
         input: u64,
         output: u64,
     },
+    ContextWindow { used: u64, size: u64 },
+    ConversationSession(String),
+    AvailableCommands(Vec<crate::ai::conversations::AvailableCommand>),
     Error(String),
 }
 

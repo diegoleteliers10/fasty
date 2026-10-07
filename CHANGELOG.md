@@ -3,6 +3,25 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.18.0 - 2026-10-07
+
+### OpenCode ACP
+
+- Add OpenCode as a native AI provider over ACP. Fastty starts and manages the OpenCode agent, discovers models and reasoning variants, and streams agent activity and permission requests in the AI panel.
+- Keep an OpenCode session for each AI conversation. Restore its session when you return to that conversation.
+- Show discovered OpenCode skills and commands in the AI panel's `@` menu.
+
+### AI conversations
+
+- Save AI conversations and context-window settings per tab. Switch between saved conversations, start a new conversation with `+`, clear the active conversation with the reset button, and delete conversations from the history menu.
+- Show an empty-state message in the history menu when the tab has no conversations.
+- Update the context window display when its setting changes.
+
+### Menus
+
+- Close menus when you click outside them or press Escape.
+- Draw AI menus and dropdowns above panel content.
+
 ## 0.17.0 - 2026-10-03
 
 ### Agent-Driven Layout Control (MCP)

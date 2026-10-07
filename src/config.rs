@@ -30,6 +30,16 @@ pub fn clipboard_read_allowed() -> bool {
 }
 
 static CONFIG_VERSION: AtomicU64 = AtomicU64::new(1);
+static AI_CONTEXT_WINDOW: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(128_000);
+
+pub fn ai_context_window() -> u32 {
+    AI_CONTEXT_WINDOW.load(Ordering::Relaxed)
+}
+
+pub fn set_ai_context_window(tokens: u32) {
+    AI_CONTEXT_WINDOW.store(tokens, Ordering::Relaxed);
+}
 
 pub fn current_config_version() -> u64 {
     CONFIG_VERSION.load(Ordering::Relaxed)
@@ -639,6 +649,7 @@ fn apply_ai_to_doc(doc: &mut DocumentMut, ai_cfg: &crate::ai::AiConfig) {
             ai.remove("default_model");
         }
         ai["permission_mode"] = value(ai_cfg.permission_mode.to_string());
+        ai["context_window"] = value(ai_cfg.context_window as i64);
         ai["learned_allow"] = value(ai_cfg.learned_allow);
 
         if !ai.contains_key("providers") || !ai["providers"].is_table() {
@@ -694,6 +705,23 @@ fn apply_ai_to_doc(doc: &mut DocumentMut, ai_cfg: &crate::ai::AiConfig) {
                                 arr.push(m.as_str());
                             }
                             p_tbl["models"] = value(arr);
+                        }
+                        crate::ai::ProviderConfig::Opencode { command, models, variants } => {
+                            p_tbl["type"] = value("opencode");
+                            p_tbl["command"] = value(command.as_str());
+                            p_tbl.remove("base_url");
+                            p_tbl.remove("api_key_env");
+                            p_tbl.remove("api_key");
+                            let mut model_list = toml_edit::Array::new();
+                            for model in models { model_list.push(model.as_str()); }
+                            p_tbl["models"] = value(model_list);
+                            let mut variant_table = Table::new();
+                            for (model, entries) in variants {
+                                let mut list = toml_edit::Array::new();
+                                for entry in entries { list.push(entry.as_str()); }
+                                variant_table[model] = value(list);
+                            }
+                            p_tbl["variants"] = Item::Table(variant_table);
                         }
                     }
                 }
@@ -968,9 +996,9 @@ impl Config {
                 path.display()
             );
         }
-        let res = self.save(&path);
+        self.save(&path)?;
         increment_config_version();
-        res
+        Ok(())
     }
 }
 
@@ -992,6 +1020,7 @@ pub fn load_error() -> Option<String> {
 pub fn load_lenient() -> Config {
     match Config::load() {
         Ok(cfg) => {
+            set_ai_context_window(cfg.ai.context_window);
             if let Ok(mut flag) = CONFIG_LOADED_FROM_EXISTING.lock() {
                 *flag = true;
             }
@@ -1006,7 +1035,9 @@ pub fn load_lenient() -> Config {
             if let Ok(mut err) = CONFIG_LOAD_ERROR.lock() {
                 *err = Some(e.to_string());
             }
-            Config::default()
+            let cfg = Config::default();
+            set_ai_context_window(cfg.ai.context_window);
+            cfg
         }
     }
 }
