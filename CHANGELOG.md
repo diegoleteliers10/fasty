@@ -3,6 +3,17 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.21.0 - 2026-10-08
+
+### Background AI turns
+
+- Run AI turns in the background when you switch tabs or select another conversation.
+- Route streaming deltas, tool executions, usage, and errors to the source conversation.
+- Keep permission prompts pending in their respective conversations until you approve or deny them.
+- Cancel only the target conversation on stop, clear, or delete actions.
+- Cancel background turns when their parent tabs are closed.
+- Clean up conversation runtimes properly when you close the last tab.
+
 ## 0.20.0 - 2026-10-08
 
 ### Program status
