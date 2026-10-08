@@ -3,6 +3,14 @@ use std::time::Duration;
 use gpui::*;
 use crate::ui::theme::Theme;
 
+/// Column alignment declared by a table's delimiter row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TableAlign {
+    Left,
+    Center,
+    Right,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum MarkdownBlock {
     /// Inline content with the char offset of each span inside the source text.
@@ -24,6 +32,15 @@ pub enum MarkdownBlock {
     },
     Blockquote(Vec<MarkdownBlock>),
     HorizontalRule,
+    /// A GFM pipe table. `aligns` comes from the delimiter row, and `header`
+    /// plus every entry of `rows` is normalised to `aligns.len()` cells so the
+    /// renderer can assume a rectangle without re-checking row lengths.
+    Table {
+        aligns: Vec<TableAlign>,
+        header: Vec<Vec<LocSpan>>,
+        rows: Vec<Vec<Vec<LocSpan>>>,
+        src: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +130,99 @@ pub fn parse_markdown(text: &str) -> Vec<MarkdownBlock> {
         .map(|l| (l.raw, l.start))
         .collect();
     parse_segments(&segments)
+}
+
+/// Splits a pipe table row into cells, pairing each with the char offset of its
+/// first character so selection and copy resolve back into the original text.
+///
+/// Leading and trailing pipes are optional. A genuinely empty cell between two
+/// pipes is kept, because dropping it would shift every later column; only the
+/// artifact produced by a closing pipe is discarded.
+///
+/// ponytail: `\|` is not honoured as an escaped pipe, so a cell cannot hold a
+/// literal `|`. Add a backslash-aware split if agents start emitting them.
+fn split_row_located(line: &str, base: usize) -> Vec<(String, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut cells: Vec<(String, usize)> = Vec::new();
+    let mut buf = String::new();
+    let mut content_start = 0usize;
+    let mut in_cell = false;
+    let mut seen_content = false;
+
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '|' {
+            if in_cell {
+                cells.push((buf.trim().to_string(), base + content_start));
+            }
+            buf.clear();
+            in_cell = true;
+            seen_content = false;
+            content_start = i + 1;
+            continue;
+        }
+        if !seen_content {
+            if c == ' ' || c == '\t' {
+                continue;
+            }
+            content_start = i;
+            seen_content = true;
+        }
+        buf.push(c);
+    }
+    // A row ending in `|` leaves seen_content false; pushing here would invent
+    // an extra column.
+    if in_cell && seen_content {
+        cells.push((buf.trim().to_string(), base + content_start));
+    }
+    cells
+}
+
+/// Reads a delimiter row as per-column alignment, or None unless every cell is a
+/// colon/dash run. This row is the only thing that makes a pipe row a table, so
+/// being strict here is what keeps ordinary prose containing pipes a paragraph.
+fn parse_delimiter_row(line: &str) -> Option<Vec<TableAlign>> {
+    let cells = split_row_located(line.trim(), 0);
+    if cells.is_empty() {
+        return None;
+    }
+    let mut aligns = Vec::with_capacity(cells.len());
+    for (text, _) in &cells {
+        let t = text.trim();
+        let left = t.starts_with(':');
+        let right = t.ends_with(':');
+        let core = t.trim_start_matches(':').trim_end_matches(':');
+        if core.is_empty() || !core.chars().all(|c| c == '-') {
+            return None;
+        }
+        aligns.push(match (left, right) {
+            (true, true) => TableAlign::Center,
+            (false, true) => TableAlign::Right,
+            _ => TableAlign::Left,
+        });
+    }
+    Some(aligns)
+}
+
+/// The column alignments when a GFM table starts at `i`, i.e. when that line
+/// contains a pipe and the next line is a valid delimiter row.
+fn table_delimiter_at(segments: &[(String, usize)], i: usize) -> Option<Vec<TableAlign>> {
+    if !segments.get(i)?.0.contains('|') {
+        return None;
+    }
+    parse_delimiter_row(&segments.get(i + 1)?.0)
+}
+
+/// Parses one row's cells into inline spans, normalised to `width` columns.
+fn parse_row_cells(row_text: &str, row_src: usize, width: usize) -> Vec<Vec<LocSpan>> {
+    let mut cells: Vec<Vec<LocSpan>> = split_row_located(row_text, row_src)
+        .into_iter()
+        .take(width)
+        .map(|(text, src)| parse_inline_located(&text, src))
+        .collect();
+    // GFM pads short rows and ignores extra ones; matching that keeps the grid
+    // rectangular without a second width check in the renderer.
+    cells.resize_with(width, Vec::new);
+    cells
 }
 
 fn parse_segments(segments: &[(String, usize)]) -> Vec<MarkdownBlock> {
@@ -355,6 +465,36 @@ fn parse_segments(segments: &[(String, usize)]) -> Vec<MarkdownBlock> {
             }
         }
 
+        // GFM pipe tables. The delimiter row is the discriminator, so a lone
+        // pipe row stays a paragraph -- which is what an agent emits mid-stream
+        // before the delimiter token arrives.
+        if let Some(aligns) = table_delimiter_at(segments, i) {
+            let width = aligns.len();
+            let (header_src, header_text) =
+                SrcLine { raw: segments[i].0.clone(), start: segments[i].1 }.trim_info();
+            let header = parse_row_cells(&header_text, header_src, width);
+            i += 2;
+            let mut rows = Vec::new();
+            while i < segments.len() {
+                let line = SrcLine { raw: segments[i].0.clone(), start: segments[i].1 };
+                let (row_src, row_text) = line.trim_info();
+                // A table ends at the first line without pipes, or at a blank
+                // line, so trailing prose is not swallowed as a row.
+                if !row_text.contains('|') {
+                    break;
+                }
+                rows.push(parse_row_cells(&row_text, row_src, width));
+                i += 1;
+            }
+            blocks.push(MarkdownBlock::Table {
+                aligns,
+                header,
+                rows,
+                src: header_src,
+            });
+            continue;
+        }
+
         // Paragraph: first raw line plus trimmed continuation lines, each span
         // keeping its own source offset.
         let mut spans = parse_inline_located(raw, *start);
@@ -382,6 +522,9 @@ fn parse_segments(segments: &[(String, usize)]) -> Vec<MarkdownBlock> {
                 || ntrim.starts_with("* ")
                 || ntrim.starts_with("+ ")
                 || is_ordered_item
+                // Without this the continuation loop would join a table into
+                // the preceding paragraph instead of ending at it.
+                || table_delimiter_at(segments, i).is_some()
             {
                 break;
             }
@@ -984,6 +1127,31 @@ fn render_block(
             text_left,
             registry,
         ),
+        MarkdownBlock::Table { header, rows, src, .. } => {
+            // ponytail: temporary flat shim so this commit changes no pixels.
+            // Replaced by real grid rendering in the next commit.
+            let sep = LocSpan { span: InlineSpan::Text(" ".to_string()), src: *src };
+            let mut spans: Vec<LocSpan> = Vec::new();
+            for cell in header.iter().chain(rows.iter().flatten()) {
+                if !spans.is_empty() {
+                    spans.push(sep.clone());
+                }
+                spans.extend(cell.iter().cloned());
+            }
+            render_inline_spans(
+                &spans,
+                *src,
+                theme,
+                px(13.),
+                FontWeight::NORMAL,
+                show_cursor,
+                selection,
+                on_select_char,
+                on_drag_char,
+                text_left,
+                registry,
+            )
+        }
         MarkdownBlock::Heading { level, content, src } => {
             let (size, weight) = match level {
                 1 => (px(20.), FontWeight::BOLD),
@@ -1876,4 +2044,202 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].0, 1..5);
     }
+
+    fn text_cell(s: &str, src: usize) -> Vec<LocSpan> {
+        vec![LocSpan { span: InlineSpan::Text(s.to_string()), src }]
+    }
+
+    #[std::prelude::v1::test]
+    fn test_table_basic_two_column() {
+        let src = "| Name | Speed |\n|---|---|\n| Rust | fast |";
+        let blocks = parse_markdown(src);
+        assert_eq!(blocks.len(), 1, "a table is one block, not three paragraphs");
+
+        let MarkdownBlock::Table { header, rows, .. } = &blocks[0] else {
+            panic!("expected Table, got {:?}", blocks[0]);
+        };
+        assert_eq!(header.len(), 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(header[0], text_cell("Name", 2));
+        assert_eq!(header[1], text_cell("Speed", 9));
+        assert_eq!(rows[0][0], text_cell("Rust", 29));
+        assert_eq!(rows[0][1], text_cell("fast", 36));
+    }
+
+    #[std::prelude::v1::test]
+    fn test_table_delimiter_row_is_consumed_not_data() {
+        // The `|---|---|` line must not appear as a data row.
+        let blocks = parse_markdown("| a | b |\n| - | :-: |\n| 1 | 2 |");
+        let MarkdownBlock::Table { rows, .. } = &blocks[0] else {
+            panic!("expected Table, got {:?}", blocks[0]);
+        };
+        assert_eq!(rows.len(), 1, "only one data row follows the delimiter");
+        assert_eq!(rows[0][0], text_cell("1", 24));
+    }
+
+    #[std::prelude::v1::test]
+    fn test_table_alignment_from_delimiter_colons() {
+        let blocks = parse_markdown("| l | c | r |\n|:---|:---:|---:|\n| 1 | 2 | 3 |");
+        let MarkdownBlock::Table { aligns, .. } = &blocks[0] else {
+            panic!("expected Table, got {:?}", blocks[0]);
+        };
+        assert_eq!(
+            *aligns,
+            vec![TableAlign::Left, TableAlign::Center, TableAlign::Right],
+        );
+    }
+
+    #[std::prelude::v1::test]
+    fn test_table_defaults_to_left_without_colons() {
+        let blocks = parse_markdown("| a |\n|---|\n| 1 |");
+        let MarkdownBlock::Table { aligns, .. } = &blocks[0] else {
+            panic!("expected Table, got {:?}", blocks[0]);
+        };
+        assert_eq!(*aligns, vec![TableAlign::Left]);
+    }
+
+    #[std::prelude::v1::test]
+    fn test_table_cell_inline_spans_parse() {
+        // Bold and inline code inside cells must survive as styled spans, since
+        // agents routinely bold values inside comparison tables.
+        let blocks = parse_markdown("| Feature | Status |\n|---|---|\n| `async` | **done** |");
+        let MarkdownBlock::Table { rows, .. } = &blocks[0] else {
+            panic!("expected Table, got {:?}", blocks[0]);
+        };
+        assert_eq!(rows[0][0], vec![LocSpan {
+            span: InlineSpan::Code("async".to_string()),
+            src: 34,
+        }]);
+        assert_eq!(rows[0][1], vec![LocSpan {
+            span: InlineSpan::Bold("done".to_string()),
+            src: 45,
+        }]);
+    }
+
+    #[std::prelude::v1::test]
+    fn test_table_ragged_rows_padded_to_header_width() {
+        // Short rows pad, long rows truncate. GFM does the same, and a uniform
+        // column count keeps the grid rectangular without a second code path.
+        let blocks = parse_markdown("| a | b | c |\n|---|---|---|\n| 1 |\n| 1 | 2 | 3 | 4 |");
+        let MarkdownBlock::Table { header, rows, .. } = &blocks[0] else {
+            panic!("expected Table, got {:?}", blocks[0]);
+        };
+        assert_eq!(header.len(), 3);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len(), 3, "short row padded to header width");
+        assert_eq!(rows[0][2], vec![], "padding cell is empty");
+        assert_eq!(rows[1].len(), 3, "long row truncated to header width");
+    }
+
+    #[std::prelude::v1::test]
+    fn test_pipe_without_delimiter_row_is_not_a_table() {
+        // The delimiter row is what makes it a table. Without it the pipes are
+        // ordinary text, which is what agents emit mid-stream before the
+        // delimiter token has arrived. Streaming therefore degrades to a
+        // paragraph instead of flickering into a broken grid.
+        let blocks = parse_markdown("| Name | Speed |\njust a sentence");
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            matches!(blocks[0], MarkdownBlock::Paragraph { .. }),
+            "no delimiter row means paragraph, got {:?}",
+            blocks[0]
+        );
+    }
+
+    #[std::prelude::v1::test]
+    fn test_delimiter_row_requires_dashes() {
+        // `:--` and `:-:` are *valid* GFM delimiters (left / centre), so they
+        // are deliberately absent here: only genuinely malformed cells qualify.
+        for bad in [
+            "| a | b |\n|:--|--x--|",
+            "| a | b |\n|:|:|",
+            "| a | b |\n|- -|-|",
+        ] {
+            let blocks = parse_markdown(bad);
+            assert!(
+                matches!(blocks[0], MarkdownBlock::Paragraph { .. }),
+                "delimiter {bad:?} is invalid, got {:?}",
+                blocks[0]
+            );
+        }
+    }
+
+    #[std::prelude::v1::test]
+    fn test_single_colon_delimiter_aligns_left() {
+        // `|:--` is a legal left-aligned delimiter, only the leading colon is
+        // set. Guards against over-rejecting valid GFM syntax.
+        let blocks = parse_markdown("| a |\n|:--|\n| 1 |");
+        let MarkdownBlock::Table { aligns, .. } = &blocks[0] else {
+            panic!("expected Table, got {:?}", blocks[0]);
+        };
+        assert_eq!(*aligns, vec![TableAlign::Left]);
+    }
+
+    #[std::prelude::v1::test]
+    fn test_table_ends_at_blank_line_and_following_text() {
+        let blocks = parse_markdown("| a |\n|---|\n| 1 |\n\nAfter");
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(blocks[0], MarkdownBlock::Table { .. }));
+        assert!(matches!(blocks[1], MarkdownBlock::Paragraph { .. }));
+    }
+
+    #[std::prelude::v1::test]
+    fn test_table_row_interrupts_a_paragraph() {
+        // Without this the paragraph continuation loop swallows the table into
+        // the preceding prose, which is the pre-fix behaviour we are replacing.
+        let blocks = parse_markdown("Intro line\n| a |\n|---|\n| 1 |");
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(blocks[0], MarkdownBlock::Paragraph { .. }));
+        assert!(matches!(blocks[1], MarkdownBlock::Table { .. }));
+    }
+
+    #[std::prelude::v1::test]
+    fn test_table_src_offsets_index_the_real_source() {
+        // Selection resolves clicks to source char offsets, so every cell
+        // offset must address the exact character in the original text.
+        let src = "| Name | Speed |\n|---|---|\n| Rust | fast |";
+        let blocks = parse_markdown(src);
+        let MarkdownBlock::Table { header, rows, .. } = &blocks[0] else {
+            panic!("expected Table");
+        };
+        let mut probes = vec![
+            (header[0][0].src, 'N'),
+            (header[1][0].src, 'S'),
+            (rows[0][0][0].src, 'R'),
+            (rows[0][1][0].src, 'f'),
+        ];
+        for (off, want) in probes.drain(..) {
+            let got = src.chars().nth(off).expect("offset in range");
+            assert_eq!(got, want, "offset {off} should address {want:?}");
+        }
+    }
+
+    #[std::prelude::v1::test]
+    fn test_table_emoji_cell_offsets_use_char_space() {
+        // src offsets are char space, not byte space. A multi-byte cell must
+        // still land on its first character.
+        let src = "| a | b |\n|---|---|\n| ✅ | z |";
+        let blocks = parse_markdown(src);
+        let MarkdownBlock::Table { rows, .. } = &blocks[0] else {
+            panic!("expected Table, got {:?}", blocks[0]);
+        };
+        assert_eq!(rows[0][0], text_cell("✅", 22));
+        assert_eq!(src.chars().nth(22), Some('✅'));
+    }
+
+    #[std::prelude::v1::test]
+    fn test_display_width_counts_cjk_and_emoji_as_two() {
+        // This is why columns use unicode_width and not chars().count(): the
+        // panel font is proportional, and a single-cell emoji would otherwise
+        // be sized as narrow as a letter and overflow its column.
+        assert_eq!(unicode_width::UnicodeWidthStr::width("Rust"), 4);
+        assert_eq!(unicode_width::UnicodeWidthStr::width("中文"), 4);
+        assert_eq!(unicode_width::UnicodeWidthStr::width("✅"), 2);
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width("✅中文"),
+            6,
+            "mixed wide and narrow cells"
+        );
+    }
 }
+
