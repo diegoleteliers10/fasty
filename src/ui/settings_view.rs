@@ -496,7 +496,7 @@ impl SettingsView {
                     #[cfg(not(target_os = "macos"))]
                     {
                         *SYSTEM_FONTS_CACHE.lock() = Some(merged.clone());
-                        this.system_fonts = pin_family_first(merged, &this.font_family);
+                        _this.system_fonts = pin_family_first(merged, &_this.font_family);
                     }
                     cx.notify();
                 });
