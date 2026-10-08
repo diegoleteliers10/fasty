@@ -1284,10 +1284,20 @@ fn render_table_row(
         if ci + 1 < cells.len() {
             column = column.border_r_1().border_color(theme.border);
         }
-        // Left is flexbox's default, so only the other two need to be stated.
-        column = match aligns.get(ci).copied().unwrap_or(TableAlign::Left) {
-            TableAlign::Center => column.items_center(),
-            TableAlign::Right => column.items_end(),
+        // Header cells are centred regardless of what the delimiter row asked
+        // for; body cells follow it.
+        let align = if is_header {
+            TableAlign::Center
+        } else {
+            aligns.get(ci).copied().unwrap_or(TableAlign::Left)
+        };
+        // text_align, not just items_*: the cell's child is a w_full() text box,
+        // so items_center() centres a box that already spans the cell and moves
+        // nothing. The glyphs have to be aligned inside that box instead, which
+        // is what text_align does. Left is flexbox's default and needs neither.
+        column = match align {
+            TableAlign::Center => column.items_center().text_align(TextAlign::Center),
+            TableAlign::Right => column.items_end().text_align(TextAlign::Right),
             TableAlign::Left => column,
         };
 
