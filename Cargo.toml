@@ -23,12 +23,20 @@ required-features = []
 
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed" }
+# runtime_shaders compiles GPUI's Metal shaders at app launch via
+# makeLibraryWithSource instead of at build time via `xcrun metal`. The build
+# time path needs full Xcode; the runtime path only needs Metal.framework,
+# which ships with macOS. Drop this feature once Xcode is installed.
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
     "font-kit",
     "wayland",
     "x11",
+    "runtime_shaders",
 ] }
 alacritty_terminal = { version = "0.26", default-features = false }
+# Already in the lock file via alacritty_terminal; direct dep for unicode_width
+# so table columns measure CJK/emoji as 2 cells instead of 1.
+unicode-width = "0.2"
 portable-pty = "0.8"
 async-channel = "2"
 serde = { version = "1", features = ["derive"] }
