@@ -1945,6 +1945,7 @@ fn render_markdown_prose(
     text_left: f32,
     window: Option<&Window>,
     registry: Option<(&crate::ui::markdown::RowRegistry, usize)>,
+    available_width: f32,
 ) -> Div {
     crate::ui::markdown::render_markdown_selectable(
         text,
@@ -1956,6 +1957,7 @@ fn render_markdown_prose(
         text_left,
         window,
         registry,
+        available_width,
     )
 }
 
@@ -1981,6 +1983,9 @@ impl RenderOnce for AiSidebar {
         // Selectable text rows are registered fresh on every render pass.
         let row_registry: crate::ui::markdown::RowRegistry =
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        // Horizontal room a table may use. The scroll area carries px(8) and the
+        // message bubble carries p(px(8)), so 16px is lost on each side.
+        let prose_width = self.width - 32.0;
         let on_focus = self.on_focus.map(std::rc::Rc::new);
         let on_click_char = self.on_click_char.map(std::rc::Rc::new);
         let on_new_chat = self.on_new_chat.map(std::rc::Rc::new);
@@ -2523,6 +2528,7 @@ impl RenderOnce for AiSidebar {
                                                             user_text_left,
                                                             Some(win_ref),
                                                             Some((&registry, msg_idx)),
+                                                        prose_width,
                                                         )),
                                                 )
                                             }),
@@ -2863,6 +2869,7 @@ impl RenderOnce for AiSidebar {
                                                         msg_text_left,
                                                         Some(win_ref),
                                                         Some((&registry, msg_idx)),
+                                                    prose_width,
                                                     ))
                                             )
                                              .child(
@@ -2975,6 +2982,7 @@ impl RenderOnce for AiSidebar {
                                         streaming_text_left,
                                         Some(win_ref),
                                         Some((&registry, stream_idx)),
+                                        prose_width,
                                     ))
                                 }),
                         )
