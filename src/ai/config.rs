@@ -53,6 +53,16 @@ pub enum ProviderConfig {
         #[serde(default)]
         variants: HashMap<String, Vec<String>>,
     },
+    #[serde(rename = "acp")]
+    Acp {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        models: Vec<String>,
+        #[serde(default)]
+        variants: HashMap<String, Vec<String>>,
+    },
 }
 
 impl ProviderConfig {
@@ -61,6 +71,7 @@ impl ProviderConfig {
             Self::OpenaiCompat { models, .. } => models.as_slice(),
             Self::Anthropic { models, .. } => models.as_slice(),
             Self::Opencode { models, .. } => models.as_slice(),
+            Self::Acp { models, .. } => models.as_slice(),
         }
     }
 
@@ -69,6 +80,7 @@ impl ProviderConfig {
             Self::OpenaiCompat { base_url, .. } => base_url.as_str(),
             Self::Anthropic { base_url, .. } => base_url.as_str(),
             Self::Opencode { .. } => "",
+            Self::Acp { .. } => "",
         }
     }
 
@@ -77,6 +89,7 @@ impl ProviderConfig {
             Self::OpenaiCompat { base_url, .. } => *base_url = new_url,
             Self::Anthropic { base_url, .. } => *base_url = new_url,
             Self::Opencode { .. } => {},
+            Self::Acp { .. } => {},
         }
     }
 
@@ -85,6 +98,7 @@ impl ProviderConfig {
             Self::OpenaiCompat { api_key_env, .. } => api_key_env.as_deref(),
             Self::Anthropic { api_key_env, .. } => Some(api_key_env.as_str()),
             Self::Opencode { .. } => None,
+            Self::Acp { .. } => None,
         }
     }
 
@@ -93,6 +107,7 @@ impl ProviderConfig {
             Self::OpenaiCompat { api_key, .. } => api_key.as_deref(),
             Self::Anthropic { api_key, .. } => api_key.as_deref(),
             Self::Opencode { .. } => None,
+            Self::Acp { .. } => None,
         }
     }
 
@@ -101,6 +116,7 @@ impl ProviderConfig {
             Self::OpenaiCompat { api_key, .. } => *api_key = new_key,
             Self::Anthropic { api_key, .. } => *api_key = new_key,
             Self::Opencode { .. } => {},
+            Self::Acp { .. } => {},
         }
     }
 
@@ -109,30 +125,50 @@ impl ProviderConfig {
             Self::OpenaiCompat { models, .. } => models,
             Self::Anthropic { models, .. } => models,
             Self::Opencode { models, .. } => models,
+            Self::Acp { models, .. } => models,
         }
     }
 
     pub fn command(&self) -> Option<&str> {
-        match self { Self::Opencode { command, .. } => Some(command), _ => None }
+        match self { Self::Opencode { command, .. } | Self::Acp { command, .. } => Some(command), _ => None }
     }
 
     pub fn set_command(&mut self, value: String) {
-        if let Self::Opencode { command, .. } = self { *command = value; }
+        match self { Self::Opencode { command, .. } | Self::Acp { command, .. } => *command = value, _ => {} }
+    }
+
+    pub fn acp_args(&self) -> Option<Vec<String>> {
+        match self {
+            Self::Opencode { .. } => Some(vec!["acp".to_string()]),
+            Self::Acp { args, .. } => Some(args.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn is_acp(&self) -> bool {
+        matches!(self, Self::Opencode { .. } | Self::Acp { .. })
+    }
+
+    pub fn acp_identity(&self, provider_name: &str) -> Option<String> {
+        let command = self.command()?;
+        let args = self.acp_args()?;
+        Some(format!("{provider_name}\u{1f}{command}\u{1f}{}", args.join("\u{1f}")))
     }
 
     pub fn remember_models(&mut self, discovered: Vec<String>) {
-        if let Self::Opencode { models, .. } = self {
+        if let Self::Opencode { models, .. } | Self::Acp { models, .. } = self {
             *models = discovered.into_iter().map(|m| m.trim().to_string())
                 .filter(|m| !m.is_empty()).collect();
         }
     }
 
-    pub fn set_opencode_catalog(
+    pub fn set_acp_catalog(
         &mut self,
         models: Vec<String>,
         variants: HashMap<String, Vec<String>>,
     ) {
-        if let Self::Opencode { models: stored_models, variants: stored_variants, .. } = self {
+        if let Self::Opencode { models: stored_models, variants: stored_variants, .. }
+        | Self::Acp { models: stored_models, variants: stored_variants, .. } = self {
             *stored_models = models.into_iter().map(|m| m.trim().to_string())
                 .filter(|m| !m.is_empty()).collect();
             *stored_variants = variants;
@@ -282,6 +318,12 @@ fn default_providers() -> HashMap<String, ProviderConfig> {
     );
     map.insert("opencode".to_string(), ProviderConfig::Opencode {
         command: default_opencode_command(), models: Vec::new(), variants: HashMap::new(),
+    });
+    map.insert("claude-acp".to_string(), ProviderConfig::Acp {
+        command: "claude-agent-acp".to_string(), args: Vec::new(), models: Vec::new(), variants: HashMap::new(),
+    });
+    map.insert("antigravity-acp".to_string(), ProviderConfig::Acp {
+        command: "agy_acp_server".to_string(), args: Vec::new(), models: Vec::new(), variants: HashMap::new(),
     });
     map.insert(
         "openai".to_string(),

@@ -199,7 +199,6 @@ pub struct AiSidebar {
     pub ai_last_usage: Option<(u64, u64)>,
     pub context_hovercard_open: bool,
     pub on_hover_context: Option<Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>>,
-    pub on_set_context_window: Option<Box<dyn Fn(&u64, &mut Window, &mut App) + 'static>>,
 }
 
 impl AiSidebar {
@@ -271,7 +270,6 @@ impl AiSidebar {
             ai_last_usage: None,
             context_hovercard_open: false,
             on_hover_context: None,
-            on_set_context_window: None,
         }
     }
 
@@ -295,13 +293,6 @@ impl AiSidebar {
         self
     }
 
-    pub fn on_set_context_window(
-        mut self,
-        handler: impl Fn(&u64, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        self.on_set_context_window = Some(Box::new(handler));
-        self
-    }
 
     pub fn scroll_handle(mut self, handle: gpui::ScrollHandle) -> Self {
         self.scroll_handle = Some(handle);
@@ -1706,7 +1697,6 @@ fn render_context_hovercard(
     usage: ContextUsage,
     theme: &Theme,
     on_file_drop: Option<std::rc::Rc<FileDropCallback>>,
-    on_set_context_window: Option<std::rc::Rc<Box<dyn Fn(&u64, &mut Window, &mut App) + 'static>>>,
 ) -> impl IntoElement {
     let ContextUsage {
         used_tokens,
@@ -1785,29 +1775,6 @@ fn render_context_hovercard(
                                 .child("Context Window"),
                         ),
                 ),
-        )
-        .child(
-            div().flex().flex_row().gap(px(4.)).children(
-                [4_000u64, 32_000, 64_000, 128_000, 200_000, 1_000_000]
-                    .into_iter().map(|size| {
-                        let selected = size == max_tokens;
-                        let label = match size {
-                            4_000 => "4k", 32_000 => "32k", 64_000 => "64k",
-                            128_000 => "128k", 200_000 => "200k", _ => "1M",
-                        };
-                        let callback = on_set_context_window.clone();
-                        div().id(SharedString::from(format!("ai-context-size-{size}")))
-                            .px(px(5.)).py(px(3.)).rounded(px(4.))
-                            .text_size(px(9.5))
-                            .bg(if selected { theme.accent } else { theme.surface })
-                            .text_color(if selected { theme.black } else { theme.muted_strong })
-                            .cursor(CursorStyle::PointingHand)
-                            .child(label)
-                            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
-                                if let Some(callback) = callback.as_ref() { callback(&size, window, cx); }
-                            })
-                    })
-            )
         )
         // Progress Bar & Percentage
         .child(
@@ -2044,7 +2011,6 @@ impl RenderOnce for AiSidebar {
         let ai_last_usage = self.ai_last_usage;
         let context_hovercard_open = self.context_hovercard_open;
         let on_hover_context = self.on_hover_context.map(std::rc::Rc::new);
-        let on_set_context_window = self.on_set_context_window.map(std::rc::Rc::new);
 
         // Text left edge = sidebar left + 8px scroll-area px + 4px outer-wrapper px.
         // Mouse events use window-absolute X, so we subtract this to get text-relative X.
@@ -3650,7 +3616,6 @@ impl RenderOnce for AiSidebar {
                     },
                     &theme,
                     on_file_drop.clone(),
-                    on_set_context_window.clone(),
                 ))
             })
     }

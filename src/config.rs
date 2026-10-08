@@ -723,6 +723,26 @@ fn apply_ai_to_doc(doc: &mut DocumentMut, ai_cfg: &crate::ai::AiConfig) {
                             }
                             p_tbl["variants"] = Item::Table(variant_table);
                         }
+                        crate::ai::ProviderConfig::Acp { command, args, models, variants } => {
+                            p_tbl["type"] = value("acp");
+                            p_tbl["command"] = value(command.as_str());
+                            p_tbl.remove("base_url");
+                            p_tbl.remove("api_key_env");
+                            p_tbl.remove("api_key");
+                            let mut arg_list = toml_edit::Array::new();
+                            for arg in args { arg_list.push(arg.as_str()); }
+                            p_tbl["args"] = value(arg_list);
+                            let mut model_list = toml_edit::Array::new();
+                            for model in models { model_list.push(model.as_str()); }
+                            p_tbl["models"] = value(model_list);
+                            let mut variant_table = Table::new();
+                            for (model, entries) in variants {
+                                let mut list = toml_edit::Array::new();
+                                for entry in entries { list.push(entry.as_str()); }
+                                variant_table[model] = value(list);
+                            }
+                            p_tbl["variants"] = Item::Table(variant_table);
+                        }
                     }
                 }
             }

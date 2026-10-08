@@ -38,10 +38,11 @@ pub struct TabBar {
     on_update: Option<MouseDownCallback>,
     ai_sidebar_open: bool,
     on_toggle_ai: Option<MouseDownCallback>,
+    tab_scroll_handle: ScrollHandle,
 }
 
 impl TabBar {
-    pub fn new(tabs: Vec<TabItem>, theme: Theme) -> Self {
+    pub fn new(tabs: Vec<TabItem>, theme: Theme, tab_scroll_handle: ScrollHandle) -> Self {
         Self {
             tabs,
             theme,
@@ -60,6 +61,7 @@ impl TabBar {
             on_update: None,
             ai_sidebar_open: false,
             on_toggle_ai: None,
+            tab_scroll_handle,
         }
     }
 
@@ -169,6 +171,7 @@ impl RenderOnce for TabBar {
         let on_logo_context = self.on_logo_context_menu.map(std::rc::Rc::new);
         let on_update = self.on_update.map(std::rc::Rc::new);
         let on_toggle_ai = self.on_toggle_ai.map(std::rc::Rc::new);
+        let tab_scroll_handle = self.tab_scroll_handle.clone();
         let btn_hover_bg = theme.hover;
 
 
@@ -219,12 +222,14 @@ impl RenderOnce for TabBar {
                         on_tab_context,
                         self.on_new_tab,
                         btn_hover_bg,
+                        tab_scroll_handle.clone(),
                     ))
                 })
                 .child(
                     div()
                         .id("mac-tab-bar-drag-spacer")
-                        .flex_1()
+                        .when(show_tabs, |this| this.w(px(8.)).flex_shrink_0())
+                        .when(!show_tabs, |this| this.flex_1())
                         .h_full()
                         .window_control_area(WindowControlArea::Drag)
                         .on_mouse_down(MouseButton::Left, |ev, window, _cx| {
@@ -241,6 +246,7 @@ impl RenderOnce for TabBar {
                         .flex_row()
                         .items_center()
                         .gap_2()
+                        .flex_shrink_0()
                         .pr(px(6.))
                         .when_some(self.update_available, |this, version| {
                             this.child(render_update_btn(
@@ -316,6 +322,8 @@ impl RenderOnce for TabBar {
                         .items_center()
                         .pl(px(4.))
                         .gap_1()
+                        .flex_1()
+                        .min_w(px(0.))
                         .child(
                             div()
                                 .id("fastty-logo")
@@ -361,13 +369,15 @@ impl RenderOnce for TabBar {
                                 on_tab_context,
                                 self.on_new_tab,
                                 btn_hover_bg,
+                                tab_scroll_handle,
                             ))
                         }),
                 )
                 .child(
                     div()
                         .id("tab-bar-drag-spacer")
-                        .flex_1()
+                        .when(show_tabs, |this| this.w(px(8.)).flex_shrink_0())
+                        .when(!show_tabs, |this| this.flex_1())
                         .h_full()
                         .window_control_area(WindowControlArea::Drag)
                         .on_mouse_down(MouseButton::Left, |ev, window, _cx| {
@@ -383,6 +393,7 @@ impl RenderOnce for TabBar {
                         .flex()
                         .flex_row()
                         .items_center()
+                        .flex_shrink_0()
                         .when_some(self.update_available, |this, version| {
                             this.child(render_update_btn(
                                 version,
@@ -630,6 +641,9 @@ impl RenderOnce for TabSidebar {
                                     .items_center()
                                     .justify_between()
                                     .h(px(30.))
+                                    .min_h(px(30.))
+                                    .max_h(px(30.))
+                                    .flex_shrink_0()
                                     .px(px(8.))
                                     .rounded(px(6.))
                                     .bg(bg)
@@ -666,6 +680,7 @@ impl RenderOnce for TabSidebar {
                                             .child(
                                                 div()
                                                     .flex_1()
+                                                    .min_w(px(0.))
                                                     .overflow_hidden()
                                                     .text_ellipsis()
                                                     .child(SharedString::from(tab.title)),
@@ -711,13 +726,19 @@ fn render_tab_strip(
     on_tab_context: Option<std::rc::Rc<TabContextCallback>>,
     on_new_tab: Option<ClickCallback>,
     btn_hover_bg: gpui::Hsla,
-) -> gpui::Div {
+    scroll_handle: ScrollHandle,
+) -> gpui::Stateful<gpui::Div> {
     div()
+        .id("horizontal-tabs-scroll")
         .flex()
         .flex_row()
         .items_center()
         .gap_1()
-        .overflow_hidden()
+        .flex_1()
+        .min_w(px(0.))
+        .overflow_x_scroll()
+        .restrict_scroll_to_axis()
+        .track_scroll(&scroll_handle)
         .children(tabs.into_iter().map(|tab| {
             let tab_id = tab.id;
             let is_active = tab.active;
@@ -742,8 +763,9 @@ fn render_tab_strip(
                 .items_center()
                 .justify_between()
                 .h(px(26.))
-                .min_w(px(120.))
-                .max_w(px(220.))
+                .w(px(132.))
+                .min_w(px(132.))
+                .max_w(px(132.))
                 .px(px(8.))
                 .rounded_t(px(4.))
                 .rounded_b(px(0.))
@@ -781,6 +803,8 @@ fn render_tab_strip(
                         .child(super::icons::render_icon(deck_icon, icon_color, 11.0))
                         .child(
                             div()
+                                .flex_1()
+                                .min_w(px(0.))
                                 .overflow_hidden()
                                 .text_ellipsis()
                                 .child(SharedString::from(tab.title)),
@@ -790,6 +814,7 @@ fn render_tab_strip(
                     div()
                         .id(SharedString::from(format!("tab-close-{}", tab_id)))
                         .flex()
+                        .flex_shrink_0()
                         .items_center()
                         .justify_center()
                         .w(px(14.))

@@ -258,7 +258,8 @@ impl SettingsView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         config::load_custom_themes();
         let loaded_config = crate::config::load_lenient();
-        let auto_discover_opencode = loaded_config.ai.default == "opencode";
+        let auto_discover_opencode = loaded_config.ai.providers.get(&loaded_config.ai.default)
+            .is_some_and(crate::ai::ProviderConfig::is_acp);
         let theme_name = loaded_config.theme.as_deref().unwrap_or("default").to_string();
         let theme = Theme::from_name(&theme_name).with_opacity(loaded_config.opacity);
         let tab_layout = loaded_config.tab_layout;
@@ -1580,6 +1581,24 @@ impl SettingsView {
                     variants: std::collections::HashMap::new(),
                 }
             });
+        } else if provider == "claude-acp" {
+            self.config.ai.providers.entry("claude-acp".to_string()).or_insert_with(|| {
+                crate::ai::ProviderConfig::Acp {
+                    command: "claude-agent-acp".to_string(),
+                    args: Vec::new(),
+                    models: Vec::new(),
+                    variants: std::collections::HashMap::new(),
+                }
+            });
+        } else if provider == "antigravity-acp" {
+            self.config.ai.providers.entry("antigravity-acp".to_string()).or_insert_with(|| {
+                crate::ai::ProviderConfig::Acp {
+                    command: "agy_acp_server".to_string(),
+                    args: Vec::new(),
+                    models: Vec::new(),
+                    variants: std::collections::HashMap::new(),
+                }
+            });
         }
         let prov_info = self
             .config
@@ -1613,7 +1632,7 @@ impl SettingsView {
         self.save_config();
         crate::config::increment_config_version();
         cx.notify();
-        if provider == "opencode" {
+        if self.config.ai.providers.get(provider).is_some_and(crate::ai::ProviderConfig::is_acp) {
             self.test_ai_connection(window, cx);
         }
     }
@@ -1626,6 +1645,8 @@ impl SettingsView {
             "openrouter" => "https://openrouter.ai/api/v1",
             "lm-studio" => "http://localhost:1234/v1",
             "opencode" => "opencode",
+            "claude-acp" => "claude-agent-acp",
+            "antigravity-acp" => "agy_acp_server",
             _ => "http://localhost:11434/v1",
         };
         self.ai_base_url_input = default_url.to_string();
@@ -1677,17 +1698,20 @@ impl SettingsView {
         self.ai_test_status = AiTestStatus::Testing;
         cx.notify();
 
-        if self.ai_provider == "opencode" {
-            let command = self.config.ai.providers.get("opencode")
-                .and_then(crate::ai::ProviderConfig::command).unwrap_or("opencode").to_string();
+        if let Some(provider) = self.config.ai.providers.get(&self.ai_provider).filter(|provider| provider.is_acp()) {
+            let provider_name = self.ai_provider.clone();
+            let command = provider.command().unwrap_or("opencode").to_string();
+            let args = provider.acp_args().unwrap_or_else(|| vec!["acp".to_string()]);
+            let args_for_check = args.clone();
+            let opencode_config = matches!(provider, crate::ai::ProviderConfig::Opencode { .. });
             let command_for_check = command.clone();
             let (tx, rx) = async_channel::bounded::<Result<(std::time::Duration, Vec<String>, std::collections::HashMap<String, Vec<String>>), String>>(1);
-            let worker = std::thread::Builder::new().name("fastty-opencode-discovery".into()).spawn(move || {
+            let worker = std::thread::Builder::new().name("fastty-acp-discovery".into()).spawn(move || {
                 let start = std::time::Instant::now();
                 let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                let result = crate::ai::opencode::discover_catalog(command, cwd)
+                let result = crate::ai::opencode::discover_catalog_with_args(command, &args, cwd, opencode_config)
                     .map(|(models, variants)| (start.elapsed(), models, variants))
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| format!("{error:#}"));
                 let _ = tx.send_blocking(result);
             });
             if let Err(error) = worker {
@@ -1698,9 +1722,13 @@ impl SettingsView {
             cx.spawn_in(window, async move |this, cx| {
                 if let Ok(result) = rx.recv().await {
                     let _ = this.update_in(cx, |this, _window, cx| {
-                        let current_command = this.config.ai.providers.get("opencode")
+                        let current_command = this.config.ai.providers.get(&provider_name)
                             .and_then(crate::ai::ProviderConfig::command).unwrap_or("opencode");
-                        if this.ai_provider != "opencode" || current_command != command_for_check {
+                        let current_args = this.config.ai.providers.get(&provider_name)
+                            .and_then(crate::ai::ProviderConfig::acp_args);
+                        if this.ai_provider != provider_name
+                            || current_command != command_for_check
+                            || current_args.as_deref() != Some(args_for_check.as_slice()) {
                             return;
                         }
                         match result {
@@ -1712,8 +1740,8 @@ impl SettingsView {
                                             .is_some_and(|effort| variants.get(model.as_str()).is_some_and(|values| values.iter().any(|value| value == effort)))
                                     }).cloned())
                                     .or_else(|| models.first().cloned());
-                                if let Some(provider) = this.config.ai.providers.get_mut("opencode") {
-                                    provider.set_opencode_catalog(models.clone(), variants);
+                                if let Some(provider) = this.config.ai.providers.get_mut(&provider_name) {
+                                    provider.set_acp_catalog(models.clone(), variants);
                                 }
                                 if let Some(model) = selected {
                                     this.ai_model = Some(model.clone());
@@ -3831,6 +3859,8 @@ impl SettingsView {
     }
 
     fn render_tab_ai(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        let is_acp = self.config.ai.providers.get(&self.ai_provider)
+            .is_some_and(crate::ai::ProviderConfig::is_acp);
         let providers = [
             ("ollama", "Ollama", "Local / Free", "Offline private models on localhost:11434"),
             ("anthropic", "Anthropic", "Cloud API", "Claude 3.7 Sonnet & 3.5 Haiku"),
@@ -3838,12 +3868,14 @@ impl SettingsView {
             ("openrouter", "OpenRouter", "Unified API", "Hundreds of open & proprietary models"),
             ("lm-studio", "LM Studio", "Local Server", "Local LLM server on localhost:1234"),
             ("opencode", "OpenCode", "ACP Agent", "Native agent with tools, MCP, and permissions"),
+            ("claude-acp", "Claude Agent", "ACP Agent", "Claude Agent SDK over ACP"),
+            ("antigravity-acp", "Antigravity", "ACP Agent", "Google Antigravity over ACP"),
         ];
 
         let is_ollama = self.ai_provider == "ollama";
         let default_presets = crate::ai::AiConfig::default_preset_models(&self.ai_provider);
-        let chips_to_render: Vec<String> = if self.ai_provider == "opencode" {
-            self.config.ai.providers.get("opencode")
+        let chips_to_render: Vec<String> = if self.config.ai.providers.get(&self.ai_provider).is_some_and(crate::ai::ProviderConfig::is_acp) {
+            self.config.ai.providers.get(&self.ai_provider)
                 .map(|provider| provider.models().to_vec()).unwrap_or_default()
         } else if is_ollama {
             if !self.detected_ollama_models.is_empty() {
@@ -3970,7 +4002,7 @@ impl SettingsView {
                 div()
                     .flex()
                     .flex_col()
-                    .child(render_section_header(if self.ai_provider == "opencode" { "OpenCode Models" } else { "Model Configuration (BYOK)" }, theme))
+                    .child(render_section_header(if is_acp { "ACP Models" } else { "Model Configuration (BYOK)" }, theme))
                     .child(
                         render_group_card(theme)
                             .child(render_card_row(
@@ -4096,8 +4128,8 @@ impl SettingsView {
                                                     .text_color(theme.foreground)
                                                     .child(if is_ollama {
                                                         "Installed Local Models"
-                                                    } else if self.ai_provider == "opencode" {
-                                                        "Available OpenCode Models"
+                                                    } else if is_acp {
+                                                        "Available ACP Models"
                                                     } else {
                                                         "Preset & Recent Models"
                                                     }),
@@ -4176,12 +4208,12 @@ impl SettingsView {
                 div()
                     .flex()
                     .flex_col()
-                    .child(render_section_header(if self.ai_provider == "opencode" { "OpenCode Agent" } else { "Endpoint & Authentication" }, theme))
+                    .child(render_section_header(if is_acp { "ACP Agent" } else { "Endpoint & Authentication" }, theme))
                     .child(
                         render_group_card(theme)
                             .child(render_card_row(
-                                if self.ai_provider == "opencode" { "Executable Command" } else { "Endpoint URL" },
-                                Some(if self.ai_provider == "opencode" { "Path or command used to start OpenCode" } else { "HTTP API base address for model requests" }),
+                                if is_acp { "Executable Command" } else { "Endpoint URL" },
+                                Some(if is_acp { "Command used to start the ACP agent" } else { "HTTP API base address for model requests" }),
                                 div()
                                     .flex()
                                     .flex_row()
@@ -4238,7 +4270,7 @@ impl SettingsView {
                                                         div()
                                                             .text_size(px(11.))
                                                             .text_color(theme.muted)
-                                                    .child(if self.ai_provider == "opencode" { "e.g. opencode" } else { "e.g. http://localhost:11434/v1" }),
+                                                    .child(if is_acp { "e.g. claude-agent-acp" } else { "e.g. http://localhost:11434/v1" }),
                                                     )
                                             } else {
                                                 crate::ui::text_input::render_line_spans(
@@ -4264,7 +4296,7 @@ impl SettingsView {
                                             .cursor(CursorStyle::PointingHand)
                                             .text_size(px(10.5))
                                             .text_color(theme.muted_strong)
-                                            .child(if self.ai_provider == "opencode" { "Default" } else { "Reset" })
+                                            .child(if is_acp { "Default" } else { "Reset" })
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                                                 this.reset_ai_base_url(cx);
                                             })),
@@ -4272,7 +4304,7 @@ impl SettingsView {
                                 false,
                                 theme,
                             ))
-                            .when(self.ai_provider != "opencode", |card| card.child(render_card_row(
+                            .when(!is_acp, |card| card.child(render_card_row(
                                 "API Secret Key",
                                 Some("Custom key stored in fastty.toml (overrides env)"),
                                 div()
@@ -4378,7 +4410,7 @@ impl SettingsView {
                                 false,
                                 theme,
                             )))
-                            .when(self.ai_provider != "opencode", |card| card.child(render_card_row(
+                            .when(!is_acp, |card| card.child(render_card_row(
                                 "Authentication Status",
                                 Some(SharedString::from(auth_desc)),
                                 div()
@@ -4399,7 +4431,7 @@ impl SettingsView {
                             )))
                             .child(render_card_row(
                                 "Test Connection",
-                                Some(if self.ai_provider == "opencode" { "Refresh the model catalog from OpenCode" } else { "Test endpoint reachability and model response" }),
+                                Some(if is_acp { "Refresh the model catalog from the ACP agent" } else { "Test endpoint reachability and model response" }),
                                 div()
                                     .flex()
                                     .flex_row()
@@ -4450,8 +4482,8 @@ impl SettingsView {
                                                     )
                                             }
                                             AiTestStatus::Failed(err) => {
-                                                let short_err = if err.len() > 30 {
-                                                    format!("{}...", &err[..27])
+                                                let short_err = if err.chars().count() > 30 {
+                                                    format!("{}...", err.chars().take(27).collect::<String>())
                                                 } else {
                                                     err.clone()
                                                 };
@@ -4493,7 +4525,7 @@ impl SettingsView {
                                             .text_size(px(11.))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(if is_testing { theme.muted } else { theme.background })
-                                            .child(if is_testing { "Testing..." } else if self.ai_provider == "opencode" { "Refresh Models" } else { "Test Connection" })
+                                            .child(if is_testing { "Testing..." } else if is_acp { "Refresh Models" } else { "Test Connection" })
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, window, cx| {
                                                 this.test_ai_connection(window, cx);
                                             }))

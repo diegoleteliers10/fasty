@@ -3,6 +3,35 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.19.0 - 2026-10-07
+
+### ACP agents
+
+- Add Claude Agent and Google Antigravity as native ACP providers.
+- Install missing ACP adapters on first use and keep them in Fastty's cache. Keep custom ACP commands and arguments.
+- Discover ACP models and restore each conversation's agent session when the server supports session loading.
+- Show ACP commands and skills in the AI panel's `@` menu.
+- Resolve adapter commands from common user install paths and report missing runtime tools.
+
+### AI conversations
+
+- Keep conversation history and context-window settings per tab.
+- Add conversation creation, reset, delete, and empty-state controls to the AI panel.
+- Refresh model catalogs when users select an ACP provider.
+- Show reasoning choices beside the send button and keep the model context display in sync with settings.
+
+### Tabs and menus
+
+- Give horizontal and vertical tabs a fixed size and scroll when tabs exceed the available space.
+- Keep the logo and AI controls at the right edge while horizontal tabs scroll.
+- Close menus when users click outside them or press Escape, and draw AI menus above panel content.
+- Add an update check to the Fastty logo menu.
+
+### Updates
+
+- Clear stale update data after a check finds no newer release.
+- Show an up-to-date message and hide update actions when Fastty has the latest version.
+
 ## 0.18.0 - 2026-10-07
 
 ### OpenCode ACP

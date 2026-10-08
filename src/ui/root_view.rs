@@ -1659,6 +1659,8 @@ fn run_opencode_turn(
     conversation_id: String,
     saved_session_id: Option<String>,
     command: String,
+    args: Vec<String>,
+    is_opencode: bool,
     cwd: std::path::PathBuf,
     model: String,
     effort: String,
@@ -1674,16 +1676,43 @@ fn run_opencode_turn(
     )>,
     event_tx: async_channel::Sender<crate::ai::AgentEvent>,
 ) -> anyhow::Result<()> {
-    let runtime = manager.session_with_saved_session(conversation_id.clone(), command, &cwd, saved_session_id)?;
-    let _ = event_tx.send_blocking(crate::ai::AgentEvent::ConversationSession(runtime.session_id().to_string()));
-    if model != "default" && !model.is_empty() {
-        runtime.select_model_value(&model)?;
+    if cancel.is_cancelled() {
+        return Ok(());
     }
-    if !effort.is_empty() {
+    let runtime = manager.session_with_saved_args(conversation_id.clone(), command, &args, &cwd, saved_session_id)?;
+    if cancel.is_cancelled() {
+        manager.remove(&conversation_id);
+        return Ok(());
+    }
+    let _ = event_tx.send_blocking(crate::ai::AgentEvent::ConversationSession(runtime.session_id().to_string()));
+    if !model.is_empty() && model != "default" {
+        if is_opencode {
+            runtime.select_model_value(&model)?;
+        } else {
+            let has_model_option = runtime.info().config_options.as_array().is_some_and(|options| {
+                options.iter().any(|option| {
+                    option.get("id").and_then(serde_json::Value::as_str) == Some("model")
+                        && option.get("options").and_then(serde_json::Value::as_array).is_some_and(|choices| {
+                            choices.iter().any(|choice| choice.get("value").and_then(serde_json::Value::as_str) == Some(model.as_str()))
+                        })
+                })
+            });
+            if has_model_option {
+                runtime.select_config_option("model", &model)?;
+            } else {
+                runtime.select_model_id(&model)?;
+            }
+        }
+    }
+    if is_opencode && !effort.is_empty() {
         runtime.select_effort(&effort)?;
     }
-    if !mode.is_empty() {
+    if is_opencode && !mode.is_empty() {
         runtime.select_mode(&mode)?;
+    }
+    if cancel.is_cancelled() {
+        manager.remove(&conversation_id);
+        return Ok(());
     }
     runtime.prompt_content(prompt)?;
 
@@ -1724,7 +1753,7 @@ fn run_opencode_turn(
             }
             crate::ai::opencode::OpencodeEvent::ToolUpdate(update) => {
                 let id = update.get("toolCallId").and_then(serde_json::Value::as_str).unwrap_or("tool").to_string();
-                let name = update.get("title").and_then(serde_json::Value::as_str).unwrap_or("OpenCode tool").to_string();
+                let name = update.get("title").and_then(serde_json::Value::as_str).unwrap_or("ACP tool").to_string();
                 let args = update.get("rawInput").map(|value| value.to_string()).unwrap_or_default();
                 if !active_tools.contains_key(&id) {
                     active_tools.insert(id.clone(), name.clone());
@@ -1948,6 +1977,7 @@ pub struct RootView {
     pub sidebar_open: bool,
     pub sidebar_anim_progress: f32,
     pub sidebar_scroll_handle: ScrollHandle,
+    pub tab_bar_scroll_handle: ScrollHandle,
     pub is_settings_open: bool,
     pub is_context_menu_open: bool,
     pub is_about_open: bool,
@@ -2092,6 +2122,7 @@ pub struct RootView {
     pub ai_current_turn_usage: (u64, u64),
     pub ai_context_hovercard_open: bool,
     pub ai_cancel_token: Option<crate::ai::CancelToken>,
+    pub ai_stream_generation: u64,
     pub ai_pending_confirmation: Option<crate::ui::ai_sidebar::AiUiPendingConfirmation>,
     pub ai_confirm_reply_tx: Option<async_channel::Sender<crate::ai::PermissionDecision>>,
     pub ai_opencode_confirm_reply_tx: Option<async_channel::Sender<Option<String>>>,
@@ -2372,6 +2403,7 @@ impl RootView {
             sidebar_open,
             sidebar_anim_progress,
             sidebar_scroll_handle: ScrollHandle::new(),
+            tab_bar_scroll_handle: ScrollHandle::new(),
             is_settings_open: false,
             is_context_menu_open: false,
             is_about_open: false,
@@ -2494,6 +2526,7 @@ impl RootView {
             ai_current_turn_usage: (0, 0),
             ai_context_hovercard_open: false,
             ai_cancel_token: None,
+            ai_stream_generation: 0,
             ai_pending_confirmation: None,
             ai_confirm_reply_tx: None,
             ai_opencode_confirm_reply_tx: None,
@@ -3688,6 +3721,7 @@ impl RootView {
                 context_window: default_context,
                 used_tokens: None,
                 acp_session_id: None,
+                acp_provider: None,
                 available_commands: Vec::new(),
                 created_at: now,
                 updated_at: now,
@@ -3697,6 +3731,7 @@ impl RootView {
         if record.cwd != cwd {
             record.cwd = cwd;
             record.acp_session_id = None;
+            record.acp_provider = None;
             record.available_commands.clear();
         }
         record.messages = self.ai_messages.clone();
@@ -3993,12 +4028,15 @@ impl RootView {
     /// with "up to date" on no release, or with the error text on failure, so
     /// the user never faces a dead button.
     pub fn check_for_updates_manual(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_updating {
+        if self.is_updating
+            || self.is_update_ready
+            || self.update_status.as_deref() == Some("Checking for updates...")
+        {
             self.is_update_modal_open = true;
             cx.notify();
             return;
         }
-        self.is_updating = false;
+        self.update_available = None;
         self.update_status = Some("Checking for updates...".to_string());
         self.is_update_modal_open = true;
         cx.notify();
@@ -4023,6 +4061,8 @@ impl RootView {
                             this.is_update_modal_open = true;
                         }
                         Ok(None) => {
+                            this.update_available = None;
+                            this.is_update_ready = false;
                             this.update_status = Some(format!(
                                 "Fastty v{} is up to date.",
                                 env!("CARGO_PKG_VERSION")
@@ -4030,6 +4070,8 @@ impl RootView {
                             this.is_update_modal_open = true;
                         }
                         Err(e) => {
+                            this.update_available = None;
+                            this.is_update_ready = false;
                             this.update_status = Some(format!("Update check failed:\n{e}"));
                             this.is_update_modal_open = true;
                         }
@@ -5006,6 +5048,7 @@ impl RootView {
     }
 
     pub fn cancel_ai_stream(&mut self) {
+        self.ai_stream_generation = self.ai_stream_generation.wrapping_add(1);
         if let Some(token) = self.ai_cancel_token.take() {
             token.cancel();
         }
@@ -5326,11 +5369,15 @@ impl RootView {
         let active_tab_id = self.tabs.get(self.active_tab_idx).map(|tab| tab.id).unwrap_or(0);
         let active_conversation_id = self.tabs.get(self.active_tab_idx)
             .map(|tab| tab.ai_conversation_id.clone()).unwrap_or_default();
+        let provider_config = cfg.providers.get(&active_prov);
+        let acp_provider_identity = provider_config.and_then(|provider| provider.acp_identity(&active_prov));
         let saved_acp_session_id = self.ai_chat_records.iter()
             .find(|record| record.id == active_conversation_id)
+            .filter(|record| record.acp_provider == acp_provider_identity)
             .and_then(|record| record.acp_session_id.clone());
         let is_opencode = active_prov == "opencode";
-        let model = if is_opencode {
+        let is_acp = provider_config.is_some_and(crate::ai::ProviderConfig::is_acp);
+        let model = if is_acp {
             None
         } else {
             match crate::ai::create_model_from_config(
@@ -5416,6 +5463,7 @@ impl RootView {
         let cancel_tok = agent.as_ref().map(crate::ai::Agent::cancel_token)
             .unwrap_or_else(crate::ai::CancelToken::new);
         self.ai_cancel_token = Some(cancel_tok.clone());
+        let stream_generation = self.ai_stream_generation;
         self.ai_is_streaming = true;
         self.ai_streaming_text.clear();
         self.ai_streaming_thinking.clear();
@@ -5512,14 +5560,20 @@ impl RootView {
         let event_tab_id = active_tab_id;
         let event_conversation_id = active_conversation_id.clone();
         let opencode_manager = Arc::clone(&self.ai_opencode_manager);
-        let opencode_command = cfg.providers.get("opencode")
+        let acp_runtime_key = acp_provider_identity.as_ref()
+            .map(|identity| format!("{active_conversation_id}::{identity}"))
+            .unwrap_or_else(|| active_conversation_id.clone());
+        let acp_provider = cfg.providers.get(&active_prov);
+        let opencode_command = acp_provider
             .and_then(crate::ai::ProviderConfig::command)
             .unwrap_or("opencode")
             .to_string();
+        let opencode_args = acp_provider.and_then(crate::ai::ProviderConfig::acp_args)
+            .unwrap_or_else(|| vec!["acp".to_string()]);
         let opencode_cwd = active_cwd.clone();
         let opencode_model = active_mod.clone();
-        let opencode_effort = cfg.providers.get("opencode").and_then(|provider| {
-            if let crate::ai::ProviderConfig::Opencode { variants, .. } = provider {
+        let opencode_effort = acp_provider.and_then(|provider| {
+            if let crate::ai::ProviderConfig::Opencode { variants, .. } | crate::ai::ProviderConfig::Acp { variants, .. } = provider {
                 crate::ai::opencode::catalog_model_key(&opencode_model, variants)
                     .and_then(|key| variants.get(&key))
             } else {
@@ -5532,7 +5586,7 @@ impl RootView {
         }).cloned().unwrap_or_default();
         let opencode_mode = if self.ai_agent_mode == "Ask" { "plan" } else { "build" }.to_string();
         let mut opencode_prompt = Vec::new();
-        if is_opencode {
+        if is_acp {
             let mut prompt_text = if augmented_content.trim().is_empty() {
                 if !attached_documents.is_empty() {
                     "Analyze and summarize this document.".to_string()
@@ -5576,9 +5630,11 @@ impl RootView {
                 } else {
                     run_opencode_turn(
                         opencode_manager,
-                        active_conversation_id,
+                        acp_runtime_key,
                         saved_acp_session_id,
                         opencode_command,
+                        opencode_args,
+                        is_opencode,
                         opencode_cwd,
                         opencode_model,
                         opencode_effort,
@@ -5591,7 +5647,7 @@ impl RootView {
                 };
                 if let Err(e) = res {
                     if !cancel_tok.is_cancelled() {
-                        let _ = event_tx.send_blocking(crate::ai::AgentEvent::Error(format!("{}", e)));
+                        let _ = event_tx.send_blocking(crate::ai::AgentEvent::Error(format!("{e:#}")));
                     }
                 }
             })
@@ -5601,7 +5657,8 @@ impl RootView {
         cx.spawn_in(window, async move |this, cx| {
             while let Ok((tool_id, tool_name, input_summary, reply_tx)) = ask_rx.recv().await {
                 let _ = this.update_in(cx, |this, _window, cx| {
-                    if this.tabs.get(this.active_tab_idx).map(|tab| (tab.id, tab.ai_conversation_id.as_str()))
+                    if this.ai_stream_generation != stream_generation
+                        || this.tabs.get(this.active_tab_idx).map(|tab| (tab.id, tab.ai_conversation_id.as_str()))
                         != Some((event_tab_id, permission_conversation_id.as_str())) {
                         let _ = reply_tx.send_blocking(crate::ai::PermissionDecision::Deny);
                         return;
@@ -5628,7 +5685,8 @@ impl RootView {
         cx.spawn_in(window, async move |this, cx| {
             while let Ok((tool_id, tool_name, input_summary, options, reply_tx)) = opencode_ask_rx.recv().await {
                 let _ = this.update_in(cx, |this, _window, cx| {
-                    if this.tabs.get(this.active_tab_idx).map(|tab| (tab.id, tab.ai_conversation_id.as_str()))
+                    if this.ai_stream_generation != stream_generation
+                        || this.tabs.get(this.active_tab_idx).map(|tab| (tab.id, tab.ai_conversation_id.as_str()))
                         != Some((event_tab_id, opencode_permission_conversation_id.as_str())) {
                         let _ = reply_tx.send_blocking(None);
                         return;
@@ -5653,10 +5711,12 @@ impl RootView {
         .detach();
 
         let stream_conversation_id = event_conversation_id;
+        let session_provider_identity = acp_provider_identity;
         cx.spawn_in(window, async move |this, cx| {
             while let Ok(ev) = event_rx.recv().await {
                 let _ = this.update_in(cx, |this, _window, cx| {
-                    if this.tabs.get(this.active_tab_idx).map(|tab| (tab.id, tab.ai_conversation_id.as_str()))
+                    if this.ai_stream_generation != stream_generation
+                        || this.tabs.get(this.active_tab_idx).map(|tab| (tab.id, tab.ai_conversation_id.as_str()))
                         != Some((event_tab_id, stream_conversation_id.as_str())) {
                         return;
                     }
@@ -5763,6 +5823,7 @@ impl RootView {
                                 let conversation_id = tab.ai_conversation_id.clone();
                                 if let Some(record) = this.ai_chat_records.iter_mut().find(|record| record.id == conversation_id) {
                                     record.acp_session_id = Some(session_id);
+                                    record.acp_provider = session_provider_identity.clone();
                                     let _ = crate::ai::conversations::save(&this.ai_chat_records);
                                 }
                             }
@@ -5916,8 +5977,8 @@ impl RootView {
         let provider = self.config.ai.default.clone();
         let model = self.config.ai.active_model();
         let opencode_variants = if provider == "opencode" {
-            self.config.ai.providers.get("opencode").and_then(|provider| {
-                if let crate::ai::ProviderConfig::Opencode { variants, .. } = provider {
+            self.config.ai.providers.get(&provider).and_then(|provider| {
+                if let crate::ai::ProviderConfig::Opencode { variants, .. } | crate::ai::ProviderConfig::Acp { variants, .. } = provider {
                     crate::ai::opencode::catalog_model_key(&model, variants)
                         .and_then(|key| variants.get(&key)).cloned()
                 } else {
@@ -5992,24 +6053,6 @@ impl RootView {
         .context_hovercard_open(self.ai_context_hovercard_open)
         .on_hover_context(cx.listener(|this, is_hovered: &bool, _window, cx| {
             this.ai_context_hovercard_open = *is_hovered;
-            cx.notify();
-        }))
-        .on_set_context_window(cx.listener(|this, size: &u64, _window, cx| {
-            let Some(tab) = this.tabs.get(this.active_tab_idx) else { return };
-            let conversation_id = tab.ai_conversation_id.clone();
-            let now = crate::ai::conversations::now_millis();
-            let record_idx = this.ai_chat_records.iter().position(|record| record.id == conversation_id);
-            if let Some(index) = record_idx {
-                this.ai_chat_records[index].context_window = *size;
-                this.ai_chat_records[index].updated_at = now;
-            } else {
-                this.save_active_ai_conversation();
-                if let Some(record) = this.ai_chat_records.iter_mut().find(|record| record.id == conversation_id) {
-                    record.context_window = *size;
-                    record.updated_at = now;
-                }
-            }
-            let _ = crate::ai::conversations::save(&this.ai_chat_records);
             cx.notify();
         }))
         .messages(self.ai_messages.clone())
@@ -6220,15 +6263,19 @@ impl RootView {
         }))
         .on_clear(cx.listener(|this, _ev, _window, cx| {
             this.cancel_ai_stream();
-            let old_id = this.tabs.get(this.active_tab_idx)
+            let conversation_id = this.tabs.get(this.active_tab_idx)
                 .map(|tab| tab.ai_conversation_id.clone());
-            if let Some(old_id) = old_id {
-                this.ai_opencode_manager.remove(&old_id);
-                this.ai_chat_records.retain(|record| record.id != old_id);
-                let _ = crate::ai::conversations::save(&this.ai_chat_records);
-            }
-            if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
-                tab.ai_conversation_id = new_ai_key("chat");
+            if let Some(conversation_id) = conversation_id {
+                this.ai_opencode_manager.remove(&conversation_id);
+                if let Some(record) = this.ai_chat_records.iter_mut().find(|record| record.id == conversation_id) {
+                    record.title = "New chat".to_string();
+                    record.messages.clear();
+                    record.used_tokens = None;
+                    record.acp_session_id = None;
+                    record.acp_provider = None;
+                    record.available_commands.clear();
+                    record.updated_at = crate::ai::conversations::now_millis();
+                }
             }
             this.ai_messages.clear();
             this.ai_streaming_text.clear();
@@ -6252,6 +6299,7 @@ impl RootView {
             this.ai_pending_confirmation = None;
             this.ai_message_selection = None;
             this.ai_message_selection_anchor = None;
+            this.save_active_ai_conversation();
             this.persist_session();
             cx.notify();
         }))
@@ -10525,7 +10573,7 @@ impl Render for RootView {
                 this.handle_file_drop(paths.paths(), window, cx);
             }))
             .child(
-                TabBar::new(tab_items.clone(), theme)
+                TabBar::new(tab_items.clone(), theme, self.tab_bar_scroll_handle.clone())
                     .layout(self.tab_layout)
                     .sidebar_open(self.sidebar_open)
                     .on_toggle_sidebar(cx.listener(|this, _ev, window, cx| {
@@ -10865,6 +10913,16 @@ impl Render for RootView {
                             None,
                             cx.listener(|this, _ev, window, cx| {
                                 this.toggle_about(window, cx);
+                            }),
+                            theme,
+                        ))
+                        .child(render_context_menu_item(
+                            IconType::RotateCcw,
+                            "Check for Updates",
+                            None,
+                            cx.listener(|this, _ev, window, cx| {
+                                this.is_context_menu_open = false;
+                                this.check_for_updates_manual(window, cx);
                             }),
                             theme,
                         ))
@@ -14462,6 +14520,7 @@ impl Render for RootView {
             })
             .when(self.is_update_modal_open, |this| {
                 let release_opt = self.update_available.clone();
+                let has_release = release_opt.is_some();
                 let version = release_opt
                     .as_ref()
                     .map(|r| r.version.clone())
@@ -14487,8 +14546,14 @@ impl Render for RootView {
                     format!("Fastty v{} is ready to install", version)
                 } else if self.is_updating {
                     format!("Downloading Fastty v{}...", version)
-                } else {
+                } else if has_release {
                     format!("Fastty v{} is available", version)
+                } else if self.update_status.as_deref() == Some("Checking for updates...") {
+                    "Checking for updates...".to_string()
+                } else if self.update_status.as_deref().is_some_and(|status| status.starts_with("Update check failed:")) {
+                    "Update check failed".to_string()
+                } else {
+                    "Fastty is up to date".to_string()
                 };
 
                 let subtitle = if self.is_update_ready {
@@ -14497,8 +14562,10 @@ impl Render for RootView {
                     "Downloading update in the background..."
                 } else if let Some(ref status) = self.update_status {
                     status.as_str()
-                } else {
+                } else if has_release {
                     "A new update is available."
+                } else {
+                    "Fastty is up to date."
                 };
 
                 this.child(
@@ -14566,7 +14633,7 @@ impl Render for RootView {
                                                 .child(render_icon(IconType::X, theme.accent, 12.0)),
                                         ),
                                 )
-                                .child(
+                                .when(has_release, |el| el.child(
                                     div()
                                         .id("update-modal-changelog")
                                         .max_h(px(320.))
@@ -14577,7 +14644,7 @@ impl Render for RootView {
                                         .border_color(theme.border)
                                         .overflow_y_scroll()
                                         .child(crate::ui::markdown::render_markdown(&notes, &theme, false)),
-                                )
+                                ))
                                 .child(
                                     div()
                                         .flex()
@@ -14585,7 +14652,7 @@ impl Render for RootView {
                                         .items_center()
                                         .justify_between()
                                         .pt(px(2.))
-                                        .child(
+                                        .when(has_release, |el| el.child(
                                             div()
                                                 .text_size(px(11.))
                                                 .text_color(theme.accent)
@@ -14594,7 +14661,7 @@ impl Render for RootView {
                                                     open_path_or_url(&release_url);
                                                 })
                                                 .child("View full changelog"),
-                                        )
+                                        ))
                                         .child(
                                             div()
                                                 .flex()
@@ -14659,7 +14726,6 @@ impl Render for RootView {
                                                         .as_ref()
                                                         .and_then(|r| r.self_update_blocked_reason.as_ref())
                                                         .is_some();
-                                                    let has_release = self.update_available.is_some();
                                                     let release_url = self
                                                         .update_available
                                                         .as_ref()
@@ -14679,7 +14745,7 @@ impl Render for RootView {
                                                                 this.is_update_modal_open = false;
                                                                 cx.notify();
                                                             }))
-                                                            .child("Later"),
+                                                            .child(if has_release { "Later" } else { "Close" }),
                                                     )
                                                     .when(has_release, |btn| {
                                                         btn.child(
@@ -14715,7 +14781,7 @@ impl Render for RootView {
                                                                 .child("Open download page"),
                                                         )
                                                     })
-                                                    .when(!is_blocked, |btn| {
+                                                    .when(has_release && !is_blocked, |btn| {
                                                         btn.child(
                                                             div()
                                                                 .px(px(12.))

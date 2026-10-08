@@ -89,6 +89,8 @@ pub struct Conversation {
     pub used_tokens: Option<u64>,
     pub acp_session_id: Option<String>,
     #[serde(default)]
+    pub acp_provider: Option<String>,
+    #[serde(default)]
     pub available_commands: Vec<AvailableCommand>,
     pub created_at: u64,
     pub updated_at: u64,

@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -62,8 +62,17 @@ pub fn discover_catalog(
     command: impl AsRef<std::ffi::OsStr>,
     cwd: impl AsRef<Path>,
 ) -> anyhow::Result<(Vec<String>, HashMap<String, Vec<String>>)> {
+    discover_catalog_with_args(command, &["acp".to_string()], cwd, true)
+}
+
+pub fn discover_catalog_with_args(
+    command: impl AsRef<std::ffi::OsStr>,
+    args: &[String],
+    cwd: impl AsRef<Path>,
+    opencode_config: bool,
+) -> anyhow::Result<(Vec<String>, HashMap<String, Vec<String>>)> {
     let discovery_deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let runtime = OpencodeRuntime::spawn_with_deadline(command, cwd, discovery_deadline)?;
+    let runtime = OpencodeRuntime::spawn_with_args_deadline(command, args, cwd, discovery_deadline)?;
     let mut models = Vec::new();
     let mut variants = HashMap::<String, Vec<String>>::new();
     let options = runtime
@@ -85,29 +94,29 @@ pub fn discover_catalog(
             let Some(value) = option.get("value").and_then(Value::as_str) else {
                 continue;
             };
-            let Some((provider, model)) = value.split_once('/') else {
-                continue;
+            let base = if opencode_config {
+                let Some((provider, model)) = value.split_once('/') else { continue };
+                if provider.is_empty() || model.is_empty() { continue; }
+                format!("{provider}/{model}")
+            } else {
+                value.to_string()
             };
-            if provider.is_empty() || model.is_empty() {
-                continue;
-            }
-            let base = format!("{provider}/{model}");
             if !models.contains(&base) {
                 models.push(base.clone());
             }
         }
     }
-    if models.is_empty() {
-        if let Some(entries) = runtime.info().available_models.as_array() {
-            for entry in entries {
-                if let Some(value) = entry.get("value").and_then(Value::as_str) {
-                    if !models.contains(&value.to_string()) {
-                        models.push(value.to_string());
-                    }
-                }
+    if let Some(entries) = runtime.info().available_models.as_array()
+        .or_else(|| runtime.info().available_models.get("availableModels").and_then(Value::as_array)) {
+        for entry in entries {
+            let value = entry.get("value").or_else(|| entry.get("modelId")).or_else(|| entry.get("id"))
+                .and_then(Value::as_str);
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                if !models.contains(&value.to_string()) { models.push(value.to_string()); }
             }
         }
     }
+    if !opencode_config { return Ok((models, variants)); }
     for model in models.clone() {
         let remaining = discovery_deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
@@ -173,6 +182,7 @@ struct Transport {
 
 pub struct OpencodeRuntime {
     command: std::ffi::OsString,
+    args: Vec<String>,
     cwd: PathBuf,
     session_id: String,
     info: OpencodeInfo,
@@ -202,15 +212,24 @@ impl OpencodeRuntime {
         command: impl AsRef<std::ffi::OsStr>,
         cwd: impl AsRef<Path>,
     ) -> anyhow::Result<Self> {
-        Self::start(command.as_ref(), cwd.as_ref(), None, None)
+        Self::start(command.as_ref(), &["acp".to_string()], cwd.as_ref(), None, None)
     }
 
-    fn spawn_with_deadline(
+    pub fn spawn_with_args(
         command: impl AsRef<std::ffi::OsStr>,
+        args: &[String],
+        cwd: impl AsRef<Path>,
+    ) -> anyhow::Result<Self> {
+        Self::start(command.as_ref(), args, cwd.as_ref(), None, None)
+    }
+
+    fn spawn_with_args_deadline(
+        command: impl AsRef<std::ffi::OsStr>,
+        args: &[String],
         cwd: impl AsRef<Path>,
         deadline: std::time::Instant,
     ) -> anyhow::Result<Self> {
-        Self::start(command.as_ref(), cwd.as_ref(), None, Some(deadline))
+        Self::start(command.as_ref(), args, cwd.as_ref(), None, Some(deadline))
     }
 
     /// Start and initialize `opencode acp`, then load a saved ACP session.
@@ -223,24 +242,36 @@ impl OpencodeRuntime {
         cwd: impl AsRef<Path>,
         session_id: impl Into<String>,
     ) -> anyhow::Result<Self> {
-        Self::start(command.as_ref(), cwd.as_ref(), Some(session_id.into()), None)
+        Self::start(command.as_ref(), &["acp".to_string()], cwd.as_ref(), Some(session_id.into()), None)
+    }
+
+    pub fn load_with_args(
+        command: impl AsRef<std::ffi::OsStr>,
+        args: &[String],
+        cwd: impl AsRef<Path>,
+        session_id: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Self::start(command.as_ref(), args, cwd.as_ref(), Some(session_id.into()), None)
     }
 
     fn start(
         command: &std::ffi::OsStr,
+        args: &[String],
         cwd: &Path,
         saved_session_id: Option<String>,
         deadline: Option<std::time::Instant>,
     ) -> anyhow::Result<Self> {
         let cwd = absolute_directory(cwd.as_ref())?;
-        let child = Command::new(command)
-            .arg("acp")
+        let preparation_started = std::time::Instant::now();
+        let mut launch = super::acp_launcher::prepare(command, args, &cwd)?;
+        let deadline = deadline.map(|value| value + preparation_started.elapsed());
+        let child = launch
             .current_dir(&cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| anyhow::anyhow!("failed to start ACP command: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("Cannot start ACP command '{}': {error}", command.to_string_lossy()))?;
         let mut child = ChildGuard(Some(child));
 
         let process = child.0.as_mut().expect("new child guard has a process");
@@ -306,6 +337,12 @@ impl OpencodeRuntime {
             json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }),
         )?;
 
+        let saved_session_id = saved_session_id.filter(|_| {
+            info.server_capabilities
+                .get("loadSession")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        });
         let (method, params, requested_session_id) = match saved_session_id {
             Some(session_id) => (
                 "session/load",
@@ -331,6 +368,7 @@ impl OpencodeRuntime {
         let child = child.0.take().expect("child guard has a process");
         Ok(Self {
             command: command.to_os_string(),
+            args: args.to_vec(),
             cwd,
             session_id,
             info,
@@ -381,6 +419,24 @@ impl OpencodeRuntime {
 
     pub fn select_model_value(&self, value: &str) -> anyhow::Result<Value> {
         self.select_model_value_with_timeout(value, REQUEST_TIMEOUT)
+    }
+
+    pub fn select_model_id(&self, model_id: &str) -> anyhow::Result<()> {
+        request(
+            &self.transport,
+            "session/set_model",
+            json!({ "sessionId": self.session_id, "modelId": model_id }),
+        )?;
+        Ok(())
+    }
+
+    pub fn select_config_option(&self, config_id: &str, value: &str) -> anyhow::Result<()> {
+        request(
+            &self.transport,
+            "session/set_config_option",
+            json!({ "sessionId": self.session_id, "configId": config_id, "value": value }),
+        )?;
+        Ok(())
     }
 
     pub fn select_model_value_with_timeout(
@@ -542,11 +598,22 @@ impl OpencodeManager {
         cwd: impl AsRef<Path>,
         saved_session_id: Option<String>,
     ) -> anyhow::Result<Arc<OpencodeRuntime>> {
+        self.session_with_saved_args(tab_id, command, &["acp".to_string()], cwd, saved_session_id)
+    }
+
+    pub fn session_with_saved_args(
+        &self,
+        tab_id: impl Into<String>,
+        command: impl AsRef<std::ffi::OsStr>,
+        args: &[String],
+        cwd: impl AsRef<Path>,
+        saved_session_id: Option<String>,
+    ) -> anyhow::Result<Arc<OpencodeRuntime>> {
         let tab_id = tab_id.into();
         let cwd = absolute_directory(cwd.as_ref())?;
         let mut sessions = self.sessions.lock().unwrap();
         if let Some(runtime) = sessions.get(&tab_id) {
-            if runtime.cwd() == cwd && runtime.command() == command.as_ref() {
+            if runtime.cwd() == cwd && runtime.command() == command.as_ref() && runtime.args == args {
                 let session_matches = saved_session_id
                     .as_deref()
                     .map_or(true, |saved| saved == runtime.session_id());
@@ -554,12 +621,13 @@ impl OpencodeManager {
                     return Ok(Arc::clone(runtime));
                 }
                 let recovered = Arc::new(match saved_session_id.as_deref() {
-                    Some(session_id) => OpencodeRuntime::load_with_command(
+                    Some(session_id) => OpencodeRuntime::load_with_args(
                         command.as_ref(),
+                        args,
                         &cwd,
                         session_id,
                     )?,
-                    None => OpencodeRuntime::spawn_with_command(command.as_ref(), &cwd)?,
+                    None => OpencodeRuntime::spawn_with_args(command.as_ref(), args, &cwd)?,
                 });
                 sessions.insert(tab_id, Arc::clone(&recovered));
                 return Ok(recovered);
@@ -569,8 +637,8 @@ impl OpencodeManager {
             runtime.shutdown();
         }
         let runtime = Arc::new(match saved_session_id.as_deref() {
-            Some(session_id) => OpencodeRuntime::load_with_command(command, &cwd, session_id)?,
-            None => OpencodeRuntime::spawn_with_command(command, &cwd)?,
+            Some(session_id) => OpencodeRuntime::load_with_args(command, args, &cwd, session_id)?,
+            None => OpencodeRuntime::spawn_with_args(command, args, &cwd)?,
         });
         sessions.insert(tab_id, Arc::clone(&runtime));
         Ok(runtime)
@@ -590,15 +658,21 @@ impl OpencodeManager {
         command: impl AsRef<std::ffi::OsStr>,
         cwd: impl AsRef<Path>,
     ) -> anyhow::Result<Arc<OpencodeRuntime>> {
-        if let Some(runtime) = self.sessions.lock().unwrap().remove(tab_id) {
-            runtime.shutdown();
-        }
+        self.remove(tab_id);
         self.session_with_command(tab_id.to_string(), command, cwd)
     }
 
     pub fn remove(&self, tab_id: &str) {
-        if let Some(runtime) = self.sessions.lock().unwrap().remove(tab_id) {
-            runtime.shutdown();
+        let prefix = format!("{tab_id}::");
+        let mut sessions = self.sessions.lock().unwrap();
+        let keys = sessions.keys()
+            .filter(|key| key.as_str() == tab_id || key.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(runtime) = sessions.remove(&key) {
+                runtime.shutdown();
+            }
         }
     }
 }
@@ -720,7 +794,7 @@ fn spawn_reader(
             }
             let _ = transport
                 .events
-                .send(OpencodeEvent::Error("OpenCode ACP process exited".into()));
+                .send(OpencodeEvent::Error("ACP process exited".into()));
         })?;
     Ok(())
 }

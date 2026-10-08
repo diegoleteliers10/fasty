@@ -1,3 +1,4 @@
+pub(crate) mod acp_launcher;
 pub mod agent;
 pub mod config;
 pub mod conversations;
