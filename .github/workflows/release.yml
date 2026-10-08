@@ -222,6 +222,28 @@ jobs:
               <string>${VERSION}</string>
               <key>LSMinimumSystemVersion</key>
               <string>10.12</string>
+              <key>NSBluetoothAlwaysUsageDescription</key>
+              <string>Un programa que ejecutaste en Fastty quiere usar Bluetooth.</string>
+              <key>NSCameraUsageDescription</key>
+              <string>Un programa que ejecutaste en Fastty quiere usar la cámara.</string>
+              <key>NSMicrophoneUsageDescription</key>
+              <string>Un programa que ejecutaste en Fastty quiere usar el micrófono.</string>
+              <key>NSLocationUsageDescription</key>
+              <string>Un programa que ejecutaste en Fastty quiere acceder a tu ubicación.</string>
+              <key>NSLocationWhenInUseUsageDescription</key>
+              <string>Un programa que ejecutaste en Fastty quiere acceder a tu ubicación mientras lo usas.</string>
+              <key>NSContactsUsageDescription</key>
+              <string>Un programa que ejecutaste en Fastty quiere acceder a tus contactos.</string>
+              <key>NSCalendarsUsageDescription</key>
+              <string>Un programa que ejecutaste en Fastty quiere acceder a tus calendarios.</string>
+              <key>NSRemindersUsageDescription</key>
+              <string>Un programa que ejecutaste en Fastty quiere acceder a tus recordatorios.</string>
+              <key>NSPhotoLibraryUsageDescription</key>
+              <string>Un programa que ejecutaste en Fastty quiere acceder a tu fototeca.</string>
+              <key>NSAppleEventsUsageDescription</key>
+              <string>Un programa que ejecutaste en Fastty quiere controlar otras apps.</string>
+              <key>NSLocalNetworkUsageDescription</key>
+              <string>Un programa que ejecutaste en Fastty quiere acceder a la red local.</string>
               <key>NSHighResolutionCapable</key>
               <true/>
           </dict>

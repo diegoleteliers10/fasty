@@ -3,6 +3,12 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.21.1 - 2026-10-08
+
+### macOS permissions
+
+- Add privacy usage descriptions to the app bundle so terminal programs can request Bluetooth and other protected resources without crashing.
+
 ## 0.21.0 - 2026-10-08
 
 ### Background AI turns
