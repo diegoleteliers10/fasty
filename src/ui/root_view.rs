@@ -987,12 +987,23 @@ fn render_geometric_cell(
     None
 }
 
-fn enable_terminal_ligatures() -> FontFeatures {
+/// OpenType features enabling ligature substitution for terminal text.
+///
+/// Previously this was unconditional, so `font.ligatures` in the config could be
+/// set either way without changing anything. Note that ligatures fuse several
+/// characters into one glyph, which does not fit the terminal's one-character-
+/// per-cell grid, so callers honour the user's preference rather than assuming.
+pub(crate) fn terminal_ligatures(enabled: bool) -> FontFeatures {
+    // Value 0 is required to switch a feature off. An empty feature list means
+    // "no override", so returning one leaves the font's own defaults in place --
+    // and calt/liga are on by default, which is why an earlier attempt to
+    // disable ligatures by returning nothing had no effect at all.
+    let value = u32::from(enabled);
     FontFeatures(std::sync::Arc::new(vec![
-        ("calt".to_string(), 1),
-        ("liga".to_string(), 1),
-        ("dlig".to_string(), 1),
-        ("clig".to_string(), 1),
+        ("calt".to_string(), value),
+        ("liga".to_string(), value),
+        ("dlig".to_string(), value),
+        ("clig".to_string(), value),
     ]))
 }
 
@@ -1099,7 +1110,10 @@ fn get_font_cell_metrics(_family: &str, size: f32) -> (f32, f32) {
 pub(crate) fn available_system_fonts() -> Vec<String> {
     #[cfg(target_os = "macos")]
     {
-        crate::font_discovery_macos::available_monospace_fonts()
+        // Unfiltered on purpose. The settings view decides whether to narrow to
+        // monospace families, and needs the full list cached to be able to widen
+        // again without paying for discovery a second time.
+        crate::font_discovery_macos::all_system_font_families()
     }
     #[cfg(target_os = "linux")]
     {
@@ -2337,7 +2351,21 @@ impl RootView {
                     "monospace".into()
                 }
             } else {
-                loaded_config.font.family.clone().into()
+                // A family that is not installed gets silently substituted by the
+                // text system, leaving cell metrics describing a different font
+                // than the one actually drawn. Resolve to an installed family so
+                // measurement and rendering agree.
+                #[cfg(target_os = "macos")]
+                {
+                    crate::font_discovery_macos::resolve_font_family(
+                        &loaded_config.font.family,
+                    )
+                    .into()
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    loaded_config.font.family.clone().into()
+                }
             };
 
         // F3: auto-detect an installed Nerd Font for PUA icon fallback.
@@ -6800,7 +6828,21 @@ impl RootView {
                     "monospace".into()
                 }
             } else {
-                loaded_config.font.family.clone().into()
+                // A family that is not installed gets silently substituted by the
+                // text system, leaving cell metrics describing a different font
+                // than the one actually drawn. Resolve to an installed family so
+                // measurement and rendering agree.
+                #[cfg(target_os = "macos")]
+                {
+                    crate::font_discovery_macos::resolve_font_family(
+                        &loaded_config.font.family,
+                    )
+                    .into()
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    loaded_config.font.family.clone().into()
+                }
             };
         self.font_family = new_family;
         self.status_bar_model = StatusBarModel::new(&loaded_config, self.theme);
@@ -7007,7 +7049,19 @@ impl RootView {
     }
 
     pub fn set_font_family(&mut self, family: &str, cx: &mut Context<Self>) {
-        self.font_family = family.to_string().into();
+        // Keep the configured value in config so the user's choice survives a
+        // restart, but render with a family that is actually installed.
+        let resolved = {
+            #[cfg(target_os = "macos")]
+            {
+                crate::font_discovery_macos::resolve_font_family(family)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                family.to_string()
+            }
+        };
+        self.font_family = resolved.into();
         self.config.font.family = family.to_string();
         let _ = self.config.save_default();
         cx.notify();
@@ -10327,6 +10381,7 @@ impl RootView {
                             font_size,
                             display_offset,
                             nerd_font_family: self.nerd_font_family.clone(),
+                            ligatures: self.config.font.ligatures,
                         })
                     } else {
                         None
@@ -10836,6 +10891,7 @@ impl Render for RootView {
             (viewport_size.height.to_f64() as f32 - top_offset - STATUS_BAR_HEIGHT).max(100.0);
 
         let font_family = self.font_family.clone();
+        let font_ligatures = self.config.font.ligatures;
         let font_size = self.font_size;
 
         // F2: a zoomed pane renders alone over the whole area. The temp leaf
@@ -11136,7 +11192,7 @@ impl Render for RootView {
                             .bg(self.theme.main_bg)
                             .font_family(font_family.clone())
                             .text_size(px(font_size))
-                            .font_features(enable_terminal_ligatures())
+                            .font_features(terminal_ligatures(font_ligatures))
                             .overflow_hidden()
                             .child(super::ime::registration(cx.entity(), self.focus_handle.clone()))
                             .child(terminal_area),
@@ -16790,5 +16846,50 @@ mod mission_control_tests {
         assert_eq!(move_grid_selection(2, GridStep::Up, 1, 3), 1);
         assert_eq!(move_grid_selection(2, GridStep::Left, 1, 3), 1);
         assert_eq!(move_grid_selection(0, GridStep::Up, 1, 3), 0);
+    }
+}
+
+#[cfg(test)]
+mod ligature_tests {
+    use super::*;
+
+    #[test]
+    fn ligatures_are_enabled_when_requested() {
+        let on = terminal_ligatures(true);
+        for tag in ["calt", "liga", "dlig", "clig"] {
+            assert!(
+                on.0.iter().any(|(name, v)| name == tag && *v == 1),
+                "{tag} should be explicitly enabled"
+            );
+        }
+    }
+
+    #[test]
+    fn ligatures_are_suppressed_when_disabled() {
+        // The regression this guards: the setting used to be ignored entirely,
+        // so `font.ligatures = false` had no effect on rendering.
+        let off = terminal_ligatures(false);
+        assert!(!off.0.is_empty(), "an empty list would mean 'no override'");
+        for tag in ["calt", "liga", "dlig", "clig"] {
+            assert!(
+                off.0.iter().any(|(name, v)| name == tag && *v == 0),
+                "{tag} must be explicitly set to 0 to disable it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_settings_differ() {
+        // Same tags either way, opposite values. Comparing lengths would pass
+        // even if the toggle were inert.
+        let on = terminal_ligatures(true);
+        let off = terminal_ligatures(false);
+        assert_eq!(on.0.len(), off.0.len(), "both list the same feature tags");
+        for ((on_name, on_val), (off_name, off_val)) in on.0.iter().zip(off.0.iter()) {
+            assert_eq!(on_name, off_name);
+            assert_eq!(*on_val, 1, "{on_name} on");
+            assert_eq!(*off_val, 0, "{on_name} off");
+        }
+        assert_ne!(on.0, off.0, "the toggle must change what is requested");
     }
 }

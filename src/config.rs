@@ -461,6 +461,11 @@ pub struct FontConfig {
     pub weight: f32,
     #[serde(default = "default_font_ligatures")]
     pub ligatures: bool,
+    /// Restrict the font picker to families whose glyphs all share one advance
+    /// width. A proportional font cannot be drawn on a fixed cell grid, so
+    /// offering only these by default prevents an unusable selection.
+    #[serde(default = "default_font_monospace_only")]
+    pub monospace_only: bool,
 }
 
 fn default_scrollback() -> usize { 10_000 }
@@ -469,6 +474,7 @@ fn default_font_family() -> String { "monospace".to_string() }
 fn default_font_size() -> f32 { 14.0 }
 fn default_font_weight() -> f32 { 400.0 }
 fn default_font_ligatures() -> bool { true }
+fn default_font_monospace_only() -> bool { true }
 fn default_session_restore() -> bool { true }
 fn default_opacity() -> f32 { 1.0 }
 fn default_notify_on_command_finish() -> bool { true }
@@ -516,6 +522,7 @@ impl Default for FontConfig {
             size: default_font_size(),
             weight: default_font_weight(),
             ligatures: default_font_ligatures(),
+            monospace_only: default_font_monospace_only(),
         }
     }
 }
@@ -1173,6 +1180,7 @@ mod tests {
                 size: 15.0,
                 weight: 500.0,
                 ligatures: true,
+                monospace_only: true,
             },
             shell: Some("/bin/zsh".to_string()),
             scrollback: 5000,
