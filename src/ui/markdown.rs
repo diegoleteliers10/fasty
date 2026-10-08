@@ -765,7 +765,7 @@ pub fn parse_inline_located(text: &str, base: usize) -> Vec<LocSpan> {
 }
 
 pub fn render_markdown(text: &str, theme: &Theme, is_streaming: bool) -> Div {
-    render_markdown_selectable(text, theme, is_streaming, None, None, None, 0.0, None, None)
+    render_markdown_selectable(text, theme, is_streaming, None, None, None, 0.0, None, None, 0.0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -779,6 +779,10 @@ pub fn render_markdown_selectable(
     text_left: f32,
     window: Option<&Window>,
     registry: Option<(&RowRegistry, usize)>,
+    // Horizontal space a table may occupy, needed to turn intrinsic column widths
+    // into concrete pixels. Zero means unknown, as in the changelog dialog, which
+    // has no agent tables and falls back to intrinsic sizing.
+    available_width: f32,
 ) -> Div {
     let blocks = parse_markdown(text);
     let mut container = div().flex().flex_col().gap_3().w_full().min_w(px(0.));
@@ -803,6 +807,7 @@ pub fn render_markdown_selectable(
             text_left,
             window,
             registry,
+            available_width,
         );
         container = container.child(block_div);
     }
@@ -1108,14 +1113,143 @@ fn src_range_to_rendered(map: &[usize], s: usize, e: usize) -> Option<(usize, us
     }
 }
 
-/// One visual table row: a flex line of equally weighted cells. `is_header`
-/// bolds the text; `is_last` suppresses the row's bottom rule so the outer
-/// border is not doubled up.
+/// Font size for table cell text. Shared by the grid and by cell measurement so
+/// the widths it computes describe the text it is about to paint.
+const TABLE_FONT_SIZE: f32 = 12.0;
+
+/// Rendered width of `text` in pixels at the table font size.
+///
+/// Measured with the real font because the panel uses a proportional UI font,
+/// where character count is a poor proxy: "Safety guarantees" is 18 characters
+/// but "Interpreted (CPython), with bytecode precompile" is far wider per
+/// character, so counting characters handed the first column roughly half the
+/// space it needed.
+///
+/// ponytail: the estimate below is only reached where no `Window` exists, which
+/// is the changelog dialog. Agent tables always take the measured path.
+fn measure_text_px(text: &str, bold: bool, window: Option<&Window>) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let estimate =
+        unicode_width::UnicodeWidthStr::width(text) as f32 * TABLE_FONT_SIZE * 0.55;
+    let Some(window) = window else {
+        return estimate;
+    };
+    let runs = shape_runs(window.text_style().font(), &[(text.len(), bold, false)]);
+    match window.text_system()
+        .shape_text(SharedString::from(text.to_string()), px(TABLE_FONT_SIZE), &runs, None, None)
+    {
+        Ok(lines) => lines
+            .first()
+            .map(|line| line.unwrapped_layout.width.to_f64() as f32)
+            .unwrap_or(estimate),
+        Err(_) => estimate,
+    }
+}
+
+fn cell_text(spans: &[LocSpan]) -> String {
+    spans.iter().map(|ls| ls.span.text()).collect()
+}
+
+/// Intrinsic width of each column: the widest cell in that column.
+///
+/// Header cells are measured at bold weight because bold renders wider than the
+/// same text at normal weight, and measuring it at the wrong weight under-sizes
+/// the column holding it.
+fn table_column_intrinsics(
+    header: &[Vec<LocSpan>],
+    rows: &[Vec<Vec<LocSpan>>],
+    width: usize,
+    window: Option<&Window>,
+) -> Vec<f32> {
+    let mut widest = vec![0.0f32; width];
+    let mut consider = |cell: &[LocSpan], bold: bool, ci: usize| {
+        widest[ci] = widest[ci].max(measure_text_px(&cell_text(cell), bold, window));
+    };
+    for (ci, cell) in header.iter().enumerate().take(width) {
+        consider(cell, true, ci);
+    }
+    for row in rows {
+        for (ci, cell) in row.iter().enumerate().take(width) {
+            consider(cell, false, ci);
+        }
+    }
+    widest.into_iter().map(|w| w.max(1.0)).collect()
+}
+
+/// Distributes `available` pixels across columns according to their intrinsic
+/// widths, by water filling: every column narrower than the fill level keeps
+/// its intrinsic width, and the columns above the level share what is left
+/// equally.
+///
+/// The result is one concrete pixel width per column, which is the whole point.
+/// A ratio cannot work here: each table row is its own flex container, and when
+/// a table's intrinsic widths exceed the panel the leftover space is negative,
+/// so flex-grow never engages and the default flex-shrink instead distributes
+/// the shortfall in proportion to each item's own base size. Because base sizes
+/// differ per row, every row landed on different pixel widths and the vertical
+/// rules failed to line up. Ratios can only align columns when they are shared
+/// by a single layout, such as a CSS grid, not by independent flex containers.
+fn table_column_widths(intrinsics: &[f32], available: f32) -> Vec<f32> {
+    let n = intrinsics.len();
+    if n == 0 || available <= 0.0 {
+        return Vec::new();
+    }
+    let usable = available.max(0.0);
+    let sum: f32 = intrinsics.iter().sum();
+
+    if sum <= usable {
+        let mut w = intrinsics.to_vec();
+        // The last column absorbs the slack so the table fills its container
+        // instead of leaving a ragged gap at the right edge.
+        w[n - 1] += usable - sum;
+        return w;
+    }
+
+    let equal = usable / n as f32;
+    if intrinsics.iter().all(|&x| x > equal) {
+        return vec![equal; n];
+    }
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        intrinsics[a]
+            .partial_cmp(&intrinsics[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut prefix = vec![0.0f32; n + 1];
+    for k in 0..n {
+        prefix[k + 1] = prefix[k] + intrinsics[order[k]];
+    }
+
+    let mut cut = n;
+    for i in 0..n {
+        let level = (usable - prefix[i]) / (n - i) as f32;
+        if intrinsics[order[i]] > level {
+            cut = i;
+            break;
+        }
+    }
+
+    let level = ((usable - prefix[cut]) / (n - cut) as f32).max(0.0);
+    let mut widths = vec![0.0f32; n];
+    for (j, &ci) in order.iter().enumerate() {
+        widths[ci] = if j < cut { intrinsics[ci] } else { level };
+    }
+    widths
+}
+
+/// One visual table row: a flex line of cells given explicit pixel widths that
+/// every row of the same table shares. `is_header` bolds the text and centres
+/// it; `is_last` suppresses the row's bottom rule so the outer border is not
+/// doubled up.
 #[allow(clippy::too_many_arguments)]
 fn render_table_row(
     cells: &[Vec<LocSpan>],
     aligns: &[TableAlign],
-    ratios: &[f32],
+    widths: &[f32],
     theme: &Theme,
     is_header: bool,
     is_last: bool,
@@ -1131,15 +1265,20 @@ fn render_table_row(
     }
 
     for (ci, cell) in cells.iter().enumerate() {
-        let mut column = div()
-            .flex_grow(ratios.get(ci).copied().unwrap_or(1.0))
-            // No pixel floor: a flat minimum reserved equal width for every
-            // column, so a one-character index column wasted as much space as
-            // a prose column and squeezed the rest into mid-word breaks. The
-            // flex ratio alone already divides the available width.
-            .min_w(px(0.))
-            .px_2()
+        // An explicit pixel width, shared by every row of the table. flex_shrink_0
+        // stops the row from renegotiating it, so every cell in a column lands on
+        // the same edge. A ratio here cannot do this: each row is a separate flex
+        // container and would resolve the same ratio to a different width.
+        let mut column = div().w(px(widths.get(ci).copied().unwrap_or(1.0))).flex_shrink_0();
+
+        // px_1 rather than px_2: padding is charged per column against a fixed
+        // panel width, so 8px a side was a meaningful slice of a 500px panel.
+        let mut column = column
+            .px_1()
             .py_1()
+            // Stretch to the row's height so the vertical rule spans cells that
+            // wrapped to a different number of lines.
+            .h_full()
             .flex()
             .flex_col();
         if ci + 1 < cells.len() {
@@ -1180,6 +1319,7 @@ fn render_block(
     text_left: f32,
     window: Option<&Window>,
     registry: Option<(&RowRegistry, usize)>,
+    available_width: f32,
 ) -> Div {
     match block {
         MarkdownBlock::Paragraph { spans, src } => render_inline_spans(
@@ -1196,22 +1336,15 @@ fn render_block(
             registry,
         ),
         MarkdownBlock::Table { aligns, header, rows, .. } => {
-            // Columns are sized as flex *ratios* derived from the widest cell,
-            // measured in display cells so CJK and emoji count double. Ratios
-            // rather than pixel widths let the grid shrink into any panel and
-            // wrap its cells instead of clipping, which is the Zed behaviour.
-            let mut ratios = vec![1.0f32; aligns.len()];
-            for ci in 0..aligns.len() {
-                let mut widest = 0usize;
-                for cell in header.iter().chain(rows.iter().flatten()) {
-                    let w: usize = cell
-                        .iter()
-                        .map(|ls| unicode_width::UnicodeWidthStr::width(ls.span.text()))
-                        .sum();
-                    widest = widest.max(w);
-                }
-                ratios[ci] = (widest as f32).max(1.0);
-            }
+            let intrinsics = table_column_intrinsics(header, rows, aligns.len(), window);
+            // available_width is zero where it is unknown, i.e. the changelog
+            // dialog. Falling back to intrinsic widths there lets such a table
+            // size to its content and wrap instead of dividing a width nobody
+            // supplied.
+            let widths = match table_column_widths(&intrinsics, available_width) {
+                w if w.is_empty() => intrinsics,
+                w => w,
+            };
 
             let mut table = div()
                 .w_full()
@@ -1227,7 +1360,7 @@ fn render_block(
             table = table.child(render_table_row(
                 header,
                 aligns,
-                &ratios,
+                &widths,
                 theme,
                 true,
                 false,
@@ -1243,7 +1376,7 @@ fn render_block(
                 table = table.child(render_table_row(
                     row,
                     aligns,
-                    &ratios,
+                    &widths,
                     theme,
                     false,
                     ri == last,
@@ -1432,6 +1565,9 @@ fn render_block(
                     text_left,
                     window,
                     registry,
+                    // Nested content sits inside the quote's left rule and
+                    // padding, so a table here has less room than its parent.
+                    (available_width - 16.0).max(0.0),
                 ));
             }
             quote
@@ -1478,6 +1614,8 @@ fn render_block(
                         text_left,
                         window,
                         registry,
+                        // Indented past the list marker gutter.
+                        (available_width - 20.0).max(0.0),
                     ));
                 }
 
@@ -2389,6 +2527,51 @@ mod tests {
             assert_eq!(r.len(), 4);
         }
         assert_eq!(aligns.len(), 4);
+    }
+
+    #[std::prelude::v1::test]
+    fn test_table_column_ratios_follow_the_widest_cell() {
+        // Ratios must come from content, so a column holding longer text gets
+        // proportionally more of the panel. This exercises the window-less
+        // estimate path; the measured path needs a real Window.
+        let blocks = parse_markdown("| ab | a much longer cell |\n|---|---|\n| x | y |");
+        let MarkdownBlock::Table { header, rows, aligns, .. } = &blocks[0] else {
+            panic!("expected Table");
+        };
+        let ratios = table_column_intrinsics(header, rows, aligns.len(), None);
+        assert_eq!(ratios.len(), 2);
+        assert!(
+            ratios[1] > ratios[0] * 3.0,
+            "wider column should get far more, got {ratios:?}"
+        );
+    }
+
+    #[std::prelude::v1::test]
+    fn test_table_column_ratios_stay_positive_for_empty_columns() {
+        // flex_grow treats zero and negative factors as invalid, so a column
+        // whose cells are all empty still needs a usable value.
+        let blocks = parse_markdown("|  | b |\n|---|---|\n|  |  |");
+        let MarkdownBlock::Table { header, rows, aligns, .. } = &blocks[0] else {
+            panic!("expected Table");
+        };
+        let ratios = table_column_intrinsics(header, rows, aligns.len(), None);
+        assert_eq!(ratios.len(), 2);
+        assert!(ratios[0] > 0.0, "empty column ratio must stay positive, got {ratios:?}");
+    }
+
+    #[std::prelude::v1::test]
+    fn test_table_column_ratios_count_display_cells() {
+        // A wide-glyph cell must measure wider than a narrow one of the same
+        // char count, otherwise CJK and emoji columns get under-sized.
+        let blocks = parse_markdown("| ab | 中文 |\n|---|---|\n| x | y |");
+        let MarkdownBlock::Table { header, rows, aligns, .. } = &blocks[0] else {
+            panic!("expected Table");
+        };
+        let ratios = table_column_intrinsics(header, rows, aligns.len(), None);
+        assert!(
+            ratios[1] > ratios[0],
+            "two CJK chars are four display cells, got {ratios:?}"
+        );
     }
 
     #[std::prelude::v1::test]
