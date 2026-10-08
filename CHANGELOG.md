@@ -3,6 +3,13 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.21.2 - 2026-10-08
+
+### Agent and program status
+
+- Keep CLI and TUI program status visible after you switch tabs. Show the tab name, program name, and status.
+- Send AI permission and program blocked notifications without the routine notification cooldown.
+
 ## 0.21.1 - 2026-10-08
 
 ### macOS permissions

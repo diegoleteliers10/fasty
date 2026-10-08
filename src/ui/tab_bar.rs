@@ -11,7 +11,7 @@ pub(crate) fn program_status_text(record: &ProgramRecord) -> &'static str {
         ProgramState::Idle => "Idle",
         ProgramState::Working => "Working",
         ProgramState::Done => "Done",
-        ProgramState::Error => "Failed",
+        ProgramState::Error => "Error",
         ProgramState::Blocked => match record.kind {
             Some(BlockedKind::Permission) => "Permission required",
             Some(BlockedKind::Question) => "Answer required",

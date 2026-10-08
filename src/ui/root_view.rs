@@ -32,6 +32,12 @@ pub enum AiTurnCompletion {
     Unread,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AiNotificationUrgency {
+    Routine,
+    RequiresAction,
+}
+
 #[derive(Default)]
 pub struct ProgramPaneStatus {
     records: Vec<ProgramRecord>,
@@ -5224,12 +5230,19 @@ impl RootView {
             && !self.is_tab_overview_open
     }
 
-    fn notify_ai_status(&mut self, window: &Window, title: &str) {
+    fn notify_ai_status(
+        &mut self,
+        window: &Window,
+        title: &str,
+        urgency: AiNotificationUrgency,
+    ) {
         if !self.config.notify_on_ai_status || self.ai_response_is_visible(window) {
             return;
         }
         let now = std::time::Instant::now();
-        if self.ai_last_notification.is_some_and(|last| now.duration_since(last).as_secs() < 5) {
+        if urgency == AiNotificationUrgency::Routine
+            && self.ai_last_notification.is_some_and(|last| now.duration_since(last).as_secs() < 5)
+        {
             return;
         }
         let tab = self.ai_event_source.as_ref()
@@ -5283,10 +5296,16 @@ impl RootView {
         status.unread = has_attention && (status.unread || !changed_attention.is_empty());
         status.records = records;
         let now = std::time::Instant::now();
-        if self.config.notify_on_program_status && !foreground
-            && status.last_notification.is_none_or(|last| now.duration_since(last).as_secs() >= 5)
-        {
+        if self.config.notify_on_program_status && !foreground {
             if let Some(record) = crate::program_status::aggregate(&changed_attention) {
+                let requires_action = record.state == ProgramState::Blocked;
+                let cooldown_elapsed = status
+                    .last_notification
+                    .is_none_or(|last| now.duration_since(last).as_secs() >= 5);
+                if !requires_action && !cooldown_elapsed {
+                    cx.notify();
+                    return;
+                }
                 let title = format!("Fastty: {}", super::tab_bar::program_status_text(record));
                 let message = record.msg.as_deref().or(record.title.as_deref()).unwrap_or("");
                 let body = format!("{}: {} {}", source, record.app.as_deref().unwrap_or("Program"), message);
@@ -5950,7 +5969,11 @@ impl RootView {
                                 options: Vec::new(),
                         });
                     this.ai_confirm_reply_tx = Some(reply_tx);
-                    this.notify_ai_status(_window, "Fastty AI: Permission required");
+                    this.notify_ai_status(
+                        _window,
+                        "Fastty AI: Permission required",
+                        AiNotificationUrgency::RequiresAction,
+                    );
                     this.ai_opencode_confirm_reply_tx = None;
                     // The confirmation card renders at the end of the message
                     // list; bring it into view so the user sees the diff.
@@ -5983,7 +6006,11 @@ impl RootView {
                     });
                     this.ai_confirm_reply_tx = None;
                     this.ai_opencode_confirm_reply_tx = Some(reply_tx);
-                    this.notify_ai_status(_window, "Fastty AI: Permission required");
+                    this.notify_ai_status(
+                        _window,
+                        "Fastty AI: Permission required",
+                        AiNotificationUrgency::RequiresAction,
+                    );
                     if this.ai_event_source.is_none() { this.ai_scroll_handle.scroll_to_bottom(); }
                     cx.notify();
                     });
@@ -6191,7 +6218,11 @@ impl RootView {
                                     AiTurnCompletion::Unread
                                 },
                             );
-                            this.notify_ai_status(_window, "Fastty AI: Turn complete");
+                            this.notify_ai_status(
+                                _window,
+                                "Fastty AI: Turn complete",
+                                AiNotificationUrgency::Routine,
+                            );
                             this.save_active_ai_conversation();
                         }
                         crate::ai::AgentEvent::Usage { input, output } => {
@@ -6238,7 +6269,11 @@ impl RootView {
                             }
 
                             this.ai_messages.push(ai_error_message(&err));
-                            this.notify_ai_status(_window, "Fastty AI: Turn failed");
+                            this.notify_ai_status(
+                                _window,
+                                "Fastty AI: Turn failed",
+                                AiNotificationUrgency::Routine,
+                            );
                             this.ai_is_streaming = false;
                             this.ai_cancel_token = None;
                             this.save_active_ai_conversation();
@@ -10753,6 +10788,22 @@ impl Render for RootView {
             })
             .collect();
 
+        let mut background_program_statuses = Vec::new();
+        for (tab_idx, tab) in self.tabs.iter().enumerate() {
+            if tab_idx == self.active_tab_idx {
+                continue;
+            }
+            let title = tab.custom_title.as_deref().unwrap_or(&tab.title).to_string();
+            for pane in tab.pane_tree.all_panes() {
+                if let Some(record) = self.visible_program_record(pane.id).cloned() {
+                    background_program_statuses.push((tab_idx, pane.id, title.clone(), record));
+                }
+            }
+        }
+        background_program_statuses.sort_by_key(|(tab_idx, pane_id, _, record)| {
+            (std::cmp::Reverse(record.state.priority()), *tab_idx, *pane_id)
+        });
+
         let cwd_changed = {
             let active_tab = self.tabs.get_mut(self.active_tab_idx);
             if let Some(active_tab) = active_tab {
@@ -11139,7 +11190,66 @@ impl Render for RootView {
                             .font_features(enable_terminal_ligatures())
                             .overflow_hidden()
                             .child(super::ime::registration(cx.entity(), self.focus_handle.clone()))
-                            .child(terminal_area),
+                            .child(terminal_area)
+                            .when(!background_program_statuses.is_empty(), |pane| {
+                                pane.child(
+                                    div()
+                                        .id("background-program-statuses")
+                                        .absolute()
+                                        .bottom(px(4.))
+                                        .right(px(20.))
+                                        .flex()
+                                        .flex_col()
+                                        .items_end()
+                                        .gap(px(4.))
+                                        .children(background_program_statuses.iter().map(
+                                            |(tab_idx, pane_id, tab_title, record)| {
+                                                let label = format!(
+                                                    "{} | {}: {}",
+                                                    tab_title,
+                                                    record
+                                                        .app
+                                                        .as_deref()
+                                                        .or(record.title.as_deref())
+                                                        .unwrap_or("Program"),
+                                                    super::tab_bar::program_status_text(record),
+                                                );
+                                                let pane_id = *pane_id;
+                                                let tab_idx = *tab_idx;
+                                                div()
+                                                    .id(("background-program-status", pane_id))
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(5.))
+                                                    .max_w(px(360.))
+                                                    .px(px(7.))
+                                                    .py(px(4.))
+                                                    .rounded(px(5.))
+                                                    .bg(theme.surface_raised)
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .text_size(px(11.))
+                                                    .text_color(theme.foreground)
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _ev, _window, cx| {
+                                                            this.activate_tab_index(tab_idx);
+                                                            cx.notify();
+                                                        }),
+                                                    )
+                                                    .child(super::tab_bar::render_program_status(
+                                                        record, theme, 12.0,
+                                                    ))
+                                                    .child(
+                                                        div()
+                                                            .min_w(px(0.))
+                                                            .truncate()
+                                                            .child(SharedString::from(label)),
+                                                    )
+                                            },
+                                        )),
+                                )
+                            }),
                     )
                     .when(
                         self.ai_opencode_variants_open
