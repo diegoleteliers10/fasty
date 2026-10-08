@@ -1102,6 +1102,68 @@ fn src_range_to_rendered(map: &[usize], s: usize, e: usize) -> Option<(usize, us
     }
 }
 
+/// Narrowest a table column may get before its cell starts wrapping. Keeps a
+/// short "Yes/No" column from collapsing to a single character.
+const TABLE_MIN_CELL_W: f32 = 44.0;
+
+/// One visual table row: a flex line of equally weighted cells. `is_header`
+/// bolds the text; `is_last` suppresses the row's bottom rule so the outer
+/// border is not doubled up.
+#[allow(clippy::too_many_arguments)]
+fn render_table_row(
+    cells: &[Vec<LocSpan>],
+    aligns: &[TableAlign],
+    ratios: &[f32],
+    theme: &Theme,
+    is_header: bool,
+    is_last: bool,
+    selection: Option<(usize, usize)>,
+    on_select_char: Option<&Arc<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
+    on_drag_char: Option<&Arc<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
+    text_left: f32,
+    registry: Option<(&RowRegistry, usize)>,
+) -> Div {
+    let mut row = div().w_full().min_w(px(0.)).flex().flex_row();
+    if !is_last {
+        row = row.border_b_1().border_color(theme.border);
+    }
+
+    for (ci, cell) in cells.iter().enumerate() {
+        let mut column = div()
+            .flex_grow(ratios.get(ci).copied().unwrap_or(1.0))
+            .min_w(px(TABLE_MIN_CELL_W))
+            .px_2()
+            .py_1()
+            .flex()
+            .flex_col();
+        if ci + 1 < cells.len() {
+            column = column.border_r_1().border_color(theme.border);
+        }
+        // Left is flexbox's default, so only the other two need to be stated.
+        column = match aligns.get(ci).copied().unwrap_or(TableAlign::Left) {
+            TableAlign::Center => column.items_center(),
+            TableAlign::Right => column.items_end(),
+            TableAlign::Left => column,
+        };
+
+        row = row.child(column.child(render_inline_spans(
+            cell,
+            cell.first().map_or(0, |ls| ls.src),
+            theme,
+            px(12.),
+            if is_header { FontWeight::BOLD } else { FontWeight::NORMAL },
+            false,
+            selection,
+            on_select_char,
+            on_drag_char,
+            text_left,
+            registry,
+        )));
+    }
+
+    row
+}
+
 fn render_block(
     block: &MarkdownBlock,
     theme: &Theme,
@@ -1127,30 +1189,71 @@ fn render_block(
             text_left,
             registry,
         ),
-        MarkdownBlock::Table { header, rows, src, .. } => {
-            // ponytail: temporary flat shim so this commit changes no pixels.
-            // Replaced by real grid rendering in the next commit.
-            let sep = LocSpan { span: InlineSpan::Text(" ".to_string()), src: *src };
-            let mut spans: Vec<LocSpan> = Vec::new();
-            for cell in header.iter().chain(rows.iter().flatten()) {
-                if !spans.is_empty() {
-                    spans.push(sep.clone());
+        MarkdownBlock::Table { aligns, header, rows, .. } => {
+            // Columns are sized as flex *ratios* derived from the widest cell,
+            // measured in display cells so CJK and emoji count double. Ratios
+            // rather than pixel widths let the grid shrink into any panel and
+            // wrap its cells instead of clipping, which is the Zed behaviour.
+            let mut ratios = vec![1.0f32; aligns.len()];
+            for ci in 0..aligns.len() {
+                let mut widest = 0usize;
+                for cell in header.iter().chain(rows.iter().flatten()) {
+                    let w: usize = cell
+                        .iter()
+                        .map(|ls| unicode_width::UnicodeWidthStr::width(ls.span.text()))
+                        .sum();
+                    widest = widest.max(w);
                 }
-                spans.extend(cell.iter().cloned());
+                ratios[ci] = (widest as f32).max(1.0);
             }
-            render_inline_spans(
-                &spans,
-                *src,
+
+            let mut table = div()
+                .w_full()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .rounded_md()
+                .bg(theme.surface_raised)
+                .border_1()
+                .border_color(theme.border)
+                .flex()
+                .flex_col();
+
+            table = table.child(render_table_row(
+                header,
+                aligns,
+                &ratios,
                 theme,
-                px(13.),
-                FontWeight::NORMAL,
-                show_cursor,
+                true,
+                false,
                 selection,
                 on_select_char,
                 on_drag_char,
                 text_left,
                 registry,
-            )
+            ));
+
+            let last = rows.len().saturating_sub(1);
+            for (ri, row) in rows.iter().enumerate() {
+                table = table.child(render_table_row(
+                    row,
+                    aligns,
+                    &ratios,
+                    theme,
+                    false,
+                    ri == last,
+                    selection,
+                    on_select_char,
+                    on_drag_char,
+                    text_left,
+                    registry,
+                ));
+            }
+
+            if show_cursor {
+                table = table.child(div().flex().flex_row().px_2().py_1().child(render_cursor(theme)));
+            }
+
+            table
         }
         MarkdownBlock::Heading { level, content, src } => {
             let (size, weight) = match level {
