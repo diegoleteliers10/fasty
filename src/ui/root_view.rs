@@ -1209,6 +1209,43 @@ pub(crate) fn available_system_fonts() -> Vec<String> {
 }
 
 pub fn send_system_notification(title: &str, body: &str) {
+    type NotificationSender = std::sync::mpsc::SyncSender<(String, String)>;
+    static WORKER: std::sync::OnceLock<Result<NotificationSender, String>> = std::sync::OnceLock::new();
+    let worker = WORKER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<(String, String)>(16);
+        std::thread::Builder::new()
+            .name("fastty-notifications".into())
+            .spawn(move || {
+                for (title, body) in receiver {
+                    deliver_system_notification(&title, &body);
+                }
+            })
+            .map(|_| sender)
+            .map_err(|error| error.to_string())
+    });
+    match worker {
+        Ok(sender) => {
+            if let Err(error) = sender.try_send((title.to_owned(), body.to_owned())) {
+                eprintln!("Fastty notification queue rejected a report: {error}");
+            }
+        }
+        Err(error) => eprintln!("Fastty notification worker failed: {error}"),
+    }
+}
+
+fn deliver_system_notification(title: &str, body: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        static APPLICATION: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+        let application = APPLICATION.get_or_init(|| {
+            notify_rust::set_application("com.diegoleteliers10.fastty")
+                .map_err(|error| error.to_string())
+        });
+        if let Err(error) = application {
+            eprintln!("Fastty notification setup failed: {error}");
+            return;
+        }
+    }
     let summary = if title.is_empty() { "Fastty" } else { title };
     #[cfg(target_os = "linux")]
     let notification_body = body.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
@@ -1220,20 +1257,8 @@ pub fn send_system_notification(title: &str, body: &str) {
         .body(&notification_body)
         .show();
 
-    if res.is_err() {
-        #[cfg(target_os = "macos")]
-        {
-            let escaped_title = summary.replace('\\', "\\\\").replace('"', "\\\"");
-            let escaped_body = body.replace('\\', "\\\\").replace('"', "\\\"");
-            let script = format!(
-                r#"display notification "{}" with title "{}""#,
-                escaped_body, escaped_title
-            );
-            let _ = std::process::Command::new("osascript")
-                .arg("-e")
-                .arg(script)
-                .spawn();
-        }
+    if let Err(error) = res {
+        eprintln!("Fastty notification delivery failed: {error}");
     }
 }
 
@@ -1976,6 +2001,45 @@ pub struct PendingClose {
     pub running_processes: Vec<RunningProcessInfo>,
 }
 
+#[derive(Default)]
+struct AiConversationRuntime {
+    owner_tab_id: usize,
+    permission_checker: Option<Arc<crate::ai::PermissionChecker>>,
+    messages: Vec<crate::ui::ai_sidebar::AiUiMessage>,
+    streaming_text: String,
+    streaming_thinking: String,
+    is_streaming: bool,
+    last_notification: Option<std::time::Instant>,
+    last_usage: Option<(u64, u64)>,
+    current_turn_usage: (u64, u64),
+    cancel_token: Option<crate::ai::CancelToken>,
+    stream_generation: u64,
+    pending_confirmation: Option<crate::ui::ai_sidebar::AiUiPendingConfirmation>,
+    confirm_reply_tx: Option<async_channel::Sender<crate::ai::PermissionDecision>>,
+    opencode_confirm_reply_tx: Option<async_channel::Sender<Option<String>>>,
+    pending_text: String,
+    pending_thinking: String,
+    turn_provider: String,
+    turn_model: String,
+}
+
+impl Drop for RootView {
+    fn drop(&mut self) {
+        self.cancel_ai_stream();
+        for runtime in self.ai_background_conversations.values_mut() {
+            if let Some(token) = runtime.cancel_token.take() {
+                token.cancel();
+            }
+            if let Some(tx) = runtime.confirm_reply_tx.take() {
+                let _ = tx.try_send(crate::ai::PermissionDecision::Deny);
+            }
+            if let Some(tx) = runtime.opencode_confirm_reply_tx.take() {
+                let _ = tx.try_send(None);
+            }
+        }
+    }
+}
+
 pub struct RootView {
     config: Config,
     window_id: gpui::WindowId,
@@ -2130,6 +2194,12 @@ pub struct RootView {
     pub ai_input_state: crate::ui::TextInputState,
     pub is_dragging_ai_input: bool,
     pub ai_input_focused: bool,
+    ai_loaded_conversation_id: String,
+    ai_background_conversations: std::collections::HashMap<String, AiConversationRuntime>,
+    ai_event_source: Option<(usize, String)>,
+    ai_next_stream_generation: u64,
+    ai_turn_provider: String,
+    ai_turn_model: String,
     pub ai_messages: Vec<crate::ui::ai_sidebar::AiUiMessage>,
     pub ai_chat_records: Vec<crate::ai::conversations::Conversation>,
     pub ai_history_open: bool,
@@ -2537,6 +2607,12 @@ impl RootView {
             ai_input_state: crate::ui::TextInputState::default(),
             is_dragging_ai_input: false,
             ai_input_focused: true,
+            ai_loaded_conversation_id: String::new(),
+            ai_background_conversations: std::collections::HashMap::new(),
+            ai_event_source: None,
+            ai_next_stream_generation: 0,
+            ai_turn_provider: String::new(),
+            ai_turn_model: String::new(),
             ai_messages: Vec::new(),
             ai_chat_records: crate::ai::conversations::load(),
             ai_history_open: false,
@@ -3733,9 +3809,13 @@ impl RootView {
     }
 
     fn save_active_ai_conversation(&mut self) {
-        let Some(tab) = self.tabs.get(self.active_tab_idx) else { return };
+        let tab = self.ai_event_source.as_ref()
+            .and_then(|(id, _)| self.tabs.iter().find(|tab| tab.id == *id))
+            .or_else(|| self.tabs.get(self.active_tab_idx));
+        let Some(tab) = tab else { return };
         let tab_key = tab.ai_tab_key.clone();
-        let conversation_id = tab.ai_conversation_id.clone();
+        let conversation_id = self.ai_event_source.as_ref().map(|(_, id)| id.clone())
+            .unwrap_or_else(|| tab.ai_conversation_id.clone());
         let cwd = tab.cwd.clone().unwrap_or_default();
         let now = crate::ai::conversations::now_millis();
         let default_context = crate::config::ai_context_window().max(1_000) as u64;
@@ -3768,8 +3848,13 @@ impl RootView {
             record.available_commands.clear();
         }
         record.messages = self.ai_messages.clone();
-        record.provider = self.config.ai.default.clone();
-        record.model = self.config.ai.active_model();
+        if !self.ai_turn_provider.is_empty() {
+            record.provider = self.ai_turn_provider.clone();
+            record.model = self.ai_turn_model.clone();
+        } else {
+            record.provider = self.config.ai.default.clone();
+            record.model = self.config.ai.active_model();
+        }
         if let Some(first_prompt) = record.messages.iter().find(|message| message.is_user) {
             let title = first_prompt.text.split_whitespace().collect::<Vec<_>>().join(" ");
             if !title.is_empty() && record.title == "New chat" {
@@ -3812,16 +3897,107 @@ impl RootView {
         self.ai_pending_thinking.clear();
     }
 
+    fn swap_ai_runtime(&mut self, runtime: &mut AiConversationRuntime) {
+        let checker = runtime.permission_checker.take().unwrap_or_else(|| {
+            Arc::new(crate::ai::PermissionChecker::new(self.config.ai.permission_mode))
+        });
+        runtime.permission_checker = Some(std::mem::replace(&mut self.ai_permission_checker, checker));
+        std::mem::swap(&mut self.ai_messages, &mut runtime.messages);
+        std::mem::swap(&mut self.ai_streaming_text, &mut runtime.streaming_text);
+        std::mem::swap(&mut self.ai_streaming_thinking, &mut runtime.streaming_thinking);
+        std::mem::swap(&mut self.ai_is_streaming, &mut runtime.is_streaming);
+        std::mem::swap(&mut self.ai_last_notification, &mut runtime.last_notification);
+        std::mem::swap(&mut self.ai_last_usage, &mut runtime.last_usage);
+        std::mem::swap(&mut self.ai_current_turn_usage, &mut runtime.current_turn_usage);
+        std::mem::swap(&mut self.ai_cancel_token, &mut runtime.cancel_token);
+        std::mem::swap(&mut self.ai_stream_generation, &mut runtime.stream_generation);
+        std::mem::swap(&mut self.ai_pending_confirmation, &mut runtime.pending_confirmation);
+        std::mem::swap(&mut self.ai_confirm_reply_tx, &mut runtime.confirm_reply_tx);
+        std::mem::swap(&mut self.ai_opencode_confirm_reply_tx, &mut runtime.opencode_confirm_reply_tx);
+        std::mem::swap(&mut self.ai_pending_text, &mut runtime.pending_text);
+        std::mem::swap(&mut self.ai_pending_thinking, &mut runtime.pending_thinking);
+        std::mem::swap(&mut self.ai_turn_provider, &mut runtime.turn_provider);
+        std::mem::swap(&mut self.ai_turn_model, &mut runtime.turn_model);
+    }
+
     fn load_ai_conversation(&mut self, conversation_id: &str) {
-        self.ai_messages = self.ai_chat_records.iter()
-            .find(|record| record.id == conversation_id)
-            .map(|record| record.messages.clone())
+        if self.ai_loaded_conversation_id == conversation_id {
+            return;
+        }
+        let mut previous = AiConversationRuntime::default();
+        previous.owner_tab_id = self.tabs.iter()
+            .find(|tab| tab.ai_conversation_id == self.ai_loaded_conversation_id)
+            .map(|tab| tab.id)
+            .or_else(|| self.tabs.get(self.active_tab_idx).map(|tab| tab.id))
             .unwrap_or_default();
-        let usage = self.ai_chat_records.iter()
-            .find(|record| record.id == conversation_id)
-            .and_then(|record| record.used_tokens.map(|used| (used, 0)));
-        self.ai_last_usage = usage;
-        self.ai_current_turn_usage = (0, 0);
+        self.swap_ai_runtime(&mut previous);
+        if !self.ai_loaded_conversation_id.is_empty() {
+            self.ai_background_conversations.insert(self.ai_loaded_conversation_id.clone(), previous);
+        }
+        let mut next = self.ai_background_conversations.remove(conversation_id).unwrap_or_else(|| {
+            let record = self.ai_chat_records.iter().find(|record| record.id == conversation_id);
+            AiConversationRuntime {
+                messages: record.map(|record| record.messages.clone()).unwrap_or_default(),
+                last_usage: record.and_then(|record| record.used_tokens.map(|used| (used, 0))),
+                ..AiConversationRuntime::default()
+            }
+        });
+        self.swap_ai_runtime(&mut next);
+        self.ai_loaded_conversation_id = conversation_id.to_string();
+        self.ai_expanded_thinkings.clear();
+        self.ai_message_selection = None;
+        self.ai_message_selection_anchor = None;
+    }
+
+    fn with_ai_turn<R>(
+        &mut self,
+        tab_id: usize,
+        conversation_id: &str,
+        generation: u64,
+        update: impl FnOnce(&mut Self) -> R,
+    ) -> Option<R> {
+        if !self.tabs.iter().any(|tab| tab.id == tab_id) {
+            return None;
+        }
+        if self.ai_loaded_conversation_id == conversation_id {
+            if self.ai_stream_generation != generation || !self.ai_is_streaming {
+                return None;
+            }
+            return Some(update(self));
+        }
+        let runtime = self.ai_background_conversations.get(conversation_id)?;
+        if runtime.stream_generation != generation || !runtime.is_streaming {
+            return None;
+        }
+        let mut runtime = self.ai_background_conversations.remove(conversation_id)?;
+        self.swap_ai_runtime(&mut runtime);
+        self.ai_event_source = Some((tab_id, conversation_id.to_string()));
+        let result = update(self);
+        self.ai_event_source = None;
+        self.swap_ai_runtime(&mut runtime);
+        self.ai_background_conversations.insert(conversation_id.to_string(), runtime);
+        Some(result)
+    }
+
+    fn cancel_background_ai_conversation(&mut self, conversation_id: &str) {
+        if let Some(mut runtime) = self.ai_background_conversations.remove(conversation_id) {
+            self.swap_ai_runtime(&mut runtime);
+            self.cancel_ai_stream();
+            self.finish_cancelled_ai_turn();
+            if let Some(record) = self.ai_chat_records.iter_mut().find(|record| record.id == conversation_id) {
+                record.messages = self.ai_messages.clone();
+            }
+            self.swap_ai_runtime(&mut runtime);
+        }
+    }
+
+    fn cancel_tab_ai_turns(&mut self, tab_id: usize) {
+        let ids: Vec<String> = self.ai_background_conversations.iter()
+            .filter(|(_, runtime)| runtime.owner_tab_id == tab_id)
+            .map(|(id, _)| id.clone()).collect();
+        for id in ids {
+            self.cancel_background_ai_conversation(&id);
+        }
     }
 
     fn activate_tab_index(&mut self, idx: usize) {
@@ -3830,31 +4006,11 @@ impl RootView {
         }
         self.acknowledge_program_status(self.tabs[idx].pane_tree.active_pane_id);
         if idx == self.active_tab_idx {
+            let id = self.tabs[idx].ai_conversation_id.clone();
+            if self.ai_loaded_conversation_id != id {
+                self.load_ai_conversation(&id);
+            }
             return;
-        }
-        if self.ai_is_streaming {
-            self.cancel_ai_stream();
-            if !self.ai_streaming_text.is_empty() || !self.ai_streaming_thinking.is_empty() {
-                self.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
-                    is_user: false,
-                    text: std::mem::take(&mut self.ai_streaming_text),
-                    thinking: if self.ai_streaming_thinking.is_empty() { None } else { Some(std::mem::take(&mut self.ai_streaming_thinking)) },
-                    tool_calls: Vec::new(),
-                    timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
-                    images: Vec::new(),
-                    documents: Vec::new(),
-                    is_error: false,
-                });
-            }
-            for message in &mut self.ai_messages {
-                for tool in &mut message.tool_calls {
-                    if tool.is_running {
-                        tool.is_running = false;
-                        tool.is_error = true;
-                        tool.output = Some("Cancelled".to_string());
-                    }
-                }
-            }
         }
         self.save_active_ai_conversation();
         self.active_tab_idx = idx;
@@ -3917,6 +4073,7 @@ impl RootView {
         self.selection_start = None;
         if let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) {
             let was_active = idx == self.active_tab_idx;
+            self.cancel_tab_ai_turns(tab_id);
             if was_active && self.ai_is_streaming {
                 self.cancel_ai_stream();
                 self.finish_cancelled_ai_turn();
@@ -4293,6 +4450,8 @@ impl RootView {
             self.finish_cancelled_ai_turn();
         }
         self.save_active_ai_conversation();
+        let removed_ids: Vec<usize> = self.tabs.iter().filter(|tab| tab.id != keep_id).map(|tab| tab.id).collect();
+        for id in removed_ids { self.cancel_tab_ai_turns(id); }
         for tab in self.tabs.iter().filter(|t| t.id != keep_id) {
             self.ai_opencode_manager.remove(&tab.ai_conversation_id);
             for pane in tab.pane_tree.all_panes() {
@@ -5051,7 +5210,8 @@ impl RootView {
     }
 
     fn ai_response_is_visible(&self, window: &Window) -> bool {
-        self.ai_sidebar_open
+        self.ai_event_source.is_none()
+            && self.ai_sidebar_open
             && window.is_window_active()
             && !self.is_settings_open
             && !self.is_update_modal_open
@@ -5067,11 +5227,18 @@ impl RootView {
         if self.ai_last_notification.is_some_and(|last| now.duration_since(last).as_secs() < 5) {
             return;
         }
-        let Some(tab) = self.tabs.get(self.active_tab_idx) else { return };
-        let body = format!("{}: {}", tab.custom_title.as_deref().unwrap_or(&tab.title), self.config.ai.default);
+        let tab = self.ai_event_source.as_ref()
+            .and_then(|(id, _)| self.tabs.iter().find(|tab| tab.id == *id))
+            .or_else(|| self.tabs.get(self.active_tab_idx));
+        let Some(tab) = tab else { return };
+        let conversation_id = self.ai_event_source.as_ref().map(|(_, id)| id.as_str())
+            .unwrap_or(tab.ai_conversation_id.as_str());
+        let conversation_title = self.ai_chat_records.iter().find(|record| record.id == conversation_id)
+            .map(|record| record.title.as_str()).unwrap_or("AI chat");
+        let body = format!("{} / {}: {}", tab.custom_title.as_deref().unwrap_or(&tab.title), conversation_title, self.ai_turn_provider);
         self.ai_last_notification = Some(now);
         let title = title.to_owned();
-        std::thread::spawn(move || send_system_notification(&title, &body));
+        send_system_notification(&title, &body);
     }
 
     fn refresh_program_status(&mut self, source_id: u64, window: &Window, cx: &mut Context<Self>) {
@@ -5119,7 +5286,7 @@ impl RootView {
                 let message = record.msg.as_deref().or(record.title.as_deref()).unwrap_or("");
                 let body = format!("{}: {} {}", source, record.app.as_deref().unwrap_or("Program"), message);
                 status.last_notification = Some(now);
-                std::thread::spawn(move || send_system_notification(&title, &body));
+                send_system_notification(&title, &body);
             }
         }
         cx.notify();
@@ -5567,6 +5734,10 @@ impl RootView {
         let cancel_tok = agent.as_ref().map(crate::ai::Agent::cancel_token)
             .unwrap_or_else(crate::ai::CancelToken::new);
         self.ai_cancel_token = Some(cancel_tok.clone());
+        self.ai_next_stream_generation = self.ai_next_stream_generation.wrapping_add(1);
+        self.ai_stream_generation = self.ai_next_stream_generation;
+        self.ai_turn_provider = active_prov.clone();
+        self.ai_turn_model = active_mod.clone();
         let stream_generation = self.ai_stream_generation;
         self.ai_is_streaming = true;
         if let Some(tab) = self.tabs.get(self.active_tab_idx) {
@@ -5764,26 +5935,26 @@ impl RootView {
         cx.spawn_in(window, async move |this, cx| {
             while let Ok((tool_id, tool_name, input_summary, reply_tx)) = ask_rx.recv().await {
                 let _ = this.update_in(cx, |this, _window, cx| {
-                    if this.ai_stream_generation != stream_generation
-                        || this.tabs.get(this.active_tab_idx).map(|tab| (tab.id, tab.ai_conversation_id.as_str()))
-                        != Some((event_tab_id, permission_conversation_id.as_str())) {
-                        let _ = reply_tx.send_blocking(crate::ai::PermissionDecision::Deny);
-                        return;
-                    }
-                    this.ai_pending_confirmation =
-                        Some(crate::ui::ai_sidebar::AiUiPendingConfirmation {
-                            tool_id,
-                            tool_name,
-                            input_summary,
-                            options: Vec::new(),
+                    let rejected_reply = reply_tx.clone();
+                    let accepted = this.with_ai_turn(event_tab_id, &permission_conversation_id, stream_generation, |this| {
+                        this.ai_pending_confirmation =
+                            Some(crate::ui::ai_sidebar::AiUiPendingConfirmation {
+                                tool_id,
+                                tool_name,
+                                input_summary,
+                                options: Vec::new(),
                         });
                     this.ai_confirm_reply_tx = Some(reply_tx);
                     this.notify_ai_status(_window, "Fastty AI: Permission required");
                     this.ai_opencode_confirm_reply_tx = None;
                     // The confirmation card renders at the end of the message
                     // list; bring it into view so the user sees the diff.
-                    this.ai_scroll_handle.scroll_to_bottom();
+                    if this.ai_event_source.is_none() { this.ai_scroll_handle.scroll_to_bottom(); }
                     cx.notify();
+                    });
+                    if accepted.is_none() {
+                        let _ = rejected_reply.send_blocking(crate::ai::PermissionDecision::Deny);
+                    }
                 });
             }
         })
@@ -5793,27 +5964,27 @@ impl RootView {
         cx.spawn_in(window, async move |this, cx| {
             while let Ok((tool_id, tool_name, input_summary, options, reply_tx)) = opencode_ask_rx.recv().await {
                 let _ = this.update_in(cx, |this, _window, cx| {
-                    if this.ai_stream_generation != stream_generation
-                        || this.tabs.get(this.active_tab_idx).map(|tab| (tab.id, tab.ai_conversation_id.as_str()))
-                        != Some((event_tab_id, opencode_permission_conversation_id.as_str())) {
-                        let _ = reply_tx.send_blocking(None);
-                        return;
-                    }
-                    this.ai_pending_confirmation = Some(crate::ui::ai_sidebar::AiUiPendingConfirmation {
-                        tool_id,
-                        tool_name,
-                        input_summary,
-                        options: options.into_iter().map(|option| crate::ui::ai_sidebar::AiUiPermissionOption {
-                            option_id: option.option_id,
-                            name: option.name,
-                            kind: option.kind,
-                        }).collect(),
+                    let rejected_reply = reply_tx.clone();
+                    let accepted = this.with_ai_turn(event_tab_id, &opencode_permission_conversation_id, stream_generation, |this| {
+                        this.ai_pending_confirmation = Some(crate::ui::ai_sidebar::AiUiPendingConfirmation {
+                            tool_id,
+                            tool_name,
+                            input_summary,
+                            options: options.into_iter().map(|option| crate::ui::ai_sidebar::AiUiPermissionOption {
+                                option_id: option.option_id,
+                                name: option.name,
+                                kind: option.kind,
+                            }).collect(),
                     });
                     this.ai_confirm_reply_tx = None;
                     this.ai_opencode_confirm_reply_tx = Some(reply_tx);
                     this.notify_ai_status(_window, "Fastty AI: Permission required");
-                    this.ai_scroll_handle.scroll_to_bottom();
+                    if this.ai_event_source.is_none() { this.ai_scroll_handle.scroll_to_bottom(); }
                     cx.notify();
+                    });
+                    if accepted.is_none() {
+                        let _ = rejected_reply.send_blocking(None);
+                    }
                 });
             }
         })
@@ -5824,56 +5995,52 @@ impl RootView {
         cx.spawn_in(window, async move |this, cx| {
             while let Ok(ev) = event_rx.recv().await {
                 let _ = this.update_in(cx, |this, _window, cx| {
-                    if this.ai_stream_generation != stream_generation
-                        || this.tabs.get(this.active_tab_idx).map(|tab| (tab.id, tab.ai_conversation_id.as_str()))
-                        != Some((event_tab_id, stream_conversation_id.as_str())) {
-                        return;
-                    }
-                    match ev {
-                        crate::ai::AgentEvent::TextDelta(d) => {
-                            this.ai_pending_text.push_str(&d);
-                            // Do not call cx.notify() here!
-                            // The 35ms ticker progressively drains ai_pending_text into ai_streaming_text,
-                            // giving a smooth, word-by-word streaming effect without GPUI frame coalescing dumps.
-                            return;
-                        }
-                        crate::ai::AgentEvent::ThinkingDelta(t) => {
-                            this.ai_pending_thinking.push_str(&t);
-                            // Also smooth reveal for thinking deltas
-                            return;
-                        }
-                        crate::ai::AgentEvent::ToolStart { id, name, args } => {
-                            if this.ai_current_turn_usage != (0, 0) {
-                                this.ai_last_usage = Some(this.ai_current_turn_usage);
+                    let accepted = this.with_ai_turn(event_tab_id, &stream_conversation_id, stream_generation, |this| {
+                        match ev {
+                            crate::ai::AgentEvent::TextDelta(d) => {
+                                this.ai_pending_text.push_str(&d);
+                                // Do not call cx.notify() here!
+                                // The 35ms ticker progressively drains ai_pending_text into ai_streaming_text,
+                                // giving a smooth, word-by-word streaming effect without GPUI frame coalescing dumps.
+                                return;
                             }
-                            this.ai_current_turn_usage = (0, 0);
+                            crate::ai::AgentEvent::ThinkingDelta(t) => {
+                                this.ai_pending_thinking.push_str(&t);
+                                // Also smooth reveal for thinking deltas
+                                return;
+                            }
+                            crate::ai::AgentEvent::ToolStart { id, name, args } => {
+                                if this.ai_current_turn_usage != (0, 0) {
+                                    this.ai_last_usage = Some(this.ai_current_turn_usage);
+                                }
+                                this.ai_current_turn_usage = (0, 0);
 
-                            // Flush any text/thinking accumulated so far into an assistant bubble
-                            if !this.ai_pending_text.is_empty() {
-                                this.ai_streaming_text.push_str(&this.ai_pending_text);
-                                this.ai_pending_text.clear();
-                            }
-                            if !this.ai_pending_thinking.is_empty() {
-                                this.ai_streaming_thinking
-                                    .push_str(&this.ai_pending_thinking);
-                                this.ai_pending_thinking.clear();
-                            }
-                            let text = std::mem::take(&mut this.ai_streaming_text);
-                            let thinking = if this.ai_streaming_thinking.is_empty() {
-                                None
-                            } else {
-                                Some(std::mem::take(&mut this.ai_streaming_thinking))
-                            };
-                            if !text.is_empty() || thinking.is_some() {
-                                this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
-                                    is_user: false,
-                                    text,
-                                    thinking,
-                                    tool_calls: Vec::new(),
-                                    timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
-                                    images: Vec::new(),
-                                    documents: Vec::new(),
-                                    is_error: false,
+                                // Flush any text/thinking accumulated so far into an assistant bubble
+                                if !this.ai_pending_text.is_empty() {
+                                    this.ai_streaming_text.push_str(&this.ai_pending_text);
+                                    this.ai_pending_text.clear();
+                                }
+                                if !this.ai_pending_thinking.is_empty() {
+                                    this.ai_streaming_thinking
+                                        .push_str(&this.ai_pending_thinking);
+                                    this.ai_pending_thinking.clear();
+                                }
+                                let text = std::mem::take(&mut this.ai_streaming_text);
+                                let thinking = if this.ai_streaming_thinking.is_empty() {
+                                    None
+                                } else {
+                                    Some(std::mem::take(&mut this.ai_streaming_thinking))
+                                };
+                                if !text.is_empty() || thinking.is_some() {
+                                    this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
+                                        is_user: false,
+                                        text,
+                                        thinking,
+                                        tool_calls: Vec::new(),
+                                        timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                                        images: Vec::new(),
+                                        documents: Vec::new(),
+                                        is_error: false,
                                 });
                             }
 
@@ -5928,8 +6095,8 @@ impl RootView {
                             }
                         }
                         crate::ai::AgentEvent::ConversationSession(session_id) => {
-                            if let Some(tab) = this.tabs.iter().find(|tab| tab.id == event_tab_id) {
-                                let conversation_id = tab.ai_conversation_id.clone();
+                            if let Some(_tab) = this.tabs.iter().find(|tab| tab.id == event_tab_id) {
+                                let conversation_id = stream_conversation_id.clone();
                                 if let Some(record) = this.ai_chat_records.iter_mut().find(|record| record.id == conversation_id) {
                                     record.acp_session_id = Some(session_id);
                                     record.acp_provider = session_provider_identity.clone();
@@ -5938,8 +6105,8 @@ impl RootView {
                             }
                         }
                         crate::ai::AgentEvent::AvailableCommands(commands) => {
-                            if let Some(tab) = this.tabs.iter().find(|tab| tab.id == event_tab_id) {
-                                let conversation_id = tab.ai_conversation_id.clone();
+                            if let Some(_tab) = this.tabs.iter().find(|tab| tab.id == event_tab_id) {
+                                let conversation_id = stream_conversation_id.clone();
                                 if let Some(record) = this.ai_chat_records.iter_mut().find(|record| record.id == conversation_id) {
                                     record.available_commands = commands;
                                     let _ = crate::ai::conversations::save(&this.ai_chat_records);
@@ -5947,8 +6114,8 @@ impl RootView {
                             }
                         }
                         crate::ai::AgentEvent::ContextWindow { used, size } => {
-                            if let Some(tab) = this.tabs.iter().find(|tab| tab.id == event_tab_id) {
-                                let conversation_id = tab.ai_conversation_id.clone();
+                            if let Some(_tab) = this.tabs.iter().find(|tab| tab.id == event_tab_id) {
+                                let conversation_id = stream_conversation_id.clone();
                                 if let Some(record) = this.ai_chat_records.iter_mut().find(|record| record.id == conversation_id) {
                                     record.used_tokens = Some(used);
                                     if record.context_window == 0 { record.context_window = size; }
@@ -6040,8 +6207,8 @@ impl RootView {
                             };
                             this.ai_current_turn_usage = (effective_input, output);
                             this.ai_last_usage = Some(this.ai_current_turn_usage);
-                            if let Some(tab) = this.tabs.iter().find(|tab| tab.id == event_tab_id) {
-                                let conversation_id = tab.ai_conversation_id.clone();
+                            if let Some(_tab) = this.tabs.iter().find(|tab| tab.id == event_tab_id) {
+                                let conversation_id = stream_conversation_id.clone();
                                 if let Some(record) = this.ai_chat_records.iter_mut().find(|record| record.id == conversation_id) {
                                     record.used_tokens = Some(effective_input.saturating_add(output));
                                     record.updated_at = crate::ai::conversations::now_millis();
@@ -6074,6 +6241,8 @@ impl RootView {
                     }
                     this.scroll_ai_to_bottom();
                     cx.notify();
+                    });
+                    let _ = accepted;
                 });
             }
         })
@@ -6083,7 +6252,7 @@ impl RootView {
     }
 
     pub fn scroll_ai_to_bottom(&self) {
-        if self.ai_is_streaming {
+        if self.ai_is_streaming && self.ai_event_source.is_none() {
             self.ai_scroll_handle.scroll_to_bottom();
         }
     }
@@ -6269,10 +6438,6 @@ impl RootView {
             cx.notify();
         }))
         .on_select_history(cx.listener(|this, conversation_id: &String, _window, cx| {
-            if this.ai_is_streaming {
-                this.cancel_ai_stream();
-                this.finish_cancelled_ai_turn();
-            }
             this.save_active_ai_conversation();
             if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
                 tab.ai_conversation_id = conversation_id.clone();
@@ -6303,9 +6468,14 @@ impl RootView {
                     tab.ai_conversation_id = new_ai_key("chat");
                 }
             }
+            this.cancel_background_ai_conversation(conversation_id);
             this.ai_opencode_manager.remove(conversation_id);
             this.ai_turn_completions.remove(conversation_id);
             this.ai_chat_records.retain(|record| record.id != *conversation_id);
+            if deleting_active {
+                this.ai_loaded_conversation_id = this.tabs.get(this.active_tab_idx)
+                    .map(|tab| tab.ai_conversation_id.clone()).unwrap_or_default();
+            }
             let _ = crate::ai::conversations::save(&this.ai_chat_records);
             this.persist_session();
             cx.notify();
@@ -6338,12 +6508,12 @@ impl RootView {
             )
         })
         .on_new_chat(cx.listener(|this, _ev, _window, cx| {
-            this.cancel_ai_stream(); // also clears ai_pending_confirmation + ai_confirm_reply_tx
-            this.finish_cancelled_ai_turn();
             this.save_active_ai_conversation();
             if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
-                this.ai_opencode_manager.remove(&tab.ai_conversation_id);
                 tab.ai_conversation_id = new_ai_key("chat");
+            }
+            if let Some(id) = this.tabs.get(this.active_tab_idx).map(|tab| tab.ai_conversation_id.clone()) {
+                this.load_ai_conversation(&id);
             }
             this.ai_messages.clear();
             this.ai_streaming_text.clear();
@@ -11307,6 +11477,7 @@ impl Render for RootView {
                                 let tab_idx_opt = this.tabs.iter().position(|t| t.id == target_tab_id);
                                 if let Some(idx) = tab_idx_opt {
                                     let was_active = idx == this.active_tab_idx;
+                                    this.cancel_tab_ai_turns(target_tab_id);
                                     if was_active && this.ai_is_streaming {
                                         this.cancel_ai_stream();
                                         this.finish_cancelled_ai_turn();

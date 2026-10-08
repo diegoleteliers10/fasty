@@ -50,7 +50,17 @@ notify_on_program_status = true
 
 Fastty sends native notifications for a completion, a request for input, or a failure when the source is in the background. Notifications require the operating system to allow Fastty notifications. Each terminal pane and the AI panel can send at most one notification every five seconds. Progress updates do not send notifications.
 
+On macOS, install and open `Fastty.app` before you use notifications. Fastty uses its registered application identifier. A bare development binary cannot register the application. If delivery fails, Fastty writes the error to stderr. Check **System Settings > Notifications > Fastty** and allow notifications.
+
 The AI panel uses provider events for its notifications. It supports ACP and HTTP providers without OSC reports.
+
+## Background AI turns
+
+Each conversation keeps its own active turn. Switch tabs or select another conversation to leave the agent at work in the background. Return to the conversation to see its response and tool activity.
+
+If an agent needs permission, its conversation keeps the request pending. Open that conversation to approve or deny the request. With **AI Status** enabled, Fastty can notify you when a background conversation needs permission or finishes its turn.
+
+Use **Stop** to cancel the visible conversation's turn. Clear or delete a conversation to cancel its turn. Close a tab to cancel its conversations. Closing Fastty cancels all active turns.
 
 ## Record lifetime
 
