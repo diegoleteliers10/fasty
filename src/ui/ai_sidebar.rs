@@ -2544,7 +2544,6 @@ impl RenderOnce for AiSidebar {
                                     .gap_3()
                                 // Collapsible reasoning line
                                 .when_some(msg.thinking.clone(), |this, thinking| {
-                                    let summary_snip: String = thinking.lines().next().unwrap_or("Model reasoning").chars().take(48).collect();
                                     let is_thinking_expanded = expanded_thinkings.contains(&msg_idx);
                                     let on_toggle_thinking = on_toggle_thinking.clone();
                                     this.child(
@@ -2560,7 +2559,8 @@ impl RenderOnce for AiSidebar {
                                                     .flex()
                                                     .flex_row()
                                                     .items_center()
-                                                    .gap_1()
+                                                    .justify_between()
+                                                    .gap_2()
                                                     .py(px(2.))
                                                     .pr(px(6.))
                                                     .rounded(px(4.))
@@ -2576,20 +2576,34 @@ impl RenderOnce for AiSidebar {
                                                     })
                                                     .child(
                                                         div()
-                                                            .text_size(px(11.))
-                                                            .text_color(theme.muted)
-                                                            .child(if is_thinking_expanded { "⌵" } else { "›" }),
+                                                            .flex()
+                                                            .flex_row()
+                                                            .items_center()
+                                                            .gap_1()
+                                                            .min_w(px(0.))
+                                                            .child(crate::ui::icons::render_icon(
+                                                                IconType::Lightbulb,
+                                                                theme.muted,
+                                                                12.0,
+                                                            ))
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(11.5))
+                                                                    .text_color(theme.muted)
+                                                                    .child("Thinking"),
+                                                            ),
                                                     )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(11.5))
-                                                            .text_color(theme.muted)
-                                                            .overflow_hidden()
-                                                            .child(SharedString::from(format!(
-                                                                "Thought · {}...",
-                                                                summary_snip
-                                                            ))),
-                                                    ),
+                                                    // justify_between pushes this to the far
+                                                    // edge rather than trailing the label.
+                                                    .child(crate::ui::icons::render_icon(
+                                                        if is_thinking_expanded {
+                                                            IconType::ChevronDown
+                                                        } else {
+                                                            IconType::ChevronUp
+                                                        },
+                                                        theme.muted,
+                                                        12.0,
+                                                    )),
                                             )
                                             .when(is_thinking_expanded, |d| {
                                                 d.child(
@@ -2940,7 +2954,6 @@ impl RenderOnce for AiSidebar {
                                 .gap_2()
                                 .w_full()
                                 .when(!self.streaming_thinking.is_empty(), |d| {
-                                    let thinking_snip: String = self.streaming_thinking.lines().next().unwrap_or("Thinking...").chars().take(48).collect();
                                     d.child(
                                         div()
                                             .flex()
@@ -2953,11 +2966,11 @@ impl RenderOnce for AiSidebar {
                                             .text_size(px(11.5))
                                             .text_color(theme.muted)
                                             .child(crate::ui::icons::render_icon(
-                                                IconType::Sparkles,
+                                                IconType::Lightbulb,
                                                 theme.muted,
                                                 12.0,
                                             ))
-                                            .child(SharedString::from(format!("Thinking · {}...", thinking_snip)))
+                                            .child(SharedString::from("Thinking"))
                                             .with_animation(
                                                 "ai-reasoning-pulse",
                                                 Animation::new(Duration::from_secs(2))
