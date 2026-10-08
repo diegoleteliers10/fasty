@@ -27,6 +27,7 @@ pub enum AppEvent {
     ClipboardLoad(u8),
     CwdChanged(std::path::PathBuf),
     TitleChanged(String),
+    ProgramStatusChanged { source_id: u64 },
     CommandStarted,
     CommandFinished { duration_ms: u128, exit_code: Option<i32> },
     Notification { title: String, body: String },
@@ -235,6 +236,9 @@ pub struct TerminalState {
     writer: Arc<ParkingMutex<Box<dyn Write + Send>>>,
     master: Arc<ParkingMutex<Box<dyn MasterPty + Send>>>,
     shell_pid: Option<u32>,
+    source_id: u64,
+    program_status: Arc<ParkingMutex<crate::program_status::ProgramStatusStore>>,
+    program_status_pending: Arc<std::sync::atomic::AtomicBool>,
     pub total_lines_pushed: Arc<AtomicU64>,
     pub prompt_lines: Arc<ParkingMutex<Vec<u64>>>,
     pub image_store: Arc<ParkingMutex<ImageStore>>,
@@ -537,6 +541,12 @@ impl TerminalState {
         let next_image_id = Arc::new(AtomicU64::new(1));
         let next_image_id_clone = Arc::clone(&next_image_id);
         let writer_clone = Arc::clone(&writer_arc);
+        static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
+        let source_id = NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
+        let program_status = Arc::new(ParkingMutex::new(crate::program_status::ProgramStatusStore::default()));
+        let program_status_clone = Arc::clone(&program_status);
+        let program_status_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let program_status_pending_clone = Arc::clone(&program_status_pending);
         if !std::env::var("FASTTY_NO_READER").is_ok() {
         thread::spawn(move || {
             use std::io::Read;
@@ -587,7 +597,18 @@ impl TerminalState {
 
             let mut handle_cmd = |cmd: OscCommand, cursor_line: i32, screen_lines: i32, base: u64, term: &mut alacritty_terminal::Term<EventListenerProxy>, parser: &mut Processor| {
                 match cmd {
+                    OscCommand::ProgramStatus(crate::program_status::ProgramStatusCommand::Query) => {
+                        let mut writer = writer_clone.lock();
+                        let _ = writer.write_all(b"\x1b]7501;?\x1b\\");
+                        let _ = writer.flush();
+                    }
+                    OscCommand::ProgramStatus(command) => {
+                        update_program_status(&program_status_clone, &program_status_pending_clone, &event_listener_clone, source_id,
+                            |store| store.apply(command));
+                    }
                     OscCommand::PromptStarted => {
+                        update_program_status(&program_status_clone, &program_status_pending_clone, &event_listener_clone, source_id,
+                            |store| store.end_activity());
                         // Reset mouse tracking modes on prompt start to prevent leaked escape codes if a child exited uncleanly
                         parser.advance(term, b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
 
@@ -836,6 +857,8 @@ impl TerminalState {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
+                        update_program_status(&program_status_clone, &program_status_pending_clone, &event_listener_clone, source_id,
+                            |store| store.end_activity());
                         alive_clone.store(false, Ordering::Relaxed);
                         event_listener_clone.send_app_event(AppEvent::Exit { shell_pid: reader_shell_pid });
                         break;
@@ -897,6 +920,10 @@ impl TerminalState {
                                     if byte == b']' {
                                         seq_state = SequenceParseState::Osc;
                                         osc_buf.clear();
+                                    } else if byte == b'c' {
+                                        update_program_status(&program_status_clone, &program_status_pending_clone, &event_listener_clone, source_id,
+                                            |store| store.reset());
+                                        seq_state = SequenceParseState::Normal;
                                     } else if byte == b'_' {
                                         seq_state = SequenceParseState::Apc;
                                         apc_buf.clear();
@@ -906,7 +933,7 @@ impl TerminalState {
                                 }
                                 SequenceParseState::Osc => {
                                     if byte == 0x07 {
-                                        if let Some(cmd) = parse_osc(&osc_buf, &mut cmd_start_time) {
+                                        if let Some(cmd) = parse_osc_framed(&osc_buf, &mut cmd_start_time, 3) {
                                             let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
                                             let screen_lines = term_locked.grid().screen_lines() as i32;
                                             let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
@@ -924,7 +951,7 @@ impl TerminalState {
                                 }
                                 SequenceParseState::OscEsc => {
                                     if byte == b'\\' {
-                                        if let Some(cmd) = parse_osc(&osc_buf, &mut cmd_start_time) {
+                                        if let Some(cmd) = parse_osc_framed(&osc_buf, &mut cmd_start_time, 4) {
                                             let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
                                             let screen_lines = term_locked.grid().screen_lines() as i32;
                                             let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
@@ -1038,6 +1065,8 @@ impl TerminalState {
                         continue;
                     }
                     Err(_) => {
+                        update_program_status(&program_status_clone, &program_status_pending_clone, &event_listener_clone, source_id,
+                            |store| store.end_activity());
                         alive_clone.store(false, Ordering::Relaxed);
                         event_listener_clone.send_app_event(AppEvent::Exit { shell_pid: reader_shell_pid });
                         break;
@@ -1053,6 +1082,9 @@ impl TerminalState {
             writer: writer_arc,
             master: master_arc,
             shell_pid,
+            source_id,
+            program_status,
+            program_status_pending,
             total_lines_pushed,
             prompt_lines,
             image_store,
@@ -1061,6 +1093,17 @@ impl TerminalState {
             alive,
             has_terminated: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    pub fn source_id(&self) -> u64 {
+        self.source_id
+    }
+
+    pub fn program_status(&self) -> Vec<crate::program_status::ProgramRecord> {
+        let store = self.program_status.lock();
+        let records = store.snapshot();
+        self.program_status_pending.store(false, Ordering::Relaxed);
+        records
     }
 
     pub fn shell_pid(&self) -> Option<u32> {
@@ -1086,6 +1129,11 @@ impl TerminalState {
 
     pub fn set_event_sender(&self, sender: crate::event_listener::EventSender) {
         self.event_listener.set_event_sender(sender);
+        {
+            let _store = self.program_status.lock();
+            self.program_status_pending.store(true, Ordering::Relaxed);
+        }
+        self.event_listener.send_app_event(AppEvent::ProgramStatusChanged { source_id: self.source_id });
     }
 
     pub fn get_current_working_directory(&self) -> Option<std::path::PathBuf> {
@@ -2351,6 +2399,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 enum OscCommand {
+    ProgramStatus(crate::program_status::ProgramStatusCommand),
     Cwd(String),
     SetTitle(String),
     CommandStarted,
@@ -2380,15 +2429,26 @@ enum OscCommand {
 /// `Event::ColorRequest`, and a second reply leaves the cursor position report
 /// (`CSI 6 n`) unclaimed in the app's input stream. Go prompt libraries (`gh`,
 /// `survey`) then print the report as literal text and abort the prompt.
+#[cfg(test)]
 fn parse_osc(
     buf: &[u8],
     cmd_start_time: &mut Option<std::time::Instant>,
+) -> Option<OscCommand> {
+    parse_osc_framed(buf, cmd_start_time, 4)
+}
+
+fn parse_osc_framed(
+    buf: &[u8],
+    cmd_start_time: &mut Option<std::time::Instant>,
+    delimiter_bytes: usize,
 ) -> Option<OscCommand> {
     let semicolon = buf.iter().position(|&b| b == b';')?;
     let code = &buf[..semicolon];
     let payload = &buf[semicolon + 1..];
 
     match code {
+        b"7501" => crate::program_status::parse(payload, buf.len() + delimiter_bytes)
+            .map(OscCommand::ProgramStatus),
         b"0" | b"1" | b"2" => {
             if let Ok(title) = std::str::from_utf8(payload) {
                 Some(OscCommand::SetTitle(title.to_string()))
@@ -2628,6 +2688,24 @@ fn parse_osc(
     }
 }
 
+fn update_program_status(
+    store: &ParkingMutex<crate::program_status::ProgramStatusStore>,
+    pending: &std::sync::atomic::AtomicBool,
+    listener: &EventListenerProxy,
+    source_id: u64,
+    update: impl FnOnce(&mut crate::program_status::ProgramStatusStore),
+) {
+    let mut store = store.lock();
+    let before = store.snapshot();
+    update(&mut store);
+    let changed = store.snapshot() != before;
+    let send_update = changed && !pending.swap(true, Ordering::Relaxed);
+    drop(store);
+    if send_update {
+        listener.send_app_event(AppEvent::ProgramStatusChanged { source_id });
+    }
+}
+
 fn dispatch_osc_action(
     cmd: &OscCommand,
     sender: &crate::event_listener::EventListenerProxy,
@@ -2638,7 +2716,7 @@ fn dispatch_osc_action(
     match cmd {
         // The kitty clipboard protocol is fully handled in the reader
         // thread (`handle_cmd`): it needs the PTY writer to reply.
-        OscCommand::KittyClipboard { .. } => {}
+        OscCommand::KittyClipboard { .. } | OscCommand::ProgramStatus(_) => {}
         OscCommand::Cwd(path) => {
             if let Some(p) = file_url_to_path(path.as_bytes()) {
                 sender.send_app_event(AppEvent::CwdChanged(p));

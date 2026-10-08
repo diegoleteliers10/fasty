@@ -665,6 +665,8 @@ impl SettingsView {
             || q.contains("scroll")
             || q.contains("copy")
             || q.contains("gen")
+            || q.contains("notif")
+            || q.contains("status")
         {
             self.active_tab = SettingsTab::General;
         } else if q.contains("migr")
@@ -1194,6 +1196,20 @@ impl SettingsView {
     pub fn toggle_contrast_correction(&mut self, cx: &mut Context<Self>) {
         self.contrast_correction = !self.contrast_correction;
         self.config.contrast_correction = self.contrast_correction;
+        self.save_config();
+        crate::config::increment_config_version();
+        cx.notify();
+    }
+
+    pub fn toggle_notify_on_ai_status(&mut self, cx: &mut Context<Self>) {
+        self.config.notify_on_ai_status = !self.config.notify_on_ai_status;
+        self.save_config();
+        crate::config::increment_config_version();
+        cx.notify();
+    }
+
+    pub fn toggle_notify_on_program_status(&mut self, cx: &mut Context<Self>) {
+        self.config.notify_on_program_status = !self.config.notify_on_program_status;
         self.save_config();
         crate::config::increment_config_version();
         cx.notify();
@@ -2620,6 +2636,37 @@ impl SettingsView {
                                     theme,
                                 )
                             }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(render_section_header("Notifications", theme))
+                    .child(
+                        render_group_card(theme)
+                            .child(render_card_row(
+                                "AI Status",
+                                None::<&str>,
+                                div()
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                        this.toggle_notify_on_ai_status(cx);
+                                    }))
+                                    .child(render_toggle_switch(self.config.notify_on_ai_status, theme)),
+                                false,
+                                theme,
+                            ))
+                            .child(render_card_row(
+                                "Program Status",
+                                None::<&str>,
+                                div()
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                        this.toggle_notify_on_program_status(cx);
+                                    }))
+                                    .child(render_toggle_switch(self.config.notify_on_program_status, theme)),
+                                true,
+                                theme,
+                            )),
                     ),
             )
             .child(

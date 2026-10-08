@@ -3,6 +3,27 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.20.0 - 2026-10-08
+
+### Program status
+
+- Add OSC 7501 support for program state, progress, and requests for input in terminal panes.
+- Show program status in panes and tabs. Keep completion and error indicators until the user views the pane.
+- Add native notifications for background program completion, errors, and requests for input.
+- Validate reports, limit stored records, and group status updates before the interface reads them.
+- Add a program status guide with shell examples.
+
+### AI notifications
+
+- Show a completion label and unread response indicators when an AI turn ends.
+- Add native notifications for AI completion, errors, and permission requests when the conversation panel is not visible.
+- Add AI Status and Program Status controls in General settings. Limit notification frequency.
+
+### File references
+
+- Support nested paths in the AI panel's `@` file menu. Type `@src/` to list a folder's contents.
+- Search an explicit directory even when the workspace index omits it.
+
 ## 0.19.0 - 2026-10-07
 
 ### ACP agents

@@ -19,10 +19,31 @@ pub const MAX_RESULTS: usize = 50;
 
 /// Directory names the index never offers or descends into.
 const SKIPPED_DIRS: &[&str] = &[
-    ".git", ".hg", ".svn", "node_modules", "target", "dist", "build", "out",
-    "vendor", ".venv", "venv", "__pycache__", ".cache", "coverage", ".next",
-    ".turbo", ".parcel-cache", "DerivedData", "Pods", ".build", ".idea",
-    ".gradle", ".dart_tool", "site-packages", ".terraform",
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "vendor",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".cache",
+    "coverage",
+    ".next",
+    ".turbo",
+    ".parcel-cache",
+    "DerivedData",
+    "Pods",
+    ".build",
+    ".idea",
+    ".gradle",
+    ".dart_tool",
+    "site-packages",
+    ".terraform",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,19 +67,20 @@ impl FileEntry {
 pub fn build_index(root: &Path) -> Vec<FileEntry> {
     let mut index = Vec::new();
     let deadline = Instant::now() + TIME_BUDGET;
+    let mut scanned = 0;
     // (directory, relative prefix below root, depth below root)
     let mut stack: Vec<(PathBuf, String, usize)> = vec![(root.to_path_buf(), String::new(), 0)];
     while let Some((dir, prefix, depth)) = stack.pop() {
-        if index.len() >= MAX_ENTRIES || Instant::now() > deadline || depth > MAX_DEPTH {
+        if scanned >= MAX_ENTRIES || Instant::now() >= deadline {
+            break;
+        }
+        if depth > MAX_DEPTH {
             continue;
         }
-        let Ok(read) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut children: Vec<_> = read.flatten().collect();
+        let mut children = read_children(&dir, deadline, &mut scanned);
         children.sort_by_key(|e| e.file_name());
         for entry in children {
-            if index.len() >= MAX_ENTRIES {
+            if index.len() >= MAX_ENTRIES || Instant::now() >= deadline {
                 break;
             }
             let Ok(file_type) = entry.file_type() else {
@@ -77,10 +99,30 @@ pub fn build_index(root: &Path) -> Vec<FileEntry> {
             if is_dir {
                 stack.push((entry.path(), rel.clone(), depth + 1));
             }
-            index.push(FileEntry { rel_path: rel, is_dir });
+            index.push(FileEntry {
+                rel_path: rel,
+                is_dir,
+            });
         }
     }
     index
+}
+
+fn read_children(dir: &Path, deadline: Instant, scanned: &mut usize) -> Vec<std::fs::DirEntry> {
+    let Ok(mut entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut children = Vec::new();
+    while *scanned < MAX_ENTRIES && Instant::now() < deadline {
+        let Some(entry) = entries.next() else {
+            break;
+        };
+        *scanned += 1;
+        if let Ok(entry) = entry {
+            children.push(entry);
+        }
+    }
+    children
 }
 
 /// Ranks `index` against `query` and returns at most `limit` entries.
@@ -98,13 +140,70 @@ pub fn search<'a>(index: &'a [FileEntry], query: &str, limit: usize) -> Vec<&'a 
         .filter_map(|e| score_match(&e.rel_path.to_lowercase(), &q).map(|s| (s, e)))
         .collect();
     scored.sort_by(|a, b| {
-        b.0
-            .cmp(&a.0)
+        b.0.cmp(&a.0)
             .then(a.1.rel_path.len().cmp(&b.1.rel_path.len()))
             .then(a.1.rel_path.cmp(&b.1.rel_path))
     });
     scored.truncate(limit);
     scored.into_iter().map(|(_, e)| e).collect()
+}
+
+/// Searches from `root`, reading an explicitly named directory on demand.
+///
+/// The background-style index has a time cap and can omit deep folders in a
+/// large workspace. A typed path gives us a precise directory to read, so use
+/// that directory directly before falling back to the bounded index.
+pub fn search_from_root(root: &Path, query: &str, limit: usize) -> Vec<FileEntry> {
+    let normalized = query.trim().replace('\\', "/");
+    let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+    if let Some(slash) = normalized.rfind('/') {
+        let directory = &normalized[..slash];
+        let leaf_query = &normalized[slash + 1..];
+        let directory_path = Path::new(directory);
+        let safe_relative = directory_path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)));
+        let full_directory = root.join(directory_path);
+        if safe_relative && full_directory.is_dir() {
+            let deadline = Instant::now() + TIME_BUDGET;
+            let mut scanned = 0;
+            let mut children = Vec::new();
+            for entry in read_children(&full_directory, deadline, &mut scanned) {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_symlink() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let is_dir = file_type.is_dir();
+                if is_dir && (name.starts_with('.') || SKIPPED_DIRS.contains(&name.as_str())) {
+                    continue;
+                }
+                children.push(FileEntry {
+                    rel_path: name,
+                    is_dir,
+                });
+            }
+            children.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+            return search(&children, leaf_query, limit)
+                .into_iter()
+                .map(|entry| FileEntry {
+                    rel_path: format!("{directory}/{}", entry.rel_path),
+                    is_dir: entry.is_dir,
+                })
+                .collect();
+        }
+    }
+
+    let index = build_index(root);
+    search(&index, normalized, limit)
+        .into_iter()
+        .cloned()
+        .collect()
 }
 
 /// Subsequence score for a lowercased path against lowercased query chars.
@@ -127,7 +226,8 @@ fn score_match(lower_path: &str, query: &[char]) -> Option<i64> {
             Some(_) => 2,
             None => 3,
         };
-        let at_segment_start = i == 0 || matches!(prev_char, Some('/') | Some('_') | Some('-') | Some('.'));
+        let at_segment_start =
+            i == 0 || matches!(prev_char, Some('/') | Some('_') | Some('-') | Some('.'));
         if at_segment_start {
             score += 6;
         }
@@ -150,7 +250,10 @@ mod tests {
     use super::*;
 
     fn entry(path: &str, is_dir: bool) -> FileEntry {
-        FileEntry { rel_path: path.to_string(), is_dir }
+        FileEntry {
+            rel_path: path.to_string(),
+            is_dir,
+        }
     }
 
     #[test]

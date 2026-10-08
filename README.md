@@ -67,6 +67,8 @@ Then visit `http://localhost:8765` in your browser. The embedded WebAssembly eng
 
 See [docs/daemon-protocol.md](docs/daemon-protocol.md) for the complete JSON IPC protocol specification.
 
+See [Report program status](docs/program-status.md) for OSC 7501 and native notification settings.
+
 ---
 
 ## Installation
@@ -169,6 +171,8 @@ scrollback = 1000
 session_restore = true
 copy_on_select = false
 notify_on_command_finish = true
+notify_on_ai_status = true
+notify_on_program_status = true
 
 [font]
 family = "monospace"

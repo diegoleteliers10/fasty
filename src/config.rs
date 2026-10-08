@@ -290,6 +290,10 @@ pub struct Config {
     pub opacity: f32,
     #[serde(default = "default_notify_on_command_finish")]
     pub notify_on_command_finish: bool,
+    #[serde(default = "default_notify_on_ai_status")]
+    pub notify_on_ai_status: bool,
+    #[serde(default = "default_notify_on_program_status")]
+    pub notify_on_program_status: bool,
     #[serde(default)]
     pub bottombar: BottombarConfig,
     #[serde(default)]
@@ -468,6 +472,8 @@ fn default_font_ligatures() -> bool { true }
 fn default_session_restore() -> bool { true }
 fn default_opacity() -> f32 { 1.0 }
 fn default_notify_on_command_finish() -> bool { true }
+fn default_notify_on_ai_status() -> bool { true }
+fn default_notify_on_program_status() -> bool { true }
 fn default_option_as_meta() -> bool { false }
 
 fn default_contrast_correction() -> bool { true }
@@ -490,6 +496,8 @@ impl Default for Config {
             clipboard_read: default_clipboard_read(),
             opacity: default_opacity(),
             notify_on_command_finish: default_notify_on_command_finish(),
+            notify_on_ai_status: default_notify_on_ai_status(),
+            notify_on_program_status: default_notify_on_program_status(),
             bottombar: BottombarConfig::default(),
             cursor: CursorConfig::default(),
             tab_layout: TabLayout::default(),
@@ -591,6 +599,8 @@ fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
     doc["contrast_correction"] = value(c.contrast_correction);
     doc["clipboard_read"] = value(c.clipboard_read);
     doc["notify_on_command_finish"] = value(c.notify_on_command_finish);
+    doc["notify_on_ai_status"] = value(c.notify_on_ai_status);
+    doc["notify_on_program_status"] = value(c.notify_on_program_status);
     let tab_layout_str = match c.tab_layout {
         TabLayout::Horizontal => "horizontal",
         TabLayout::Vertical => "vertical",
@@ -821,6 +831,14 @@ fn parse_lenient_from_doc(doc: &DocumentMut) -> Option<Config> {
     }
     if let Some(val) = doc.get("notify_on_command_finish").and_then(|v| v.as_bool()) {
         cfg.notify_on_command_finish = val;
+        any_recognized = true;
+    }
+    if let Some(val) = doc.get("notify_on_ai_status").and_then(|v| v.as_bool()) {
+        cfg.notify_on_ai_status = val;
+        any_recognized = true;
+    }
+    if let Some(val) = doc.get("notify_on_program_status").and_then(|v| v.as_bool()) {
+        cfg.notify_on_program_status = val;
         any_recognized = true;
     }
     if let Some(val) = doc.get("option_as_meta").and_then(|v| v.as_bool()) {
@@ -1166,6 +1184,8 @@ mod tests {
             clipboard_read: false,
             opacity: 0.95,
             notify_on_command_finish: true,
+            notify_on_ai_status: true,
+            notify_on_program_status: true,
             bottombar: BottombarConfig::default(),
             cursor: CursorConfig {
                 shape: CursorShapeConfig::Beam,

@@ -139,6 +139,7 @@ pub struct AiSidebar {
     pub streaming_text: String,
     pub streaming_thinking: String,
     pub is_streaming: bool,
+    pub turn_completed: bool,
     pub is_focused: bool,
     pub pending_confirmation: Option<AiUiPendingConfirmation>,
     pub input_text: String,
@@ -202,6 +203,11 @@ pub struct AiSidebar {
 }
 
 impl AiSidebar {
+    pub fn turn_completed(mut self, completed: bool) -> Self {
+        self.turn_completed = completed;
+        self
+    }
+
     pub fn new(
         theme: Theme,
         width: f32,
@@ -219,6 +225,7 @@ impl AiSidebar {
             streaming_text: String::new(),
             streaming_thinking: String::new(),
             is_streaming: false,
+            turn_completed: false,
             is_focused: true,
             pending_confirmation: None,
             input_text: String::new(),
@@ -2986,6 +2993,19 @@ impl RenderOnce for AiSidebar {
                     .relative()
                     .p(px(12.))
                     .pt(px(6.))
+                    .when(self.turn_completed && !self.is_streaming, |composer| {
+                        composer.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .pb(px(6.))
+                                .text_size(px(11.))
+                                .text_color(theme.accent)
+                                .child(crate::ui::icons::render_icon(IconType::Check, theme.accent, 12.0))
+                                .child("Turn complete"),
+                        )
+                    })
                     .child(
                         // Composer Inset Box
                         div()

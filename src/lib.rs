@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod pane_tree;
 pub mod parser;
 pub mod paste;
+pub mod program_status;
 pub mod paths;
 pub mod selection_classifier;
 pub mod session;

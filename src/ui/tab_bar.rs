@@ -4,6 +4,49 @@ use gpui::{
 };
 use crate::config::TabLayout;
 use super::theme::Theme;
+use crate::program_status::{BlockedKind, ProgramRecord, ProgramState};
+
+pub(crate) fn program_status_text(record: &ProgramRecord) -> &'static str {
+    match record.state {
+        ProgramState::Idle => "Idle",
+        ProgramState::Working => "Working",
+        ProgramState::Done => "Done",
+        ProgramState::Error => "Failed",
+        ProgramState::Blocked => match record.kind {
+            Some(BlockedKind::Permission) => "Permission required",
+            Some(BlockedKind::Question) => "Answer required",
+            Some(BlockedKind::Auth) => "Sign-in required",
+            None => "Waiting for input",
+        },
+    }
+}
+
+pub(crate) fn render_program_status(record: &ProgramRecord, theme: Theme, size: f32) -> gpui::Div {
+    if record.state == ProgramState::Working {
+        return div().flex().items_center().flex_shrink_0()
+            .child(super::icons::render_spinner(theme.accent, size, "program-working"));
+    }
+    let (icon, color) = match record.state {
+        ProgramState::Idle => (icons::common::IconType::Clock, theme.muted),
+        ProgramState::Working => (icons::common::IconType::Loader, theme.accent),
+        ProgramState::Done => (icons::common::IconType::Check, theme.green),
+        ProgramState::Blocked => (icons::common::IconType::Clock, theme.yellow),
+        ProgramState::Error => (icons::common::IconType::X, theme.red),
+    };
+    div().flex().items_center().flex_shrink_0()
+        .child(super::icons::render_icon(icon, color, size))
+}
+fn render_ai_response_badge(theme: Theme) -> gpui::Div {
+    div()
+        .absolute()
+        .top(px(1.))
+        .right(px(1.))
+        .w(px(6.))
+        .h(px(6.))
+        .rounded_full()
+        .bg(theme.accent)
+}
+
 pub type TabCallback = Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>;
 pub type TabContextCallback = Box<dyn Fn(&(usize, f32, f32), &mut Window, &mut App) + 'static>;
 pub type ClickCallback = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
@@ -16,6 +59,8 @@ pub struct TabItem {
     pub title: String,
     pub active: bool,
     pub is_dirty: bool,
+    pub ai_response_unread: bool,
+    pub program_status: Option<ProgramRecord>,
     pub process_name: Option<String>,
 }
 
@@ -37,6 +82,7 @@ pub struct TabBar {
     is_update_ready: bool,
     on_update: Option<MouseDownCallback>,
     ai_sidebar_open: bool,
+    ai_response_unread: bool,
     on_toggle_ai: Option<MouseDownCallback>,
     tab_scroll_handle: ScrollHandle,
 }
@@ -60,6 +106,7 @@ impl TabBar {
             is_update_ready: false,
             on_update: None,
             ai_sidebar_open: false,
+            ai_response_unread: false,
             on_toggle_ai: None,
             tab_scroll_handle,
         }
@@ -149,6 +196,11 @@ impl TabBar {
 
     pub fn ai_sidebar_open(mut self, open: bool) -> Self {
         self.ai_sidebar_open = open;
+        self
+    }
+
+    pub fn ai_response_unread(mut self, unread: bool) -> Self {
+        self.ai_response_unread = unread;
         self
     }
 
@@ -260,6 +312,7 @@ impl RenderOnce for TabBar {
                         .child(
                             div()
                                 .id("fastty-ai-btn")
+                                .relative()
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -269,6 +322,9 @@ impl RenderOnce for TabBar {
                                 .cursor(CursorStyle::PointingHand)
                                 .hover(move |s| s.bg(btn_hover_bg))
                                 .when(self.ai_sidebar_open, |s| s.bg(theme.selected))
+                                .when(self.ai_response_unread, |button| {
+                                    button.child(render_ai_response_badge(theme))
+                                })
                                 .on_mouse_down(MouseButton::Left, {
                                     let on_toggle_ai = on_toggle_ai.clone();
                                     move |ev, window, cx| {
@@ -406,6 +462,7 @@ impl RenderOnce for TabBar {
                         .child(
                             div()
                                 .id("win-ai-btn")
+                                .relative()
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -414,6 +471,9 @@ impl RenderOnce for TabBar {
                                 .cursor(CursorStyle::PointingHand)
                                 .hover(move |s| s.bg(btn_hover_bg))
                                 .when(self.ai_sidebar_open, |s| s.bg(theme.selected))
+                                .when(self.ai_response_unread, |button| {
+                                    button.child(render_ai_response_badge(theme))
+                                })
                                 .on_mouse_down(MouseButton::Left, {
                                     let on_toggle_ai = on_toggle_ai.clone();
                                     move |ev, window, cx| {
@@ -677,6 +737,12 @@ impl RenderOnce for TabSidebar {
                                             .overflow_hidden()
                                             .flex_1()
                                             .child(super::icons::render_icon(deck_icon, icon_color, 12.0))
+                                            .when_some(tab.program_status.clone(), |row, record| {
+                                                row.child(render_program_status(&record, theme, 12.0))
+                                            })
+                                            .when(tab.ai_response_unread, |row| {
+                                                row.child(div().w(px(6.)).h(px(6.)).flex_shrink_0().rounded_full().bg(theme.accent))
+                                            })
                                             .child(
                                                 div()
                                                     .flex_1()
@@ -801,6 +867,12 @@ fn render_tab_strip(
                         .overflow_hidden()
                         .flex_1()
                         .child(super::icons::render_icon(deck_icon, icon_color, 11.0))
+                        .when_some(tab.program_status.clone(), |row, record| {
+                            row.child(render_program_status(&record, theme, 11.0))
+                        })
+                        .when(tab.ai_response_unread, |row| {
+                            row.child(div().w(px(6.)).h(px(6.)).flex_shrink_0().rounded_full().bg(theme.accent))
+                        })
                         .child(
                             div()
                                 .flex_1()

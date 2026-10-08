@@ -17,12 +17,26 @@ use crate::config::{self, Config, TabLayout};
 use crate::event_listener::EventSender;
 use crate::git::GitStatus;
 use crate::pane_tree::{Direction, PaneId, PaneNode, PaneTree, SplitDirection, TerminalPane};
+use crate::program_status::{ProgramRecord, ProgramState};
 use crate::terminal_state::{AppEvent, TerminalState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
     pub start: alacritty_terminal::index::Point,
     pub end: alacritty_terminal::index::Point,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AiTurnCompletion {
+    Read,
+    Unread,
+}
+
+#[derive(Default)]
+pub struct ProgramPaneStatus {
+    records: Vec<ProgramRecord>,
+    unread: bool,
+    last_notification: Option<std::time::Instant>,
 }
 
 pub struct TabData {
@@ -1196,10 +1210,14 @@ pub(crate) fn available_system_fonts() -> Vec<String> {
 
 pub fn send_system_notification(title: &str, body: &str) {
     let summary = if title.is_empty() { "Fastty" } else { title };
+    #[cfg(target_os = "linux")]
+    let notification_body = body.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    #[cfg(not(target_os = "linux"))]
+    let notification_body = body.to_owned();
     let res = notify_rust::Notification::new()
         .appname("Fastty")
         .summary(summary)
-        .body(body)
+        .body(&notification_body)
         .show();
 
     if res.is_err() {
@@ -2118,6 +2136,9 @@ pub struct RootView {
     pub ai_streaming_text: String,
     pub ai_streaming_thinking: String,
     pub ai_is_streaming: bool,
+    pub ai_turn_completions: std::collections::HashMap<String, AiTurnCompletion>,
+    pub program_statuses: std::collections::HashMap<PaneId, ProgramPaneStatus>,
+    pub ai_last_notification: Option<std::time::Instant>,
     pub ai_last_usage: Option<(u64, u64)>,
     pub ai_current_turn_usage: (u64, u64),
     pub ai_context_hovercard_open: bool,
@@ -2522,6 +2543,9 @@ impl RootView {
             ai_streaming_text: String::new(),
             ai_streaming_thinking: String::new(),
             ai_is_streaming: false,
+            ai_turn_completions: std::collections::HashMap::new(),
+            program_statuses: std::collections::HashMap::new(),
+            ai_last_notification: None,
             ai_last_usage: None,
             ai_current_turn_usage: (0, 0),
             ai_context_hovercard_open: false,
@@ -2989,6 +3013,9 @@ impl RootView {
                         }
                         cx.notify();
                     }
+                    AppEvent::ProgramStatusChanged { source_id } => {
+                        this.refresh_program_status(source_id, _window, cx);
+                    }
                     AppEvent::Notification { title, body } => {
                         send_system_notification(&title, &body);
                     }
@@ -3151,6 +3178,9 @@ impl RootView {
                 }
                 cx.notify();
             }
+        }
+        if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+            self.acknowledge_program_status(tab.pane_tree.active_pane_id);
         }
     }
 
@@ -3626,6 +3656,9 @@ impl RootView {
                         }
                         cx.notify();
                     }
+                    AppEvent::ProgramStatusChanged { source_id } => {
+                        this.refresh_program_status(source_id, _window, cx);
+                    }
                     AppEvent::Notification { title, body } => {
                         send_system_notification(&title, &body);
                     }
@@ -3792,7 +3825,11 @@ impl RootView {
     }
 
     fn activate_tab_index(&mut self, idx: usize) {
-        if idx == self.active_tab_idx || idx >= self.tabs.len() {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.acknowledge_program_status(self.tabs[idx].pane_tree.active_pane_id);
+        if idx == self.active_tab_idx {
             return;
         }
         if self.ai_is_streaming {
@@ -3888,6 +3925,10 @@ impl RootView {
                 self.save_active_ai_conversation();
             }
             let removed_conversation_id = self.tabs[idx].ai_conversation_id.clone();
+            let removed_tab_key = &self.tabs[idx].ai_tab_key;
+            self.ai_turn_completions.retain(|id, _| {
+                !self.ai_chat_records.iter().any(|record| record.id == *id && record.tab_key == *removed_tab_key)
+            });
             self.ai_opencode_manager.remove(&removed_conversation_id);
             let removed = self.tabs.remove(idx);
             for pane in removed.pane_tree.all_panes() {
@@ -5009,6 +5050,96 @@ impl RootView {
         cx.notify();
     }
 
+    fn ai_response_is_visible(&self, window: &Window) -> bool {
+        self.ai_sidebar_open
+            && window.is_window_active()
+            && !self.is_settings_open
+            && !self.is_update_modal_open
+            && !self.is_whats_new_open
+            && !self.is_tab_overview_open
+    }
+
+    fn notify_ai_status(&mut self, window: &Window, title: &str) {
+        if !self.config.notify_on_ai_status || self.ai_response_is_visible(window) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.ai_last_notification.is_some_and(|last| now.duration_since(last).as_secs() < 5) {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active_tab_idx) else { return };
+        let body = format!("{}: {}", tab.custom_title.as_deref().unwrap_or(&tab.title), self.config.ai.default);
+        self.ai_last_notification = Some(now);
+        let title = title.to_owned();
+        std::thread::spawn(move || send_system_notification(&title, &body));
+    }
+
+    fn refresh_program_status(&mut self, source_id: u64, window: &Window, cx: &mut Context<Self>) {
+        let source = self.tabs.iter().flat_map(|tab| tab.pane_tree.all_panes())
+            .find_map(|pane| pane.terminal.as_ref()
+                .filter(|terminal| terminal.source_id() == source_id)
+                .map(|terminal| (pane.id, terminal.program_status())));
+        if let Some((pane_id, records)) = source {
+            self.update_program_status(pane_id, records, window, cx);
+        }
+    }
+
+    fn update_program_status(
+        &mut self,
+        pane_id: PaneId,
+        records: Vec<ProgramRecord>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.pane_tree.find_pane(pane_id).is_some()) else {
+            return;
+        };
+        let source = format!("{} / pane {}", tab.custom_title.as_deref().unwrap_or(&tab.title), pane_id);
+        let foreground = window.is_window_active()
+            && !self.any_input_overlay_open()
+            && self.tabs.get(self.active_tab_idx).is_some_and(|tab| tab.pane_tree.active_pane_id == pane_id);
+        let status = self.program_statuses.entry(pane_id).or_default();
+        let changed_attention: Vec<ProgramRecord> = records.iter().filter(|record| {
+            matches!(record.state, ProgramState::Done | ProgramState::Blocked | ProgramState::Error)
+                && !status.records.iter().any(|previous| {
+                    previous.id == record.id && previous.state == record.state && previous.kind == record.kind
+                })
+        }).cloned().collect();
+        let has_attention = records.iter().any(|record| {
+            matches!(record.state, ProgramState::Done | ProgramState::Blocked | ProgramState::Error)
+        });
+        status.unread = has_attention && (status.unread || !changed_attention.is_empty());
+        status.records = records;
+        let now = std::time::Instant::now();
+        if self.config.notify_on_program_status && !foreground
+            && status.last_notification.is_none_or(|last| now.duration_since(last).as_secs() >= 5)
+        {
+            if let Some(record) = crate::program_status::aggregate(&changed_attention) {
+                let title = format!("Fastty: {}", super::tab_bar::program_status_text(record));
+                let message = record.msg.as_deref().or(record.title.as_deref()).unwrap_or("");
+                let body = format!("{}: {} {}", source, record.app.as_deref().unwrap_or("Program"), message);
+                status.last_notification = Some(now);
+                std::thread::spawn(move || send_system_notification(&title, &body));
+            }
+        }
+        cx.notify();
+    }
+
+    fn visible_program_record(&self, pane_id: PaneId) -> Option<&ProgramRecord> {
+        let status = self.program_statuses.get(&pane_id)?;
+        status.records.iter().filter(|record| match record.state {
+            ProgramState::Idle => false,
+            ProgramState::Done | ProgramState::Error => status.unread,
+            ProgramState::Working | ProgramState::Blocked => true,
+        }).max_by_key(|record| record.state.priority())
+    }
+
+    fn acknowledge_program_status(&mut self, pane_id: PaneId) {
+        if let Some(status) = self.program_statuses.get_mut(&pane_id) {
+            status.unread = false;
+        }
+    }
+
     /// 160ms ease-out-cubic open/close animation, same as the tabs sidebar.
     pub fn trigger_ai_sidebar_animation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let target = if self.ai_sidebar_open { 1.0f32 } else { 0.0f32 };
@@ -5085,41 +5216,14 @@ impl RootView {
             .and_then(|t| t.cwd.as_ref().map(|p| p.to_string_lossy().to_string()))
             .unwrap_or_else(|| "~".to_string());
 
-        let mut all_files = Vec::new();
-        if let Ok(repo) = git2::Repository::discover(&active_cwd) {
-            if let Ok(index) = repo.index() {
-                for entry in index.iter() {
-                    if let Ok(s) = std::str::from_utf8(&entry.path) {
-                        all_files.push(s.to_string());
-                    }
-                }
-            }
-        }
-        if all_files.is_empty() {
-            if let Ok(entries) = std::fs::read_dir(&active_cwd) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if let Ok(rel) = p.strip_prefix(&active_cwd) {
-                        all_files.push(rel.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
-        all_files.sort();
-
-        let q = query.to_lowercase();
-        if q.is_empty() {
-            self.ai_at_matches = all_files
-                .into_iter()
-                .take(crate::ui::ai_sidebar::AI_AT_MENU_MAX_ROWS)
-                .collect();
-        } else {
-            self.ai_at_matches = all_files
-                .into_iter()
-                .filter(|f| f.to_lowercase().contains(&q))
-                .take(crate::ui::ai_sidebar::AI_AT_MENU_MAX_ROWS)
-                .collect();
-        }
+        self.ai_at_matches = crate::file_search::search_from_root(
+            std::path::Path::new(&active_cwd),
+            query,
+            crate::ui::ai_sidebar::AI_AT_MENU_MAX_ROWS,
+        )
+        .into_iter()
+        .map(|entry| entry.rel_path)
+        .collect();
         // The list just changed under the selection. Typing filters it, so an
         // index from before can point past the end.
         self.ai_at_selected = 0;
@@ -5465,6 +5569,9 @@ impl RootView {
         self.ai_cancel_token = Some(cancel_tok.clone());
         let stream_generation = self.ai_stream_generation;
         self.ai_is_streaming = true;
+        if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+            self.ai_turn_completions.remove(&tab.ai_conversation_id);
+        }
         self.ai_streaming_text.clear();
         self.ai_streaming_thinking.clear();
         self.ai_pending_text.clear();
@@ -5671,6 +5778,7 @@ impl RootView {
                             options: Vec::new(),
                         });
                     this.ai_confirm_reply_tx = Some(reply_tx);
+                    this.notify_ai_status(_window, "Fastty AI: Permission required");
                     this.ai_opencode_confirm_reply_tx = None;
                     // The confirmation card renders at the end of the message
                     // list; bring it into view so the user sees the diff.
@@ -5703,6 +5811,7 @@ impl RootView {
                     });
                     this.ai_confirm_reply_tx = None;
                     this.ai_opencode_confirm_reply_tx = Some(reply_tx);
+                    this.notify_ai_status(_window, "Fastty AI: Permission required");
                     this.ai_scroll_handle.scroll_to_bottom();
                     cx.notify();
                 });
@@ -5902,6 +6011,15 @@ impl RootView {
                             }
                             this.ai_is_streaming = false;
                             this.ai_cancel_token = None;
+                            this.ai_turn_completions.insert(
+                                stream_conversation_id.clone(),
+                                if this.ai_response_is_visible(_window) {
+                                    AiTurnCompletion::Read
+                                } else {
+                                    AiTurnCompletion::Unread
+                                },
+                            );
+                            this.notify_ai_status(_window, "Fastty AI: Turn complete");
                             this.save_active_ai_conversation();
                         }
                         crate::ai::AgentEvent::Usage { input, output } => {
@@ -5948,6 +6066,7 @@ impl RootView {
                             }
 
                             this.ai_messages.push(ai_error_message(&err));
+                            this.notify_ai_status(_window, "Fastty AI: Turn failed");
                             this.ai_is_streaming = false;
                             this.ai_cancel_token = None;
                             this.save_active_ai_conversation();
@@ -6056,6 +6175,7 @@ impl RootView {
             cx.notify();
         }))
         .messages(self.ai_messages.clone())
+        .turn_completed(self.ai_turn_completions.contains_key(active_conversation_id))
         .streaming(
             self.ai_is_streaming,
             self.ai_streaming_text.clone(),
@@ -6184,6 +6304,7 @@ impl RootView {
                 }
             }
             this.ai_opencode_manager.remove(conversation_id);
+            this.ai_turn_completions.remove(conversation_id);
             this.ai_chat_records.retain(|record| record.id != *conversation_id);
             let _ = crate::ai::conversations::save(&this.ai_chat_records);
             this.persist_session();
@@ -6266,6 +6387,7 @@ impl RootView {
             let conversation_id = this.tabs.get(this.active_tab_idx)
                 .map(|tab| tab.ai_conversation_id.clone());
             if let Some(conversation_id) = conversation_id {
+                this.ai_turn_completions.remove(&conversation_id);
                 this.ai_opencode_manager.remove(&conversation_id);
                 if let Some(record) = this.ai_chat_records.iter_mut().find(|record| record.id == conversation_id) {
                     record.title = "New chat".to_string();
@@ -6854,6 +6976,12 @@ impl RootView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.any_input_overlay_open() && !self.ai_keys_own_input() {
+            if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                self.acknowledge_program_status(tab.pane_tree.active_pane_id);
+                cx.notify();
+            }
+        }
         let key = &event.keystroke.key;
         let key_lower = key.to_lowercase();
         let modifiers = &event.keystroke.modifiers;
@@ -10141,6 +10269,33 @@ impl RootView {
                     None
                 };
 
+                let program_badge = self.visible_program_record(pane_id).map(|record| {
+                    let mut label = format!("{}: {}",
+                        record.app.as_deref().or(record.title.as_deref()).unwrap_or("Program"),
+                        super::tab_bar::program_status_text(record));
+                    if let Some(progress) = record.progress {
+                        label.push_str(&format!(" {progress}%"));
+                    }
+                    if let Some(message) = record.msg.as_deref().filter(|message| !message.is_empty()) {
+                        label.push_str(&format!(" · {message}"));
+                    }
+                    div().id(("program-status", pane_id))
+                        .absolute().bottom(px(4.)).right(px(20.))
+                        .flex().items_center().gap(px(5.))
+                        .max_w(px(260.)).px(px(7.)).py(px(4.))
+                        .rounded(px(5.)).bg(theme.surface_raised)
+                        .border_1().border_color(theme.border)
+                        .text_size(px(11.)).text_color(theme.foreground)
+                        .overflow_hidden()
+                        .child(super::tab_bar::render_program_status(record, theme, 12.0))
+                        .child(div().min_w(px(0.)).truncate().child(SharedString::from(label)))
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                            this.acknowledge_program_status(pane_id);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }))
+                });
+
                 div()
                     .size_full()
                     .relative()
@@ -10154,6 +10309,7 @@ impl RootView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _ev, _window, cx| {
+                            this.acknowledge_program_status(pane_id);
                             if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
                                 tab.pane_tree.active_pane_id = pane_id;
                                 if let Some(p) = tab.pane_tree.active_pane() {
@@ -10195,6 +10351,7 @@ impl RootView {
                     )
                     .when_some(grid_el, |d, el| d.child(el))
                     .when_some(pane_scrollbar_thumb, |d, thumb| d.child(thumb))
+                    .when_some(program_badge, |d, badge| d.child(badge))
             }
             PaneNode::Split {
                 direction,
@@ -10351,6 +10508,29 @@ impl RootView {
 impl Render for RootView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        let mut live_panes = std::collections::HashSet::new();
+        for tab in &self.tabs {
+            for pane in tab.pane_tree.all_panes() {
+                live_panes.insert(pane.id);
+                if !self.program_statuses.contains_key(&pane.id) {
+                    if let Some(terminal) = pane.terminal.as_ref() {
+                        let records = terminal.program_status();
+                        let unread = records.iter().any(|record| {
+                            matches!(record.state, ProgramState::Done | ProgramState::Blocked | ProgramState::Error)
+                        });
+                        self.program_statuses.insert(pane.id, ProgramPaneStatus { records, unread, last_notification: None });
+                    }
+                }
+            }
+        }
+        self.program_statuses.retain(|id, _| live_panes.contains(id));
+        if self.ai_response_is_visible(_window) {
+            if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                if let Some(completion) = self.ai_turn_completions.get_mut(&tab.ai_conversation_id) {
+                    *completion = AiTurnCompletion::Read;
+                }
+            }
+        }
 
         // F5: the picker fetched for another cwd: close rather than act on
         // stale data (e.g. tab switched by mouse while open).
@@ -10384,6 +10564,11 @@ impl Render for RootView {
                     id: tab.id,
                     title,
                     active: idx == self.active_tab_idx,
+                    ai_response_unread: self.ai_turn_completions.get(&tab.ai_conversation_id) == Some(&AiTurnCompletion::Unread),
+                    program_status: tab.pane_tree.all_panes().into_iter()
+                        .filter_map(|pane| self.visible_program_record(pane.id))
+                        .max_by_key(|record| record.state.priority())
+                        .cloned(),
                     is_dirty: tab
                         .git_status
                         .as_ref()
@@ -10580,6 +10765,9 @@ impl Render for RootView {
                         this.toggle_tab_sidebar(window, cx);
                     }))
                     .ai_sidebar_open(self.ai_sidebar_open)
+                    .ai_response_unread(self.tabs.iter().any(|tab| {
+                        self.ai_turn_completions.get(&tab.ai_conversation_id) == Some(&AiTurnCompletion::Unread)
+                    }))
                     .on_toggle_ai(cx.listener(|this, _ev, window, cx| {
                         this.toggle_ai_sidebar(window, cx);
                     }))
