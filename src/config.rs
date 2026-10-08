@@ -633,6 +633,7 @@ fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
         font["size"] = value(c.font.size as f64);
         font["weight"] = value(c.font.weight as f64);
         font["ligatures"] = value(c.font.ligatures);
+        font["monospace_only"] = value(c.font.monospace_only);
     }
     ensure_table(doc, "cursor");
     if let Some(cursor) = doc["cursor"].as_table_mut() {
@@ -881,6 +882,10 @@ fn parse_lenient_from_doc(doc: &DocumentMut) -> Option<Config> {
         }
         if let Some(lig) = tbl.get("ligatures").and_then(|v| v.as_bool()) {
             cfg.font.ligatures = lig;
+            any_recognized = true;
+        }
+        if let Some(monospace_only) = tbl.get("monospace_only").and_then(|v| v.as_bool()) {
+            cfg.font.monospace_only = monospace_only;
             any_recognized = true;
         }
     }
@@ -1180,7 +1185,7 @@ mod tests {
                 size: 15.0,
                 weight: 500.0,
                 ligatures: true,
-                monospace_only: true,
+                monospace_only: false,
             },
             shell: Some("/bin/zsh".to_string()),
             scrollback: 5000,
@@ -1210,11 +1215,15 @@ mod tests {
 
         let serialized = config_to_toml_string(&cfg);
         let deserialized: Config = toml_edit::de::from_str(&serialized).unwrap();
+        let lenient_doc = serialized.parse::<DocumentMut>().unwrap();
+        let lenient_deserialized = parse_lenient_from_doc(&lenient_doc).unwrap();
 
         assert_eq!(deserialized.font.family, "Fira Code");
         assert_eq!(deserialized.font.size, 15.0);
         assert_eq!(deserialized.font.weight, 500.0);
         assert_eq!(deserialized.font.ligatures, true);
+        assert!(!deserialized.font.monospace_only);
+        assert!(!lenient_deserialized.font.monospace_only);
         assert_eq!(deserialized.shell.as_deref(), Some("/bin/zsh"));
         assert_eq!(deserialized.scrollback, 5000);
         assert_eq!(deserialized.theme.as_deref(), Some("tokyo-night"));

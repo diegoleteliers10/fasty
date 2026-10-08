@@ -74,6 +74,8 @@ impl CelebrationParticle {
 /// subprocess elsewhere), so it runs once per process on a background
 /// thread and every settings window reuses the result.
 static SYSTEM_FONTS_CACHE: Mutex<Option<Vec<String>>> = Mutex::new(None);
+#[cfg(target_os = "macos")]
+static MONOSPACE_FONTS_CACHE: Mutex<Option<Vec<String>>> = Mutex::new(None);
 
 /// Union of the text-system families and the OS-level list, deduped
 /// case-insensitively and sorted.
@@ -295,6 +297,8 @@ impl SettingsView {
         // opening slowly or freezing on Windows. Until background discovery
         // lands, the combobox shows only the configured family.
         let cached_fonts = SYSTEM_FONTS_CACHE.lock().clone();
+        #[cfg(target_os = "macos")]
+        let cached_monospace_fonts = MONOSPACE_FONTS_CACHE.lock().clone();
         let fonts_cached = cached_fonts.is_some();
         let monospace_fonts_only = loaded_config.font.monospace_only;
         let font_ligatures = loaded_config.font.ligatures;
@@ -302,7 +306,7 @@ impl SettingsView {
             #[cfg(target_os = "macos")]
             {
                 if monospace_fonts_only {
-                    crate::font_discovery_macos::filter_monospace(list)
+                    cached_monospace_fonts.unwrap_or_default()
                 } else {
                     list
                 }
@@ -457,27 +461,43 @@ impl SettingsView {
 
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(os_fonts) = rx.recv().await {
-                let _ = this.update_in(cx, |this, _window, cx| {
-                    if SYSTEM_FONTS_CACHE.lock().is_some() {
-                        return;
-                    }
+                let _ = this.update_in(cx, |_this, _window, cx| {
                     let merged = merge_font_lists(cx.text_system().all_font_names(), os_fonts);
                     // Cache the unfiltered list so toggling back to "all fonts"
                     // is instant instead of re-running discovery.
-                    *SYSTEM_FONTS_CACHE.lock() = Some(merged.clone());
-                    let shown = if this.monospace_fonts_only {
-                        #[cfg(target_os = "macos")]
-                        {
-                            crate::font_discovery_macos::filter_monospace(merged)
-                        }
-                        #[cfg(not(target_os = "macos"))]
-                        {
-                            merged.clone()
-                        }
-                    } else {
-                        merged.clone()
-                    };
-                    this.system_fonts = pin_family_first(shown, &this.font_family);
+                    #[cfg(target_os = "macos")]
+                    {
+                        let (tx, rx) = async_channel::bounded::<Vec<String>>(1);
+                        let all_fonts = merged.clone();
+                        std::thread::Builder::new()
+                            .name("fastty-monospace-font-filter".into())
+                            .spawn(move || {
+                                let filtered = crate::font_discovery_macos::filter_monospace(merged);
+                                *MONOSPACE_FONTS_CACHE.lock() = Some(filtered.clone());
+                                *SYSTEM_FONTS_CACHE.lock() = Some(all_fonts);
+                                let _ = tx.send_blocking(filtered);
+                            })
+                            .ok();
+                        cx.spawn(async move |this, cx| {
+                            if let Ok(filtered) = rx.recv().await {
+                                let _ = this.update(cx, |this, cx| {
+                                    let shown = if this.monospace_fonts_only {
+                                        filtered
+                                    } else {
+                                        SYSTEM_FONTS_CACHE.lock().clone().unwrap_or_default()
+                                    };
+                                    this.system_fonts = pin_family_first(shown, &this.font_family);
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        .detach();
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        *SYSTEM_FONTS_CACHE.lock() = Some(merged.clone());
+                        this.system_fonts = pin_family_first(merged, &this.font_family);
+                    }
                     cx.notify();
                 });
             }
@@ -568,8 +588,21 @@ impl SettingsView {
         self.update_channel = crate::updater::UpdateChannel::parse(&cfg.update_channel).as_str().to_string();
         self.tab_layout = cfg.tab_layout;
         self.font_size = cfg.font.size;
+        self.font_ligatures = cfg.font.ligatures;
+        self.monospace_fonts_only = cfg.font.monospace_only;
         if !cfg.font.family.is_empty() && cfg.font.family != "monospace" {
             self.font_family = cfg.font.family.clone();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let fonts = if self.monospace_fonts_only {
+                MONOSPACE_FONTS_CACHE.lock().clone()
+            } else {
+                SYSTEM_FONTS_CACHE.lock().clone()
+            };
+            if let Some(fonts) = fonts {
+                self.system_fonts = pin_family_first(fonts, &self.font_family);
+            }
         }
         self.keybinding_preset = cfg.keybinding_preset.unwrap_or_default();
         self.ai_permission_mode = cfg.ai.permission_mode;
@@ -1228,13 +1261,14 @@ impl SettingsView {
         // Refilter the cached enumeration rather than rediscovering fonts.
         #[cfg(target_os = "macos")]
         {
-            let shown = match SYSTEM_FONTS_CACHE.lock().clone() {
-                Some(list) if self.monospace_fonts_only => {
-                    crate::font_discovery_macos::filter_monospace(list)
-                }
-                other => other.unwrap_or_default(),
+            let shown = if self.monospace_fonts_only {
+                MONOSPACE_FONTS_CACHE.lock().clone()
+            } else {
+                SYSTEM_FONTS_CACHE.lock().clone()
             };
-            self.system_fonts = pin_family_first(shown, &self.font_family);
+            if let Some(shown) = shown {
+                self.system_fonts = pin_family_first(shown, &self.font_family);
+            }
         }
         cx.notify();
     }
@@ -3167,17 +3201,19 @@ impl SettingsView {
                                 false,
                                 theme,
                             ))
-                            .child(render_card_row(
-                                "Monospace Fonts Only",
-                                Some("Show only fonts whose characters share one cell width"),
-                                div()
-                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                        this.toggle_monospace_fonts_only(cx);
-                                    }))
-                                    .child(render_toggle_switch(self.monospace_fonts_only, theme)),
-                                false,
-                                theme,
-                            ))
+                            .when(cfg!(target_os = "macos"), |this| {
+                                this.child(render_card_row(
+                                    "Monospace Fonts Only",
+                                    Some("Show only fonts whose characters share one cell width"),
+                                    div()
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                            this.toggle_monospace_fonts_only(cx);
+                                        }))
+                                        .child(render_toggle_switch(self.monospace_fonts_only, theme)),
+                                    false,
+                                    theme,
+                                ))
+                            })
                             .child(
                                 div()
                                     .p(px(16.))

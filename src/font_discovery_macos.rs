@@ -144,17 +144,18 @@ fn glyph_advance(family: &str, ch: char) -> Option<f64> {
     (advance.width > 0.0).then_some(advance.width)
 }
 
-/// Whether every glyph in `family` occupies the same horizontal space.
-///
-/// Compares `i`, the narrowest common letter, against `W`, the widest. Equal
-/// advances mean a single cell width describes the whole font, which is what a
-/// terminal grid requires. The probe is deliberately coarse: a proportional
-/// font differs by several pixels between these two, far beyond rounding.
+/// Whether common ASCII glyphs in `family` share one advance width.
 pub fn is_monospace(family: &str) -> bool {
-    match (glyph_advance(family, 'i'), glyph_advance(family, 'W')) {
-        (Some(narrow), Some(wide)) => (wide - narrow).abs() < 0.01,
-        _ => false,
-    }
+    let advances = ['i', 'W', 'm', '0', '@', '.']
+        .into_iter()
+        .map(|ch| glyph_advance(family, ch));
+    let Some(advances) = advances.collect::<Option<Vec<_>>>() else {
+        return false;
+    };
+    let Some(first) = advances.first() else {
+        return false;
+    };
+    advances.iter().all(|advance| (advance - first).abs() < 0.01)
 }
 
 /// Memoised `is_monospace`. Each probe hits CoreText and the system exposes
@@ -165,12 +166,11 @@ pub fn is_monospace_cached(family: &str) -> bool {
 
     static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&cached) = cache.get(family) {
+    if let Some(cached) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(family).copied() {
         return cached;
     }
     let verdict = is_monospace(family);
-    cache.insert(family.to_string(), verdict);
+    cache.lock().unwrap_or_else(|e| e.into_inner()).insert(family.to_string(), verdict);
     verdict
 }
 
@@ -362,12 +362,8 @@ mod mono_tests {
 
     #[test]
     fn a_proportional_family_is_rejected() {
-        // The corruption this guards: a proportional font was measurable, so it
-        // was offered as a choice and produced overlapping glyphs on the grid.
-        let w = glyph_advance("Menlo", 'W').expect("Menlo must shape");
-        let i = glyph_advance("Menlo", 'i').expect("Menlo must shape");
-        assert!((w - i).abs() < 0.01, "Menlo must report equal advances");
-        assert!(w > 0.0);
+        // Arial ships with macOS and uses proportional ASCII advances.
+        assert!(!is_monospace("Arial"), "Arial must not pass the terminal font filter");
     }
 
     #[test]
@@ -393,6 +389,10 @@ mod mono_tests {
         assert!(
             list.iter().all(|f| is_monospace_cached(f)),
             "every returned family must be monospace"
+        );
+        assert!(
+            !list.iter().any(|f| f.eq_ignore_ascii_case("Arial")),
+            "the proportional Arial family must not appear"
         );
     }
 
