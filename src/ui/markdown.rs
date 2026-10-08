@@ -468,10 +468,16 @@ fn parse_segments(segments: &[(String, usize)]) -> Vec<MarkdownBlock> {
         // GFM pipe tables. The delimiter row is the discriminator, so a lone
         // pipe row stays a paragraph -- which is what an agent emits mid-stream
         // before the delimiter token arrives.
-        if let Some(aligns) = table_delimiter_at(segments, i) {
-            let width = aligns.len();
+        if let Some(mut aligns) = table_delimiter_at(segments, i) {
             let (header_src, header_text) =
                 SrcLine { raw: segments[i].0.clone(), start: segments[i].1 }.trim_info();
+            // The header defines the column count. Agents often emit a delimiter
+            // row whose cell count disagrees with the header, and trusting the
+            // delimiter either appends a phantom empty column or silently drops
+            // columns that held data. Alignment is still read from it.
+            let width = split_row_located(&header_text, header_src).len();
+            aligns.truncate(width);
+            aligns.resize(width, TableAlign::Left);
             let header = parse_row_cells(&header_text, header_src, width);
             i += 2;
             let mut rows = Vec::new();
@@ -1102,10 +1108,6 @@ fn src_range_to_rendered(map: &[usize], s: usize, e: usize) -> Option<(usize, us
     }
 }
 
-/// Narrowest a table column may get before its cell starts wrapping. Keeps a
-/// short "Yes/No" column from collapsing to a single character.
-const TABLE_MIN_CELL_W: f32 = 44.0;
-
 /// One visual table row: a flex line of equally weighted cells. `is_header`
 /// bolds the text; `is_last` suppresses the row's bottom rule so the outer
 /// border is not doubled up.
@@ -1131,7 +1133,11 @@ fn render_table_row(
     for (ci, cell) in cells.iter().enumerate() {
         let mut column = div()
             .flex_grow(ratios.get(ci).copied().unwrap_or(1.0))
-            .min_w(px(TABLE_MIN_CELL_W))
+            // No pixel floor: a flat minimum reserved equal width for every
+            // column, so a one-character index column wasted as much space as
+            // a prose column and squeezed the rest into mid-word breaks. The
+            // flex ratio alone already divides the available width.
+            .min_w(px(0.))
             .px_2()
             .py_1()
             .flex()
@@ -2328,6 +2334,61 @@ mod tests {
         };
         assert_eq!(rows[0][0], text_cell("✅", 22));
         assert_eq!(src.chars().nth(22), Some('✅'));
+    }
+
+    #[std::prelude::v1::test]
+    fn test_delimiter_wider_than_header_does_not_add_empty_column() {
+        // Agents routinely emit a delimiter row with a different cell count to
+        // the header. The header defines the columns; taking the count from the
+        // delimiter instead would append a phantom empty column and a border to
+        // match, which is what a screenshot of the panel showed.
+        let blocks = parse_markdown("| # | Aspect | Rust |\n|---|---|---|---|\n| 1 | Typing | fast |");
+        let MarkdownBlock::Table { header, rows, aligns, .. } = &blocks[0] else {
+            panic!("expected Table, got {:?}", blocks[0]);
+        };
+        assert_eq!(header.len(), 3, "header decides the column count");
+        assert_eq!(rows[0].len(), 3, "body follows the header, not the delimiter");
+        assert_eq!(aligns.len(), 3);
+    }
+
+    #[std::prelude::v1::test]
+    fn test_delimiter_narrower_than_header_keeps_all_header_columns() {
+        let blocks = parse_markdown("| a | b | c |\n|---|\n| 1 | 2 | 3 |");
+        let MarkdownBlock::Table { header, rows, aligns, .. } = &blocks[0] else {
+            panic!("expected Table, got {:?}", blocks[0]);
+        };
+        assert_eq!(header.len(), 3, "a short delimiter row must not truncate columns");
+        assert_eq!(rows[0].len(), 3);
+        // Columns the delimiter said nothing about fall back to left.
+        assert_eq!(*aligns, vec![TableAlign::Left, TableAlign::Left, TableAlign::Left]);
+    }
+
+    #[std::prelude::v1::test]
+    fn test_delimiter_alignment_survives_width_mismatch() {
+        // Alignment is still read from the delimiter even when the widths differ.
+        let blocks = parse_markdown("| a | b | c |\n|:---|---:|---|\n| 1 | 2 | 3 |");
+        let MarkdownBlock::Table { aligns, .. } = &blocks[0] else {
+            panic!("expected Table, got {:?}", blocks[0]);
+        };
+        assert_eq!(*aligns, vec![TableAlign::Left, TableAlign::Right, TableAlign::Left]);
+    }
+
+    #[std::prelude::v1::test]
+    fn test_realistic_agent_table_with_numbered_column() {
+        // Captured from the agent panel: an indexed comparison table where the
+        // delimiter row carried one cell too many.
+        let src = "| # | Aspect | Rust | Python |\n|---|---|---|---|\n| 1 | Typing | Statically typed | Dynamically typed |\n| 2 | Execution | Compiled to binary | Interpreted |";
+        let blocks = parse_markdown(src);
+        assert_eq!(blocks.len(), 1);
+        let MarkdownBlock::Table { header, rows, aligns, .. } = &blocks[0] else {
+            panic!("expected Table, got {:?}", blocks[0]);
+        };
+        assert_eq!(header.len(), 4);
+        assert_eq!(rows.len(), 2);
+        for r in rows {
+            assert_eq!(r.len(), 4);
+        }
+        assert_eq!(aligns.len(), 4);
     }
 
     #[std::prelude::v1::test]
