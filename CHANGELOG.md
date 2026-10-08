@@ -3,6 +3,14 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.21.3 - 2026-10-08
+
+### Fonts
+
+- Apply the Ligatures setting to terminal text.
+- Use an installed font when the selected font is missing.
+- Add a macOS-only monospace font filter and save its setting.
+
 ## 0.21.2 - 2026-10-08
 
 ### Agent and program status
