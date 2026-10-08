@@ -63,6 +63,10 @@ pub struct TerminalGridElement {
     pub display_offset: usize,
     /// F3: Nerd Font fallback for PUA icon spans. `None` keeps OS cascade.
     pub nerd_font_family: Option<gpui::SharedString>,
+    /// Whether to request ligature substitution for terminal text. Features
+    /// travel on the `Font` that each `TextRun` carries, not on the
+    /// surrounding styled element, so they must be set on `normal_font` below.
+    pub ligatures: bool,
 }
 
 impl IntoElement for TerminalGridElement {
@@ -124,7 +128,12 @@ impl Element for TerminalGridElement {
     ) {
         let origin = bounds.origin;
         let emoji_font = gpui::font(self.font_family.clone());
-        let normal_font = gpui::font(self.font_family.clone());
+        let mut normal_font = gpui::font(self.font_family.clone());
+        // The grid paints through explicit TextRuns, so ligature features have
+        // to live on the run's font. Setting them on the wrapping styled element
+        // has no effect on this path, which is why the setting appeared to do
+        // nothing. Emoji and kbd runs deliberately keep default features.
+        normal_font.features = crate::ui::root_view::terminal_ligatures(self.ligatures);
         // F3: explicit Nerd Font for icon spans when one is installed;
         // `None` falls back to `normal_font` (today's behavior).
         let nerd_font: Option<gpui::Font> = self
