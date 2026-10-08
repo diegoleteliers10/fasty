@@ -4100,6 +4100,11 @@ impl RootView {
             if self.tabs.is_empty() {
                 self.ai_messages.clear();
                 self.create_tab(window, cx);
+                // Sync the loaded id so the removed conversation is not
+                // re-inserted as a ghost runtime on the next load call.
+                if let Some(tab) = self.tabs.first() {
+                    self.ai_loaded_conversation_id = tab.ai_conversation_id.clone();
+                }
             } else if was_active {
                 self.active_tab_idx = idx.min(self.tabs.len() - 1);
                 let active_id = self.tabs[self.active_tab_idx].ai_conversation_id.clone();
