@@ -735,38 +735,107 @@ pub fn current_time_str() -> String {
     format!("{}:{:02} {}", h12, mins, ampm)
 }
 
-struct ParsedToolRow {
-    icon_type: IconType,
-    action: &'static str,
-    target: String,
-    status_text: String,
-    is_running: bool,
-    is_error: bool,
+pub(crate) struct ParsedToolRow {
+    pub(crate) icon_type: IconType,
+    pub(crate) action: String,
+    pub(crate) target: String,
+    pub(crate) status_text: String,
+    pub(crate) is_running: bool,
+    pub(crate) is_error: bool,
 }
 
-fn parse_tool_row(tc: &AiUiToolCall) -> ParsedToolRow {
-    let (icon_type, action) = match tc.name.as_str() {
-        "run_command" => (IconType::Terminal, "Run"),
-        "search" | "list_dir" => (IconType::Search, "Search"),
-        "read_file" => (IconType::FileCode, "Read"),
-        "edit_file" => (IconType::Pencil, "Edit"),
-        _ => (IconType::Sparkles, "Tool"),
+/// Argument keys worth showing as the row's subject, most specific first.
+/// Agents that host their own tools send their own key names, so a closed list
+/// of fastty's own keys left every such call falling back to raw JSON.
+pub(crate) const TOOL_SUBJECT_KEYS: [&str; 12] = [
+    "command", "file_path", "filePath", "path", "pattern", "query", "url", "glob",
+    "description", "title", "prompt", "content",
+];
+
+/// Picks the most informative argument as the row's subject, or `None` when the
+/// arguments carry nothing worth singling out.
+pub(crate) fn tool_subject(args: &str) -> Option<String> {
+    let val = serde_json::from_str::<serde_json::Value>(args).ok()?;
+    let obj = val.as_object()?;
+    for key in TOOL_SUBJECT_KEYS {
+        if let Some(text) = obj.get(key).and_then(|v| v.as_str()) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    // Nothing recognisable: summarise as `key: value` pairs rather than
+    // printing the raw JSON blob, which is what made these rows unreadable.
+    let pairs: Vec<String> = obj
+        .iter()
+        .filter_map(|(k, v)| {
+            let rendered = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let rendered = rendered.trim().replace('\n', " ");
+            (!rendered.is_empty()).then(|| format!("{k}: {rendered}"))
+        })
+        .collect();
+    (!pairs.is_empty()).then(|| pairs.join(" · "))
+}
+
+/// Turns an arbitrary tool name into a readable label.
+///
+/// The previous table only recognised fastty's own four tools, so every call
+/// from a hosted agent (`bash`, `grep`, `read`, `glob`, or a server-supplied
+/// title) collapsed to the literal word "Tool".
+pub(crate) fn tool_label(name: &str) -> (IconType, Option<&'static str>) {
+    let known = match name {
+        "run_command" | "bash" | "shell" => (IconType::Terminal, "Bash"),
+        "search" | "list_dir" | "glob" | "grep" => (IconType::Search, "Search"),
+        "read_file" | "read" => (IconType::FileCode, "Read"),
+        "edit_file" | "edit" | "write" => (IconType::Pencil, "Edit"),
+        _ => (IconType::Sparkles, ""),
+    };
+    (known.0, Some(known.1).filter(|s| !s.is_empty()))
+}
+
+/// `exa_web_search` -> `Exa Web Search`, `todowrite` -> `Todowrite`.
+pub(crate) fn humanize_tool_name(name: &str) -> String {
+    let cleaned = name.replace(['_', '-'], " ");
+    let words: Vec<String> = cleaned
+        .split_whitespace()
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        return "Tool".to_string();
+    }
+    words.join(" ")
+}
+
+pub(crate) fn parse_tool_row(tc: &AiUiToolCall) -> ParsedToolRow {
+    // A few agents put the whole shell invocation in the tool name rather than
+    // in `command`; treat that as the subject instead of labelling it.
+    let name_is_command = tc.name.contains(' ') && tool_subject(&tc.args).is_none();
+    let (icon_type, action) = if name_is_command {
+        (IconType::Terminal, "Bash".to_string())
+    } else {
+        let (icon, known_label) = tool_label(&tc.name);
+        (
+            icon,
+            known_label
+                .map(str::to_string)
+                .unwrap_or_else(|| humanize_tool_name(&tc.name)),
+        )
     };
 
-    let raw_target = if let Ok(val) = serde_json::from_str::<serde_json::Value>(&tc.args) {
-        if let Some(cmd) = val.get("command").and_then(|v| v.as_str()) {
-            cmd.to_string()
-        } else if let Some(path) = val.get("path").and_then(|v| v.as_str()) {
-            path.to_string()
-        } else if let Some(pattern) = val.get("pattern").and_then(|v| v.as_str()) {
-            pattern.to_string()
-        } else if let Some(query) = val.get("query").and_then(|v| v.as_str()) {
-            query.to_string()
-        } else {
-            tc.args.clone()
-        }
+    let raw_target = if name_is_command {
+        tc.name.clone()
     } else {
-        tc.args.clone()
+        tool_subject(&tc.args).unwrap_or_default()
     };
 
     let cleaned_target = raw_target.replace('\n', " ");
@@ -2712,7 +2781,7 @@ impl RenderOnce for AiSidebar {
                                                                     .text_size(px(12.))
                                                                     .text_color(theme.muted_strong)
                                                                     .flex_shrink_0()
-                                                                    .child(info.action),
+                                                                    .child(SharedString::from(info.action)),
                                                             )
                                                             .child(
                                                                 div()
@@ -3643,8 +3712,8 @@ impl RenderOnce for AiSidebar {
                         pct: context_pct,
                     },
                     &theme,
-                    on_file_drop.clone(),
-                ))
+on_file_drop.clone(),
+                    ))
             })
     }
 }

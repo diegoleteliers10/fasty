@@ -17002,4 +17002,90 @@ mod ligature_tests {
         }
         assert_ne!(on.0, off.0, "the toggle must change what is requested");
     }
+
+    // ---- Tool-call rows for hosted agents -------------------------------
+    //
+    // The agent's tools are its own (`bash`, `read`, `grep`, `glob`), not
+    // fastty's. The row builder used to recognise only fastty's four tools and
+    // fell back to the literal label "Tool" plus the raw JSON arguments, which
+    // rendered as `Tool {"cwd":"/Users/kagesyntax/Do...`.
+    mod hosted_agent_tool_rows {
+    use crate::ui::ai_sidebar::{
+        humanize_tool_name, parse_tool_row, tool_label, tool_subject, AiUiToolCall,
+    };
+
+    fn tool_row(name: &str, args: &str) -> crate::ui::ai_sidebar::ParsedToolRow {
+        parse_tool_row(&AiUiToolCall {
+            id: "t1".to_string(),
+            name: name.to_string(),
+            args: args.to_string(),
+            output: None,
+            is_error: false,
+            is_running: false,
+            diff: None,
+        })
+    }
+
+    #[test]
+    fn tool_subject_prefers_command_and_reads_agent_keys() {
+        assert_eq!(
+            tool_subject(r#"{"path":"/a","command":"ls -la"}"#).unwrap(),
+            "ls -la"
+        );
+        assert_eq!(tool_subject(r#"{"file_path":"a.rs"}"#).unwrap(), "a.rs");
+        assert_eq!(tool_subject(r#"{"filePath":"b.rs"}"#).unwrap(), "b.rs");
+        assert_eq!(
+            tool_subject(r#"{"url":"https://x.dev"}"#).unwrap(),
+            "https://x.dev"
+        );
+    }
+
+    #[test]
+    fn tool_subject_never_falls_back_to_raw_json() {
+        let got = tool_subject(r#"{"cwd":"/Users/kagesyntax/Documents"}"#).unwrap();
+        assert_eq!(got, "cwd: /Users/kagesyntax/Documents");
+        assert!(!got.contains('{'), "must not leak raw JSON: {got}");
+        assert_eq!(tool_subject("{}"), None);
+        assert_eq!(tool_subject("not json"), None);
+    }
+
+    #[test]
+    fn tool_labels_cover_hosted_agent_tools() {
+        assert_eq!(tool_label("bash").1, Some("Bash"));
+        assert_eq!(tool_label("grep").1, Some("Search"));
+        assert_eq!(tool_label("read").1, Some("Read"));
+        assert_eq!(tool_label("exa_web_search").1, None);
+        assert_eq!(humanize_tool_name("exa_web_search"), "Exa Web Search");
+    }
+
+    #[test]
+    fn bash_call_with_cwd_renders_readable_row() {
+        // Short argument: shown verbatim.
+        assert_eq!(tool_row("bash", r#"{"cwd":"/tmp"}"#).target, "cwd: /tmp");
+        // Long argument: truncated on purpose, but still never raw JSON.
+        let long = tool_row("bash", r#"{"cwd":"/Users/kagesyntax/Documents"}"#);
+        assert_eq!(long.action, "Bash");
+        assert!(
+            long.target.starts_with("cwd: /Users/kagesyntax"),
+            "got: {}",
+            long.target
+        );
+        assert!(long.target.ends_with("..."), "got: {}", long.target);
+        assert!(!long.target.starts_with('{'), "got: {}", long.target);
+    }
+
+    #[test]
+    fn unknown_tool_uses_humanized_name() {
+        let got = tool_row("exa_web_search", r#"{"query":"rust gpu"}"#);
+        assert_eq!(got.action, "Exa Web Search");
+        assert_eq!(got.target, "rust gpu");
+    }
+
+    #[test]
+    fn command_in_tool_name_is_treated_as_subject() {
+        let got = tool_row("ls ~/Documents | wc -l", "{}");
+        assert_eq!(got.action, "Bash");
+        assert!(got.target.contains("wc -l"), "got: {}", got.target);
+    }
+    }
 }
