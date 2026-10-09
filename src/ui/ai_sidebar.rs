@@ -968,6 +968,37 @@ fn clamp_detail(text: &str, max_lines: usize) -> String {
     )
 }
 
+/// Inserts zero-width spaces so long unbreakable tokens — file paths, JSON
+/// keys, URLs — can wrap instead of running past the panel's edge.
+///
+/// The style layer here has no `overflow-wrap`, and `whitespace_nowrap` is what
+/// let the text escape horizontally in the first place. Zero-width spaces give
+/// the line breaker somewhere to break without changing what is displayed.
+pub(crate) fn soft_wrap(text: &str) -> String {
+    const BREAK_AFTER: [char; 12] = ['/', '\\', '-', '_', ',', ';', ':', '.', '=', '&', '|', '>'];
+    /// Longest unbroken run left without a break opportunity.
+    const MAX_RUN: usize = 24;
+
+    let mut out = String::with_capacity(text.len() + text.len() / 8);
+    let mut run = 0usize;
+    for c in text.chars() {
+        out.push(c);
+        if BREAK_AFTER.contains(&c) {
+            out.push('\u{200B}');
+            run = 0;
+        } else if c.is_alphanumeric() {
+            run += 1;
+            if run == MAX_RUN {
+                out.push('\u{200B}');
+                run = 0;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    out
+}
+
 /// The expanded panel under a tool row: the arguments it was called with and
 /// what it returned. This is the only record of what a tool actually did.
 fn render_tool_detail(tc: &AiUiToolCall, theme: &Theme) -> impl IntoElement {
@@ -979,10 +1010,11 @@ fn render_tool_detail(tc: &AiUiToolCall, theme: &Theme) -> impl IntoElement {
     };
     let body = |text: &str, color: Hsla| {
         div()
+            .w_full()
+            .min_w(px(0.))
             .text_size(px(11.))
             .text_color(color)
-            .whitespace_nowrap()
-            .child(SharedString::from(clamp_detail(text, 40)))
+            .child(SharedString::from(soft_wrap(&clamp_detail(text, 40))))
     };
 
     let mut sections: Vec<gpui::AnyElement> = Vec::new();

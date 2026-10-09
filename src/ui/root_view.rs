@@ -17118,6 +17118,23 @@ mod ligature_tests {
     }
 
     #[test]
+    fn soft_wrap_adds_break_points_without_changing_text() {
+        use crate::ui::ai_sidebar::soft_wrap;
+        // A long path gets break opportunities but reads identically.
+        let path = "/Users/kagesyntax/Documents/window/src/main.rs";
+        let wrapped = soft_wrap(path);
+        assert!(wrapped.contains('\u{200B}'), "expected break points: {wrapped:?}");
+        assert_eq!(wrapped.replace('\u{200B}', ""), path);
+        // Already-short text is left readable.
+        assert_eq!(soft_wrap("done"), "done");
+        // Very long unbroken tokens get a break too.
+        let blob = "a".repeat(40);
+        let wrapped = soft_wrap(&blob);
+        assert!(wrapped.contains('\u{200B}'));
+        assert_eq!(wrapped.replace('\u{200B}', ""), blob);
+    }
+
+    #[test]
     fn acp_content_envelope_is_unwrapped_for_display() {
         use crate::ui::ai_sidebar::extract_output_text;
         // ACP wraps output in content arrays; the text is what matters.
