@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   prepare:
@@ -362,6 +362,8 @@ jobs:
     name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v7
@@ -403,6 +405,9 @@ jobs:
     needs: [prepare, release]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
@@ -433,14 +438,35 @@ jobs:
           sed -i -E "s/intel:[[:space:]]+\"[a-f0-9]+\"/intel: \"${{ steps.sha.outputs.intel_sha }}\"/" Casks/fastty.rb
           cat Casks/fastty.rb
 
-      - name: Commit and Push Cask Update
+      - name: Open or update cask pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
         run: |
+          branch="automation/homebrew-cask-v${VERSION}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git switch --create "$branch"
           git add Casks/fastty.rb
           if git diff --cached --quiet; then
             echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: update Homebrew cask to v${VERSION}"
+          git push --force origin "HEAD:refs/heads/${branch}"
+
+          title="chore: update Homebrew cask to v${VERSION}"
+          body="Update the Homebrew cask to v${VERSION} with the checksums from the release DMGs."
+          existing_pr=$(gh pr list --repo "$REPOSITORY" --state all --base main --head "$branch" --json number,state --jq '.[0] // empty')
+
+          if [[ -n "$existing_pr" ]]; then
+            pr_number=$(jq -r '.number' <<< "$existing_pr")
+            pr_state=$(jq -r '.state' <<< "$existing_pr")
+            if [[ "$pr_state" == "CLOSED" ]]; then
+              gh pr reopen "$pr_number" --repo "$REPOSITORY"
+            fi
+            gh pr edit "$pr_number" --repo "$REPOSITORY" --title "$title" --body "$body"
           else
-            git commit -m "chore: update Homebrew cask to v${VERSION}"
-            git push origin HEAD:main
+            gh pr create --repo "$REPOSITORY" --base main --head "$branch" --title "$title" --body "$body"
           fi
