@@ -1816,17 +1816,64 @@ fn run_opencode_turn(
             }
             crate::ai::opencode::OpencodeEvent::ToolUpdate(update) => {
                 let id = update.get("toolCallId").and_then(serde_json::Value::as_str).unwrap_or("tool").to_string();
-                let name = update.get("title").and_then(serde_json::Value::as_str).unwrap_or("ACP tool").to_string();
-                let args = update.get("rawInput").map(|value| value.to_string()).unwrap_or_default();
+                // ACP `title` is prose ("Read src/main.rs"), not a tool identifier, so it
+                // used to be pushed in as the name and then treated as one long
+                // word by the label humaniser.
+                let title = update
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let kind = update
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let name = crate::ui::ai_sidebar::tool_name_from_title(title, kind);
+                // ACP streams arguments: the opening `tool_call` carries
+                // `status:"pending"` with empty `rawInput`, and the real values
+                // only arrive on later `tool_call_update`s. Reading it just once,
+                // on first sight, left every row without a subject.
+                let mut args = update
+                    .get("rawInput")
+                    .or_else(|| update.get("input"))
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                // `locations` is where OpenCode puts the file for read/edit/
+                // grep, and it is present even when the arguments are not.
+                if let Some(path) = update
+                    .get("locations")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|locations| locations.first())
+                    .and_then(|location| location.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if args.is_empty() {
+                        args = serde_json::json!({ "path": path }).to_string();
+                    } else if let Ok(serde_json::Value::Object(map)) =
+                        serde_json::from_str::<serde_json::Value>(&args)
+                    {
+                        let known = ["command", "file_path", "filePath", "path", "pattern", "query", "url", "glob"];
+                        if !known.iter().any(|key| map.contains_key(*key)) {
+                            let mut map = map;
+                            map.insert("path".to_string(), serde_json::Value::String(path.to_string()));
+                            args = serde_json::Value::Object(map).to_string();
+                        }
+                    }
+                }
                 if !active_tools.contains_key(&id) {
                     active_tools.insert(id.clone(), name.clone());
-                    let _ = event_tx.send_blocking(crate::ai::AgentEvent::ToolStart { id: id.clone(), name: name.clone(), args });
+                    let _ = event_tx.send_blocking(crate::ai::AgentEvent::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
+                } else if !args.is_empty() {
+                    // Arguments arrived after the row was created.
+                    let _ = event_tx.send_blocking(crate::ai::AgentEvent::ToolArgs { id: id.clone(), args: args.clone() });
                 }
                 let status = update.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
                 if status == "completed" || status == "failed" {
                     let output = update.get("content").map(|value| value.to_string()).unwrap_or_default();
                     let _ = event_tx.send_blocking(crate::ai::AgentEvent::ToolEnd {
                         id: id.clone(), name, output, is_error: status == "failed", diff: None,
+                        args: (!args.is_empty()).then_some(args),
                     });
                     active_tools.remove(&id);
                 }
@@ -1879,6 +1926,7 @@ fn end_opencode_tools(
             output: output.to_string(),
             is_error: true,
             diff: None,
+            args: None,
         });
     }
 }
@@ -2243,6 +2291,7 @@ pub struct RootView {
     pub ai_permission_checker: std::sync::Arc<crate::ai::PermissionChecker>,
     pub ai_agent_mode: String,
     pub ai_expanded_thinkings: std::collections::HashSet<usize>,
+    pub ai_expanded_tools: std::collections::HashSet<String>,
     pub ai_attached_files: Vec<std::path::PathBuf>,
     pub ai_at_menu_open: bool,
     pub ai_at_is_skill_menu: bool,
@@ -2672,6 +2721,7 @@ impl RootView {
             )),
             ai_agent_mode: "Agent".to_string(),
             ai_expanded_thinkings: std::collections::HashSet::new(),
+            ai_expanded_tools: std::collections::HashSet::new(),
             ai_attached_files: Vec::new(),
             ai_at_menu_open: false,
             ai_at_is_skill_menu: false,
@@ -6137,15 +6187,27 @@ impl RootView {
                                 }
                             }
                         }
+                        crate::ai::AgentEvent::ToolArgs { id, args } => {
+                            for m in this.ai_messages.iter_mut().rev() {
+                                if let Some(tc) = m.tool_calls.iter_mut().find(|c| c.id == id) {
+                                    tc.args = args;
+                                    break;
+                                }
+                            }
+                        }
                         crate::ai::AgentEvent::ToolEnd {
                             id,
                             output,
                             is_error,
                             diff,
+                            args,
                             ..
                         } => {
                             for m in this.ai_messages.iter_mut().rev() {
                                 if let Some(tc) = m.tool_calls.iter_mut().find(|c| c.id == id) {
+                                    if let Some(args) = args {
+                                        tc.args = args;
+                                    }
                                     tc.output = Some(output);
                                     tc.is_error = is_error;
                                     tc.is_running = false;
@@ -6402,6 +6464,15 @@ impl RootView {
         .opencode_variants(opencode_variants, opencode_variant)
         .opencode_variants_open(self.ai_opencode_variants_open)
         .expanded_thinkings(self.ai_expanded_thinkings.clone())
+        .expanded_tools(self.ai_expanded_tools.clone())
+        .on_toggle_tool(cx.listener(|this, target: &String, _window, cx| {
+            if this.ai_expanded_tools.contains(target) {
+                this.ai_expanded_tools.remove(target);
+            } else {
+                this.ai_expanded_tools.insert(target.clone());
+            }
+            cx.notify();
+        }))
         .cwd(active_cwd)
         .git_branch(active_branch)
         .context_pct(context_pct)
@@ -17001,5 +17072,190 @@ mod ligature_tests {
             assert_eq!(*off_val, 0, "{on_name} off");
         }
         assert_ne!(on.0, off.0, "the toggle must change what is requested");
+    }
+
+    // ---- Tool-call rows for hosted agents -------------------------------
+    //
+    // The agent's tools are its own (`bash`, `read`, `grep`, `glob`), not
+    // fastty's. The row builder used to recognise only fastty's four tools and
+    // fell back to the literal label "Tool" plus the raw JSON arguments, which
+    // rendered as `Tool {"cwd":"/Users/kagesyntax/Do...`.
+    mod hosted_agent_tool_rows {
+    use crate::ui::ai_sidebar::{
+        humanize_tool_name, parse_tool_row, tool_label, tool_name_from_title, tool_subject,
+        AiUiToolCall,
+    };
+
+    /// OpenCode's ACP layer emits `title: input.command ?? state.title ??
+    /// toolName` for bash, and `title: state.title || toolName` otherwise. So
+    /// the fallback is the raw tool name, usually lowercase.
+    /// OpenCode namespaces MCP tools as `<server>_<tool>`. Fastty's server is
+/// named "fastty" and its tools are already `fastty_*`, so the wire name is
+/// `fastty_fastty_split_pane`.
+#[test]
+    fn repeated_server_prefix_is_collapsed() {
+        assert_eq!(
+            humanize_tool_name("fastty_fastty_split_pane"),
+            "Split Pane"
+        );
+        assert_eq!(
+            humanize_tool_name("fastty_fastty_write_session"),
+            "Write Session"
+        );
+        // A single prefix is the normal shape and must be left alone.
+        assert_eq!(humanize_tool_name("fastty_layout"), "Fastty Layout");
+        assert_eq!(humanize_tool_name("exa_web_search"), "Exa Web Search");
+        assert_eq!(humanize_tool_name("todowrite"), "Todowrite");
+    }
+
+    #[test]
+    fn lowercase_bare_tool_names_are_names_not_prose() {
+        assert_eq!(tool_name_from_title("websearch", ""), "Websearch");
+        assert_eq!(tool_name_from_title("todowrite", ""), "Todowrite");
+        assert_eq!(tool_name_from_title("skill", ""), "Skill");
+        // A path-like token is not a tool name; `kind` decides instead.
+        assert_eq!(tool_name_from_title("src/main.rs", "read"), "Read");
+    }
+
+    #[test]
+    fn soft_wrap_adds_break_points_without_changing_text() {
+        use crate::ui::ai_sidebar::soft_wrap;
+        // A long path gets break opportunities but reads identically.
+        let path = "/Users/kagesyntax/Documents/window/src/main.rs";
+        let wrapped = soft_wrap(path);
+        assert!(wrapped.contains('\u{200B}'), "expected break points: {wrapped:?}");
+        assert_eq!(wrapped.replace('\u{200B}', ""), path);
+        // Already-short text is left readable.
+        assert_eq!(soft_wrap("done"), "done");
+        // Very long unbroken tokens get a break too.
+        let blob = "a".repeat(40);
+        let wrapped = soft_wrap(&blob);
+        assert!(wrapped.contains('\u{200B}'));
+        assert_eq!(wrapped.replace('\u{200B}', ""), blob);
+    }
+
+    #[test]
+    fn acp_content_envelope_is_unwrapped_for_display() {
+        use crate::ui::ai_sidebar::extract_output_text;
+        // ACP wraps output in content arrays; the text is what matters.
+        assert_eq!(
+            extract_output_text(r#"[{"type":"content","content":{"text":"hello"}}]"#),
+            "hello"
+        );
+        assert_eq!(extract_output_text(r#"{"output":"done"}"#), "done");
+        assert_eq!(extract_output_text(r#"{"error":"boom"}"#), r#"{"error":"boom"}"#);
+        assert_eq!(extract_output_text(""), "");
+    }
+
+    #[test]
+    fn args_are_pretty_printed_and_tolerated() {
+        use crate::ui::ai_sidebar::pretty_args;
+        let pretty = pretty_args(r#"{"path":"a.rs","limit":10}"#);
+        assert!(pretty.contains('\n'), "expected multi-line: {pretty}");
+        assert!(pretty.contains("\"path\": \"a.rs\""));
+        assert_eq!(pretty_args(""), "");
+        // Non-JSON input (a bare command string) must survive untouched.
+        assert_eq!(pretty_args("ls -la"), "ls -la");
+    }
+
+    #[test]
+    fn acp_prose_titles_yield_the_tool_not_the_sentence() {
+        assert_eq!(tool_name_from_title("Read src/main.rs", "read"), "Read");
+        assert_eq!(
+            tool_name_from_title("Fasty Fasty Run Command", ""),
+            "Fasty"
+        );
+        assert_eq!(tool_name_from_title("Webfetch", "fetch"), "Webfetch");
+        // No verb to lead with: fall back to the protocol's own `kind`.
+        assert_eq!(tool_name_from_title("src/main.rs", "read"), "Read");
+        assert_eq!(tool_name_from_title("", "execute"), "Bash");
+        assert_eq!(tool_name_from_title("", "fetch"), "Fetch");
+        assert_eq!(tool_name_from_title("", ""), "Tool");
+    }
+
+    #[test]
+    fn prose_subject_keeps_the_meaningful_tail() {
+        assert_eq!(
+            tool_subject(r#"{"title":"Read src/main.rs"}"#).unwrap(),
+            "src/main.rs"
+        );
+        assert_eq!(
+            tool_subject(r#"{"description":"Search the cargo registry"}"#).unwrap(),
+            "the cargo registry"
+        );
+        // Single-word titles have no tail, so keep them whole.
+        assert_eq!(tool_subject(r#"{"title":"Task"}"#).unwrap(), "Task");
+    }
+
+    fn tool_row(name: &str, args: &str) -> crate::ui::ai_sidebar::ParsedToolRow {
+        parse_tool_row(&AiUiToolCall {
+            id: "t1".to_string(),
+            name: name.to_string(),
+            args: args.to_string(),
+            output: None,
+            is_error: false,
+            is_running: false,
+            diff: None,
+        })
+    }
+
+    #[test]
+    fn tool_subject_prefers_command_and_reads_agent_keys() {
+        assert_eq!(
+            tool_subject(r#"{"path":"/a","command":"ls -la"}"#).unwrap(),
+            "ls -la"
+        );
+        assert_eq!(tool_subject(r#"{"file_path":"a.rs"}"#).unwrap(), "a.rs");
+        assert_eq!(tool_subject(r#"{"filePath":"b.rs"}"#).unwrap(), "b.rs");
+        assert_eq!(
+            tool_subject(r#"{"url":"https://x.dev"}"#).unwrap(),
+            "https://x.dev"
+        );
+    }
+
+    #[test]
+    fn tool_subject_never_falls_back_to_raw_json() {
+        // A working directory reads better as the bare path.
+        let got = tool_subject(r#"{"cwd":"/Users/kagesyntax/Documents"}"#).unwrap();
+        assert_eq!(got, "/Users/kagesyntax/Documents");
+        assert!(!got.contains('{'), "must not leak raw JSON: {got}");
+        // Unrecognised keys keep their name so the row stays explicable.
+        assert_eq!(tool_subject(r#"{"foo":"bar"}"#).unwrap(), "foo: bar");
+        assert_eq!(tool_subject("{}"), None);
+        assert_eq!(tool_subject("not json"), None);
+    }
+
+    #[test]
+    fn tool_labels_cover_hosted_agent_tools() {
+        assert_eq!(tool_label("bash").1, Some("Bash"));
+        assert_eq!(tool_label("grep").1, Some("Search"));
+        assert_eq!(tool_label("read").1, Some("Read"));
+        assert_eq!(tool_label("exa_web_search").1, None);
+        assert_eq!(humanize_tool_name("exa_web_search"), "Exa Web Search");
+    }
+
+    #[test]
+    fn bash_call_with_cwd_renders_readable_row() {
+        // No character clamp any more — the row ellipsises in CSS to whatever
+        // width the sidebar actually has.
+        let got = tool_row("bash", r#"{"cwd":"/Users/kagesyntax/Documents"}"#);
+        assert_eq!(got.action, "Bash");
+        assert_eq!(got.target, "/Users/kagesyntax/Documents");
+        assert!(!got.target.starts_with('{'), "got: {}", got.target);
+    }
+
+    #[test]
+    fn unknown_tool_uses_humanized_name() {
+        let got = tool_row("exa_web_search", r#"{"query":"rust gpu"}"#);
+        assert_eq!(got.action, "Exa Web Search");
+        assert_eq!(got.target, "rust gpu");
+    }
+
+    #[test]
+    fn command_in_tool_name_is_treated_as_subject() {
+        let got = tool_row("ls ~/Documents | wc -l", "{}");
+        assert_eq!(got.action, "Bash");
+        assert!(got.target.contains("wc -l"), "got: {}", got.target);
+    }
     }
 }

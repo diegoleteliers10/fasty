@@ -466,6 +466,7 @@ fn run_ask_command(mut args: impl Iterator<Item = String>) {
             println!();
         }
         fastty::ai::AgentEvent::Usage { .. } => {}
+        fastty::ai::AgentEvent::ToolArgs { .. } => {}
         fastty::ai::AgentEvent::ContextWindow { .. }
         | fastty::ai::AgentEvent::ConversationSession(_)
         | fastty::ai::AgentEvent::AvailableCommands(_) => {}

@@ -883,7 +883,20 @@ fn dispatch_update(transport: &Transport, update: Value) {
     let event = match kind {
         "agent_message_chunk" => OpencodeEvent::Text(text),
         "agent_thought_chunk" => OpencodeEvent::Thinking(text),
-        "tool_call" | "tool_call_update" => OpencodeEvent::ToolUpdate(update),
+        "tool_call" | "tool_call_update" => {
+            // FASTTY_DEBUG_TOOLS=1 dumps every raw tool update, which is the
+            // only reliable way to see which fields the agent actually sends.
+            if std::env::var_os("FASTTY_DEBUG_TOOLS").is_some() {
+                let path = crate::paths::get().state_dir.join("tool_calls.log");
+                if let Ok(mut file) =
+                    std::fs::OpenOptions::new().create(true).append(true).open(&path)
+                {
+                    use std::io::Write as _;
+                    let _ = writeln!(file, "{kind}\t{update}");
+                }
+            }
+            OpencodeEvent::ToolUpdate(update)
+        }
         "usage_update" => OpencodeEvent::UsageUpdate {
             used: update.get("used").and_then(Value::as_u64).unwrap_or(0),
             size: update.get("size").and_then(Value::as_u64).unwrap_or(0),

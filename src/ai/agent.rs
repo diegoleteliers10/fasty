@@ -23,6 +23,16 @@ pub enum AgentEvent {
         output: String,
         is_error: bool,
         diff: Option<crate::ai::diff::FileDiff>,
+        /// Arguments as last seen. ACP streams arguments across several
+        /// updates, so the ones seen at start are often empty; carrying them
+        /// here lets the row be filled in once the call is complete.
+        args: Option<String>,
+    },
+    /// Arguments for a call that was already on screen, arriving after its
+    /// opening (empty) update.
+    ToolArgs {
+        id: String,
+        args: String,
     },
     TurnEnd,
     Usage {
@@ -280,6 +290,7 @@ impl Agent {
                         name: tc.name.clone(),
                         output: err_msg.clone(),
                         is_error: true,
+                        args: None,
                         diff: None,
                     });
                     self.messages.push(Message::tool_result(tc.id, err_msg, true));
@@ -304,6 +315,7 @@ impl Agent {
                         name: tc.name.clone(),
                         output: deny_msg.clone(),
                         is_error: true,
+                        args: None,
                         diff: None,
                     });
                     self.messages.push(Message::tool_result(tc.id, deny_msg, true));
@@ -330,7 +342,8 @@ impl Agent {
                             name: tc.name.clone(),
                             output: err_msg.clone(),
                             is_error: true,
-                            diff: None,
+                            args: None,
+                        diff: None,
                         });
                         self.messages.push(Message::tool_result(tc.id, err_msg, true));
                         continue;
@@ -367,7 +380,8 @@ impl Agent {
                             name: tc.name.clone(),
                             output: msg.clone(),
                             is_error: true,
-                            diff: None,
+                            args: None,
+                        diff: None,
                         });
                         self.messages.push(Message::tool_result(tc.id, msg, true));
                         on_event(AgentEvent::TurnEnd);
@@ -383,7 +397,8 @@ impl Agent {
                     name: tc.name.clone(),
                     output: out.content.clone(),
                     is_error: out.is_error,
-                    diff: out.diff,
+                    args: None,
+                        diff: out.diff,
                 });
 
                 self.messages.push(Message::tool_result(

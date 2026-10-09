@@ -161,6 +161,9 @@ pub struct AiSidebar {
     pub on_model_click: Option<MouseDownCallback>,
     pub on_toggle_mode: Option<Box<dyn Fn(&String, &mut Window, &mut App) + 'static>>,
     pub expanded_thinkings: std::collections::HashSet<usize>,
+    /// Tool calls whose input/output detail is expanded, keyed by tool id.
+    pub expanded_tools: std::collections::HashSet<String>,
+    pub on_toggle_tool: Option<std::rc::Rc<dyn Fn(&String, &mut Window, &mut App) + 'static>>,
     pub on_toggle_thinking: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
     pub attached_files: Vec<std::path::PathBuf>,
     pub on_remove_attachment: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
@@ -247,6 +250,8 @@ impl AiSidebar {
             on_model_click: None,
             on_toggle_mode: None,
             expanded_thinkings: std::collections::HashSet::new(),
+            expanded_tools: std::collections::HashSet::new(),
+            on_toggle_tool: None,
             on_toggle_thinking: None,
             attached_files: Vec::new(),
             on_remove_attachment: None,
@@ -511,6 +516,19 @@ impl AiSidebar {
         self
     }
 
+    pub fn expanded_tools(mut self, set: std::collections::HashSet<String>) -> Self {
+        self.expanded_tools = set;
+        self
+    }
+
+    pub fn on_toggle_tool(
+        mut self,
+        handler: impl Fn(&String, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_toggle_tool = Some(std::rc::Rc::new(handler));
+        self
+    }
+
     pub fn expanded_thinkings(mut self, set: std::collections::HashSet<usize>) -> Self {
         self.expanded_thinkings = set;
         self
@@ -735,48 +753,374 @@ pub fn current_time_str() -> String {
     format!("{}:{:02} {}", h12, mins, ampm)
 }
 
-struct ParsedToolRow {
-    icon_type: IconType,
-    action: &'static str,
-    target: String,
-    status_text: String,
-    is_running: bool,
-    is_error: bool,
+pub(crate) struct ParsedToolRow {
+    pub(crate) icon_type: IconType,
+    pub(crate) action: String,
+    pub(crate) target: String,
+    pub(crate) status_text: String,
+    pub(crate) is_running: bool,
+    pub(crate) is_error: bool,
 }
 
-fn parse_tool_row(tc: &AiUiToolCall) -> ParsedToolRow {
-    let (icon_type, action) = match tc.name.as_str() {
-        "run_command" => (IconType::Terminal, "Run"),
-        "search" | "list_dir" => (IconType::Search, "Search"),
-        "read_file" => (IconType::FileCode, "Read"),
-        "edit_file" => (IconType::Pencil, "Edit"),
-        _ => (IconType::Sparkles, "Tool"),
-    };
+/// Argument keys worth showing as the row's subject, most specific first.
+/// Agents that host their own tools send their own key names, so a closed list
+/// of fastty's own keys left every such call falling back to raw JSON.
+pub(crate) // `title`, `description` and `summary` are deliberately absent: they are
+// prose, so they go through the prose-tail path below instead of being shown
+// whole.
+const TOOL_SUBJECT_KEYS: [&str; 9] = [
+    "command", "file_path", "filePath", "path", "pattern", "query", "url", "glob", "prompt",
+];
 
-    let raw_target = if let Ok(val) = serde_json::from_str::<serde_json::Value>(&tc.args) {
-        if let Some(cmd) = val.get("command").and_then(|v| v.as_str()) {
-            cmd.to_string()
-        } else if let Some(path) = val.get("path").and_then(|v| v.as_str()) {
-            path.to_string()
-        } else if let Some(pattern) = val.get("pattern").and_then(|v| v.as_str()) {
-            pattern.to_string()
-        } else if let Some(query) = val.get("query").and_then(|v| v.as_str()) {
-            query.to_string()
-        } else {
-            tc.args.clone()
+/// Picks the most informative argument as the row's subject, or `None` when the
+/// arguments carry nothing worth singling out.
+pub(crate) fn tool_subject(args: &str) -> Option<String> {
+    let val = serde_json::from_str::<serde_json::Value>(args).ok()?;
+    let obj = val.as_object()?;
+    for key in TOOL_SUBJECT_KEYS {
+        if let Some(text) = obj.get(key).and_then(|v| v.as_str()) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    // A prose title ("Read src/main.rs", "Websearch rust async") carries the
+    // subject after the verb. Use that remainder, which is what the row should
+    // show, instead of dropping it and leaving the row blank.
+    for key in ["title", "description", "summary", "prompt", "name"] {
+        if let Some(text) = obj.get(key).and_then(|v| v.as_str()) {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let mut words = trimmed.split_whitespace();
+            let head = words.next().unwrap_or_default();
+            let rest = words.collect::<Vec<_>>().join(" ");
+            // "Read src/main.rs" -> "src/main.rs". A single-word title has no
+            // tail to strip, so keep it as-is.
+            let subject = if rest.is_empty() {
+                trimmed.to_string()
+            } else if is_prose_verb(head) {
+                rest
+            } else {
+                trimmed.to_string()
+            };
+            return Some(subject.replace(['\n', '\r'], " "));
+        }
+    }
+    // Nothing recognisable: summarise as `key: value` pairs rather than
+    // printing the raw JSON blob, which is what made these rows unreadable.
+    let pairs: Vec<String> = obj
+        .iter()
+        .filter_map(|(k, v)| {
+            let rendered = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let rendered = rendered.trim().replace(['\n', '\r'], " ");
+            if rendered.is_empty() {
+                return None;
+            }
+            // A working directory on its own reads better as the bare path;
+            // "cwd: /Users/..." just added a label nobody asked for.
+            let bare = matches!(
+                k.as_str(),
+                "cwd" | "dir" | "directory" | "root" | "workdir" | "working_directory"
+            );
+            Some(if bare {
+                rendered
+            } else {
+                format!("{k}: {rendered}")
+            })
+        })
+        .collect();
+    (!pairs.is_empty()).then(|| pairs.join(" · "))
+}
+
+/// Turns an arbitrary tool name into a readable label.
+///
+/// The previous table only recognised fastty's own four tools, so every call
+/// from a hosted agent (`bash`, `grep`, `read`, `glob`, or a server-supplied
+/// title) collapsed to the literal word "Tool".
+pub(crate) fn tool_label(name: &str) -> (IconType, Option<&'static str>) {
+    let known = match name {
+        "run_command" | "bash" | "shell" => (IconType::Terminal, "Bash"),
+        "search" | "list_dir" | "glob" | "grep" => (IconType::Search, "Search"),
+        "read_file" | "read" => (IconType::FileCode, "Read"),
+        "edit_file" | "edit" | "write" => (IconType::Pencil, "Edit"),
+        _ => (IconType::Sparkles, ""),
+    };
+    (known.0, Some(known.1).filter(|s| !s.is_empty()))
+}
+
+/// True for a leading verb like "Read", "Websearch" or "Fetch" — but not for a
+/// path ("src/main.rs"), a range (`35,90p`) or a flag (`-rf`).
+fn is_prose_verb(word: &str) -> bool {
+    !word.is_empty()
+        && word.chars().all(|c| c.is_alphabetic() || c == '_')
+        && word.chars().next().is_some_and(|c| c.is_uppercase())
+}
+
+/// Recovers the tool identifier from an ACP `title` and falls back to `kind`.
+///
+/// ACP titles are prose written for humans, e.g. "Read src/main.rs" or
+/// "Websearch rust async", and `kind` is one of `read`, `edit`, `search`,
+/// `execute`, `fetch`, `other`. Taking the title verbatim as the tool name
+/// produced rows labelled "Fasty Fasty Run Command".
+pub(crate) fn tool_name_from_title(title: &str, kind: &str) -> String {
+    let trimmed = title.trim();
+    // OpenCode's ACP layer sets `title` to the bare tool name when the model
+    // supplies no title of its own, so a single lowercase token is a real name
+    // ("websearch", "todowrite") and must not be read as prose.
+    if !trimmed.is_empty() && !trimmed.contains(char::is_whitespace) {
+        // A path-like token is not a tool name, so let `kind` decide.
+        let looks_like_path = trimmed.contains(['/', '\\']) || trimmed.contains('.');
+        if !looks_like_path {
+            return humanize_tool_name(trimmed);
+        }
+    }
+    // Otherwise lead with the leading verb, which is the tool in disguise.
+    if let Some(first) = trimmed.split_whitespace().next() {
+        if is_prose_verb(first) {
+            return humanize_tool_name(first);
+        }
+    }
+    match kind {
+        "read" => "Read".to_string(),
+        "edit" => "Edit".to_string(),
+        "search" => "Search".to_string(),
+        "execute" => "Bash".to_string(),
+        "fetch" => "Fetch".to_string(),
+        "think" => "Think".to_string(),
+        "other" | "" => "Tool".to_string(),
+        other => humanize_tool_name(other),
+    }
+}
+
+/// `exa_web_search` -> `Exa Web Search`, `todowrite` -> `Todowrite`.
+/// Pretty-prints tool arguments, tolerating input that is not valid JSON.
+pub(crate) fn pretty_args(args: &str) -> String {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .map(|value| serde_json::to_string_pretty(&value).unwrap_or_else(|_| trimmed.to_string()))
+        .unwrap_or_else(|_| trimmed.to_string())
+}
+
+/// ACP wraps tool output in a `content` array of `{type, content:{text}}`,
+/// so the useful text is buried a few levels down. Unwrap it for display.
+pub(crate) fn extract_output_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return trimmed.to_string();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut collect = |node: &serde_json::Value| {
+        if let Some(text) = node.get("text").and_then(serde_json::Value::as_str) {
+            parts.push(text.to_string());
+        }
+    };
+    if let Some(items) = value.as_array() {
+        for item in items {
+            collect(item);
+            if let Some(nested) = item.get("content") {
+                collect(nested);
+            }
         }
     } else {
-        tc.args.clone()
+        collect(&value);
+        if let Some(text) = value.get("output").and_then(serde_json::Value::as_str) {
+            parts.push(text.to_string());
+        }
+    }
+    let joined = parts
+        .into_iter()
+        .map(|part| part.trim_end().to_string())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if joined.is_empty() {
+        trimmed.to_string()
+    } else {
+        joined
+    }
+}
+
+/// Caps detail text so a large output cannot lock up the sidebar, noting how
+/// much was dropped.
+fn clamp_detail(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= max_lines {
+        return text.to_string();
+    }
+    let kept: Vec<&str> = lines.iter().take(max_lines).copied().collect();
+    format!(
+        "{}\n… {} more line{}",
+        kept.join("\n"),
+        lines.len() - max_lines,
+        if lines.len() - max_lines == 1 { "" } else { "s" }
+    )
+}
+
+/// Inserts zero-width spaces so long unbreakable tokens — file paths, JSON
+/// keys, URLs — can wrap instead of running past the panel's edge.
+///
+/// The style layer here has no `overflow-wrap`, and `whitespace_nowrap` is what
+/// let the text escape horizontally in the first place. Zero-width spaces give
+/// the line breaker somewhere to break without changing what is displayed.
+pub(crate) fn soft_wrap(text: &str) -> String {
+    const BREAK_AFTER: [char; 12] = ['/', '\\', '-', '_', ',', ';', ':', '.', '=', '&', '|', '>'];
+    /// Longest unbroken run left without a break opportunity.
+    const MAX_RUN: usize = 24;
+
+    let mut out = String::with_capacity(text.len() + text.len() / 8);
+    let mut run = 0usize;
+    for c in text.chars() {
+        out.push(c);
+        if BREAK_AFTER.contains(&c) {
+            out.push('\u{200B}');
+            run = 0;
+        } else if c.is_alphanumeric() {
+            run += 1;
+            if run == MAX_RUN {
+                out.push('\u{200B}');
+                run = 0;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    out
+}
+
+/// The expanded panel under a tool row: the arguments it was called with and
+/// what it returned. This is the only record of what a tool actually did.
+fn render_tool_detail(tc: &AiUiToolCall, theme: &Theme) -> impl IntoElement {
+    let label = |text: &str| {
+        div()
+            .text_size(px(10.))
+            .text_color(theme.muted)
+            .child(SharedString::from(text.to_uppercase()))
+    };
+    let body = |text: &str, color: Hsla| {
+        div()
+            .w_full()
+            .min_w(px(0.))
+            .text_size(px(11.))
+            .text_color(color)
+            .child(SharedString::from(soft_wrap(&clamp_detail(text, 40))))
     };
 
-    let cleaned_target = raw_target.replace('\n', " ");
-    let max_len = 28;
-    let target = if cleaned_target.chars().count() > max_len {
-        let truncated: String = cleaned_target.chars().take(max_len).collect();
-        format!("{}...", truncated.trim_end())
+    let mut sections: Vec<gpui::AnyElement> = Vec::new();
+    let args = pretty_args(&tc.args);
+    if !args.is_empty() {
+        sections.push(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(label("input"))
+                .child(body(&args, theme.muted_strong))
+                .into_any_element(),
+        );
+    }
+    if let Some(output) = tc.output.as_deref() {
+        let text = extract_output_text(output);
+        if !text.trim().is_empty() {
+            sections.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(label("output"))
+                    .child(body(&text, if tc.is_error { theme.bright_red } else { theme.foreground }))
+                    .into_any_element(),
+            );
+        }
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .gap_2()
+        .px(px(10.))
+        .py(px(6.))
+        .rounded(px(6.))
+        .bg(theme.surface)
+        .border_1()
+        .border_color(theme.border)
+        .children(sections)
+}
+
+/// Drops a leading word that the name immediately repeats.
+///
+/// OpenCode exposes MCP tools as `<server>_<tool>`, and Fastty's MCP server is
+/// named "fastty" while its tools are themselves named `fastty_*`. The result
+/// arriving on the wire is `fastty_fastty_split_pane`, which humanised to
+/// "Fasty Fasty Split Pane".
+fn strip_server_prefix(name: &str) -> &str {
+    if let Some((first, rest)) = name.split_once('_') {
+        if rest.len() > first.len() && rest.starts_with(first) {
+            let trimmed = &rest[first.len()..];
+            if let Some(stripped) = trimmed.strip_prefix('_') {
+                return stripped;
+            }
+        }
+    }
+    name
+}
+
+pub(crate) fn humanize_tool_name(name: &str) -> String {
+    let cleaned = strip_server_prefix(name).replace(['_', '-'], " ");
+    let words: Vec<String> = cleaned
+        .split_whitespace()
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        return "Tool".to_string();
+    }
+    words.join(" ")
+}
+
+pub(crate) fn parse_tool_row(tc: &AiUiToolCall) -> ParsedToolRow {
+    // A few agents put the whole shell invocation in the tool name rather than
+    // in `command`; treat that as the subject instead of labelling it.
+    let name_is_command = tc.name.contains(' ') && tool_subject(&tc.args).is_none();
+    let (icon_type, action) = if name_is_command {
+        (IconType::Terminal, "Bash".to_string())
     } else {
-        cleaned_target
+        let (icon, known_label) = tool_label(&tc.name);
+        (
+            icon,
+            known_label
+                .map(str::to_string)
+                .unwrap_or_else(|| humanize_tool_name(&tc.name)),
+        )
     };
+
+    let raw_target = if name_is_command {
+        tc.name.clone()
+    } else {
+        tool_subject(&tc.args).unwrap_or_default()
+    };
+
+    // Truncation is handled in CSS (`.truncate()`), which adapts to the
+    // sidebar's actual width. Clamping to a fixed character count here threw
+    // away space and cut subjects mid-word regardless of room available.
+    let target = raw_target.replace(['\n', '\r'], " ");
 
     let status_text = if tc.is_running {
         "running".to_string()
@@ -2012,6 +2356,8 @@ impl RenderOnce for AiSidebar {
         let on_select_message_char = self.on_select_message_char.clone();
         let on_drag_message_char = self.on_drag_message_char.clone();
         let expanded_thinkings = self.expanded_thinkings;
+        let expanded_tools = self.expanded_tools;
+        let on_toggle_tool = self.on_toggle_tool.clone();
 
         let input_val = self.input_text.clone();
         let display_cwd = format_cwd_display(&self.cwd);
@@ -2689,25 +3035,51 @@ impl RenderOnce for AiSidebar {
                                                              false,
                                                          )
                                                      };
-                                                 let show_card = is_edit || tc.diff.is_some();
-                                                 div()
-                                                     .flex()
-                                                     .flex_col()
-                                                     .w_full()
-                                                     .gap_1()
-                                                     .child(
-                                                     div()
-                                                     .flex()
-                                                     .flex_row()
-                                                     .items_center()
-                                                     .justify_between()
-                                                     .px(px(10.))
-                                                     .py(px(6.))
-                                                     .rounded(px(6.))
-                                                     .bg(theme.surface)
-                                                     .border_1()
-                                                     .border_color(theme.border)
-                                                     .child(
+let show_card = is_edit || tc.diff.is_some();
+                                                  // Output is the only way to tell
+                                                  // what a call actually did, so any
+                                                  // row with a subject or output can
+                                                  // be opened.
+                                                  let tool_is_open = expanded_tools.contains(&tc.id);
+                                                  let tool_detail = if tool_is_open {
+                                                      Some(render_tool_detail(&tc, &theme))
+                                                  } else {
+                                                      None
+                                                  };
+                                                  let tool_toggle = on_toggle_tool.clone();
+                                                  div()
+                                                      .flex()
+                                                      .flex_col()
+                                                      .w_full()
+                                                      .gap_1()
+                                                      .child(
+                                                      div()
+                                                      .id(ElementId::named_usize(
+                                                          "ai-tool-header",
+                                                          tc_idx,
+                                                      ))
+                                                      .flex()
+                                                      .flex_row()
+                                                      .items_center()
+                                                      .justify_between()
+                                                      .px(px(10.))
+                                                      .py(px(6.))
+                                                      .rounded(px(6.))
+                                                      .bg(theme.surface)
+                                                      .border_1()
+                                                      .border_color(theme.border)
+                                                      .cursor(CursorStyle::PointingHand)
+                                                      .hover(move |s| s.bg(theme.hover))
+                                                      .on_mouse_down(MouseButton::Left, {
+                                                          let tool_toggle = tool_toggle.clone();
+                                                          let tool_id = tc.id.clone();
+                                                          move |_ev, window, cx| {
+                                                              if let Some(ref cb) = tool_toggle {
+                                                                  cb(&tool_id, window, cx);
+                                                              }
+                                                          }
+                                                      })
+                                                      .child(
                                                         div()
                                                             .flex()
                                                             .flex_row()
@@ -2716,25 +3088,29 @@ impl RenderOnce for AiSidebar {
                                                             .flex_1()
                                                             .min_w(px(0.))
                                                             .overflow_hidden()
-                                                            .child(crate::ui::icons::render_icon(
-                                                                info.icon_type,
-                                                                theme.muted,
-                                                                12.0,
-                                                            ))
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(12.))
-                                                                    .text_color(theme.muted_strong)
-                                                                    .flex_shrink_0()
-                                                                    .child(info.action),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(12.))
-                                                                    .text_color(theme.foreground)
-                                                                    .overflow_hidden()
-                                                                    .child(SharedString::from(info.target)),
-                                                            ),
+.child(div()
+                                                                     .flex_shrink_0()
+                                                                     .child(crate::ui::icons::render_icon(
+                                                                         info.icon_type,
+                                                                         theme.muted,
+                                                                         12.0,
+                                                                     )))
+                                                             .child(
+                                                                 div()
+                                                                     .text_size(px(12.))
+                                                                     .text_color(theme.muted_strong)
+                                                                     .flex_shrink_0()
+                                                                     .child(SharedString::from(info.action)),
+                                                             )
+                                                             .child(
+                                                                 div()
+                                                                     .text_size(px(12.))
+                                                                     .text_color(theme.foreground)
+                                                                     .flex_1()
+                                                                     .min_w(px(0.))
+                                                                     .truncate()
+                                                                     .child(SharedString::from(info.target)),
+                                                             ),
                                                     )
                                                     .child(
                                                         div()
@@ -2775,8 +3151,9 @@ impl RenderOnce for AiSidebar {
                                                              })
                                                      )
                                                      )
-                                                     .when(show_card, |d| {
-                                                         d.child(render_tool_diff_card(
+.when_some(tool_detail, |d, detail| d.child(detail))
+                                                      .when(show_card, |d| {
+                                                          d.child(render_tool_diff_card(
                                                              &theme,
                                                              &card_diff,
                                                              awaiting.is_some(),
@@ -3656,8 +4033,8 @@ impl RenderOnce for AiSidebar {
                         pct: context_pct,
                     },
                     &theme,
-                    on_file_drop.clone(),
-                ))
+on_file_drop.clone(),
+                    ))
             })
     }
 }
