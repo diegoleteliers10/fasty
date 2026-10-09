@@ -3,6 +3,12 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.21.6 - 2026-10-09
+
+### Terminal
+
+- Forward mouse drags to terminal applications that use mouse reporting, so their text selection works.
+
 ## 0.21.5 - 2026-10-09
 
 ### AI panel
