@@ -1,7 +1,7 @@
 //! Terminal state wrapper using alacritty_terminal.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -14,6 +14,24 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 use crate::config::FontConfig;
 use crate::event_listener::EventListenerProxy;
+
+#[derive(Clone, Copy, Debug)]
+pub enum MouseWheelDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+fn append_legacy_mouse_value(output: &mut Vec<u8>, value: usize, utf8: bool) {
+    if utf8 {
+        let codepoint = char::from_u32(value.min(0x10_FFFF) as u32).unwrap_or('\u{fffd}');
+        let mut bytes = [0; 4];
+        output.extend_from_slice(codepoint.encode_utf8(&mut bytes).as_bytes());
+    } else {
+        output.push(value.min(u8::MAX as usize) as u8);
+    }
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -57,6 +75,8 @@ pub enum CsiEvent {
     SyncOutputEnd,
     /// `CSI ? 5522 $ p` — DECRQM probe for the kitty clipboard protocol.
     QueryKittyClipboard,
+    X10MouseEnable,
+    X10MouseDisable,
 }
 
 /// Byte-level watcher for the CSI sequences fastty handles outside the
@@ -138,6 +158,10 @@ impl CsiWatcher {
                     let params = &self.params[..self.param_count];
                     let event = if byte == b'J' && !self.private && params.contains(&2) {
                         Some(CsiEvent::ClearHistory)
+                    } else if self.private && byte == b'h' && params.contains(&9) {
+                        Some(CsiEvent::X10MouseEnable)
+                    } else if self.private && byte == b'l' && params.contains(&9) {
+                        Some(CsiEvent::X10MouseDisable)
                     } else if self.private && byte == b'h' && params.contains(&2026) {
                         Some(CsiEvent::SyncOutputBegin)
                     } else if self.private && byte == b'l' && params.contains(&2026) {
@@ -230,6 +254,19 @@ impl ImageStore {
     }
 }
 
+fn read_kitty_image_file(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > 256 * 1024 * 1024 {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(256 * 1024 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= 256 * 1024 * 1024).then_some(bytes)
+}
+
 pub struct TerminalState {
     term: Arc<ParkingMutex<alacritty_terminal::term::Term<EventListenerProxy>>>,
     render_generation: Arc<AtomicU64>,
@@ -252,6 +289,7 @@ pub struct TerminalState {
     /// which asks whether the shell has an active *foreground child* — this
     /// asks whether the pane's shell process is there at all.
     alive: Arc<std::sync::atomic::AtomicBool>,
+    x10_mouse_active: Arc<AtomicBool>,
     has_terminated: std::sync::atomic::AtomicBool,
 }
 
@@ -302,6 +340,7 @@ impl TerminalState {
 
         let config = AlacrittyConfig {
             scrolling_history: scrollback.clamp(500, 100_000),
+            kitty_keyboard: true,
             ..Default::default()
         };
         let size = TermSize::new(cols, rows);
@@ -359,129 +398,28 @@ impl TerminalState {
             }
         }
 
-        // Shell integration: write OSC 133 command markers so fastty can
-        // detect command start/finish for duration tracking.
-        //
-        // The integration scripts are identical for every tab and never change
-        // between releases, so materialise them at most once per process. This
-        // avoids redundant filesystem writes on every `create_new_tab` call —
-        // which matters at startup when a saved session is restored and many
-        // tabs are created back-to-back.
-        static INTEGRATION_WRITTEN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        let integration_dir = crate::paths::get().cache_dir.join("shell_integration");
-        let integration_path = integration_dir.join("fastty_shell_integration.sh");
-        let integration_path_zsh = integration_dir.join("fastty_shell_integration.zsh");
-        let integration_path_fish = integration_dir.join("fastty_shell_integration.fish");
-        let zdotdir = integration_dir.join("fastty_zsh");
-        INTEGRATION_WRITTEN.get_or_init(|| {
-            let _ = std::fs::create_dir_all(&integration_dir);
-            let _ = std::fs::create_dir_all(&zdotdir);
-
-            // POSIX shell integration (bash)
-            let _ = std::fs::write(
-                &integration_path,
-                "# fastty shell integration — OSC 133 command markers\n\
-                 __fastty_cmd_start() {\n\
-                 \techo -ne \"\\e]133;B\\e\\\\\"\n\
-                 }\n\
-                 __fastty_prompt() {\n\
-                 \techo -ne \"\\e]133;D;$?\\e\\\\\"\n\
-                 \techo -ne \"\\e]133;A\\e\\\\\"\n\
-                 \techo -ne \"\\e[?1000l\\e[?1002l\\e[?1003l\\e[?1006l\"\n\
-                 }\n\
-                 PROMPT_COMMAND=\"__fastty_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"\n\
-                 trap '__fastty_cmd_start' DEBUG\n",
-            );
-
-            // Zsh shell integration: precmd/preexec hooks appended via add-zsh-hook
-            // so user-defined hooks in ~/.zshrc are preserved, not overwritten.
-            let _ = std::fs::write(
-                &integration_path_zsh,
-                "# fastty shell integration — OSC 133 command markers\n\
-                 autoload -Uz add-zsh-hook\n\
-                 __fastty_preexec() {\n\
-                 \techo -ne \"\\e]133;B\\e\\\\\"\n\
-                 }\n\
-                 __fastty_precmd() {\n\
-                 \techo -ne \"\\e]133;D;$?\\e\\\\\"\n\
-                 \techo -ne \"\\e]133;A\\e\\\\\"\n\
-                 \techo -ne \"\\e[?1000l\\e[?1002l\\e[?1003l\\e[?1006l\"\n\
-                 }\n\
-                 add-zsh-hook preexec __fastty_preexec\n\
-                 add-zsh-hook precmd __fastty_precmd\n",
-            );
-
-            // Fish shell integration
-            let _ = std::fs::write(
-                &integration_path_fish,
-                "# fastty shell integration — OSC 133 command markers\n\
-                 function __fastty_cmd_start --on-event fish_preexec\n\
-                 \techo -ne \"\\e]133;B\\e\\\\\"\n\
-                 end\n\
-                 function __fastty_cmd_end --on-event fish_postexec\n\
-                 \techo -ne \"\\e]133;D;$status\\e\\\\\"\n\
-                 end\n\
-                 function __fastty_prompt --on-event fish_prompt\n\
-                 \techo -ne \"\\e]133;A\\e\\\\\"\n\
-                 \techo -ne \"\\e[?1000l\\e[?1002l\\e[?1003l\\e[?1006l\"\n\
-                 end\n",
-            );
-
-            // Bash wrapper
-            let wrapper_path_bash = integration_dir.join("fastty_bashrc");
-            let _ = std::fs::write(
-                &wrapper_path_bash,
-                format!(
-                    "# Auto-generated by fastty — shell integration wrapper\n\
-                     [ -f \"$HOME/.bash_profile\" ] && . \"$HOME/.bash_profile\"\n\
-                     [ -f \"$HOME/.bashrc\" ] && . \"$HOME/.bashrc\"\n\
-                     [ -f \"$HOME/.profile\" ] && . \"$HOME/.profile\"\n\
-                     . \"{}\"\n",
-                    integration_path.display(),
-                ),
-            );
-
-            // Zsh wrappers
-            let _ = std::fs::write(
-                zdotdir.join(".zshenv"),
-                "# Auto-generated by fastty\n\
-                 [ -f \"$HOME/.zshenv\" ] && . \"$HOME/.zshenv\"\n",
-            );
-            let _ = std::fs::write(
-                zdotdir.join(".zprofile"),
-                "# Auto-generated by fastty\n\
-                 [ -f \"$HOME/.zprofile\" ] && . \"$HOME/.zprofile\"\n",
-            );
-            let _ = std::fs::write(
-                zdotdir.join(".zshrc"),
-                format!(
-                    "# Auto-generated by fastty\n\
-                     [ -f \"$HOME/.zshrc\" ] && . \"$HOME/.zshrc\"\n\
-                     . \"{}\"\n\
-                     if [ -n \"$FASTTY_ORIG_ZDOTDIR\" ]; then\n\
-                     \texport ZDOTDIR=\"$FASTTY_ORIG_ZDOTDIR\"\n\
-                     else\n\
-                     \tunset ZDOTDIR\n\
-                     fi\n",
-                    integration_path_zsh.display(),
-                ),
-            );
-            let _ = std::fs::write(
-                zdotdir.join(".zlogin"),
-                "# Auto-generated by fastty\n\
-                 [ -f \"$HOME/.zlogin\" ] && . \"$HOME/.zlogin\"\n",
-            );
-        });
-
-        // Wrap the shell command to source the integration before launching.
-        if !exec_args.is_empty() {
+        if let Some(plan) = crate::shell_integration::plan_shell_integration(
+            executable,
+            exec_args,
+            &crate::paths::get().cache_dir,
+            &dirs::home_dir().unwrap_or_default(),
+        ) {
+            for file in &plan.files {
+                std::fs::create_dir_all(file.path.parent().unwrap_or(std::path::Path::new(".")))?;
+                std::fs::write(&file.path, &file.contents)?;
+            }
+            for (key, value) in plan.env {
+                cmd.env(key, value);
+            }
+            cmd.args(plan.args);
+        } else if !exec_args.is_empty() {
             cmd.args(exec_args);
         } else {
             #[cfg(unix)]
             {
-                let shell_name = std::path::Path::new(&executable)
+                let shell_name = std::path::Path::new(executable)
                     .file_name()
-                    .and_then(|n| n.to_str())
+                    .and_then(|name| name.to_str())
                     .unwrap_or("");
                 if matches!(shell_name, "zsh" | "bash" | "fish" | "sh" | "dash" | "ksh") {
                     cmd.arg("-l");
@@ -541,6 +479,8 @@ impl TerminalState {
         let next_image_id = Arc::new(AtomicU64::new(1));
         let next_image_id_clone = Arc::clone(&next_image_id);
         let writer_clone = Arc::clone(&writer_arc);
+        let x10_mouse_active = Arc::new(AtomicBool::new(false));
+        let x10_mouse_active_clone = Arc::clone(&x10_mouse_active);
         static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
         let source_id = NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
         let program_status = Arc::new(ParkingMutex::new(crate::program_status::ProgramStatusStore::default()));
@@ -610,7 +550,8 @@ impl TerminalState {
                         update_program_status(&program_status_clone, &program_status_pending_clone, &event_listener_clone, source_id,
                             |store| store.end_activity());
                         // Reset mouse tracking modes on prompt start to prevent leaked escape codes if a child exited uncleanly
-                        parser.advance(term, b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+                        parser.advance(term, b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l");
+                        x10_mouse_active_clone.store(false, Ordering::Relaxed);
 
                         let scrolled = (base as i64 - screen_lines as i64).max(0);
                         let absolute_line = (scrolled + cursor_line as i64).max(0) as u64;
@@ -671,7 +612,13 @@ impl TerminalState {
                     }
                     OscCommand::KittyClipboard { metadata, payload } => {
                         use crate::parser::kitty_clipboard as kclip;
-                        let Some(msg) = kclip::parse(&metadata, &payload) else {
+                        let Some(msg) = kclip::parse_protocol(&metadata, &payload) else {
+                            if let Some(session) = kitty_clip_write.take() {
+                                let resp = kclip::response("write", "EINVAL", session.id.as_deref());
+                                let mut writer = writer_clone.lock();
+                                let _ = writer.write_all(resp.as_bytes());
+                                let _ = writer.flush();
+                            }
                             return;
                         };
                         let write_resp = |resp: String| {
@@ -680,10 +627,15 @@ impl TerminalState {
                             let _ = w.flush();
                         };
                         match msg {
-                            kclip::Message::WriteBegin { id } => {
+                            kclip::ProtocolMessage::WriteBegin { id, location, password, name } => {
+                                if location != kclip::Location::Clipboard || password.is_some() || name.is_some() {
+                                    kitty_clip_write = None;
+                                    write_resp(kclip::response("write", "EPERM", id.as_deref()));
+                                    return;
+                                }
                                 kitty_clip_write = Some(kclip::WriteSession::new(id));
                             }
-                            kclip::Message::WriteData { id, mime, data } => match (mime, kitty_clip_write.as_mut()) {
+                            kclip::ProtocolMessage::WriteData { id, mime, data } => match (mime, kitty_clip_write.as_mut()) {
                                 (Some(mime), Some(session)) => {
                                     if session.push(mime, data).is_err() {
                                         let id = kitty_clip_write.take().and_then(|s| s.id);
@@ -706,13 +658,41 @@ impl TerminalState {
                                     write_resp(kclip::response("write", "EINVAL", id.as_deref()));
                                 }
                             },
-                            kclip::Message::Read { id, request } => {
+                            kclip::ProtocolMessage::WriteDataEncoded { id, mime, data } => {
+                                if let Some(session) = kitty_clip_write.as_mut() {
+                                    if session.push_encoded(mime, data).is_err() {
+                                        let id = kitty_clip_write.take().and_then(|s| s.id);
+                                        write_resp(kclip::response("write", "EFBIG", id.as_deref()));
+                                    }
+                                } else {
+                                    write_resp(kclip::response("write", "EINVAL", id.as_deref()));
+                                }
+                            }
+                            kclip::ProtocolMessage::WriteAlias { mime, aliases } => {
+                                if kitty_clip_write.as_mut().is_some_and(|session| session.add_aliases(mime, aliases).is_ok()) {
+                                } else {
+                                    let id = kitty_clip_write.take().and_then(|s| s.id);
+                                    write_resp(kclip::response("write", "EINVAL", id.as_deref()));
+                                }
+                            }
+                            kclip::ProtocolMessage::Read { id, request, location, password, name } => {
                                 if !crate::config::clipboard_read_allowed() {
                                     write_resp(kclip::response("read", "EPERM", id.as_deref()));
                                     return;
                                 }
+                                if password.is_some() || name.is_some() {
+                                    write_resp(kclip::response("read", "EPERM", id.as_deref()));
+                                    return;
+                                }
+                                let formats = match kclip::read_from_location(&request, location) {
+                                    Ok(formats) => formats,
+                                    Err(error) => {
+                                        write_resp(kclip::response("read", error.status(), id.as_deref()));
+                                        return;
+                                    }
+                                };
                                 write_resp(kclip::response("read", "OK", id.as_deref()));
-                                for (mime, data) in kclip::read(&request) {
+                                for (mime, data) in formats {
                                     let chunks: Vec<&[u8]> = if data.is_empty() {
                                         vec![&[][..]]
                                     } else {
@@ -754,7 +734,9 @@ impl TerminalState {
                     match ctrl.action {
                         crate::parser::kitty_graphics::KittyAction::Query => {
                             let id = ctrl.image_id.unwrap_or(0);
-                            let resp = format!("\x1b_Gi={};OK\x1b\\", id);
+                            let exists = image_store_clone.lock().images.contains_key(&id);
+                            let status = if exists { "OK" } else { "ENOENT" };
+                            let resp = format!("\x1b_Gi={};{}\x1b\\", id, status);
                             let mut w = writer_clone.lock();
                             let _ = w.write_all(resp.as_bytes());
                             let _ = w.flush();
@@ -771,9 +753,16 @@ impl TerminalState {
                                 Some(crate::parser::kitty_graphics::KittyDeleteAction::ByPlacement(p_id)) => {
                                     store.delete_by_placement(p_id);
                                 }
-                                _ => {
-                                    store.delete_all();
+                                Some(crate::parser::kitty_graphics::KittyDeleteAction::AtCursor) => {
+                                    let abs_line = (base as i64 + cursor_line as i64).max(0) as u64;
+                                    store.placements.retain(|p| {
+                                        !(p.absolute_line <= abs_line
+                                            && abs_line < p.absolute_line.saturating_add(p.rows as u64)
+                                            && p.col <= cursor_col
+                                            && cursor_col < p.col.saturating_add(p.cols))
+                                    });
                                 }
+                                None => store.delete_all(),
                             }
                         }
                         crate::parser::kitty_graphics::KittyAction::Put => {
@@ -806,9 +795,13 @@ impl TerminalState {
                                 {
                                     if let Ok(path_str) = std::str::from_utf8(&raw_bytes) {
                                         let trimmed = path_str.trim();
-                                        if let Ok(file_content) = std::fs::read(trimmed) {
+                                        if let Some(file_content) = read_kitty_image_file(std::path::Path::new(trimmed)) {
                                             raw_bytes = file_content;
+                                        } else {
+                                            return added_lines;
                                         }
+                                    } else {
+                                        return added_lines;
                                     }
                                 }
 
@@ -1016,6 +1009,12 @@ impl TerminalState {
                                     let _ = w.write_all(resp);
                                     let _ = w.flush();
                                 }
+                                Some(CsiEvent::X10MouseEnable) => {
+                                    x10_mouse_active_clone.store(true, Ordering::Relaxed);
+                                }
+                                Some(CsiEvent::X10MouseDisable) => {
+                                    x10_mouse_active_clone.store(false, Ordering::Relaxed);
+                                }
                                 Some(CsiEvent::SyncOutputBegin) => {
                                     sync_output_active = true;
                                     sync_started = Some(std::time::Instant::now());
@@ -1091,6 +1090,7 @@ impl TerminalState {
             event_listener,
             output_subs,
             alive,
+            x10_mouse_active,
             has_terminated: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -1247,7 +1247,7 @@ impl TerminalState {
             alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
                 | alacritty_terminal::term::TermMode::MOUSE_DRAG
                 | alacritty_terminal::term::TermMode::MOUSE_MOTION,
-        )
+        ) || self.x10_mouse_active.load(Ordering::Relaxed)
     }
 
     pub fn is_bracketed_paste_enabled(&self) -> bool {
@@ -1276,10 +1276,12 @@ impl TerminalState {
                 | alacritty_terminal::term::TermMode::MOUSE_DRAG
                 | alacritty_terminal::term::TermMode::MOUSE_MOTION,
         );
+        let x10 = self.x10_mouse_active.load(Ordering::Relaxed);
         let sgr = mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE);
+        let utf8 = mode.contains(alacritty_terminal::term::TermMode::UTF8_MOUSE);
         drop(term);
 
-        if !is_mouse_active {
+        if (!is_mouse_active && !x10) || (x10 && (!pressed || button > 2)) {
             return;
         }
 
@@ -1297,7 +1299,7 @@ impl TerminalState {
         let col_1 = col.max(1);
         let row_1 = row.max(1);
 
-        if sgr {
+        if sgr && !x10 {
             // SGR 1006 format: \x1b[<{button};{col};{row}{M/m}
             let flag = if pressed { 'M' } else { 'm' };
             let seq = format!("\x1b[<{};{};{}{}", btn_code, col_1, row_1, flag);
@@ -1305,12 +1307,30 @@ impl TerminalState {
         } else {
             // Normal X10/1000 format: \x1b[M{btn + 32}{col + 32}{row + 32}
             let b_byte = if pressed { btn_code } else { 3 };
-            let cb = b_byte.saturating_add(32);
-            let cx = (col_1 as u8).saturating_add(32);
-            let cy = (row_1 as u8).saturating_add(32);
-            let seq = [0x1b, b'[', b'M', cb, cx, cy];
+            let mut seq = vec![0x1b, b'[', b'M'];
+            append_legacy_mouse_value(&mut seq, b_byte as usize + 32, utf8);
+            append_legacy_mouse_value(&mut seq, col_1 + 32, utf8);
+            append_legacy_mouse_value(&mut seq, row_1 + 32, utf8);
             self.write_to_pty(&seq);
         }
+    }
+
+    pub fn send_mouse_wheel_with_mods(
+        &self,
+        direction: MouseWheelDirection,
+        col: usize,
+        row: usize,
+        shift: bool,
+        alt: bool,
+        control: bool,
+    ) {
+        let button = match direction {
+            MouseWheelDirection::Up => 64,
+            MouseWheelDirection::Down => 65,
+            MouseWheelDirection::Left => 66,
+            MouseWheelDirection::Right => 67,
+        };
+        self.send_mouse_button_with_mods(button, col, row, true, shift, alt, control);
     }
 
     pub fn send_mouse_motion(
@@ -1332,6 +1352,7 @@ impl TerminalState {
                 | alacritty_terminal::term::TermMode::MOUSE_MOTION,
         );
         let sgr = mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE);
+        let utf8 = mode.contains(alacritty_terminal::term::TermMode::UTF8_MOUSE);
         let motion_any = mode.contains(alacritty_terminal::term::TermMode::MOUSE_MOTION);
         let motion_drag = mode.contains(alacritty_terminal::term::TermMode::MOUSE_DRAG);
         drop(term);
@@ -1349,13 +1370,13 @@ impl TerminalState {
         }
 
         let mut btn_code: u8 = if left_down {
-            32
+            0
         } else if middle_down {
-            1 + 32
+            1
         } else if right_down {
-            2 + 32
+            2
         } else {
-            3 + 32 // 35 = motion without button
+            3 // motion without button
         };
 
         if shift {
@@ -1375,10 +1396,10 @@ impl TerminalState {
             let seq = format!("\x1b[<{};{};{}M", btn_code, col_1, row_1);
             self.write_to_pty(seq.as_bytes());
         } else {
-            let cb = btn_code.saturating_add(32);
-            let cx = (col_1 as u8).saturating_add(32);
-            let cy = (row_1 as u8).saturating_add(32);
-            let seq = [0x1b, b'[', b'M', cb, cx, cy];
+            let mut seq = vec![0x1b, b'[', b'M'];
+            append_legacy_mouse_value(&mut seq, btn_code as usize + 32, utf8);
+            append_legacy_mouse_value(&mut seq, col_1 + 32, utf8);
+            append_legacy_mouse_value(&mut seq, row_1 + 32, utf8);
             self.write_to_pty(&seq);
         }
     }

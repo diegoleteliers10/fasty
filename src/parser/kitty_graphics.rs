@@ -1,7 +1,12 @@
-use std::sync::Arc;
 use gpui::RenderImage;
-use image::{Frame, RgbaImage};
+use image::{Frame, ImageReader, Limits, RgbaImage};
 use smallvec::smallvec;
+use std::io::Cursor;
+use std::sync::Arc;
+
+const MAX_ENCODED_IMAGE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_IMAGE_PIXELS: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KittyAction {
@@ -50,6 +55,8 @@ pub struct KittyControl {
     pub z_index: i32,
     pub quiet: u8,
     pub more_chunks: bool,
+    pub has_more_chunks: bool,
+    pub continuation_only: bool,
     pub cursor_movement: bool,
     pub delete_action: Option<KittyDeleteAction>,
 }
@@ -70,6 +77,8 @@ impl Default for KittyControl {
             z_index: 0,
             quiet: 0,
             more_chunks: false,
+            has_more_chunks: false,
+            continuation_only: true,
             cursor_movement: true,
             delete_action: None,
         }
@@ -87,6 +96,9 @@ pub fn parse_kitty_control(header: &[u8]) -> Option<KittyControl> {
         let mut parts = item.splitn(2, '=');
         let key = parts.next()?.trim();
         let val = parts.next().unwrap_or("").trim();
+        if !matches!(key, "m" | "q") {
+            ctrl.continuation_only = false;
+        }
 
         match key {
             "a" => {
@@ -96,14 +108,15 @@ pub fn parse_kitty_control(header: &[u8]) -> Option<KittyControl> {
                     "q" => KittyAction::Query,
                     "p" => KittyAction::Put,
                     "d" => KittyAction::Delete,
-                    _ => KittyAction::TransmitAndDisplay,
+                    _ => return None,
                 };
             }
             "f" => {
                 ctrl.format = match val {
                     "100" => KittyFormat::Png,
                     "24" => KittyFormat::Rgb24,
-                    _ => KittyFormat::Rgba32,
+                    "32" => KittyFormat::Rgba32,
+                    _ => return None,
                 };
             }
             "t" => {
@@ -111,55 +124,97 @@ pub fn parse_kitty_control(header: &[u8]) -> Option<KittyControl> {
                     "f" => KittyTransmission::File,
                     "t" => KittyTransmission::TempFile,
                     "s" => KittyTransmission::SharedMem,
-                    _ => KittyTransmission::Direct,
+                    "d" => KittyTransmission::Direct,
+                    _ => return None,
                 };
             }
-            "s" => ctrl.width_px = val.parse::<u32>().ok(),
-            "v" => ctrl.height_px = val.parse::<u32>().ok(),
-            "i" => ctrl.image_id = val.parse::<u32>().ok(),
-            "I" => ctrl.image_number = val.parse::<u32>().ok(),
-            "p" => ctrl.placement_id = val.parse::<u32>().ok(),
-            "c" => ctrl.columns = val.parse::<usize>().ok(),
-            "r" => ctrl.rows = val.parse::<usize>().ok(),
-            "z" => ctrl.z_index = val.parse::<i32>().ok().unwrap_or(0),
-            "q" => ctrl.quiet = val.parse::<u8>().ok().unwrap_or(0),
-            "m" => ctrl.more_chunks = val == "1",
+            "s" => ctrl.width_px = Some(parse_positive_u32(val)?),
+            "v" => ctrl.height_px = Some(parse_positive_u32(val)?),
+            "i" => ctrl.image_id = Some(parse_positive_u32(val)?),
+            "I" => ctrl.image_number = Some(parse_positive_u32(val)?),
+            "p" => ctrl.placement_id = Some(parse_positive_u32(val)?),
+            "c" => ctrl.columns = Some(parse_positive_usize(val)?),
+            "r" => ctrl.rows = Some(parse_positive_usize(val)?),
+            "z" => ctrl.z_index = val.parse::<i32>().ok()?,
+            "q" => ctrl.quiet = val.parse::<u8>().ok().filter(|v| *v <= 2)?,
+            "m" => {
+                ctrl.has_more_chunks = true;
+                ctrl.more_chunks = match val {
+                    "0" => false,
+                    "1" => true,
+                    _ => return None,
+                };
+            }
             "C" => ctrl.cursor_movement = val != "0",
             "d" => {
                 ctrl.action = KittyAction::Delete;
                 ctrl.delete_action = match val {
                     "a" | "A" => Some(KittyDeleteAction::All),
-                    "i" | "I" => ctrl.image_id.map(KittyDeleteAction::ById),
-                    "p" | "P" => ctrl.placement_id.map(KittyDeleteAction::ByPlacement),
+                    "i" | "I" => Some(KittyDeleteAction::ById(0)),
+                    "p" | "P" => Some(KittyDeleteAction::ByPlacement(0)),
                     "c" | "C" => Some(KittyDeleteAction::AtCursor),
-                    _ => Some(KittyDeleteAction::All),
+                    _ => return None,
                 };
             }
             _ => {}
         }
     }
 
+    if ctrl.width_px.is_some_and(|v| v > MAX_IMAGE_DIMENSION)
+        || ctrl.height_px.is_some_and(|v| v > MAX_IMAGE_DIMENSION)
+    {
+        return None;
+    }
+    if let Some(delete_action) = ctrl.delete_action.as_mut() {
+        *delete_action = match delete_action {
+            KittyDeleteAction::ById(_) => KittyDeleteAction::ById(ctrl.image_id?),
+            KittyDeleteAction::ByPlacement(_) => KittyDeleteAction::ByPlacement(ctrl.placement_id?),
+            action => *action,
+        };
+    }
     Some(ctrl)
 }
 
-/// Decode base64 bytes ignoring ASCII whitespace.
+fn parse_positive_u32(value: &str) -> Option<u32> {
+    value.parse::<u32>().ok().filter(|value| *value > 0)
+}
+
+fn parse_positive_usize(value: &str) -> Option<usize> {
+    value.parse::<usize>().ok().filter(|value| *value > 0)
+}
+
+/// Decode one strict RFC 4648 base64 payload.
 pub fn base64_decode_bytes(input: &[u8]) -> Option<Vec<u8>> {
     let mut table = [255u8; 256];
-    for (i, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".iter().enumerate() {
+    for (i, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        .iter()
+        .enumerate()
+    {
         table[c as usize] = i as u8;
     }
 
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    if input.len() > MAX_ENCODED_IMAGE_BYTES || input.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(input.len().checked_mul(3)?.checked_div(4)?);
     let mut buffer = 0u32;
     let mut bits = 0;
 
-    for &b in input {
+    let mut padding = 0;
+    for (index, &b) in input.iter().enumerate() {
         if b == b'=' {
-            break;
+            padding += 1;
+            if padding > 2 || index < input.len().saturating_sub(2) {
+                return None;
+            }
+            continue;
+        }
+        if padding != 0 {
+            return None;
         }
         let val = table[b as usize];
         if val == 255 {
-            continue; // Ignore whitespace / invalid characters
+            return None;
         }
         buffer = (buffer << 6) | (val as u32);
         bits += 6;
@@ -167,6 +222,12 @@ pub fn base64_decode_bytes(input: &[u8]) -> Option<Vec<u8>> {
             bits -= 8;
             out.push((buffer >> bits) as u8);
         }
+    }
+    if padding == 1 && (input.len() < 4 || input[input.len() - 2] == b'=')
+        || padding == 2 && (input.len() < 4 || input[input.len() - 3] == b'=')
+        || bits >= 6
+    {
+        return None;
     }
     Some(out)
 }
@@ -178,52 +239,59 @@ pub fn decode_image_data(
     height_px: Option<u32>,
     raw_bytes: &[u8],
 ) -> anyhow::Result<(Arc<RenderImage>, u32, u32)> {
-    if raw_bytes.is_empty() {
+    if raw_bytes.is_empty() || raw_bytes.len() > MAX_ENCODED_IMAGE_BYTES {
         anyhow::bail!("empty image payload");
     }
 
-    // Try universal auto-detection via `image::load_from_memory` first (supports PNG, JPEG, WebP, GIF, BMP)
-    let (mut rgba_img, w, h) = if let Ok(img) = image::load_from_memory(raw_bytes) {
-        let w = img.width();
-        let h = img.height();
-        (img.to_rgba8(), w, h)
-    } else {
-        match format {
-            KittyFormat::Png => {
-                let img = image::load_from_memory(raw_bytes)?;
-                let w = img.width();
-                let h = img.height();
-                (img.to_rgba8(), w, h)
+    let (mut rgba_img, w, h) = match format {
+        KittyFormat::Png => {
+            let mut reader =
+                ImageReader::with_format(Cursor::new(raw_bytes), image::ImageFormat::Png);
+            reader.limits(Limits {
+                max_image_width: Some(MAX_IMAGE_DIMENSION),
+                max_image_height: Some(MAX_IMAGE_DIMENSION),
+                max_alloc: Some((MAX_IMAGE_PIXELS * 4) as u64),
+            });
+            let img = reader.decode()?;
+            let w = img.width();
+            let h = img.height();
+            pixel_byte_len(w, h, 4)?;
+            (img.to_rgba8(), w, h)
+        }
+        KittyFormat::Rgba32 => {
+            let w = width_px.unwrap_or(0);
+            let h = height_px.unwrap_or(0);
+            let expected = pixel_byte_len(w, h, 4)?;
+            if raw_bytes.len() != expected {
+                anyhow::bail!("invalid RGBA32 dimensions or insufficient bytes");
             }
-            KittyFormat::Rgba32 => {
-                let w = width_px.unwrap_or(0);
-                let h = height_px.unwrap_or(0);
-                if w == 0 || h == 0 || (raw_bytes.len() as u32) < w * h * 4 {
-                    anyhow::bail!("invalid RGBA32 dimensions or insufficient bytes");
-                }
-                let img = RgbaImage::from_raw(w, h, raw_bytes[..(w * h * 4) as usize].to_vec())
-                    .ok_or_else(|| anyhow::anyhow!("failed to create RgbaImage from raw RGBA32 bytes"))?;
-                (img, w, h)
+            let img = RgbaImage::from_raw(w, h, raw_bytes.to_vec()).ok_or_else(|| {
+                anyhow::anyhow!("failed to create RgbaImage from raw RGBA32 bytes")
+            })?;
+            (img, w, h)
+        }
+        KittyFormat::Rgb24 => {
+            let w = width_px.unwrap_or(0);
+            let h = height_px.unwrap_or(0);
+            let expected = pixel_byte_len(w, h, 3)?;
+            if raw_bytes.len() != expected {
+                anyhow::bail!("invalid RGB24 dimensions or insufficient bytes");
             }
-            KittyFormat::Rgb24 => {
-                let w = width_px.unwrap_or(0);
-                let h = height_px.unwrap_or(0);
-                if w == 0 || h == 0 || (raw_bytes.len() as u32) < w * h * 3 {
-                    anyhow::bail!("invalid RGB24 dimensions or insufficient bytes");
-                }
-                let mut rgba_bytes = Vec::with_capacity((w * h * 4) as usize);
-                for chunk in raw_bytes[..(w * h * 3) as usize].chunks_exact(3) {
-                    rgba_bytes.push(chunk[0]);
-                    rgba_bytes.push(chunk[1]);
-                    rgba_bytes.push(chunk[2]);
-                    rgba_bytes.push(255);
-                }
-                let img = RgbaImage::from_raw(w, h, rgba_bytes)
-                    .ok_or_else(|| anyhow::anyhow!("failed to create RgbaImage from raw RGB24 bytes"))?;
-                (img, w, h)
+            let mut rgba_bytes = Vec::with_capacity(pixel_byte_len(w, h, 4)?);
+            for chunk in raw_bytes.chunks_exact(3) {
+                rgba_bytes.push(chunk[0]);
+                rgba_bytes.push(chunk[1]);
+                rgba_bytes.push(chunk[2]);
+                rgba_bytes.push(255);
             }
+            let img = RgbaImage::from_raw(w, h, rgba_bytes).ok_or_else(|| {
+                anyhow::anyhow!("failed to create RgbaImage from raw RGB24 bytes")
+            })?;
+            (img, w, h)
         }
     };
+
+    pixel_byte_len(w, h, 4)?;
 
     // GPUI expects BGRA channel ordering in `RenderImage`
     for pixel in rgba_img.chunks_exact_mut(4) {
@@ -235,10 +303,27 @@ pub fn decode_image_data(
     Ok((render_image, w, h))
 }
 
+fn pixel_byte_len(width: u32, height: u32, channels: u64) -> anyhow::Result<usize> {
+    if width == 0 || height == 0 || width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
+        anyhow::bail!("invalid image dimensions");
+    }
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_IMAGE_PIXELS {
+        anyhow::bail!("image exceeds pixel limit");
+    }
+    usize::try_from(
+        pixels
+            .checked_mul(channels)
+            .ok_or_else(|| anyhow::anyhow!("image size overflow"))?,
+    )
+    .map_err(|_| anyhow::anyhow!("image size overflow"))
+}
+
 #[derive(Debug, Default)]
 pub struct KittyReassembler {
     pub pending_control: Option<KittyControl>,
     pub chunks_buffer: Vec<u8>,
+    chunk_count: usize,
 }
 
 impl KittyReassembler {
@@ -246,24 +331,56 @@ impl KittyReassembler {
         Self::default()
     }
 
-    pub fn push_chunk(&mut self, control: KittyControl, payload_b64: &[u8]) -> Option<(KittyControl, Vec<u8>)> {
+    pub fn push_chunk(
+        &mut self,
+        control: KittyControl,
+        payload_b64: &[u8],
+    ) -> Option<(KittyControl, Vec<u8>)> {
         if self.pending_control.is_none() {
             self.pending_control = Some(control.clone());
             self.chunks_buffer.clear();
+            self.chunk_count = 0;
+        } else if !is_valid_continuation(&control) {
+            self.reset();
+            return None;
         }
 
+        if payload_b64.is_empty()
+            || payload_b64.len() > 4096
+            || (control.more_chunks && payload_b64.len() % 4 != 0)
+            || self
+                .chunks_buffer
+                .len()
+                .checked_add(payload_b64.len())
+                .is_none_or(|length| length > MAX_ENCODED_IMAGE_BYTES)
+            || self.chunk_count >= 65_536
+        {
+            self.reset();
+            return None;
+        }
         self.chunks_buffer.extend_from_slice(payload_b64);
+        self.chunk_count += 1;
 
         if !control.more_chunks {
             let mut final_control = self.pending_control.take().unwrap_or(control);
             final_control.more_chunks = false;
             let payload = std::mem::take(&mut self.chunks_buffer);
-            let decoded = base64_decode_bytes(&payload).unwrap_or_default();
-            Some((final_control, decoded))
+            self.chunk_count = 0;
+            base64_decode_bytes(&payload).map(|decoded| (final_control, decoded))
         } else {
             None
         }
     }
+
+    fn reset(&mut self) {
+        self.pending_control = None;
+        self.chunks_buffer.clear();
+        self.chunk_count = 0;
+    }
+}
+
+fn is_valid_continuation(control: &KittyControl) -> bool {
+    control.continuation_only && control.has_more_chunks
 }
 
 #[cfg(test)]

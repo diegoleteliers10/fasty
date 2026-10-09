@@ -3,7 +3,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 use gpui::{
     div, prelude::*, px, size, Bounds, Context, CursorStyle, Div, FocusHandle, FontFeatures,
-    FontWeight, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    FontWeight, Hsla, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     Render, ScrollHandle, ScrollWheelEvent, SharedString, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
@@ -18,7 +18,7 @@ use crate::event_listener::EventSender;
 use crate::git::GitStatus;
 use crate::pane_tree::{Direction, PaneId, PaneNode, PaneTree, SplitDirection, TerminalPane};
 use crate::program_status::{ProgramRecord, ProgramState};
-use crate::terminal_state::{AppEvent, TerminalState};
+use crate::terminal_state::{AppEvent, MouseWheelDirection, TerminalState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
@@ -2066,6 +2066,7 @@ pub struct RootView {
     theme: Theme,
     tabs: Vec<TabData>,
     active_tab_idx: usize,
+    kitty_pressed_keys: std::collections::HashMap<String, (Arc<TerminalState>, crate::kitty_keyboard::PressedKey)>,
     next_tab_id: usize,
     pub next_pane_id: usize,
     focus_handle: FocusHandle,
@@ -2517,6 +2518,7 @@ impl RootView {
             theme,
             tabs: Vec::new(),
             active_tab_idx: 0,
+            kitty_pressed_keys: std::collections::HashMap::new(),
             next_tab_id: 1,
             next_pane_id: 1,
             focus_handle,
@@ -7234,6 +7236,19 @@ impl RootView {
         cx.stop_propagation();
     }
 
+    fn handle_key_up(
+        &mut self,
+        event: &KeyUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.to_lowercase();
+        if let Some((terminal, pressed)) = self.kitty_pressed_keys.remove(&key) {
+            terminal.write_to_pty(&crate::kitty_keyboard::encode_key_up(pressed));
+        }
+        cx.stop_propagation();
+    }
+
     fn process_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -8735,6 +8750,11 @@ impl RootView {
         let Some(ref terminal) = active_tab.terminal else {
             return;
         };
+        if let Some((pressed_terminal, _)) = self.kitty_pressed_keys.get(&key_lower) {
+            if !Arc::ptr_eq(pressed_terminal, terminal) {
+                return;
+            }
+        }
 
         self.last_cursor_activity = std::time::Instant::now();
         self.cursor_blink_visible = true;
@@ -8937,6 +8957,25 @@ impl RootView {
             }
         };
 
+        if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+            if let Some(terminal) = tab.terminal.as_ref() {
+                let mode = *terminal.term().lock().mode();
+                let key_id = key_lower.clone();
+                let repeat = self.kitty_pressed_keys.contains_key(&key_id);
+                if let Some((bytes, pressed)) =
+                    crate::kitty_keyboard::encode_key_down(&event.keystroke, mode, repeat)
+                {
+                    if let Some(pressed) = pressed {
+                        self.kitty_pressed_keys
+                            .insert(key_id, (terminal.clone(), pressed));
+                    }
+                    terminal.write_to_pty(&bytes);
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
         if let Some(bytes) = bytes_to_send {
             terminal.write_to_pty(&bytes);
             cx.notify();
@@ -9134,13 +9173,12 @@ impl RootView {
 
         self.pressed_mouse_button = Some(event.button);
 
-        let is_right_click = event.button == MouseButton::Right;
-
-        if terminal.is_mouse_mode_enabled() && !is_right_click && event.click_count < 2 {
+        if terminal.is_mouse_mode_enabled() {
             let btn = match event.button {
                 MouseButton::Left => 0,
                 MouseButton::Middle => 1,
-                _ => 0,
+                MouseButton::Right => 2,
+                _ => return,
             };
             terminal.send_mouse_button_with_mods(
                 btn,
@@ -9954,19 +9992,18 @@ impl RootView {
             return;
         };
 
-        let (_, line_h) = self.measure_cell_metrics(_window);
+        let (cell_w, line_h) = self.measure_cell_metrics(_window);
         let px_per_line = if line_h > 0.0 { line_h } else { 18.0 };
 
-        let delta_y = match event.delta {
-            gpui::ScrollDelta::Pixels(p) => p.y.as_f32(),
-            gpui::ScrollDelta::Lines(l) => l.y * px_per_line * 3.0,
+        let (delta_x, delta_y) = match event.delta {
+            gpui::ScrollDelta::Pixels(p) => (p.x.as_f32(), p.y.as_f32()),
+            gpui::ScrollDelta::Lines(l) => (l.x * px_per_line * 3.0, l.y * px_per_line * 3.0),
         };
 
-        if delta_y.abs() > 0.1 {
+        if delta_x.abs() > 0.1 || delta_y.abs() > 0.1 {
             self.last_scroll_activity = std::time::Instant::now();
             self.last_scrolled_pane_id = target_pane_id;
             if terminal.is_mouse_mode_enabled() {
-                let (cell_w, _) = self.measure_cell_metrics(_window);
                 let (pane_x, pane_y) = if let Some(b) = target_bounds {
                     (b.origin.x.to_f64() as f32, b.origin.y.to_f64() as f32)
                 } else {
@@ -9977,12 +10014,21 @@ impl RootView {
                 let local_y = (mouse_y - pane_y).max(0.0);
                 let col = ((local_x / cell_w).floor() as usize) + 1;
                 let row = ((local_y / px_per_line).floor() as usize) + 1;
-                let btn = if delta_y > 0.0 { 64 } else { 65 };
-                terminal.send_mouse_button_with_mods(
-                    btn,
+                let direction = if delta_x.abs() > delta_y.abs() {
+                    if delta_x > 0.0 {
+                        MouseWheelDirection::Left
+                    } else {
+                        MouseWheelDirection::Right
+                    }
+                } else if delta_y > 0.0 {
+                    MouseWheelDirection::Up
+                } else {
+                    MouseWheelDirection::Down
+                };
+                terminal.send_mouse_wheel_with_mods(
+                    direction,
                     col,
                     row,
-                    true,
                     event.modifiers.shift,
                     event.modifiers.alt,
                     event.modifiers.control,
@@ -11224,6 +11270,7 @@ impl Render for RootView {
                             .track_focus(&self.focus_handle)
                             .key_context("RootView")
                             .on_key_down(cx.listener(Self::handle_key_down))
+                            .on_key_up(cx.listener(Self::handle_key_up))
                             .on_scroll_wheel(cx.listener(Self::handle_scroll))
                             .on_mouse_move(cx.listener(Self::handle_mouse_move))
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
