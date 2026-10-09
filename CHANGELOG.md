@@ -3,6 +3,32 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.21.5 - 2026-10-09
+
+### AI panel
+
+- Show thinking output in a collapsible block.
+- Open tool calls to inspect their input and output.
+- Show hosted agent tool names and streamed tool arguments. Keep tool details inside the panel.
+- Keep AI permission prompts tied to their conversation during background turns.
+
+### Terminal
+
+- Select text by dragging in terminal apps that use mouse reporting. Keep clicks available to the app.
+
+## 0.21.4 - 2026-10-08
+
+### Terminal compatibility
+
+- Add a compatibility matrix for terminal protocols and mark Sixel as unsupported.
+- Add Kitty keyboard encoding for Unicode and functional keys, modifiers, repeats, releases, and associated text.
+- Add shell integration hooks for Bash, Zsh, Fish, PowerShell, and Nushell.
+- Improve Kitty clipboard packet handling for chunked data, MIME aliases, response errors, and bounded image decoding.
+- Improve Kitty graphics parsing, image limits, file reads, image queries, and deletion at the cursor.
+- Add X10 mouse tracking and UTF-8 mouse coordinates. Report wheel and motion events with modifiers.
+- Group synchronized output updates and release the update after a 150 ms timeout.
+- Set `COLORTERM=truecolor` for launched shells.
+
 ## 0.21.3 - 2026-10-08
 
 ### Fonts
