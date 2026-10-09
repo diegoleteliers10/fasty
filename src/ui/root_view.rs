@@ -2291,6 +2291,7 @@ pub struct RootView {
     pub ai_permission_checker: std::sync::Arc<crate::ai::PermissionChecker>,
     pub ai_agent_mode: String,
     pub ai_expanded_thinkings: std::collections::HashSet<usize>,
+    pub ai_expanded_tools: std::collections::HashSet<String>,
     pub ai_attached_files: Vec<std::path::PathBuf>,
     pub ai_at_menu_open: bool,
     pub ai_at_is_skill_menu: bool,
@@ -2720,6 +2721,7 @@ impl RootView {
             )),
             ai_agent_mode: "Agent".to_string(),
             ai_expanded_thinkings: std::collections::HashSet::new(),
+            ai_expanded_tools: std::collections::HashSet::new(),
             ai_attached_files: Vec::new(),
             ai_at_menu_open: false,
             ai_at_is_skill_menu: false,
@@ -6462,6 +6464,15 @@ impl RootView {
         .opencode_variants(opencode_variants, opencode_variant)
         .opencode_variants_open(self.ai_opencode_variants_open)
         .expanded_thinkings(self.ai_expanded_thinkings.clone())
+        .expanded_tools(self.ai_expanded_tools.clone())
+        .on_toggle_tool(cx.listener(|this, target: &String, _window, cx| {
+            if this.ai_expanded_tools.contains(target) {
+                this.ai_expanded_tools.remove(target);
+            } else {
+                this.ai_expanded_tools.insert(target.clone());
+            }
+            cx.notify();
+        }))
         .cwd(active_cwd)
         .git_branch(active_branch)
         .context_pct(context_pct)
@@ -17085,6 +17096,30 @@ mod ligature_tests {
         assert_eq!(tool_name_from_title("skill", ""), "Skill");
         // A path-like token is not a tool name; `kind` decides instead.
         assert_eq!(tool_name_from_title("src/main.rs", "read"), "Read");
+    }
+
+    #[test]
+    fn acp_content_envelope_is_unwrapped_for_display() {
+        use crate::ui::ai_sidebar::extract_output_text;
+        // ACP wraps output in content arrays; the text is what matters.
+        assert_eq!(
+            extract_output_text(r#"[{"type":"content","content":{"text":"hello"}}]"#),
+            "hello"
+        );
+        assert_eq!(extract_output_text(r#"{"output":"done"}"#), "done");
+        assert_eq!(extract_output_text(r#"{"error":"boom"}"#), r#"{"error":"boom"}"#);
+        assert_eq!(extract_output_text(""), "");
+    }
+
+    #[test]
+    fn args_are_pretty_printed_and_tolerated() {
+        use crate::ui::ai_sidebar::pretty_args;
+        let pretty = pretty_args(r#"{"path":"a.rs","limit":10}"#);
+        assert!(pretty.contains('\n'), "expected multi-line: {pretty}");
+        assert!(pretty.contains("\"path\": \"a.rs\""));
+        assert_eq!(pretty_args(""), "");
+        // Non-JSON input (a bare command string) must survive untouched.
+        assert_eq!(pretty_args("ls -la"), "ls -la");
     }
 
     #[test]

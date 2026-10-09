@@ -161,6 +161,9 @@ pub struct AiSidebar {
     pub on_model_click: Option<MouseDownCallback>,
     pub on_toggle_mode: Option<Box<dyn Fn(&String, &mut Window, &mut App) + 'static>>,
     pub expanded_thinkings: std::collections::HashSet<usize>,
+    /// Tool calls whose input/output detail is expanded, keyed by tool id.
+    pub expanded_tools: std::collections::HashSet<String>,
+    pub on_toggle_tool: Option<std::rc::Rc<dyn Fn(&String, &mut Window, &mut App) + 'static>>,
     pub on_toggle_thinking: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
     pub attached_files: Vec<std::path::PathBuf>,
     pub on_remove_attachment: Option<Box<dyn Fn(&usize, &mut Window, &mut App) + 'static>>,
@@ -247,6 +250,8 @@ impl AiSidebar {
             on_model_click: None,
             on_toggle_mode: None,
             expanded_thinkings: std::collections::HashSet::new(),
+            expanded_tools: std::collections::HashSet::new(),
+            on_toggle_tool: None,
             on_toggle_thinking: None,
             attached_files: Vec::new(),
             on_remove_attachment: None,
@@ -508,6 +513,19 @@ impl AiSidebar {
         handler: impl Fn(&String, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_toggle_mode = Some(Box::new(handler));
+        self
+    }
+
+    pub fn expanded_tools(mut self, set: std::collections::HashSet<String>) -> Self {
+        self.expanded_tools = set;
+        self
+    }
+
+    pub fn on_toggle_tool(
+        mut self,
+        handler: impl Fn(&String, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_toggle_tool = Some(std::rc::Rc::new(handler));
         self
     }
 
@@ -881,6 +899,134 @@ pub(crate) fn tool_name_from_title(title: &str, kind: &str) -> String {
 }
 
 /// `exa_web_search` -> `Exa Web Search`, `todowrite` -> `Todowrite`.
+/// Pretty-prints tool arguments, tolerating input that is not valid JSON.
+pub(crate) fn pretty_args(args: &str) -> String {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .map(|value| serde_json::to_string_pretty(&value).unwrap_or_else(|_| trimmed.to_string()))
+        .unwrap_or_else(|_| trimmed.to_string())
+}
+
+/// ACP wraps tool output in a `content` array of `{type, content:{text}}`,
+/// so the useful text is buried a few levels down. Unwrap it for display.
+pub(crate) fn extract_output_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return trimmed.to_string();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut collect = |node: &serde_json::Value| {
+        if let Some(text) = node.get("text").and_then(serde_json::Value::as_str) {
+            parts.push(text.to_string());
+        }
+    };
+    if let Some(items) = value.as_array() {
+        for item in items {
+            collect(item);
+            if let Some(nested) = item.get("content") {
+                collect(nested);
+            }
+        }
+    } else {
+        collect(&value);
+        if let Some(text) = value.get("output").and_then(serde_json::Value::as_str) {
+            parts.push(text.to_string());
+        }
+    }
+    let joined = parts
+        .into_iter()
+        .map(|part| part.trim_end().to_string())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if joined.is_empty() {
+        trimmed.to_string()
+    } else {
+        joined
+    }
+}
+
+/// Caps detail text so a large output cannot lock up the sidebar, noting how
+/// much was dropped.
+fn clamp_detail(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= max_lines {
+        return text.to_string();
+    }
+    let kept: Vec<&str> = lines.iter().take(max_lines).copied().collect();
+    format!(
+        "{}\n… {} more line{}",
+        kept.join("\n"),
+        lines.len() - max_lines,
+        if lines.len() - max_lines == 1 { "" } else { "s" }
+    )
+}
+
+/// The expanded panel under a tool row: the arguments it was called with and
+/// what it returned. This is the only record of what a tool actually did.
+fn render_tool_detail(tc: &AiUiToolCall, theme: &Theme) -> impl IntoElement {
+    let label = |text: &str| {
+        div()
+            .text_size(px(10.))
+            .text_color(theme.muted)
+            .child(SharedString::from(text.to_uppercase()))
+    };
+    let body = |text: &str, color: Hsla| {
+        div()
+            .text_size(px(11.))
+            .text_color(color)
+            .whitespace_nowrap()
+            .child(SharedString::from(clamp_detail(text, 40)))
+    };
+
+    let mut sections: Vec<gpui::AnyElement> = Vec::new();
+    let args = pretty_args(&tc.args);
+    if !args.is_empty() {
+        sections.push(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(label("input"))
+                .child(body(&args, theme.muted_strong))
+                .into_any_element(),
+        );
+    }
+    if let Some(output) = tc.output.as_deref() {
+        let text = extract_output_text(output);
+        if !text.trim().is_empty() {
+            sections.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(label("output"))
+                    .child(body(&text, if tc.is_error { theme.bright_red } else { theme.foreground }))
+                    .into_any_element(),
+            );
+        }
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .gap_2()
+        .px(px(10.))
+        .py(px(6.))
+        .rounded(px(6.))
+        .bg(theme.surface)
+        .border_1()
+        .border_color(theme.border)
+        .children(sections)
+}
+
 pub(crate) fn humanize_tool_name(name: &str) -> String {
     let cleaned = name.replace(['_', '-'], " ");
     let words: Vec<String> = cleaned
@@ -2160,6 +2306,8 @@ impl RenderOnce for AiSidebar {
         let on_select_message_char = self.on_select_message_char.clone();
         let on_drag_message_char = self.on_drag_message_char.clone();
         let expanded_thinkings = self.expanded_thinkings;
+        let expanded_tools = self.expanded_tools;
+        let on_toggle_tool = self.on_toggle_tool.clone();
 
         let input_val = self.input_text.clone();
         let display_cwd = format_cwd_display(&self.cwd);
@@ -2823,25 +2971,51 @@ impl RenderOnce for AiSidebar {
                                                              false,
                                                          )
                                                      };
-                                                 let show_card = is_edit || tc.diff.is_some();
-                                                 div()
-                                                     .flex()
-                                                     .flex_col()
-                                                     .w_full()
-                                                     .gap_1()
-                                                     .child(
-                                                     div()
-                                                     .flex()
-                                                     .flex_row()
-                                                     .items_center()
-                                                     .justify_between()
-                                                     .px(px(10.))
-                                                     .py(px(6.))
-                                                     .rounded(px(6.))
-                                                     .bg(theme.surface)
-                                                     .border_1()
-                                                     .border_color(theme.border)
-                                                     .child(
+let show_card = is_edit || tc.diff.is_some();
+                                                  // Output is the only way to tell
+                                                  // what a call actually did, so any
+                                                  // row with a subject or output can
+                                                  // be opened.
+                                                  let tool_is_open = expanded_tools.contains(&tc.id);
+                                                  let tool_detail = if tool_is_open {
+                                                      Some(render_tool_detail(&tc, &theme))
+                                                  } else {
+                                                      None
+                                                  };
+                                                  let tool_toggle = on_toggle_tool.clone();
+                                                  div()
+                                                      .flex()
+                                                      .flex_col()
+                                                      .w_full()
+                                                      .gap_1()
+                                                      .child(
+                                                      div()
+                                                      .id(ElementId::named_usize(
+                                                          "ai-tool-header",
+                                                          tc_idx,
+                                                      ))
+                                                      .flex()
+                                                      .flex_row()
+                                                      .items_center()
+                                                      .justify_between()
+                                                      .px(px(10.))
+                                                      .py(px(6.))
+                                                      .rounded(px(6.))
+                                                      .bg(theme.surface)
+                                                      .border_1()
+                                                      .border_color(theme.border)
+                                                      .cursor(CursorStyle::PointingHand)
+                                                      .hover(move |s| s.bg(theme.hover))
+                                                      .on_mouse_down(MouseButton::Left, {
+                                                          let tool_toggle = tool_toggle.clone();
+                                                          let tool_id = tc.id.clone();
+                                                          move |_ev, window, cx| {
+                                                              if let Some(ref cb) = tool_toggle {
+                                                                  cb(&tool_id, window, cx);
+                                                              }
+                                                          }
+                                                      })
+                                                      .child(
                                                         div()
                                                             .flex()
                                                             .flex_row()
@@ -2913,8 +3087,9 @@ impl RenderOnce for AiSidebar {
                                                              })
                                                      )
                                                      )
-                                                     .when(show_card, |d| {
-                                                         d.child(render_tool_diff_card(
+.when_some(tool_detail, |d, detail| d.child(detail))
+                                                      .when(show_card, |d| {
+                                                          d.child(render_tool_diff_card(
                                                              &theme,
                                                              &card_diff,
                                                              awaiting.is_some(),
