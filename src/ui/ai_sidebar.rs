@@ -747,9 +747,11 @@ pub(crate) struct ParsedToolRow {
 /// Argument keys worth showing as the row's subject, most specific first.
 /// Agents that host their own tools send their own key names, so a closed list
 /// of fastty's own keys left every such call falling back to raw JSON.
-pub(crate) const TOOL_SUBJECT_KEYS: [&str; 12] = [
-    "command", "file_path", "filePath", "path", "pattern", "query", "url", "glob",
-    "description", "title", "prompt", "content",
+pub(crate) // `title`, `description` and `summary` are deliberately absent: they are
+// prose, so they go through the prose-tail path below instead of being shown
+// whole.
+const TOOL_SUBJECT_KEYS: [&str; 9] = [
+    "command", "file_path", "filePath", "path", "pattern", "query", "url", "glob", "prompt",
 ];
 
 /// Picks the most informative argument as the row's subject, or `None` when the
@@ -765,6 +767,30 @@ pub(crate) fn tool_subject(args: &str) -> Option<String> {
             }
         }
     }
+    // A prose title ("Read src/main.rs", "Websearch rust async") carries the
+    // subject after the verb. Use that remainder, which is what the row should
+    // show, instead of dropping it and leaving the row blank.
+    for key in ["title", "description", "summary", "prompt", "name"] {
+        if let Some(text) = obj.get(key).and_then(|v| v.as_str()) {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let mut words = trimmed.split_whitespace();
+            let head = words.next().unwrap_or_default();
+            let rest = words.collect::<Vec<_>>().join(" ");
+            // "Read src/main.rs" -> "src/main.rs". A single-word title has no
+            // tail to strip, so keep it as-is.
+            let subject = if rest.is_empty() {
+                trimmed.to_string()
+            } else if is_prose_verb(head) {
+                rest
+            } else {
+                trimmed.to_string()
+            };
+            return Some(subject.replace(['\n', '\r'], " "));
+        }
+    }
     // Nothing recognisable: summarise as `key: value` pairs rather than
     // printing the raw JSON blob, which is what made these rows unreadable.
     let pairs: Vec<String> = obj
@@ -774,8 +800,21 @@ pub(crate) fn tool_subject(args: &str) -> Option<String> {
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            let rendered = rendered.trim().replace('\n', " ");
-            (!rendered.is_empty()).then(|| format!("{k}: {rendered}"))
+            let rendered = rendered.trim().replace(['\n', '\r'], " ");
+            if rendered.is_empty() {
+                return None;
+            }
+            // A working directory on its own reads better as the bare path;
+            // "cwd: /Users/..." just added a label nobody asked for.
+            let bare = matches!(
+                k.as_str(),
+                "cwd" | "dir" | "directory" | "root" | "workdir" | "working_directory"
+            );
+            Some(if bare {
+                rendered
+            } else {
+                format!("{k}: {rendered}")
+            })
         })
         .collect();
     (!pairs.is_empty()).then(|| pairs.join(" · "))
@@ -795,6 +834,45 @@ pub(crate) fn tool_label(name: &str) -> (IconType, Option<&'static str>) {
         _ => (IconType::Sparkles, ""),
     };
     (known.0, Some(known.1).filter(|s| !s.is_empty()))
+}
+
+/// True for a leading verb like "Read", "Websearch" or "Fetch" — but not for a
+/// path ("src/main.rs"), a range (`35,90p`) or a flag (`-rf`).
+fn is_prose_verb(word: &str) -> bool {
+    !word.is_empty()
+        && word.chars().all(|c| c.is_alphabetic() || c == '_')
+        && word.chars().next().is_some_and(|c| c.is_uppercase())
+}
+
+/// Recovers the tool identifier from an ACP `title` and falls back to `kind`.
+///
+/// ACP titles are prose written for humans, e.g. "Read src/main.rs" or
+/// "Websearch rust async", and `kind` is one of `read`, `edit`, `search`,
+/// `execute`, `fetch`, `other`. Taking the title verbatim as the tool name
+/// produced rows labelled "Fasty Fasty Run Command".
+pub(crate) fn tool_name_from_title(title: &str, kind: &str) -> String {
+    let trimmed = title.trim();
+    // A title that is exactly one token is already a name ("bash", "Task") —
+    // but only when it looks like a name and not a bare path ("src/main.rs").
+    if !trimmed.is_empty() && !trimmed.contains(char::is_whitespace) && is_prose_verb(trimmed) {
+        return humanize_tool_name(trimmed);
+    }
+    // Otherwise lead with the leading verb, which is the tool in disguise.
+    if let Some(first) = trimmed.split_whitespace().next() {
+        if is_prose_verb(first) {
+            return humanize_tool_name(first);
+        }
+    }
+    match kind {
+        "read" => "Read".to_string(),
+        "edit" => "Edit".to_string(),
+        "search" => "Search".to_string(),
+        "execute" => "Bash".to_string(),
+        "fetch" => "Fetch".to_string(),
+        "think" => "Think".to_string(),
+        "other" | "" => "Tool".to_string(),
+        other => humanize_tool_name(other),
+    }
 }
 
 /// `exa_web_search` -> `Exa Web Search`, `todowrite` -> `Todowrite`.
@@ -838,14 +916,10 @@ pub(crate) fn parse_tool_row(tc: &AiUiToolCall) -> ParsedToolRow {
         tool_subject(&tc.args).unwrap_or_default()
     };
 
-    let cleaned_target = raw_target.replace('\n', " ");
-    let max_len = 28;
-    let target = if cleaned_target.chars().count() > max_len {
-        let truncated: String = cleaned_target.chars().take(max_len).collect();
-        format!("{}...", truncated.trim_end())
-    } else {
-        cleaned_target
-    };
+    // Truncation is handled in CSS (`.truncate()`), which adapts to the
+    // sidebar's actual width. Clamping to a fixed character count here threw
+    // away space and cut subjects mid-word regardless of room available.
+    let target = raw_target.replace(['\n', '\r'], " ");
 
     let status_text = if tc.is_running {
         "running".to_string()
@@ -2771,25 +2845,29 @@ impl RenderOnce for AiSidebar {
                                                             .flex_1()
                                                             .min_w(px(0.))
                                                             .overflow_hidden()
-                                                            .child(crate::ui::icons::render_icon(
-                                                                info.icon_type,
-                                                                theme.muted,
-                                                                12.0,
-                                                            ))
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(12.))
-                                                                    .text_color(theme.muted_strong)
-                                                                    .flex_shrink_0()
-                                                                    .child(SharedString::from(info.action)),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(12.))
-                                                                    .text_color(theme.foreground)
-                                                                    .overflow_hidden()
-                                                                    .child(SharedString::from(info.target)),
-                                                            ),
+.child(div()
+                                                                     .flex_shrink_0()
+                                                                     .child(crate::ui::icons::render_icon(
+                                                                         info.icon_type,
+                                                                         theme.muted,
+                                                                         12.0,
+                                                                     )))
+                                                             .child(
+                                                                 div()
+                                                                     .text_size(px(12.))
+                                                                     .text_color(theme.muted_strong)
+                                                                     .flex_shrink_0()
+                                                                     .child(SharedString::from(info.action)),
+                                                             )
+                                                             .child(
+                                                                 div()
+                                                                     .text_size(px(12.))
+                                                                     .text_color(theme.foreground)
+                                                                     .flex_1()
+                                                                     .min_w(px(0.))
+                                                                     .truncate()
+                                                                     .child(SharedString::from(info.target)),
+                                                             ),
                                                     )
                                                     .child(
                                                         div()

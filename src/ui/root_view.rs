@@ -1816,8 +1816,25 @@ fn run_opencode_turn(
             }
             crate::ai::opencode::OpencodeEvent::ToolUpdate(update) => {
                 let id = update.get("toolCallId").and_then(serde_json::Value::as_str).unwrap_or("tool").to_string();
-                let name = update.get("title").and_then(serde_json::Value::as_str).unwrap_or("ACP tool").to_string();
-                let args = update.get("rawInput").map(|value| value.to_string()).unwrap_or_default();
+                // ACP `title` is prose ("Read src/main.rs"), not a tool identifier, so it
+                // used to be pushed in as the name and then treated as one long
+                // word by the label humaniser.
+                let title = update
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let kind = update
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let name = crate::ui::ai_sidebar::tool_name_from_title(title, kind);
+                let args = update
+                    .get("rawInput")
+                    .or_else(|| update.get("input"))
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
                 if !active_tools.contains_key(&id) {
                     active_tools.insert(id.clone(), name.clone());
                     let _ = event_tx.send_blocking(crate::ai::AgentEvent::ToolStart { id: id.clone(), name: name.clone(), args });
@@ -17011,8 +17028,38 @@ mod ligature_tests {
     // rendered as `Tool {"cwd":"/Users/kagesyntax/Do...`.
     mod hosted_agent_tool_rows {
     use crate::ui::ai_sidebar::{
-        humanize_tool_name, parse_tool_row, tool_label, tool_subject, AiUiToolCall,
+        humanize_tool_name, parse_tool_row, tool_label, tool_name_from_title, tool_subject,
+        AiUiToolCall,
     };
+
+    #[test]
+    fn acp_prose_titles_yield_the_tool_not_the_sentence() {
+        assert_eq!(tool_name_from_title("Read src/main.rs", "read"), "Read");
+        assert_eq!(
+            tool_name_from_title("Fasty Fasty Run Command", ""),
+            "Fasty"
+        );
+        assert_eq!(tool_name_from_title("Webfetch", "fetch"), "Webfetch");
+        // No verb to lead with: fall back to the protocol's own `kind`.
+        assert_eq!(tool_name_from_title("src/main.rs", "read"), "Read");
+        assert_eq!(tool_name_from_title("", "execute"), "Bash");
+        assert_eq!(tool_name_from_title("", "fetch"), "Fetch");
+        assert_eq!(tool_name_from_title("", ""), "Tool");
+    }
+
+    #[test]
+    fn prose_subject_keeps_the_meaningful_tail() {
+        assert_eq!(
+            tool_subject(r#"{"title":"Read src/main.rs"}"#).unwrap(),
+            "src/main.rs"
+        );
+        assert_eq!(
+            tool_subject(r#"{"description":"Search the cargo registry"}"#).unwrap(),
+            "the cargo registry"
+        );
+        // Single-word titles have no tail, so keep them whole.
+        assert_eq!(tool_subject(r#"{"title":"Task"}"#).unwrap(), "Task");
+    }
 
     fn tool_row(name: &str, args: &str) -> crate::ui::ai_sidebar::ParsedToolRow {
         parse_tool_row(&AiUiToolCall {
@@ -17042,9 +17089,12 @@ mod ligature_tests {
 
     #[test]
     fn tool_subject_never_falls_back_to_raw_json() {
+        // A working directory reads better as the bare path.
         let got = tool_subject(r#"{"cwd":"/Users/kagesyntax/Documents"}"#).unwrap();
-        assert_eq!(got, "cwd: /Users/kagesyntax/Documents");
+        assert_eq!(got, "/Users/kagesyntax/Documents");
         assert!(!got.contains('{'), "must not leak raw JSON: {got}");
+        // Unrecognised keys keep their name so the row stays explicable.
+        assert_eq!(tool_subject(r#"{"foo":"bar"}"#).unwrap(), "foo: bar");
         assert_eq!(tool_subject("{}"), None);
         assert_eq!(tool_subject("not json"), None);
     }
@@ -17060,18 +17110,12 @@ mod ligature_tests {
 
     #[test]
     fn bash_call_with_cwd_renders_readable_row() {
-        // Short argument: shown verbatim.
-        assert_eq!(tool_row("bash", r#"{"cwd":"/tmp"}"#).target, "cwd: /tmp");
-        // Long argument: truncated on purpose, but still never raw JSON.
-        let long = tool_row("bash", r#"{"cwd":"/Users/kagesyntax/Documents"}"#);
-        assert_eq!(long.action, "Bash");
-        assert!(
-            long.target.starts_with("cwd: /Users/kagesyntax"),
-            "got: {}",
-            long.target
-        );
-        assert!(long.target.ends_with("..."), "got: {}", long.target);
-        assert!(!long.target.starts_with('{'), "got: {}", long.target);
+        // No character clamp any more — the row ellipsises in CSS to whatever
+        // width the sidebar actually has.
+        let got = tool_row("bash", r#"{"cwd":"/Users/kagesyntax/Documents"}"#);
+        assert_eq!(got.action, "Bash");
+        assert_eq!(got.target, "/Users/kagesyntax/Documents");
+        assert!(!got.target.starts_with('{'), "got: {}", got.target);
     }
 
     #[test]
