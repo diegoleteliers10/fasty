@@ -1027,8 +1027,26 @@ fn render_tool_detail(tc: &AiUiToolCall, theme: &Theme) -> impl IntoElement {
         .children(sections)
 }
 
+/// Drops a leading word that the name immediately repeats.
+///
+/// OpenCode exposes MCP tools as `<server>_<tool>`, and Fastty's MCP server is
+/// named "fastty" while its tools are themselves named `fastty_*`. The result
+/// arriving on the wire is `fastty_fastty_split_pane`, which humanised to
+/// "Fasty Fasty Split Pane".
+fn strip_server_prefix(name: &str) -> &str {
+    if let Some((first, rest)) = name.split_once('_') {
+        if rest.len() > first.len() && rest.starts_with(first) {
+            let trimmed = &rest[first.len()..];
+            if let Some(stripped) = trimmed.strip_prefix('_') {
+                return stripped;
+            }
+        }
+    }
+    name
+}
+
 pub(crate) fn humanize_tool_name(name: &str) -> String {
-    let cleaned = name.replace(['_', '-'], " ");
+    let cleaned = strip_server_prefix(name).replace(['_', '-'], " ");
     let words: Vec<String> = cleaned
         .split_whitespace()
         .map(|w| {

@@ -17089,6 +17089,25 @@ mod ligature_tests {
     /// OpenCode's ACP layer emits `title: input.command ?? state.title ??
     /// toolName` for bash, and `title: state.title || toolName` otherwise. So
     /// the fallback is the raw tool name, usually lowercase.
+    /// OpenCode namespaces MCP tools as `<server>_<tool>`. Fastty's server is
+/// named "fastty" and its tools are already `fastty_*`, so the wire name is
+/// `fastty_fastty_split_pane`.
+#[test]
+    fn repeated_server_prefix_is_collapsed() {
+        assert_eq!(
+            humanize_tool_name("fastty_fastty_split_pane"),
+            "Split Pane"
+        );
+        assert_eq!(
+            humanize_tool_name("fastty_fastty_write_session"),
+            "Write Session"
+        );
+        // A single prefix is the normal shape and must be left alone.
+        assert_eq!(humanize_tool_name("fastty_layout"), "Fastty Layout");
+        assert_eq!(humanize_tool_name("exa_web_search"), "Exa Web Search");
+        assert_eq!(humanize_tool_name("todowrite"), "Todowrite");
+    }
+
     #[test]
     fn lowercase_bare_tool_names_are_names_not_prose() {
         assert_eq!(tool_name_from_title("websearch", ""), "Websearch");
