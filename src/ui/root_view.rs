@@ -2204,7 +2204,6 @@ pub struct RootView {
     pub has_selection_dragged: bool,
     pub selection_start: Option<alacritty_terminal::index::Point>,
     pub selection_mouse_pos: Option<(f32, f32)>,
-    pub selection_anchor_mouse_pos: Option<(f32, f32)>,
     pub selection_autoscroll_accum: f32,
     pub cursor_window_pos: Option<(f32, f32)>,
     pub hovered_url: Option<String>,
@@ -2241,7 +2240,8 @@ pub struct RootView {
     pub is_whats_new_open: bool,
     pub whats_new_notes: Option<String>,
     pub pending_close: Option<PendingClose>,
-    pub pressed_mouse_button: Option<MouseButton>,
+    pub pressed_mouse_buttons: Vec<MouseButton>,
+    pub reported_mouse_buttons: Vec<MouseButton>,
     pub(crate) ime_marked_text: Option<String>,
     pub last_config_version: u64,
     pub is_dragging_pane_split: bool,
@@ -2647,7 +2647,6 @@ impl RootView {
             has_selection_dragged: false,
             selection_start: None,
             selection_mouse_pos: None,
-            selection_anchor_mouse_pos: None,
             selection_autoscroll_accum: 0.0,
             cursor_window_pos: None,
             hovered_url: None,
@@ -2676,7 +2675,8 @@ impl RootView {
             is_whats_new_open: show_whats_new,
             whats_new_notes: crate::whats_new::notes_for(env!("CARGO_PKG_VERSION")),
             pending_close: None,
-            pressed_mouse_button: None,
+            pressed_mouse_buttons: Vec::new(),
+            reported_mouse_buttons: Vec::new(),
             ime_marked_text: None,
             last_config_version: crate::config::current_config_version(),
             is_dragging_pane_split: false,
@@ -9205,20 +9205,21 @@ impl RootView {
         let col = ((local_x / cell_w).floor() as usize) + 1;
         let row = ((local_y / line_h).floor() as usize) + 1;
 
-        self.pressed_mouse_button = Some(event.button);
+        if !self.pressed_mouse_buttons.contains(&event.button) {
+            self.pressed_mouse_buttons.push(event.button);
+        }
 
         let is_right_click = event.button == MouseButton::Right;
 
-        if terminal.is_mouse_mode_enabled()
-            && event.button != MouseButton::Left
-            && !is_right_click
-            && event.click_count < 2
-        {
+        if terminal.is_mouse_mode_enabled() && !is_right_click {
             let btn = match event.button {
                 MouseButton::Left => 0,
                 MouseButton::Middle => 1,
                 _ => 0,
             };
+            if !self.reported_mouse_buttons.contains(&event.button) {
+                self.reported_mouse_buttons.push(event.button);
+            }
             terminal.send_mouse_button_with_mods(
                 btn,
                 col,
@@ -9372,7 +9373,6 @@ impl RootView {
             self.selection_start = Some(start_point);
             self.selection = None;
             self.selection_mouse_pos = Some((mouse_x, mouse_y));
-            self.selection_anchor_mouse_pos = Some((mouse_x, mouse_y));
             cx.notify();
         } else if event.button == MouseButton::Right {
             // Right click: If no selection yet, select word under cursor if present, and open context menu
@@ -9591,7 +9591,7 @@ impl RootView {
         let (cell_w, line_h) = self.measure_cell_metrics(_window);
 
         // Terminal mouse motion reporting (for active pane if dragging, or hovered pane if moving)
-        let motion_pane = if self.pressed_mouse_button.is_some() {
+        let motion_pane = if !self.pressed_mouse_buttons.is_empty() {
             active_tab.pane_tree.active_pane()
         } else {
             hovered_pane
@@ -9601,7 +9601,7 @@ impl RootView {
 
         if let Some(ref pane) = motion_pane {
             if let Some(ref term) = pane.terminal {
-                if term.is_mouse_mode_enabled() && !self.is_selecting {
+                if term.is_mouse_mode_enabled() {
                     let (pane_x, pane_y) = if let Some(b) = pane.last_bounds {
                         (b.origin.x.to_f64() as f32, b.origin.y.to_f64() as f32)
                     } else {
@@ -9609,9 +9609,12 @@ impl RootView {
                     };
                     let local_x = (cur_x - pane_x).max(0.0);
                     let local_y = (cur_y - pane_y).max(0.0);
-                    let left = self.pressed_mouse_button == Some(MouseButton::Left);
-                    let middle = self.pressed_mouse_button == Some(MouseButton::Middle);
-                    let right = self.pressed_mouse_button == Some(MouseButton::Right);
+                    let left = self.pressed_mouse_buttons.contains(&MouseButton::Left)
+                        && self.reported_mouse_buttons.contains(&MouseButton::Left);
+                    let middle = self.pressed_mouse_buttons.contains(&MouseButton::Middle)
+                        && self.reported_mouse_buttons.contains(&MouseButton::Middle);
+                    let right = self.pressed_mouse_buttons.contains(&MouseButton::Right)
+                        && self.reported_mouse_buttons.contains(&MouseButton::Right);
                     let col = ((local_x / cell_w).floor() as usize) + 1;
                     let row = ((local_y / line_h).floor() as usize) + 1;
                     term.send_mouse_motion(
@@ -9624,7 +9627,11 @@ impl RootView {
                         event.modifiers.alt,
                         event.modifiers.control,
                     );
-                    if self.pressed_mouse_button.is_some() {
+                    if self
+                        .pressed_mouse_buttons
+                        .iter()
+                        .any(|button| self.reported_mouse_buttons.contains(button))
+                    {
                         return;
                     }
                 }
@@ -9636,9 +9643,8 @@ impl RootView {
                 self.is_selecting = false;
                 self.has_selection_dragged = false;
                 self.selection_mouse_pos = None;
-                self.selection_anchor_mouse_pos = None;
                 self.selection_autoscroll_accum = 0.0;
-                self.pressed_mouse_button = None;
+                self.pressed_mouse_buttons.clear();
                 if self.config.copy_on_select {
                     if let Some(text) = self.get_selected_text() {
                         if let Some(mut clip) = crate::event_listener::clipboard_helper() {
@@ -9652,16 +9658,8 @@ impl RootView {
             let raw_x = cur_x;
             let raw_y = cur_y;
             self.selection_mouse_pos = Some((raw_x, raw_y));
-            self.has_selection_dragged = self
-                .selection_anchor_mouse_pos
-                .is_some_and(|(anchor_x, anchor_y)| {
-                    let dx = raw_x - anchor_x;
-                    let dy = raw_y - anchor_y;
-                    dx * dx + dy * dy >= 16.0
-                });
-            if self.has_selection_dragged {
-                self.update_selection_endpoint(_window, cx);
-            }
+            self.has_selection_dragged = true;
+            self.update_selection_endpoint(_window, cx);
             return;
         }
 
@@ -9777,9 +9775,11 @@ impl RootView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let was_selecting = self.is_selecting;
-        let selection_was_dragged = self.has_selection_dragged;
-        self.pressed_mouse_button = None;
+        let reported_mouse_button = self.reported_mouse_buttons.contains(&event.button);
+        self.reported_mouse_buttons
+            .retain(|button| *button != event.button);
+        self.pressed_mouse_buttons
+            .retain(|button| *button != event.button);
         self.is_dragging_scrollbar = false;
         self.dragging_scrollbar_pane_id = None;
         self.is_dragging_pane_split = false;
@@ -9800,7 +9800,6 @@ impl RootView {
         }
         self.dragging_split_path.clear();
         self.selection_mouse_pos = None;
-        self.selection_anchor_mouse_pos = None;
         self.has_selection_dragged = false;
         self.selection_autoscroll_accum = 0.0;
         if self.is_selecting {
@@ -9819,7 +9818,7 @@ impl RootView {
             if let Some(p) = active_pane.as_ref() {
                 if let Some(ref terminal) = p.terminal {
                     if terminal.is_mouse_mode_enabled()
-                        && (!was_selecting || !selection_was_dragged)
+                        && reported_mouse_button
                     {
                         let (cell_w, line_h) = self.measure_cell_metrics(_window);
                         let (pane_x, pane_y) = if let Some(b) = p.last_bounds {
@@ -9837,17 +9836,6 @@ impl RootView {
                             MouseButton::Right => 2,
                             _ => 0,
                         };
-                        if was_selecting && !selection_was_dragged {
-                            terminal.send_mouse_button_with_mods(
-                                btn,
-                                col,
-                                row,
-                                true,
-                                event.modifiers.shift,
-                                event.modifiers.alt,
-                                event.modifiers.control,
-                            );
-                        }
                         terminal.send_mouse_button_with_mods(
                             btn,
                             col,
