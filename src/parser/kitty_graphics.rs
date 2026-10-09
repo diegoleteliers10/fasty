@@ -166,10 +166,10 @@ pub fn parse_kitty_control(header: &[u8]) -> Option<KittyControl> {
         return None;
     }
     if let Some(delete_action) = ctrl.delete_action.as_mut() {
-        *delete_action = match delete_action {
+        *delete_action = match *delete_action {
             KittyDeleteAction::ById(_) => KittyDeleteAction::ById(ctrl.image_id?),
             KittyDeleteAction::ByPlacement(_) => KittyDeleteAction::ByPlacement(ctrl.placement_id?),
-            action => *action,
+            action => action,
         };
     }
     Some(ctrl)
@@ -247,11 +247,11 @@ pub fn decode_image_data(
         KittyFormat::Png => {
             let mut reader =
                 ImageReader::with_format(Cursor::new(raw_bytes), image::ImageFormat::Png);
-            reader.limits(Limits {
-                max_image_width: Some(MAX_IMAGE_DIMENSION),
-                max_image_height: Some(MAX_IMAGE_DIMENSION),
-                max_alloc: Some((MAX_IMAGE_PIXELS * 4) as u64),
-            });
+            let mut limits = Limits::default();
+            limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+            limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+            limits.max_alloc = Some((MAX_IMAGE_PIXELS * 4) as u64);
+            reader.limits(limits);
             let img = reader.decode()?;
             let w = img.width();
             let h = img.height();

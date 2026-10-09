@@ -72,7 +72,7 @@ fn bash_plan(cache_dir: &Path) -> ShellIntegrationPlan {
          for __fastty_candidate in \"$HOME/.bash_profile\" \"$HOME/.bash_login\" \"$HOME/.profile\"; do\n\
              if [ -f \"$__fastty_candidate\" ]; then __fastty_profile=$__fastty_candidate; . \"$__fastty_profile\"; break; fi\n\
          done\n\
-         if [ -f \"$HOME/.bashrc\" ] && { [ -z \"$__fastty_profile\" ] || ! grep -Eq '(^|[[:space:];])(\\.|source)[[:space:]].*bashrc' \"$__fastty_profile\"; }; then . \"$HOME/.bashrc\"; fi\n\
+         if [ -f \"$HOME/.bashrc\" ] && {{ [ -z \"$__fastty_profile\" ] || ! grep -Eq '(^|[[:space:];])(\\.|source)[[:space:]].*bashrc' \"$__fastty_profile\"; }}; then . \"$HOME/.bashrc\"; fi\n\
          . {}\n",
         bash_quote(&integration)
     );

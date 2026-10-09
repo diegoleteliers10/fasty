@@ -341,11 +341,11 @@ impl WriteSession {
             let mut reader = image::ImageReader::new(std::io::Cursor::new(&data))
                 .with_guessed_format()
                 .map_err(|_| ())?;
-            reader.limits(image::Limits {
-                max_image_width: Some(MAX_IMAGE_DIMENSION),
-                max_image_height: Some(MAX_IMAGE_DIMENSION),
-                max_alloc: Some(MAX_IMAGE_PIXELS * 4),
-            });
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+            limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+            limits.max_alloc = Some(MAX_IMAGE_PIXELS * 4);
+            reader.limits(limits);
             let img = reader.decode().map_err(|_| ())?.to_rgba8();
             let (width, height) = img.dimensions();
             if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {

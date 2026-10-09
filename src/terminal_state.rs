@@ -261,7 +261,7 @@ fn read_kitty_image_file(path: &std::path::Path) -> Option<Vec<u8>> {
     if !metadata.is_file() || metadata.len() > 256 * 1024 * 1024 {
         return None;
     }
-    let mut file = std::fs::File::open(path).ok()?;
+    let file = std::fs::File::open(path).ok()?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.take(256 * 1024 * 1024 + 1).read_to_end(&mut bytes).ok()?;
     (bytes.len() as u64 <= 256 * 1024 * 1024).then_some(bytes)
