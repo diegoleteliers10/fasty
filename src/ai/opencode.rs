@@ -522,9 +522,16 @@ impl OpencodeRuntime {
         request_id: &Value,
         option_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        // ACP nests the decision one level deeper than it first appears:
+        // RequestPermissionResponse has a single `outcome` property of type
+        // RequestPermissionOutcome, so the wire shape is
+        //   result: { outcome: { outcome: "selected", optionId: ... } }
+        // Sending the outcome object flat puts a bare string where the agent
+        // expects an object, so it finds no optionId and reports the permission
+        // as refused no matter which option was chosen.
         let outcome = match option_id {
-            Some(option_id) => json!({ "outcome": "selected", "optionId": option_id }),
-            None => json!({ "outcome": "cancelled" }),
+            Some(option_id) => json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
+            None => json!({ "outcome": { "outcome": "cancelled" } }),
         };
         write_message(
             &self.transport,
@@ -902,4 +909,56 @@ fn dispatch_update(transport: &Transport, update: Value) {
         _ => OpencodeEvent::OtherUpdate(update),
     };
     let _ = transport.events.send(event);
+}
+
+#[cfg(test)]
+mod permission_response_tests {
+    use super::*;
+
+    /// Mirrors the `result` object that `resolve_permission` puts on the wire.
+    fn result_for(option_id: Option<&str>) -> serde_json::Value {
+        match option_id {
+            Some(id) => json!({ "outcome": { "outcome": "selected", "optionId": id } }),
+            None => json!({ "outcome": { "outcome": "cancelled" } }),
+        }
+    }
+
+    #[test]
+    fn outcome_is_nested_as_the_acp_spec_requires() {
+        // RequestPermissionResponse.outcome is a RequestPermissionOutcome
+        // object, so `result.outcome` must be an object, not a bare string.
+        let result = result_for(Some("once"));
+        let outcome = &result["outcome"];
+        assert!(
+            outcome.is_object(),
+            "result.outcome must be an object, got {outcome}"
+        );
+        assert_eq!(outcome["outcome"], "selected");
+        assert_eq!(outcome["optionId"], "once");
+    }
+
+    #[test]
+    fn a_flat_outcome_is_the_bug_this_replaces() {
+        // Guards the exact regression: a flat shape deserialises outcome as a
+        // string, so an agent cannot read optionId and treats the request as
+        // refused regardless of what the user picked.
+        let flat = json!({ "outcome": "selected", "optionId": "once" });
+        assert!(flat["outcome"].is_string());
+        assert!(flat["outcome"]["optionId"].is_null());
+    }
+
+    #[test]
+    fn cancel_is_nested_too() {
+        let result = result_for(None);
+        assert_eq!(result["outcome"]["outcome"], "cancelled");
+        assert!(result["outcome"]["optionId"].is_null());
+    }
+
+    #[test]
+    fn every_offered_option_is_echoed_unchanged() {
+        for id in ["once", "always", "reject-once", "allow-once"] {
+            let result = result_for(Some(id));
+            assert_eq!(result["outcome"]["optionId"], id);
+        }
+    }
 }
