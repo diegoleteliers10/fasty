@@ -1830,20 +1830,50 @@ fn run_opencode_turn(
                     .unwrap_or("")
                     .trim();
                 let name = crate::ui::ai_sidebar::tool_name_from_title(title, kind);
-                let args = update
+                // ACP streams arguments: the opening `tool_call` carries
+                // `status:"pending"` with empty `rawInput`, and the real values
+                // only arrive on later `tool_call_update`s. Reading it just once,
+                // on first sight, left every row without a subject.
+                let mut args = update
                     .get("rawInput")
                     .or_else(|| update.get("input"))
                     .map(|value| value.to_string())
                     .unwrap_or_default();
+                // `locations` is where OpenCode puts the file for read/edit/
+                // grep, and it is present even when the arguments are not.
+                if let Some(path) = update
+                    .get("locations")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|locations| locations.first())
+                    .and_then(|location| location.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    if args.is_empty() {
+                        args = serde_json::json!({ "path": path }).to_string();
+                    } else if let Ok(serde_json::Value::Object(map)) =
+                        serde_json::from_str::<serde_json::Value>(&args)
+                    {
+                        let known = ["command", "file_path", "filePath", "path", "pattern", "query", "url", "glob"];
+                        if !known.iter().any(|key| map.contains_key(*key)) {
+                            let mut map = map;
+                            map.insert("path".to_string(), serde_json::Value::String(path.to_string()));
+                            args = serde_json::Value::Object(map).to_string();
+                        }
+                    }
+                }
                 if !active_tools.contains_key(&id) {
                     active_tools.insert(id.clone(), name.clone());
-                    let _ = event_tx.send_blocking(crate::ai::AgentEvent::ToolStart { id: id.clone(), name: name.clone(), args });
+                    let _ = event_tx.send_blocking(crate::ai::AgentEvent::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
+                } else if !args.is_empty() {
+                    // Arguments arrived after the row was created.
+                    let _ = event_tx.send_blocking(crate::ai::AgentEvent::ToolArgs { id: id.clone(), args: args.clone() });
                 }
                 let status = update.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
                 if status == "completed" || status == "failed" {
                     let output = update.get("content").map(|value| value.to_string()).unwrap_or_default();
                     let _ = event_tx.send_blocking(crate::ai::AgentEvent::ToolEnd {
                         id: id.clone(), name, output, is_error: status == "failed", diff: None,
+                        args: (!args.is_empty()).then_some(args),
                     });
                     active_tools.remove(&id);
                 }
@@ -1896,6 +1926,7 @@ fn end_opencode_tools(
             output: output.to_string(),
             is_error: true,
             diff: None,
+            args: None,
         });
     }
 }
@@ -6154,15 +6185,27 @@ impl RootView {
                                 }
                             }
                         }
+                        crate::ai::AgentEvent::ToolArgs { id, args } => {
+                            for m in this.ai_messages.iter_mut().rev() {
+                                if let Some(tc) = m.tool_calls.iter_mut().find(|c| c.id == id) {
+                                    tc.args = args;
+                                    break;
+                                }
+                            }
+                        }
                         crate::ai::AgentEvent::ToolEnd {
                             id,
                             output,
                             is_error,
                             diff,
+                            args,
                             ..
                         } => {
                             for m in this.ai_messages.iter_mut().rev() {
                                 if let Some(tc) = m.tool_calls.iter_mut().find(|c| c.id == id) {
+                                    if let Some(args) = args {
+                                        tc.args = args;
+                                    }
                                     tc.output = Some(output);
                                     tc.is_error = is_error;
                                     tc.is_running = false;
@@ -17031,6 +17074,18 @@ mod ligature_tests {
         humanize_tool_name, parse_tool_row, tool_label, tool_name_from_title, tool_subject,
         AiUiToolCall,
     };
+
+    /// OpenCode's ACP layer emits `title: input.command ?? state.title ??
+    /// toolName` for bash, and `title: state.title || toolName` otherwise. So
+    /// the fallback is the raw tool name, usually lowercase.
+    #[test]
+    fn lowercase_bare_tool_names_are_names_not_prose() {
+        assert_eq!(tool_name_from_title("websearch", ""), "Websearch");
+        assert_eq!(tool_name_from_title("todowrite", ""), "Todowrite");
+        assert_eq!(tool_name_from_title("skill", ""), "Skill");
+        // A path-like token is not a tool name; `kind` decides instead.
+        assert_eq!(tool_name_from_title("src/main.rs", "read"), "Read");
+    }
 
     #[test]
     fn acp_prose_titles_yield_the_tool_not_the_sentence() {

@@ -852,10 +852,15 @@ fn is_prose_verb(word: &str) -> bool {
 /// produced rows labelled "Fasty Fasty Run Command".
 pub(crate) fn tool_name_from_title(title: &str, kind: &str) -> String {
     let trimmed = title.trim();
-    // A title that is exactly one token is already a name ("bash", "Task") —
-    // but only when it looks like a name and not a bare path ("src/main.rs").
-    if !trimmed.is_empty() && !trimmed.contains(char::is_whitespace) && is_prose_verb(trimmed) {
-        return humanize_tool_name(trimmed);
+    // OpenCode's ACP layer sets `title` to the bare tool name when the model
+    // supplies no title of its own, so a single lowercase token is a real name
+    // ("websearch", "todowrite") and must not be read as prose.
+    if !trimmed.is_empty() && !trimmed.contains(char::is_whitespace) {
+        // A path-like token is not a tool name, so let `kind` decide.
+        let looks_like_path = trimmed.contains(['/', '\\']) || trimmed.contains('.');
+        if !looks_like_path {
+            return humanize_tool_name(trimmed);
+        }
     }
     // Otherwise lead with the leading verb, which is the tool in disguise.
     if let Some(first) = trimmed.split_whitespace().next() {
