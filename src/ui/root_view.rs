@@ -2263,6 +2263,9 @@ pub struct RootView {
     pub ai_input_state: crate::ui::TextInputState,
     pub is_dragging_ai_input: bool,
     pub ai_input_focused: bool,
+    /// Previous value of `ai_input_focused`, so the blink timer can snap the
+    /// cursor solid on a focus change instead of revealing it mid-blink.
+    pub last_ai_input_focused: bool,
     ai_loaded_conversation_id: String,
     ai_background_conversations: std::collections::HashMap<String, AiConversationRuntime>,
     ai_event_source: Option<(usize, String)>,
@@ -2465,6 +2468,14 @@ impl RootView {
                     }
 
                     // Cursor blink logic (every ~525ms = 15 ticks of 35ms)
+                    // The timer keeps running while the cursor is hidden, so a
+                    // focus change can otherwise reveal the cursor mid-blink and
+                    // leave it invisible for up to half a second. Snap it solid on
+                    // every transition.
+                    if this.ai_input_focused != this.last_ai_input_focused {
+                        this.last_ai_input_focused = this.ai_input_focused;
+                        this.cursor_blink_visible = true;
+                    }
                     blink_counter += 1;
                     if blink_counter >= 15 {
                         blink_counter = 0;
@@ -2692,6 +2703,7 @@ impl RootView {
             ai_input_state: crate::ui::TextInputState::default(),
             is_dragging_ai_input: false,
             ai_input_focused: true,
+            last_ai_input_focused: false,
             ai_loaded_conversation_id: String::new(),
             ai_background_conversations: std::collections::HashMap::new(),
             ai_event_source: None,
@@ -10126,11 +10138,22 @@ impl RootView {
         line_h: f32,
         active_pane_id: usize,
         pane_count: usize,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = self.theme;
         let font_family = self.font_family.clone();
         let font_size = self.font_size;
+        // While the agent input holds focus the terminal is not receiving keys,
+        // but its cursor kept painting and blinking there, which reads as "you
+        // are still in the shell". Hide it in every pane while that is true.
+        //
+        // `ai_input_focused` alone is not enough: it is only ever cleared when
+        // the terminal area is clicked, and this view registers no blur handler,
+        // so it stays true after Tab, a secondary window, or app deactivation.
+        // The focus handle is the source of truth and cannot go stale.
+        let ai_has_focus = self.ai_sidebar_open
+            && (self.ai_input_focused || self.focus_handle.contains_focused(window, cx));
 
         match node {
             PaneNode::Leaf(pane) => {
@@ -10392,7 +10415,7 @@ impl RootView {
                         };
 
                         let cursor_info =
-                            if cursor_visible && is_active && self.cursor_blink_visible {
+                            if cursor_visible && is_active && self.cursor_blink_visible && !ai_has_focus {
                                 Some((cursor_point.line.0, cursor_point.column.0, effective_shape))
                             } else {
                                 None
@@ -10833,6 +10856,7 @@ impl RootView {
                                 line_h,
                                 active_pane_id,
                                 pane_count,
+                                window,
                                 cx,
                             )),
                     )
@@ -10853,6 +10877,7 @@ impl RootView {
                                 line_h,
                                 active_pane_id,
                                 pane_count,
+                                window,
                                 cx,
                             )),
                     )
@@ -11097,6 +11122,7 @@ impl Render for RootView {
                 line_h,
                 active_pane_id,
                 1,
+                _window,
                 cx,
             )
         } else if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
@@ -11113,6 +11139,7 @@ impl Render for RootView {
                 line_h,
                 active_pane_id,
                 pane_count,
+                _window,
                 cx,
             )
         } else {
