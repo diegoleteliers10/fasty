@@ -10138,6 +10138,7 @@ impl RootView {
         line_h: f32,
         active_pane_id: usize,
         pane_count: usize,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let theme = self.theme;
@@ -10146,7 +10147,13 @@ impl RootView {
         // While the agent input holds focus the terminal is not receiving keys,
         // but its cursor kept painting and blinking there, which reads as "you
         // are still in the shell". Hide it in every pane while that is true.
-        let ai_has_focus = self.ai_sidebar_open && self.ai_input_focused;
+        //
+        // `ai_input_focused` alone is not enough: it is only ever cleared when
+        // the terminal area is clicked, and this view registers no blur handler,
+        // so it stays true after Tab, a secondary window, or app deactivation.
+        // The focus handle is the source of truth and cannot go stale.
+        let ai_has_focus = self.ai_sidebar_open
+            && (self.ai_input_focused || self.focus_handle.contains_focused(window, cx));
 
         match node {
             PaneNode::Leaf(pane) => {
@@ -10849,6 +10856,7 @@ impl RootView {
                                 line_h,
                                 active_pane_id,
                                 pane_count,
+                                window,
                                 cx,
                             )),
                     )
@@ -10869,6 +10877,7 @@ impl RootView {
                                 line_h,
                                 active_pane_id,
                                 pane_count,
+                                window,
                                 cx,
                             )),
                     )
@@ -11113,6 +11122,7 @@ impl Render for RootView {
                 line_h,
                 active_pane_id,
                 1,
+                _window,
                 cx,
             )
         } else if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
@@ -11129,6 +11139,7 @@ impl Render for RootView {
                 line_h,
                 active_pane_id,
                 pane_count,
+                _window,
                 cx,
             )
         } else {
