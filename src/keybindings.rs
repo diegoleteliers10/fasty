@@ -129,6 +129,7 @@ pub enum Action {
     ClearScrollback,
     ToggleFullscreen,
     ToggleTabSidebar,
+    ToggleProjectSidebar,
     ToggleAiSidebar,
     SplitRight,
     SplitDown,
@@ -185,6 +186,7 @@ impl Action {
             Action::ClearScrollback,
             Action::ToggleFullscreen,
             Action::ToggleTabSidebar,
+            Action::ToggleProjectSidebar,
             Action::ToggleAiSidebar,
             Action::OpenSearch,
             Action::GlobalSearch,
@@ -229,6 +231,7 @@ impl Action {
             Action::ClearScrollback => "clear_scrollback".to_string(),
             Action::ToggleFullscreen => "toggle_fullscreen".to_string(),
             Action::ToggleTabSidebar => "toggle_tab_sidebar".to_string(),
+            Action::ToggleProjectSidebar => "toggle_project_sidebar".to_string(),
             Action::ToggleAiSidebar => "toggle_ai_sidebar".to_string(),
             Action::SplitRight => "split_right".to_string(),
             Action::SplitDown => "split_down".to_string(),
@@ -274,6 +277,7 @@ impl Action {
                 Action::ClearScrollback => "Clear Scrollback",
                 Action::ToggleFullscreen => "Toggle Fullscreen",
                 Action::ToggleTabSidebar => "Toggle Tab Sidebar",
+                Action::ToggleProjectSidebar => "Toggle Project Sidebar",
                 Action::ToggleAiSidebar => "Toggle AI Sidebar",
                 Action::SplitRight => "Split Right",
                 Action::SplitDown => "Split Down",
@@ -305,7 +309,7 @@ impl Action {
             Action::Copy | Action::Paste => "Clipboard",
             Action::IncreaseFontSize | Action::DecreaseFontSize | Action::ResetFontSize
             | Action::ClearScrollback | Action::ToggleFullscreen | Action::ToggleTabSidebar
-            | Action::ToggleAiSidebar => "View",
+            | Action::ToggleProjectSidebar | Action::ToggleAiSidebar => "View",
             Action::OpenSearch | Action::GlobalSearch | Action::TabOverview
             | Action::CommandPalette => "Search",
             Action::SshManager | Action::ProjectJumper | Action::WorktreePicker
@@ -366,6 +370,7 @@ impl KeyBindingResolver {
                     insert("super+w", Action::ClosePane);
                     insert("super+shift+w", Action::CloseTab);
                     insert("super+b", Action::ToggleTabSidebar);
+                    insert("super+shift+g", Action::ToggleProjectSidebar);
                     insert("super+l", Action::ToggleAiSidebar);
                     insert("super+n", Action::NewWindow);
                     insert("super+f", Action::OpenSearch);
@@ -398,6 +403,7 @@ impl KeyBindingResolver {
                     insert("ctrl+shift+w", Action::ClosePane);
                     insert("ctrl+shift+q", Action::CloseTab);
                     insert("ctrl+shift+b", Action::ToggleTabSidebar);
+                    insert("ctrl+shift+g", Action::ToggleProjectSidebar);
                     insert("ctrl+shift+l", Action::ToggleAiSidebar);
                     insert("ctrl+shift+n", Action::NewWindow);
                     insert("ctrl+shift+e", Action::SplitRight);
@@ -673,6 +679,7 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "clear_scrollback" => Some(Action::ClearScrollback),
         "toggle_fullscreen" => Some(Action::ToggleFullscreen),
         "toggle_tab_sidebar" => Some(Action::ToggleTabSidebar),
+        "toggle_project_sidebar" => Some(Action::ToggleProjectSidebar),
         "toggle_ai_sidebar" => Some(Action::ToggleAiSidebar),
         "split_right" => Some(Action::SplitRight),
         "split_down" => Some(Action::SplitDown),
@@ -1146,5 +1153,21 @@ mod tests {
         assert_eq!(combos.len(), 1);
         assert_eq!(combos[0], parse_combo("ctrl+super+,").unwrap());
         assert_eq!(combos[0], parse_combo("ctrl+cmd+,").unwrap());
+    }
+
+    #[test]
+    fn keybindings_project_sidebar_default_shortcut_is_unique() {
+        let resolver = KeyBindingResolver::for_preset(KeybindingPreset::Default);
+        let combo = if cfg!(target_os = "macos") {
+            parse_combo("super+shift+g").unwrap()
+        } else {
+            parse_combo("ctrl+shift+g").unwrap()
+        };
+        assert_eq!(resolver.resolve(&combo), Some(Action::ToggleProjectSidebar));
+        assert_eq!(resolver.combos_for(Action::ToggleProjectSidebar), vec![combo]);
+        assert!(Action::all()
+            .into_iter()
+            .filter(|action| *action != Action::ToggleProjectSidebar)
+            .all(|action| !resolver.combos_for(action).contains(&combo)));
     }
 }

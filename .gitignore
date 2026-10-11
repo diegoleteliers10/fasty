@@ -16,3 +16,8 @@ scripts/
 
 #plans
 docs/plans/
+
+# gentle-ai local metadata and task artifacts
+/.atl/
+/.codegraph/
+/odd/

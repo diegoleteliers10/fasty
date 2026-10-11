@@ -3,6 +3,7 @@ pub mod button;
 pub mod color_harmony;
 pub mod icons;
 pub mod ime;
+pub mod project_sidebar;
 pub mod root_view;
 pub mod settings_view;
 pub mod status_bar;

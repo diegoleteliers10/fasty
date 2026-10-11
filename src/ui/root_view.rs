@@ -12,6 +12,7 @@ use std::sync::Arc;
 use super::settings_view::SettingsView;
 use super::status_bar::{StatusBar, StatusBarModel, StatusInfo};
 use super::tab_bar::{TabBar, TabItem, TabSidebar};
+use super::project_sidebar::{cached_graph_layout, GraphLayout, ProjectPanelTab, ProjectSidebar};
 use super::theme::{rgb_to_hsla, Theme};
 use crate::config::{self, Config, TabLayout};
 use crate::event_listener::EventSender;
@@ -19,6 +20,98 @@ use crate::git::GitStatus;
 use crate::pane_tree::{Direction, PaneId, PaneNode, PaneTree, SplitDirection, TerminalPane};
 use crate::program_status::{ProgramRecord, ProgramState};
 use crate::terminal_state::{AppEvent, TerminalState};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RightPanel {
+    #[default]
+    Closed,
+    Project,
+    Ai,
+}
+
+const PROJECT_PANEL_WIDTH: f32 = 300.0;
+
+fn project_panel_width_after_drag(viewport_width: f32, cursor_x: f32) -> f32 {
+    (viewport_width - cursor_x).clamp(240.0, 750.0)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectPanelFeedback {
+    tab_id: usize,
+    cwd: Option<std::path::PathBuf>,
+    message: String,
+    action_id: Option<u64>,
+}
+
+impl ProjectPanelFeedback {
+    fn matches(&self, tab_id: usize, cwd: Option<&std::path::Path>) -> bool {
+        self.tab_id == tab_id && self.cwd.as_deref() == cwd
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectGraphScrollTarget {
+    tab_id: usize,
+    cwd: Option<std::path::PathBuf>,
+}
+
+fn project_graph_scroll_target_changed(
+    previous: Option<&ProjectGraphScrollTarget>,
+    next: &ProjectGraphScrollTarget,
+) -> bool {
+    previous != Some(next)
+}
+
+impl RightPanel {
+    fn toggle(self, panel: Self) -> Self {
+        if self == panel { Self::Closed } else { panel }
+    }
+}
+
+#[cfg(test)]
+mod project_panel_state_tests {
+    use super::{project_graph_scroll_target_changed, project_panel_width_after_drag, ProjectGraphScrollTarget, ProjectPanelFeedback, RightPanel};
+    use std::path::PathBuf;
+
+    #[test]
+    fn project_and_ai_panels_replace_or_close_each_other() {
+        let project_open = RightPanel::Closed.toggle(RightPanel::Project);
+        assert_eq!(project_open, RightPanel::Project);
+        assert_eq!(project_open.toggle(RightPanel::Project), RightPanel::Closed);
+        assert_eq!(project_open.toggle(RightPanel::Ai), RightPanel::Ai);
+        assert_eq!(RightPanel::Ai.toggle(RightPanel::Project), RightPanel::Project);
+    }
+
+    #[test]
+    fn project_panel_feedback_is_hidden_after_tab_or_cwd_change() {
+        let cwd = PathBuf::from("/repo/a");
+        let feedback = ProjectPanelFeedback { tab_id: 1, cwd: Some(cwd.clone()), message: "Running Stage All".to_string(), action_id: Some(1) };
+
+        assert!(feedback.matches(1, Some(&cwd)));
+        assert!(!feedback.matches(2, Some(&cwd)));
+        assert!(!feedback.matches(1, Some(PathBuf::from("/repo/b").as_path())));
+    }
+
+    #[test]
+    fn project_panel_resize_uses_ai_sidebar_width_bounds() {
+        assert_eq!(project_panel_width_after_drag(1200.0, 800.0), 400.0);
+        assert_eq!(project_panel_width_after_drag(1200.0, 1000.0), 240.0);
+        assert_eq!(project_panel_width_after_drag(1200.0, 200.0), 750.0);
+    }
+
+    #[test]
+    fn project_graph_scroll_target_changes_when_tab_or_folder_changes() {
+        let first = ProjectGraphScrollTarget { tab_id: 1, cwd: Some(PathBuf::from("/repo/a")) };
+        let same = first.clone();
+        let other_tab = ProjectGraphScrollTarget { tab_id: 2, cwd: first.cwd.clone() };
+        let other_cwd = ProjectGraphScrollTarget { tab_id: 1, cwd: Some(PathBuf::from("/repo/b")) };
+
+        assert!(project_graph_scroll_target_changed(None, &first));
+        assert!(!project_graph_scroll_target_changed(Some(&first), &same));
+        assert!(project_graph_scroll_target_changed(Some(&first), &other_tab));
+        assert!(project_graph_scroll_target_changed(Some(&first), &other_cwd));
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
@@ -2254,7 +2347,18 @@ pub struct RootView {
     /// one-shot execution, not a persistent shell tab. `None` for every
     /// other pane (normal tabs, splits, session restore, new windows).
     exec_pane_id: Option<crate::pane_tree::PaneId>,
-    pub ai_sidebar_open: bool,
+    right_panel: RightPanel,
+    project_panel_tab: ProjectPanelTab,
+    project_panel_menu_open: bool,
+    project_panel_confirmation: Option<crate::git::ProjectGitConfirmation>,
+    project_panel_feedback: Option<ProjectPanelFeedback>,
+    project_panel_action_generation: u64,
+    pub project_panel_width: f32,
+    pub is_dragging_project_panel: bool,
+    project_graph_scroll_handle: ScrollHandle,
+    project_graph_rendered_range: std::rc::Rc<std::cell::Cell<(usize, usize)>>,
+    project_graph_scroll_target: Option<ProjectGraphScrollTarget>,
+    project_graph_layout: Option<Arc<GraphLayout>>,
     pub ai_sidebar_width: f32,
     /// 0..=1 open/close animation progress, mirroring the tabs sidebar.
     pub ai_sidebar_anim_progress: f32,
@@ -2331,11 +2435,138 @@ impl RootView {
 
     #[inline]
     pub fn current_ai_sidebar_width(&self) -> f32 {
-        if self.ai_sidebar_open || self.ai_sidebar_anim_progress > 0.001 {
+        if self.right_panel != RightPanel::Project && self.ai_sidebar_anim_progress > 0.001 {
             (self.ai_sidebar_width * self.ai_sidebar_anim_progress).round()
         } else {
             0.0
         }
+    }
+
+    #[inline]
+    fn current_project_panel_width(&self) -> f32 {
+        if self.right_panel == RightPanel::Project { self.project_panel_width.clamp(240.0, 750.0) } else { 0.0 }
+    }
+
+    fn request_project_graph_page(&self, offset: usize, cx: &mut Context<Self>) {
+        let Some(cwd) = self.tabs.get(self.active_tab_idx).and_then(|tab| tab.cwd.clone()) else { return };
+        let (tx, rx) = async_channel::bounded::<u64>(1);
+        let completion_path = cwd.clone();
+        if !crate::git::request_git_graph_page(&cwd, offset, move |loaded, generation| {
+            if loaded { let _ = tx.send_blocking(generation); }
+        }) { return; }
+        cx.spawn(async move |this, cx| {
+            if let Ok(generation) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    if !crate::git::is_git_info_generation_current(&completion_path, generation) { return; }
+                    if this.tabs.get(this.active_tab_idx).and_then(|tab| tab.cwd.as_ref()) == Some(&completion_path) {
+                        cx.notify();
+                    }
+                });
+            }
+        }).detach();
+    }
+
+    fn request_git_status_refresh(&self, cwd: std::path::PathBuf, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::bounded::<(Option<GitStatus>, u64)>(1);
+        let completion_path = cwd.clone();
+        if !crate::git::request_git_info_refresh(&cwd, move |status, generation| { let _ = tx.send_blocking((status, generation)); }) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            if let Ok((status, generation)) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    if !crate::git::is_git_info_generation_current(&completion_path, generation) { return; }
+                    let now = std::time::Instant::now();
+                    for tab in &mut this.tabs {
+                        if tab.cwd.as_ref() != Some(&cwd) { continue; }
+                        tab.git_status = status.clone();
+                        tab.git_checked_cwd = Some(cwd.clone());
+                        tab.git_last_poll = Some(now);
+                        let active_pane = tab.pane_tree.active_pane_id;
+                        if let Some(pane) = tab.pane_tree.find_pane_mut(active_pane) {
+                            if pane.cwd.as_ref() == Some(&cwd) {
+                                pane.git_status = status.clone();
+                                pane.git_checked_cwd = Some(cwd.clone());
+                                pane.git_last_poll = Some(now);
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        }).detach();
+    }
+
+    fn handle_project_git_action(&mut self, action: crate::git::ProjectGitAction, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab_idx) else {
+            return;
+        };
+        let Some(cwd) = tab.cwd.clone() else {
+            self.project_panel_feedback = Some(ProjectPanelFeedback { tab_id: tab.id, cwd: None, message: "No project folder".to_string(), action_id: None });
+            cx.notify();
+            return;
+        };
+        let tab_id = tab.id;
+        let target_cwd = Some(cwd.clone());
+        if action.requires_confirmation() {
+            self.project_panel_confirmation = Some(crate::git::ProjectGitConfirmation { action, tab_id, cwd });
+            self.project_panel_menu_open = false;
+            cx.notify();
+            return;
+        }
+        self.execute_project_git_action(action, tab_id, target_cwd, cwd, cx);
+    }
+
+    fn confirm_project_git_action(&mut self, action: crate::git::ProjectGitAction, cx: &mut Context<Self>) {
+        let Some(pending) = self.project_panel_confirmation.clone() else {
+            return;
+        };
+        let active_tab = self.tabs.get(self.active_tab_idx);
+        let matches = active_tab.is_some_and(|tab| {
+            pending.matches(tab.id, tab.cwd.as_deref()) && pending.action == action
+        });
+        if !matches {
+            self.project_panel_confirmation = None;
+            if let Some(tab) = active_tab {
+                self.project_panel_feedback = Some(ProjectPanelFeedback { tab_id: tab.id, cwd: tab.cwd.clone(), message: "Confirmation expired because the active tab or folder changed.".to_string(), action_id: None });
+            }
+            cx.notify();
+            return;
+        }
+        self.execute_project_git_action(pending.action, pending.tab_id, Some(pending.cwd.clone()), pending.cwd, cx);
+    }
+
+    fn execute_project_git_action(&mut self, action: crate::git::ProjectGitAction, tab_id: usize, feedback_cwd: Option<std::path::PathBuf>, cwd: std::path::PathBuf, cx: &mut Context<Self>) {
+        self.project_panel_confirmation = None;
+        self.project_panel_menu_open = false;
+        self.project_panel_action_generation = self.project_panel_action_generation.wrapping_add(1);
+        let action_id = self.project_panel_action_generation;
+        self.project_panel_feedback = Some(ProjectPanelFeedback { tab_id, cwd: feedback_cwd.clone(), message: format!("Running {}…", action.label()), action_id: Some(action_id) });
+        let (tx, rx) = async_channel::bounded(1);
+        let worker_cwd = cwd.clone();
+        std::thread::spawn(move || {
+            let result = crate::git::run_project_git_action(&worker_cwd, &action);
+            let _ = tx.send_blocking(result);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    crate::git::invalidate_git_info_cache(&cwd);
+                    if this.project_panel_feedback.as_ref().is_some_and(|feedback| feedback.action_id == Some(action_id)) {
+                        let target_is_active = this.tabs.get(this.active_tab_idx).is_some_and(|tab| {
+                            tab.id == tab_id && tab.cwd.as_ref() == feedback_cwd.as_ref()
+                        });
+                        this.project_panel_feedback = if target_is_active { Some(ProjectPanelFeedback { tab_id, cwd: feedback_cwd.clone(), message: match result {
+                            Ok(message) => message,
+                            Err(error) => format!("Git action failed: {error}"),
+                        }, action_id: Some(action_id) }) } else { None };
+                    }
+                    this.request_git_status_refresh(cwd, cx);
+                    cx.notify();
+                });
+            }
+        }).detach();
+        cx.notify();
     }
 
     #[inline]
@@ -2684,7 +2915,18 @@ impl RootView {
             dragging_split_direction: SplitDirection::Horizontal,
             dragging_split_bounds: (0.0, 0.0, 0.0, 0.0),
             exec_pane_id: None,
-            ai_sidebar_open: restored_ai_sidebar_open,
+            right_panel: if restored_ai_sidebar_open { RightPanel::Ai } else { RightPanel::Closed },
+            project_panel_tab: ProjectPanelTab::Changes,
+            project_panel_menu_open: false,
+            project_panel_confirmation: None,
+            project_panel_feedback: None,
+            project_panel_action_generation: 0,
+            project_panel_width: PROJECT_PANEL_WIDTH,
+            is_dragging_project_panel: false,
+            project_graph_scroll_handle: ScrollHandle::new(),
+            project_graph_rendered_range: std::rc::Rc::new(std::cell::Cell::new((0, 0))),
+            project_graph_scroll_target: None,
+            project_graph_layout: None,
             ai_sidebar_width: 340.0,
             ai_sidebar_anim_progress: if restored_ai_sidebar_open { 1.0 } else { 0.0 },
             is_dragging_ai_sidebar: false,
@@ -2944,7 +3186,7 @@ impl RootView {
                 active_tab: self.active_tab_idx,
                 position: None,
                 size: None,
-                ai_sidebar_open: self.ai_sidebar_open,
+                ai_sidebar_open: self.right_panel == RightPanel::Ai,
             }],
             active_window: 0,
             legacy_tabs: Vec::new(),
@@ -3059,8 +3301,6 @@ impl RootView {
         // split, session restore, CLI `-e`) -- unregistered on the two removal
         // paths, `close_tab` and `close_active_pane`.
         crate::daemon::register(pane_id, terminal_arc.clone());
-        let event_sender_loop = event_sender.clone();
-
         cx.spawn_in(window, async move |this, cx| {
             while let Ok(mut event) = event_rx.recv().await {
                 // Coalesce consecutive Wakeup events (pure re-render pings) into
@@ -3101,27 +3341,19 @@ impl RootView {
                                 pane.git_checked_cwd = Some(p.clone());
                                 pane.git_last_poll = Some(now);
                                 pane.cwd = Some(p.clone());
+                                pane.git_status = None;
                                 if tab.pane_tree.active_pane_id == pane_id {
                                     tab.git_checked_cwd = Some(p.clone());
                                     tab.git_last_poll = Some(now);
                                     tab.cwd = Some(p.clone());
+                                    tab.git_status = None;
                                 }
                             }
                         }
                         this.persist_session();
                         cx.notify();
-
-                        let sender_bg = event_sender_loop.clone();
-                        let p_bg = p.clone();
-                        std::thread::spawn(move || {
-                            if let Some(git) = crate::git::fetch_git_info_cached(&p_bg) {
-                                sender_bg.send(AppEvent::GitStatusUpdated {
-                                    window_id: None,
-                                    tab_idx: pane_id,
-                                    status: Some(git),
-                                });
-                            }
-                        });
+                        crate::git::invalidate_git_info_cache(&p);
+                        this.request_git_status_refresh(p, cx);
                     }
                     AppEvent::CommandFinished {
                         duration_ms,
@@ -3145,34 +3377,10 @@ impl RootView {
                         cx.notify();
 
                         if let Some(cwd) = cwd_to_poll {
-                            let sender_bg = event_sender_loop.clone();
-                            std::thread::spawn(move || {
-                                if let Some(git) = crate::git::fetch_git_info_cached(&cwd) {
-                                    sender_bg.send(AppEvent::GitStatusUpdated {
-                                        window_id: None,
-                                        tab_idx: pane_id,
-                                        status: Some(git),
-                                    });
-                                }
-                            });
+                            this.request_git_status_refresh(cwd, cx);
                         }
                     }
                     AppEvent::PromptStarted { .. } => {
-                        cx.notify();
-                    }
-                    AppEvent::GitStatusUpdated {
-                        tab_idx, status, ..
-                    } => {
-                        for tab in &mut this.tabs {
-                            if let Some(pane) = tab.pane_tree.find_pane_mut(tab_idx) {
-                                pane.git_status = status.clone();
-                                pane.git_last_poll = Some(std::time::Instant::now());
-                                if tab.pane_tree.active_pane_id == tab_idx {
-                                    tab.git_status = status.clone();
-                                    tab.git_last_poll = Some(std::time::Instant::now());
-                                }
-                            }
-                        }
                         cx.notify();
                     }
                     AppEvent::ProgramStatusChanged { source_id } => {
@@ -3217,20 +3425,6 @@ impl RootView {
             .filter(|n| !n.is_empty())
             .unwrap_or("fastty");
         let pane_title = title_override.unwrap_or_else(|| default_shell_name.to_string());
-
-        if let Some(ref p) = initial_cwd {
-            let sender_bg = event_sender.clone();
-            let p_bg = p.clone();
-            std::thread::spawn(move || {
-                if let Some(git) = crate::git::fetch_git_info_cached(&p_bg) {
-                    sender_bg.send(AppEvent::GitStatusUpdated {
-                        window_id: None,
-                        tab_idx: pane_id,
-                        status: Some(git),
-                    });
-                }
-            });
-        }
 
         TerminalPane {
             id: pane_id,
@@ -3714,17 +3908,21 @@ impl RootView {
         self.next_tab_id += 1;
         tab_data.id = tab_id;
 
-        let (event_tx, event_rx) = async_channel::unbounded::<AppEvent>();
-        let event_sender = EventSender::Callback(Arc::new(move |event| {
-            let _ = event_tx.send_blocking(event);
-        }));
+        let (event_tx, event_rx) = async_channel::unbounded::<(u64, AppEvent)>();
+        let set_terminal_event_sender = |terminal: &Arc<TerminalState>| {
+            let source_id = terminal.source_id();
+            let event_tx = event_tx.clone();
+            terminal.set_event_sender(EventSender::Callback(Arc::new(move |event| {
+                let _ = event_tx.send_blocking((source_id, event));
+            })));
+        };
 
         if let Some(terminal) = &tab_data.terminal {
-            terminal.set_event_sender(event_sender.clone());
+            set_terminal_event_sender(terminal);
         }
-        for pane in tab_data.pane_tree.all_panes_mut() {
-            if let Some(ref term) = pane.terminal {
-                term.set_event_sender(event_sender.clone());
+        for pane in tab_data.pane_tree.all_panes() {
+            if let Some(terminal) = &pane.terminal {
+                set_terminal_event_sender(terminal);
             }
         }
 
@@ -3734,13 +3932,16 @@ impl RootView {
         cx.notify();
 
         cx.spawn_in(window, async move |this, cx| {
-            while let Ok(mut event) = event_rx.recv().await {
+            while let Ok((mut source_id, mut event)) = event_rx.recv().await {
                 // See the identical comment in `spawn_terminal_pane`: coalesce
                 // consecutive Wakeup events without dropping the first non-Wakeup
                 // event that follows one in the channel.
                 while matches!(event, AppEvent::Wakeup) {
                     match event_rx.try_recv() {
-                        Ok(next) => event = next,
+                        Ok((next_source_id, next_event)) => {
+                            source_id = next_source_id;
+                            event = next_event;
+                        }
                         Err(_) => break,
                     }
                 }
@@ -3759,25 +3960,38 @@ impl RootView {
                     AppEvent::CwdChanged(cwd) => {
                         let p = std::path::PathBuf::from(&cwd);
                         let now = std::time::Instant::now();
+                        let mut refresh_active_cwd = false;
                         if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
-                            tab.git_checked_cwd = Some(p.clone());
-                            tab.git_last_poll = Some(now);
-                            tab.cwd = Some(p.clone());
+                            let source_pane_id = tab.pane_tree.all_panes().into_iter().find_map(|pane| {
+                                pane.terminal
+                                    .as_ref()
+                                    .filter(|terminal| terminal.source_id() == source_id)
+                                    .map(|_| pane.id)
+                            });
+                            if let Some(source_pane_id) = source_pane_id {
+                                let is_active = tab.pane_tree.active_pane_id == source_pane_id;
+                                let pane = tab.pane_tree.find_pane_mut(source_pane_id);
+                                if let Some(pane) = pane {
+                                    pane.cwd = Some(p.clone());
+                                    pane.git_status = None;
+                                    pane.git_checked_cwd = Some(p.clone());
+                                    pane.git_last_poll = Some(now);
+                                }
+                                if is_active {
+                                    refresh_active_cwd = true;
+                                    tab.git_checked_cwd = Some(p.clone());
+                                    tab.git_last_poll = Some(now);
+                                    tab.cwd = Some(p.clone());
+                                    tab.git_status = None;
+                                }
+                            }
                         }
                         this.persist_session();
                         cx.notify();
-
-                        let sender_bg = event_sender.clone();
-                        let p_bg = p.clone();
-                        std::thread::spawn(move || {
-                            if let Some(git) = crate::git::fetch_git_info_cached(&p_bg) {
-                                sender_bg.send(AppEvent::GitStatusUpdated {
-                                    window_id: None,
-                                    tab_idx: tab_id,
-                                    status: Some(git),
-                                });
-                            }
-                        });
+                        crate::git::invalidate_git_info_cache(&p);
+                        if refresh_active_cwd {
+                            this.request_git_status_refresh(p, cx);
+                        }
                     }
                     AppEvent::CommandFinished {
                         duration_ms,
@@ -3794,28 +4008,10 @@ impl RootView {
                         cx.notify();
 
                         if let Some(cwd) = cwd_to_poll {
-                            let sender_bg = event_sender.clone();
-                            std::thread::spawn(move || {
-                                if let Some(git) = crate::git::fetch_git_info_cached(&cwd) {
-                                    sender_bg.send(AppEvent::GitStatusUpdated {
-                                        window_id: None,
-                                        tab_idx: tab_id,
-                                        status: Some(git),
-                                    });
-                                }
-                            });
+                            this.request_git_status_refresh(cwd, cx);
                         }
                     }
                     AppEvent::PromptStarted { .. } => {
-                        cx.notify();
-                    }
-                    AppEvent::GitStatusUpdated {
-                        tab_idx, status, ..
-                    } => {
-                        if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_idx) {
-                            tab.git_status = status.clone();
-                            tab.git_last_poll = Some(std::time::Instant::now());
-                        }
                         cx.notify();
                     }
                     AppEvent::ProgramStatusChanged { source_id } => {
@@ -5290,8 +5486,8 @@ impl RootView {
     }
 
     pub fn toggle_ai_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.ai_sidebar_open = !self.ai_sidebar_open;
-        if self.ai_sidebar_open {
+        self.right_panel = self.right_panel.toggle(RightPanel::Ai);
+        if self.right_panel == RightPanel::Ai {
             self.ai_input_focused = true;
             window.focus(&self.focus_handle, cx);
         }
@@ -5300,9 +5496,16 @@ impl RootView {
         cx.notify();
     }
 
+    pub fn toggle_project_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.right_panel = self.right_panel.toggle(RightPanel::Project);
+        self.persist_session();
+        self.trigger_ai_sidebar_animation(window, cx);
+        cx.notify();
+    }
+
     fn ai_response_is_visible(&self, window: &Window) -> bool {
         self.ai_event_source.is_none()
-            && self.ai_sidebar_open
+            && self.right_panel == RightPanel::Ai
             && window.is_window_active()
             && !self.is_settings_open
             && !self.is_update_modal_open
@@ -5413,7 +5616,7 @@ impl RootView {
 
     /// 160ms ease-out-cubic open/close animation, same as the tabs sidebar.
     pub fn trigger_ai_sidebar_animation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let target = if self.ai_sidebar_open { 1.0f32 } else { 0.0f32 };
+        let target = if self.right_panel == RightPanel::Ai { 1.0f32 } else { 0.0f32 };
 
         if (self.ai_sidebar_anim_progress - target).abs() < 0.001 {
             return;
@@ -5541,7 +5744,7 @@ impl RootView {
     /// True when the AI composer gets the key instead of an overlay or the shell.
     pub fn ai_keys_own_input(&self) -> bool {
         ai_keys_own_input(
-            self.ai_sidebar_open,
+            self.right_panel == RightPanel::Ai,
             self.ai_input_focused,
             self.is_file_picker_open,
         )
@@ -6797,12 +7000,12 @@ impl RootView {
             .on_drag_move::<gpui::ExternalPaths>(cx.listener(
                 |this, ev: &gpui::DragMoveEvent<gpui::ExternalPaths>, window, cx| {
                     let over_composer = file_drop_target_at(
-                        this.ai_sidebar_open,
+                        this.right_panel == RightPanel::Ai,
                         window.viewport_size().width.to_f64() as f32
                             - this.current_ai_sidebar_width(),
                         ev.event.position.x.to_f64() as f32,
                     ) == FileDropTarget::AiAttach;
-                    let hover = this.ai_sidebar_open && over_composer;
+                    let hover = this.right_panel == RightPanel::Ai && over_composer;
                     if hover != this.ai_file_drag_hover {
                         this.ai_file_drag_hover = hover;
                         cx.notify();
@@ -7330,6 +7533,16 @@ impl RootView {
         let is_alt_gr = modifiers.control && !modifiers.platform && modifiers.alt;
         let is_ctrl = modifiers.control && !is_alt_gr;
 
+        let project_panel_shortcut = if cfg!(target_os = "macos") {
+            modifiers.platform && modifiers.shift && key_lower == "g"
+        } else {
+            is_ctrl && modifiers.shift && key_lower == "g"
+        };
+        if self.ai_keys_own_input() && project_panel_shortcut {
+            self.toggle_project_sidebar(_window, cx);
+            return;
+        }
+
         // AI Sidebar Input Keyboard Handler
         if self.ai_keys_own_input() {
             if key_lower == "escape" || key_lower == "esc" {
@@ -7345,7 +7558,7 @@ impl RootView {
                 } else if self.ai_is_streaming {
                     self.cancel_ai_stream();
                 } else {
-                    self.ai_sidebar_open = false;
+                    self.right_panel = RightPanel::Closed;
                 }
                 cx.notify();
                 return;
@@ -8621,6 +8834,10 @@ impl RootView {
                     self.toggle_tab_sidebar(_window, cx);
                     return;
                 }
+                Action::ToggleProjectSidebar => {
+                    self.toggle_project_sidebar(_window, cx);
+                    return;
+                }
                 Action::ToggleAiSidebar => {
                     self.toggle_ai_sidebar(_window, cx);
                     return;
@@ -9033,7 +9250,7 @@ impl RootView {
             || self.is_update_modal_open
             || self.is_whats_new_open
             || self.pending_close.is_some()
-            || (self.ai_sidebar_open && self.ai_input_focused)
+            || (self.right_panel == RightPanel::Ai && self.ai_input_focused)
     }
 
     fn any_root_menu_open(&self) -> bool {
@@ -9120,7 +9337,7 @@ impl RootView {
         };
 
         // Click in terminal area unfocuses the AI input so keystrokes go to the terminal.
-        if self.ai_sidebar_open && self.ai_input_focused {
+        if self.right_panel == RightPanel::Ai && self.ai_input_focused {
             let win_w = window.viewport_size().width.to_f64() as f32;
             let sidebar_left = win_w - self.current_ai_sidebar_width();
             if (event.position.x.to_f64() as f32) < sidebar_left {
@@ -9209,12 +9426,11 @@ impl RootView {
             self.pressed_mouse_buttons.push(event.button);
         }
 
-        let is_right_click = event.button == MouseButton::Right;
-
-        if terminal.is_mouse_mode_enabled() && !is_right_click {
+        if terminal.is_mouse_mode_enabled() {
             let btn = match event.button {
                 MouseButton::Left => 0,
                 MouseButton::Middle => 1,
+                MouseButton::Right => 2,
                 _ => 0,
             };
             if !self.reported_mouse_buttons.contains(&event.button) {
@@ -9505,6 +9721,13 @@ impl RootView {
             return;
         }
 
+        if self.is_dragging_project_panel {
+            let win_w = _window.viewport_size().width.to_f64() as f32;
+            self.project_panel_width = project_panel_width_after_drag(win_w, cur_x);
+            cx.notify();
+            return;
+        }
+
         if self.is_dragging_pane_split {
             let (bx, by, bw, bh) = self.dragging_split_bounds;
             let new_ratio = match self.dragging_split_direction {
@@ -9784,6 +10007,7 @@ impl RootView {
         self.dragging_scrollbar_pane_id = None;
         self.is_dragging_pane_split = false;
         self.is_dragging_ai_sidebar = false;
+        self.is_dragging_project_panel = false;
         if self.is_dragging_ai_input {
             self.is_dragging_ai_input = false;
             self.ai_input_state.end_drag();
@@ -10956,44 +11180,67 @@ impl Render for RootView {
                 if let Some(ref term) = active_tab.terminal {
                     if let Some(proc_cwd) = term.get_current_working_directory() {
                         if active_tab.cwd.as_ref() != Some(&proc_cwd) {
-                            active_tab.cwd = Some(proc_cwd);
-                            true
+                            active_tab.cwd = Some(proc_cwd.clone());
+                            active_tab.git_status = None;
+                            active_tab.git_checked_cwd = None;
+                            active_tab.git_last_poll = None;
+                            let active_pane = active_tab.pane_tree.active_pane_id;
+                            if let Some(pane) = active_tab.pane_tree.find_pane_mut(active_pane) {
+                                pane.cwd = Some(proc_cwd.clone());
+                                pane.git_status = None;
+                                pane.git_checked_cwd = None;
+                                pane.git_last_poll = None;
+                            }
+                            Some(proc_cwd)
                         } else {
-                            false
+                            None
                         }
                     } else {
-                        false
+                        None
                     }
                 } else {
-                    false
+                    None
                 }
             } else {
-                false
+                None
             }
         };
-        if cwd_changed {
+        let graph_scroll_target = self.tabs.get(self.active_tab_idx).map(|tab| ProjectGraphScrollTarget {
+            tab_id: tab.id,
+            cwd: tab.cwd.clone(),
+        });
+        if graph_scroll_target.as_ref().is_some_and(|target| {
+            project_graph_scroll_target_changed(self.project_graph_scroll_target.as_ref(), target)
+        }) {
+            self.project_graph_scroll_handle.set_offset(gpui::point(px(0.), px(0.)));
+            self.project_graph_rendered_range.set((0, 0));
+        }
+        self.project_graph_scroll_target = graph_scroll_target;
+        if let Some(cwd) = cwd_changed {
             self.persist_session();
+            crate::git::invalidate_git_info_cache(&cwd);
+            self.request_git_status_refresh(cwd, cx);
         }
 
         let (active_cwd, active_git, fallback_info) =
-            if let Some(active_tab) = self.tabs.get_mut(self.active_tab_idx) {
-                let now = std::time::Instant::now();
-                let should_poll = active_tab.git_checked_cwd.as_ref() != active_tab.cwd.as_ref()
-                    || active_tab.git_last_poll.is_none_or(|last| {
-                        now.duration_since(last) >= std::time::Duration::from_secs(2)
-                    });
-
-                if should_poll {
-                    active_tab.git_checked_cwd = active_tab.cwd.clone();
-                    active_tab.git_last_poll = Some(now);
-                    if let Some(ref cwd) = active_tab.cwd {
-                        active_tab.git_status = crate::git::fetch_git_info_cached(cwd);
-                    } else {
-                        active_tab.git_status = None;
-                    }
-                }
+            if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
                 let cwd_path = active_tab.cwd.as_deref();
-                let git = active_tab.git_status.as_ref();
+                let active_git = match crate::git::cached_git_info_state(cwd_path) {
+                    crate::git::CachedGitInfo::Available { info, stale } => {
+                        if stale { if let Some(cwd) = cwd_path { self.request_git_status_refresh(cwd.to_path_buf(), cx); } }
+                        Some(info)
+                    }
+                    crate::git::CachedGitInfo::CacheMiss => {
+                        if let Some(cwd) = cwd_path { self.request_git_status_refresh(cwd.to_path_buf(), cx); }
+                        None
+                    }
+                    crate::git::CachedGitInfo::NoRepository { stale } | crate::git::CachedGitInfo::FetchFailed { stale } => {
+                        if stale { if let Some(cwd) = cwd_path { self.request_git_status_refresh(cwd.to_path_buf(), cx); } }
+                        None
+                    }
+                    crate::git::CachedGitInfo::NoProject => None,
+                };
+                let git = active_git.as_ref();
                 let info = StatusInfo {
                     git_branch: git.map(|g| g.branch.clone()),
                     git_dirty: git.map(|g| g.unstaged > 0 || g.staged > 0).unwrap_or(false),
@@ -11001,7 +11248,7 @@ impl Render for RootView {
                     last_duration_ms: active_tab.last_duration_ms,
                     last_exit_code: active_tab.last_exit_code,
                 };
-                (cwd_path, git.cloned(), info)
+                (cwd_path, active_git, info)
             } else {
                 (None, None, StatusInfo::default())
             };
@@ -11016,7 +11263,8 @@ impl Render for RootView {
         let viewport_size = _window.viewport_size();
         let sidebar_w = self.current_sidebar_width();
         let ai_w = self.current_ai_sidebar_width();
-        let avail_w = (viewport_size.width.to_f64() as f32 - 1.0 - sidebar_w - ai_w).max(100.0);
+        let project_w = self.current_project_panel_width();
+        let avail_w = (viewport_size.width.to_f64() as f32 - 1.0 - sidebar_w - ai_w - project_w).max(100.0);
         // Chrome layout constants — must match TabBar/StatusBar element heights
 
         const TAB_BAR_HEIGHT: f32 = 32.0;
@@ -11137,7 +11385,7 @@ impl Render for RootView {
                     .on_toggle_sidebar(cx.listener(|this, _ev, window, cx| {
                         this.toggle_tab_sidebar(window, cx);
                     }))
-                    .ai_sidebar_open(self.ai_sidebar_open)
+                    .ai_sidebar_open(self.right_panel == RightPanel::Ai)
                     .ai_response_unread(self.tabs.iter().any(|tab| {
                         self.ai_turn_completions.get(&tab.ai_conversation_id) == Some(&AiTurnCompletion::Unread)
                     }))
@@ -11425,9 +11673,80 @@ impl Render for RootView {
                         )
                     })
                     .when(
-                        self.ai_sidebar_open || self.ai_sidebar_anim_progress > 0.001,
+                        self.right_panel == RightPanel::Ai
+                            || (self.right_panel == RightPanel::Closed && self.ai_sidebar_anim_progress > 0.001),
                         |this| this.child(self.render_ai_sidebar(_window, cx)),
                     )
+                    .when(self.right_panel == RightPanel::Project, |this| {
+                        let active_tab = self.tabs.get(self.active_tab_idx);
+                        let cwd = active_tab.and_then(|tab| tab.cwd.as_deref());
+                        let snapshot = crate::git::cached_project_panel_snapshot(cwd);
+                        let graph_layout = cached_graph_layout(&snapshot.commits, &mut self.project_graph_layout);
+                        let confirmation = active_tab.and_then(|tab| self.project_panel_confirmation.as_ref()
+                            .filter(|confirmation| confirmation.matches(tab.id, tab.cwd.as_deref()))
+                            .map(|confirmation| confirmation.action.clone()));
+                        let feedback = active_tab.and_then(|tab| self.project_panel_feedback.as_ref()
+                            .filter(|feedback| feedback.matches(tab.id, tab.cwd.as_deref()))
+                            .map(|feedback| feedback.message.clone()));
+                        let project_entity = cx.entity();
+                        let confirm_entity = project_entity.clone();
+                        let menu_entity = project_entity.clone();
+                        let cancel_entity = project_entity.clone();
+                        let graph_entity = project_entity.clone();
+                        let project_width = self.current_project_panel_width();
+                        this.child(
+                            div().relative().w(px(project_width)).h_full().flex_shrink_0()
+                                .child(ProjectSidebar::new(theme, project_width, snapshot, self.project_panel_tab)
+                                .on_close(cx.listener(|this, _ev, window, cx| {
+                                    this.toggle_project_sidebar(window, cx);
+                                }))
+                                .on_select_changes(cx.listener(|this, _ev, _window, cx| {
+                                    this.project_panel_tab = ProjectPanelTab::Changes;
+                                    cx.notify();
+                                }))
+                                .on_select_graph(cx.listener(|this, _ev, _window, cx| {
+                                    this.project_panel_tab = ProjectPanelTab::Graph;
+                                    cx.notify();
+                                }))
+                                .actions(
+                                    self.project_panel_menu_open,
+                                    confirmation,
+                                    feedback,
+                                    move |action, _event, _window, app| {
+                                        let action = action.clone();
+                                        project_entity.update(app, |this, cx| this.handle_project_git_action(action, cx));
+                                    },
+                                    move |action, _event, _window, app| {
+                                        let action = action.clone();
+                                        confirm_entity.update(app, |this, cx| this.confirm_project_git_action(action, cx));
+                                    },
+                                    move |_event, _window, app| {
+                                        menu_entity.update(app, |this, cx| {
+                                            this.project_panel_menu_open = !this.project_panel_menu_open;
+                                            cx.notify();
+                                        });
+                                    },
+                                    move |_event, _window, app| {
+                                        cancel_entity.update(app, |this, cx| {
+                                            this.project_panel_confirmation = None;
+                                            cx.notify();
+                                        });
+                                    },
+                                )
+                                .graph_pagination(self.project_graph_scroll_handle.clone(), self.project_graph_rendered_range.clone(), move |offset, near_bottom, refresh_rows, _event, _window, app| {
+                                    graph_entity.update(app, |this, cx| {
+                                        if near_bottom { this.request_project_graph_page(offset, cx); }
+                                        if refresh_rows { cx.notify(); }
+                                    });
+                                })
+                                .graph_layout(graph_layout))
+                                .child(div().id("project-panel-resize-handle").absolute().left(px(-3.)).top_0().bottom_0().w(px(7.)).cursor(CursorStyle::ResizeColumn)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
+                                        this.is_dragging_project_panel = true;
+                                        cx.notify();
+                                    }))),
+                        )
+                    })
             )
             .child(
 
@@ -11440,6 +11759,9 @@ impl Render for RootView {
                                 cx.notify();
                             }
                         }
+                    }))
+                    .on_toggle_project_panel(self.right_panel == RightPanel::Project, cx.listener(|this, _ev, window, cx| {
+                        this.toggle_project_sidebar(window, cx);
                     }))
             )
             .when(self.any_root_menu_open(), |this| {
