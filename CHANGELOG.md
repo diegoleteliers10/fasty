@@ -3,6 +3,14 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.22.1 - 2026-10-11
+
+### Terminal
+
+- Show the terminal cursor when the terminal has focus, even while the AI panel stays open.
+- Suppress interim native notifications while a terminal agent works or waits for input.
+- Keep native notifications for program completion, errors, and requests for input.
+
 ## 0.22.0 - 2026-10-11
 
 ### Terminal sessions
