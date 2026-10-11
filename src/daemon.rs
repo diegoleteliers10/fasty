@@ -5,20 +5,15 @@
 //!
 //! - One Unix domain socket per user, at `<state_dir>/fasttyd.sock`.
 //! - Newline-delimited JSON control messages (see `docs/daemon-protocol.md`).
-//! - The registry is in-memory only and owned by the running `fastty`
-//!   process — it holds no state across restarts, and cleans itself up when
-//!   the process exits (the socket file goes with it).
+//! - The registry is in-memory only and owned by the local session-host
+//!   process. It survives GUI exit, and ends when the host or computer stops.
 //! - Windows has no Unix domain sockets in the same shape; `start()` is a
 //!   no-op there for now rather than half-supporting named pipes.
 //!
-//! Panes register themselves in `RootView::spawn_terminal_pane` and
-//! unregister on the two removal paths that exist today (`close_tab`,
-//! `close_active_pane`). The registry is memory-only and dies with the
-//! process, so a pane that somehow skips both (e.g. the whole app being
-//! killed) never leaks past that point either -- it just means `list` can
-//! serve a stale entry for the remainder of *this* run. `list` doesn't hide
-//! those; it reports them with `alive: false` (see `TerminalState::is_alive`)
-//! so a client can decide what to do with a dead session itself.
+//! The host owns PTYs. A GUI pane attaches to a host session and renders its
+//! output through a local terminal projection. Closing the GUI detaches that
+//! projection. It does not stop the session. Use the explicit close-session
+//! request to stop a host session.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -530,6 +525,14 @@ pub fn start() {
     });
 }
 
+/// Run the local host accept loop in this process.
+///
+/// Unlike `start`, this returns if another process already owns the socket.
+pub fn run_host() {
+    #[cfg(unix)]
+    unix_impl::run();
+}
+
 #[cfg(unix)]
 mod unix_impl {
     use super::*;
@@ -544,9 +547,18 @@ mod unix_impl {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // Remove a stale socket from a previous (crashed/killed) run before
-        // binding — UnixListener::bind fails if the path already exists.
-        let _ = std::fs::remove_file(&path);
+        let Some(_instance_lock) = acquire_instance_lock() else {
+            return;
+        };
+        if UnixStream::connect(&path).is_ok() {
+            return;
+        }
+        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+            use std::os::unix::fs::FileTypeExt;
+            if !metadata.file_type().is_socket() || std::fs::remove_file(&path).is_err() {
+                return;
+            }
+        }
         let listener = match UnixListener::bind(&path) {
             Ok(l) => l,
             Err(_) => return, // e.g. state_dir not writable; daemon is best-effort
@@ -562,6 +574,24 @@ mod unix_impl {
         for stream in listener.incoming().flatten() {
             std::thread::spawn(move || handle_connection(stream));
         }
+    }
+
+    fn acquire_instance_lock() -> Option<std::fs::File> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+
+        let lock_path = crate::paths::get().state_dir.join("fasttyd.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .ok()?;
+        let mut permissions = lock.metadata().ok()?.permissions();
+        permissions.set_mode(0o600);
+        lock.set_permissions(permissions).ok()?;
+        let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        (result == 0).then_some(lock)
     }
 
     /// One currently-attached session on a connection: its stop-flag (so
@@ -659,6 +689,7 @@ mod unix_impl {
                     mode
                 };
                 let (cols, rows) = terminal.dimensions();
+                let (snapshot, rx) = terminal.snapshot_and_subscribe_output();
                 send(
                     &conn.out,
                     &Response::Attached {
@@ -672,7 +703,7 @@ mod unix_impl {
                     &conn.out,
                     &Response::Snapshot {
                         id,
-                        data: base64_encode(&terminal.snapshot_ansi()),
+                        data: base64_encode(&snapshot),
                     },
                 );
 
@@ -690,7 +721,6 @@ mod unix_impl {
                     },
                 );
 
-                let rx = terminal.subscribe_output();
                 let out = Arc::clone(&conn.out);
                 let conn_alive = Arc::clone(&conn.conn_alive);
                 std::thread::spawn(move || {

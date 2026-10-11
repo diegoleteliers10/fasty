@@ -44,6 +44,61 @@ pub enum AppEvent {
     },
 }
 
+#[cfg(test)]
+mod dws_regression_tests {
+    use super::OutputHub;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    #[test]
+    fn active_hosted_terminal_requires_close_confirmation() {
+        assert!(super::remote_session_needs_close_confirmation(
+            Some(7),
+            true
+        ));
+        assert!(!super::remote_session_needs_close_confirmation(
+            Some(7),
+            false
+        ));
+        assert!(!super::remote_session_needs_close_confirmation(None, true));
+    }
+
+    #[test]
+    fn snapshot_and_subscribe_delivers_each_boundary_chunk_once() {
+        let hub = OutputHub::default();
+        let terminal_state = Arc::new(Mutex::new(Vec::new()));
+        let (snapshot, output) = hub.snapshot_and_subscribe(|| terminal_state.lock().clone());
+        assert!(snapshot.is_empty());
+
+        hub.publish(b"after-boundary", || {
+            terminal_state.lock().extend_from_slice(b"after-boundary");
+        });
+
+        let next = output.try_recv().expect("new output follows the snapshot");
+        assert_eq!(next, b"after-boundary");
+        assert!(
+            output.try_recv().is_err(),
+            "output is delivered only once"
+        );
+    }
+
+    #[test]
+    fn published_output_is_in_snapshot_and_not_replayed() {
+        let hub = OutputHub::default();
+        let terminal_state = Arc::new(Mutex::new(Vec::new()));
+        hub.publish(b"before-boundary", || {
+            terminal_state.lock().extend_from_slice(b"before-boundary");
+        });
+
+        let (snapshot, output) = hub.snapshot_and_subscribe(|| terminal_state.lock().clone());
+
+        assert_eq!(snapshot, b"before-boundary");
+        assert!(
+            output.try_recv().is_err(),
+            "snapshot bytes are not replayed"
+        );
+    }
+}
 
 
 /// Events derived from raw PTY byte-stream CSI scanning.
@@ -246,13 +301,77 @@ pub struct TerminalState {
     /// Raw PTY byte stream, fanned out to anyone subscribed via
     /// `subscribe_output` (currently just `crate::daemon`'s attach clients).
     /// Closed receivers are pruned lazily on the next write.
-    output_subs: Arc<ParkingMutex<Vec<async_channel::Sender<Vec<u8>>>>>,
+    output_hub: Arc<OutputHub>,
     /// Flipped to `false` by the reader thread once it sees EOF/an error on
     /// the PTY (i.e. the shell exited). Distinct from `is_process_running`,
     /// which asks whether the shell has an active *foreground child* — this
     /// asks whether the pane's shell process is there at all.
     alive: Arc<std::sync::atomic::AtomicBool>,
     has_terminated: std::sync::atomic::AtomicBool,
+    remote_session_id: Option<usize>,
+    remote_control: Option<Arc<crate::session_host::RemoteControl>>,
+}
+
+#[derive(Default)]
+struct OutputHub {
+    boundary: ParkingMutex<()>,
+    subscribers: ParkingMutex<Vec<async_channel::Sender<Vec<u8>>>>,
+}
+
+impl OutputHub {
+    fn subscribe(&self) -> async_channel::Receiver<Vec<u8>> {
+        let _boundary = self.boundary.lock();
+        self.subscribe_at_boundary()
+    }
+
+    fn snapshot_and_subscribe(
+        &self,
+        snapshot: impl FnOnce() -> Vec<u8>,
+    ) -> (Vec<u8>, async_channel::Receiver<Vec<u8>>) {
+        let _boundary = self.boundary.lock();
+        let snapshot = snapshot();
+        (snapshot, self.subscribe_at_boundary())
+    }
+
+    #[cfg(test)]
+    fn publish(&self, bytes: &[u8], apply_to_terminal: impl FnOnce()) {
+        let _boundary = self.boundary.lock();
+        apply_to_terminal();
+        self.publish_at_boundary(bytes);
+    }
+
+    fn publish_at_boundary(&self, bytes: &[u8]) {
+        let chunk = bytes.to_vec();
+        self.subscribers
+            .lock()
+            .retain(|subscriber| subscriber.try_send(chunk.clone()).is_ok());
+    }
+
+    fn subscribe_at_boundary(&self) -> async_channel::Receiver<Vec<u8>> {
+        let (sender, receiver) = async_channel::unbounded();
+        self.subscribers.lock().push(sender);
+        receiver
+    }
+}
+
+fn remote_session_needs_close_confirmation(
+    remote_session_id: Option<usize>,
+    is_alive: bool,
+) -> bool {
+    remote_session_id.is_some() && is_alive
+}
+
+struct RemoteInputWriter(Arc<crate::session_host::RemoteControl>);
+
+impl Write for RemoteInputWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.write(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl TerminalState {
@@ -294,6 +413,93 @@ impl TerminalState {
         viewport_width: f32,
         viewport_height: f32,
         sender: crate::event_listener::EventSender,
+    ) -> anyhow::Result<Self> {
+        Self::new_internal(
+            executable,
+            exec_args,
+            cwd,
+            scrollback,
+            _font_config,
+            cell_width,
+            cell_height,
+            viewport_width,
+            viewport_height,
+            sender,
+            None,
+        )
+    }
+
+    #[cfg(unix)]
+    pub fn new_hosted(
+        executable: &str,
+        exec_args: &[String],
+        cwd: Option<&str>,
+        scrollback: usize,
+        font_config: FontConfig,
+        cell_width: f32,
+        cell_height: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+        sender: crate::event_listener::EventSender,
+    ) -> anyhow::Result<Self> {
+        let cols = ((viewport_width as usize) / (cell_width as usize).max(1)).max(80);
+        let rows = ((viewport_height as usize) / (cell_height as usize).max(1)).max(24);
+        let remote = crate::session_host::spawn_attached(executable, exec_args, cwd, cols, rows)
+            .map_err(anyhow::Error::msg)?;
+        Self::new_internal(
+            executable,
+            exec_args,
+            cwd,
+            scrollback,
+            font_config,
+            cell_width,
+            cell_height,
+            viewport_width,
+            viewport_height,
+            sender,
+            Some(remote),
+        )
+    }
+
+    #[cfg(not(unix))]
+    pub fn new_hosted(
+        executable: &str,
+        exec_args: &[String],
+        cwd: Option<&str>,
+        scrollback: usize,
+        font_config: FontConfig,
+        cell_width: f32,
+        cell_height: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+        sender: crate::event_listener::EventSender,
+    ) -> anyhow::Result<Self> {
+        Self::new(
+            executable,
+            exec_args,
+            cwd,
+            scrollback,
+            font_config,
+            cell_width,
+            cell_height,
+            viewport_width,
+            viewport_height,
+            sender,
+        )
+    }
+
+    fn new_internal(
+        executable: &str,
+        exec_args: &[String],
+        cwd: Option<&str>,
+        scrollback: usize,
+        _font_config: FontConfig,
+        cell_width: f32,
+        cell_height: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+        sender: crate::event_listener::EventSender,
+        remote: Option<crate::session_host::RemoteSession>,
     ) -> anyhow::Result<Self> {
         let cell_w = (cell_width as usize).max(1);
         let cell_h = (cell_height as usize).max(1);
@@ -489,7 +695,7 @@ impl TerminalState {
             }
         }
 
-        let no_spawn = std::env::var("FASTTY_NO_SPAWN").is_ok();
+        let no_spawn = remote.is_some() || std::env::var("FASTTY_NO_SPAWN").is_ok();
         let child = if no_spawn {
             None
         } else {
@@ -503,19 +709,34 @@ impl TerminalState {
         let master: Box<dyn MasterPty + Send> = pair.master;
         let master_arc: Arc<ParkingMutex<Box<dyn MasterPty + Send>>> =
             Arc::new(ParkingMutex::new(master));
+        let remote_session_id = remote.as_ref().map(|session| session.id);
+        let remote_control = remote.as_ref().map(|session| Arc::clone(&session.control));
+        #[cfg(unix)]
+        let (mut reader, remote_output) = if remote.is_some() {
+            let (read_end, write_end) = std::os::unix::net::UnixStream::pair()?;
+            (Box::new(read_end) as Box<dyn std::io::Read + Send>, Some(write_end))
+        } else {
+            let reader = master_arc
+                .lock()
+                .try_clone_reader()
+                .expect("Failed to clone reader");
+            (reader, None)
+        };
+        #[cfg(not(unix))]
         let mut reader = master_arc
             .lock()
             .try_clone_reader()
             .expect("Failed to clone reader");
-        let writer = master_arc.lock().take_writer().expect("Failed to take writer");
 
-        let writer_boxed: Box<dyn Write + Send> = Box::new(writer);
+        let writer_boxed: Box<dyn Write + Send> = match &remote_control {
+            Some(control) => Box::new(RemoteInputWriter(Arc::clone(control))),
+            None => Box::new(master_arc.lock().take_writer().expect("Failed to take writer")),
+        };
         let writer_arc: Arc<ParkingMutex<Box<dyn Write + Send>>> =
             Arc::new(ParkingMutex::new(writer_boxed));
 
-        let output_subs: Arc<ParkingMutex<Vec<async_channel::Sender<Vec<u8>>>>> =
-            Arc::new(ParkingMutex::new(Vec::new()));
-        let output_subs_clone = Arc::clone(&output_subs);
+        let output_hub = Arc::new(OutputHub::default());
+        let output_hub_clone = Arc::clone(&output_hub);
         let alive: Arc<std::sync::atomic::AtomicBool> =
             Arc::new(std::sync::atomic::AtomicBool::new(true));
         let alive_clone = Arc::clone(&alive);
@@ -864,17 +1085,7 @@ impl TerminalState {
                         break;
                     }
                     Ok(n) => {
-                        // Fan out the raw chunk to any daemon attach clients before
-                        // parsing it. Best-effort: an unbounded channel never
-                        // backpressures the reader, and a closed receiver (client
-                        // disconnected) just gets pruned on its next failed send.
-                        {
-                            let mut subs = output_subs_clone.lock();
-                            if !subs.is_empty() {
-                                let chunk = buf[..n].to_vec();
-                                subs.retain(|tx| tx.try_send(chunk.clone()).is_ok());
-                            }
-                        }
+                        let output_boundary = output_hub_clone.boundary.lock();
 
                         let mut term_locked = term_clone.lock();
                         let mut local_lines = 0;
@@ -1060,6 +1271,8 @@ impl TerminalState {
                             render_gen_clone.fetch_add(1, Ordering::Relaxed);
                             event_listener_clone.send_app_event(AppEvent::Wakeup);
                         }
+                        output_hub_clone.publish_at_boundary(&buf[..n]);
+                        drop(output_boundary);
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
                         continue;
@@ -1076,6 +1289,27 @@ impl TerminalState {
         });
         }
 
+        #[cfg(unix)]
+        if let (Some(remote), Some(mut output_sink)) = (remote, remote_output) {
+            let _ = output_sink.write_all(&remote.snapshot);
+            thread::spawn(move || {
+                let mut reader = remote.reader;
+                loop {
+                    match crate::session_host::read_output(&mut reader) {
+                        Ok(Some(bytes)) if !bytes.is_empty() => {
+                            if output_sink.write_all(&bytes).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+            });
+        }
+        #[cfg(not(unix))]
+        drop(remote);
+
         Ok(Self {
             term,
             render_generation,
@@ -1089,9 +1323,11 @@ impl TerminalState {
             prompt_lines,
             image_store,
             event_listener,
-            output_subs,
+            output_hub,
             alive,
             has_terminated: std::sync::atomic::AtomicBool::new(false),
+            remote_session_id,
+            remote_control,
         })
     }
 
@@ -1110,6 +1346,10 @@ impl TerminalState {
         self.shell_pid
     }
 
+    pub fn remote_session_id(&self) -> Option<usize> {
+        self.remote_session_id
+    }
+
     /// Whether the pane's shell process is still there — `false` once the
     /// reader thread has seen EOF/an error on the PTY. Unlike
     /// `is_process_running`, this is about the shell itself, not whether it
@@ -1122,9 +1362,20 @@ impl TerminalState {
     /// attached client sees the same bytes the GPUI renderer does, without
     /// stealing them — every subscriber gets its own copy of each chunk.
     pub fn subscribe_output(&self) -> async_channel::Receiver<Vec<u8>> {
-        let (tx, rx) = async_channel::unbounded();
-        self.output_subs.lock().push(tx);
-        rx
+        self.output_hub.subscribe()
+    }
+
+    pub fn snapshot_and_subscribe_output(&self) -> (Vec<u8>, async_channel::Receiver<Vec<u8>>) {
+        self.output_hub
+            .snapshot_and_subscribe(|| self.snapshot_ansi())
+    }
+
+    pub fn needs_close_confirmation(&self) -> bool {
+        if self.remote_session_id.is_some() {
+            remote_session_needs_close_confirmation(self.remote_session_id, self.is_alive())
+        } else {
+            self.is_process_running()
+        }
     }
 
     pub fn set_event_sender(&self, sender: crate::event_listener::EventSender) {
@@ -1178,6 +1429,10 @@ impl TerminalState {
         if self.has_terminated.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
+        if let Some(remote) = &self.remote_control {
+            remote.stop();
+            return;
+        }
         let Some(pid) = self.shell_pid else { return; };
         if pid <= 1 { return; }
         #[cfg(not(windows))]
@@ -1209,7 +1464,11 @@ impl TerminalState {
 
 impl Drop for TerminalState {
     fn drop(&mut self) {
-        self.terminate_process();
+        if let Some(remote) = &self.remote_control {
+            remote.detach();
+        } else {
+            self.terminate_process();
+        }
     }
 }
 
@@ -1412,6 +1671,9 @@ impl TerminalState {
             pixel_width,
             pixel_height,
         }).ok();
+        if let Some(remote) = &self.remote_control {
+            remote.resize(cols, rows);
+        }
 
         self.render_generation.fetch_add(1, Ordering::Relaxed);
     }

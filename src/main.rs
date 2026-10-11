@@ -23,6 +23,12 @@ fn parse_wait_flag(arg: &str) -> Option<u64> {
 }
 
 fn main() {
+    if fastty::session_host::is_host_argument(std::env::args().nth(1).as_deref()) {
+        let _ = fastty::paths::init();
+        fastty::session_host::run_host();
+        return;
+    }
+
     fastty::updater::cleanup_old_installations();
     let _ = fastty::paths::init();
 
@@ -318,7 +324,10 @@ fn main() {
 
 
     let cli_opts = CliOptions::parse();
-    fastty::daemon::start();
+    if let Err(error) = fastty::session_host::ensure_running() {
+        eprintln!("fastty: {error}");
+        std::process::exit(1);
+    }
 
     application()
         .with_quit_mode(QuitMode::LastWindowClosed)

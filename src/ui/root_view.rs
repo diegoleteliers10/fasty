@@ -3281,7 +3281,7 @@ impl RootView {
             let _ = event_tx.send_blocking(event);
         }));
 
-        let terminal = TerminalState::new(
+        let terminal = TerminalState::new_hosted(
             cmd,
             args,
             cwd.and_then(|p| p.to_str()),
@@ -3296,11 +3296,8 @@ impl RootView {
         .expect("Failed to initialize terminal state");
 
         let terminal_arc = Arc::new(terminal);
-        // Every pane is attachable over the local IPC daemon (`crate::daemon`)
-        // the moment it exists, regardless of how it was created (new tab,
-        // split, session restore, CLI `-e`) -- unregistered on the two removal
-        // paths, `close_tab` and `close_active_pane`.
-        crate::daemon::register(pane_id, terminal_arc.clone());
+        // The session host owns this PTY. The local TerminalState is only the
+        // renderer projection fed by the host's attach stream.
         cx.spawn_in(window, async move |this, cx| {
             while let Ok(mut event) = event_rx.recv().await {
                 // Coalesce consecutive Wakeup events (pure re-render pings) into
@@ -3561,7 +3558,7 @@ impl RootView {
             if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
                 if let Some(pane) = tab.pane_tree.find_pane(pane_id) {
                     if let Some(term) = &pane.terminal {
-                        if term.is_process_running() {
+                        if term.needs_close_confirmation() {
                             let name = term
                                 .get_foreground_process_name()
                                 .unwrap_or_else(|| "process".to_string());
@@ -4321,7 +4318,7 @@ impl RootView {
                 .into_iter()
                 .filter_map(|pane| {
                     if let Some(term) = &pane.terminal {
-                        if term.is_process_running() {
+                        if term.needs_close_confirmation() {
                             let name = term
                                 .get_foreground_process_name()
                                 .unwrap_or_else(|| "process".to_string());
@@ -4698,7 +4695,7 @@ impl RootView {
             .flat_map(|t| t.pane_tree.all_panes())
             .filter_map(|pane| {
                 if let Some(term) = &pane.terminal {
-                    if term.is_process_running() {
+                    if term.needs_close_confirmation() {
                         let name = term
                             .get_foreground_process_name()
                             .unwrap_or_else(|| "process".to_string());
