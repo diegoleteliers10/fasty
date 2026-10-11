@@ -11502,7 +11502,7 @@ impl RootView {
         // the terminal area is clicked, and this view registers no blur handler,
         // so it stays true after Tab, a secondary window, or app deactivation.
         // The focus handle is the source of truth and cannot go stale.
-        let ai_has_focus = self.ai_sidebar_open
+        let ai_has_focus = self.right_panel == RightPanel::Ai
             && (self.ai_input_focused || self.focus_handle.contains_focused(window, cx));
 
         match node {
