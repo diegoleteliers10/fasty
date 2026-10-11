@@ -60,6 +60,12 @@ pub(crate) struct ProgramStatusStore {
 }
 
 impl ProgramStatusStore {
+    pub(crate) fn should_deliver_native_notification(&self) -> bool {
+        !self.records.iter().any(|record| {
+            matches!(record.state, ProgramState::Working | ProgramState::Blocked)
+        })
+    }
+
     pub(crate) fn apply(&mut self, command: ProgramStatusCommand) {
         match command {
             ProgramStatusCommand::Query => {}
@@ -470,5 +476,21 @@ mod tests {
         assert_eq!(record(&records, "idle").state, ProgramState::Idle);
         store.reset();
         assert!(store.snapshot().is_empty());
+    }
+
+    #[test]
+    fn native_notifications_wait_until_nested_activity_finishes() {
+        let mut store = ProgramStatusStore::default();
+        report(&mut store, "state=done:app=pi");
+        assert!(store.should_deliver_native_notification());
+
+        report(&mut store, "state=working:id=pi/child");
+        assert!(!store.should_deliver_native_notification());
+
+        report(&mut store, "state=blocked:id=pi/child");
+        assert!(!store.should_deliver_native_notification());
+
+        report(&mut store, "state=done:id=pi/child");
+        assert!(store.should_deliver_native_notification());
     }
 }

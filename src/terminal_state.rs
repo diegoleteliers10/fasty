@@ -928,8 +928,10 @@ impl TerminalState {
                                     } else {
                                         finished.title
                                     };
-                                    dispatch_osc_action(
-                                        &OscCommand::Notification { title, body: finished.body },
+                                    dispatch_notification_if_allowed(
+                                        &title,
+                                        &finished.body,
+                                        &program_status_clone,
                                         &event_listener_clone,
                                         cursor_line,
                                         base,
@@ -938,8 +940,10 @@ impl TerminalState {
                                 }
                             }
                         } else {
-                            dispatch_osc_action(
-                                &OscCommand::Notification { title: "Fastty".to_string(), body: payload },
+                            dispatch_notification_if_allowed(
+                                "Fastty",
+                                &payload,
+                                &program_status_clone,
                                 &event_listener_clone,
                                 cursor_line,
                                 base,
@@ -1003,6 +1007,17 @@ impl TerminalState {
                                 write_resp(kclip::response("read", "DONE", id.as_deref()));
                             }
                         }
+                    }
+                    OscCommand::Notification { title, body } => {
+                        dispatch_notification_if_allowed(
+                            &title,
+                            &body,
+                            &program_status_clone,
+                            &event_listener_clone,
+                            cursor_line,
+                            base,
+                            screen_lines,
+                        );
                     }
                     _ => {
                         dispatch_osc_action(&cmd, &event_listener_clone, cursor_line, base, screen_lines);
@@ -3073,6 +3088,30 @@ fn dispatch_osc_action(
     }
 }
 
+fn dispatch_notification_if_allowed(
+    title: &str,
+    body: &str,
+    program_status: &ParkingMutex<crate::program_status::ProgramStatusStore>,
+    sender: &EventListenerProxy,
+    cursor_line: i32,
+    absolute_base: u64,
+    screen_lines: i32,
+) {
+    if !program_status.lock().should_deliver_native_notification() {
+        return;
+    }
+    dispatch_osc_action(
+        &OscCommand::Notification {
+            title: title.to_owned(),
+            body: body.to_owned(),
+        },
+        sender,
+        cursor_line,
+        absolute_base,
+        screen_lines,
+    );
+}
+
 #[cfg(target_os = "macos")]
 fn get_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     use std::ffi::CStr;
@@ -3399,6 +3438,66 @@ mod tests {
         assert!(parse_osc(b"12;?", &mut cmd_start).is_none());
         assert!(parse_osc(b"4;2;?", &mut cmd_start).is_none());
         assert!(parse_osc(b"4;?;2", &mut cmd_start).is_none());
+    }
+
+    #[test]
+    fn notification_protocols_parse_to_the_filtered_command_path() {
+        let mut cmd_start = None;
+        for sequence in [b"9;4;3".as_slice(), b"777;notify;4;3".as_slice()] {
+            assert!(matches!(
+                parse_osc(sequence, &mut cmd_start),
+                Some(OscCommand::Notification { .. })
+            ));
+        }
+        assert!(matches!(
+            parse_osc(b"99;i=job:p=body;3", &mut cmd_start),
+            Some(OscCommand::NotificationFragment { .. })
+        ));
+    }
+
+    #[test]
+    fn native_notifications_are_suppressed_until_program_completion() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_events = Arc::clone(&events);
+        let writer: Box<dyn Write + Send> = Box::new(std::io::sink());
+        let sender = EventListenerProxy::from_arc(Arc::new(ParkingMutex::new(writer)));
+        sender.set_event_sender(crate::event_listener::EventSender::Callback(Arc::new(
+            move |event| captured_events.lock().unwrap().push(event),
+        )));
+        let program_status = ParkingMutex::new(crate::program_status::ProgramStatusStore::default());
+        program_status.lock().apply(crate::program_status::ProgramStatusCommand::Report(
+            crate::program_status::ProgramRecord {
+                id: "pi".to_owned(),
+                state: crate::program_status::ProgramState::Working,
+                app: Some("pi".to_owned()),
+                title: None,
+                msg: None,
+                progress: None,
+                kind: None,
+            },
+        ));
+
+        dispatch_notification_if_allowed("4", "3", &program_status, &sender, 0, 0, 24);
+        assert!(events.lock().unwrap().is_empty());
+
+        program_status.lock().apply(crate::program_status::ProgramStatusCommand::Report(
+            crate::program_status::ProgramRecord {
+                id: "pi".to_owned(),
+                state: crate::program_status::ProgramState::Done,
+                app: Some("pi".to_owned()),
+                title: None,
+                msg: None,
+                progress: None,
+                kind: None,
+            },
+        ));
+        dispatch_notification_if_allowed("Pi", "Done", &program_status, &sender, 0, 0, 24);
+
+        let events = events.lock().unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [AppEvent::Notification { title, body }] if title == "Pi" && body == "Done"
+        ));
     }
 
     /// A color query must produce exactly one reply.

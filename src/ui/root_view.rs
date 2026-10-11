@@ -11494,16 +11494,10 @@ impl RootView {
         let theme = self.theme;
         let font_family = self.font_family.clone();
         let font_size = self.font_size;
-        // While the agent input holds focus the terminal is not receiving keys,
-        // but its cursor kept painting and blinking there, which reads as "you
-        // are still in the shell". Hide it in every pane while that is true.
-        //
-        // `ai_input_focused` alone is not enough: it is only ever cleared when
-        // the terminal area is clicked, and this view registers no blur handler,
-        // so it stays true after Tab, a secondary window, or app deactivation.
-        // The focus handle is the source of truth and cannot go stale.
-        let ai_has_focus = self.right_panel == RightPanel::Ai
-            && (self.ai_input_focused || self.focus_handle.contains_focused(window, cx));
+        // The root focus handle also contains terminal focus. Use the explicit
+        // input focus state so a terminal click restores its cursor while the
+        // AI panel remains open.
+        let ai_has_focus = self.right_panel == RightPanel::Ai && self.ai_input_focused;
 
         match node {
             PaneNode::Leaf(pane) => {
