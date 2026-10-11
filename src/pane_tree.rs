@@ -22,6 +22,7 @@ pub type PaneId = usize;
 pub struct TerminalPane {
     pub id: PaneId,
     pub terminal: Option<Arc<TerminalState>>,
+    pub host_session_id: Option<usize>,
     pub title: String,
     pub custom_title: Option<String>,
     pub cwd: Option<std::path::PathBuf>,
@@ -38,6 +39,7 @@ impl Clone for TerminalPane {
         Self {
             id: self.id,
             terminal: self.terminal.clone(),
+            host_session_id: self.host_session_id,
             title: self.title.clone(),
             custom_title: self.custom_title.clone(),
             cwd: self.cwd.clone(),
@@ -405,6 +407,7 @@ impl PaneTree {
             PaneNode::Leaf(TerminalPane {
                 id: 0,
                 terminal: None,
+                host_session_id: None,
                 title: String::new(),
                 custom_title: None,
                 cwd: None,
@@ -438,6 +441,7 @@ impl PaneTree {
             PaneNode::Leaf(TerminalPane {
                 id: 0,
                 terminal: None,
+                host_session_id: None,
                 title: String::new(),
                 custom_title: None,
                 cwd: None,
@@ -510,6 +514,7 @@ impl PaneTree {
             PaneNode::Leaf(TerminalPane {
                 id: 0,
                 terminal: None,
+                host_session_id: None,
                 title: String::new(),
                 custom_title: None,
                 cwd: None,
@@ -622,6 +627,7 @@ mod tests {
         TerminalPane {
             id,
             terminal: None,
+            host_session_id: None,
             title: format!("Pane {}", id),
             custom_title: None,
             cwd: None,

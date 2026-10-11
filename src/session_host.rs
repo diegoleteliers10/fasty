@@ -333,6 +333,21 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>, String> {
     }
 }
 
+#[cfg(unix)]
+pub fn session_exists(id: usize) -> Result<bool, String> {
+    use std::os::unix::net::UnixStream;
+    ensure_running()?;
+    let mut stream =
+        UnixStream::connect(crate::daemon::socket_path()).map_err(|error| error.to_string())?;
+    write_request(&mut stream, &Request::SessionExists { id })
+        .map_err(|error| error.to_string())?;
+    match read_response(&mut BufReader::new(stream))? {
+        Response::SessionExists { exists } => Ok(exists),
+        Response::Error { code, message } => Err(format!("{code}: {message}")),
+        other => Err(format!("unexpected session-exists response: {other:?}")),
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -720,6 +735,8 @@ mod tests {
         std::fs::write(host_pid_path, host.child_mut().id().to_string())
             .expect("write host PID for lifecycle parent");
         wait_for_socket(&crate::daemon::socket_path(), host.child_mut());
+        assert!(!session_exists(usize::MAX).expect("query missing session"));
+        assert!(!session_exists(usize::MAX).expect("query registry after missing ID"));
 
         let args = vec![
             "-c".to_string(),

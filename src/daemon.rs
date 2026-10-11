@@ -203,6 +203,8 @@ pub enum Request {
         read_only: bool,
     },
     List,
+    /// Check whether a session ID is registered without creating a default session.
+    SessionExists { id: PaneId },
     /// Push-updated session list: an initial `sessions` event with everything
     /// currently registered, followed by `session_added` / `session_removed`
     /// / `session_updated` as the registry changes, for as long as this
@@ -369,6 +371,7 @@ pub enum Response {
     Sessions {
         sessions: Vec<SessionInfo>,
     },
+    SessionExists { exists: bool },
     /// A session appeared (new tab/split) while `subscribe_sessions` was
     /// active on this connection.
     SessionAdded {
@@ -670,6 +673,10 @@ mod unix_impl {
                     .map(|(id, entry)| session_info(*id, &entry.terminal))
                     .collect();
                 send(&conn.out, &Response::Sessions { sessions });
+            }
+            Request::SessionExists { id } => {
+                let exists = registry().lock().contains_key(&id);
+                send(&conn.out, &Response::SessionExists { exists });
             }
             Request::Attach { id, mode } => {
                 let terminal = registry().lock().get(&id).map(|e| Arc::clone(&e.terminal));

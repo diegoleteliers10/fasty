@@ -63,6 +63,21 @@ mod dws_regression_tests {
         assert!(!super::remote_session_needs_close_confirmation(None, true));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn only_no_such_session_allows_restore_fallback() {
+        assert!(super::is_missing_host_session_error(
+            "no_such_session: session ID 12 not found"
+        ));
+        assert!(!super::is_missing_host_session_error("connection refused"));
+        assert!(!super::is_missing_host_session_error(
+            "invalid session-host response: malformed JSON"
+        ));
+        assert!(!super::is_missing_host_session_error(
+            "spawn_failed: no_such_session"
+        ));
+    }
+
     #[test]
     fn snapshot_and_subscribe_delivers_each_boundary_chunk_once() {
         let hub = OutputHub::default();
@@ -361,6 +376,11 @@ fn remote_session_needs_close_confirmation(
     remote_session_id.is_some() && is_alive
 }
 
+#[cfg(unix)]
+fn is_missing_host_session_error(error: &str) -> bool {
+    error.starts_with("no_such_session: ")
+}
+
 struct RemoteInputWriter(Arc<crate::session_host::RemoteControl>);
 
 impl Write for RemoteInputWriter {
@@ -486,6 +506,43 @@ impl TerminalState {
             viewport_height,
             sender,
         )
+    }
+
+    /// Attach a GUI projection to an existing host session. `Ok(None)` means
+    /// the saved ID is no longer present and the caller can start one shell.
+    #[cfg(unix)]
+    pub fn attach_hosted(
+        session_id: usize,
+        executable: &str,
+        exec_args: &[String],
+        cwd: Option<&str>,
+        scrollback: usize,
+        font_config: FontConfig,
+        cell_width: f32,
+        cell_height: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+        sender: crate::event_listener::EventSender,
+    ) -> anyhow::Result<Option<Self>> {
+        let remote = match crate::session_host::attach(session_id) {
+            Ok(remote) => remote,
+            Err(error) if is_missing_host_session_error(&error) => return Ok(None),
+            Err(error) => return Err(anyhow::Error::msg(error)),
+        };
+        Self::new_internal(
+            executable,
+            exec_args,
+            cwd,
+            scrollback,
+            font_config,
+            cell_width,
+            cell_height,
+            viewport_width,
+            viewport_height,
+            sender,
+            Some(remote),
+        )
+        .map(Some)
     }
 
     fn new_internal(

@@ -101,6 +101,116 @@ pub struct TabInfo {
     pub custom_name: Option<String>,
     #[serde(default)]
     pub title_override: Option<String>,
+    #[serde(default)]
+    pub pane_tree: Option<PersistedPaneTree>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedPaneTree {
+    pub root: PersistedPaneNode,
+    pub active_pane_id: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PersistedPaneNode {
+    Leaf(PersistedTerminalPane),
+    Split {
+        direction: PersistedSplitDirection,
+        ratio: f32,
+        first: Box<PersistedPaneNode>,
+        second: Box<PersistedPaneNode>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum PersistedSplitDirection {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedTerminalPane {
+    pub pane_id: usize,
+    /// Absent in old session files and when a pane has no live host session.
+    #[serde(default)]
+    pub host_session_id: Option<usize>,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    pub title: String,
+    #[serde(default)]
+    pub custom_title: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_tab_json_loads_without_pane_tree() {
+        let json = r#"{"cwd":"/tmp","ai_tab_key":"tab","ai_conversation_id":"chat","custom_name":null,"title_override":"Terminal"}"#;
+
+        let tab: TabInfo = serde_json::from_str(json).unwrap();
+
+        assert!(tab.pane_tree.is_none());
+        assert_eq!(tab.cwd, Some(PathBuf::from("/tmp")));
+        assert_eq!(tab.title_override.as_deref(), Some("Terminal"));
+    }
+
+    #[test]
+    fn legacy_session_migrates_tabs_without_host_session_ids() {
+        let json = r#"{"tabs":[{"cwd":"/tmp","ai_tab_key":"tab","ai_conversation_id":"chat","custom_name":null,"title_override":"Terminal"}],"active_tab":0}"#;
+
+        let session: Session = serde_json::from_str(json).unwrap();
+        let migrated = session.migrate();
+
+        assert_eq!(migrated.windows.len(), 1);
+        assert_eq!(migrated.windows[0].tabs.len(), 1);
+        assert!(migrated.windows[0].tabs[0].pane_tree.is_none());
+    }
+
+    #[test]
+    fn pane_tree_round_trip_keeps_each_host_session_id() {
+        let tab = TabInfo {
+            cwd: Some(PathBuf::from("/work")),
+            ai_tab_key: None,
+            ai_conversation_id: None,
+            custom_name: None,
+            title_override: None,
+            pane_tree: Some(PersistedPaneTree {
+                root: PersistedPaneNode::Split {
+                    direction: PersistedSplitDirection::Horizontal,
+                    ratio: 0.4,
+                    first: Box::new(PersistedPaneNode::Leaf(PersistedTerminalPane {
+                        pane_id: 10,
+                        host_session_id: Some(41),
+                        cwd: Some(PathBuf::from("/work/one")),
+                        title: "one".into(),
+                        custom_title: Some("first".into()),
+                    })),
+                    second: Box::new(PersistedPaneNode::Leaf(PersistedTerminalPane {
+                        pane_id: 11,
+                        host_session_id: Some(42),
+                        cwd: Some(PathBuf::from("/work/two")),
+                        title: "two".into(),
+                        custom_title: None,
+                    })),
+                },
+                active_pane_id: 11,
+            }),
+        };
+
+        let encoded = serde_json::to_string(&tab).unwrap();
+        let decoded: TabInfo = serde_json::from_str(&encoded).unwrap();
+
+        let Some(PersistedPaneTree { root: PersistedPaneNode::Split { first, second, .. }, active_pane_id }) = decoded.pane_tree else {
+            panic!("persisted split must round-trip");
+        };
+        let PersistedPaneNode::Leaf(first) = *first else { panic!("first pane must be a leaf"); };
+        let PersistedPaneNode::Leaf(second) = *second else { panic!("second pane must be a leaf"); };
+        assert_eq!(first.host_session_id, Some(41));
+        assert_eq!(second.host_session_id, Some(42));
+        assert_eq!(active_pane_id, 11);
+    }
 }
 
 pub fn session_path() -> PathBuf {
