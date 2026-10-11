@@ -3,6 +3,24 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.22.0 - 2026-10-11
+
+### Terminal sessions
+
+- Keep terminal sessions running when you close and reopen Fastty.
+- Restore terminal panes, split layouts, and active sessions when Fastty starts.
+- Retry a session connection when a restored pane cannot connect to its host.
+
+### Project panel
+
+- View staged and unstaged file changes in the project panel.
+- Browse repository commits with a colored branch graph.
+- Stage, unstage, stash, restore, and discard changes from the panel.
+
+### Terminal
+
+- Hide the terminal cursor while the agent panel has focus.
+
 ## 0.21.6 - 2026-10-09
 
 ### Terminal
