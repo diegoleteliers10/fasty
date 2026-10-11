@@ -3,6 +3,13 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.22.2 - 2026-10-11
+
+### Terminal sessions
+
+- Ask before closing a restored session only when it has an active process.
+- Restore mouse, scroll, focus, paste, and key modes when Fastty reconnects to a session.
+
 ## 0.22.1 - 2026-10-11
 
 ### Terminal
