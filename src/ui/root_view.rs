@@ -218,6 +218,16 @@ enum HostAttachOutcome<T> {
     Failed(String),
 }
 
+#[derive(Clone, Copy)]
+enum MissingSessionPolicy {
+    StartFresh,
+    KeepUnavailable,
+}
+
+fn should_start_shell_for_missing_session(policy: MissingSessionPolicy) -> bool {
+    matches!(policy, MissingSessionPolicy::StartFresh)
+}
+
 fn classify_host_attach<T>(result: Result<Option<T>, String>) -> HostAttachOutcome<T> {
     match result {
         Ok(Some(terminal)) => HostAttachOutcome::Attached(terminal),
@@ -232,6 +242,28 @@ fn pane_host_session_id(pane: &crate::pane_tree::TerminalPane) -> Option<usize> 
             .as_ref()
             .and_then(|terminal| terminal.remote_session_id())
     })
+}
+
+fn unavailable_terminal_pane(
+    pane_id: PaneId,
+    host_session_id: Option<usize>,
+    title: String,
+    cwd: Option<std::path::PathBuf>,
+) -> TerminalPane {
+    TerminalPane {
+        id: pane_id,
+        terminal: None,
+        host_session_id,
+        title,
+        custom_title: None,
+        cwd: cwd.clone(),
+        git_status: None,
+        git_checked_cwd: cwd,
+        git_last_poll: None,
+        last_duration_ms: None,
+        last_exit_code: None,
+        last_bounds: None,
+    }
 }
 
 fn pane_close_info(pane: &crate::pane_tree::TerminalPane) -> Option<RunningProcessInfo> {
@@ -366,6 +398,16 @@ mod host_restore_tests {
             last_exit_code: None,
             last_bounds: None,
         }
+    }
+
+    #[test]
+    fn retry_does_not_start_a_replacement_shell_when_host_session_is_missing() {
+        assert!(!should_start_shell_for_missing_session(
+            MissingSessionPolicy::KeepUnavailable
+        ));
+        assert!(should_start_shell_for_missing_session(
+            MissingSessionPolicy::StartFresh
+        ));
     }
 
     #[test]
@@ -3723,6 +3765,7 @@ impl RootView {
             title_override,
             None,
             None,
+            MissingSessionPolicy::StartFresh,
             window,
             cx,
         )
@@ -3736,6 +3779,7 @@ impl RootView {
         title_override: Option<String>,
         host_session_id: Option<usize>,
         restored_pane_id: Option<PaneId>,
+        missing_session_policy: MissingSessionPolicy,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> TerminalPane {
@@ -3792,35 +3836,37 @@ impl RootView {
         };
         let terminal = match attach {
             HostAttachOutcome::Attached(terminal) => terminal,
-            HostAttachOutcome::Missing => TerminalState::new_hosted(
-                cmd,
-                args,
-                cwd_str,
-            self.config.scrollback,
-            font_config,
-            cell_w,
-            line_h,
-            960.0,
-            640.0,
-            event_sender.clone(),
-        )
-            .expect("Failed to initialize terminal state"),
+            HostAttachOutcome::Missing => {
+                if !should_start_shell_for_missing_session(missing_session_policy) {
+                    return unavailable_terminal_pane(
+                        pane_id,
+                        host_session_id,
+                        pane_title,
+                        initial_cwd,
+                    );
+                }
+                TerminalState::new_hosted(
+                    cmd,
+                    args,
+                    cwd_str,
+                    self.config.scrollback,
+                    font_config,
+                    cell_w,
+                    line_h,
+                    960.0,
+                    640.0,
+                    event_sender.clone(),
+                )
+                .expect("Failed to initialize terminal state")
+            }
             HostAttachOutcome::Failed(error) => {
                 eprintln!("Fastty could not restore host session {host_session_id:?}: {error}");
-                return TerminalPane {
-                    id: pane_id,
-                    terminal: None,
+                return unavailable_terminal_pane(
+                    pane_id,
                     host_session_id,
-                    title: pane_title,
-                    custom_title: None,
-                    cwd: initial_cwd.clone(),
-                    git_status: None,
-                    git_checked_cwd: initial_cwd,
-                    git_last_poll: None,
-                    last_duration_ms: None,
-                    last_exit_code: None,
-                    last_bounds: None,
-                };
+                    pane_title,
+                    initial_cwd,
+                );
             }
         };
 
@@ -3960,6 +4006,61 @@ impl RootView {
         }
     }
 
+    fn retry_host_session(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((tab_id, session_id, title, custom_title, cwd)) = self.tabs.iter()
+            .find_map(|tab| tab.pane_tree.find_pane(pane_id).and_then(|pane| {
+                if pane.terminal.is_some() {
+                    return None;
+                }
+                Some((
+                    tab.id,
+                    pane.host_session_id?,
+                    pane.title.clone(),
+                    pane.custom_title.clone(),
+                    pane.cwd.clone(),
+                ))
+            }))
+        else {
+            return;
+        };
+
+        let shell = self.config.shell.clone()
+            .or_else(|| std::env::var("SHELL").ok())
+            .unwrap_or_else(crate::paths::default_system_shell);
+        let mut replacement = self.spawn_terminal_pane_with_session(
+            &shell,
+            &[],
+            cwd.as_deref(),
+            Some(title),
+            Some(session_id),
+            Some(pane_id),
+            MissingSessionPolicy::KeepUnavailable,
+            window,
+            cx,
+        );
+        replacement.custom_title = custom_title;
+
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) else {
+            return;
+        };
+        if pane.host_session_id != Some(session_id) || pane.terminal.is_some() {
+            return;
+        }
+        *pane = replacement;
+        if tab.pane_tree.active_pane_id == pane_id {
+            if let Some(active) = tab.pane_tree.active_pane() {
+                tab.terminal = active.terminal.clone();
+                tab.cwd = active.cwd.clone();
+                tab.git_status = active.git_status.clone();
+            }
+        }
+        self.persist_session();
+        cx.notify();
+    }
+
     pub fn create_tab_with_cmd_and_cwd(
         &mut self,
         cmd: &str,
@@ -4020,6 +4121,7 @@ impl RootView {
                     Some(persisted.title),
                     persisted.host_session_id,
                     Some(persisted.pane_id),
+                    MissingSessionPolicy::StartFresh,
                     window,
                     cx,
                 );
@@ -4069,6 +4171,7 @@ impl RootView {
                         .or(tab_info.custom_name.clone()),
                     None,
                     None,
+                    MissingSessionPolicy::StartFresh,
                     window,
                     cx,
                 );
@@ -11927,6 +12030,47 @@ impl RootView {
                         )
                 });
 
+                let retry_panel = pane.host_session_id
+                    .filter(|_| pane.terminal.is_none())
+                    .map(|session_id| {
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap_2()
+                            .bg(theme.background)
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.muted_strong)
+                                    .child(format!("Could not reconnect to session {session_id}")),
+                            )
+                            .child(
+                                div()
+                                    .id(("retry-host-session", pane_id))
+                                    .px(px(12.))
+                                    .py(px(6.))
+                                    .rounded(px(5.))
+                                    .bg(theme.surface_raised)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .text_size(px(12.))
+                                    .text_color(theme.foreground)
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _ev, window, cx| {
+                                            this.retry_host_session(pane_id, window, cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                                    .child("Retry connection"),
+                            )
+                    });
+
                 div()
                     .size_full()
                     .relative()
@@ -11981,6 +12125,7 @@ impl RootView {
                         }),
                     )
                     .when_some(grid_el, |d, el| d.child(el))
+                    .when_some(retry_panel, |d, panel| d.child(panel))
                     .when_some(pane_scrollbar_thumb, |d, thumb| d.child(thumb))
                     .when_some(program_badge, |d, badge| d.child(badge))
             }
