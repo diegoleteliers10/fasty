@@ -90,6 +90,8 @@ impl RemoteControl {
     pub fn resize(&self, _cols: usize, _rows: usize) {}
 
     pub fn detach(&self) {}
+
+    pub fn stop(&self) {}
 }
 
 #[cfg(not(unix))]
