@@ -2,23 +2,142 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 use gpui::{
-    div, prelude::*, px, size, Bounds, Context, CursorStyle, Div, FocusHandle, FontFeatures,
-    FontWeight, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Render, ScrollHandle, ScrollWheelEvent, SharedString, TitlebarOptions, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions,
+    Bounds, Context, CursorStyle, Div, FocusHandle, FontFeatures, FontWeight, Hsla, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle,
+    ScrollWheelEvent, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use std::sync::Arc;
 
+use super::project_sidebar::{GraphLayout, ProjectPanelTab, ProjectSidebar, cached_graph_layout};
 use super::settings_view::SettingsView;
 use super::status_bar::{StatusBar, StatusBarModel, StatusInfo};
 use super::tab_bar::{TabBar, TabItem, TabSidebar};
-use super::theme::{rgb_to_hsla, Theme};
+use super::theme::{Theme, rgb_to_hsla};
 use crate::config::{self, Config, TabLayout};
 use crate::event_listener::EventSender;
 use crate::git::GitStatus;
 use crate::pane_tree::{Direction, PaneId, PaneNode, PaneTree, SplitDirection, TerminalPane};
 use crate::program_status::{ProgramRecord, ProgramState};
 use crate::terminal_state::{AppEvent, TerminalState};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RightPanel {
+    #[default]
+    Closed,
+    Project,
+    Ai,
+}
+
+const PROJECT_PANEL_WIDTH: f32 = 300.0;
+
+fn project_panel_width_after_drag(viewport_width: f32, cursor_x: f32) -> f32 {
+    (viewport_width - cursor_x).clamp(240.0, 750.0)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectPanelFeedback {
+    tab_id: usize,
+    cwd: Option<std::path::PathBuf>,
+    message: String,
+    action_id: Option<u64>,
+}
+
+impl ProjectPanelFeedback {
+    fn matches(&self, tab_id: usize, cwd: Option<&std::path::Path>) -> bool {
+        self.tab_id == tab_id && self.cwd.as_deref() == cwd
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectGraphScrollTarget {
+    tab_id: usize,
+    cwd: Option<std::path::PathBuf>,
+}
+
+fn project_graph_scroll_target_changed(
+    previous: Option<&ProjectGraphScrollTarget>,
+    next: &ProjectGraphScrollTarget,
+) -> bool {
+    previous != Some(next)
+}
+
+impl RightPanel {
+    fn toggle(self, panel: Self) -> Self {
+        if self == panel { Self::Closed } else { panel }
+    }
+}
+
+#[cfg(test)]
+mod project_panel_state_tests {
+    use super::{
+        ProjectGraphScrollTarget, ProjectPanelFeedback, RightPanel,
+        project_graph_scroll_target_changed, project_panel_width_after_drag,
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn project_and_ai_panels_replace_or_close_each_other() {
+        let project_open = RightPanel::Closed.toggle(RightPanel::Project);
+        assert_eq!(project_open, RightPanel::Project);
+        assert_eq!(project_open.toggle(RightPanel::Project), RightPanel::Closed);
+        assert_eq!(project_open.toggle(RightPanel::Ai), RightPanel::Ai);
+        assert_eq!(
+            RightPanel::Ai.toggle(RightPanel::Project),
+            RightPanel::Project
+        );
+    }
+
+    #[test]
+    fn project_panel_feedback_is_hidden_after_tab_or_cwd_change() {
+        let cwd = PathBuf::from("/repo/a");
+        let feedback = ProjectPanelFeedback {
+            tab_id: 1,
+            cwd: Some(cwd.clone()),
+            message: "Running Stage All".to_string(),
+            action_id: Some(1),
+        };
+
+        assert!(feedback.matches(1, Some(&cwd)));
+        assert!(!feedback.matches(2, Some(&cwd)));
+        assert!(!feedback.matches(1, Some(PathBuf::from("/repo/b").as_path())));
+    }
+
+    #[test]
+    fn project_panel_resize_uses_ai_sidebar_width_bounds() {
+        assert_eq!(project_panel_width_after_drag(1200.0, 800.0), 400.0);
+        assert_eq!(project_panel_width_after_drag(1200.0, 1000.0), 240.0);
+        assert_eq!(project_panel_width_after_drag(1200.0, 200.0), 750.0);
+    }
+
+    #[test]
+    fn project_graph_scroll_target_changes_when_tab_or_folder_changes() {
+        let first = ProjectGraphScrollTarget {
+            tab_id: 1,
+            cwd: Some(PathBuf::from("/repo/a")),
+        };
+        let same = first.clone();
+        let other_tab = ProjectGraphScrollTarget {
+            tab_id: 2,
+            cwd: first.cwd.clone(),
+        };
+        let other_cwd = ProjectGraphScrollTarget {
+            tab_id: 1,
+            cwd: Some(PathBuf::from("/repo/b")),
+        };
+
+        assert!(project_graph_scroll_target_changed(None, &first));
+        assert!(!project_graph_scroll_target_changed(Some(&first), &same));
+        assert!(project_graph_scroll_target_changed(
+            Some(&first),
+            &other_tab
+        ));
+        assert!(project_graph_scroll_target_changed(
+            Some(&first),
+            &other_cwd
+        ));
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
@@ -62,6 +181,302 @@ pub struct TabData {
     /// F2: zoomed pane (tmux `prefix+z` semantics). The pane takes the whole
     /// terminal area until toggled off. Per-tab, transient (not persisted).
     pub zoomed_pane: Option<PaneId>,
+}
+
+fn persist_pane_node(node: &crate::pane_tree::PaneNode) -> crate::session::PersistedPaneNode {
+    use crate::pane_tree::PaneNode;
+    use crate::session::{PersistedPaneNode, PersistedSplitDirection, PersistedTerminalPane};
+
+    match node {
+        PaneNode::Leaf(pane) => PersistedPaneNode::Leaf(PersistedTerminalPane {
+            pane_id: pane.id,
+            host_session_id: pane_host_session_id(pane),
+            cwd: pane.cwd.clone(),
+            title: pane.title.clone(),
+            custom_title: pane.custom_title.clone(),
+        }),
+        PaneNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => PersistedPaneNode::Split {
+            direction: match direction {
+                crate::pane_tree::SplitDirection::Horizontal => PersistedSplitDirection::Horizontal,
+                crate::pane_tree::SplitDirection::Vertical => PersistedSplitDirection::Vertical,
+            },
+            ratio: *ratio,
+            first: Box::new(persist_pane_node(first)),
+            second: Box::new(persist_pane_node(second)),
+        },
+    }
+}
+
+enum HostAttachOutcome<T> {
+    Attached(T),
+    Missing,
+    Failed(String),
+}
+
+#[derive(Clone, Copy)]
+enum MissingSessionPolicy {
+    StartFresh,
+    KeepUnavailable,
+}
+
+fn should_start_shell_for_missing_session(policy: MissingSessionPolicy) -> bool {
+    matches!(policy, MissingSessionPolicy::StartFresh)
+}
+
+fn classify_host_attach<T>(result: Result<Option<T>, String>) -> HostAttachOutcome<T> {
+    match result {
+        Ok(Some(terminal)) => HostAttachOutcome::Attached(terminal),
+        Ok(None) => HostAttachOutcome::Missing,
+        Err(error) => HostAttachOutcome::Failed(error),
+    }
+}
+
+fn pane_host_session_id(pane: &crate::pane_tree::TerminalPane) -> Option<usize> {
+    pane.host_session_id.or_else(|| {
+        pane.terminal
+            .as_ref()
+            .and_then(|terminal| terminal.remote_session_id())
+    })
+}
+
+fn unavailable_terminal_pane(
+    pane_id: PaneId,
+    host_session_id: Option<usize>,
+    title: String,
+    cwd: Option<std::path::PathBuf>,
+) -> TerminalPane {
+    TerminalPane {
+        id: pane_id,
+        terminal: None,
+        host_session_id,
+        title,
+        custom_title: None,
+        cwd: cwd.clone(),
+        git_status: None,
+        git_checked_cwd: cwd,
+        git_last_poll: None,
+        last_duration_ms: None,
+        last_exit_code: None,
+        last_bounds: None,
+    }
+}
+
+fn pane_close_info(pane: &crate::pane_tree::TerminalPane) -> Option<RunningProcessInfo> {
+    let terminal = pane.terminal.as_ref();
+    let requires_confirmation = pane.host_session_id.is_some()
+        || terminal.is_some_and(|terminal| terminal.needs_close_confirmation());
+    requires_confirmation.then(|| RunningProcessInfo {
+        pane_id: pane.id,
+        process_name: terminal
+            .and_then(|terminal| terminal.get_foreground_process_name())
+            .unwrap_or_else(|| "process".to_string()),
+        pid: terminal
+            .and_then(|terminal| terminal.shell_pid())
+            .unwrap_or(0),
+    })
+}
+
+fn stop_host_session(session_id: usize) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let session = match crate::session_host::attach(session_id) {
+            Ok(session) => session,
+            Err(error) if is_missing_host_session(&error) => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "could not attach to host session {session_id}: {error}"
+                ));
+            }
+        };
+        session.control.stop();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let exists = crate::session_host::session_exists(session_id).map_err(|error| {
+                format!("could not verify host session {session_id} stop: {error}")
+            })?;
+            if !exists {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "host session {session_id} is still running after stop"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session_id;
+        Err("host sessions are not supported on this platform".to_string())
+    }
+}
+
+fn is_missing_host_session(error: &str) -> bool {
+    error.starts_with("no_such_session:")
+}
+
+fn verify_host_session_stopped(
+    session_id: usize,
+    sessions: &[crate::daemon::SessionInfo],
+) -> Result<(), String> {
+    if sessions.iter().any(|session| session.id == session_id) {
+        Err(format!(
+            "host session {session_id} is still running after stop"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn stop_pane_session(pane: &crate::pane_tree::TerminalPane) -> Result<(), String> {
+    if let Some(session_id) = pane_host_session_id(pane) {
+        stop_host_session(session_id)?;
+        return Ok(());
+    }
+    if let Some(terminal) = &pane.terminal {
+        terminal.terminate_process();
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct PaneStopReport {
+    stopped_ids: Vec<usize>,
+    failures: Vec<(usize, String)>,
+}
+
+impl PaneStopReport {
+    fn error_message(&self) -> String {
+        self.failures
+            .iter()
+            .map(|(pane_id, error)| format!("pane {pane_id}: {error}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn stop_panes(panes: &[&crate::pane_tree::TerminalPane]) -> PaneStopReport {
+    collect_stop_results(panes, stop_pane_session)
+}
+
+fn collect_stop_results(
+    panes: &[&crate::pane_tree::TerminalPane],
+    mut stop: impl FnMut(&crate::pane_tree::TerminalPane) -> Result<(), String>,
+) -> PaneStopReport {
+    let mut report = PaneStopReport::default();
+    for pane in panes {
+        match stop(pane) {
+            Ok(()) => report.stopped_ids.push(pane.id),
+            Err(error) => report.failures.push((pane.id, error)),
+        }
+    }
+    report
+}
+
+#[cfg(test)]
+mod host_restore_tests {
+    use super::*;
+
+    fn pane(host_session_id: Option<usize>) -> crate::pane_tree::TerminalPane {
+        crate::pane_tree::TerminalPane {
+            id: 7,
+            terminal: None,
+            host_session_id,
+            title: "restored".into(),
+            custom_title: None,
+            cwd: None,
+            git_status: None,
+            git_checked_cwd: None,
+            git_last_poll: None,
+            last_duration_ms: None,
+            last_exit_code: None,
+            last_bounds: None,
+        }
+    }
+
+    #[test]
+    fn retry_does_not_start_a_replacement_shell_when_host_session_is_missing() {
+        assert!(!should_start_shell_for_missing_session(
+            MissingSessionPolicy::KeepUnavailable
+        ));
+        assert!(should_start_shell_for_missing_session(
+            MissingSessionPolicy::StartFresh
+        ));
+    }
+
+    #[test]
+    fn stop_results_keep_successful_and_failed_panes_separate() {
+        let stopped = pane(None);
+        let mut failed = pane(None);
+        failed.id = 8;
+        let report = collect_stop_results(&[&stopped, &failed], |pane| {
+            if pane.id == 8 {
+                Err("host is unavailable".to_string())
+            } else {
+                Ok(())
+        }
+        });
+
+        assert_eq!(report.stopped_ids, vec![stopped.id]);
+        assert_eq!(report.failures, vec![(failed.id, "host is unavailable".to_string())]);
+    }
+
+    #[test]
+    fn attach_error_is_preserved_without_replacement_fallback() {
+        let outcome = classify_host_attach::<()>(Err("socket unavailable".into()));
+        assert!(
+            matches!(outcome, HostAttachOutcome::Failed(error) if error == "socket unavailable")
+        );
+    }
+
+    #[test]
+    fn saved_host_session_id_survives_a_missing_terminal_projection() {
+        let pane = pane(Some(41));
+        assert_eq!(pane_host_session_id(&pane), Some(41));
+    }
+
+    #[test]
+    fn unresolved_host_session_requires_close_confirmation() {
+        let unresolved = pane(Some(41));
+        let ordinary_placeholder = pane(None);
+        assert_eq!(
+            pane_close_info(&unresolved).map(|info| info.pane_id),
+            Some(7)
+        );
+        assert!(pane_close_info(&ordinary_placeholder).is_none());
+    }
+
+    #[test]
+    fn only_no_such_session_is_treated_as_already_stopped() {
+        assert!(is_missing_host_session(
+            "no_such_session: session not found"
+        ));
+        assert!(!is_missing_host_session("connection refused"));
+        assert!(!is_missing_host_session(
+            "other_no_such_session: session not found"
+        ));
+    }
+
+    #[test]
+    fn saved_session_can_be_removed_only_after_host_list_confirms_stop() {
+        let session = crate::daemon::SessionInfo {
+            id: 42,
+            title: "shell".into(),
+            cwd: None,
+            cols: 80,
+            rows: 24,
+            alive: true,
+            history_size: 0,
+        };
+        assert!(verify_host_session_stopped(42, &[]).is_ok());
+        assert!(verify_host_session_stopped(42, &[session]).is_err());
+    }
 }
 
 fn new_ai_key(prefix: &str) -> String {
@@ -586,11 +1001,7 @@ fn move_grid_selection(selected: usize, step: GridStep, cols: usize, items: usiz
             // The last row is short when the cell count is not a multiple of
             // the column count. A step into a cell that row does not have keeps
             // the selection put, rather than sliding it into another column.
-            if target > last {
-                current
-            } else {
-                target
-            }
+            if target > last { current } else { target }
         }
     }
 }
@@ -1230,7 +1641,8 @@ pub(crate) fn available_system_fonts() -> Vec<String> {
 
 pub fn send_system_notification(title: &str, body: &str) {
     type NotificationSender = std::sync::mpsc::SyncSender<(String, String)>;
-    static WORKER: std::sync::OnceLock<Result<NotificationSender, String>> = std::sync::OnceLock::new();
+    static WORKER: std::sync::OnceLock<Result<NotificationSender, String>> =
+        std::sync::OnceLock::new();
     let worker = WORKER.get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<(String, String)>(16);
         std::thread::Builder::new()
@@ -1268,7 +1680,10 @@ fn deliver_system_notification(title: &str, body: &str) {
     }
     let summary = if title.is_empty() { "Fastty" } else { title };
     #[cfg(target_os = "linux")]
-    let notification_body = body.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let notification_body = body
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
     #[cfg(not(target_os = "linux"))]
     let notification_body = body.to_owned();
     let res = notify_rust::Notification::new()
@@ -1624,16 +2039,21 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
     .into_iter()
     // Theme switch commands come from the registry: one entry per built-in
     // theme, sharing the table the palette preview and dispatch read.
-    .chain(crate::config::THEME_REGISTRY.iter().filter(|(name, _, _, _)| {
+    .chain(
+        crate::config::THEME_REGISTRY
+            .iter()
+            .filter(|(name, _, _, _)| {
         // `default` already has its hand-written entry above.
         *name != "default"
-    }).map(|(_, id, title, _)| PaletteCommand {
+            })
+            .map(|(_, id, title, _)| PaletteCommand {
         id,
         icon: IconType::Palette,
         title,
         category: "Theme",
         shortcut: None,
-    }))
+            }),
+    )
     .collect()
 }
 
@@ -1742,21 +2162,40 @@ fn run_opencode_turn(
     if cancel.is_cancelled() {
         return Ok(());
     }
-    let runtime = manager.session_with_saved_args(conversation_id.clone(), command, &args, &cwd, saved_session_id)?;
+    let runtime = manager.session_with_saved_args(
+        conversation_id.clone(),
+        command,
+        &args,
+        &cwd,
+        saved_session_id,
+    )?;
     if cancel.is_cancelled() {
         manager.remove(&conversation_id);
         return Ok(());
     }
-    let _ = event_tx.send_blocking(crate::ai::AgentEvent::ConversationSession(runtime.session_id().to_string()));
+    let _ = event_tx.send_blocking(crate::ai::AgentEvent::ConversationSession(
+        runtime.session_id().to_string(),
+    ));
     if !model.is_empty() && model != "default" {
         if is_opencode {
             runtime.select_model_value(&model)?;
         } else {
-            let has_model_option = runtime.info().config_options.as_array().is_some_and(|options| {
+            let has_model_option =
+                runtime
+                    .info()
+                    .config_options
+                    .as_array()
+                    .is_some_and(|options| {
                 options.iter().any(|option| {
                     option.get("id").and_then(serde_json::Value::as_str) == Some("model")
-                        && option.get("options").and_then(serde_json::Value::as_array).is_some_and(|choices| {
-                            choices.iter().any(|choice| choice.get("value").and_then(serde_json::Value::as_str) == Some(model.as_str()))
+                                && option
+                                    .get("options")
+                                    .and_then(serde_json::Value::as_array)
+                                    .is_some_and(|choices| {
+                                        choices.iter().any(|choice| {
+                                            choice.get("value").and_then(serde_json::Value::as_str)
+                                                == Some(model.as_str())
+                                        })
                         })
                 })
             });
@@ -1792,7 +2231,10 @@ fn run_opencode_turn(
                         break;
                     }
                     Ok(Some(crate::ai::opencode::OpencodeEvent::Error(_))) | Err(_) => break,
-                    Ok(Some(crate::ai::opencode::OpencodeEvent::PermissionRequest { request_id, .. })) => {
+                    Ok(Some(crate::ai::opencode::OpencodeEvent::PermissionRequest {
+                        request_id,
+                        ..
+                    })) => {
                         let _ = runtime.resolve_permission(&request_id, None);
                     }
                     Ok(Some(_)) | Ok(None) => {}
@@ -1815,7 +2257,11 @@ fn run_opencode_turn(
                 let _ = event_tx.send_blocking(crate::ai::AgentEvent::ThinkingDelta(delta));
             }
             crate::ai::opencode::OpencodeEvent::ToolUpdate(update) => {
-                let id = update.get("toolCallId").and_then(serde_json::Value::as_str).unwrap_or("tool").to_string();
+                let id = update
+                    .get("toolCallId")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
                 // ACP `title` is prose ("Read src/main.rs"), not a tool identifier, so it
                 // used to be pushed in as the name and then treated as one long
                 // word by the label humaniser.
@@ -1853,26 +2299,55 @@ fn run_opencode_turn(
                     } else if let Ok(serde_json::Value::Object(map)) =
                         serde_json::from_str::<serde_json::Value>(&args)
                     {
-                        let known = ["command", "file_path", "filePath", "path", "pattern", "query", "url", "glob"];
+                        let known = [
+                            "command",
+                            "file_path",
+                            "filePath",
+                            "path",
+                            "pattern",
+                            "query",
+                            "url",
+                            "glob",
+                        ];
                         if !known.iter().any(|key| map.contains_key(*key)) {
                             let mut map = map;
-                            map.insert("path".to_string(), serde_json::Value::String(path.to_string()));
+                            map.insert(
+                                "path".to_string(),
+                                serde_json::Value::String(path.to_string()),
+                            );
                             args = serde_json::Value::Object(map).to_string();
                         }
                     }
                 }
                 if !active_tools.contains_key(&id) {
                     active_tools.insert(id.clone(), name.clone());
-                    let _ = event_tx.send_blocking(crate::ai::AgentEvent::ToolStart { id: id.clone(), name: name.clone(), args: args.clone() });
+                    let _ = event_tx.send_blocking(crate::ai::AgentEvent::ToolStart {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args: args.clone(),
+                    });
                 } else if !args.is_empty() {
                     // Arguments arrived after the row was created.
-                    let _ = event_tx.send_blocking(crate::ai::AgentEvent::ToolArgs { id: id.clone(), args: args.clone() });
+                    let _ = event_tx.send_blocking(crate::ai::AgentEvent::ToolArgs {
+                        id: id.clone(),
+                        args: args.clone(),
+                    });
                 }
-                let status = update.get("status").and_then(serde_json::Value::as_str).unwrap_or("");
+                let status = update
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
                 if status == "completed" || status == "failed" {
-                    let output = update.get("content").map(|value| value.to_string()).unwrap_or_default();
+                    let output = update
+                        .get("content")
+                        .map(|value| value.to_string())
+                        .unwrap_or_default();
                     let _ = event_tx.send_blocking(crate::ai::AgentEvent::ToolEnd {
-                        id: id.clone(), name, output, is_error: status == "failed", diff: None,
+                        id: id.clone(),
+                        name,
+                        output,
+                        is_error: status == "failed",
+                        diff: None,
                         args: (!args.is_empty()).then_some(args),
                     });
                     active_tools.remove(&id);
@@ -1884,12 +2359,30 @@ fn run_opencode_turn(
             crate::ai::opencode::OpencodeEvent::AvailableCommands(commands) => {
                 let _ = event_tx.send_blocking(crate::ai::AgentEvent::AvailableCommands(commands));
             }
-            crate::ai::opencode::OpencodeEvent::PermissionRequest { request_id, tool_call, options } => {
-                let id = tool_call.get("toolCallId").and_then(serde_json::Value::as_str).unwrap_or("permission").to_string();
-                let name = tool_call.get("title").and_then(serde_json::Value::as_str).unwrap_or("OpenCode tool").to_string();
-                let summary = tool_call.get("rawInput").map(|value| value.to_string()).unwrap_or_else(|| tool_call.to_string());
+            crate::ai::opencode::OpencodeEvent::PermissionRequest {
+                request_id,
+                tool_call,
+                options,
+            } => {
+                let id = tool_call
+                    .get("toolCallId")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("permission")
+                    .to_string();
+                let name = tool_call
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("OpenCode tool")
+                    .to_string();
+                let summary = tool_call
+                    .get("rawInput")
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| tool_call.to_string());
                 let (reply_tx, reply_rx) = async_channel::bounded(1);
-                if permission_tx.send_blocking((id, name, summary, options, reply_tx)).is_err() {
+                if permission_tx
+                    .send_blocking((id, name, summary, options, reply_tx))
+                    .is_err()
+                {
                     let _ = runtime.resolve_permission(&request_id, None);
                     continue;
                 }
@@ -1898,8 +2391,14 @@ fn run_opencode_turn(
             }
             crate::ai::opencode::OpencodeEvent::PromptFinished(response) => {
                 if let Some(usage) = response.get("usage") {
-                    let input = usage.get("inputTokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
-                    let output = usage.get("outputTokens").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    let input = usage
+                        .get("inputTokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let output = usage
+                        .get("outputTokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
                     let _ = event_tx.send_blocking(crate::ai::AgentEvent::Usage { input, output });
                 }
                 let _ = event_tx.send_blocking(crate::ai::AgentEvent::TurnEnd);
@@ -2067,6 +2566,7 @@ pub struct RunningProcessInfo {
 pub struct PendingClose {
     pub target: CloseTarget,
     pub running_processes: Vec<RunningProcessInfo>,
+    pub failure: Option<String>,
 }
 
 #[derive(Default)]
@@ -2254,7 +2754,18 @@ pub struct RootView {
     /// one-shot execution, not a persistent shell tab. `None` for every
     /// other pane (normal tabs, splits, session restore, new windows).
     exec_pane_id: Option<crate::pane_tree::PaneId>,
-    pub ai_sidebar_open: bool,
+    right_panel: RightPanel,
+    project_panel_tab: ProjectPanelTab,
+    project_panel_menu_open: bool,
+    project_panel_confirmation: Option<crate::git::ProjectGitConfirmation>,
+    project_panel_feedback: Option<ProjectPanelFeedback>,
+    project_panel_action_generation: u64,
+    pub project_panel_width: f32,
+    pub is_dragging_project_panel: bool,
+    project_graph_scroll_handle: ScrollHandle,
+    project_graph_rendered_range: std::rc::Rc<std::cell::Cell<(usize, usize)>>,
+    project_graph_scroll_target: Option<ProjectGraphScrollTarget>,
+    project_graph_layout: Option<Arc<GraphLayout>>,
     pub ai_sidebar_width: f32,
     /// 0..=1 open/close animation progress, mirroring the tabs sidebar.
     pub ai_sidebar_anim_progress: f32,
@@ -2331,11 +2842,223 @@ impl RootView {
 
     #[inline]
     pub fn current_ai_sidebar_width(&self) -> f32 {
-        if self.ai_sidebar_open || self.ai_sidebar_anim_progress > 0.001 {
+        if self.right_panel != RightPanel::Project && self.ai_sidebar_anim_progress > 0.001 {
             (self.ai_sidebar_width * self.ai_sidebar_anim_progress).round()
         } else {
             0.0
         }
+    }
+
+    #[inline]
+    fn current_project_panel_width(&self) -> f32 {
+        if self.right_panel == RightPanel::Project {
+            self.project_panel_width.clamp(240.0, 750.0)
+        } else {
+            0.0
+        }
+    }
+
+    fn request_project_graph_page(&self, offset: usize, cx: &mut Context<Self>) {
+        let Some(cwd) = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|tab| tab.cwd.clone())
+        else {
+            return;
+        };
+        let (tx, rx) = async_channel::bounded::<u64>(1);
+        let completion_path = cwd.clone();
+        if !crate::git::request_git_graph_page(&cwd, offset, move |loaded, generation| {
+            if loaded {
+                let _ = tx.send_blocking(generation);
+            }
+        }) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            if let Ok(generation) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    if !crate::git::is_git_info_generation_current(&completion_path, generation) {
+                        return;
+                    }
+                    if this
+                        .tabs
+                        .get(this.active_tab_idx)
+                        .and_then(|tab| tab.cwd.as_ref())
+                        == Some(&completion_path)
+                    {
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn request_git_status_refresh(&self, cwd: std::path::PathBuf, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::bounded::<(Option<GitStatus>, u64)>(1);
+        let completion_path = cwd.clone();
+        if !crate::git::request_git_info_refresh(&cwd, move |status, generation| {
+            let _ = tx.send_blocking((status, generation));
+        }) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            if let Ok((status, generation)) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    if !crate::git::is_git_info_generation_current(&completion_path, generation) {
+                        return;
+                    }
+                    let now = std::time::Instant::now();
+                    for tab in &mut this.tabs {
+                        if tab.cwd.as_ref() != Some(&cwd) {
+                            continue;
+                        }
+                        tab.git_status = status.clone();
+                        tab.git_checked_cwd = Some(cwd.clone());
+                        tab.git_last_poll = Some(now);
+                        let active_pane = tab.pane_tree.active_pane_id;
+                        if let Some(pane) = tab.pane_tree.find_pane_mut(active_pane) {
+                            if pane.cwd.as_ref() == Some(&cwd) {
+                                pane.git_status = status.clone();
+                                pane.git_checked_cwd = Some(cwd.clone());
+                                pane.git_last_poll = Some(now);
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn handle_project_git_action(
+        &mut self,
+        action: crate::git::ProjectGitAction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(self.active_tab_idx) else {
+            return;
+        };
+        let Some(cwd) = tab.cwd.clone() else {
+            self.project_panel_feedback = Some(ProjectPanelFeedback {
+                tab_id: tab.id,
+                cwd: None,
+                message: "No project folder".to_string(),
+                action_id: None,
+            });
+            cx.notify();
+            return;
+        };
+        let tab_id = tab.id;
+        let target_cwd = Some(cwd.clone());
+        if action.requires_confirmation() {
+            self.project_panel_confirmation = Some(crate::git::ProjectGitConfirmation {
+                action,
+                tab_id,
+                cwd,
+            });
+            self.project_panel_menu_open = false;
+            cx.notify();
+            return;
+        }
+        self.execute_project_git_action(action, tab_id, target_cwd, cwd, cx);
+    }
+
+    fn confirm_project_git_action(
+        &mut self,
+        action: crate::git::ProjectGitAction,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.project_panel_confirmation.clone() else {
+            return;
+        };
+        let active_tab = self.tabs.get(self.active_tab_idx);
+        let matches = active_tab.is_some_and(|tab| {
+            pending.matches(tab.id, tab.cwd.as_deref()) && pending.action == action
+        });
+        if !matches {
+            self.project_panel_confirmation = None;
+            if let Some(tab) = active_tab {
+                self.project_panel_feedback = Some(ProjectPanelFeedback {
+                    tab_id: tab.id,
+                    cwd: tab.cwd.clone(),
+                    message: "Confirmation expired because the active tab or folder changed."
+                        .to_string(),
+                    action_id: None,
+                });
+            }
+            cx.notify();
+            return;
+        }
+        self.execute_project_git_action(
+            pending.action,
+            pending.tab_id,
+            Some(pending.cwd.clone()),
+            pending.cwd,
+            cx,
+        );
+    }
+
+    fn execute_project_git_action(
+        &mut self,
+        action: crate::git::ProjectGitAction,
+        tab_id: usize,
+        feedback_cwd: Option<std::path::PathBuf>,
+        cwd: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_panel_confirmation = None;
+        self.project_panel_menu_open = false;
+        self.project_panel_action_generation = self.project_panel_action_generation.wrapping_add(1);
+        let action_id = self.project_panel_action_generation;
+        self.project_panel_feedback = Some(ProjectPanelFeedback {
+            tab_id,
+            cwd: feedback_cwd.clone(),
+            message: format!("Running {}…", action.label()),
+            action_id: Some(action_id),
+        });
+        let (tx, rx) = async_channel::bounded(1);
+        let worker_cwd = cwd.clone();
+        std::thread::spawn(move || {
+            let result = crate::git::run_project_git_action(&worker_cwd, &action);
+            let _ = tx.send_blocking(result);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    crate::git::invalidate_git_info_cache(&cwd);
+                    if this
+                        .project_panel_feedback
+                        .as_ref()
+                        .is_some_and(|feedback| feedback.action_id == Some(action_id))
+                    {
+                        let target_is_active =
+                            this.tabs.get(this.active_tab_idx).is_some_and(|tab| {
+                            tab.id == tab_id && tab.cwd.as_ref() == feedback_cwd.as_ref()
+                        });
+                        this.project_panel_feedback = if target_is_active {
+                            Some(ProjectPanelFeedback {
+                                tab_id,
+                                cwd: feedback_cwd.clone(),
+                                message: match result {
+                            Ok(message) => message,
+                            Err(error) => format!("Git action failed: {error}"),
+                                },
+                                action_id: Some(action_id),
+                            })
+                        } else {
+                            None
+                        };
+                    }
+                    this.request_git_status_refresh(cwd, cx);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     #[inline]
@@ -2392,8 +3115,9 @@ impl RootView {
         _window.focus(&focus_handle, cx);
 
         let font_size = loaded_config.font.size;
-        let font_family: SharedString =
-            if loaded_config.font.family.is_empty() || loaded_config.font.family == "monospace" {
+        let font_family: SharedString = if loaded_config.font.family.is_empty()
+            || loaded_config.font.family == "monospace"
+        {
                 #[cfg(target_os = "macos")]
                 {
                     "Menlo".into()
@@ -2413,10 +3137,7 @@ impl RootView {
                 // measurement and rendering agree.
                 #[cfg(target_os = "macos")]
                 {
-                    crate::font_discovery_macos::resolve_font_family(
-                        &loaded_config.font.family,
-                    )
-                    .into()
+                crate::font_discovery_macos::resolve_font_family(&loaded_config.font.family).into()
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
@@ -2531,7 +3252,7 @@ impl RootView {
         })
         .detach();
 
-        let mut restored_tabs = Vec::new();
+        let mut restored_tabs: Vec<crate::session::TabInfo> = Vec::new();
         let mut restored_ai_sidebar_open = false;
         let mut restored_active_tab = 0usize;
         let ai_permission_mode = loaded_config.ai.permission_mode;
@@ -2541,12 +3262,7 @@ impl RootView {
                     restored_ai_sidebar_open = win.ai_sidebar_open;
                     restored_active_tab = win.active_tab;
                     for tab_info in &win.tabs {
-                        let cwd_path = tab_info.cwd.clone();
-                        let title = tab_info
-                            .title_override
-                            .clone()
-                            .or_else(|| tab_info.custom_name.clone());
-                        restored_tabs.push((cwd_path, title, tab_info.ai_tab_key.clone(), tab_info.ai_conversation_id.clone()));
+                        restored_tabs.push(tab_info.clone());
                     }
                 }
             }
@@ -2684,7 +3400,22 @@ impl RootView {
             dragging_split_direction: SplitDirection::Horizontal,
             dragging_split_bounds: (0.0, 0.0, 0.0, 0.0),
             exec_pane_id: None,
-            ai_sidebar_open: restored_ai_sidebar_open,
+            right_panel: if restored_ai_sidebar_open {
+                RightPanel::Ai
+            } else {
+                RightPanel::Closed
+            },
+            project_panel_tab: ProjectPanelTab::Changes,
+            project_panel_menu_open: false,
+            project_panel_confirmation: None,
+            project_panel_feedback: None,
+            project_panel_action_generation: 0,
+            project_panel_width: PROJECT_PANEL_WIDTH,
+            is_dragging_project_panel: false,
+            project_graph_scroll_handle: ScrollHandle::new(),
+            project_graph_rendered_range: std::rc::Rc::new(std::cell::Cell::new((0, 0))),
+            project_graph_scroll_target: None,
+            project_graph_layout: None,
             ai_sidebar_width: 340.0,
             ai_sidebar_anim_progress: if restored_ai_sidebar_open { 1.0 } else { 0.0 },
             is_dragging_ai_sidebar: false,
@@ -2766,9 +3497,10 @@ impl RootView {
                         cwd,
                         reply,
                     } => {
-                        let _ = reply.send(
-                            this.daemon_split_pane(target, direction, command, &args, cwd, window, cx),
-                        );
+                        let _ =
+                            reply.send(this.daemon_split_pane(
+                                target, direction, command, &args, cwd, window, cx,
+                            ));
                     }
                     crate::daemon::GuiRequest::ResizePane {
                         target,
@@ -2776,8 +3508,7 @@ impl RootView {
                         delta,
                         reply,
                     } => {
-                        let _ = reply
-                            .send(this.daemon_resize_pane(target, direction, delta, cx));
+                        let _ = reply.send(this.daemon_resize_pane(target, direction, delta, cx));
                     }
                     crate::daemon::GuiRequest::FocusPane { target, reply } => {
                         let _ = reply.send(this.daemon_focus_pane(target, cx));
@@ -2786,8 +3517,7 @@ impl RootView {
                         let _ = reply.send(Ok(this.daemon_layout()));
                     }
                     crate::daemon::GuiRequest::ResizeWindow { cols, rows, reply } => {
-                        let _ =
-                            reply.send(this.daemon_resize_window(cols, rows, window, cx));
+                        let _ = reply.send(this.daemon_resize_window(cols, rows, window, cx));
                     }
                 });
                 if res.is_err() {
@@ -2906,12 +3636,8 @@ impl RootView {
                 .clone()
                 .or_else(|| std::env::var("SHELL").ok())
                 .unwrap_or_else(crate::paths::default_system_shell);
-            for (cwd, title, ai_tab_key, ai_conversation_id) in restored_tabs {
-                view.create_tab_with_cmd_and_cwd(&shell, &[], cwd.as_deref(), title, _window, cx);
-                if let Some(tab) = view.tabs.last_mut() {
-                    if let Some(key) = ai_tab_key { tab.ai_tab_key = key; }
-                    if let Some(id) = ai_conversation_id { tab.ai_conversation_id = id; }
-                }
+            for tab_info in restored_tabs {
+                view.create_restored_tab(tab_info, &shell, _window, cx);
             }
             if !view.tabs.is_empty() {
                 view.active_tab_idx = restored_active_tab.min(view.tabs.len() - 1);
@@ -2935,6 +3661,10 @@ impl RootView {
                 ai_conversation_id: Some(t.ai_conversation_id.clone()),
                 custom_name: None,
                 title_override: Some(t.title.clone()),
+                pane_tree: Some(crate::session::PersistedPaneTree {
+                    root: persist_pane_node(&t.pane_tree.root),
+                    active_pane_id: t.pane_tree.active_pane_id,
+                }),
             })
             .collect();
 
@@ -2944,7 +3674,7 @@ impl RootView {
                 active_tab: self.active_tab_idx,
                 position: None,
                 size: None,
-                ai_sidebar_open: self.ai_sidebar_open,
+                ai_sidebar_open: self.right_panel == RightPanel::Ai,
             }],
             active_window: 0,
             legacy_tabs: Vec::new(),
@@ -3028,8 +3758,33 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> TerminalPane {
-        let pane_id = self.next_pane_id;
-        self.next_pane_id += 1;
+        self.spawn_terminal_pane_with_session(
+            cmd,
+            args,
+            cwd,
+            title_override,
+            None,
+            None,
+            MissingSessionPolicy::StartFresh,
+            window,
+            cx,
+        )
+    }
+
+    fn spawn_terminal_pane_with_session(
+        &mut self,
+        cmd: &str,
+        args: &[String],
+        cwd: Option<&std::path::Path>,
+        title_override: Option<String>,
+        host_session_id: Option<usize>,
+        restored_pane_id: Option<PaneId>,
+        missing_session_policy: MissingSessionPolicy,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TerminalPane {
+        let pane_id = restored_pane_id.unwrap_or(self.next_pane_id);
+        self.next_pane_id = self.next_pane_id.max(pane_id.saturating_add(1));
 
         let font_config = self.config.font.clone();
         let (cell_w, line_h) = self.measure_cell_metrics(window);
@@ -3039,28 +3794,86 @@ impl RootView {
             let _ = event_tx.send_blocking(event);
         }));
 
-        let terminal = TerminalState::new(
+        let cwd_str = cwd.and_then(|p| p.to_str());
+        let initial_cwd = cwd.map(|p| p.to_path_buf()).or_else(dirs::home_dir);
+        let default_shell_name = std::path::Path::new(cmd)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.trim_end_matches(".exe"))
+            .filter(|n| !n.is_empty())
+            .unwrap_or("fastty");
+        let pane_title = title_override.unwrap_or_else(|| default_shell_name.to_string());
+
+        let attach = if let Some(session_id) = host_session_id {
+            #[cfg(unix)]
+            {
+                classify_host_attach(
+                    TerminalState::attach_hosted(
+                        session_id,
             cmd,
             args,
-            cwd.and_then(|p| p.to_str()),
-            self.config.scrollback,
-            font_config,
-            cell_w,
-            line_h,
-            960.0,
-            640.0,
-            event_sender.clone(),
-        )
-        .expect("Failed to initialize terminal state");
+                        cwd_str,
+                        self.config.scrollback,
+                        font_config.clone(),
+                        cell_w,
+                        line_h,
+                        960.0,
+                        640.0,
+                        event_sender.clone(),
+                    )
+                    .map_err(|error| error.to_string()),
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = session_id;
+                HostAttachOutcome::Failed(
+                    "Hosted sessions are not supported on this platform".into(),
+                )
+            }
+        } else {
+            HostAttachOutcome::Missing
+        };
+        let terminal = match attach {
+            HostAttachOutcome::Attached(terminal) => terminal,
+            HostAttachOutcome::Missing => {
+                if !should_start_shell_for_missing_session(missing_session_policy) {
+                    return unavailable_terminal_pane(
+                        pane_id,
+                        host_session_id,
+                        pane_title,
+                        initial_cwd,
+                    );
+                }
+                TerminalState::new_hosted(
+                    cmd,
+                    args,
+                    cwd_str,
+                    self.config.scrollback,
+                    font_config,
+                    cell_w,
+                    line_h,
+                    960.0,
+                    640.0,
+                    event_sender.clone(),
+                )
+                .expect("Failed to initialize terminal state")
+            }
+            HostAttachOutcome::Failed(error) => {
+                eprintln!("Fastty could not restore host session {host_session_id:?}: {error}");
+                return unavailable_terminal_pane(
+                    pane_id,
+                    host_session_id,
+                    pane_title,
+                    initial_cwd,
+                );
+            }
+        };
 
         let terminal_arc = Arc::new(terminal);
-        // Every pane is attachable over the local IPC daemon (`crate::daemon`)
-        // the moment it exists, regardless of how it was created (new tab,
-        // split, session restore, CLI `-e`) -- unregistered on the two removal
-        // paths, `close_tab` and `close_active_pane`.
-        crate::daemon::register(pane_id, terminal_arc.clone());
-        let event_sender_loop = event_sender.clone();
-
+        let terminal_host_session_id = terminal_arc.remote_session_id();
+        // The session host owns this PTY. The local TerminalState is only the
+        // renderer projection fed by the host's attach stream.
         cx.spawn_in(window, async move |this, cx| {
             while let Ok(mut event) = event_rx.recv().await {
                 // Coalesce consecutive Wakeup events (pure re-render pings) into
@@ -3101,27 +3914,19 @@ impl RootView {
                                 pane.git_checked_cwd = Some(p.clone());
                                 pane.git_last_poll = Some(now);
                                 pane.cwd = Some(p.clone());
+                                pane.git_status = None;
                                 if tab.pane_tree.active_pane_id == pane_id {
                                     tab.git_checked_cwd = Some(p.clone());
                                     tab.git_last_poll = Some(now);
                                     tab.cwd = Some(p.clone());
+                                    tab.git_status = None;
                                 }
                             }
                         }
                         this.persist_session();
                         cx.notify();
-
-                        let sender_bg = event_sender_loop.clone();
-                        let p_bg = p.clone();
-                        std::thread::spawn(move || {
-                            if let Some(git) = crate::git::fetch_git_info_cached(&p_bg) {
-                                sender_bg.send(AppEvent::GitStatusUpdated {
-                                    window_id: None,
-                                    tab_idx: pane_id,
-                                    status: Some(git),
-                                });
-                            }
-                        });
+                        crate::git::invalidate_git_info_cache(&p);
+                        this.request_git_status_refresh(p, cx);
                     }
                     AppEvent::CommandFinished {
                         duration_ms,
@@ -3145,34 +3950,10 @@ impl RootView {
                         cx.notify();
 
                         if let Some(cwd) = cwd_to_poll {
-                            let sender_bg = event_sender_loop.clone();
-                            std::thread::spawn(move || {
-                                if let Some(git) = crate::git::fetch_git_info_cached(&cwd) {
-                                    sender_bg.send(AppEvent::GitStatusUpdated {
-                                        window_id: None,
-                                        tab_idx: pane_id,
-                                        status: Some(git),
-                                    });
-                                }
-                            });
+                            this.request_git_status_refresh(cwd, cx);
                         }
                     }
                     AppEvent::PromptStarted { .. } => {
-                        cx.notify();
-                    }
-                    AppEvent::GitStatusUpdated {
-                        tab_idx, status, ..
-                    } => {
-                        for tab in &mut this.tabs {
-                            if let Some(pane) = tab.pane_tree.find_pane_mut(tab_idx) {
-                                pane.git_status = status.clone();
-                                pane.git_last_poll = Some(std::time::Instant::now());
-                                if tab.pane_tree.active_pane_id == tab_idx {
-                                    tab.git_status = status.clone();
-                                    tab.git_last_poll = Some(std::time::Instant::now());
-                                }
-                            }
-                        }
                         cx.notify();
                     }
                     AppEvent::ProgramStatusChanged { source_id } => {
@@ -3209,32 +3990,10 @@ impl RootView {
         })
         .detach();
 
-        let initial_cwd = cwd.map(|p| p.to_path_buf()).or_else(dirs::home_dir);
-        let default_shell_name = std::path::Path::new(cmd)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.trim_end_matches(".exe"))
-            .filter(|n| !n.is_empty())
-            .unwrap_or("fastty");
-        let pane_title = title_override.unwrap_or_else(|| default_shell_name.to_string());
-
-        if let Some(ref p) = initial_cwd {
-            let sender_bg = event_sender.clone();
-            let p_bg = p.clone();
-            std::thread::spawn(move || {
-                if let Some(git) = crate::git::fetch_git_info_cached(&p_bg) {
-                    sender_bg.send(AppEvent::GitStatusUpdated {
-                        window_id: None,
-                        tab_idx: pane_id,
-                        status: Some(git),
-                    });
-                }
-            });
-        }
-
         TerminalPane {
             id: pane_id,
             terminal: Some(terminal_arc),
+            host_session_id: terminal_host_session_id,
             title: pane_title,
             custom_title: None,
             cwd: initial_cwd.clone(),
@@ -3245,6 +4004,61 @@ impl RootView {
             last_exit_code: None,
             last_bounds: None,
         }
+    }
+
+    fn retry_host_session(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((tab_id, session_id, title, custom_title, cwd)) = self.tabs.iter()
+            .find_map(|tab| tab.pane_tree.find_pane(pane_id).and_then(|pane| {
+                if pane.terminal.is_some() {
+                    return None;
+                }
+                Some((
+                    tab.id,
+                    pane.host_session_id?,
+                    pane.title.clone(),
+                    pane.custom_title.clone(),
+                    pane.cwd.clone(),
+                ))
+            }))
+        else {
+            return;
+        };
+
+        let shell = self.config.shell.clone()
+            .or_else(|| std::env::var("SHELL").ok())
+            .unwrap_or_else(crate::paths::default_system_shell);
+        let mut replacement = self.spawn_terminal_pane_with_session(
+            &shell,
+            &[],
+            cwd.as_deref(),
+            Some(title),
+            Some(session_id),
+            Some(pane_id),
+            MissingSessionPolicy::KeepUnavailable,
+            window,
+            cx,
+        );
+        replacement.custom_title = custom_title;
+
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) else {
+            return;
+        };
+        if pane.host_session_id != Some(session_id) || pane.terminal.is_some() {
+            return;
+        }
+        *pane = replacement;
+        if tab.pane_tree.active_pane_id == pane_id {
+            if let Some(active) = tab.pane_tree.active_pane() {
+                tab.terminal = active.terminal.clone();
+                tab.cwd = active.cwd.clone();
+                tab.git_status = active.git_status.clone();
+            }
+        }
+        self.persist_session();
+        cx.notify();
     }
 
     pub fn create_tab_with_cmd_and_cwd(
@@ -3276,6 +4090,127 @@ impl RootView {
             terminal: pane_term,
             cwd: pane_cwd.clone(),
             git_status: pane_git,
+            git_checked_cwd: pane_cwd,
+            git_last_poll: Some(std::time::Instant::now()),
+            last_duration_ms: None,
+            last_exit_code: None,
+            zoomed_pane: None,
+        });
+
+        self.activate_tab_index(self.tabs.len() - 1);
+        self.persist_session();
+        cx.notify();
+    }
+
+    fn restore_persisted_pane_node(
+        &mut self,
+        node: crate::session::PersistedPaneNode,
+        shell: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> crate::pane_tree::PaneNode {
+        use crate::pane_tree::{PaneNode, SplitDirection};
+        use crate::session::{PersistedPaneNode, PersistedSplitDirection};
+
+        match node {
+            PersistedPaneNode::Leaf(persisted) => {
+                let mut pane = self.spawn_terminal_pane_with_session(
+                    shell,
+                    &[],
+                    persisted.cwd.as_deref(),
+                    Some(persisted.title),
+                    persisted.host_session_id,
+                    Some(persisted.pane_id),
+                    MissingSessionPolicy::StartFresh,
+                    window,
+                    cx,
+                );
+                pane.custom_title = persisted.custom_title;
+                PaneNode::Leaf(pane)
+            }
+            PersistedPaneNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => PaneNode::Split {
+                direction: match direction {
+                    PersistedSplitDirection::Horizontal => SplitDirection::Horizontal,
+                    PersistedSplitDirection::Vertical => SplitDirection::Vertical,
+                },
+                ratio,
+                first: Box::new(self.restore_persisted_pane_node(*first, shell, window, cx)),
+                second: Box::new(self.restore_persisted_pane_node(*second, shell, window, cx)),
+            },
+        }
+    }
+
+    fn create_restored_tab(
+        &mut self,
+        tab_info: crate::session::TabInfo,
+        shell: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_id = self.next_tab_id;
+        self.next_tab_id += 1;
+
+        let (root, active_pane_id) = match tab_info.pane_tree {
+            Some(tree) => (
+                self.restore_persisted_pane_node(tree.root, shell, window, cx),
+                tree.active_pane_id,
+            ),
+            None => {
+                let pane = self.spawn_terminal_pane_with_session(
+                    shell,
+                    &[],
+                    tab_info.cwd.as_deref(),
+                    tab_info
+                        .title_override
+                        .clone()
+                        .or(tab_info.custom_name.clone()),
+                    None,
+                    None,
+                    MissingSessionPolicy::StartFresh,
+                    window,
+                    cx,
+                );
+                let pane_id = pane.id;
+                (crate::pane_tree::PaneNode::Leaf(pane), pane_id)
+            }
+        };
+        let mut pane_tree = PaneTree {
+            root,
+            active_pane_id,
+        };
+        if pane_tree.find_pane(pane_tree.active_pane_id).is_none() {
+            if let Some(pane) = pane_tree.all_panes().first() {
+                pane_tree.active_pane_id = pane.id;
+            }
+        }
+
+        let active_pane = pane_tree.active_pane();
+        let pane_title = active_pane
+            .map(|pane| pane.title.clone())
+            .unwrap_or_default();
+        let pane_cwd = active_pane.and_then(|pane| pane.cwd.clone());
+        let pane_terminal = active_pane.and_then(|pane| pane.terminal.clone());
+        let title = tab_info
+            .title_override
+            .or(tab_info.custom_name.clone())
+            .unwrap_or(pane_title);
+        self.tabs.push(TabData {
+            id: tab_id,
+            ai_tab_key: tab_info.ai_tab_key.unwrap_or_else(|| new_ai_key("tab")),
+            ai_conversation_id: tab_info
+                .ai_conversation_id
+                .unwrap_or_else(|| new_ai_key("chat")),
+            pane_tree,
+            title,
+            custom_title: tab_info.custom_name,
+            terminal: pane_terminal,
+            cwd: pane_cwd.clone(),
+            git_status: None,
             git_checked_cwd: pane_cwd,
             git_last_poll: Some(std::time::Instant::now()),
             last_duration_ms: None,
@@ -3366,26 +4301,17 @@ impl RootView {
         } else {
             if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
                 if let Some(pane) = tab.pane_tree.find_pane(pane_id) {
-                    if let Some(term) = &pane.terminal {
-                        if term.is_process_running() {
-                            let name = term
-                                .get_foreground_process_name()
-                                .unwrap_or_else(|| "process".to_string());
-                            let pid = term.shell_pid().unwrap_or(0);
+                    if let Some(process) = pane_close_info(pane) {
                             self.pending_close = Some(PendingClose {
                                 target: CloseTarget::Pane { tab_id, pane_id },
-                                running_processes: vec![RunningProcessInfo {
-                                    pane_id,
-                                    process_name: name,
-                                    pid,
-                                }],
+                            running_processes: vec![process],
+                            failure: None,
                             });
                             cx.notify();
                             return;
                         }
                     }
                 }
-            }
             self.force_close_pane(tab_id, pane_id, cx);
         }
     }
@@ -3416,6 +4342,31 @@ impl RootView {
     }
 
     pub fn force_close_pane(&mut self, tab_id: usize, pane_id: usize, cx: &mut Context<Self>) {
+        let close_result = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.pane_tree.find_pane(pane_id))
+            .map(stop_pane_session)
+            .unwrap_or(Ok(()));
+        if let Err(error) = close_result {
+            let running_processes = self.pending_close.as_ref()
+                .filter(|pending| matches!(pending.target, CloseTarget::Pane { tab_id: pending_tab, pane_id: pending_pane } if pending_tab == tab_id && pending_pane == pane_id))
+                .map(|pending| pending.running_processes.clone())
+                .unwrap_or_default();
+            self.pending_close = Some(PendingClose {
+                target: CloseTarget::Pane { tab_id, pane_id },
+                running_processes,
+                failure: Some(error),
+            });
+            cx.notify();
+            return;
+        }
+        self.pending_close = None;
+        self.remove_stopped_pane(tab_id, pane_id, cx);
+    }
+
+    fn remove_stopped_pane(&mut self, tab_id: usize, pane_id: usize, cx: &mut Context<Self>) {
         self.selection = None;
         self.is_selecting = false;
         self.selection_start = None;
@@ -3423,11 +4374,6 @@ impl RootView {
             self.exec_pane_id = None;
         }
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-            if let Some(pane) = tab.pane_tree.find_pane(pane_id) {
-                if let Some(ref term) = pane.terminal {
-                    term.terminate_process();
-                }
-            }
             if tab.pane_tree.close_pane(pane_id) {
                 crate::daemon::unregister(pane_id);
             }
@@ -3493,6 +4439,7 @@ impl RootView {
         let pane = TerminalPane {
             id,
             terminal: Some(terminal.clone()),
+            host_session_id: terminal.remote_session_id(),
             title: title.clone(),
             custom_title: None,
             cwd: cwd.clone(),
@@ -3615,7 +4562,11 @@ impl RootView {
     /// Daemon-facing `focus_pane`: bring the pane's tab to the front and
     /// make the pane the active one, so the user sees what the agent is
     /// touching.
-    pub fn daemon_focus_pane(&mut self, target: PaneId, cx: &mut Context<Self>) -> Result<(), String> {
+    pub fn daemon_focus_pane(
+        &mut self,
+        target: PaneId,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         let tab_idx = self
             .tab_index_of_pane(target)
             .ok_or_else(|| format!("pane {target} is not visible in the fastty window"))?;
@@ -3661,10 +4612,7 @@ impl RootView {
                         crate::daemon::PaneLayoutInfo {
                             id: p.id,
                             title: p.title.clone(),
-                            cwd: p
-                                .cwd
-                                .clone()
-                                .map(|c| c.to_string_lossy().into_owned()),
+                            cwd: p.cwd.clone().map(|c| c.to_string_lossy().into_owned()),
                             active: p.id == tab.pane_tree.active_pane_id,
                             cols,
                             rows,
@@ -3714,17 +4662,21 @@ impl RootView {
         self.next_tab_id += 1;
         tab_data.id = tab_id;
 
-        let (event_tx, event_rx) = async_channel::unbounded::<AppEvent>();
-        let event_sender = EventSender::Callback(Arc::new(move |event| {
-            let _ = event_tx.send_blocking(event);
-        }));
+        let (event_tx, event_rx) = async_channel::unbounded::<(u64, AppEvent)>();
+        let set_terminal_event_sender = |terminal: &Arc<TerminalState>| {
+            let source_id = terminal.source_id();
+            let event_tx = event_tx.clone();
+            terminal.set_event_sender(EventSender::Callback(Arc::new(move |event| {
+                let _ = event_tx.send_blocking((source_id, event));
+            })));
+        };
 
         if let Some(terminal) = &tab_data.terminal {
-            terminal.set_event_sender(event_sender.clone());
+            set_terminal_event_sender(terminal);
         }
-        for pane in tab_data.pane_tree.all_panes_mut() {
-            if let Some(ref term) = pane.terminal {
-                term.set_event_sender(event_sender.clone());
+        for pane in tab_data.pane_tree.all_panes() {
+            if let Some(terminal) = &pane.terminal {
+                set_terminal_event_sender(terminal);
             }
         }
 
@@ -3734,13 +4686,16 @@ impl RootView {
         cx.notify();
 
         cx.spawn_in(window, async move |this, cx| {
-            while let Ok(mut event) = event_rx.recv().await {
+            while let Ok((mut source_id, mut event)) = event_rx.recv().await {
                 // See the identical comment in `spawn_terminal_pane`: coalesce
                 // consecutive Wakeup events without dropping the first non-Wakeup
                 // event that follows one in the channel.
                 while matches!(event, AppEvent::Wakeup) {
                     match event_rx.try_recv() {
-                        Ok(next) => event = next,
+                        Ok((next_source_id, next_event)) => {
+                            source_id = next_source_id;
+                            event = next_event;
+                        }
                         Err(_) => break,
                     }
                 }
@@ -3759,25 +4714,39 @@ impl RootView {
                     AppEvent::CwdChanged(cwd) => {
                         let p = std::path::PathBuf::from(&cwd);
                         let now = std::time::Instant::now();
+                        let mut refresh_active_cwd = false;
                         if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
-                            tab.git_checked_cwd = Some(p.clone());
-                            tab.git_last_poll = Some(now);
-                            tab.cwd = Some(p.clone());
+                            let source_pane_id =
+                                tab.pane_tree.all_panes().into_iter().find_map(|pane| {
+                                pane.terminal
+                                    .as_ref()
+                                    .filter(|terminal| terminal.source_id() == source_id)
+                                    .map(|_| pane.id)
+                            });
+                            if let Some(source_pane_id) = source_pane_id {
+                                let is_active = tab.pane_tree.active_pane_id == source_pane_id;
+                                let pane = tab.pane_tree.find_pane_mut(source_pane_id);
+                                if let Some(pane) = pane {
+                                    pane.cwd = Some(p.clone());
+                                    pane.git_status = None;
+                                    pane.git_checked_cwd = Some(p.clone());
+                                    pane.git_last_poll = Some(now);
+                                }
+                                if is_active {
+                                    refresh_active_cwd = true;
+                                    tab.git_checked_cwd = Some(p.clone());
+                                    tab.git_last_poll = Some(now);
+                                    tab.cwd = Some(p.clone());
+                                    tab.git_status = None;
+                                }
+                            }
                         }
                         this.persist_session();
                         cx.notify();
-
-                        let sender_bg = event_sender.clone();
-                        let p_bg = p.clone();
-                        std::thread::spawn(move || {
-                            if let Some(git) = crate::git::fetch_git_info_cached(&p_bg) {
-                                sender_bg.send(AppEvent::GitStatusUpdated {
-                                    window_id: None,
-                                    tab_idx: tab_id,
-                                    status: Some(git),
-                                });
-                            }
-                        });
+                        crate::git::invalidate_git_info_cache(&p);
+                        if refresh_active_cwd {
+                            this.request_git_status_refresh(p, cx);
+                        }
                     }
                     AppEvent::CommandFinished {
                         duration_ms,
@@ -3794,28 +4763,10 @@ impl RootView {
                         cx.notify();
 
                         if let Some(cwd) = cwd_to_poll {
-                            let sender_bg = event_sender.clone();
-                            std::thread::spawn(move || {
-                                if let Some(git) = crate::git::fetch_git_info_cached(&cwd) {
-                                    sender_bg.send(AppEvent::GitStatusUpdated {
-                                        window_id: None,
-                                        tab_idx: tab_id,
-                                        status: Some(git),
-                                    });
-                                }
-                            });
+                            this.request_git_status_refresh(cwd, cx);
                         }
                     }
                     AppEvent::PromptStarted { .. } => {
-                        cx.notify();
-                    }
-                    AppEvent::GitStatusUpdated {
-                        tab_idx, status, ..
-                    } => {
-                        if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_idx) {
-                            tab.git_status = status.clone();
-                            tab.git_last_poll = Some(std::time::Instant::now());
-                        }
                         cx.notify();
                     }
                     AppEvent::ProgramStatusChanged { source_id } => {
@@ -3830,11 +4781,8 @@ impl RootView {
                         // every pane in the tab, so match the exited pane by
                         // shell pid; close that pane, or the whole tab when
                         // it was the only one.
-                        let exited_pane = this
-                            .tabs
-                            .iter()
-                            .find(|t| t.id == tab_id)
-                            .and_then(|tab| {
+                        let exited_pane =
+                            this.tabs.iter().find(|t| t.id == tab_id).and_then(|tab| {
                                 tab.pane_tree.all_panes().iter().find_map(|p| {
                                     let matches = p
                                         .terminal
@@ -3847,11 +4795,7 @@ impl RootView {
                         if let Some(pane_id) = exited_pane {
                             if this.exec_pane_id == Some(pane_id) {
                                 cx.quit();
-                            } else if let Some(tab) = this
-                                .tabs
-                                .iter()
-                                .find(|t| t.id == tab_id)
-                            {
+                            } else if let Some(tab) = this.tabs.iter().find(|t| t.id == tab_id) {
                                 let pane_count = tab.pane_tree.pane_count();
                                 if pane_count > 1 {
                                     this.force_close_pane(tab_id, pane_id, cx);
@@ -3895,21 +4839,30 @@ impl RootView {
     }
 
     fn save_active_ai_conversation(&mut self) {
-        let tab = self.ai_event_source.as_ref()
+        let tab = self
+            .ai_event_source
+            .as_ref()
             .and_then(|(id, _)| self.tabs.iter().find(|tab| tab.id == *id))
             .or_else(|| self.tabs.get(self.active_tab_idx));
         let Some(tab) = tab else { return };
         let tab_key = tab.ai_tab_key.clone();
-        let conversation_id = self.ai_event_source.as_ref().map(|(_, id)| id.clone())
+        let conversation_id = self
+            .ai_event_source
+            .as_ref()
+            .map(|(_, id)| id.clone())
             .unwrap_or_else(|| tab.ai_conversation_id.clone());
         let cwd = tab.cwd.clone().unwrap_or_default();
         let now = crate::ai::conversations::now_millis();
         let default_context = crate::config::ai_context_window().max(1_000) as u64;
-        let index = self.ai_chat_records.iter().position(|record| record.id == conversation_id);
+        let index = self
+            .ai_chat_records
+            .iter()
+            .position(|record| record.id == conversation_id);
         let record = if let Some(index) = index {
             &mut self.ai_chat_records[index]
         } else {
-            self.ai_chat_records.push(crate::ai::conversations::Conversation {
+            self.ai_chat_records
+                .push(crate::ai::conversations::Conversation {
                 id: conversation_id,
                 tab_key,
                 cwd: cwd.clone(),
@@ -3942,7 +4895,11 @@ impl RootView {
             record.model = self.config.ai.active_model();
         }
         if let Some(first_prompt) = record.messages.iter().find(|message| message.is_user) {
-            let title = first_prompt.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let title = first_prompt
+                .text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             if !title.is_empty() && record.title == "New chat" {
                 record.title = title.chars().take(64).collect();
             }
@@ -3985,21 +4942,42 @@ impl RootView {
 
     fn swap_ai_runtime(&mut self, runtime: &mut AiConversationRuntime) {
         let checker = runtime.permission_checker.take().unwrap_or_else(|| {
-            Arc::new(crate::ai::PermissionChecker::new(self.config.ai.permission_mode))
+            Arc::new(crate::ai::PermissionChecker::new(
+                self.config.ai.permission_mode,
+            ))
         });
-        runtime.permission_checker = Some(std::mem::replace(&mut self.ai_permission_checker, checker));
+        runtime.permission_checker =
+            Some(std::mem::replace(&mut self.ai_permission_checker, checker));
         std::mem::swap(&mut self.ai_messages, &mut runtime.messages);
         std::mem::swap(&mut self.ai_streaming_text, &mut runtime.streaming_text);
-        std::mem::swap(&mut self.ai_streaming_thinking, &mut runtime.streaming_thinking);
+        std::mem::swap(
+            &mut self.ai_streaming_thinking,
+            &mut runtime.streaming_thinking,
+        );
         std::mem::swap(&mut self.ai_is_streaming, &mut runtime.is_streaming);
-        std::mem::swap(&mut self.ai_last_notification, &mut runtime.last_notification);
+        std::mem::swap(
+            &mut self.ai_last_notification,
+            &mut runtime.last_notification,
+        );
         std::mem::swap(&mut self.ai_last_usage, &mut runtime.last_usage);
-        std::mem::swap(&mut self.ai_current_turn_usage, &mut runtime.current_turn_usage);
+        std::mem::swap(
+            &mut self.ai_current_turn_usage,
+            &mut runtime.current_turn_usage,
+        );
         std::mem::swap(&mut self.ai_cancel_token, &mut runtime.cancel_token);
-        std::mem::swap(&mut self.ai_stream_generation, &mut runtime.stream_generation);
-        std::mem::swap(&mut self.ai_pending_confirmation, &mut runtime.pending_confirmation);
+        std::mem::swap(
+            &mut self.ai_stream_generation,
+            &mut runtime.stream_generation,
+        );
+        std::mem::swap(
+            &mut self.ai_pending_confirmation,
+            &mut runtime.pending_confirmation,
+        );
         std::mem::swap(&mut self.ai_confirm_reply_tx, &mut runtime.confirm_reply_tx);
-        std::mem::swap(&mut self.ai_opencode_confirm_reply_tx, &mut runtime.opencode_confirm_reply_tx);
+        std::mem::swap(
+            &mut self.ai_opencode_confirm_reply_tx,
+            &mut runtime.opencode_confirm_reply_tx,
+        );
         std::mem::swap(&mut self.ai_pending_text, &mut runtime.pending_text);
         std::mem::swap(&mut self.ai_pending_thinking, &mut runtime.pending_thinking);
         std::mem::swap(&mut self.ai_turn_provider, &mut runtime.turn_provider);
@@ -4011,19 +4989,30 @@ impl RootView {
             return;
         }
         let mut previous = AiConversationRuntime::default();
-        previous.owner_tab_id = self.tabs.iter()
+        previous.owner_tab_id = self
+            .tabs
+            .iter()
             .find(|tab| tab.ai_conversation_id == self.ai_loaded_conversation_id)
             .map(|tab| tab.id)
             .or_else(|| self.tabs.get(self.active_tab_idx).map(|tab| tab.id))
             .unwrap_or_default();
         self.swap_ai_runtime(&mut previous);
         if !self.ai_loaded_conversation_id.is_empty() {
-            self.ai_background_conversations.insert(self.ai_loaded_conversation_id.clone(), previous);
+            self.ai_background_conversations
+                .insert(self.ai_loaded_conversation_id.clone(), previous);
         }
-        let mut next = self.ai_background_conversations.remove(conversation_id).unwrap_or_else(|| {
-            let record = self.ai_chat_records.iter().find(|record| record.id == conversation_id);
+        let mut next = self
+            .ai_background_conversations
+            .remove(conversation_id)
+            .unwrap_or_else(|| {
+                let record = self
+                    .ai_chat_records
+                    .iter()
+                    .find(|record| record.id == conversation_id);
             AiConversationRuntime {
-                messages: record.map(|record| record.messages.clone()).unwrap_or_default(),
+                    messages: record
+                        .map(|record| record.messages.clone())
+                        .unwrap_or_default(),
                 last_usage: record.and_then(|record| record.used_tokens.map(|used| (used, 0))),
                 ..AiConversationRuntime::default()
             }
@@ -4061,7 +5050,8 @@ impl RootView {
         let result = update(self);
         self.ai_event_source = None;
         self.swap_ai_runtime(&mut runtime);
-        self.ai_background_conversations.insert(conversation_id.to_string(), runtime);
+        self.ai_background_conversations
+            .insert(conversation_id.to_string(), runtime);
         Some(result)
     }
 
@@ -4070,7 +5060,11 @@ impl RootView {
             self.swap_ai_runtime(&mut runtime);
             self.cancel_ai_stream();
             self.finish_cancelled_ai_turn();
-            if let Some(record) = self.ai_chat_records.iter_mut().find(|record| record.id == conversation_id) {
+            if let Some(record) = self
+                .ai_chat_records
+                .iter_mut()
+                .find(|record| record.id == conversation_id)
+            {
                 record.messages = self.ai_messages.clone();
             }
             self.swap_ai_runtime(&mut runtime);
@@ -4078,9 +5072,12 @@ impl RootView {
     }
 
     fn cancel_tab_ai_turns(&mut self, tab_id: usize) {
-        let ids: Vec<String> = self.ai_background_conversations.iter()
+        let ids: Vec<String> = self
+            .ai_background_conversations
+            .iter()
             .filter(|(_, runtime)| runtime.owner_tab_id == tab_id)
-            .map(|(id, _)| id.clone()).collect();
+            .map(|(id, _)| id.clone())
+            .collect();
         for id in ids {
             self.cancel_background_ai_conversation(&id);
         }
@@ -4123,28 +5120,14 @@ impl RootView {
                 .pane_tree
                 .all_panes()
                 .into_iter()
-                .filter_map(|pane| {
-                    if let Some(term) = &pane.terminal {
-                        if term.is_process_running() {
-                            let name = term
-                                .get_foreground_process_name()
-                                .unwrap_or_else(|| "process".to_string());
-                            let pid = term.shell_pid().unwrap_or(0);
-                            return Some(RunningProcessInfo {
-                                pane_id: pane.id,
-                                process_name: name,
-                                pid,
-                            });
-                        }
-                    }
-                    None
-                })
+                .filter_map(pane_close_info)
                 .collect();
 
             if !running.is_empty() {
                 self.pending_close = Some(PendingClose {
                     target: CloseTarget::Tab { tab_id },
                     running_processes: running,
+                    failure: None,
                 });
                 cx.notify();
                 return;
@@ -4154,6 +5137,38 @@ impl RootView {
     }
 
     pub fn force_close_tab(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let stop_report = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| stop_panes(&tab.pane_tree.all_panes()))
+            .unwrap_or_default();
+        if !stop_report.failures.is_empty() {
+            let failed_ids: std::collections::HashSet<usize> = stop_report
+                .failures
+                .iter()
+                .map(|(pane_id, _)| *pane_id)
+                .collect();
+            let running_processes = self.tabs.iter()
+                .find(|tab| tab.id == tab_id)
+                .map(|tab| tab.pane_tree.all_panes().into_iter()
+                    .filter(|pane| failed_ids.contains(&pane.id))
+                    .filter_map(pane_close_info)
+                    .collect())
+                .unwrap_or_default();
+            let error = stop_report.error_message();
+            for pane_id in stop_report.stopped_ids {
+                self.remove_stopped_pane(tab_id, pane_id, cx);
+            }
+            self.pending_close = Some(PendingClose {
+                target: CloseTarget::Tab { tab_id },
+                running_processes,
+                failure: Some(error),
+            });
+            cx.notify();
+            return;
+        }
+        self.pending_close = None;
         self.selection = None;
         self.is_selecting = false;
         self.selection_start = None;
@@ -4170,16 +5185,16 @@ impl RootView {
             let removed_conversation_id = self.tabs[idx].ai_conversation_id.clone();
             let removed_tab_key = &self.tabs[idx].ai_tab_key;
             self.ai_turn_completions.retain(|id, _| {
-                !self.ai_chat_records.iter().any(|record| record.id == *id && record.tab_key == *removed_tab_key)
+                !self
+                    .ai_chat_records
+                    .iter()
+                    .any(|record| record.id == *id && record.tab_key == *removed_tab_key)
             });
             self.ai_opencode_manager.remove(&removed_conversation_id);
             let removed = self.tabs.remove(idx);
             for pane in removed.pane_tree.all_panes() {
                 if self.exec_pane_id == Some(pane.id) {
                     self.exec_pane_id = None;
-                }
-                if let Some(ref term) = pane.terminal {
-                    term.terminate_process();
                 }
                 crate::daemon::unregister(pane.id);
             }
@@ -4211,40 +5226,13 @@ impl RootView {
     }
 
     pub fn confirm_pending_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pending) = self.pending_close.take() else {
+        let Some(pending) = self.pending_close.clone() else {
             return;
         };
         match pending.target {
-            CloseTarget::Tab { tab_id } => {
-                if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
-                    for pane in tab.pane_tree.all_panes() {
-                        if let Some(term) = &pane.terminal {
-                            term.terminate_process();
-                        }
-                    }
-                }
-                self.force_close_tab(tab_id, window, cx);
-            }
-            CloseTarget::Pane { tab_id, pane_id } => {
-                if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
-                    if let Some(pane) = tab.pane_tree.find_pane(pane_id) {
-                        if let Some(term) = &pane.terminal {
-                            term.terminate_process();
-                        }
-                    }
-                }
-                self.force_close_pane(tab_id, pane_id, cx);
-            }
-            CloseTarget::OtherTabs { keep_id } => {
-                for tab in self.tabs.iter().filter(|t| t.id != keep_id) {
-                    for pane in tab.pane_tree.all_panes() {
-                        if let Some(term) = &pane.terminal {
-                            term.terminate_process();
-                        }
-                    }
-                }
-                self.force_close_other_tabs(keep_id, window, cx);
-            }
+            CloseTarget::Tab { tab_id } => self.force_close_tab(tab_id, window, cx),
+            CloseTarget::Pane { tab_id, pane_id } => self.force_close_pane(tab_id, pane_id, cx),
+            CloseTarget::OtherTabs { keep_id } => self.force_close_other_tabs(keep_id, window, cx),
         }
     }
 
@@ -4500,28 +5488,14 @@ impl RootView {
             .iter()
             .filter(|t| t.id != keep_id)
             .flat_map(|t| t.pane_tree.all_panes())
-            .filter_map(|pane| {
-                if let Some(term) = &pane.terminal {
-                    if term.is_process_running() {
-                        let name = term
-                            .get_foreground_process_name()
-                            .unwrap_or_else(|| "process".to_string());
-                        let pid = term.shell_pid().unwrap_or(0);
-                        return Some(RunningProcessInfo {
-                            pane_id: pane.id,
-                            process_name: name,
-                            pid,
-                        });
-                    }
-                }
-                None
-            })
+            .filter_map(pane_close_info)
             .collect();
 
         if !other_running.is_empty() {
             self.pending_close = Some(PendingClose {
                 target: CloseTarget::OtherTabs { keep_id },
                 running_processes: other_running,
+                failure: None,
             });
             cx.notify();
             return;
@@ -4533,22 +5507,71 @@ impl RootView {
     pub fn force_close_other_tabs(
         &mut self,
         keep_id: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.ai_is_streaming && self.tabs.get(self.active_tab_idx).map(|tab| tab.id) != Some(keep_id) {
+        let stop_reports: Vec<(usize, PaneStopReport)> = self.tabs
+            .iter()
+            .filter(|tab| tab.id != keep_id)
+            .map(|tab| (tab.id, stop_panes(&tab.pane_tree.all_panes())))
+            .collect();
+        let failures: Vec<(usize, usize, String)> = stop_reports.iter()
+            .flat_map(|(tab_id, report)| report.failures.iter()
+                .map(|(pane_id, error)| (*tab_id, *pane_id, error.clone())))
+            .collect();
+        if !failures.is_empty() {
+            let failed_ids: std::collections::HashSet<usize> = failures
+                .iter()
+                .map(|(_, pane_id, _)| *pane_id)
+                .collect();
+            let running_processes = self.tabs.iter()
+                .filter(|tab| tab.id != keep_id)
+                .flat_map(|tab| tab.pane_tree.all_panes())
+                .filter(|pane| failed_ids.contains(&pane.id))
+                .filter_map(pane_close_info)
+                .collect();
+            let error = failures.iter()
+                .map(|(tab_id, pane_id, error)| format!("tab {tab_id}, pane {pane_id}: {error}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            for (tab_id, report) in stop_reports {
+                if report.failures.is_empty() {
+                    self.force_close_tab(tab_id, window, cx);
+                } else {
+                    for pane_id in report.stopped_ids {
+                        self.remove_stopped_pane(tab_id, pane_id, cx);
+                    }
+                }
+            }
+            self.pending_close = Some(PendingClose {
+                target: CloseTarget::OtherTabs { keep_id },
+                running_processes,
+                failure: Some(error),
+            });
+            cx.notify();
+            return;
+        }
+        self.pending_close = None;
+        if self.ai_is_streaming
+            && self.tabs.get(self.active_tab_idx).map(|tab| tab.id) != Some(keep_id)
+        {
             self.cancel_ai_stream();
             self.finish_cancelled_ai_turn();
         }
         self.save_active_ai_conversation();
-        let removed_ids: Vec<usize> = self.tabs.iter().filter(|tab| tab.id != keep_id).map(|tab| tab.id).collect();
-        for id in removed_ids { self.cancel_tab_ai_turns(id); }
+        let removed_ids: Vec<usize> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.id != keep_id)
+            .map(|tab| tab.id)
+            .collect();
+        for id in removed_ids {
+            self.cancel_tab_ai_turns(id);
+        }
         for tab in self.tabs.iter().filter(|t| t.id != keep_id) {
             self.ai_opencode_manager.remove(&tab.ai_conversation_id);
             for pane in tab.pane_tree.all_panes() {
-                if let Some(ref term) = pane.terminal {
-                    term.terminate_process();
-                }
                 crate::daemon::unregister(pane.id);
             }
         }
@@ -5102,7 +6125,9 @@ impl RootView {
                 self.tabs.push(TabData {
                     id: tab_id,
                     ai_tab_key: tab_data.ai_tab_key.unwrap_or_else(|| new_ai_key("tab")),
-                    ai_conversation_id: tab_data.ai_conversation_id.unwrap_or_else(|| new_ai_key("chat")),
+                    ai_conversation_id: tab_data
+                        .ai_conversation_id
+                        .unwrap_or_else(|| new_ai_key("chat")),
                     pane_tree,
                     title: pane_title,
                     custom_title: tab_data.custom_title,
@@ -5234,7 +6259,11 @@ impl RootView {
                 self.commit_font_size(cx);
             }
             "theme_default" => self.set_theme("default", cx),
-            theme_cmd if crate::config::THEME_REGISTRY.iter().any(|(_, id, _, _)| *id == theme_cmd) => {
+            theme_cmd
+                if crate::config::THEME_REGISTRY
+                    .iter()
+                    .any(|(_, id, _, _)| *id == theme_cmd) =>
+            {
                 let theme_name = crate::config::THEME_REGISTRY
                     .iter()
                     .find(|(_, id, _, _)| *id == theme_cmd)
@@ -5290,8 +6319,8 @@ impl RootView {
     }
 
     pub fn toggle_ai_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.ai_sidebar_open = !self.ai_sidebar_open;
-        if self.ai_sidebar_open {
+        self.right_panel = self.right_panel.toggle(RightPanel::Ai);
+        if self.right_panel == RightPanel::Ai {
             self.ai_input_focused = true;
             window.focus(&self.focus_handle, cx);
         }
@@ -5300,9 +6329,16 @@ impl RootView {
         cx.notify();
     }
 
+    pub fn toggle_project_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.right_panel = self.right_panel.toggle(RightPanel::Project);
+        self.persist_session();
+        self.trigger_ai_sidebar_animation(window, cx);
+        cx.notify();
+    }
+
     fn ai_response_is_visible(&self, window: &Window) -> bool {
         self.ai_event_source.is_none()
-            && self.ai_sidebar_open
+            && self.right_panel == RightPanel::Ai
             && window.is_window_active()
             && !self.is_settings_open
             && !self.is_update_modal_open
@@ -5310,40 +6346,57 @@ impl RootView {
             && !self.is_tab_overview_open
     }
 
-    fn notify_ai_status(
-        &mut self,
-        window: &Window,
-        title: &str,
-        urgency: AiNotificationUrgency,
-    ) {
+    fn notify_ai_status(&mut self, window: &Window, title: &str, urgency: AiNotificationUrgency) {
         if !self.config.notify_on_ai_status || self.ai_response_is_visible(window) {
             return;
         }
         let now = std::time::Instant::now();
         if urgency == AiNotificationUrgency::Routine
-            && self.ai_last_notification.is_some_and(|last| now.duration_since(last).as_secs() < 5)
+            && self
+                .ai_last_notification
+                .is_some_and(|last| now.duration_since(last).as_secs() < 5)
         {
             return;
         }
-        let tab = self.ai_event_source.as_ref()
+        let tab = self
+            .ai_event_source
+            .as_ref()
             .and_then(|(id, _)| self.tabs.iter().find(|tab| tab.id == *id))
             .or_else(|| self.tabs.get(self.active_tab_idx));
         let Some(tab) = tab else { return };
-        let conversation_id = self.ai_event_source.as_ref().map(|(_, id)| id.as_str())
+        let conversation_id = self
+            .ai_event_source
+            .as_ref()
+            .map(|(_, id)| id.as_str())
             .unwrap_or(tab.ai_conversation_id.as_str());
-        let conversation_title = self.ai_chat_records.iter().find(|record| record.id == conversation_id)
-            .map(|record| record.title.as_str()).unwrap_or("AI chat");
-        let body = format!("{} / {}: {}", tab.custom_title.as_deref().unwrap_or(&tab.title), conversation_title, self.ai_turn_provider);
+        let conversation_title = self
+            .ai_chat_records
+            .iter()
+            .find(|record| record.id == conversation_id)
+            .map(|record| record.title.as_str())
+            .unwrap_or("AI chat");
+        let body = format!(
+            "{} / {}: {}",
+            tab.custom_title.as_deref().unwrap_or(&tab.title),
+            conversation_title,
+            self.ai_turn_provider
+        );
         self.ai_last_notification = Some(now);
         let title = title.to_owned();
         send_system_notification(&title, &body);
     }
 
     fn refresh_program_status(&mut self, source_id: u64, window: &Window, cx: &mut Context<Self>) {
-        let source = self.tabs.iter().flat_map(|tab| tab.pane_tree.all_panes())
-            .find_map(|pane| pane.terminal.as_ref()
+        let source = self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.pane_tree.all_panes())
+            .find_map(|pane| {
+                pane.terminal
+                    .as_ref()
                 .filter(|terminal| terminal.source_id() == source_id)
-                .map(|terminal| (pane.id, terminal.program_status())));
+                    .map(|terminal| (pane.id, terminal.program_status()))
+            });
         if let Some((pane_id, records)) = source {
             self.update_program_status(pane_id, records, window, cx);
         }
@@ -5356,22 +6409,44 @@ impl RootView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(tab) = self.tabs.iter().find(|tab| tab.pane_tree.find_pane(pane_id).is_some()) else {
+        let Some(tab) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.pane_tree.find_pane(pane_id).is_some())
+        else {
             return;
         };
-        let source = format!("{} / pane {}", tab.custom_title.as_deref().unwrap_or(&tab.title), pane_id);
+        let source = format!(
+            "{} / pane {}",
+            tab.custom_title.as_deref().unwrap_or(&tab.title),
+            pane_id
+        );
         let foreground = window.is_window_active()
             && !self.any_input_overlay_open()
-            && self.tabs.get(self.active_tab_idx).is_some_and(|tab| tab.pane_tree.active_pane_id == pane_id);
+            && self
+                .tabs
+                .get(self.active_tab_idx)
+                .is_some_and(|tab| tab.pane_tree.active_pane_id == pane_id);
         let status = self.program_statuses.entry(pane_id).or_default();
-        let changed_attention: Vec<ProgramRecord> = records.iter().filter(|record| {
-            matches!(record.state, ProgramState::Done | ProgramState::Blocked | ProgramState::Error)
-                && !status.records.iter().any(|previous| {
-                    previous.id == record.id && previous.state == record.state && previous.kind == record.kind
+        let changed_attention: Vec<ProgramRecord> = records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    ProgramState::Done | ProgramState::Blocked | ProgramState::Error
+                ) && !status.records.iter().any(|previous| {
+                    previous.id == record.id
+                        && previous.state == record.state
+                        && previous.kind == record.kind
                 })
-        }).cloned().collect();
+                })
+            .cloned()
+            .collect();
         let has_attention = records.iter().any(|record| {
-            matches!(record.state, ProgramState::Done | ProgramState::Blocked | ProgramState::Error)
+            matches!(
+                record.state,
+                ProgramState::Done | ProgramState::Blocked | ProgramState::Error
+            )
         });
         status.unread = has_attention && (status.unread || !changed_attention.is_empty());
         status.records = records;
@@ -5387,8 +6462,17 @@ impl RootView {
                     return;
                 }
                 let title = format!("Fastty: {}", super::tab_bar::program_status_text(record));
-                let message = record.msg.as_deref().or(record.title.as_deref()).unwrap_or("");
-                let body = format!("{}: {} {}", source, record.app.as_deref().unwrap_or("Program"), message);
+                let message = record
+                    .msg
+                    .as_deref()
+                    .or(record.title.as_deref())
+                    .unwrap_or("");
+                let body = format!(
+                    "{}: {} {}",
+                    source,
+                    record.app.as_deref().unwrap_or("Program"),
+                    message
+                );
                 status.last_notification = Some(now);
                 send_system_notification(&title, &body);
             }
@@ -5398,11 +6482,15 @@ impl RootView {
 
     fn visible_program_record(&self, pane_id: PaneId) -> Option<&ProgramRecord> {
         let status = self.program_statuses.get(&pane_id)?;
-        status.records.iter().filter(|record| match record.state {
+        status
+            .records
+            .iter()
+            .filter(|record| match record.state {
             ProgramState::Idle => false,
             ProgramState::Done | ProgramState::Error => status.unread,
             ProgramState::Working | ProgramState::Blocked => true,
-        }).max_by_key(|record| record.state.priority())
+            })
+            .max_by_key(|record| record.state.priority())
     }
 
     fn acknowledge_program_status(&mut self, pane_id: PaneId) {
@@ -5413,7 +6501,11 @@ impl RootView {
 
     /// 160ms ease-out-cubic open/close animation, same as the tabs sidebar.
     pub fn trigger_ai_sidebar_animation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let target = if self.ai_sidebar_open { 1.0f32 } else { 0.0f32 };
+        let target = if self.right_panel == RightPanel::Ai {
+            1.0f32
+        } else {
+            0.0f32
+        };
 
         if (self.ai_sidebar_anim_progress - target).abs() < 0.001 {
             return;
@@ -5505,21 +6597,43 @@ impl RootView {
 
     fn update_ai_skill_matches(&mut self, query: &str) {
         self.ai_at_is_skill_menu = true;
-        let cwd = self.tabs.get(self.active_tab_idx).and_then(|tab| tab.cwd.clone()).unwrap_or_default();
+        let cwd = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|tab| tab.cwd.clone())
+            .unwrap_or_default();
         let needle = query.to_lowercase();
-        let mut matches: Vec<String> = crate::ai::conversations::discover_skills(&cwd).into_iter()
+        let mut matches: Vec<String> = crate::ai::conversations::discover_skills(&cwd)
+            .into_iter()
             .filter(|skill| needle.is_empty() || skill.name.to_lowercase().contains(&needle))
             .map(|skill| format!("skill::{}::{}", skill.name, skill.scope))
             .collect();
-        let conversation_id = self.tabs.get(self.active_tab_idx).map(|tab| tab.ai_conversation_id.as_str()).unwrap_or_default();
+        let conversation_id = self
+            .tabs
+            .get(self.active_tab_idx)
+            .map(|tab| tab.ai_conversation_id.as_str())
+            .unwrap_or_default();
         if self.config.ai.default == "opencode" {
-        let active_commands = self.ai_chat_records.iter().find(|record| record.id == conversation_id)
+            let active_commands = self
+                .ai_chat_records
+                .iter()
+                .find(|record| record.id == conversation_id)
             .filter(|record| !record.available_commands.is_empty())
-            .or_else(|| self.ai_chat_records.iter().find(|record| record.cwd == cwd && !record.available_commands.is_empty()));
+                .or_else(|| {
+                    self.ai_chat_records
+                        .iter()
+                        .find(|record| record.cwd == cwd && !record.available_commands.is_empty())
+                });
         if let Some(record) = active_commands {
-            matches.extend(record.available_commands.iter()
-                .filter(|command| needle.is_empty() || command.name.to_lowercase().contains(&needle))
-                .map(|command| format!("acp::{}", command.name)));
+                matches.extend(
+                    record
+                        .available_commands
+                        .iter()
+                        .filter(|command| {
+                            needle.is_empty() || command.name.to_lowercase().contains(&needle)
+                        })
+                        .map(|command| format!("acp::{}", command.name)),
+                );
         }
         }
         matches.truncate(crate::ui::ai_sidebar::AI_AT_MENU_MAX_ROWS);
@@ -5541,7 +6655,7 @@ impl RootView {
     /// True when the AI composer gets the key instead of an overlay or the shell.
     pub fn ai_keys_own_input(&self) -> bool {
         ai_keys_own_input(
-            self.ai_sidebar_open,
+            self.right_panel == RightPanel::Ai,
             self.ai_input_focused,
             self.is_file_picker_open,
         )
@@ -5557,17 +6671,22 @@ impl RootView {
 
     pub fn insert_ai_at_path(&mut self, path: &str) {
         if path.starts_with("skill::") || path.starts_with("acp::") {
-            let Some(name) = path.split("::").nth(1) else { return };
+            let Some(name) = path.split("::").nth(1) else {
+                return;
+            };
             let text = self.ai_input_state.text.clone();
             let chars: Vec<char> = text.chars().collect();
             let cursor = self.ai_input_state.cursor.min(chars.len());
             let before: String = chars[..cursor].iter().collect();
             let after: String = chars[cursor..].iter().collect();
-            let Some(slash_idx) = before.rfind('/') else { return };
+            let Some(slash_idx) = before.rfind('/') else {
+                return;
+            };
             let prefix = &before[..slash_idx];
             let insertion = format!("{prefix}/{name} {after}");
             let new_cursor = prefix.chars().count() + name.chars().count() + 2;
-            self.ai_input_state.set_text_with_cursor(insertion, new_cursor);
+            self.ai_input_state
+                .set_text_with_cursor(insertion, new_cursor);
             self.ai_input_text = self.ai_input_state.text.clone();
             self.ai_at_menu_open = false;
             return;
@@ -5603,7 +6722,11 @@ impl RootView {
         if let Some(slash_idx) = before.rfind('/') {
             let prefix = &before[..slash_idx];
             let query = &before[slash_idx + 1..];
-            let at_token_start = prefix.chars().last().map(char::is_whitespace).unwrap_or(true);
+            let at_token_start = prefix
+                .chars()
+                .last()
+                .map(char::is_whitespace)
+                .unwrap_or(true);
             if at_token_start && !query.chars().any(char::is_whitespace) {
                 self.update_ai_skill_matches(query);
                 self.ai_at_menu_open = true;
@@ -5661,7 +6784,11 @@ impl RootView {
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
         let mut augmented_content = text.clone();
-        let universal_skill = text.trim_start().split_whitespace().next().and_then(|word| {
+        let universal_skill = text
+            .trim_start()
+            .split_whitespace()
+            .next()
+            .and_then(|word| {
             let name = word.strip_prefix('/')?.trim_matches(|character: char| {
                 !character.is_alphanumeric() && character != '-' && character != '_'
             });
@@ -5741,12 +6868,22 @@ impl RootView {
         let cfg = self.config.ai.clone();
         let active_prov = self.config.ai.default.clone();
         let active_mod = self.config.ai.active_model();
-        let active_tab_id = self.tabs.get(self.active_tab_idx).map(|tab| tab.id).unwrap_or(0);
-        let active_conversation_id = self.tabs.get(self.active_tab_idx)
-            .map(|tab| tab.ai_conversation_id.clone()).unwrap_or_default();
+        let active_tab_id = self
+            .tabs
+            .get(self.active_tab_idx)
+            .map(|tab| tab.id)
+            .unwrap_or(0);
+        let active_conversation_id = self
+            .tabs
+            .get(self.active_tab_idx)
+            .map(|tab| tab.ai_conversation_id.clone())
+            .unwrap_or_default();
         let provider_config = cfg.providers.get(&active_prov);
-        let acp_provider_identity = provider_config.and_then(|provider| provider.acp_identity(&active_prov));
-        let saved_acp_session_id = self.ai_chat_records.iter()
+        let acp_provider_identity =
+            provider_config.and_then(|provider| provider.acp_identity(&active_prov));
+        let saved_acp_session_id = self
+            .ai_chat_records
+            .iter()
             .find(|record| record.id == active_conversation_id)
             .filter(|record| record.acp_provider == acp_provider_identity)
             .and_then(|record| record.acp_session_id.clone());
@@ -5762,7 +6899,8 @@ impl RootView {
             ) {
                 Ok((model, model_name)) => Some((model, model_name)),
                 Err(e) => {
-                    self.ai_messages.push(ai_error_message(&format!("initializing AI model: {e}")));
+                    self.ai_messages
+                        .push(ai_error_message(&format!("initializing AI model: {e}")));
                     cx.notify();
                     return;
                 }
@@ -5835,7 +6973,9 @@ impl RootView {
             crate::ai::Agent::new(model, model_name, tools, checker, perm_handler, ctx_tool)
         });
 
-        let cancel_tok = agent.as_ref().map(crate::ai::Agent::cancel_token)
+        let cancel_tok = agent
+            .as_ref()
+            .map(crate::ai::Agent::cancel_token)
             .unwrap_or_else(crate::ai::CancelToken::new);
         self.ai_cancel_token = Some(cancel_tok.clone());
         self.ai_next_stream_generation = self.ai_next_stream_generation.wrapping_add(1);
@@ -5942,7 +7082,8 @@ impl RootView {
         let event_tab_id = active_tab_id;
         let event_conversation_id = active_conversation_id.clone();
         let opencode_manager = Arc::clone(&self.ai_opencode_manager);
-        let acp_runtime_key = acp_provider_identity.as_ref()
+        let acp_runtime_key = acp_provider_identity
+            .as_ref()
             .map(|identity| format!("{active_conversation_id}::{identity}"))
             .unwrap_or_else(|| active_conversation_id.clone());
         let acp_provider = cfg.providers.get(&active_prov);
@@ -5950,23 +7091,41 @@ impl RootView {
             .and_then(crate::ai::ProviderConfig::command)
             .unwrap_or("opencode")
             .to_string();
-        let opencode_args = acp_provider.and_then(crate::ai::ProviderConfig::acp_args)
+        let opencode_args = acp_provider
+            .and_then(crate::ai::ProviderConfig::acp_args)
             .unwrap_or_else(|| vec!["acp".to_string()]);
         let opencode_cwd = active_cwd.clone();
         let opencode_model = active_mod.clone();
-        let opencode_effort = acp_provider.and_then(|provider| {
-            if let crate::ai::ProviderConfig::Opencode { variants, .. } | crate::ai::ProviderConfig::Acp { variants, .. } = provider {
+        let opencode_effort = acp_provider
+            .and_then(|provider| {
+                if let crate::ai::ProviderConfig::Opencode { variants, .. }
+                | crate::ai::ProviderConfig::Acp { variants, .. } = provider
+                {
                 crate::ai::opencode::catalog_model_key(&opencode_model, variants)
                     .and_then(|key| variants.get(&key))
             } else {
                 None
             }
-        }).and_then(|variants| {
-            variants.iter().find(|variant| **variant == self.ai_opencode_variant)
-                .or_else(|| variants.iter().find(|variant| variant.as_str() == "default"))
+            })
+            .and_then(|variants| {
+                variants
+                    .iter()
+                    .find(|variant| **variant == self.ai_opencode_variant)
+                    .or_else(|| {
+                        variants
+                            .iter()
+                            .find(|variant| variant.as_str() == "default")
+                    })
                 .or_else(|| variants.first())
-        }).cloned().unwrap_or_default();
-        let opencode_mode = if self.ai_agent_mode == "Ask" { "plan" } else { "build" }.to_string();
+            })
+            .cloned()
+            .unwrap_or_default();
+        let opencode_mode = if self.ai_agent_mode == "Ask" {
+            "plan"
+        } else {
+            "build"
+        }
+        .to_string();
         let mut opencode_prompt = Vec::new();
         if is_acp {
             let mut prompt_text = if augmented_content.trim().is_empty() {
@@ -5986,17 +7145,29 @@ impl RootView {
                         opencode_prompt.push(serde_json::json!({ "type": "image", "mimeType": media_type, "data": data }));
                     }
                     Ok(_) => {}
-                    Err(error) => prompt_text.push_str(&format!("\n\n[Attached image error {}: {}]", path.display(), error)),
+                    Err(error) => prompt_text.push_str(&format!(
+                        "\n\n[Attached image error {}: {}]",
+                        path.display(),
+                        error
+                    )),
                 }
             }
             for path in &attached_documents {
                 match crate::ai::load_and_prepare_document(path) {
-                    Ok(crate::ai::ContentPart::Document { media_type, data, name }) => {
+                    Ok(crate::ai::ContentPart::Document {
+                        media_type,
+                        data,
+                        name,
+                    }) => {
                         let uri = format!("file://{}", path.to_string_lossy());
                         opencode_prompt.push(serde_json::json!({ "type": "resource", "resource": { "uri": uri, "mimeType": media_type, "blob": data, "name": name } }));
                     }
                     Ok(_) => {}
-                    Err(error) => prompt_text.push_str(&format!("\n\n[Attached PDF error {}: {}]", path.display(), error)),
+                    Err(error) => prompt_text.push_str(&format!(
+                        "\n\n[Attached PDF error {}: {}]",
+                        path.display(),
+                        error
+                    )),
                 }
             }
             opencode_prompt.push(serde_json::json!({ "type": "text", "text": prompt_text }));
@@ -6029,7 +7200,8 @@ impl RootView {
                 };
                 if let Err(e) = res {
                     if !cancel_tok.is_cancelled() {
-                        let _ = event_tx.send_blocking(crate::ai::AgentEvent::Error(format!("{e:#}")));
+                        let _ =
+                            event_tx.send_blocking(crate::ai::AgentEvent::Error(format!("{e:#}")));
                     }
                 }
             })
@@ -6040,7 +7212,11 @@ impl RootView {
             while let Ok((tool_id, tool_name, input_summary, reply_tx)) = ask_rx.recv().await {
                 let _ = this.update_in(cx, |this, _window, cx| {
                     let rejected_reply = reply_tx.clone();
-                    let accepted = this.with_ai_turn(event_tab_id, &permission_conversation_id, stream_generation, |this| {
+                    let accepted = this.with_ai_turn(
+                        event_tab_id,
+                        &permission_conversation_id,
+                        stream_generation,
+                        |this| {
                         this.ai_pending_confirmation =
                             Some(crate::ui::ai_sidebar::AiUiPendingConfirmation {
                                 tool_id,
@@ -6057,9 +7233,12 @@ impl RootView {
                     this.ai_opencode_confirm_reply_tx = None;
                     // The confirmation card renders at the end of the message
                     // list; bring it into view so the user sees the diff.
-                    if this.ai_event_source.is_none() { this.ai_scroll_handle.scroll_to_bottom(); }
+                            if this.ai_event_source.is_none() {
+                                this.ai_scroll_handle.scroll_to_bottom();
+                            }
                     cx.notify();
-                    });
+                        },
+                    );
                     if accepted.is_none() {
                         let _ = rejected_reply.send_blocking(crate::ai::PermissionDecision::Deny);
                     }
@@ -6070,19 +7249,29 @@ impl RootView {
 
         let opencode_permission_conversation_id = event_conversation_id.clone();
         cx.spawn_in(window, async move |this, cx| {
-            while let Ok((tool_id, tool_name, input_summary, options, reply_tx)) = opencode_ask_rx.recv().await {
+            while let Ok((tool_id, tool_name, input_summary, options, reply_tx)) =
+                opencode_ask_rx.recv().await
+            {
                 let _ = this.update_in(cx, |this, _window, cx| {
                     let rejected_reply = reply_tx.clone();
-                    let accepted = this.with_ai_turn(event_tab_id, &opencode_permission_conversation_id, stream_generation, |this| {
-                        this.ai_pending_confirmation = Some(crate::ui::ai_sidebar::AiUiPendingConfirmation {
+                    let accepted = this.with_ai_turn(
+                        event_tab_id,
+                        &opencode_permission_conversation_id,
+                        stream_generation,
+                        |this| {
+                            this.ai_pending_confirmation =
+                                Some(crate::ui::ai_sidebar::AiUiPendingConfirmation {
                             tool_id,
                             tool_name,
                             input_summary,
-                            options: options.into_iter().map(|option| crate::ui::ai_sidebar::AiUiPermissionOption {
+                                    options: options
+                                        .into_iter()
+                                        .map(|option| crate::ui::ai_sidebar::AiUiPermissionOption {
                                 option_id: option.option_id,
                                 name: option.name,
                                 kind: option.kind,
-                            }).collect(),
+                                        })
+                                        .collect(),
                     });
                     this.ai_confirm_reply_tx = None;
                     this.ai_opencode_confirm_reply_tx = Some(reply_tx);
@@ -6091,9 +7280,12 @@ impl RootView {
                         "Fastty AI: Permission required",
                         AiNotificationUrgency::RequiresAction,
                     );
-                    if this.ai_event_source.is_none() { this.ai_scroll_handle.scroll_to_bottom(); }
+                            if this.ai_event_source.is_none() {
+                                this.ai_scroll_handle.scroll_to_bottom();
+                            }
                     cx.notify();
-                    });
+                        },
+                    );
                     if accepted.is_none() {
                         let _ = rejected_reply.send_blocking(None);
                     }
@@ -6107,7 +7299,11 @@ impl RootView {
         cx.spawn_in(window, async move |this, cx| {
             while let Ok(ev) = event_rx.recv().await {
                 let _ = this.update_in(cx, |this, _window, cx| {
-                    let accepted = this.with_ai_turn(event_tab_id, &stream_conversation_id, stream_generation, |this| {
+                    let accepted = this.with_ai_turn(
+                        event_tab_id,
+                        &stream_conversation_id,
+                        stream_generation,
+                        |this| {
                         match ev {
                             crate::ai::AgentEvent::TextDelta(d) => {
                                 this.ai_pending_text.push_str(&d);
@@ -6149,7 +7345,9 @@ impl RootView {
                                         text,
                                         thinking,
                                         tool_calls: Vec::new(),
-                                        timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                                            timestamp: Some(
+                                                crate::ui::ai_sidebar::current_time_str(),
+                                            ),
                                         images: Vec::new(),
                                         documents: Vec::new(),
                                         is_error: false,
@@ -6158,7 +7356,8 @@ impl RootView {
 
                             if let Some(last) = this.ai_messages.last_mut() {
                                 if !last.is_user {
-                                    last.tool_calls.push(crate::ui::ai_sidebar::AiUiToolCall {
+                                            last.tool_calls.push(
+                                                crate::ui::ai_sidebar::AiUiToolCall {
                                         id,
                                         name,
                                         args,
@@ -6166,13 +7365,16 @@ impl RootView {
                                         is_error: false,
                                         is_running: true,
                                         diff: None,
-                                    });
+                                                },
+                                            );
                                 } else {
-                                    this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
+                                            this.ai_messages.push(
+                                                crate::ui::ai_sidebar::AiUiMessage {
                                         is_user: false,
                                         text: String::new(),
                                         thinking: None,
-                                        tool_calls: vec![crate::ui::ai_sidebar::AiUiToolCall {
+                                                    tool_calls: vec![
+                                                        crate::ui::ai_sidebar::AiUiToolCall {
                                             id,
                                             name,
                                             args,
@@ -6180,18 +7382,24 @@ impl RootView {
                                             is_error: false,
                                             is_running: true,
                                             diff: None,
-                                        }],
-                                        timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                                                        },
+                                                    ],
+                                                    timestamp: Some(
+                                                        crate::ui::ai_sidebar::current_time_str(),
+                                                    ),
                                         images: Vec::new(),
                                         documents: Vec::new(),
                                         is_error: false,
-                                    });
+                                                },
+                                            );
                                 }
                             }
                         }
                         crate::ai::AgentEvent::ToolArgs { id, args } => {
                             for m in this.ai_messages.iter_mut().rev() {
-                                if let Some(tc) = m.tool_calls.iter_mut().find(|c| c.id == id) {
+                                        if let Some(tc) =
+                                            m.tool_calls.iter_mut().find(|c| c.id == id)
+                                        {
                                     tc.args = args;
                                     break;
                                 }
@@ -6206,7 +7414,9 @@ impl RootView {
                             ..
                         } => {
                             for m in this.ai_messages.iter_mut().rev() {
-                                if let Some(tc) = m.tool_calls.iter_mut().find(|c| c.id == id) {
+                                        if let Some(tc) =
+                                            m.tool_calls.iter_mut().find(|c| c.id == id)
+                                        {
                                     if let Some(args) = args {
                                         tc.args = args;
                                     }
@@ -6219,33 +7429,60 @@ impl RootView {
                             }
                         }
                         crate::ai::AgentEvent::ConversationSession(session_id) => {
-                            if let Some(_tab) = this.tabs.iter().find(|tab| tab.id == event_tab_id) {
+                                    if let Some(_tab) =
+                                        this.tabs.iter().find(|tab| tab.id == event_tab_id)
+                                    {
                                 let conversation_id = stream_conversation_id.clone();
-                                if let Some(record) = this.ai_chat_records.iter_mut().find(|record| record.id == conversation_id) {
+                                        if let Some(record) = this
+                                            .ai_chat_records
+                                            .iter_mut()
+                                            .find(|record| record.id == conversation_id)
+                                        {
                                     record.acp_session_id = Some(session_id);
                                     record.acp_provider = session_provider_identity.clone();
-                                    let _ = crate::ai::conversations::save(&this.ai_chat_records);
+                                            let _ = crate::ai::conversations::save(
+                                                &this.ai_chat_records,
+                                            );
                                 }
                             }
                         }
                         crate::ai::AgentEvent::AvailableCommands(commands) => {
-                            if let Some(_tab) = this.tabs.iter().find(|tab| tab.id == event_tab_id) {
+                                    if let Some(_tab) =
+                                        this.tabs.iter().find(|tab| tab.id == event_tab_id)
+                                    {
                                 let conversation_id = stream_conversation_id.clone();
-                                if let Some(record) = this.ai_chat_records.iter_mut().find(|record| record.id == conversation_id) {
+                                        if let Some(record) = this
+                                            .ai_chat_records
+                                            .iter_mut()
+                                            .find(|record| record.id == conversation_id)
+                                        {
                                     record.available_commands = commands;
-                                    let _ = crate::ai::conversations::save(&this.ai_chat_records);
+                                            let _ = crate::ai::conversations::save(
+                                                &this.ai_chat_records,
+                                            );
                                 }
                             }
                         }
                         crate::ai::AgentEvent::ContextWindow { used, size } => {
-                            if let Some(_tab) = this.tabs.iter().find(|tab| tab.id == event_tab_id) {
+                                    if let Some(_tab) =
+                                        this.tabs.iter().find(|tab| tab.id == event_tab_id)
+                                    {
                                 let conversation_id = stream_conversation_id.clone();
-                                if let Some(record) = this.ai_chat_records.iter_mut().find(|record| record.id == conversation_id) {
+                                        if let Some(record) = this
+                                            .ai_chat_records
+                                            .iter_mut()
+                                            .find(|record| record.id == conversation_id)
+                                        {
                                     record.used_tokens = Some(used);
-                                    if record.context_window == 0 { record.context_window = size; }
-                                    record.updated_at = crate::ai::conversations::now_millis();
+                                            if record.context_window == 0 {
+                                                record.context_window = size;
+                                            }
+                                            record.updated_at =
+                                                crate::ai::conversations::now_millis();
                                     this.ai_last_usage = Some((used, 0));
-                                    let _ = crate::ai::conversations::save(&this.ai_chat_records);
+                                            let _ = crate::ai::conversations::save(
+                                                &this.ai_chat_records,
+                                            );
                                 }
                             }
                         }
@@ -6283,7 +7520,9 @@ impl RootView {
                                     text,
                                     thinking,
                                     tool_calls: Vec::new(),
-                                    timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                                            timestamp: Some(
+                                                crate::ui::ai_sidebar::current_time_str(),
+                                            ),
                                     images: Vec::new(),
                                     documents: Vec::new(),
                                     is_error: false,
@@ -6291,10 +7530,13 @@ impl RootView {
                             } else if !has_last_tools {
                                 this.ai_messages.push(crate::ui::ai_sidebar::AiUiMessage {
                                     is_user: false,
-                                    text: "(Assistant completed turn with no content)".to_string(),
+                                            text: "(Assistant completed turn with no content)"
+                                                .to_string(),
                                     thinking: None,
                                     tool_calls: Vec::new(),
-                                    timestamp: Some(crate::ui::ai_sidebar::current_time_str()),
+                                            timestamp: Some(
+                                                crate::ui::ai_sidebar::current_time_str(),
+                                            ),
                                     images: Vec::new(),
                                     documents: Vec::new(),
                                     is_error: false,
@@ -6328,19 +7570,30 @@ impl RootView {
                                     .ai_messages
                                     .iter()
                                     .map(|m| {
-                                        m.text.len() + m.thinking.as_deref().unwrap_or("").len()
+                                                m.text.len()
+                                                    + m.thinking.as_deref().unwrap_or("").len()
                                     })
                                     .sum();
                                 ((chars / 4).max(50)) as u64
                             };
                             this.ai_current_turn_usage = (effective_input, output);
                             this.ai_last_usage = Some(this.ai_current_turn_usage);
-                            if let Some(_tab) = this.tabs.iter().find(|tab| tab.id == event_tab_id) {
+                                    if let Some(_tab) =
+                                        this.tabs.iter().find(|tab| tab.id == event_tab_id)
+                                    {
                                 let conversation_id = stream_conversation_id.clone();
-                                if let Some(record) = this.ai_chat_records.iter_mut().find(|record| record.id == conversation_id) {
-                                    record.used_tokens = Some(effective_input.saturating_add(output));
-                                    record.updated_at = crate::ai::conversations::now_millis();
-                                    let _ = crate::ai::conversations::save(&this.ai_chat_records);
+                                        if let Some(record) = this
+                                            .ai_chat_records
+                                            .iter_mut()
+                                            .find(|record| record.id == conversation_id)
+                                        {
+                                            record.used_tokens =
+                                                Some(effective_input.saturating_add(output));
+                                            record.updated_at =
+                                                crate::ai::conversations::now_millis();
+                                            let _ = crate::ai::conversations::save(
+                                                &this.ai_chat_records,
+                                            );
                                 }
                             }
                             return;
@@ -6373,7 +7626,8 @@ impl RootView {
                     }
                     this.scroll_ai_to_bottom();
                     cx.notify();
-                    });
+                        },
+                    );
                     let _ = accepted;
                 });
             }
@@ -6397,21 +7651,35 @@ impl RootView {
         let provider = self.config.ai.default.clone();
         let model = self.config.ai.active_model();
         let opencode_variants = if provider == "opencode" {
-            self.config.ai.providers.get(&provider).and_then(|provider| {
-                if let crate::ai::ProviderConfig::Opencode { variants, .. } | crate::ai::ProviderConfig::Acp { variants, .. } = provider {
+            self.config
+                .ai
+                .providers
+                .get(&provider)
+                .and_then(|provider| {
+                    if let crate::ai::ProviderConfig::Opencode { variants, .. }
+                    | crate::ai::ProviderConfig::Acp { variants, .. } = provider
+                    {
                     crate::ai::opencode::catalog_model_key(&model, variants)
-                        .and_then(|key| variants.get(&key)).cloned()
+                            .and_then(|key| variants.get(&key))
+                            .cloned()
                 } else {
                     None
                 }
-            }).unwrap_or_default()
+                })
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
-        let opencode_variant = opencode_variants.iter()
+        let opencode_variant = opencode_variants
+            .iter()
             .find(|variant| **variant == self.ai_opencode_variant)
             .cloned()
-            .or_else(|| opencode_variants.iter().find(|variant| variant.as_str() == "default").cloned())
+            .or_else(|| {
+                opencode_variants
+                    .iter()
+                    .find(|variant| variant.as_str() == "default")
+                    .cloned()
+            })
             .or_else(|| opencode_variants.first().cloned())
             .unwrap_or_else(|| "default".to_string());
         let active_cwd = self
@@ -6423,25 +7691,51 @@ impl RootView {
             .tabs
             .get(self.active_tab_idx)
             .and_then(|t| t.git_status.as_ref().map(|g| g.branch.clone()));
-        let history_cwd = self.tabs.get(self.active_tab_idx).and_then(|tab| tab.cwd.clone()).unwrap_or_default();
-        let history_tab_key = self.tabs.get(self.active_tab_idx)
+        let history_cwd = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|tab| tab.cwd.clone())
+            .unwrap_or_default();
+        let history_tab_key = self
+            .tabs
+            .get(self.active_tab_idx)
             .map(|tab| tab.ai_tab_key.clone())
             .unwrap_or_default();
-        let mut history_items: Vec<(String, String, u64)> = self.ai_chat_records.iter()
+        let mut history_items: Vec<(String, String, u64)> = self
+            .ai_chat_records
+            .iter()
             .filter(|record| record.tab_key == history_tab_key && record.cwd == history_cwd)
-            .map(|record| (record.id.clone(), record.title.clone(), record.updated_at / 1_000))
+            .map(|record| {
+                (
+                    record.id.clone(),
+                    record.title.clone(),
+                    record.updated_at / 1_000,
+                )
+            })
             .collect();
         history_items.sort_by(|left, right| right.2.cmp(&left.2));
         history_items.truncate(30);
 
-        let active_conversation_id = self.tabs.get(self.active_tab_idx)
-            .map(|tab| tab.ai_conversation_id.as_str()).unwrap_or_default();
-        let active_record = self.ai_chat_records.iter().find(|record| record.id == active_conversation_id);
-        let max_context_u64 = active_record.map(|record| record.context_window)
+        let active_conversation_id = self
+            .tabs
+            .get(self.active_tab_idx)
+            .map(|tab| tab.ai_conversation_id.as_str())
+            .unwrap_or_default();
+        let active_record = self
+            .ai_chat_records
+            .iter()
+            .find(|record| record.id == active_conversation_id);
+        let max_context_u64 = active_record
+            .map(|record| record.context_window)
             .filter(|size| *size > 0)
             .unwrap_or_else(|| crate::config::ai_context_window().max(1_000) as u64);
-        let effective_usage = if active_record.and_then(|record| record.used_tokens).is_some() {
-            active_record.and_then(|record| record.used_tokens).map(|used| (used, 0))
+        let effective_usage = if active_record
+            .and_then(|record| record.used_tokens)
+            .is_some()
+        {
+            active_record
+                .and_then(|record| record.used_tokens)
+                .map(|used| (used, 0))
         } else if self.ai_current_turn_usage != (0, 0) {
             Some(self.ai_current_turn_usage)
         } else {
@@ -6485,7 +7779,10 @@ impl RootView {
             cx.notify();
         }))
         .messages(self.ai_messages.clone())
-        .turn_completed(self.ai_turn_completions.contains_key(active_conversation_id))
+        .turn_completed(
+            self.ai_turn_completions
+                .contains_key(active_conversation_id),
+        )
         .streaming(
             self.ai_is_streaming,
             self.ai_streaming_text.clone(),
@@ -6589,7 +7886,9 @@ impl RootView {
             cx.notify();
         }))
         .on_delete_history(cx.listener(|this, conversation_id: &String, _window, cx| {
-            let deleting_active = this.tabs.get(this.active_tab_idx)
+            let deleting_active = this
+                .tabs
+                .get(this.active_tab_idx)
                 .map(|tab| tab.ai_conversation_id == *conversation_id)
                 .unwrap_or(false);
             if deleting_active {
@@ -6612,10 +7911,14 @@ impl RootView {
             this.cancel_background_ai_conversation(conversation_id);
             this.ai_opencode_manager.remove(conversation_id);
             this.ai_turn_completions.remove(conversation_id);
-            this.ai_chat_records.retain(|record| record.id != *conversation_id);
+            this.ai_chat_records
+                .retain(|record| record.id != *conversation_id);
             if deleting_active {
-                this.ai_loaded_conversation_id = this.tabs.get(this.active_tab_idx)
-                    .map(|tab| tab.ai_conversation_id.clone()).unwrap_or_default();
+                this.ai_loaded_conversation_id = this
+                    .tabs
+                    .get(this.active_tab_idx)
+                    .map(|tab| tab.ai_conversation_id.clone())
+                    .unwrap_or_default();
             }
             let _ = crate::ai::conversations::save(&this.ai_chat_records);
             this.persist_session();
@@ -6653,7 +7956,11 @@ impl RootView {
             if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
                 tab.ai_conversation_id = new_ai_key("chat");
             }
-            if let Some(id) = this.tabs.get(this.active_tab_idx).map(|tab| tab.ai_conversation_id.clone()) {
+            if let Some(id) = this
+                .tabs
+                .get(this.active_tab_idx)
+                .map(|tab| tab.ai_conversation_id.clone())
+            {
                 this.load_ai_conversation(&id);
             }
             this.ai_messages.clear();
@@ -6695,12 +8002,18 @@ impl RootView {
         }))
         .on_clear(cx.listener(|this, _ev, _window, cx| {
             this.cancel_ai_stream();
-            let conversation_id = this.tabs.get(this.active_tab_idx)
+            let conversation_id = this
+                .tabs
+                .get(this.active_tab_idx)
                 .map(|tab| tab.ai_conversation_id.clone());
             if let Some(conversation_id) = conversation_id {
                 this.ai_turn_completions.remove(&conversation_id);
                 this.ai_opencode_manager.remove(&conversation_id);
-                if let Some(record) = this.ai_chat_records.iter_mut().find(|record| record.id == conversation_id) {
+                if let Some(record) = this
+                    .ai_chat_records
+                    .iter_mut()
+                    .find(|record| record.id == conversation_id)
+                {
                     record.title = "New chat".to_string();
                     record.messages.clear();
                     record.used_tokens = None;
@@ -6743,8 +8056,7 @@ impl RootView {
         .on_submit(cx.listener(|this, _ev, window, cx| {
             this.submit_ai_prompt(window, cx);
         }))
-        .on_confirm(
-            cx.listener(|this, option_id: &String, _window, cx| {
+        .on_confirm(cx.listener(|this, option_id: &String, _window, cx| {
                 let is_always = option_id == "allow_always";
                 let is_allow = !option_id.starts_with("reject");
                 if is_always && is_allow {
@@ -6776,8 +8088,7 @@ impl RootView {
                 }
                 this.ai_pending_confirmation = None;
                 cx.notify();
-            }),
-        );
+        }));
 
         div()
             .relative()
@@ -6797,12 +8108,12 @@ impl RootView {
             .on_drag_move::<gpui::ExternalPaths>(cx.listener(
                 |this, ev: &gpui::DragMoveEvent<gpui::ExternalPaths>, window, cx| {
                     let over_composer = file_drop_target_at(
-                        this.ai_sidebar_open,
+                        this.right_panel == RightPanel::Ai,
                         window.viewport_size().width.to_f64() as f32
                             - this.current_ai_sidebar_width(),
                         ev.event.position.x.to_f64() as f32,
                     ) == FileDropTarget::AiAttach;
-                    let hover = this.ai_sidebar_open && over_composer;
+                    let hover = this.right_panel == RightPanel::Ai && over_composer;
                     if hover != this.ai_file_drag_hover {
                         this.ai_file_drag_hover = hover;
                         cx.notify();
@@ -6921,8 +8232,9 @@ impl RootView {
         self.current_theme_name = theme_name.clone();
         self.theme = Theme::from_name(&theme_name).with_opacity(loaded_config.opacity);
         self.font_size = loaded_config.font.size;
-        let new_family: SharedString =
-            if loaded_config.font.family.is_empty() || loaded_config.font.family == "monospace" {
+        let new_family: SharedString = if loaded_config.font.family.is_empty()
+            || loaded_config.font.family == "monospace"
+        {
                 #[cfg(target_os = "macos")]
                 {
                     "Menlo".into()
@@ -6942,10 +8254,7 @@ impl RootView {
                 // measurement and rendering agree.
                 #[cfg(target_os = "macos")]
                 {
-                    crate::font_discovery_macos::resolve_font_family(
-                        &loaded_config.font.family,
-                    )
-                    .into()
+                crate::font_discovery_macos::resolve_font_family(&loaded_config.font.family).into()
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
@@ -6969,17 +8278,22 @@ impl RootView {
                 term.update_scrollback(loaded_config.scrollback);
             });
         }
-        let context_window_changed = loaded_config.ai.context_window != self.config.ai.context_window;
+        let context_window_changed =
+            loaded_config.ai.context_window != self.config.ai.context_window;
         crate::keybindings::init_resolver(
             loaded_config.keybindings.clone(),
             loaded_config.keybinding_preset,
         );
         self.config = loaded_config;
         if context_window_changed {
-            let active_conversation_id = self.tabs.get(self.active_tab_idx)
+            let active_conversation_id = self
+                .tabs
+                .get(self.active_tab_idx)
                 .map(|tab| tab.ai_conversation_id.as_str());
             if let Some(record) = active_conversation_id.and_then(|id| {
-                self.ai_chat_records.iter_mut().find(|record| record.id == id)
+                self.ai_chat_records
+                    .iter_mut()
+                    .find(|record| record.id == id)
             }) {
                 record.context_window = self.config.ai.context_window.max(1_000) as u64;
                 record.updated_at = crate::ai::conversations::now_millis();
@@ -7198,7 +8512,11 @@ impl RootView {
     }
 
     fn ansi_spec(rgb: (u8, u8, u8)) -> AnsiColor {
-        AnsiColor::Spec(Rgb { r: rgb.0, g: rgb.1, b: rgb.2 })
+        AnsiColor::Spec(Rgb {
+            r: rgb.0,
+            g: rgb.1,
+            b: rgb.2,
+        })
     }
 
     fn hsla_to_rgb_tuple(c: Hsla) -> (u8, u8, u8) {
@@ -7330,6 +8648,16 @@ impl RootView {
         let is_alt_gr = modifiers.control && !modifiers.platform && modifiers.alt;
         let is_ctrl = modifiers.control && !is_alt_gr;
 
+        let project_panel_shortcut = if cfg!(target_os = "macos") {
+            modifiers.platform && modifiers.shift && key_lower == "g"
+        } else {
+            is_ctrl && modifiers.shift && key_lower == "g"
+        };
+        if self.ai_keys_own_input() && project_panel_shortcut {
+            self.toggle_project_sidebar(_window, cx);
+            return;
+        }
+
         // AI Sidebar Input Keyboard Handler
         if self.ai_keys_own_input() {
             if key_lower == "escape" || key_lower == "esc" {
@@ -7345,7 +8673,7 @@ impl RootView {
                 } else if self.ai_is_streaming {
                     self.cancel_ai_stream();
                 } else {
-                    self.ai_sidebar_open = false;
+                    self.right_panel = RightPanel::Closed;
                 }
                 cx.notify();
                 return;
@@ -7504,9 +8832,22 @@ impl RootView {
                     self.check_ai_at_trigger();
                 } else if self.ai_pending_confirmation.is_some() && modifiers.platform {
                     if let Some(tx) = self.ai_opencode_confirm_reply_tx.take() {
-                        let selected = self.ai_pending_confirmation.as_ref()
-                            .and_then(|pending| pending.options.iter().find(|option| option.kind.as_deref() == Some("allow_once")))
-                            .or_else(|| self.ai_pending_confirmation.as_ref().and_then(|pending| pending.options.iter().find(|option| !option.kind.as_deref().unwrap_or("").starts_with("reject"))))
+                        let selected = self
+                            .ai_pending_confirmation
+                            .as_ref()
+                            .and_then(|pending| {
+                                pending
+                                    .options
+                                    .iter()
+                                    .find(|option| option.kind.as_deref() == Some("allow_once"))
+                            })
+                            .or_else(|| {
+                                self.ai_pending_confirmation.as_ref().and_then(|pending| {
+                                    pending.options.iter().find(|option| {
+                                        !option.kind.as_deref().unwrap_or("").starts_with("reject")
+                                    })
+                                })
+                            })
                             .map(|option| option.option_id.clone());
                         let _ = tx.send_blocking(selected);
                     } else if let Some(tx) = self.ai_confirm_reply_tx.take() {
@@ -8621,6 +9962,10 @@ impl RootView {
                     self.toggle_tab_sidebar(_window, cx);
                     return;
                 }
+                Action::ToggleProjectSidebar => {
+                    self.toggle_project_sidebar(_window, cx);
+                    return;
+                }
                 Action::ToggleAiSidebar => {
                     self.toggle_ai_sidebar(_window, cx);
                     return;
@@ -9033,7 +10378,7 @@ impl RootView {
             || self.is_update_modal_open
             || self.is_whats_new_open
             || self.pending_close.is_some()
-            || (self.ai_sidebar_open && self.ai_input_focused)
+            || (self.right_panel == RightPanel::Ai && self.ai_input_focused)
     }
 
     fn any_root_menu_open(&self) -> bool {
@@ -9120,7 +10465,7 @@ impl RootView {
         };
 
         // Click in terminal area unfocuses the AI input so keystrokes go to the terminal.
-        if self.ai_sidebar_open && self.ai_input_focused {
+        if self.right_panel == RightPanel::Ai && self.ai_input_focused {
             let win_w = window.viewport_size().width.to_f64() as f32;
             let sidebar_left = win_w - self.current_ai_sidebar_width();
             if (event.position.x.to_f64() as f32) < sidebar_left {
@@ -9209,12 +10554,11 @@ impl RootView {
             self.pressed_mouse_buttons.push(event.button);
         }
 
-        let is_right_click = event.button == MouseButton::Right;
-
-        if terminal.is_mouse_mode_enabled() && !is_right_click {
+        if terminal.is_mouse_mode_enabled() {
             let btn = match event.button {
                 MouseButton::Left => 0,
                 MouseButton::Middle => 1,
+                MouseButton::Right => 2,
                 _ => 0,
             };
             if !self.reported_mouse_buttons.contains(&event.button) {
@@ -9505,6 +10849,13 @@ impl RootView {
             return;
         }
 
+        if self.is_dragging_project_panel {
+            let win_w = _window.viewport_size().width.to_f64() as f32;
+            self.project_panel_width = project_panel_width_after_drag(win_w, cur_x);
+            cx.notify();
+            return;
+        }
+
         if self.is_dragging_pane_split {
             let (bx, by, bw, bh) = self.dragging_split_bounds;
             let new_ratio = match self.dragging_split_direction {
@@ -9784,6 +11135,7 @@ impl RootView {
         self.dragging_scrollbar_pane_id = None;
         self.is_dragging_pane_split = false;
         self.is_dragging_ai_sidebar = false;
+        self.is_dragging_project_panel = false;
         if self.is_dragging_ai_input {
             self.is_dragging_ai_input = false;
             self.ai_input_state.end_drag();
@@ -9817,9 +11169,7 @@ impl RootView {
             let active_pane = active_tab.pane_tree.active_pane();
             if let Some(p) = active_pane.as_ref() {
                 if let Some(ref terminal) = p.terminal {
-                    if terminal.is_mouse_mode_enabled()
-                        && reported_mouse_button
-                    {
+                    if terminal.is_mouse_mode_enabled() && reported_mouse_button {
                         let (cell_w, line_h) = self.measure_cell_metrics(_window);
                         let (pane_x, pane_y) = if let Some(b) = p.last_bounds {
                             (b.origin.x.to_f64() as f32, b.origin.y.to_f64() as f32)
@@ -10257,8 +11607,8 @@ impl RootView {
                                 AnsiColor::Named(NamedColor::Background) => theme_bg_rgb,
                                 other => Self::explicit_color_rgb(other).unwrap_or(theme_bg_rgb),
                             };
-                            let in_selection = current_sel_cols
-                                .is_some_and(|(c0, c1)| col >= c0 && col < c1);
+                            let in_selection =
+                                current_sel_cols.is_some_and(|(c0, c1)| col >= c0 && col < c1);
                             let correction_base = if in_selection {
                                 crate::ui::color_harmony::alpha_blend(
                                     cell_bg_rgb,
@@ -10275,8 +11625,10 @@ impl RootView {
                                     let hsla = if self.config.contrast_correction {
                                         Self::explicit_color_rgb(other)
                                             .map(|rgb| {
-                                                let fixed =
-                                                    crate::ui::color_harmony::correct_bg(rgb, theme_fg_rgb);
+                                                let fixed = crate::ui::color_harmony::correct_bg(
+                                                    rgb,
+                                                    theme_fg_rgb,
+                                                );
                                                 self.convert_color(Self::ansi_spec(fixed), false)
                                             })
                                             .unwrap_or_else(|| self.convert_color(other, false))
@@ -10626,31 +11978,98 @@ impl RootView {
                 };
 
                 let program_badge = self.visible_program_record(pane_id).map(|record| {
-                    let mut label = format!("{}: {}",
-                        record.app.as_deref().or(record.title.as_deref()).unwrap_or("Program"),
-                        super::tab_bar::program_status_text(record));
+                    let mut label = format!(
+                        "{}: {}",
+                        record
+                            .app
+                            .as_deref()
+                            .or(record.title.as_deref())
+                            .unwrap_or("Program"),
+                        super::tab_bar::program_status_text(record)
+                    );
                     if let Some(progress) = record.progress {
                         label.push_str(&format!(" {progress}%"));
                     }
-                    if let Some(message) = record.msg.as_deref().filter(|message| !message.is_empty()) {
+                    if let Some(message) =
+                        record.msg.as_deref().filter(|message| !message.is_empty())
+                    {
                         label.push_str(&format!(" · {message}"));
                     }
-                    div().id(("program-status", pane_id))
-                        .absolute().bottom(px(4.)).right(px(20.))
-                        .flex().items_center().gap(px(5.))
-                        .max_w(px(260.)).px(px(7.)).py(px(4.))
-                        .rounded(px(5.)).bg(theme.surface_raised)
-                        .border_1().border_color(theme.border)
-                        .text_size(px(11.)).text_color(theme.foreground)
+                    div()
+                        .id(("program-status", pane_id))
+                        .absolute()
+                        .bottom(px(4.))
+                        .right(px(20.))
+                        .flex()
+                        .items_center()
+                        .gap(px(5.))
+                        .max_w(px(260.))
+                        .px(px(7.))
+                        .py(px(4.))
+                        .rounded(px(5.))
+                        .bg(theme.surface_raised)
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_size(px(11.))
+                        .text_color(theme.foreground)
                         .overflow_hidden()
                         .child(super::tab_bar::render_program_status(record, theme, 12.0))
-                        .child(div().min_w(px(0.)).truncate().child(SharedString::from(label)))
-                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .child(SharedString::from(label)),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _window, cx| {
                             this.acknowledge_program_status(pane_id);
                             cx.stop_propagation();
                             cx.notify();
-                        }))
+                            }),
+                        )
                 });
+
+                let retry_panel = pane.host_session_id
+                    .filter(|_| pane.terminal.is_none())
+                    .map(|session_id| {
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap_2()
+                            .bg(theme.background)
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.muted_strong)
+                                    .child(format!("Could not reconnect to session {session_id}")),
+                            )
+                            .child(
+                                div()
+                                    .id(("retry-host-session", pane_id))
+                                    .px(px(12.))
+                                    .py(px(6.))
+                                    .rounded(px(5.))
+                                    .bg(theme.surface_raised)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .text_size(px(12.))
+                                    .text_color(theme.foreground)
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _ev, window, cx| {
+                                            this.retry_host_session(pane_id, window, cx);
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                                    .child("Retry connection"),
+                            )
+                    });
 
                 div()
                     .size_full()
@@ -10706,6 +12125,7 @@ impl RootView {
                         }),
                     )
                     .when_some(grid_el, |d, el| d.child(el))
+                    .when_some(retry_panel, |d, panel| d.child(panel))
                     .when_some(pane_scrollbar_thumb, |d, thumb| d.child(thumb))
                     .when_some(program_badge, |d, badge| d.child(badge))
             }
@@ -10872,17 +12292,29 @@ impl Render for RootView {
                     if let Some(terminal) = pane.terminal.as_ref() {
                         let records = terminal.program_status();
                         let unread = records.iter().any(|record| {
-                            matches!(record.state, ProgramState::Done | ProgramState::Blocked | ProgramState::Error)
+                            matches!(
+                                record.state,
+                                ProgramState::Done | ProgramState::Blocked | ProgramState::Error
+                            )
                         });
-                        self.program_statuses.insert(pane.id, ProgramPaneStatus { records, unread, last_notification: None });
+                        self.program_statuses.insert(
+                            pane.id,
+                            ProgramPaneStatus {
+                                records,
+                                unread,
+                                last_notification: None,
+                            },
+                        );
                     }
                 }
             }
         }
-        self.program_statuses.retain(|id, _| live_panes.contains(id));
+        self.program_statuses
+            .retain(|id, _| live_panes.contains(id));
         if self.ai_response_is_visible(_window) {
             if let Some(tab) = self.tabs.get(self.active_tab_idx) {
-                if let Some(completion) = self.ai_turn_completions.get_mut(&tab.ai_conversation_id) {
+                if let Some(completion) = self.ai_turn_completions.get_mut(&tab.ai_conversation_id)
+                {
                     *completion = AiTurnCompletion::Read;
                 }
             }
@@ -10920,8 +12352,12 @@ impl Render for RootView {
                     id: tab.id,
                     title,
                     active: idx == self.active_tab_idx,
-                    ai_response_unread: self.ai_turn_completions.get(&tab.ai_conversation_id) == Some(&AiTurnCompletion::Unread),
-                    program_status: tab.pane_tree.all_panes().into_iter()
+                    ai_response_unread: self.ai_turn_completions.get(&tab.ai_conversation_id)
+                        == Some(&AiTurnCompletion::Unread),
+                    program_status: tab
+                        .pane_tree
+                        .all_panes()
+                        .into_iter()
                         .filter_map(|pane| self.visible_program_record(pane.id))
                         .max_by_key(|record| record.state.priority())
                         .cloned(),
@@ -10939,7 +12375,11 @@ impl Render for RootView {
             if tab_idx == self.active_tab_idx {
                 continue;
             }
-            let title = tab.custom_title.as_deref().unwrap_or(&tab.title).to_string();
+            let title = tab
+                .custom_title
+                .as_deref()
+                .unwrap_or(&tab.title)
+                .to_string();
             for pane in tab.pane_tree.all_panes() {
                 if let Some(record) = self.visible_program_record(pane.id).cloned() {
                     background_program_statuses.push((tab_idx, pane.id, title.clone(), record));
@@ -10947,7 +12387,11 @@ impl Render for RootView {
             }
         }
         background_program_statuses.sort_by_key(|(tab_idx, pane_id, _, record)| {
-            (std::cmp::Reverse(record.state.priority()), *tab_idx, *pane_id)
+            (
+                std::cmp::Reverse(record.state.priority()),
+                *tab_idx,
+                *pane_id,
+            )
         });
 
         let cwd_changed = {
@@ -10956,44 +12400,82 @@ impl Render for RootView {
                 if let Some(ref term) = active_tab.terminal {
                     if let Some(proc_cwd) = term.get_current_working_directory() {
                         if active_tab.cwd.as_ref() != Some(&proc_cwd) {
-                            active_tab.cwd = Some(proc_cwd);
-                            true
+                            active_tab.cwd = Some(proc_cwd.clone());
+                            active_tab.git_status = None;
+                            active_tab.git_checked_cwd = None;
+                            active_tab.git_last_poll = None;
+                            let active_pane = active_tab.pane_tree.active_pane_id;
+                            if let Some(pane) = active_tab.pane_tree.find_pane_mut(active_pane) {
+                                pane.cwd = Some(proc_cwd.clone());
+                                pane.git_status = None;
+                                pane.git_checked_cwd = None;
+                                pane.git_last_poll = None;
+                            }
+                            Some(proc_cwd)
                         } else {
-                            false
+                            None
                         }
                     } else {
-                        false
+                        None
                     }
                 } else {
-                    false
+                    None
                 }
             } else {
-                false
+                None
             }
         };
-        if cwd_changed {
+        let graph_scroll_target =
+            self.tabs
+                .get(self.active_tab_idx)
+                .map(|tab| ProjectGraphScrollTarget {
+            tab_id: tab.id,
+            cwd: tab.cwd.clone(),
+        });
+        if graph_scroll_target.as_ref().is_some_and(|target| {
+            project_graph_scroll_target_changed(self.project_graph_scroll_target.as_ref(), target)
+        }) {
+            self.project_graph_scroll_handle
+                .set_offset(gpui::point(px(0.), px(0.)));
+            self.project_graph_rendered_range.set((0, 0));
+        }
+        self.project_graph_scroll_target = graph_scroll_target;
+        if let Some(cwd) = cwd_changed {
             self.persist_session();
+            crate::git::invalidate_git_info_cache(&cwd);
+            self.request_git_status_refresh(cwd, cx);
         }
 
         let (active_cwd, active_git, fallback_info) =
-            if let Some(active_tab) = self.tabs.get_mut(self.active_tab_idx) {
-                let now = std::time::Instant::now();
-                let should_poll = active_tab.git_checked_cwd.as_ref() != active_tab.cwd.as_ref()
-                    || active_tab.git_last_poll.is_none_or(|last| {
-                        now.duration_since(last) >= std::time::Duration::from_secs(2)
-                    });
-
-                if should_poll {
-                    active_tab.git_checked_cwd = active_tab.cwd.clone();
-                    active_tab.git_last_poll = Some(now);
-                    if let Some(ref cwd) = active_tab.cwd {
-                        active_tab.git_status = crate::git::fetch_git_info_cached(cwd);
-                    } else {
-                        active_tab.git_status = None;
-                    }
-                }
+            if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
                 let cwd_path = active_tab.cwd.as_deref();
-                let git = active_tab.git_status.as_ref();
+                let active_git = match crate::git::cached_git_info_state(cwd_path) {
+                    crate::git::CachedGitInfo::Available { info, stale } => {
+                        if stale {
+                            if let Some(cwd) = cwd_path {
+                                self.request_git_status_refresh(cwd.to_path_buf(), cx);
+                            }
+                        }
+                        Some(info)
+                    }
+                    crate::git::CachedGitInfo::CacheMiss => {
+                        if let Some(cwd) = cwd_path {
+                            self.request_git_status_refresh(cwd.to_path_buf(), cx);
+                        }
+                        None
+                    }
+                    crate::git::CachedGitInfo::NoRepository { stale }
+                    | crate::git::CachedGitInfo::FetchFailed { stale } => {
+                        if stale {
+                            if let Some(cwd) = cwd_path {
+                                self.request_git_status_refresh(cwd.to_path_buf(), cx);
+                            }
+                        }
+                        None
+                    }
+                    crate::git::CachedGitInfo::NoProject => None,
+                };
+                let git = active_git.as_ref();
                 let info = StatusInfo {
                     git_branch: git.map(|g| g.branch.clone()),
                     git_dirty: git.map(|g| g.unstaged > 0 || g.staged > 0).unwrap_or(false),
@@ -11001,7 +12483,7 @@ impl Render for RootView {
                     last_duration_ms: active_tab.last_duration_ms,
                     last_exit_code: active_tab.last_exit_code,
                 };
-                (cwd_path, git.cloned(), info)
+                (cwd_path, active_git, info)
             } else {
                 (None, None, StatusInfo::default())
             };
@@ -11016,7 +12498,9 @@ impl Render for RootView {
         let viewport_size = _window.viewport_size();
         let sidebar_w = self.current_sidebar_width();
         let ai_w = self.current_ai_sidebar_width();
-        let avail_w = (viewport_size.width.to_f64() as f32 - 1.0 - sidebar_w - ai_w).max(100.0);
+        let project_w = self.current_project_panel_width();
+        let avail_w =
+            (viewport_size.width.to_f64() as f32 - 1.0 - sidebar_w - ai_w - project_w).max(100.0);
         // Chrome layout constants — must match TabBar/StatusBar element heights
 
         const TAB_BAR_HEIGHT: f32 = 32.0;
@@ -11137,7 +12621,7 @@ impl Render for RootView {
                     .on_toggle_sidebar(cx.listener(|this, _ev, window, cx| {
                         this.toggle_tab_sidebar(window, cx);
                     }))
-                    .ai_sidebar_open(self.ai_sidebar_open)
+                    .ai_sidebar_open(self.right_panel == RightPanel::Ai)
                     .ai_response_unread(self.tabs.iter().any(|tab| {
                         self.ai_turn_completions.get(&tab.ai_conversation_id) == Some(&AiTurnCompletion::Unread)
                     }))
@@ -11425,9 +12909,80 @@ impl Render for RootView {
                         )
                     })
                     .when(
-                        self.ai_sidebar_open || self.ai_sidebar_anim_progress > 0.001,
+                        self.right_panel == RightPanel::Ai
+                            || (self.right_panel == RightPanel::Closed && self.ai_sidebar_anim_progress > 0.001),
                         |this| this.child(self.render_ai_sidebar(_window, cx)),
                     )
+                    .when(self.right_panel == RightPanel::Project, |this| {
+                        let active_tab = self.tabs.get(self.active_tab_idx);
+                        let cwd = active_tab.and_then(|tab| tab.cwd.as_deref());
+                        let snapshot = crate::git::cached_project_panel_snapshot(cwd);
+                        let graph_layout = cached_graph_layout(&snapshot.commits, &mut self.project_graph_layout);
+                        let confirmation = active_tab.and_then(|tab| self.project_panel_confirmation.as_ref()
+                            .filter(|confirmation| confirmation.matches(tab.id, tab.cwd.as_deref()))
+                            .map(|confirmation| confirmation.action.clone()));
+                        let feedback = active_tab.and_then(|tab| self.project_panel_feedback.as_ref()
+                            .filter(|feedback| feedback.matches(tab.id, tab.cwd.as_deref()))
+                            .map(|feedback| feedback.message.clone()));
+                        let project_entity = cx.entity();
+                        let confirm_entity = project_entity.clone();
+                        let menu_entity = project_entity.clone();
+                        let cancel_entity = project_entity.clone();
+                        let graph_entity = project_entity.clone();
+                        let project_width = self.current_project_panel_width();
+                        this.child(
+                            div().relative().w(px(project_width)).h_full().flex_shrink_0()
+                                .child(ProjectSidebar::new(theme, project_width, snapshot, self.project_panel_tab)
+                                .on_close(cx.listener(|this, _ev, window, cx| {
+                                    this.toggle_project_sidebar(window, cx);
+                                }))
+                                .on_select_changes(cx.listener(|this, _ev, _window, cx| {
+                                    this.project_panel_tab = ProjectPanelTab::Changes;
+                                    cx.notify();
+                                }))
+                                .on_select_graph(cx.listener(|this, _ev, _window, cx| {
+                                    this.project_panel_tab = ProjectPanelTab::Graph;
+                                    cx.notify();
+                                }))
+                                .actions(
+                                    self.project_panel_menu_open,
+                                    confirmation,
+                                    feedback,
+                                    move |action, _event, _window, app| {
+                                        let action = action.clone();
+                                        project_entity.update(app, |this, cx| this.handle_project_git_action(action, cx));
+                                    },
+                                    move |action, _event, _window, app| {
+                                        let action = action.clone();
+                                        confirm_entity.update(app, |this, cx| this.confirm_project_git_action(action, cx));
+                                    },
+                                    move |_event, _window, app| {
+                                        menu_entity.update(app, |this, cx| {
+                                            this.project_panel_menu_open = !this.project_panel_menu_open;
+                                            cx.notify();
+                                        });
+                                    },
+                                    move |_event, _window, app| {
+                                        cancel_entity.update(app, |this, cx| {
+                                            this.project_panel_confirmation = None;
+                                            cx.notify();
+                                        });
+                                    },
+                                )
+                                .graph_pagination(self.project_graph_scroll_handle.clone(), self.project_graph_rendered_range.clone(), move |offset, near_bottom, refresh_rows, _event, _window, app| {
+                                    graph_entity.update(app, |this, cx| {
+                                        if near_bottom { this.request_project_graph_page(offset, cx); }
+                                        if refresh_rows { cx.notify(); }
+                                    });
+                                })
+                                .graph_layout(graph_layout))
+                                .child(div().id("project-panel-resize-handle").absolute().left(px(-3.)).top_0().bottom_0().w(px(7.)).cursor(CursorStyle::ResizeColumn)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
+                                        this.is_dragging_project_panel = true;
+                                        cx.notify();
+                                    }))),
+                        )
+                    })
             )
             .child(
 
@@ -11440,6 +12995,9 @@ impl Render for RootView {
                                 cx.notify();
                             }
                         }
+                    }))
+                    .on_toggle_project_panel(self.right_panel == RightPanel::Project, cx.listener(|this, _ev, window, cx| {
+                        this.toggle_project_sidebar(window, cx);
                     }))
             )
             .when(self.any_root_menu_open(), |this| {
@@ -15529,6 +17087,7 @@ impl Render for RootView {
             })
             .when(self.pending_close.is_some(), |this| {
                 let pending = self.pending_close.clone().unwrap();
+                let close_failure = pending.failure.clone();
                 let process_names: Vec<String> = pending
                     .running_processes
                     .iter()
@@ -15629,6 +17188,17 @@ impl Render for RootView {
                                         .text_color(theme.foreground)
                                         .child(desc),
                                 )
+                                .when_some(close_failure.clone(), |this, failure| {
+                                    this.child(
+                                        div()
+                                            .rounded(px(5.))
+                                            .bg(gpui::Hsla { a: 0.12, ..theme.red })
+                                            .p(px(8.))
+                                            .text_size(px(11.))
+                                            .text_color(theme.red)
+                                            .child(format!("Close failed: {failure}")),
+                                    )
+                                })
                                 .child(
                                     div()
                                         .flex()
@@ -15688,7 +17258,7 @@ impl Render for RootView {
                                                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, window, cx| {
                                                     this.confirm_pending_close(window, cx);
                                                 }))
-                                                .child("Terminate & Close"),
+                                                .child(if pending.failure.is_some() { "Retry Close" } else { "Terminate & Close" }),
                                         ),
                                 ),
                         ),
@@ -17102,8 +18672,8 @@ mod ligature_tests {
     // rendered as `Tool {"cwd":"/Users/kagesyntax/Do...`.
     mod hosted_agent_tool_rows {
     use crate::ui::ai_sidebar::{
-        humanize_tool_name, parse_tool_row, tool_label, tool_name_from_title, tool_subject,
-        AiUiToolCall,
+            AiUiToolCall, humanize_tool_name, parse_tool_row, tool_label, tool_name_from_title,
+            tool_subject,
     };
 
     /// OpenCode's ACP layer emits `title: input.command ?? state.title ??
@@ -17114,10 +18684,7 @@ mod ligature_tests {
 /// `fastty_fastty_split_pane`.
 #[test]
     fn repeated_server_prefix_is_collapsed() {
-        assert_eq!(
-            humanize_tool_name("fastty_fastty_split_pane"),
-            "Split Pane"
-        );
+            assert_eq!(humanize_tool_name("fastty_fastty_split_pane"), "Split Pane");
         assert_eq!(
             humanize_tool_name("fastty_fastty_write_session"),
             "Write Session"
@@ -17143,7 +18710,10 @@ mod ligature_tests {
         // A long path gets break opportunities but reads identically.
         let path = "/Users/kagesyntax/Documents/window/src/main.rs";
         let wrapped = soft_wrap(path);
-        assert!(wrapped.contains('\u{200B}'), "expected break points: {wrapped:?}");
+            assert!(
+                wrapped.contains('\u{200B}'),
+                "expected break points: {wrapped:?}"
+            );
         assert_eq!(wrapped.replace('\u{200B}', ""), path);
         // Already-short text is left readable.
         assert_eq!(soft_wrap("done"), "done");
@@ -17163,7 +18733,10 @@ mod ligature_tests {
             "hello"
         );
         assert_eq!(extract_output_text(r#"{"output":"done"}"#), "done");
-        assert_eq!(extract_output_text(r#"{"error":"boom"}"#), r#"{"error":"boom"}"#);
+            assert_eq!(
+                extract_output_text(r#"{"error":"boom"}"#),
+                r#"{"error":"boom"}"#
+            );
         assert_eq!(extract_output_text(""), "");
     }
 
@@ -17181,10 +18754,7 @@ mod ligature_tests {
     #[test]
     fn acp_prose_titles_yield_the_tool_not_the_sentence() {
         assert_eq!(tool_name_from_title("Read src/main.rs", "read"), "Read");
-        assert_eq!(
-            tool_name_from_title("Fasty Fasty Run Command", ""),
-            "Fasty"
-        );
+            assert_eq!(tool_name_from_title("Fasty Fasty Run Command", ""), "Fasty");
         assert_eq!(tool_name_from_title("Webfetch", "fetch"), "Webfetch");
         // No verb to lead with: fall back to the protocol's own `kind`.
         assert_eq!(tool_name_from_title("src/main.rs", "read"), "Read");

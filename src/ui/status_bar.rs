@@ -110,6 +110,7 @@ pub struct StatusInfo {
 }
 
 pub type GitContextCallback = Arc<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>;
+pub type ProjectToggleCallback = Arc<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>;
 
 #[derive(IntoElement)]
 pub struct StatusBar {
@@ -118,6 +119,8 @@ pub struct StatusBar {
     fallback_info: StatusInfo,
     theme: Theme,
     on_git_context_menu: Option<GitContextCallback>,
+    project_panel_open: bool,
+    on_toggle_project_panel: Option<ProjectToggleCallback>,
 }
 
 impl StatusBar {
@@ -133,6 +136,8 @@ impl StatusBar {
             fallback_info,
             theme,
             on_git_context_menu: None,
+            project_panel_open: false,
+            on_toggle_project_panel: None,
         }
     }
 
@@ -143,12 +148,24 @@ impl StatusBar {
         self.on_git_context_menu = Some(Arc::new(handler));
         self
     }
+
+    pub fn on_toggle_project_panel(
+        mut self,
+        open: bool,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.project_panel_open = open;
+        self.on_toggle_project_panel = Some(Arc::new(handler));
+        self
+    }
 }
 
 impl RenderOnce for StatusBar {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let theme = self.theme;
         let git_menu_cb = self.on_git_context_menu.clone();
+        let project_panel_open = self.project_panel_open;
+        let project_toggle_cb = self.on_toggle_project_panel.clone();
 
         let has_widgets = !self.left_segments.is_empty() || !self.right_segments.is_empty();
 
@@ -347,7 +364,30 @@ impl RenderOnce for StatusBar {
                     .flex_row()
                     .items_center()
                     .gap_3()
-                    .children(right_children),
+                    .children(right_children)
+                    .child(
+                        div()
+                            .id("project-panel-bottom-toggle")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(20.))
+                            .h(px(20.))
+                            .cursor(gpui::CursorStyle::PointingHand)
+                            .when_some(project_toggle_cb, |button, on_toggle| {
+                                button.on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    move |event, window, cx| {
+                                        on_toggle(event, window, cx);
+                                    },
+                                )
+                            })
+                            .child(super::icons::render_icon(
+                                icons::common::IconType::Folder,
+                                if project_panel_open { theme.accent } else { theme.muted_strong },
+                                12.0,
+                            )),
+                    ),
             )
     }
 }
