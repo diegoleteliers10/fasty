@@ -205,6 +205,8 @@ pub enum Request {
     List,
     /// Check whether a session ID is registered without creating a default session.
     SessionExists { id: PaneId },
+    /// Get the live process state for a registered terminal session.
+    SessionStatus { id: PaneId },
     /// Push-updated session list: an initial `sessions` event with everything
     /// currently registered, followed by `session_added` / `session_removed`
     /// / `session_updated` as the registry changes, for as long as this
@@ -372,6 +374,10 @@ pub enum Response {
         sessions: Vec<SessionInfo>,
     },
     SessionExists { exists: bool },
+    SessionStatus {
+        alive: bool,
+        process_running: bool,
+    },
     /// A session appeared (new tab/split) while `subscribe_sessions` was
     /// active on this connection.
     SessionAdded {
@@ -677,6 +683,29 @@ mod unix_impl {
             Request::SessionExists { id } => {
                 let exists = registry().lock().contains_key(&id);
                 send(&conn.out, &Response::SessionExists { exists });
+            }
+            Request::SessionStatus { id } => {
+                let terminal = registry().lock().get(&id).map(|entry| Arc::clone(&entry.terminal));
+                match terminal {
+                    Some(terminal) => {
+                        send(
+                            &conn.out,
+                            &Response::SessionStatus {
+                                alive: terminal.is_alive(),
+                                process_running: terminal.is_process_running(),
+                            },
+                        );
+                    }
+                    None => {
+                        send(
+                            &conn.out,
+                            &Response::Error {
+                                code: "no_such_session".to_string(),
+                                message: "no such session".to_string(),
+                            },
+                        );
+                    }
+                }
             }
             Request::Attach { id, mode } => {
                 let terminal = registry().lock().get(&id).map(|e| Arc::clone(&e.terminal));
@@ -1260,6 +1289,7 @@ mod tests {
             Request::Hello { read_only: false },
             Request::Hello { read_only: true },
             Request::List,
+            Request::SessionStatus { id: 42 },
             Request::SubscribeSessions,
             Request::Attach {
                 id: 42,
@@ -1315,6 +1345,9 @@ mod tests {
                     assert_eq!(a, b);
                 }
                 (Request::List, Request::List) => {}
+                (Request::SessionStatus { id: a }, Request::SessionStatus { id: b }) => {
+                    assert_eq!(a, b);
+                }
                 (Request::SubscribeSessions, Request::SubscribeSessions) => {}
                 (Request::Attach { id: a, mode: m1 }, Request::Attach { id: b, mode: m2 }) => {
                     assert_eq!(a, b);
@@ -1442,6 +1475,14 @@ mod tests {
 
     #[test]
     fn test_response_serialization() {
+        let status = Response::SessionStatus {
+            alive: true,
+            process_running: false,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["event"], "session_status");
+        assert_eq!(json["process_running"], false);
+
         let res = Response::Attached {
             id: 1,
             cols: 80,

@@ -94,6 +94,27 @@ impl RemoteControl {
     pub fn stop(&self) {}
 }
 
+#[cfg(unix)]
+pub fn session_process_running(id: usize) -> Result<bool, String> {
+    use std::os::unix::net::UnixStream;
+
+    ensure_running()?;
+    let mut stream = UnixStream::connect(crate::daemon::socket_path())
+        .map_err(|error| error.to_string())?;
+    write_request(&mut stream, &Request::SessionStatus { id })
+        .map_err(|error| error.to_string())?;
+    match read_response(&mut BufReader::new(stream))? {
+        Response::SessionStatus { process_running, .. } => Ok(process_running),
+        Response::Error { code, message } => Err(format!("{code}: {message}")),
+        other => Err(format!("unexpected session status response: {other:?}")),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn session_process_running(_id: usize) -> Result<bool, String> {
+    Ok(false)
+}
+
 #[cfg(not(unix))]
 impl Write for RemoteControl {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -740,6 +761,29 @@ mod tests {
         assert!(!session_exists(usize::MAX).expect("query missing session"));
         assert!(!session_exists(usize::MAX).expect("query registry after missing ID"));
 
+        let idle_projection = crate::terminal_state::TerminalState::new_hosted(
+            "/bin/sh",
+            &[],
+            None,
+            2_000,
+            crate::config::FontConfig::default(),
+            10.0,
+            20.0,
+            800.0,
+            480.0,
+            crate::event_listener::EventSender::None,
+        )
+        .expect("spawn idle hosted shell");
+        let idle_session_id = idle_projection
+            .remote_session_id()
+            .expect("idle terminal has a host session id");
+        assert!(!idle_projection.needs_close_confirmation());
+        attach(idle_session_id)
+            .expect("attach to idle hosted shell")
+            .control
+            .stop();
+        drop(idle_projection);
+
         let args = vec![
             "-c".to_string(),
             "sleep 1; printf 'output-after-detach-marker\\n'; sleep 30".to_string(),
@@ -760,6 +804,12 @@ mod tests {
         let session_id = projection
             .remote_session_id()
             .expect("hosted terminal has a host session id");
+        let process_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !session_process_running(session_id).unwrap_or(false)
+            && std::time::Instant::now() < process_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         assert!(
             projection.needs_close_confirmation(),
             "an active hosted shell keeps the close confirmation"

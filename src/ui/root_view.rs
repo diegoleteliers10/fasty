@@ -268,8 +268,10 @@ fn unavailable_terminal_pane(
 
 fn pane_close_info(pane: &crate::pane_tree::TerminalPane) -> Option<RunningProcessInfo> {
     let terminal = pane.terminal.as_ref();
-    let requires_confirmation = pane.host_session_id.is_some()
-        || terminal.is_some_and(|terminal| terminal.needs_close_confirmation());
+    let requires_confirmation = should_confirm_pane_close(
+        terminal.map(|terminal| terminal.needs_close_confirmation()),
+        pane.host_session_id.is_some() && terminal.is_none(),
+    );
     requires_confirmation.then(|| RunningProcessInfo {
         pane_id: pane.id,
         process_name: terminal
@@ -279,6 +281,13 @@ fn pane_close_info(pane: &crate::pane_tree::TerminalPane) -> Option<RunningProce
             .and_then(|terminal| terminal.shell_pid())
             .unwrap_or(0),
     })
+}
+
+fn should_confirm_pane_close(
+    terminal_has_process: Option<bool>,
+    hosted_session_unavailable: bool,
+) -> bool {
+    terminal_has_process.unwrap_or(hosted_session_unavailable)
 }
 
 fn stop_host_session(session_id: usize) -> Result<(), String> {
@@ -450,6 +459,14 @@ mod host_restore_tests {
             Some(7)
         );
         assert!(pane_close_info(&ordinary_placeholder).is_none());
+    }
+
+    #[test]
+    fn restored_idle_host_session_does_not_require_close_confirmation() {
+        assert!(!should_confirm_pane_close(Some(false), false));
+        assert!(should_confirm_pane_close(Some(true), false));
+        assert!(should_confirm_pane_close(None, true));
+        assert!(!should_confirm_pane_close(None, false));
     }
 
     #[test]

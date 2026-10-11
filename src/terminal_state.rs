@@ -51,7 +51,7 @@ mod dws_regression_tests {
     use std::sync::Arc;
 
     #[test]
-    fn active_hosted_terminal_requires_close_confirmation() {
+    fn hosted_terminal_confirmation_tracks_foreground_process() {
         assert!(super::remote_session_needs_close_confirmation(
             Some(7),
             true
@@ -371,9 +371,42 @@ impl OutputHub {
 
 fn remote_session_needs_close_confirmation(
     remote_session_id: Option<usize>,
-    is_alive: bool,
+    has_foreground_process: bool,
 ) -> bool {
-    remote_session_id.is_some() && is_alive
+    remote_session_id.is_some() && has_foreground_process
+}
+
+fn append_restored_terminal_modes(
+    out: &mut Vec<u8>,
+    mode: alacritty_terminal::term::TermMode,
+) {
+    use alacritty_terminal::term::TermMode;
+
+    if mode.contains(TermMode::APP_CURSOR) {
+        out.extend_from_slice(b"\x1b[?1h");
+    }
+    if mode.contains(TermMode::APP_KEYPAD) {
+        out.extend_from_slice(b"\x1b=");
+    }
+    if !mode.contains(TermMode::SHOW_CURSOR) {
+        out.extend_from_slice(b"\x1b[?25l");
+    }
+    if mode.contains(TermMode::MOUSE_MOTION) {
+        out.extend_from_slice(b"\x1b[?1003h");
+    } else if mode.contains(TermMode::MOUSE_DRAG) {
+        out.extend_from_slice(b"\x1b[?1002h");
+    } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+        out.extend_from_slice(b"\x1b[?1000h");
+    }
+    if mode.contains(TermMode::SGR_MOUSE) {
+        out.extend_from_slice(b"\x1b[?1006h");
+    }
+    if mode.contains(TermMode::FOCUS_IN_OUT) {
+        out.extend_from_slice(b"\x1b[?1004h");
+    }
+    if mode.contains(TermMode::BRACKETED_PASTE) {
+        out.extend_from_slice(b"\x1b[?2004h");
+    }
 }
 
 #[cfg(unix)]
@@ -1443,8 +1476,10 @@ impl TerminalState {
     }
 
     pub fn needs_close_confirmation(&self) -> bool {
-        if self.remote_session_id.is_some() {
-            remote_session_needs_close_confirmation(self.remote_session_id, self.is_alive())
+        if let Some(session_id) = self.remote_session_id {
+            let has_foreground_process = crate::session_host::session_process_running(session_id)
+                .unwrap_or(true);
+            remote_session_needs_close_confirmation(Some(session_id), has_foreground_process)
         } else {
             self.is_process_running()
         }
@@ -2191,8 +2226,12 @@ impl TerminalState {
         let grid = term.grid();
         let screen_lines = grid.screen_lines();
         let cols = grid.columns();
+        let mode = *term.mode();
 
         let mut out = Vec::new();
+        if mode.contains(alacritty_terminal::term::TermMode::ALT_SCREEN) {
+            out.extend_from_slice(b"\x1b[?1049h");
+        }
         out.extend_from_slice(b"\x1b[0m\x1b[2J\x1b[H");
 
         let mut cur_fg: Option<AnsiColor> = None;
@@ -2262,6 +2301,8 @@ impl TerminalState {
         let cursor_line = grid.cursor.point.line.0;
         let cursor_col = grid.cursor.point.column.0;
         out.extend(format!("\x1b[{};{}H", (cursor_line + 1).max(1), cursor_col + 1).bytes());
+
+        append_restored_terminal_modes(&mut out, mode);
         out
     }
 
@@ -3662,9 +3703,33 @@ mod tests {
         let mut parser: Processor = Processor::new();
 
         // Enable mouse tracking
-        parser.advance(&mut term, b"\x1b[?1000h\x1b[?1006h");
+        parser.advance(
+            &mut term,
+            b"\x1b[?1049h\x1b[?1h\x1b=\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[?2004h",
+        );
         assert!(term.mode().contains(TermMode::MOUSE_REPORT_CLICK));
         assert!(term.mode().contains(TermMode::SGR_MOUSE));
+        assert!(term.mode().contains(TermMode::APP_CURSOR));
+        assert!(term.mode().contains(TermMode::APP_KEYPAD));
+        assert!(term.mode().contains(TermMode::FOCUS_IN_OUT));
+        assert!(term.mode().contains(TermMode::BRACKETED_PASTE));
+        assert!(term.mode().contains(TermMode::ALT_SCREEN));
+        assert!(!term.mode().contains(TermMode::SHOW_CURSOR));
+
+        let mut restored: Term<VoidListener> = Term::new(Config::default(), &size, VoidListener);
+        let mut snapshot_modes = Vec::new();
+        snapshot_modes.extend_from_slice(b"\x1b[?1049h");
+        append_restored_terminal_modes(&mut snapshot_modes, *term.mode());
+        let mut restored_parser: Processor = Processor::new();
+        restored_parser.advance(&mut restored, &snapshot_modes);
+        assert!(restored.mode().contains(TermMode::MOUSE_REPORT_CLICK));
+        assert!(restored.mode().contains(TermMode::SGR_MOUSE));
+        assert!(restored.mode().contains(TermMode::APP_CURSOR));
+        assert!(restored.mode().contains(TermMode::APP_KEYPAD));
+        assert!(restored.mode().contains(TermMode::FOCUS_IN_OUT));
+        assert!(restored.mode().contains(TermMode::BRACKETED_PASTE));
+        assert!(restored.mode().contains(TermMode::ALT_SCREEN));
+        assert!(!restored.mode().contains(TermMode::SHOW_CURSOR));
 
         // Reset mouse tracking
         parser.advance(&mut term, b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");

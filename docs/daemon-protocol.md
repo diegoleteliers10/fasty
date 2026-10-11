@@ -29,6 +29,7 @@ Un objeto JSON por línea (`\n`-terminated) en ambas direcciones.
 {"cmd": "hello"}
 {"cmd": "hello", "read_only": true}
 {"cmd": "list"}
+{"cmd": "session_status", "id": 1}
 {"cmd": "subscribe_sessions"}
 {"cmd": "attach", "id": 1}
 {"cmd": "attach", "id": 1, "mode": "read_only"}
@@ -44,6 +45,10 @@ Un objeto JSON por línea (`\n`-terminated) en ambas direcciones.
 {"cmd": "layout"}
 {"cmd": "resize_window", "cols": 120, "rows": 40}
 ```
+
+`session_status` returns whether the shell is alive and whether it has a
+foreground child process. Fastty uses this data to tell an idle shell from an
+active command before it asks to close a restored session.
 
 - `id` es el `PaneId` de fastty (un `usize`, único por proceso — cada split
   cuenta como su propia sesión, no solo cada tab).
@@ -83,6 +88,7 @@ Un objeto JSON por línea (`\n`-terminated) en ambas direcciones.
 {"event": "sessions", "sessions": [
   {"id": 1, "title": "zsh", "cwd": "/Users/you", "cols": 89, "rows": 32, "alive": true, "history_size": 0}
 ]}
+{"event": "session_status", "alive": true, "process_running": false}
 {"event": "session_added", "session": {"id": 2, "title": "zsh", "cwd": "/tmp", "cols": 89, "rows": 32, "alive": true, "history_size": 0}}
 {"event": "session_removed", "id": 2}
 {"event": "session_updated", "session": {"id": 1, "title": "vim", "cwd": "/Users/you", "cols": 89, "rows": 32, "alive": true, "history_size": 120}}
