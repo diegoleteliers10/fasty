@@ -3848,21 +3848,28 @@ impl RootView {
         let Some(selection) = self.get_selected_text_for_pane(pane_id) else {
             return;
         };
-        let Some(terminal) = self
+        let Some((terminal, pane_cwd, tab_cwd)) = self
             .tabs
             .get(self.active_tab_idx)
-            .and_then(|tab| tab.pane_tree.find_pane(pane_id))
-            .and_then(|pane| pane.terminal.as_ref())
+            .and_then(|tab| {
+                let pane = tab.pane_tree.find_pane(pane_id)?;
+                Some((
+                    pane.terminal.as_ref()?,
+                    pane.cwd.clone(),
+                    tab.cwd.clone(),
+                ))
+            })
         else {
             return;
         };
         if !terminal.is_alive() || selection.len() > 16 * 1024 {
             return;
         }
-        let cwd = terminal
-            .get_current_working_directory()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unknown".to_string());
+        let cwd = terminal_context_cwd(
+            terminal.get_current_working_directory(),
+            pane_cwd.as_deref(),
+            tab_cwd.as_deref(),
+        );
         let command = terminal
             .get_foreground_process_command()
             .unwrap_or_else(|| "terminal".to_string());
@@ -17634,6 +17641,18 @@ fn format_terminal_context(selection: &str, cwd: &str, command: &str) -> String 
     )
 }
 
+fn terminal_context_cwd(
+    process_cwd: Option<std::path::PathBuf>,
+    pane_cwd: Option<&std::path::Path>,
+    tab_cwd: Option<&std::path::Path>,
+) -> String {
+    process_cwd
+        .or_else(|| pane_cwd.map(std::path::Path::to_path_buf))
+        .or_else(|| tab_cwd.map(std::path::Path::to_path_buf))
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn append_terminal_context(draft: &str, attachment: &str) -> String {
     if draft.trim().is_empty() {
         attachment.to_string()
@@ -17740,6 +17759,26 @@ mod tests {
         assert!(context.contains("Directorio: `/work/repo`"));
         assert!(context.contains("Comando: \"cargo test\""));
         assert!(context.contains("line one\nline two"));
+    }
+
+    #[test]
+    fn terminal_context_uses_saved_pane_directory_when_host_process_is_remote() {
+        let cwd = terminal_context_cwd(
+            None,
+            Some(std::path::Path::new("/work/project")),
+            Some(std::path::Path::new("/work")),
+        );
+        assert_eq!(cwd, "/work/project");
+    }
+
+    #[test]
+    fn terminal_context_uses_tab_directory_when_pane_directory_is_missing() {
+        let cwd = terminal_context_cwd(
+            None,
+            None,
+            Some(std::path::Path::new("/work/project")),
+        );
+        assert_eq!(cwd, "/work/project");
     }
 
     #[test]
