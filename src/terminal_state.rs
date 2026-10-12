@@ -65,6 +65,16 @@ mod dws_regression_tests {
 
     #[cfg(unix)]
     #[test]
+    fn idle_shell_process_group_does_not_require_close_confirmation() {
+        assert!(!super::foreground_process_state(41, 41, false));
+        assert!(super::foreground_process_state(41, 41, true));
+        assert!(super::foreground_process_state(41, 42, false));
+        assert!(super::foreground_process_state(-1, 41, false));
+        assert!(super::foreground_process_state(41, -1, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn only_no_such_session_allows_restore_fallback() {
         assert!(super::is_missing_host_session_error(
             "no_such_session: session ID 12 not found"
@@ -376,6 +386,18 @@ fn remote_session_needs_close_confirmation(
     remote_session_id.is_some() && has_foreground_process
 }
 
+#[cfg(unix)]
+fn foreground_process_state(
+    shell_pgid: libc::pid_t,
+    foreground_pgid: libc::pid_t,
+    has_foreground_child: bool,
+) -> bool {
+    match (shell_pgid > 0, foreground_pgid > 0) {
+        (true, true) => shell_pgid != foreground_pgid || has_foreground_child,
+        _ => true,
+    }
+}
+
 fn append_restored_terminal_modes(
     out: &mut Vec<u8>,
     mode: alacritty_terminal::term::TermMode,
@@ -407,6 +429,11 @@ fn append_restored_terminal_modes(
     if mode.contains(TermMode::BRACKETED_PASTE) {
         out.extend_from_slice(b"\x1b[?2004h");
     }
+}
+
+#[cfg(unix)]
+fn append_legacy_mouse_modes(out: &mut Vec<u8>) {
+    out.extend_from_slice(b"\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h");
 }
 
 #[cfg(unix)]
@@ -1396,7 +1423,11 @@ impl TerminalState {
 
         #[cfg(unix)]
         if let (Some(remote), Some(mut output_sink)) = (remote, remote_output) {
-            let _ = output_sink.write_all(&remote.snapshot);
+            let mut snapshot = remote.snapshot;
+            if remote.restore_legacy_mouse_modes {
+                append_legacy_mouse_modes(&mut snapshot);
+            }
+            let _ = output_sink.write_all(&snapshot);
             thread::spawn(move || {
                 let mut reader = remote.reader;
                 loop {
@@ -1517,19 +1548,34 @@ impl TerminalState {
 
     pub fn is_process_running(&self) -> bool {
         let Some(pid) = self.shell_pid else { return false; };
-        #[cfg(target_os = "macos")]
-        {
-            has_active_child_process_macos(pid)
+        if !self.alive.load(Ordering::Relaxed) {
+            return false;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
-            has_active_child_process_linux(pid)
+            let master = self.master.lock();
+            let Some(fd) = master.as_raw_fd() else {
+                return true;
+            };
+            let foreground_pgid = unsafe { libc::tcgetpgrp(fd) };
+            let has_foreground_child = if foreground_pgid > 0 {
+                #[cfg(target_os = "macos")]
+                { has_active_child_macos(pid, foreground_pgid) }
+                #[cfg(target_os = "linux")]
+                { has_active_child_linux(pid, foreground_pgid) }
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                { false }
+            } else {
+                false
+            };
+            foreground_process_state(
+                unsafe { libc::getpgid(pid as libc::pid_t) },
+                foreground_pgid,
+                has_foreground_child,
+            )
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            let _ = pid;
-            false
-        }
+        #[cfg(not(unix))]
+        { let _ = pid; false }
     }
 
     pub fn terminate_process(&self) {
@@ -3272,7 +3318,7 @@ fn get_foreground_process_name_macos(shell_pid: u32) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn has_active_child_process_macos(shell_pid: u32) -> bool {
+fn has_active_child_macos(shell_pid: u32, foreground_pgid: libc::pid_t) -> bool {
     use std::os::raw::{c_int, c_uint, c_void};
 
     extern "C" {
@@ -3298,7 +3344,10 @@ fn has_active_child_process_macos(shell_pid: u32) -> bool {
         let count = (res as usize) / std::mem::size_of::<i32>();
         for &p in &pids[..count] {
             if p > 0 && p != (shell_pid as i32) {
-                return true;
+                let child_pgid = unsafe { libc::getpgid(p) };
+                if child_pgid == foreground_pgid {
+                    return true;
+                }
             }
         }
     }
@@ -3338,9 +3387,12 @@ fn get_foreground_process_name_linux(shell_pid: u32) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn has_active_child_process_linux(shell_pid: u32) -> bool {
+fn has_active_child_linux(shell_pid: u32, foreground_pgid: libc::pid_t) -> bool {
     if let Ok(content) = std::fs::read_to_string(format!("/proc/{}/task/{}/children", shell_pid, shell_pid)) {
-        return !content.trim().is_empty();
+        return content
+            .split_whitespace()
+            .filter_map(|value| value.parse::<libc::pid_t>().ok())
+            .any(|child_pid| unsafe { libc::getpgid(child_pid) } == foreground_pgid);
     }
     false
 }
@@ -3373,10 +3425,11 @@ mod tests {
             .spawn()
             .expect("failed to spawn sleep");
         let parent_pid = std::process::id();
+        let foreground_pgid = unsafe { libc::getpgid(child.id() as libc::pid_t) };
         #[cfg(target_os = "macos")]
-        {
-            assert!(has_active_child_process_macos(parent_pid));
-        }
+        assert!(has_active_child_macos(parent_pid, foreground_pgid));
+        #[cfg(target_os = "linux")]
+        assert!(has_active_child_linux(parent_pid, foreground_pgid));
         let _ = child.kill();
     }
 
@@ -3737,6 +3790,27 @@ mod tests {
         assert!(!term.mode().contains(TermMode::SGR_MOUSE));
         assert!(!term.mode().contains(TermMode::MOUSE_MOTION));
         assert!(!term.mode().contains(TermMode::MOUSE_DRAG));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_active_session_seed_restores_local_mouse_and_focus_modes() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::test::TermSize;
+        use alacritty_terminal::term::{Config, Term, TermMode};
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let mut terminal: Term<VoidListener> =
+            Term::new(Config::default(), &TermSize::new(80, 24), VoidListener);
+        let mut parser: Processor = Processor::new();
+        let mut modes = Vec::new();
+        append_legacy_mouse_modes(&mut modes);
+        parser.advance(&mut terminal, &modes);
+
+        assert!(terminal.mode().contains(TermMode::MOUSE_MOTION));
+        assert!(terminal.mode().contains(TermMode::SGR_MOUSE));
+        assert!(terminal.mode().contains(TermMode::FOCUS_IN_OUT));
+        assert!(terminal.mode().contains(TermMode::BRACKETED_PASTE));
     }
 
     #[test]

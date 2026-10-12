@@ -57,6 +57,7 @@ pub fn run_host() {
 pub struct RemoteSession {
     pub id: usize,
     pub snapshot: Vec<u8>,
+    pub restore_legacy_mouse_modes: bool,
     pub reader: BufReader<std::os::unix::net::UnixStream>,
     pub control: std::sync::Arc<RemoteControl>,
 }
@@ -65,6 +66,7 @@ pub struct RemoteSession {
 pub struct RemoteSession {
     pub id: usize,
     pub snapshot: Vec<u8>,
+    pub restore_legacy_mouse_modes: bool,
     pub control: std::sync::Arc<RemoteControl>,
 }
 
@@ -105,6 +107,11 @@ pub fn session_process_running(id: usize) -> Result<bool, String> {
         .map_err(|error| error.to_string())?;
     match read_response(&mut BufReader::new(stream))? {
         Response::SessionStatus { process_running, .. } => Ok(process_running),
+        Response::Error { code, .. } if code == "bad_request" => {
+            let session = legacy_session_info(id)?;
+            legacy_session_process_running(&session)
+                .ok_or_else(|| "legacy host returned an unknown process name".to_string())
+        }
         Response::Error { code, message } => Err(format!("{code}: {message}")),
         other => Err(format!("unexpected session status response: {other:?}")),
     }
@@ -260,6 +267,7 @@ pub fn spawn_attached(
     Ok(RemoteSession {
         id,
         snapshot,
+        restore_legacy_mouse_modes: false,
         reader,
         control: std::sync::Arc::new(RemoteControl {
             id,
@@ -274,6 +282,15 @@ pub fn attach(id: usize) -> Result<RemoteSession, String> {
     use std::os::unix::net::UnixStream;
 
     ensure_running()?;
+    let restore_legacy_mouse_modes = match query_session_status(id)? {
+        Response::SessionStatus { .. } => false,
+        Response::Error { code, .. } if code == "bad_request" => {
+            legacy_session_info(id)
+                .map(|session| legacy_session_needs_mouse_modes(&session))?
+        }
+        Response::Error { code, message } => return Err(format!("{code}: {message}")),
+        other => return Err(format!("unexpected session status response: {other:?}")),
+    };
     let mut stream =
         UnixStream::connect(crate::daemon::socket_path()).map_err(|error| error.to_string())?;
     write_request(
@@ -300,6 +317,7 @@ pub fn attach(id: usize) -> Result<RemoteSession, String> {
     Ok(RemoteSession {
         id,
         snapshot,
+        restore_legacy_mouse_modes,
         reader,
         control: std::sync::Arc::new(RemoteControl {
             id,
@@ -307,6 +325,47 @@ pub fn attach(id: usize) -> Result<RemoteSession, String> {
             closed: std::sync::atomic::AtomicBool::new(false),
         }),
     })
+}
+
+#[cfg(unix)]
+fn query_session_status(id: usize) -> Result<Response, String> {
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(crate::daemon::socket_path())
+        .map_err(|error| error.to_string())?;
+    write_request(&mut stream, &Request::SessionStatus { id })
+        .map_err(|error| error.to_string())?;
+    read_response(&mut BufReader::new(stream))
+}
+
+#[cfg(unix)]
+fn legacy_session_info(id: usize) -> Result<SessionInfo, String> {
+    list_sessions()?
+        .into_iter()
+        .find(|session| session.id == id)
+        .ok_or_else(|| format!("no_such_session: session ID {id} not found"))
+}
+
+fn legacy_session_process_running(session: &SessionInfo) -> Option<bool> {
+    if !session.alive {
+        return Some(false);
+    }
+    let process_name = session.title.trim().rsplit('/').next()?.to_ascii_lowercase();
+    if process_name.is_empty() {
+        return None;
+    }
+    if matches!(
+        process_name.as_str(),
+        "shell" | "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "csh" | "tcsh"
+    ) {
+        return None;
+    }
+    Some(true)
+}
+
+fn legacy_session_needs_mouse_modes(session: &SessionInfo) -> bool {
+    let process_name = session.title.trim().rsplit('/').next().unwrap_or_default().to_ascii_lowercase();
+    matches!(process_name.as_str(), "claude" | "opencode" | "agy" | "pi" | "codex")
 }
 
 #[cfg(unix)]
@@ -376,6 +435,29 @@ mod tests {
     use super::*;
     use std::io::BufRead;
     use std::os::unix::net::UnixStream;
+
+    fn legacy_session(title: &str, alive: bool) -> SessionInfo {
+        SessionInfo {
+            id: 7,
+            title: title.to_string(),
+            cwd: None,
+            cols: 80,
+            rows: 24,
+            alive,
+            history_size: 0,
+        }
+    }
+
+    #[test]
+    fn legacy_host_list_identifies_idle_shell_and_running_agent() {
+        assert_eq!(legacy_session_process_running(&legacy_session("zsh", true)), None);
+        assert_eq!(legacy_session_process_running(&legacy_session("opencode", true)), Some(true));
+        assert_eq!(legacy_session_process_running(&legacy_session("zsh", false)), Some(false));
+        assert_eq!(legacy_session_process_running(&legacy_session("", true)), None);
+        assert_eq!(legacy_session_process_running(&legacy_session("shell", true)), None);
+        assert!(legacy_session_needs_mouse_modes(&legacy_session("claude", true)));
+        assert!(!legacy_session_needs_mouse_modes(&legacy_session("zsh", true)));
+    }
 
     #[test]
     fn remote_input_uses_the_existing_write_request_shape() {
