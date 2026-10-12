@@ -6,6 +6,7 @@ pub struct TextInputState {
     pub cursor: usize, // Character offset (0..=char_count)
     pub selection: Option<(usize, usize)>, // (start, end) where start < end
     pub drag_anchor: Option<usize>,
+    preferred_column: Option<usize>,
     pub last_bounds: Option<gpui::Bounds<gpui::Pixels>>,
 }
 
@@ -17,6 +18,7 @@ impl TextInputState {
             cursor,
             selection: None,
             drag_anchor: None,
+            preferred_column: None,
             last_bounds: None,
         }
     }
@@ -30,6 +32,7 @@ impl TextInputState {
         self.cursor = self.cursor.min(self.char_count());
         self.selection = None;
         self.drag_anchor = None;
+        self.preferred_column = None;
     }
 
     pub fn clear(&mut self) {
@@ -37,6 +40,7 @@ impl TextInputState {
         self.cursor = 0;
         self.selection = None;
         self.drag_anchor = None;
+        self.preferred_column = None;
     }
 
     pub fn set_text_with_cursor(&mut self, text: impl Into<String>, cursor: usize) {
@@ -44,12 +48,14 @@ impl TextInputState {
         self.cursor = cursor.min(self.char_count());
         self.selection = None;
         self.drag_anchor = None;
+        self.preferred_column = None;
     }
 
     pub fn set_cursor(&mut self, idx: usize) {
         self.cursor = idx.min(self.char_count());
         self.selection = None;
         self.drag_anchor = None;
+        self.preferred_column = None;
     }
 
     pub fn start_drag(&mut self, idx: usize) {
@@ -57,6 +63,7 @@ impl TextInputState {
         self.cursor = clamped;
         self.drag_anchor = Some(clamped);
         self.selection = None;
+        self.preferred_column = None;
     }
 
     pub fn update_drag(&mut self, idx: usize) {
@@ -73,6 +80,7 @@ impl TextInputState {
 
     pub fn end_drag(&mut self) {
         self.drag_anchor = None;
+        self.preferred_column = None;
     }
 
     pub fn select_all(&mut self) {
@@ -112,6 +120,7 @@ impl TextInputState {
                 self.cursor = clamped_start;
                 self.selection = None;
                 self.drag_anchor = None;
+                self.preferred_column = None;
                 return true;
             }
         }
@@ -131,6 +140,7 @@ impl TextInputState {
         self.cursor = cur + ins.len();
         self.selection = None;
         self.drag_anchor = None;
+        self.preferred_column = None;
     }
 
     pub fn backspace(&mut self) {
@@ -145,6 +155,7 @@ impl TextInputState {
             new_chars.extend(&chars[cur..]);
             self.text = new_chars.into_iter().collect();
             self.cursor = cur - 1;
+            self.preferred_column = None;
         }
     }
 
@@ -159,10 +170,12 @@ impl TextInputState {
             new_chars.extend(&chars[..cur]);
             new_chars.extend(&chars[cur + 1..]);
             self.text = new_chars.into_iter().collect();
+            self.preferred_column = None;
         }
     }
 
     pub fn move_left(&mut self, extend: bool) {
+        self.preferred_column = None;
         let cur = self.cursor;
         if extend {
             let anchor = self.drag_anchor.unwrap_or(cur);
@@ -186,6 +199,7 @@ impl TextInputState {
     }
 
     pub fn move_right(&mut self, extend: bool) {
+        self.preferred_column = None;
         let cur = self.cursor;
         let count = self.char_count();
         if extend {
@@ -210,6 +224,7 @@ impl TextInputState {
     }
 
     pub fn move_home(&mut self, extend: bool) {
+        self.preferred_column = None;
         if extend {
             let anchor = self.drag_anchor.unwrap_or(self.cursor);
             self.drag_anchor = Some(anchor);
@@ -223,6 +238,7 @@ impl TextInputState {
     }
 
     pub fn move_end(&mut self, extend: bool) {
+        self.preferred_column = None;
         let count = self.char_count();
         if extend {
             let anchor = self.drag_anchor.unwrap_or(self.cursor);
@@ -231,6 +247,48 @@ impl TextInputState {
             self.selection = if anchor < count { Some((anchor, count)) } else { None };
         } else {
             self.cursor = count;
+            self.selection = None;
+            self.drag_anchor = None;
+        }
+    }
+
+    pub fn move_vertical(
+        &mut self,
+        lines: &[WrappedVisualLine],
+        delta: isize,
+        extend: bool,
+    ) {
+        if lines.is_empty() || delta == 0 {
+            return;
+        }
+        let cursor = self.cursor.min(self.char_count());
+        let current_line = lines
+            .iter()
+            .position(|line| line.start_char == cursor)
+            .or_else(|| {
+                lines.iter().position(|line| {
+                    let end = line.start_char + line.text.chars().count();
+                    cursor > line.start_char && cursor <= end
+                })
+            })
+            .unwrap_or(lines.len() - 1);
+        let current = &lines[current_line];
+        let column = self.preferred_column.unwrap_or_else(|| {
+            cursor
+                .saturating_sub(current.start_char)
+                .min(current.text.chars().count())
+        });
+        let next_line = (current_line as isize + delta).clamp(0, lines.len() as isize - 1) as usize;
+        let target = &lines[next_line];
+        let target_cursor = target.start_char + column.min(target.text.chars().count());
+        self.preferred_column = Some(column);
+        self.cursor = target_cursor;
+        if extend {
+            let anchor = self.drag_anchor.unwrap_or(cursor);
+            self.drag_anchor = Some(anchor);
+            self.selection = (target_cursor != anchor)
+                .then_some((anchor.min(target_cursor), anchor.max(target_cursor)));
+        } else {
             self.selection = None;
             self.drag_anchor = None;
         }
@@ -524,6 +582,32 @@ mod tests {
 
         state.backspace();
         assert_eq!(state.text, "hello rust");
+    }
+
+    #[test]
+    fn vertical_cursor_moves_between_visual_lines_and_keeps_its_column() {
+        let text = "abcdef\nxy\nabcdef";
+        let lines = wrap_text_into_lines(text, 20);
+        let mut state = TextInputState::new(text.into());
+        state.set_cursor(4);
+
+        state.move_vertical(&lines, 1, false);
+        assert_eq!(state.cursor, 9);
+        state.move_vertical(&lines, 1, false);
+        assert_eq!(state.cursor, 14);
+    }
+
+    #[test]
+    fn vertical_cursor_can_extend_a_selection() {
+        let text = "first line\nsecond line";
+        let lines = wrap_text_into_lines(text, 30);
+        let mut state = TextInputState::new(text.into());
+        state.set_cursor(2);
+
+        state.move_vertical(&lines, 1, true);
+
+        assert_eq!(state.cursor, 13);
+        assert_eq!(state.selection, Some((2, 13)));
     }
 
     #[test]

@@ -6490,6 +6490,8 @@ impl RootView {
         if self.right_panel == RightPanel::Ai {
             self.ai_input_focused = true;
             window.focus(&self.focus_handle, cx);
+        } else {
+            self.ai_input_focused = false;
         }
         self.persist_session();
         self.trigger_ai_sidebar_animation(window, cx);
@@ -8841,6 +8843,8 @@ impl RootView {
                     self.cancel_ai_stream();
                 } else {
                     self.right_panel = RightPanel::Closed;
+                    self.ai_input_focused = false;
+                    self.persist_session();
                 }
                 cx.notify();
                 return;
@@ -8902,6 +8906,27 @@ impl RootView {
                     cx.notify();
                     return;
                 }
+            }
+
+            let vertical_delta = if key_lower == "up" || key_lower == "arrowup" {
+                Some(-1)
+            } else if key_lower == "down" || key_lower == "arrowdown" {
+                Some(1)
+            } else {
+                None
+            };
+            if let Some(delta) = vertical_delta {
+                let available_width = (self.current_ai_sidebar_width() - 44.0).max(80.0);
+                let max_cols = ((available_width / 7.2).floor() as usize).max(10);
+                let lines = crate::ui::text_input::wrap_text_into_lines(
+                    &self.ai_input_state.text,
+                    max_cols,
+                );
+                self.ai_input_state
+                    .move_vertical(&lines, delta, modifiers.shift);
+                self.check_ai_at_trigger();
+                cx.notify();
+                return;
             }
 
             // Select All: Cmd+A (macOS) or Ctrl+A (Linux/Windows)
