@@ -233,6 +233,274 @@ pub fn run_sessions_command(watch: bool, wait_secs: Option<u64>, json: bool) -> 
     }
 }
 
+pub fn run_capture_command(id: usize, wait_secs: Option<u64>) -> ! {
+    #[cfg(not(unix))]
+    {
+        let _ = (id, wait_secs);
+        eprintln!("fastty capture: not supported on this platform yet.");
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        let mut stream = match connect_with_retry(wait_secs) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("fastty capture: {error}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(error) = send_request(&mut stream, &Request::Hello { read_only: true }) {
+            eprintln!("fastty capture: {error}");
+            std::process::exit(1);
+        }
+        let mut reader = std::io::BufReader::new(stream);
+        if !matches!(read_response(&mut reader), Ok(Response::Hello { .. })) {
+            eprintln!("fastty capture: daemon did not accept read-only mode");
+            std::process::exit(1);
+        }
+        let mut stream = reader.into_inner();
+        if let Err(error) = send_request(&mut stream, &Request::Capture { id }) {
+            eprintln!("fastty capture: {error}");
+            std::process::exit(1);
+        }
+        match read_response(&mut std::io::BufReader::new(stream)) {
+            Ok(Response::Captured {
+                data, truncated, ..
+            }) => {
+                if std::io::stdout().write_all(data.as_bytes()).is_err() {
+                    std::process::exit(1);
+                }
+                if truncated {
+                    eprintln!("fastty capture: output was truncated at 1 MiB");
+                    std::process::exit(2);
+                }
+                std::process::exit(0);
+            }
+            Ok(Response::Error { code, message }) => {
+                eprintln!("fastty capture: {code}: {message}");
+                std::process::exit(1);
+            }
+            Ok(_) => {
+                eprintln!("fastty capture: unexpected response from fastty");
+                std::process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("fastty capture: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+pub fn run_focus_command(id: usize, wait_secs: Option<u64>) -> ! {
+    #[cfg(not(unix))]
+    {
+        let _ = (id, wait_secs);
+        eprintln!("fastty focus: not supported on this platform yet.");
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        let mut stream = match connect_with_retry(wait_secs) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("fastty focus: {error}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(error) = send_request(&mut stream, &Request::FocusPane { id }) {
+            eprintln!("fastty focus: {error}");
+            std::process::exit(1);
+        }
+        match read_response(&mut std::io::BufReader::new(stream)) {
+            Ok(Response::Done { .. }) => std::process::exit(0),
+            Ok(Response::Error { code, message }) => {
+                eprintln!("fastty focus: {code}: {message}");
+                std::process::exit(1);
+            }
+            Ok(_) => {
+                eprintln!("fastty focus: unexpected response from fastty");
+                std::process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("fastty focus: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+pub fn run_events_command(wait_secs: Option<u64>) -> ! {
+    #[cfg(not(unix))]
+    {
+        let _ = wait_secs;
+        eprintln!("fastty events: not supported on this platform yet.");
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        let mut stream = match connect_with_retry(wait_secs) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("fastty events: {error}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(error) = send_request(&mut stream, &Request::Hello { read_only: true }) {
+            eprintln!("fastty events: {error}");
+            std::process::exit(1);
+        }
+        let mut reader = std::io::BufReader::new(stream);
+        if !matches!(read_response(&mut reader), Ok(Response::Hello { .. })) {
+            eprintln!("fastty events: daemon did not accept read-only mode");
+            std::process::exit(1);
+        }
+        let mut stream = reader.into_inner();
+        if let Err(error) = send_request(&mut stream, &Request::SubscribeEvents) {
+            eprintln!("fastty events: {error}");
+            std::process::exit(1);
+        }
+        let mut reader = std::io::BufReader::new(stream);
+        loop {
+            let response = match read_response(&mut reader) {
+                Ok(response) => response,
+                Err(error) => {
+                    eprintln!("fastty events: {error}");
+                    std::process::exit(1);
+                }
+            };
+            let event = match response {
+                Response::EventStreamStarted {
+                    version,
+                    sequence,
+                    sessions,
+                } => {
+                    serde_json::json!({
+                        "version": version,
+                        "type": "snapshot",
+                        "sequence": sequence,
+                        "sessions": sessions,
+                    })
+                }
+                Response::EventStreamGap {
+                    version,
+                    after_sequence,
+                    oldest_sequence,
+                    latest_sequence,
+                    sessions,
+                } => {
+                    let [gap, snapshot] = event_stream_gap_jsonl(
+                        version,
+                        after_sequence,
+                        oldest_sequence,
+                        latest_sequence,
+                        sessions,
+                    );
+                    for event in [gap, snapshot] {
+                        if writeln!(std::io::stdout(), "{event}").is_err() {
+                            std::process::exit(1);
+                        }
+                    }
+                    let _ = std::io::stdout().flush();
+                    continue;
+                }
+                Response::StreamEvent { envelope } => {
+                    let metadata = serde_json::json!({
+                        "version": envelope.version,
+                        "sequence": envelope.sequence,
+                        "timestamp_unix_ms": envelope.timestamp_unix_ms,
+                        "session_id": envelope.session_id,
+                    });
+                    match envelope.kind {
+                        crate::daemon::SessionEvent::SessionAdded { session } => {
+                            serde_json::json!({
+                                "version": metadata["version"],
+                                "type": "session_added",
+                                "sequence": metadata["sequence"],
+                                "timestamp_unix_ms": metadata["timestamp_unix_ms"],
+                                "session_id": metadata["session_id"],
+                                "session": session,
+                            })
+                        }
+                        crate::daemon::SessionEvent::SessionRemoved { id } => serde_json::json!({
+                            "version": metadata["version"],
+                            "type": "session_removed",
+                            "sequence": metadata["sequence"],
+                            "timestamp_unix_ms": metadata["timestamp_unix_ms"],
+                            "session_id": metadata["session_id"],
+                            "id": id,
+                        }),
+                        crate::daemon::SessionEvent::SessionUpdated { session } => {
+                            serde_json::json!({
+                                "version": metadata["version"],
+                                "type": "session_updated",
+                                "sequence": metadata["sequence"],
+                                "timestamp_unix_ms": metadata["timestamp_unix_ms"],
+                                "session_id": metadata["session_id"],
+                                "session": session,
+                            })
+                        }
+                    }
+                }
+                Response::Error { code, message } => {
+                    eprintln!("fastty events: {code}: {message}");
+                    std::process::exit(1);
+                }
+                _ => continue,
+            };
+            if writeln!(std::io::stdout(), "{event}").is_err() {
+                std::process::exit(1);
+            }
+            let _ = std::io::stdout().flush();
+        }
+    }
+}
+
+fn event_stream_gap_jsonl<S: serde::Serialize>(
+    version: u16,
+    after_sequence: u64,
+    oldest_sequence: u64,
+    latest_sequence: u64,
+    sessions: S,
+) -> [serde_json::Value; 2] {
+    [
+        serde_json::json!({
+            "version": version,
+            "type": "gap",
+            "after_sequence": after_sequence,
+            "oldest_sequence": oldest_sequence,
+            "latest_sequence": latest_sequence,
+        }),
+        serde_json::json!({
+            "version": version,
+            "type": "snapshot",
+            "sequence": latest_sequence,
+            "sessions": sessions,
+        }),
+    ]
+}
+
+#[cfg(test)]
+mod event_stream_cli_tests {
+    use super::event_stream_gap_jsonl;
+    use serde_json::json;
+
+    #[test]
+    fn event_gap_outputs_recovery_marker_and_replacement_snapshot() {
+        let lines = event_stream_gap_jsonl(1, 4, 10, 12, json!([{"id": 7}]));
+
+        assert_eq!(lines[0]["type"], "gap");
+        assert_eq!(lines[0]["after_sequence"], 4);
+        assert_eq!(lines[0]["oldest_sequence"], 10);
+        assert_eq!(lines[0]["latest_sequence"], 12);
+        assert_eq!(lines[1]["type"], "snapshot");
+        assert_eq!(lines[1]["sequence"], 12);
+        assert_eq!(lines[1]["sessions"][0]["id"], 7);
+    }
+}
+
 #[cfg(unix)]
 struct RawModeGuard {
     original: libc::termios,
@@ -475,7 +743,14 @@ pub fn run_spawn_command(
                 std::process::exit(1);
             }
         };
-        let req = Request::Spawn { command, args, cwd, cols, rows, open };
+        let req = Request::Spawn {
+            command,
+            args,
+            cwd,
+            cols,
+            rows,
+            open,
+        };
         if let Err(e) = send_request(&mut stream, &req) {
             eprintln!("fastty spawn: {e}");
             std::process::exit(1);
@@ -551,10 +826,7 @@ pub fn run_split_pane_command(
         match read_response(&mut reader) {
             Ok(Response::PaneSplit { id }) => {
                 if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({ "event": "pane_split", "id": id })
-                    );
+                    println!("{}", serde_json::json!({ "event": "pane_split", "id": id }));
                 } else {
                     println!("{id}");
                 }
@@ -595,7 +867,15 @@ pub fn run_close_command(id: usize, force: bool, wait_secs: Option<u64>) -> ! {
                 std::process::exit(1);
             }
         };
-        if let Err(e) = send_request(&mut stream, &Request::Close { id, force }) {
+        let request = if force {
+            Request::ExternalAction {
+                id,
+                action: crate::daemon::ExternalAction::Close { force: true },
+            }
+        } else {
+            Request::Close { id, force }
+        };
+        if let Err(e) = send_request(&mut stream, &request) {
             eprintln!("fastty close: {e}");
             std::process::exit(1);
         }
@@ -638,7 +918,12 @@ pub fn run_resize_command(id: usize, cols: usize, rows: usize, wait_secs: Option
                 std::process::exit(1);
             }
         };
-        let req = Request::Resize { id, cols, rows, ack: true };
+        let req = Request::Resize {
+            id,
+            cols,
+            rows,
+            ack: true,
+        };
         if let Err(e) = send_request(&mut stream, &req) {
             eprintln!("fastty resize: {e}");
             std::process::exit(1);
@@ -683,6 +968,45 @@ pub fn run_write_command(id: usize, text: String, enter: bool, wait_secs: Option
                 std::process::exit(1);
             }
         };
+        if let Err(error) = send_request(&mut stream, &Request::Hello { read_only: false }) {
+            eprintln!("fastty write: {error}");
+            std::process::exit(1);
+        }
+        let mut reader = std::io::BufReader::new(stream);
+        if !matches!(read_response(&mut reader), Ok(Response::Hello { .. })) {
+            eprintln!("fastty write: daemon did not accept the hello request");
+            std::process::exit(1);
+        }
+        let mut stream = reader.into_inner();
+        if let Err(error) = send_request(
+            &mut stream,
+            &Request::SetAccessScope {
+                scope: crate::daemon::AccessScope::Interact,
+            },
+        ) {
+            eprintln!("fastty write: {error}");
+            std::process::exit(1);
+        }
+        let mut reader = std::io::BufReader::new(stream);
+        match read_response(&mut reader) {
+            Ok(Response::Done { .. }) => {}
+            // Older hosts do not know the optional access-scope request.
+            // Keep the existing explicit `write` command behavior with them.
+            Ok(Response::Error { code, .. }) if code == "bad_request" => {}
+            Ok(Response::Error { code, message }) => {
+                eprintln!("fastty write: {code}: {message}");
+                std::process::exit(1);
+            }
+            Ok(_) => {
+                eprintln!("fastty write: unexpected access-scope response");
+                std::process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("fastty write: {error}");
+                std::process::exit(1);
+            }
+        }
+        let mut stream = reader.into_inner();
         let payload = if enter { format!("{text}\r") } else { text };
         let req = Request::Write {
             id,
@@ -712,4 +1036,228 @@ pub fn run_write_command(id: usize, text: String, enter: bool, wait_secs: Option
             }
         }
     }
+}
+
+/// `fastty send` asks the visible Fastty window to approve input before it
+/// reaches the session.
+pub fn run_send_command(id: usize, text: String, enter: bool, wait_secs: Option<u64>) -> ! {
+    #[cfg(not(unix))]
+    {
+        let _ = (id, text, enter, wait_secs);
+        eprintln!("fastty send: not supported on this platform yet.");
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        let result = (|| {
+            let mut stream = connect_with_retry(wait_secs)?;
+            send_request(&mut stream, &Request::Hello { read_only: false })?;
+            let mut reader = std::io::BufReader::new(stream);
+            if !matches!(read_response(&mut reader)?, Response::Hello { .. }) {
+                return Err("daemon did not accept the hello request".to_string());
+            }
+            let mut stream = reader.into_inner();
+            send_request(
+                &mut stream,
+                &Request::SetAccessScope {
+                    scope: crate::daemon::AccessScope::Interact,
+                },
+            )?;
+            let mut reader = std::io::BufReader::new(stream);
+            match read_response(&mut reader)? {
+                Response::Done { .. } => {}
+                Response::Error { code, message } => return Err(format!("{code}: {message}")),
+                _ => return Err("unexpected access-scope response".to_string()),
+            }
+            let payload = if enter { format!("{text}\r") } else { text };
+            let mut stream = reader.into_inner();
+            send_request(
+                &mut stream,
+                &Request::ExternalAction {
+                    id,
+                    action: crate::daemon::ExternalAction::Send { text: payload },
+                },
+            )?;
+            match read_response(&mut std::io::BufReader::new(stream))? {
+                Response::Done { .. } => Ok(()),
+                Response::Error { code, message } => Err(format!("{code}: {message}")),
+                _ => Err("unexpected response from fastty".to_string()),
+            }
+        })();
+        match result {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("fastty send: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+pub fn run_agent_status_command(state: String, app: String, kind: Option<String>) -> ! {
+    #[cfg(not(unix))]
+    {
+        let _ = (state, app, kind);
+        eprintln!("fastty agent-status: not supported on this platform yet.");
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        let result = (|| {
+            let source_id = std::env::var("FASTTY_SESSION_TOKEN")
+                .map_err(|_| "FASTTY_SESSION_TOKEN is missing. Start the agent inside Fastty.".to_string())?
+                .parse::<u64>()
+                .map_err(|_| "FASTTY_SESSION_TOKEN is invalid".to_string())?;
+            let valid_state = matches!(state.as_str(), "idle" | "working" | "done" | "blocked" | "error" | "clear");
+            let valid_app = matches!(app.as_str(), "claude" | "opencode" | "gemini" | "pi" | "codex");
+            let valid_kind = kind.as_deref().is_none_or(|value| matches!(value, "permission" | "question" | "auth"));
+            if !valid_state || !valid_app || !valid_kind {
+                return Err("invalid state, agent, or blocked kind".to_string());
+            }
+            let mut payload = format!("state={state}:id=agent:app={app}");
+            if state == "blocked" {
+                let kind = kind.as_deref().unwrap_or("question");
+                payload.push_str(&format!(":kind={kind}"));
+            }
+            let mut stream = connect()?;
+            send_request(&mut stream, &Request::Hello { read_only: false })?;
+            let mut reader = std::io::BufReader::new(stream);
+            if !matches!(read_response(&mut reader)?, Response::Hello { .. }) {
+                return Err("daemon did not accept the hello request".to_string());
+            }
+            let mut stream = reader.into_inner();
+            send_request(
+                &mut stream,
+                &Request::SetAccessScope {
+                    scope: crate::daemon::AccessScope::Interact,
+                },
+            )?;
+            let mut reader = std::io::BufReader::new(stream);
+            match read_response(&mut reader)? {
+                Response::Done { .. } => {}
+                Response::Error { code, message } => return Err(format!("{code}: {message}")),
+                _ => return Err("unexpected access-scope response".to_string()),
+            }
+            let mut stream = reader.into_inner();
+            send_request(
+                &mut stream,
+                &Request::ReportProgramStatus { source_id, payload },
+            )?;
+            match read_response(&mut std::io::BufReader::new(stream))? {
+                Response::Done { .. } => Ok(()),
+                Response::Error { code, message } => Err(format!("{code}: {message}")),
+                _ => Err("unexpected response from Fastty".to_string()),
+            }
+        })();
+        match result {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("fastty agent-status: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn status_for_agent_hook(
+    provider: &str,
+    event: Option<&str>,
+    notification: Option<&str>,
+) -> Option<(&'static str, Option<&'static str>)> {
+    match (provider, event) {
+        ("claude", Some("SessionStart"))
+        | ("gemini", Some("SessionStart"))
+        | ("codex", Some("SessionStart")) => Some(("idle", None)),
+        ("claude", Some("UserPromptSubmit"))
+        | ("gemini", Some("BeforeAgent"))
+        | ("codex", Some("UserPromptSubmit")) => Some(("working", None)),
+        ("claude", Some("Stop"))
+        | ("gemini", Some("AfterAgent"))
+        | ("codex", Some("Stop")) => Some(("done", None)),
+        ("claude", Some("StopFailure")) => Some(("error", None)),
+        ("claude", Some("SessionEnd"))
+        | ("gemini", Some("SessionEnd"))
+        | ("codex", Some("SessionEnd")) => Some(("clear", None)),
+        ("codex", Some("Interrupt")) => Some(("idle", None)),
+        ("codex", Some("PermissionRequest")) => Some(("blocked", Some("permission"))),
+        ("claude", Some("Notification")) if notification == Some("permission_prompt") => {
+            Some(("blocked", Some("permission")))
+        }
+        ("claude", Some("Notification"))
+            if matches!(notification, Some("idle_prompt" | "agent_needs_input")) =>
+        {
+            Some(("blocked", Some("question")))
+        }
+        ("gemini", Some("Notification")) if notification == Some("ToolPermission") => {
+            Some(("blocked", Some("permission")))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod agent_hook_tests {
+    use super::status_for_agent_hook;
+
+    #[test]
+    fn provider_hooks_map_only_supported_lifecycle_states() {
+        assert_eq!(
+            status_for_agent_hook("claude", Some("UserPromptSubmit"), None),
+            Some(("working", None))
+        );
+        assert_eq!(
+            status_for_agent_hook("gemini", Some("Notification"), Some("ToolPermission")),
+            Some(("blocked", Some("permission")))
+        );
+        assert_eq!(
+            status_for_agent_hook("codex", Some("PermissionRequest"), None),
+            Some(("blocked", Some("permission")))
+        );
+        assert_eq!(status_for_agent_hook("pi", Some("agent_end"), None), None);
+    }
+}
+
+pub fn run_agent_hook_command(provider: String) -> ! {
+    use std::io::Read;
+
+    if !matches!(provider.as_str(), "claude" | "gemini" | "codex") {
+        eprintln!("fastty agent-hook: supported providers: claude, gemini, codex");
+        std::process::exit(2);
+    }
+    let emit_result = || {
+        if provider != "claude" {
+            println!("{{}}");
+        }
+    };
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        emit_result();
+        std::process::exit(0);
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(&input).ok();
+    let Some(value) = parsed else {
+        emit_result();
+        std::process::exit(0);
+    };
+    let event = value.get("hook_event_name").and_then(serde_json::Value::as_str);
+    let notification = value.get("notification_type").and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("type").and_then(serde_json::Value::as_str));
+    let status = status_for_agent_hook(provider.as_str(), event, notification);
+    if let (Some((state, kind)), Some(executable)) =
+        (status, std::env::current_exe().ok())
+    {
+        if std::env::var_os("FASTTY_SESSION_TOKEN").is_some() {
+            let mut command = std::process::Command::new(executable);
+            command
+                .args(["agent-status", state, provider.as_str()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if let Some(kind) = kind {
+                command.arg(kind);
+            }
+            let _ = command.status();
+        }
+    }
+    emit_result();
+    std::process::exit(0);
 }

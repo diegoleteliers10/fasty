@@ -365,10 +365,9 @@ fn call_tool(name: &str, args: &Value) -> Result<String, String> {
             let text = args.get("text").and_then(Value::as_str).ok_or("missing text")?;
             let enter = args.get("enter").and_then(Value::as_bool).unwrap_or(false);
             let payload = if enter { format!("{text}\r") } else { text.to_string() };
-            match send_and_read(&Request::Write {
+            match send_and_read(&Request::ExternalAction {
                 id,
-                data: crate::daemon::base64_encode(payload.as_bytes()),
-                ack: true,
+                action: crate::daemon::ExternalAction::Send { text: payload },
             })? {
                 Response::Done { .. } => Ok(json!({ "ok": true }).to_string()),
                 Response::Error { code, message } => Err(format!("{code}: {message}")),
@@ -381,7 +380,10 @@ fn call_tool(name: &str, args: &Value) -> Result<String, String> {
                 .get("include_history")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            match send_and_read(&Request::BinarySnapshot { id })? {
+            match send_and_read(&Request::BinarySnapshot {
+                id,
+                screen_only: !include_history,
+            })? {
                 Response::BinarySnapshot { data, .. } => {
                     let bytes = crate::daemon::base64_decode(&data)
                         .ok_or("invalid base64 in snapshot")?;
@@ -404,7 +406,11 @@ fn call_tool(name: &str, args: &Value) -> Result<String, String> {
         "fastty_close_session" => {
             let id = args.get("id").and_then(Value::as_u64).ok_or("missing id")? as usize;
             let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
-            match send_and_read(&Request::Close { id, force })? {
+            let request = Request::ExternalAction {
+                id,
+                action: crate::daemon::ExternalAction::Close { force },
+            };
+            match send_and_read(&request)? {
                 Response::Closed { id } => Ok(json!({ "closed": id }).to_string()),
                 Response::Error { code, message } => Err(format!("{code}: {message}")),
                 _ => Err("unexpected daemon response to close".to_string()),
@@ -547,7 +553,10 @@ fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<Stri
         std::thread::sleep(POLL_INTERVAL);
     }
 
-    let output = match send_and_read(&Request::BinarySnapshot { id })? {
+    let output = match send_and_read(&Request::BinarySnapshot {
+        id,
+        screen_only: false,
+    })? {
         Response::BinarySnapshot { data, .. } => {
             let bytes = crate::daemon::base64_decode(&data).ok_or("invalid base64 in snapshot")?;
             render_snapshot_text(&bytes, true).unwrap_or_default()

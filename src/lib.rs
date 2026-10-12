@@ -4,6 +4,7 @@
 #![recursion_limit = "512"]
 
 pub mod ai;
+pub mod agent_hooks;
 pub mod cli;
 
 pub mod config;

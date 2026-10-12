@@ -5,21 +5,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::Config as AlacrittyConfig;
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
-use alacritty_terminal::grid::Dimensions;
 use parking_lot::Mutex as ParkingMutex;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 use crate::config::FontConfig;
 use crate::event_listener::EventListenerProxy;
 
+static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum AppEvent {
     Wakeup,
-    Exit { shell_pid: Option<u32> },
+    Exit {
+        shell_pid: Option<u32>,
+    },
     ForceExit,
     ConfigChanged,
     Bell,
@@ -27,12 +31,25 @@ pub enum AppEvent {
     ClipboardLoad(u8),
     CwdChanged(std::path::PathBuf),
     TitleChanged(String),
-    ProgramStatusChanged { source_id: u64 },
+    ProgramStatusChanged {
+        source_id: u64,
+    },
     CommandStarted,
-    CommandFinished { duration_ms: u128, exit_code: Option<i32> },
-    Notification { title: String, body: String },
-    PromptStarted { absolute_line: u64 },
-    ShowToast { message: String, duration_ms: u64 },
+    CommandFinished {
+        duration_ms: u128,
+        exit_code: Option<i32>,
+    },
+    Notification {
+        title: String,
+        body: String,
+    },
+    PromptStarted {
+        absolute_line: u64,
+    },
+    ShowToast {
+        message: String,
+        duration_ms: u64,
+    },
     ForcePollWidgets,
     GitStatusUpdated {
         window_id: Option<usize>,
@@ -101,10 +118,7 @@ mod dws_regression_tests {
 
         let next = output.try_recv().expect("new output follows the snapshot");
         assert_eq!(next, b"after-boundary");
-        assert!(
-            output.try_recv().is_err(),
-            "output is delivered only once"
-        );
+        assert!(output.try_recv().is_err(), "output is delivered only once");
     }
 
     #[test]
@@ -124,7 +138,6 @@ mod dws_regression_tests {
         );
     }
 }
-
 
 /// Events derived from raw PTY byte-stream CSI scanning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -301,7 +314,8 @@ impl ImageStore {
     /// Prunes placements past the maximum scrollback and removes unreferenced textures.
     pub fn prune_old_placements(&mut self, min_visible_abs_line: u64) {
         let initial_len = self.placements.len();
-        self.placements.retain(|p| (p.absolute_line + p.rows as u64) >= min_visible_abs_line);
+        self.placements
+            .retain(|p| (p.absolute_line + p.rows as u64) >= min_visible_abs_line);
         if self.placements.len() < initial_len {
             let active_ids: std::collections::HashSet<u32> =
                 self.placements.iter().map(|p| p.image_id).collect();
@@ -398,10 +412,7 @@ fn foreground_process_state(
     }
 }
 
-fn append_restored_terminal_modes(
-    out: &mut Vec<u8>,
-    mode: alacritty_terminal::term::TermMode,
-) {
+fn append_restored_terminal_modes(out: &mut Vec<u8>, mode: alacritty_terminal::term::TermMode) {
     use alacritty_terminal::term::TermMode;
 
     if mode.contains(TermMode::APP_CURSOR) {
@@ -655,10 +666,12 @@ impl TerminalState {
         // Restriction: new_default_prog() panics if .arg()/.args() is called on it,
         // so we only use it for the zsh-without-exec-args branch. bash and fish still
         // use .args() for their --rcfile / -C wrappers and must stay on new().
+        let source_id = NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
         let mut cmd = CommandBuilder::new(executable);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "fastty");
+        cmd.env("FASTTY_SESSION_TOKEN", source_id.to_string());
         if let Some(dir) = cwd {
             cmd.cwd(dir);
         }
@@ -669,8 +682,15 @@ impl TerminalState {
             #[cfg(target_os = "macos")]
             {
                 let mut full_path = path;
-                for p in ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin"] {
-                    if !full_path.split(':').any(|segment| segment == p) && std::path::Path::new(p).exists() {
+                for p in [
+                    "/opt/homebrew/bin",
+                    "/opt/homebrew/sbin",
+                    "/usr/local/bin",
+                    "/usr/local/sbin",
+                ] {
+                    if !full_path.split(':').any(|segment| segment == p)
+                        && std::path::Path::new(p).exists()
+                    {
                         full_path = format!("{}:{}", p, full_path);
                     }
                 }
@@ -831,7 +851,10 @@ impl TerminalState {
         #[cfg(unix)]
         let (mut reader, remote_output) = if remote.is_some() {
             let (read_end, write_end) = std::os::unix::net::UnixStream::pair()?;
-            (Box::new(read_end) as Box<dyn std::io::Read + Send>, Some(write_end))
+            (
+                Box::new(read_end) as Box<dyn std::io::Read + Send>,
+                Some(write_end),
+            )
         } else {
             let reader = master_arc
                 .lock()
@@ -847,7 +870,12 @@ impl TerminalState {
 
         let writer_boxed: Box<dyn Write + Send> = match &remote_control {
             Some(control) => Box::new(RemoteInputWriter(Arc::clone(control))),
-            None => Box::new(master_arc.lock().take_writer().expect("Failed to take writer")),
+            None => Box::new(
+                master_arc
+                    .lock()
+                    .take_writer()
+                    .expect("Failed to take writer"),
+            ),
         };
         let writer_arc: Arc<ParkingMutex<Box<dyn Write + Send>>> =
             Arc::new(ParkingMutex::new(writer_boxed));
@@ -879,130 +907,252 @@ impl TerminalState {
         let next_image_id = Arc::new(AtomicU64::new(1));
         let next_image_id_clone = Arc::clone(&next_image_id);
         let writer_clone = Arc::clone(&writer_arc);
-        static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
-        let source_id = NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed);
-        let program_status = Arc::new(ParkingMutex::new(crate::program_status::ProgramStatusStore::default()));
+        let program_status = Arc::new(ParkingMutex::new(
+            crate::program_status::ProgramStatusStore::default(),
+        ));
         let program_status_clone = Arc::clone(&program_status);
         let program_status_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let program_status_pending_clone = Arc::clone(&program_status_pending);
         if !std::env::var("FASTTY_NO_READER").is_ok() {
-        thread::spawn(move || {
-            use std::io::Read;
+            thread::spawn(move || {
+                use std::io::Read;
 
-            let mut buf = [0u8; 65536];
-            let mut parser: Processor<StdSyncHandler> = Processor::new();
+                let mut buf = [0u8; 65536];
+                let mut parser: Processor<StdSyncHandler> = Processor::new();
 
-            #[derive(Clone, Copy, Debug, PartialEq)]
-            enum SequenceParseState {
-                Normal,
-                Esc,
-                Osc,
-                OscEsc,
-                Apc,
-                ApcEsc,
-            }
+                #[derive(Clone, Copy, Debug, PartialEq)]
+                enum SequenceParseState {
+                    Normal,
+                    Esc,
+                    Osc,
+                    OscEsc,
+                    Apc,
+                    ApcEsc,
+                }
 
-            let mut seq_state = SequenceParseState::Normal;
-            let mut osc_buf: Vec<u8> = Vec::new();
-            let mut apc_buf: Vec<u8> = Vec::new();
-            let mut kitty_reassembler = crate::parser::kitty_graphics::KittyReassembler::new();
-            let mut kitty_clip_write: Option<crate::parser::kitty_clipboard::WriteSession> = None;
-            let mut cmd_start_time: Option<std::time::Instant> = None;
+                let mut seq_state = SequenceParseState::Normal;
+                let mut osc_buf: Vec<u8> = Vec::new();
+                let mut apc_buf: Vec<u8> = Vec::new();
+                let mut kitty_reassembler = crate::parser::kitty_graphics::KittyReassembler::new();
+                let mut kitty_clip_write: Option<crate::parser::kitty_clipboard::WriteSession> =
+                    None;
+                let mut cmd_start_time: Option<std::time::Instant> = None;
 
-            // CSI detection: see `CsiWatcher` (module level). The watcher
-            // emits events for `CSI 2J` scrollback wipes and for Synchronized
-            // Output mode 2026, which alacritty_terminal 0.24 ignores.
-            let mut csi_watcher = CsiWatcher::new();
-            let mut clear_history_flag = false;
+                // CSI detection: see `CsiWatcher` (module level). The watcher
+                // emits events for `CSI 2J` scrollback wipes and for Synchronized
+                // Output mode 2026, which alacritty_terminal 0.24 ignores.
+                let mut csi_watcher = CsiWatcher::new();
+                let mut clear_history_flag = false;
 
-            const SYNC_OUTPUT_TIMEOUT: std::time::Duration =
-                std::time::Duration::from_millis(150);
-            let mut sync_output_active = false;
-            let mut sync_started: Option<std::time::Instant> = None;
+                const SYNC_OUTPUT_TIMEOUT: std::time::Duration =
+                    std::time::Duration::from_millis(150);
+                let mut sync_output_active = false;
+                let mut sync_started: Option<std::time::Instant> = None;
 
-            // Debug: capture PTY bytes to log if FASTTY_PTY_DEBUG=1
-            let pty_debug = std::env::var("FASTTY_PTY_DEBUG").ok().as_deref() == Some("1");
-            let pty_log_path = crate::paths::get().state_dir.join("fastty_pty_debug.log");
-            if pty_debug {
-                let _ = std::fs::write(&pty_log_path, "");  // truncate on start
-            }
+                // Debug: capture PTY bytes to log if FASTTY_PTY_DEBUG=1
+                let pty_debug = std::env::var("FASTTY_PTY_DEBUG").ok().as_deref() == Some("1");
+                let pty_log_path = crate::paths::get().state_dir.join("fastty_pty_debug.log");
+                if pty_debug {
+                    let _ = std::fs::write(&pty_log_path, ""); // truncate on start
+                }
 
-            struct PendingNotification {
-                title: String,
-                body: String,
-            }
-            let mut pending_notifications: std::collections::HashMap<String, PendingNotification> = std::collections::HashMap::new();
+                struct PendingNotification {
+                    title: String,
+                    body: String,
+                }
+                let mut pending_notifications: std::collections::HashMap<
+                    String,
+                    PendingNotification,
+                > = std::collections::HashMap::new();
 
-            let mut handle_cmd = |cmd: OscCommand, cursor_line: i32, screen_lines: i32, base: u64, term: &mut alacritty_terminal::Term<EventListenerProxy>, parser: &mut Processor| {
-                match cmd {
-                    OscCommand::ProgramStatus(crate::program_status::ProgramStatusCommand::Query) => {
-                        let mut writer = writer_clone.lock();
-                        let _ = writer.write_all(b"\x1b]7501;?\x1b\\");
-                        let _ = writer.flush();
-                    }
-                    OscCommand::ProgramStatus(command) => {
-                        update_program_status(&program_status_clone, &program_status_pending_clone, &event_listener_clone, source_id,
-                            |store| store.apply(command));
-                    }
-                    OscCommand::PromptStarted => {
-                        update_program_status(&program_status_clone, &program_status_pending_clone, &event_listener_clone, source_id,
-                            |store| store.end_activity());
-                        // Reset mouse tracking modes on prompt start to prevent leaked escape codes if a child exited uncleanly
-                        parser.advance(term, b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+                let mut handle_cmd = |cmd: OscCommand,
+                                      cursor_line: i32,
+                                      screen_lines: i32,
+                                      base: u64,
+                                      term: &mut alacritty_terminal::Term<EventListenerProxy>,
+                                      parser: &mut Processor| {
+                    match cmd {
+                        OscCommand::ProgramStatus(
+                            crate::program_status::ProgramStatusCommand::Query,
+                        ) => {
+                            let mut writer = writer_clone.lock();
+                            let _ = writer.write_all(b"\x1b]7501;?\x1b\\");
+                            let _ = writer.flush();
+                        }
+                        OscCommand::ProgramStatus(command) => {
+                            update_program_status(
+                                &program_status_clone,
+                                &program_status_pending_clone,
+                                &event_listener_clone,
+                                source_id,
+                                |store| store.apply(command),
+                            );
+                        }
+                        OscCommand::PromptStarted => {
+                            update_program_status(
+                                &program_status_clone,
+                                &program_status_pending_clone,
+                                &event_listener_clone,
+                                source_id,
+                                |store| store.end_activity(),
+                            );
+                            // Reset mouse tracking modes on prompt start to prevent leaked escape codes if a child exited uncleanly
+                            parser.advance(term, b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
 
-                        let scrolled = (base as i64 - screen_lines as i64).max(0);
-                        let absolute_line = (scrolled + cursor_line as i64).max(0) as u64;
-                        {
-                            let mut p = prompt_lines_clone.lock();
-                            if p.last().copied() != Some(absolute_line) {
-                                p.push(absolute_line);
-                                if p.len() > 500 {
-                                    let excess = p.len() - 500;
-                                    p.drain(0..excess);
+                            let scrolled = (base as i64 - screen_lines as i64).max(0);
+                            let absolute_line = (scrolled + cursor_line as i64).max(0) as u64;
+                            {
+                                let mut p = prompt_lines_clone.lock();
+                                if p.last().copied() != Some(absolute_line) {
+                                    p.push(absolute_line);
+                                    if p.len() > 500 {
+                                        let excess = p.len() - 500;
+                                        p.drain(0..excess);
+                                    }
+                                }
+                            }
+                            dispatch_osc_action(
+                                &OscCommand::PromptStarted,
+                                &event_listener_clone,
+                                cursor_line,
+                                base,
+                                screen_lines,
+                            );
+                        }
+                        OscCommand::NotificationQuery { id } => {
+                            let resp = format!("\x1b]99;i={}:p=OK;\x1b\\", id);
+                            let mut w = writer_clone.lock();
+                            let _ = w.write_all(resp.as_bytes());
+                            let _ = w.flush();
+                        }
+                        OscCommand::NotificationFragment {
+                            id,
+                            p_type,
+                            done,
+                            payload,
+                        } => {
+                            if let Some(query_id) = id {
+                                let entry = pending_notifications
+                                    .entry(query_id.clone())
+                                    .or_insert_with(|| PendingNotification {
+                                        title: String::new(),
+                                        body: String::new(),
+                                    });
+                                match p_type.as_deref() {
+                                    Some("title") => entry.title.push_str(&payload),
+                                    Some("body") | None => entry.body.push_str(&payload),
+                                    _ => {}
+                                }
+                                if done {
+                                    if let Some(finished) = pending_notifications.remove(&query_id)
+                                    {
+                                        let title = if finished.title.is_empty() {
+                                            "Fastty".to_string()
+                                        } else {
+                                            finished.title
+                                        };
+                                        dispatch_notification_if_allowed(
+                                            &title,
+                                            &finished.body,
+                                            &program_status_clone,
+                                            &event_listener_clone,
+                                            cursor_line,
+                                            base,
+                                            screen_lines,
+                                        );
+                                    }
+                                }
+                            } else {
+                                dispatch_notification_if_allowed(
+                                    "Fastty",
+                                    &payload,
+                                    &program_status_clone,
+                                    &event_listener_clone,
+                                    cursor_line,
+                                    base,
+                                    screen_lines,
+                                );
+                            }
+                        }
+                        OscCommand::KittyClipboard { metadata, payload } => {
+                            use crate::parser::kitty_clipboard as kclip;
+                            let Some(msg) = kclip::parse(&metadata, &payload) else {
+                                return;
+                            };
+                            let write_resp = |resp: String| {
+                                let mut w = writer_clone.lock();
+                                let _ = w.write_all(resp.as_bytes());
+                                let _ = w.flush();
+                            };
+                            match msg {
+                                kclip::Message::WriteBegin { id } => {
+                                    kitty_clip_write = Some(kclip::WriteSession::new(id));
+                                }
+                                kclip::Message::WriteData { id, mime, data } => {
+                                    match (mime, kitty_clip_write.as_mut()) {
+                                        (Some(mime), Some(session)) => {
+                                            if session.push(mime, data).is_err() {
+                                                let id = kitty_clip_write.take().and_then(|s| s.id);
+                                                write_resp(kclip::response(
+                                                    "write",
+                                                    "EFBIG",
+                                                    id.as_deref(),
+                                                ));
+                                            }
+                                        }
+                                        (None, Some(_)) => {
+                                            // End of transmission: apply to the clipboard.
+                                            if let Some(session) = kitty_clip_write.take() {
+                                                let id = session.id.clone();
+                                                let status = if session.finish().is_ok() {
+                                                    "DONE"
+                                                } else {
+                                                    "EIO"
+                                                };
+                                                write_resp(kclip::response(
+                                                    "write",
+                                                    status,
+                                                    id.as_deref(),
+                                                ));
+                                            }
+                                        }
+                                        (_, None) => {
+                                            write_resp(kclip::response(
+                                                "write",
+                                                "EINVAL",
+                                                id.as_deref(),
+                                            ));
+                                        }
+                                    }
+                                }
+                                kclip::Message::Read { id, request } => {
+                                    if !crate::config::clipboard_read_allowed() {
+                                        write_resp(kclip::response("read", "EPERM", id.as_deref()));
+                                        return;
+                                    }
+                                    write_resp(kclip::response("read", "OK", id.as_deref()));
+                                    for (mime, data) in kclip::read(&request) {
+                                        let chunks: Vec<&[u8]> = if data.is_empty() {
+                                            vec![&[][..]]
+                                        } else {
+                                            data.chunks(kclip::MAX_DATA_CHUNK).collect()
+                                        };
+                                        for chunk in chunks {
+                                            write_resp(kclip::response_data(
+                                                &mime,
+                                                chunk,
+                                                id.as_deref(),
+                                            ));
+                                        }
+                                    }
+                                    write_resp(kclip::response("read", "DONE", id.as_deref()));
                                 }
                             }
                         }
-                        dispatch_osc_action(&OscCommand::PromptStarted, &event_listener_clone, cursor_line, base, screen_lines);
-                    }
-                    OscCommand::NotificationQuery { id } => {
-                        let resp = format!("\x1b]99;i={}:p=OK;\x1b\\", id);
-                        let mut w = writer_clone.lock();
-                        let _ = w.write_all(resp.as_bytes());
-                        let _ = w.flush();
-                    }
-                    OscCommand::NotificationFragment { id, p_type, done, payload } => {
-                        if let Some(query_id) = id {
-                            let entry = pending_notifications.entry(query_id.clone()).or_insert_with(|| PendingNotification {
-                                title: String::new(),
-                                body: String::new(),
-                            });
-                            match p_type.as_deref() {
-                                Some("title") => entry.title.push_str(&payload),
-                                Some("body") | None => entry.body.push_str(&payload),
-                                _ => {}
-                            }
-                            if done {
-                                if let Some(finished) = pending_notifications.remove(&query_id) {
-                                    let title = if finished.title.is_empty() {
-                                        "Fastty".to_string()
-                                    } else {
-                                        finished.title
-                                    };
-                                    dispatch_notification_if_allowed(
-                                        &title,
-                                        &finished.body,
-                                        &program_status_clone,
-                                        &event_listener_clone,
-                                        cursor_line,
-                                        base,
-                                        screen_lines,
-                                    );
-                                }
-                            }
-                        } else {
+                        OscCommand::Notification { title, body } => {
                             dispatch_notification_if_allowed(
-                                "Fastty",
-                                &payload,
+                                &title,
+                                &body,
                                 &program_status_clone,
                                 &event_listener_clone,
                                 cursor_line,
@@ -1010,111 +1160,51 @@ impl TerminalState {
                                 screen_lines,
                             );
                         }
-                    }
-                    OscCommand::KittyClipboard { metadata, payload } => {
-                        use crate::parser::kitty_clipboard as kclip;
-                        let Some(msg) = kclip::parse(&metadata, &payload) else {
-                            return;
-                        };
-                        let write_resp = |resp: String| {
-                            let mut w = writer_clone.lock();
-                            let _ = w.write_all(resp.as_bytes());
-                            let _ = w.flush();
-                        };
-                        match msg {
-                            kclip::Message::WriteBegin { id } => {
-                                kitty_clip_write = Some(kclip::WriteSession::new(id));
-                            }
-                            kclip::Message::WriteData { id, mime, data } => match (mime, kitty_clip_write.as_mut()) {
-                                (Some(mime), Some(session)) => {
-                                    if session.push(mime, data).is_err() {
-                                        let id = kitty_clip_write.take().and_then(|s| s.id);
-                                        write_resp(kclip::response("write", "EFBIG", id.as_deref()));
-                                    }
-                                }
-                                (None, Some(_)) => {
-                                    // End of transmission: apply to the clipboard.
-                                    if let Some(session) = kitty_clip_write.take() {
-                                        let id = session.id.clone();
-                                        let status = if session.finish().is_ok() {
-                                            "DONE"
-                                        } else {
-                                            "EIO"
-                                        };
-                                        write_resp(kclip::response("write", status, id.as_deref()));
-                                    }
-                                }
-                                (_, None) => {
-                                    write_resp(kclip::response("write", "EINVAL", id.as_deref()));
-                                }
-                            },
-                            kclip::Message::Read { id, request } => {
-                                if !crate::config::clipboard_read_allowed() {
-                                    write_resp(kclip::response("read", "EPERM", id.as_deref()));
-                                    return;
-                                }
-                                write_resp(kclip::response("read", "OK", id.as_deref()));
-                                for (mime, data) in kclip::read(&request) {
-                                    let chunks: Vec<&[u8]> = if data.is_empty() {
-                                        vec![&[][..]]
-                                    } else {
-                                        data.chunks(kclip::MAX_DATA_CHUNK).collect()
-                                    };
-                                    for chunk in chunks {
-                                        write_resp(kclip::response_data(&mime, chunk, id.as_deref()));
-                                    }
-                                }
-                                write_resp(kclip::response("read", "DONE", id.as_deref()));
-                            }
+                        _ => {
+                            dispatch_osc_action(
+                                &cmd,
+                                &event_listener_clone,
+                                cursor_line,
+                                base,
+                                screen_lines,
+                            );
                         }
                     }
-                    OscCommand::Notification { title, body } => {
-                        dispatch_notification_if_allowed(
-                            &title,
-                            &body,
-                            &program_status_clone,
-                            &event_listener_clone,
-                            cursor_line,
-                            base,
-                            screen_lines,
-                        );
-                    }
-                    _ => {
-                        dispatch_osc_action(&cmd, &event_listener_clone, cursor_line, base, screen_lines);
-                    }
-                }
-            };
-
-            let mut handle_apc = |apc_data: &[u8],
-                                  cursor_line: i32,
-                                  cursor_col: usize,
-                                  base: u64,
-                                  term_locked: &mut alacritty_terminal::Term<EventListenerProxy>,
-                                  parser: &mut alacritty_terminal::vte::ansi::Processor| -> u64 {
-                if !apc_data.starts_with(b"G") {
-                    return 0;
-                }
-                let body = &apc_data[1..];
-                let semicolon_pos = body.iter().position(|&b| b == b';');
-                let (header, payload_b64) = match semicolon_pos {
-                    Some(pos) => (&body[..pos], &body[pos + 1..]),
-                    None => (body, &[][..]),
                 };
 
-                let mut added_lines = 0u64;
+                let mut handle_apc = |apc_data: &[u8],
+                                      cursor_line: i32,
+                                      cursor_col: usize,
+                                      base: u64,
+                                      term_locked: &mut alacritty_terminal::Term<
+                    EventListenerProxy,
+                >,
+                                      parser: &mut alacritty_terminal::vte::ansi::Processor|
+                 -> u64 {
+                    if !apc_data.starts_with(b"G") {
+                        return 0;
+                    }
+                    let body = &apc_data[1..];
+                    let semicolon_pos = body.iter().position(|&b| b == b';');
+                    let (header, payload_b64) = match semicolon_pos {
+                        Some(pos) => (&body[..pos], &body[pos + 1..]),
+                        None => (body, &[][..]),
+                    };
 
-                if let Some(ctrl) = crate::parser::kitty_graphics::parse_kitty_control(header) {
-                    match ctrl.action {
-                        crate::parser::kitty_graphics::KittyAction::Query => {
-                            let id = ctrl.image_id.unwrap_or(0);
-                            let resp = format!("\x1b_Gi={};OK\x1b\\", id);
-                            let mut w = writer_clone.lock();
-                            let _ = w.write_all(resp.as_bytes());
-                            let _ = w.flush();
-                        }
-                        crate::parser::kitty_graphics::KittyAction::Delete => {
-                            let mut store = image_store_clone.lock();
-                            match ctrl.delete_action {
+                    let mut added_lines = 0u64;
+
+                    if let Some(ctrl) = crate::parser::kitty_graphics::parse_kitty_control(header) {
+                        match ctrl.action {
+                            crate::parser::kitty_graphics::KittyAction::Query => {
+                                let id = ctrl.image_id.unwrap_or(0);
+                                let resp = format!("\x1b_Gi={};OK\x1b\\", id);
+                                let mut w = writer_clone.lock();
+                                let _ = w.write_all(resp.as_bytes());
+                                let _ = w.flush();
+                            }
+                            crate::parser::kitty_graphics::KittyAction::Delete => {
+                                let mut store = image_store_clone.lock();
+                                match ctrl.delete_action {
                                 Some(crate::parser::kitty_graphics::KittyDeleteAction::All) => {
                                     store.delete_all();
                                 }
@@ -1128,32 +1218,35 @@ impl TerminalState {
                                     store.delete_all();
                                 }
                             }
-                        }
-                        crate::parser::kitty_graphics::KittyAction::Put => {
-                            if let Some(id) = ctrl.image_id {
-                                let mut store = image_store_clone.lock();
-                                if let Some(img) = store.images.get(&id).cloned() {
-                                    let abs_line = (base as i64 + cursor_line as i64).max(0) as u64;
-                                    let cols = ctrl.columns.unwrap_or(10);
-                                    let rows = ctrl.rows.unwrap_or(5);
-                                    store.add_placement(ImagePlacement {
-                                        placement_id: ctrl.placement_id.unwrap_or(0),
-                                        image_id: id,
-                                        absolute_line: abs_line,
-                                        col: cursor_col,
-                                        cols,
-                                        rows,
-                                        z_index: ctrl.z_index,
-                                        image: img,
-                                    });
+                            }
+                            crate::parser::kitty_graphics::KittyAction::Put => {
+                                if let Some(id) = ctrl.image_id {
+                                    let mut store = image_store_clone.lock();
+                                    if let Some(img) = store.images.get(&id).cloned() {
+                                        let abs_line =
+                                            (base as i64 + cursor_line as i64).max(0) as u64;
+                                        let cols = ctrl.columns.unwrap_or(10);
+                                        let rows = ctrl.rows.unwrap_or(5);
+                                        store.add_placement(ImagePlacement {
+                                            placement_id: ctrl.placement_id.unwrap_or(0),
+                                            image_id: id,
+                                            absolute_line: abs_line,
+                                            col: cursor_col,
+                                            cols,
+                                            rows,
+                                            z_index: ctrl.z_index,
+                                            image: img,
+                                        });
+                                    }
                                 }
                             }
-                        }
-                        crate::parser::kitty_graphics::KittyAction::TransmitAndDisplay
-                        | crate::parser::kitty_graphics::KittyAction::ImmediateDisplay => {
-                            if let Some((final_ctrl, mut raw_bytes)) = kitty_reassembler.push_chunk(ctrl.clone(), payload_b64) {
-                                // If transmission is file-based (t=f or t=t), read bytes from filesystem path
-                                if (final_ctrl.transmission == crate::parser::kitty_graphics::KittyTransmission::File
+                            crate::parser::kitty_graphics::KittyAction::TransmitAndDisplay
+                            | crate::parser::kitty_graphics::KittyAction::ImmediateDisplay => {
+                                if let Some((final_ctrl, mut raw_bytes)) =
+                                    kitty_reassembler.push_chunk(ctrl.clone(), payload_b64)
+                                {
+                                    // If transmission is file-based (t=f or t=t), read bytes from filesystem path
+                                    if (final_ctrl.transmission == crate::parser::kitty_graphics::KittyTransmission::File
                                     || final_ctrl.transmission == crate::parser::kitty_graphics::KittyTransmission::TempFile)
                                     && !raw_bytes.is_empty()
                                 {
@@ -1165,260 +1258,339 @@ impl TerminalState {
                                     }
                                 }
 
-                                if let Ok((render_img, img_w, img_h)) = crate::parser::kitty_graphics::decode_image_data(
-                                    final_ctrl.format,
-                                    final_ctrl.width_px,
-                                    final_ctrl.height_px,
-                                    &raw_bytes,
-                                ) {
-                                    let img_id = final_ctrl.image_id.unwrap_or_else(|| next_image_id_clone.fetch_add(1, Ordering::Relaxed) as u32);
-                                    let mut store = image_store_clone.lock();
-                                    store.add_image(img_id, render_img.clone());
+                                    if let Ok((render_img, img_w, img_h)) =
+                                        crate::parser::kitty_graphics::decode_image_data(
+                                            final_ctrl.format,
+                                            final_ctrl.width_px,
+                                            final_ctrl.height_px,
+                                            &raw_bytes,
+                                        )
+                                    {
+                                        let img_id = final_ctrl.image_id.unwrap_or_else(|| {
+                                            next_image_id_clone.fetch_add(1, Ordering::Relaxed)
+                                                as u32
+                                        });
+                                        let mut store = image_store_clone.lock();
+                                        store.add_image(img_id, render_img.clone());
 
-                                    let abs_line = (base as i64 + cursor_line as i64).max(0) as u64;
-                                    let cw = if cell_width > 0.0 { cell_width } else { 9.0 };
-                                    let ch = if cell_height > 0.0 { cell_height } else { 18.0 };
-                                    let cols = final_ctrl.columns.unwrap_or_else(|| {
-                                        ((img_w as f32) / cw).ceil().max(1.0) as usize
-                                    });
-                                    let rows = final_ctrl.rows.unwrap_or_else(|| {
-                                        ((img_h as f32) / ch).ceil().max(1.0) as usize
-                                    });
-                                    store.add_placement(ImagePlacement {
-                                        placement_id: final_ctrl.placement_id.unwrap_or(0),
-                                        image_id: img_id,
-                                        absolute_line: abs_line,
-                                        col: cursor_col,
-                                        cols,
-                                        rows,
-                                        z_index: final_ctrl.z_index,
-                                        image: render_img,
-                                    });
+                                        let abs_line =
+                                            (base as i64 + cursor_line as i64).max(0) as u64;
+                                        let cw = if cell_width > 0.0 { cell_width } else { 9.0 };
+                                        let ch = if cell_height > 0.0 { cell_height } else { 18.0 };
+                                        let cols = final_ctrl.columns.unwrap_or_else(|| {
+                                            ((img_w as f32) / cw).ceil().max(1.0) as usize
+                                        });
+                                        let rows = final_ctrl.rows.unwrap_or_else(|| {
+                                            ((img_h as f32) / ch).ceil().max(1.0) as usize
+                                        });
+                                        store.add_placement(ImagePlacement {
+                                            placement_id: final_ctrl.placement_id.unwrap_or(0),
+                                            image_id: img_id,
+                                            absolute_line: abs_line,
+                                            col: cursor_col,
+                                            cols,
+                                            rows,
+                                            z_index: final_ctrl.z_index,
+                                            image: render_img,
+                                        });
 
-                                    if final_ctrl.cursor_movement && rows > 0 {
-                                        parser.advance(&mut *term_locked, &vec![0x0A; rows as usize]);
-                                        added_lines = rows as u64;
+                                        if final_ctrl.cursor_movement && rows > 0 {
+                                            parser.advance(
+                                                &mut *term_locked,
+                                                &vec![0x0A; rows as usize],
+                                            );
+                                            added_lines = rows as u64;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-                added_lines
-            };
+                    added_lines
+                };
 
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
-                        update_program_status(&program_status_clone, &program_status_pending_clone, &event_listener_clone, source_id,
-                            |store| store.end_activity());
-                        alive_clone.store(false, Ordering::Relaxed);
-                        event_listener_clone.send_app_event(AppEvent::Exit { shell_pid: reader_shell_pid });
-                        break;
-                    }
-                    Ok(n) => {
-                        let output_boundary = output_hub_clone.boundary.lock();
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => {
+                            update_program_status(
+                                &program_status_clone,
+                                &program_status_pending_clone,
+                                &event_listener_clone,
+                                source_id,
+                                |store| store.end_activity(),
+                            );
+                            alive_clone.store(false, Ordering::Relaxed);
+                            event_listener_clone.send_app_event(AppEvent::Exit {
+                                shell_pid: reader_shell_pid,
+                            });
+                            break;
+                        }
+                        Ok(n) => {
+                            let output_boundary = output_hub_clone.boundary.lock();
 
-                        let mut term_locked = term_clone.lock();
-                        let mut local_lines = 0;
+                            let mut term_locked = term_clone.lock();
+                            let mut local_lines = 0;
 
-                        // Debug: write raw PTY bytes to log file
-                        if pty_debug {
-                            use std::io::Write as _;
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(&pty_log_path)
+                            // Debug: write raw PTY bytes to log file
+                            if pty_debug {
+                                use std::io::Write as _;
+                                if let Ok(mut f) = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(&pty_log_path)
+                                {
+                                    let ts = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis();
+                                    let escaped: String = buf[..n]
+                                        .iter()
+                                        .map(|&b| match b {
+                                            0x1b => "ESC".to_string(),
+                                            0x07 => "BEL".to_string(),
+                                            b if b.is_ascii_graphic() || b == b' ' => {
+                                                format!("{}", b as char)
+                                            }
+                                            b => format!("\\x{:02x}", b),
+                                        })
+                                        .collect();
+                                    let _ = writeln!(f, "[{}ms] PTY({} bytes): {}", ts, n, escaped);
+                                }
+                            }
+
+                            for &byte in buf[..n].iter() {
+                                if byte == 0x0A {
+                                    local_lines += 1;
+                                }
+
+                                parser.advance(&mut *term_locked, &[byte]);
+
+                                match seq_state {
+                                    SequenceParseState::Normal => {
+                                        if byte == 0x1b {
+                                            seq_state = SequenceParseState::Esc;
+                                        }
+                                    }
+                                    SequenceParseState::Esc => {
+                                        if byte == b']' {
+                                            seq_state = SequenceParseState::Osc;
+                                            osc_buf.clear();
+                                        } else if byte == b'c' {
+                                            update_program_status(
+                                                &program_status_clone,
+                                                &program_status_pending_clone,
+                                                &event_listener_clone,
+                                                source_id,
+                                                |store| store.reset(),
+                                            );
+                                            seq_state = SequenceParseState::Normal;
+                                        } else if byte == b'_' {
+                                            seq_state = SequenceParseState::Apc;
+                                            apc_buf.clear();
+                                        } else {
+                                            seq_state = SequenceParseState::Normal;
+                                        }
+                                    }
+                                    SequenceParseState::Osc => {
+                                        if byte == 0x07 {
+                                            if let Some(cmd) =
+                                                parse_osc_framed(&osc_buf, &mut cmd_start_time, 3)
+                                            {
+                                                let cursor_line =
+                                                    term_locked.grid().cursor.point.line.0 as i32;
+                                                let screen_lines =
+                                                    term_locked.grid().screen_lines() as i32;
+                                                let base = total_lines_pushed_clone
+                                                    .load(Ordering::Relaxed)
+                                                    + local_lines;
+                                                handle_cmd(
+                                                    cmd,
+                                                    cursor_line,
+                                                    screen_lines,
+                                                    base,
+                                                    &mut term_locked,
+                                                    &mut parser,
+                                                );
+                                            }
+                                            seq_state = SequenceParseState::Normal;
+                                        } else if byte == 0x1b {
+                                            seq_state = SequenceParseState::OscEsc;
+                                        } else {
+                                            osc_buf.push(byte);
+                                            if osc_buf.len() > 131072 {
+                                                seq_state = SequenceParseState::Normal;
+                                            }
+                                        }
+                                    }
+                                    SequenceParseState::OscEsc => {
+                                        if byte == b'\\' {
+                                            if let Some(cmd) =
+                                                parse_osc_framed(&osc_buf, &mut cmd_start_time, 4)
+                                            {
+                                                let cursor_line =
+                                                    term_locked.grid().cursor.point.line.0 as i32;
+                                                let screen_lines =
+                                                    term_locked.grid().screen_lines() as i32;
+                                                let base = total_lines_pushed_clone
+                                                    .load(Ordering::Relaxed)
+                                                    + local_lines;
+                                                handle_cmd(
+                                                    cmd,
+                                                    cursor_line,
+                                                    screen_lines,
+                                                    base,
+                                                    &mut term_locked,
+                                                    &mut parser,
+                                                );
+                                            }
+                                            seq_state = SequenceParseState::Normal;
+                                        } else {
+                                            osc_buf.push(0x1b);
+                                            osc_buf.push(byte);
+                                            seq_state = SequenceParseState::Osc;
+                                            if osc_buf.len() > 131072 {
+                                                seq_state = SequenceParseState::Normal;
+                                            }
+                                        }
+                                    }
+                                    SequenceParseState::Apc => {
+                                        if byte == 0x07 {
+                                            let cursor_line =
+                                                term_locked.grid().cursor.point.line.0 as i32;
+                                            let cursor_col =
+                                                term_locked.grid().cursor.point.column.0;
+                                            let base = total_lines_pushed_clone
+                                                .load(Ordering::Relaxed)
+                                                + local_lines;
+                                            let added = handle_apc(
+                                                &apc_buf,
+                                                cursor_line,
+                                                cursor_col,
+                                                base,
+                                                &mut term_locked,
+                                                &mut parser,
+                                            );
+                                            local_lines += added;
+                                            seq_state = SequenceParseState::Normal;
+                                        } else if byte == 0x1b {
+                                            seq_state = SequenceParseState::ApcEsc;
+                                        } else {
+                                            apc_buf.push(byte);
+                                            if apc_buf.len() > 16 * 1024 * 1024 {
+                                                seq_state = SequenceParseState::Normal;
+                                            }
+                                        }
+                                    }
+                                    SequenceParseState::ApcEsc => {
+                                        if byte == b'\\' {
+                                            let cursor_line =
+                                                term_locked.grid().cursor.point.line.0 as i32;
+                                            let cursor_col =
+                                                term_locked.grid().cursor.point.column.0;
+                                            let base = total_lines_pushed_clone
+                                                .load(Ordering::Relaxed)
+                                                + local_lines;
+                                            let added = handle_apc(
+                                                &apc_buf,
+                                                cursor_line,
+                                                cursor_col,
+                                                base,
+                                                &mut term_locked,
+                                                &mut parser,
+                                            );
+                                            local_lines += added;
+                                            seq_state = SequenceParseState::Normal;
+                                        } else {
+                                            apc_buf.push(0x1b);
+                                            apc_buf.push(byte);
+                                            seq_state = SequenceParseState::Apc;
+                                            if apc_buf.len() > 16 * 1024 * 1024 {
+                                                seq_state = SequenceParseState::Normal;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // CSI detection: dispatch watcher events for
+                                // scrollback wipes and Synchronized Output.
+                                match csi_watcher.feed(byte) {
+                                    Some(CsiEvent::ClearHistory) => clear_history_flag = true,
+                                    Some(CsiEvent::QueryKittyClipboard) => {
+                                        // DECRQM for mode 5522: reply "set" —
+                                        // fastty implements the kitty clipboard
+                                        // protocol (reads, writes, images).
+                                        let resp = b"\x1b[?5522;1$y";
+                                        let mut w = writer_clone.lock();
+                                        let _ = w.write_all(resp);
+                                        let _ = w.flush();
+                                    }
+                                    Some(CsiEvent::SyncOutputBegin) => {
+                                        sync_output_active = true;
+                                        sync_started = Some(std::time::Instant::now());
+                                    }
+                                    Some(CsiEvent::SyncOutputEnd) => {
+                                        sync_output_active = false;
+                                        sync_started = None;
+                                    }
+                                    None => {}
+                                }
+                            }
+                            // After the byte loop: clear scrollback history if we detected
+                            // \x1b[2J (EraseDisplay::All) on the main screen.
+                            if clear_history_flag {
+                                use alacritty_terminal::term::TermMode;
+                                let mode = *term_locked.mode();
+                                if !mode.contains(TermMode::ALT_SCREEN) {
+                                    term_locked.grid_mut().clear_history();
+                                    image_store_clone.lock().placements.clear();
+                                }
+                                clear_history_flag = false;
+                            }
+                            drop(term_locked);
+
+                            total_lines_pushed_clone.fetch_add(local_lines, Ordering::Relaxed);
+                            if local_lines > 0 {
+                                let total_pushed = total_lines_pushed_clone.load(Ordering::Relaxed);
+                                let min_line = total_pushed.saturating_sub(scrollback as u64);
+                                image_store_clone.lock().prune_old_placements(min_line);
+                            }
+
+                            // Synchronized Output: if the app still holds mode 2026
+                            // set and the safety deadline passed, release it so a
+                            // crashed app can never freeze the screen.
+                            if sync_output_active
+                                && sync_started.is_some_and(|t| t.elapsed() >= SYNC_OUTPUT_TIMEOUT)
                             {
-                                let ts = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis();
-                                let escaped: String = buf[..n].iter().map(|&b| {
-                                    match b {
-                                        0x1b => "ESC".to_string(),
-                                        0x07 => "BEL".to_string(),
-                                        b if b.is_ascii_graphic() || b == b' ' => format!("{}", b as char),
-                                        b => format!("\\x{:02x}", b),
-                                    }
-                                }).collect();
-                                let _ = writeln!(f, "[{}ms] PTY({} bytes): {}", ts, n, escaped);
+                                sync_output_active = false;
+                                sync_started = None;
                             }
-                        }
-
-                        for &byte in buf[..n].iter() {
-                            if byte == 0x0A {
-                                local_lines += 1;
+                            if !sync_output_active {
+                                render_gen_clone.fetch_add(1, Ordering::Relaxed);
+                                event_listener_clone.send_app_event(AppEvent::Wakeup);
                             }
-
-                            parser.advance(&mut *term_locked, &[byte]);
-
-                            match seq_state {
-                                SequenceParseState::Normal => {
-                                    if byte == 0x1b {
-                                        seq_state = SequenceParseState::Esc;
-                                    }
-                                }
-                                SequenceParseState::Esc => {
-                                    if byte == b']' {
-                                        seq_state = SequenceParseState::Osc;
-                                        osc_buf.clear();
-                                    } else if byte == b'c' {
-                                        update_program_status(&program_status_clone, &program_status_pending_clone, &event_listener_clone, source_id,
-                                            |store| store.reset());
-                                        seq_state = SequenceParseState::Normal;
-                                    } else if byte == b'_' {
-                                        seq_state = SequenceParseState::Apc;
-                                        apc_buf.clear();
-                                    } else {
-                                        seq_state = SequenceParseState::Normal;
-                                    }
-                                }
-                                SequenceParseState::Osc => {
-                                    if byte == 0x07 {
-                                        if let Some(cmd) = parse_osc_framed(&osc_buf, &mut cmd_start_time, 3) {
-                                            let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
-                                            let screen_lines = term_locked.grid().screen_lines() as i32;
-                                            let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
-                                            handle_cmd(cmd, cursor_line, screen_lines, base, &mut term_locked, &mut parser);
-                                        }
-                                        seq_state = SequenceParseState::Normal;
-                                    } else if byte == 0x1b {
-                                        seq_state = SequenceParseState::OscEsc;
-                                    } else {
-                                        osc_buf.push(byte);
-                                        if osc_buf.len() > 131072 {
-                                            seq_state = SequenceParseState::Normal;
-                                        }
-                                    }
-                                }
-                                SequenceParseState::OscEsc => {
-                                    if byte == b'\\' {
-                                        if let Some(cmd) = parse_osc_framed(&osc_buf, &mut cmd_start_time, 4) {
-                                            let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
-                                            let screen_lines = term_locked.grid().screen_lines() as i32;
-                                            let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
-                                            handle_cmd(cmd, cursor_line, screen_lines, base, &mut term_locked, &mut parser);
-                                        }
-                                        seq_state = SequenceParseState::Normal;
-                                    } else {
-                                        osc_buf.push(0x1b);
-                                        osc_buf.push(byte);
-                                        seq_state = SequenceParseState::Osc;
-                                        if osc_buf.len() > 131072 {
-                                            seq_state = SequenceParseState::Normal;
-                                        }
-                                    }
-                                }
-                                SequenceParseState::Apc => {
-                                    if byte == 0x07 {
-                                        let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
-                                        let cursor_col = term_locked.grid().cursor.point.column.0;
-                                        let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
-                                        let added = handle_apc(&apc_buf, cursor_line, cursor_col, base, &mut term_locked, &mut parser);
-                                        local_lines += added;
-                                        seq_state = SequenceParseState::Normal;
-                                    } else if byte == 0x1b {
-                                        seq_state = SequenceParseState::ApcEsc;
-                                    } else {
-                                        apc_buf.push(byte);
-                                        if apc_buf.len() > 16 * 1024 * 1024 {
-                                            seq_state = SequenceParseState::Normal;
-                                        }
-                                    }
-                                }
-                                SequenceParseState::ApcEsc => {
-                                    if byte == b'\\' {
-                                        let cursor_line = term_locked.grid().cursor.point.line.0 as i32;
-                                        let cursor_col = term_locked.grid().cursor.point.column.0;
-                                        let base = total_lines_pushed_clone.load(Ordering::Relaxed) + local_lines;
-                                        let added = handle_apc(&apc_buf, cursor_line, cursor_col, base, &mut term_locked, &mut parser);
-                                        local_lines += added;
-                                        seq_state = SequenceParseState::Normal;
-                                    } else {
-                                        apc_buf.push(0x1b);
-                                        apc_buf.push(byte);
-                                        seq_state = SequenceParseState::Apc;
-                                        if apc_buf.len() > 16 * 1024 * 1024 {
-                                            seq_state = SequenceParseState::Normal;
-                                        }
-                                    }
-                                }
-                            }
-
-                            // CSI detection: dispatch watcher events for
-                            // scrollback wipes and Synchronized Output.
-                            match csi_watcher.feed(byte) {
-                                Some(CsiEvent::ClearHistory) => clear_history_flag = true,
-                                Some(CsiEvent::QueryKittyClipboard) => {
-                                    // DECRQM for mode 5522: reply "set" —
-                                    // fastty implements the kitty clipboard
-                                    // protocol (reads, writes, images).
-                                    let resp = b"\x1b[?5522;1$y";
-                                    let mut w = writer_clone.lock();
-                                    let _ = w.write_all(resp);
-                                    let _ = w.flush();
-                                }
-                                Some(CsiEvent::SyncOutputBegin) => {
-                                    sync_output_active = true;
-                                    sync_started = Some(std::time::Instant::now());
-                                }
-                                Some(CsiEvent::SyncOutputEnd) => {
-                                    sync_output_active = false;
-                                    sync_started = None;
-                                }
-                                None => {}
-                            }
+                            output_hub_clone.publish_at_boundary(&buf[..n]);
+                            drop(output_boundary);
                         }
-                        // After the byte loop: clear scrollback history if we detected
-                        // \x1b[2J (EraseDisplay::All) on the main screen.
-                        if clear_history_flag {
-                            use alacritty_terminal::term::TermMode;
-                            let mode = *term_locked.mode();
-                            if !mode.contains(TermMode::ALT_SCREEN) {
-                                term_locked.grid_mut().clear_history();
-                                image_store_clone.lock().placements.clear();
-                            }
-                            clear_history_flag = false;
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                            continue;
                         }
-                        drop(term_locked);
-
-                        total_lines_pushed_clone.fetch_add(local_lines, Ordering::Relaxed);
-                        if local_lines > 0 {
-                            let total_pushed = total_lines_pushed_clone.load(Ordering::Relaxed);
-                            let min_line = total_pushed.saturating_sub(scrollback as u64);
-                            image_store_clone.lock().prune_old_placements(min_line);
+                        Err(_) => {
+                            update_program_status(
+                                &program_status_clone,
+                                &program_status_pending_clone,
+                                &event_listener_clone,
+                                source_id,
+                                |store| store.end_activity(),
+                            );
+                            alive_clone.store(false, Ordering::Relaxed);
+                            event_listener_clone.send_app_event(AppEvent::Exit {
+                                shell_pid: reader_shell_pid,
+                            });
+                            break;
                         }
-
-                        // Synchronized Output: if the app still holds mode 2026
-                        // set and the safety deadline passed, release it so a
-                        // crashed app can never freeze the screen.
-                        if sync_output_active
-                            && sync_started.is_some_and(|t| t.elapsed() >= SYNC_OUTPUT_TIMEOUT)
-                        {
-                            sync_output_active = false;
-                            sync_started = None;
-                        }
-                        if !sync_output_active {
-                            render_gen_clone.fetch_add(1, Ordering::Relaxed);
-                            event_listener_clone.send_app_event(AppEvent::Wakeup);
-                        }
-                        output_hub_clone.publish_at_boundary(&buf[..n]);
-                        drop(output_boundary);
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                        continue;
-                    }
-                    Err(_) => {
-                        update_program_status(&program_status_clone, &program_status_pending_clone, &event_listener_clone, source_id,
-                            |store| store.end_activity());
-                        alive_clone.store(false, Ordering::Relaxed);
-                        event_listener_clone.send_app_event(AppEvent::Exit { shell_pid: reader_shell_pid });
-                        break;
                     }
                 }
-            }
-        });
+            });
         }
 
         #[cfg(unix)]
@@ -1478,6 +1650,23 @@ impl TerminalState {
         records
     }
 
+    pub fn program_status_snapshot(&self) -> Vec<crate::program_status::ProgramRecord> {
+        self.program_status.lock().snapshot()
+    }
+
+    pub fn report_external_program_status(&self, payload: &[u8]) -> Result<(), String> {
+        let command = crate::program_status::parse(payload, payload.len() + 9)
+            .ok_or_else(|| "invalid program status report".to_string())?;
+        update_program_status(
+            &self.program_status,
+            &self.program_status_pending,
+            &self.event_listener,
+            self.source_id,
+            |store| store.apply(command),
+        );
+        Ok(())
+    }
+
     pub fn shell_pid(&self) -> Option<u32> {
         self.shell_pid
     }
@@ -1508,8 +1697,8 @@ impl TerminalState {
 
     pub fn needs_close_confirmation(&self) -> bool {
         if let Some(session_id) = self.remote_session_id {
-            let has_foreground_process = crate::session_host::session_process_running(session_id)
-                .unwrap_or(true);
+            let has_foreground_process =
+                crate::session_host::session_process_running(session_id).unwrap_or(true);
             remote_session_needs_close_confirmation(Some(session_id), has_foreground_process)
         } else {
             self.is_process_running()
@@ -1522,7 +1711,10 @@ impl TerminalState {
             let _store = self.program_status.lock();
             self.program_status_pending.store(true, Ordering::Relaxed);
         }
-        self.event_listener.send_app_event(AppEvent::ProgramStatusChanged { source_id: self.source_id });
+        self.event_listener
+            .send_app_event(AppEvent::ProgramStatusChanged {
+                source_id: self.source_id,
+            });
     }
 
     pub fn get_current_working_directory(&self) -> Option<std::path::PathBuf> {
@@ -1546,8 +1738,57 @@ impl TerminalState {
         }
     }
 
+    pub fn get_foreground_process_command(&self) -> Option<String> {
+        let shell_pid = self.shell_pid?;
+        #[cfg(unix)]
+        {
+            let output = std::process::Command::new("ps")
+                .args(["-axo", "pid=,ppid=,command="])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let mut processes = std::string::String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    let pid = fields.next()?.parse::<u32>().ok()?;
+                    let parent = fields.next()?.parse::<u32>().ok()?;
+                    let command = fields.collect::<Vec<_>>().join(" ");
+                    (!command.is_empty()).then_some((pid, parent, command))
+                })
+                .collect::<Vec<_>>();
+            processes.sort_by_key(|(pid, _, _)| *pid);
+            let mut current = shell_pid;
+            let mut selected = processes
+                .iter()
+                .find(|(pid, _, _)| *pid == shell_pid)
+                .map(|(_, _, command)| command.clone());
+            for _ in 0..32 {
+                let next = processes
+                    .iter()
+                    .rev()
+                    .find(|(_, parent, _)| *parent == current);
+                let Some((pid, _, command)) = next else {
+                    break;
+                };
+                current = *pid;
+                selected = Some(command.clone());
+            }
+            selected
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = shell_pid;
+            None
+        }
+    }
+
     pub fn is_process_running(&self) -> bool {
-        let Some(pid) = self.shell_pid else { return false; };
+        let Some(pid) = self.shell_pid else {
+            return false;
+        };
         if !self.alive.load(Ordering::Relaxed) {
             return false;
         }
@@ -1560,11 +1801,17 @@ impl TerminalState {
             let foreground_pgid = unsafe { libc::tcgetpgrp(fd) };
             let has_foreground_child = if foreground_pgid > 0 {
                 #[cfg(target_os = "macos")]
-                { has_active_child_macos(pid, foreground_pgid) }
+                {
+                    has_active_child_macos(pid, foreground_pgid)
+                }
                 #[cfg(target_os = "linux")]
-                { has_active_child_linux(pid, foreground_pgid) }
+                {
+                    has_active_child_linux(pid, foreground_pgid)
+                }
                 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-                { false }
+                {
+                    false
+                }
             } else {
                 false
             };
@@ -1575,23 +1822,35 @@ impl TerminalState {
             )
         }
         #[cfg(not(unix))]
-        { let _ = pid; false }
+        {
+            let _ = pid;
+            false
+        }
     }
 
     pub fn terminate_process(&self) {
-        if self.has_terminated.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .has_terminated
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             return;
         }
         if let Some(remote) = &self.remote_control {
             remote.stop();
             return;
         }
-        let Some(pid) = self.shell_pid else { return; };
-        if pid <= 1 { return; }
+        let Some(pid) = self.shell_pid else {
+            return;
+        };
+        if pid <= 1 {
+            return;
+        }
         #[cfg(not(windows))]
         {
             let ipid = pid as i32;
-            if ipid <= 1 { return; }
+            if ipid <= 1 {
+                return;
+            }
             std::thread::spawn(move || {
                 unsafe {
                     libc::kill(-ipid, libc::SIGHUP);
@@ -1640,7 +1899,6 @@ pub struct PreviewLine {
 }
 
 impl TerminalState {
-
     pub fn write_to_pty(&self, bytes: &[u8]) {
         let mut w = self.writer.lock();
         let _ = w.write_all(bytes);
@@ -1649,7 +1907,8 @@ impl TerminalState {
 
     pub fn update_scrollback(&self, scrollback: usize) {
         let mut term = self.term.lock();
-        term.grid_mut().update_history(scrollback.clamp(500, 100_000));
+        term.grid_mut()
+            .update_history(scrollback.clamp(500, 100_000));
     }
 
     pub fn is_mouse_mode_enabled(&self) -> bool {
@@ -1664,7 +1923,8 @@ impl TerminalState {
 
     pub fn is_bracketed_paste_enabled(&self) -> bool {
         let term = self.term.lock();
-        term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
+        term.mode()
+            .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
     }
 
     pub fn send_mouse_event(&self, button: u8, col: usize, row: usize, pressed: bool) {
@@ -1804,7 +2064,13 @@ impl TerminalState {
         self.resize_with_pixels(cols, rows, (cols as u16) * 8, (rows as u16) * 16);
     }
 
-    pub fn resize_with_pixels(&self, cols: usize, rows: usize, pixel_width: u16, pixel_height: u16) {
+    pub fn resize_with_pixels(
+        &self,
+        cols: usize,
+        rows: usize,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) {
         if cols == 0 || rows == 0 {
             return;
         }
@@ -1818,12 +2084,15 @@ impl TerminalState {
         term.resize(size);
         drop(term);
 
-        self.master.lock().resize(PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
-            pixel_width,
-            pixel_height,
-        }).ok();
+        self.master
+            .lock()
+            .resize(PtySize {
+                rows: rows as u16,
+                cols: cols as u16,
+                pixel_width,
+                pixel_height,
+            })
+            .ok();
         if let Some(remote) = &self.remote_control {
             remote.resize(cols, rows);
         }
@@ -1936,8 +2205,6 @@ impl TerminalState {
         term.history_size()
     }
 
-
-
     pub fn search_matches(&self, query: &str) -> Vec<usize> {
         if query.trim().is_empty() {
             return Vec::new();
@@ -1963,11 +2230,7 @@ impl TerminalState {
                 }
             }
             if line_str.to_lowercase().contains(&query_lower) {
-                let offset = if line_i < 0 {
-                    (-line_i) as usize
-                } else {
-                    0
-                };
+                let offset = if line_i < 0 { (-line_i) as usize } else { 0 };
                 matches.push(offset);
             }
         }
@@ -2020,11 +2283,7 @@ impl TerminalState {
             };
 
             if is_match {
-                let offset = if line_i < 0 {
-                    (-line_i) as usize
-                } else {
-                    0
-                };
+                let offset = if line_i < 0 { (-line_i) as usize } else { 0 };
                 snippets.push(SearchSnippet {
                     offset,
                     line_index: line_i,
@@ -2132,7 +2391,11 @@ impl TerminalState {
                         cell.fg
                     };
                     let effective_bold = cell.flags.contains(Flags::BOLD);
-                    let c = if cell.c == '\t' || cell.c == '\0' { ' ' } else { cell.c };
+                    let c = if cell.c == '\t' || cell.c == '\0' {
+                        ' '
+                    } else {
+                        cell.c
+                    };
 
                     let cell_fg_opt = match effective_fg {
                         alacritty_terminal::vte::ansi::Color::Named(
@@ -2167,7 +2430,11 @@ impl TerminalState {
             result.push(PreviewLine {
                 spans,
                 is_cursor_row,
-                cursor_col: if is_cursor_row { Some(cursor_col) } else { None },
+                cursor_col: if is_cursor_row {
+                    Some(cursor_col)
+                } else {
+                    None
+                },
             });
         }
 
@@ -2197,11 +2464,51 @@ impl TerminalState {
     /// this method has no theme to resolve them against, and a client-side
     /// default is a reasonable approximation for a one-shot snapshot.
     pub fn snapshot_ansi(&self) -> Vec<u8> {
+        self.snapshot_ansi_bounded(usize::MAX).0
+    }
+
+    /// Render the current screen into at most `max_bytes` ANSI bytes.
+    ///
+    /// The renderer stops when the next complete ANSI command or character
+    /// does not fit. This bounds both the returned buffer and cell traversal.
+    pub fn snapshot_ansi_bounded(&self, max_bytes: usize) -> (Vec<u8>, bool) {
         use alacritty_terminal::index::Line;
         use alacritty_terminal::term::cell::Flags;
         use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 
-        fn push_color(out: &mut Vec<u8>, color: AnsiColor, is_bg: bool) {
+        struct BoundedSnapshot {
+            bytes: Vec<u8>,
+            max_bytes: usize,
+            truncated: bool,
+        }
+
+        impl BoundedSnapshot {
+            fn new(max_bytes: usize) -> Self {
+                Self {
+                    bytes: Vec::with_capacity(max_bytes.min(4096)),
+                    max_bytes,
+                    truncated: false,
+                }
+            }
+
+            fn extend_from_slice(&mut self, chunk: &[u8]) {
+                if self.truncated {
+                    return;
+                }
+                if chunk.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
+                    self.truncated = true;
+                    return;
+                }
+                self.bytes.extend_from_slice(chunk);
+            }
+
+            fn extend(&mut self, bytes: impl IntoIterator<Item = u8>) {
+                let bytes = bytes.into_iter().collect::<Vec<_>>();
+                self.extend_from_slice(&bytes);
+            }
+        }
+
+        fn push_color(out: &mut BoundedSnapshot, color: AnsiColor, is_bg: bool) {
             match color {
                 AnsiColor::Named(n) => {
                     let code = match n {
@@ -2274,7 +2581,7 @@ impl TerminalState {
         let cols = grid.columns();
         let mode = *term.mode();
 
-        let mut out = Vec::new();
+        let mut out = BoundedSnapshot::new(max_bytes);
         if mode.contains(alacritty_terminal::term::TermMode::ALT_SCREEN) {
             out.extend_from_slice(b"\x1b[?1049h");
         }
@@ -2285,11 +2592,17 @@ impl TerminalState {
         let mut cur_flags = Flags::empty();
 
         for line_i in 0..screen_lines {
+            if out.truncated {
+                break;
+            }
             if line_i > 0 {
                 out.extend_from_slice(b"\r\n");
             }
             let row = &grid[Line(line_i as i32)];
             for col in 0..cols {
+                if out.truncated {
+                    break;
+                }
                 let cell = &row[alacritty_terminal::index::Column(col)];
                 if cell
                     .flags
@@ -2342,14 +2655,19 @@ impl TerminalState {
                 out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             }
         }
+        if out.truncated {
+            return (out.bytes, true);
+        }
         out.extend_from_slice(b"\x1b[0m");
 
         let cursor_line = grid.cursor.point.line.0;
         let cursor_col = grid.cursor.point.column.0;
         out.extend(format!("\x1b[{};{}H", (cursor_line + 1).max(1), cursor_col + 1).bytes());
 
-        append_restored_terminal_modes(&mut out, mode);
-        out
+        let mut restored_modes = Vec::new();
+        append_restored_terminal_modes(&mut restored_modes, mode);
+        out.extend_from_slice(&restored_modes);
+        (out.bytes, out.truncated)
     }
 
     /// Take a full binary terminal state snapshot in microseconds.
@@ -2357,21 +2675,23 @@ impl TerminalState {
     /// Directly extracts cells into a flat `FasttyPackedCell` contiguous vector with a 32-byte
     /// `FasttyBinarySnapshotHeader`. Restorable directly in WASM or native clients with zero VT
     /// parsing overhead.
-    fn snapshot_binary_parts(&self) -> (
+    fn snapshot_binary_parts(
+        &self,
+        include_history: bool,
+    ) -> (
         crate::server::binary_snapshot::FasttyBinarySnapshotHeader,
         Vec<crate::server::binary_snapshot::FasttyPackedCell>,
     ) {
+        use crate::server::binary_snapshot::{
+            FasttyBinarySnapshotHeader, FasttyPackedCell, BINARY_SNAPSHOT_MAGIC,
+            BINARY_SNAPSHOT_VERSION, CELL_FLAG_BOLD, CELL_FLAG_DIM, CELL_FLAG_HIDDEN,
+            CELL_FLAG_INVERSE, CELL_FLAG_ITALIC, CELL_FLAG_STRIKETHROUGH, CELL_FLAG_UNDERLINE,
+            CELL_FLAG_WIDE_CHAR, CELL_FLAG_WIDE_CHAR_SPACER, SNAPSHOT_FLAG_ALT_SCREEN,
+            SNAPSHOT_FLAG_CURSOR_VISIBLE,
+        };
         use alacritty_terminal::index::Line;
         use alacritty_terminal::term::cell::Flags;
         use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
-        use crate::server::binary_snapshot::{
-            FasttyBinarySnapshotHeader, FasttyPackedCell,
-            BINARY_SNAPSHOT_MAGIC, BINARY_SNAPSHOT_VERSION,
-            CELL_FLAG_BOLD, CELL_FLAG_DIM, CELL_FLAG_ITALIC, CELL_FLAG_UNDERLINE,
-            CELL_FLAG_INVERSE, CELL_FLAG_HIDDEN, CELL_FLAG_STRIKETHROUGH,
-            CELL_FLAG_WIDE_CHAR, CELL_FLAG_WIDE_CHAR_SPACER,
-            SNAPSHOT_FLAG_ALT_SCREEN, SNAPSHOT_FLAG_CURSOR_VISIBLE,
-        };
 
         // Named and 0-15 indexed colors resolve against the ACTIVE theme —
         // snapshots used to hardcode Catppuccin Mocha, feeding web clients
@@ -2436,7 +2756,11 @@ impl TerminalState {
                     let mapped = named_to_rgb(n);
                     // Foreground/Background/Dim resolve per channel via the
                     // caller's default (theme fg for fg, theme bg for bg).
-                    if mapped == 0 { default } else { mapped }
+                    if mapped == 0 {
+                        default
+                    } else {
+                        mapped
+                    }
                 }
                 AnsiColor::Indexed(i) => {
                     if i < 16 {
@@ -2463,17 +2787,39 @@ impl TerminalState {
 
         let cell_to_packed = |cell: &alacritty_terminal::term::cell::Cell| -> FasttyPackedCell {
             let mut flags = 0u16;
-            if cell.flags.contains(Flags::BOLD) { flags |= CELL_FLAG_BOLD; }
-            if cell.flags.contains(Flags::DIM) { flags |= CELL_FLAG_DIM; }
-            if cell.flags.contains(Flags::ITALIC) { flags |= CELL_FLAG_ITALIC; }
-            if cell.flags.intersects(Flags::ALL_UNDERLINES) { flags |= CELL_FLAG_UNDERLINE; }
-            if cell.flags.contains(Flags::INVERSE) { flags |= CELL_FLAG_INVERSE; }
-            if cell.flags.contains(Flags::HIDDEN) { flags |= CELL_FLAG_HIDDEN; }
-            if cell.flags.contains(Flags::STRIKEOUT) { flags |= CELL_FLAG_STRIKETHROUGH; }
-            if cell.flags.contains(Flags::WIDE_CHAR) { flags |= CELL_FLAG_WIDE_CHAR; }
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) { flags |= CELL_FLAG_WIDE_CHAR_SPACER; }
+            if cell.flags.contains(Flags::BOLD) {
+                flags |= CELL_FLAG_BOLD;
+            }
+            if cell.flags.contains(Flags::DIM) {
+                flags |= CELL_FLAG_DIM;
+            }
+            if cell.flags.contains(Flags::ITALIC) {
+                flags |= CELL_FLAG_ITALIC;
+            }
+            if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+                flags |= CELL_FLAG_UNDERLINE;
+            }
+            if cell.flags.contains(Flags::INVERSE) {
+                flags |= CELL_FLAG_INVERSE;
+            }
+            if cell.flags.contains(Flags::HIDDEN) {
+                flags |= CELL_FLAG_HIDDEN;
+            }
+            if cell.flags.contains(Flags::STRIKEOUT) {
+                flags |= CELL_FLAG_STRIKETHROUGH;
+            }
+            if cell.flags.contains(Flags::WIDE_CHAR) {
+                flags |= CELL_FLAG_WIDE_CHAR;
+            }
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                flags |= CELL_FLAG_WIDE_CHAR_SPACER;
+            }
 
-            let c = if cell.c == '\0' { ' ' as u32 } else { cell.c as u32 };
+            let c = if cell.c == '\0' {
+                ' ' as u32
+            } else {
+                cell.c as u32
+            };
             FasttyPackedCell {
                 c,
                 fg: color_to_rgb(cell.fg, &palette, default_fg, &named_to_rgb),
@@ -2491,7 +2837,7 @@ impl TerminalState {
             .mode()
             .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
         // Alt-screen apps don't have history; the alternate grid replaces it.
-        let history_rows = if snapshot_is_alt {
+        let history_rows = if snapshot_is_alt || !include_history {
             0
         } else {
             grid.total_lines().saturating_sub(screen_lines)
@@ -2547,13 +2893,17 @@ impl TerminalState {
 
     /// Take a full binary terminal state snapshot in microseconds.
     pub fn snapshot_binary(&self) -> Vec<u8> {
-        let (header, cells) = self.snapshot_binary_parts();
+        let (header, cells) = self.snapshot_binary_parts(true);
         crate::server::binary_snapshot::encode_snapshot(&header, &cells)
     }
 
     /// Take a full binary terminal state snapshot compressed with Deflate.
     pub fn snapshot_binary_compressed(&self) -> Vec<u8> {
-        let (header, cells) = self.snapshot_binary_parts();
+        self.snapshot_binary_compressed_with_history(true)
+    }
+
+    pub fn snapshot_binary_compressed_with_history(&self, include_history: bool) -> Vec<u8> {
+        let (header, cells) = self.snapshot_binary_parts(include_history);
         crate::server::binary_snapshot::encode_snapshot_compressed(&header, &cells)
     }
 
@@ -2563,10 +2913,8 @@ impl TerminalState {
     /// same semantics as tmux's `respawn-pane`. Returns false on malformed
     /// input, leaving the terminal untouched.
     pub fn restore_binary_snapshot(&self, data: &[u8]) -> bool {
+        use crate::server::binary_snapshot::decode_snapshot;
         use alacritty_terminal::term::TermMode;
-        use crate::server::binary_snapshot::{
-            decode_snapshot,
-        };
 
         let Some((header, cells)) = decode_snapshot(data) else {
             return false;
@@ -2633,12 +2981,12 @@ fn apply_snapshot_to_grid(
     header: &crate::server::binary_snapshot::FasttyBinarySnapshotHeader,
     cells: &[crate::server::binary_snapshot::FasttyPackedCell],
 ) -> bool {
-    use alacritty_terminal::vte::ansi::Processor;
     use crate::server::binary_snapshot::{
-        CELL_FLAG_BOLD, CELL_FLAG_DIM, CELL_FLAG_ITALIC, CELL_FLAG_UNDERLINE,
-        CELL_FLAG_INVERSE, CELL_FLAG_HIDDEN, CELL_FLAG_STRIKETHROUGH,
-        CELL_FLAG_WIDE_CHAR_SPACER, SNAPSHOT_FLAG_CURSOR_VISIBLE,
+        CELL_FLAG_BOLD, CELL_FLAG_DIM, CELL_FLAG_HIDDEN, CELL_FLAG_INVERSE, CELL_FLAG_ITALIC,
+        CELL_FLAG_STRIKETHROUGH, CELL_FLAG_UNDERLINE, CELL_FLAG_WIDE_CHAR_SPACER,
+        SNAPSHOT_FLAG_CURSOR_VISIBLE,
     };
+    use alacritty_terminal::vte::ansi::Processor;
 
     let cols = header.cols as usize;
     let rows = header.rows as usize;
@@ -2661,28 +3009,54 @@ fn apply_snapshot_to_grid(
     let mut cur_flags = u16::MAX;
     let emit_sgr = |out: &mut Vec<u8>, fg: u32, bg: u32, flags: u16| {
         out.extend_from_slice(b"\x1b[0m");
-        if flags & CELL_FLAG_BOLD != 0 { out.extend_from_slice(b"\x1b[1m"); }
-        if flags & CELL_FLAG_DIM != 0 { out.extend_from_slice(b"\x1b[2m"); }
-        if flags & CELL_FLAG_ITALIC != 0 { out.extend_from_slice(b"\x1b[3m"); }
-        if flags & CELL_FLAG_UNDERLINE != 0 { out.extend_from_slice(b"\x1b[4m"); }
-        if flags & CELL_FLAG_INVERSE != 0 { out.extend_from_slice(b"\x1b[7m"); }
-        if flags & CELL_FLAG_HIDDEN != 0 { out.extend_from_slice(b"\x1b[8m"); }
-        if flags & CELL_FLAG_STRIKETHROUGH != 0 { out.extend_from_slice(b"\x1b[9m"); }
+        if flags & CELL_FLAG_BOLD != 0 {
+            out.extend_from_slice(b"\x1b[1m");
+        }
+        if flags & CELL_FLAG_DIM != 0 {
+            out.extend_from_slice(b"\x1b[2m");
+        }
+        if flags & CELL_FLAG_ITALIC != 0 {
+            out.extend_from_slice(b"\x1b[3m");
+        }
+        if flags & CELL_FLAG_UNDERLINE != 0 {
+            out.extend_from_slice(b"\x1b[4m");
+        }
+        if flags & CELL_FLAG_INVERSE != 0 {
+            out.extend_from_slice(b"\x1b[7m");
+        }
+        if flags & CELL_FLAG_HIDDEN != 0 {
+            out.extend_from_slice(b"\x1b[8m");
+        }
+        if flags & CELL_FLAG_STRIKETHROUGH != 0 {
+            out.extend_from_slice(b"\x1b[9m");
+        }
         if fg != 0 {
             out.extend_from_slice(
-                format!("\x1b[38;2;{};{};{}m", (fg >> 16) & 0xff, (fg >> 8) & 0xff, fg & 0xff)
-                    .as_bytes(),
+                format!(
+                    "\x1b[38;2;{};{};{}m",
+                    (fg >> 16) & 0xff,
+                    (fg >> 8) & 0xff,
+                    fg & 0xff
+                )
+                .as_bytes(),
             );
         }
         if bg != 0 {
             out.extend_from_slice(
-                format!("\x1b[48;2;{};{};{}m", (bg >> 16) & 0xff, (bg >> 8) & 0xff, bg & 0xff)
-                    .as_bytes(),
+                format!(
+                    "\x1b[48;2;{};{};{}m",
+                    (bg >> 16) & 0xff,
+                    (bg >> 8) & 0xff,
+                    bg & 0xff
+                )
+                .as_bytes(),
             );
         }
     };
 
-    let mut emit_row = |out: &mut Vec<u8>, row_cells: &[crate::server::binary_snapshot::FasttyPackedCell], newline: bool| {
+    let mut emit_row = |out: &mut Vec<u8>,
+                        row_cells: &[crate::server::binary_snapshot::FasttyPackedCell],
+                        newline: bool| {
         for pc in row_cells {
             // Wide-char spacers are drawn by the parser's own width handling.
             if pc.flags & CELL_FLAG_WIDE_CHAR_SPACER != 0 {
@@ -2751,7 +3125,11 @@ fn file_url_to_path(buf: &[u8]) -> Option<std::path::PathBuf> {
         Some(std::path::PathBuf::from(decoded))
     } else {
         let trimmed = s.trim();
-        if !trimmed.is_empty() && (trimmed.starts_with('/') || trimmed.starts_with('~') || (trimmed.len() >= 2 && trimmed.chars().nth(1) == Some(':'))) {
+        if !trimmed.is_empty()
+            && (trimmed.starts_with('/')
+                || trimmed.starts_with('~')
+                || (trimmed.len() >= 2 && trimmed.chars().nth(1) == Some(':')))
+        {
             Some(std::path::PathBuf::from(trimmed))
         } else {
             None
@@ -2791,14 +3169,17 @@ fn hex_digit(b: u8) -> Option<u8> {
 
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let mut table = [0u8; 256];
-    for (i, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".iter().enumerate() {
+    for (i, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        .iter()
+        .enumerate()
+    {
         table[c as usize] = i as u8;
     }
-    
+
     let mut out = Vec::new();
     let mut buffer = 0u32;
     let mut bits = 0;
-    
+
     for &b in s.as_bytes() {
         if b == b'=' {
             break;
@@ -2824,10 +3205,18 @@ enum OscCommand {
     Cwd(String),
     SetTitle(String),
     CommandStarted,
-    CommandFinished { duration_ms: u128, exit_code: Option<i32> },
+    CommandFinished {
+        duration_ms: u128,
+        exit_code: Option<i32>,
+    },
     PromptStarted,
-    Notification { title: String, body: String },
-    NotificationQuery { id: String },
+    Notification {
+        title: String,
+        body: String,
+    },
+    NotificationQuery {
+        id: String,
+    },
     NotificationFragment {
         id: Option<String>,
         p_type: Option<String>,
@@ -2835,7 +3224,9 @@ enum OscCommand {
         payload: String,
     },
     ResetPalette,
-    ResetColor { code: u8 },
+    ResetColor {
+        code: u8,
+    },
     /// Kitty clipboard protocol (OSC 5522): metadata + raw payload halves.
     KittyClipboard {
         metadata: String,
@@ -2851,10 +3242,7 @@ enum OscCommand {
 /// (`CSI 6 n`) unclaimed in the app's input stream. Go prompt libraries (`gh`,
 /// `survey`) then print the report as literal text and abort the prompt.
 #[cfg(test)]
-fn parse_osc(
-    buf: &[u8],
-    cmd_start_time: &mut Option<std::time::Instant>,
-) -> Option<OscCommand> {
+fn parse_osc(buf: &[u8], cmd_start_time: &mut Option<std::time::Instant>) -> Option<OscCommand> {
     parse_osc_framed(buf, cmd_start_time, 4)
 }
 
@@ -2918,11 +3306,12 @@ fn parse_osc_framed(
             })
         }
         b"99" => {
-            let (metadata_bytes, payload_bytes) = if let Some(idx) = payload.iter().position(|&b| b == b';') {
-                (&payload[..idx], &payload[idx + 1..])
-            } else {
-                (payload, &[][..])
-            };
+            let (metadata_bytes, payload_bytes) =
+                if let Some(idx) = payload.iter().position(|&b| b == b';') {
+                    (&payload[..idx], &payload[idx + 1..])
+                } else {
+                    (payload, &[][..])
+                };
 
             let metadata = std::str::from_utf8(metadata_bytes).ok()?;
             let actual_payload = std::str::from_utf8(payload_bytes).ok()?;
@@ -2969,9 +3358,7 @@ fn parse_osc_framed(
                 payload: decoded_payload,
             })
         }
-        b"104" => {
-            Some(OscCommand::ResetPalette)
-        }
+        b"104" => Some(OscCommand::ResetPalette),
         b"110" | b"111" | b"112" => {
             let code_num = match code {
                 b"110" => 10,
@@ -2985,7 +3372,9 @@ fn parse_osc_framed(
             if payload.starts_with(b"notify;") {
                 let parts: Vec<&[u8]> = payload[7..].split(|&b| b == b';').collect();
                 if parts.len() >= 2 {
-                    let title = std::str::from_utf8(parts[0]).unwrap_or("Fastty").to_string();
+                    let title = std::str::from_utf8(parts[0])
+                        .unwrap_or("Fastty")
+                        .to_string();
                     let body = parts[1..]
                         .iter()
                         .map(|p| std::str::from_utf8(p).unwrap_or(""))
@@ -3005,102 +3394,95 @@ fn parse_osc_framed(
                 None
             }
         }
-        b"133" => {
-            match payload {
-                b"A" => {
-                    Some(OscCommand::PromptStarted)
-                }
-                b"B" => {
+        b"133" => match payload {
+            b"A" => Some(OscCommand::PromptStarted),
+            b"B" => {
+                *cmd_start_time = Some(std::time::Instant::now());
+                Some(OscCommand::CommandStarted)
+            }
+            b"C" => {
+                if cmd_start_time.is_none() {
                     *cmd_start_time = Some(std::time::Instant::now());
-                    Some(OscCommand::CommandStarted)
                 }
-                b"C" => {
-                    if cmd_start_time.is_none() {
-                        *cmd_start_time = Some(std::time::Instant::now());
-                    }
-                    Some(OscCommand::CommandStarted)
+                Some(OscCommand::CommandStarted)
+            }
+            b"D" => {
+                if let Some(start) = cmd_start_time.take() {
+                    let duration_ms = start.elapsed().as_millis();
+                    Some(OscCommand::CommandFinished {
+                        duration_ms,
+                        exit_code: None,
+                    })
+                } else {
+                    None
                 }
-                b"D" => {
+            }
+            _ => {
+                if payload.starts_with(b"D;") {
+                    let exit_str = std::str::from_utf8(&payload[2..]).unwrap_or("0");
+                    let exit_code: Option<i32> = exit_str.parse().ok();
                     if let Some(start) = cmd_start_time.take() {
                         let duration_ms = start.elapsed().as_millis();
                         Some(OscCommand::CommandFinished {
                             duration_ms,
-                            exit_code: None,
+                            exit_code,
                         })
                     } else {
                         None
                     }
-                }
-                _ => {
-                    if payload.starts_with(b"D;") {
-                        let exit_str = std::str::from_utf8(&payload[2..]).unwrap_or("0");
-                        let exit_code: Option<i32> = exit_str.parse().ok();
-                        if let Some(start) = cmd_start_time.take() {
-                            let duration_ms = start.elapsed().as_millis();
-                            Some(OscCommand::CommandFinished {
-                                duration_ms,
-                                exit_code,
-                            })
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
+                } else {
+                    None
                 }
             }
-        }
-        b"633" => {
-            match payload {
-                b"A" => {
-                    Some(OscCommand::PromptStarted)
-                }
-                b"B" => {
+        },
+        b"633" => match payload {
+            b"A" => Some(OscCommand::PromptStarted),
+            b"B" => {
+                *cmd_start_time = Some(std::time::Instant::now());
+                Some(OscCommand::CommandStarted)
+            }
+            b"C" => {
+                if cmd_start_time.is_none() {
                     *cmd_start_time = Some(std::time::Instant::now());
-                    Some(OscCommand::CommandStarted)
                 }
-                b"C" => {
-                    if cmd_start_time.is_none() {
-                        *cmd_start_time = Some(std::time::Instant::now());
-                    }
-                    Some(OscCommand::CommandStarted)
+                Some(OscCommand::CommandStarted)
+            }
+            b"D" => {
+                if let Some(start) = cmd_start_time.take() {
+                    let duration_ms = start.elapsed().as_millis();
+                    Some(OscCommand::CommandFinished {
+                        duration_ms,
+                        exit_code: None,
+                    })
+                } else {
+                    None
                 }
-                b"D" => {
+            }
+            _ => {
+                if payload.starts_with(b"D;") {
+                    let exit_str = std::str::from_utf8(&payload[2..]).unwrap_or("0");
+                    let exit_code: Option<i32> = exit_str.parse().ok();
                     if let Some(start) = cmd_start_time.take() {
                         let duration_ms = start.elapsed().as_millis();
                         Some(OscCommand::CommandFinished {
                             duration_ms,
-                            exit_code: None,
+                            exit_code,
                         })
                     } else {
                         None
                     }
-                }
-                _ => {
-                    if payload.starts_with(b"D;") {
-                        let exit_str = std::str::from_utf8(&payload[2..]).unwrap_or("0");
-                        let exit_code: Option<i32> = exit_str.parse().ok();
-                        if let Some(start) = cmd_start_time.take() {
-                            let duration_ms = start.elapsed().as_millis();
-                            Some(OscCommand::CommandFinished {
-                                duration_ms,
-                                exit_code,
-                            })
-                        } else {
-                            None
-                        }
-                    } else if payload.starts_with(b"P;Cwd=") {
-                        let cwd_str = std::str::from_utf8(&payload[6..]).ok()?;
-                        Some(OscCommand::Cwd(cwd_str.to_string()))
-                    } else {
-                        None
-                    }
+                } else if payload.starts_with(b"P;Cwd=") {
+                    let cwd_str = std::str::from_utf8(&payload[6..]).ok()?;
+                    Some(OscCommand::Cwd(cwd_str.to_string()))
+                } else {
+                    None
                 }
             }
-        }
+        },
         b"1337" => {
             if let Ok(s) = std::str::from_utf8(payload) {
-                s.strip_prefix("CurrentDir=").map(|dir| OscCommand::Cwd(dir.to_string()))
+                s.strip_prefix("CurrentDir=")
+                    .map(|dir| OscCommand::Cwd(dir.to_string()))
             } else {
                 None
             }
@@ -3149,7 +3531,10 @@ fn dispatch_osc_action(
         OscCommand::CommandStarted => {
             sender.send_app_event(AppEvent::CommandStarted);
         }
-        OscCommand::CommandFinished { duration_ms, exit_code } => {
+        OscCommand::CommandFinished {
+            duration_ms,
+            exit_code,
+        } => {
             sender.send_app_event(AppEvent::CommandFinished {
                 duration_ms: *duration_ms,
                 exit_code: *exit_code,
@@ -3269,8 +3654,13 @@ fn get_process_name_macos(pid: u32) -> Option<String> {
     if res > 0 {
         let name_bytes = &name_buf[..res as usize];
         // Strip trailing null bytes if present
-        let clean_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
-        let name = String::from_utf8_lossy(&name_bytes[..clean_len]).trim().to_string();
+        let clean_len = name_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(name_bytes.len());
+        let name = String::from_utf8_lossy(&name_bytes[..clean_len])
+            .trim()
+            .to_string();
         if !name.is_empty() {
             return Some(name);
         }
@@ -3361,7 +3751,9 @@ fn get_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn get_foreground_process_name_linux(shell_pid: u32) -> Option<String> {
-    if let Ok(content) = std::fs::read_to_string(format!("/proc/{}/task/{}/children", shell_pid, shell_pid)) {
+    if let Ok(content) =
+        std::fs::read_to_string(format!("/proc/{}/task/{}/children", shell_pid, shell_pid))
+    {
         let children: Vec<&str> = content.split_whitespace().collect();
         if let Some(&child) = children.last() {
             if let Ok(child_pid) = child.parse::<u32>() {
@@ -3388,7 +3780,9 @@ fn get_foreground_process_name_linux(shell_pid: u32) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn has_active_child_linux(shell_pid: u32, foreground_pgid: libc::pid_t) -> bool {
-    if let Ok(content) = std::fs::read_to_string(format!("/proc/{}/task/{}/children", shell_pid, shell_pid)) {
+    if let Ok(content) =
+        std::fs::read_to_string(format!("/proc/{}/task/{}/children", shell_pid, shell_pid))
+    {
         return content
             .split_whitespace()
             .filter_map(|value| value.parse::<libc::pid_t>().ok())
@@ -3409,9 +3803,9 @@ fn get_foreground_process_name_other(_shell_pid: u32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::CsiEvent::{self, *};
     use super::CsiWatcher;
+    use super::*;
 
     fn run(bytes: &[u8]) -> Vec<CsiEvent> {
         let mut w = CsiWatcher::new();
@@ -3475,10 +3869,7 @@ mod tests {
 
     #[test]
     fn plain_text_emits_nothing() {
-        assert_eq!(
-            run(b"hello \x1b]0;title\x07 world"),
-            Vec::<CsiEvent>::new()
-        );
+        assert_eq!(run(b"hello \x1b]0;title\x07 world"), Vec::<CsiEvent>::new());
     }
 
     #[test]
@@ -3513,7 +3904,13 @@ mod tests {
         assert!(cmd_start.is_some());
 
         let cmd = parse_osc(b"133;D;0", &mut cmd_start).unwrap();
-        assert!(matches!(cmd, super::OscCommand::CommandFinished { exit_code: Some(0), .. }));
+        assert!(matches!(
+            cmd,
+            super::OscCommand::CommandFinished {
+                exit_code: Some(0),
+                ..
+            }
+        ));
 
         // OSC 633 - VS Code Shell Integration
         let cmd = parse_osc(b"633;A", &mut cmd_start).unwrap();
@@ -3558,33 +3955,38 @@ mod tests {
         sender.set_event_sender(crate::event_listener::EventSender::Callback(Arc::new(
             move |event| captured_events.lock().unwrap().push(event),
         )));
-        let program_status = ParkingMutex::new(crate::program_status::ProgramStatusStore::default());
-        program_status.lock().apply(crate::program_status::ProgramStatusCommand::Report(
-            crate::program_status::ProgramRecord {
-                id: "pi".to_owned(),
-                state: crate::program_status::ProgramState::Working,
-                app: Some("pi".to_owned()),
-                title: None,
-                msg: None,
-                progress: None,
-                kind: None,
-            },
-        ));
+        let program_status =
+            ParkingMutex::new(crate::program_status::ProgramStatusStore::default());
+        program_status
+            .lock()
+            .apply(crate::program_status::ProgramStatusCommand::Report(
+                crate::program_status::ProgramRecord {
+                    id: "pi".to_owned(),
+                    state: crate::program_status::ProgramState::Working,
+                    app: Some("pi".to_owned()),
+                    title: None,
+                    msg: None,
+                    progress: None,
+                    kind: None,
+                },
+            ));
 
         dispatch_notification_if_allowed("4", "3", &program_status, &sender, 0, 0, 24);
         assert!(events.lock().unwrap().is_empty());
 
-        program_status.lock().apply(crate::program_status::ProgramStatusCommand::Report(
-            crate::program_status::ProgramRecord {
-                id: "pi".to_owned(),
-                state: crate::program_status::ProgramState::Done,
-                app: Some("pi".to_owned()),
-                title: None,
-                msg: None,
-                progress: None,
-                kind: None,
-            },
-        ));
+        program_status
+            .lock()
+            .apply(crate::program_status::ProgramStatusCommand::Report(
+                crate::program_status::ProgramRecord {
+                    id: "pi".to_owned(),
+                    state: crate::program_status::ProgramState::Done,
+                    app: Some("pi".to_owned()),
+                    title: None,
+                    msg: None,
+                    progress: None,
+                    kind: None,
+                },
+            ));
         dispatch_notification_if_allowed("Pi", "Done", &program_status, &sender, 0, 0, 24);
 
         let events = events.lock().unwrap();
@@ -3647,7 +4049,8 @@ mod tests {
             let body = query
                 .strip_prefix(b"\x1b]")
                 .and_then(|rest| {
-                    rest.strip_suffix(b"\x07").or_else(|| rest.strip_suffix(b"\x1b\\"))
+                    rest.strip_suffix(b"\x07")
+                        .or_else(|| rest.strip_suffix(b"\x1b\\"))
                 })
                 .unwrap_or(query);
             assert!(
@@ -3713,10 +4116,7 @@ mod tests {
                 // `OSC 4` carries its index between the code and the colour, as
                 // in `\x1b]4;2;rgb:...`. `OSC 10|11|12` does not.
                 let value = if query_code == "4" {
-                    trimmed
-                        .splitn(3, ';')
-                        .nth(2)
-                        .unwrap_or_default()
+                    trimmed.splitn(3, ';').nth(2).unwrap_or_default()
                 } else {
                     trimmed
                         .split_once(';')
@@ -3735,8 +4135,7 @@ mod tests {
                 );
                 for component in components {
                     assert!(
-                        component.len() == 4
-                            && component.chars().all(|c| c.is_ascii_hexdigit()),
+                        component.len() == 4 && component.chars().all(|c| c.is_ascii_hexdigit()),
                         "{name} reply {trimmed:?} has a malformed component {component:?}"
                     );
                 }
@@ -3901,7 +4300,11 @@ mod tests {
             assert_eq!(lines.len(), preview.len());
             // Lines should correspond to rendered preview spans
             for (line_str, prev_line) in lines.iter().zip(preview.iter()) {
-                let joined = prev_line.spans.iter().map(|s| s.text.as_str()).collect::<String>();
+                let joined = prev_line
+                    .spans
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<String>();
                 assert_eq!(line_str, joined.trim_end());
             }
         }
@@ -3909,16 +4312,20 @@ mod tests {
 
     #[test]
     fn test_apply_snapshot_to_grid_restores_history_and_cursor() {
-        use alacritty_terminal::term::{Config as AlacrittyTestConfig, Term as TestTerm};
-        use parking_lot::Mutex as ParkingMutex;
         use crate::server::binary_snapshot::{
             encode_snapshot, FasttyBinarySnapshotHeader, FasttyPackedCell,
         };
+        use alacritty_terminal::term::{Config as AlacrittyTestConfig, Term as TestTerm};
+        use parking_lot::Mutex as ParkingMutex;
 
         struct NullWriter;
         impl std::io::Write for NullWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { Ok(buf.len()) }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
 
         let writer: Box<dyn Write + Send> = Box::new(NullWriter);
@@ -3960,17 +4367,57 @@ mod tests {
             crate::server::binary_snapshot::decode_snapshot(&encoded).unwrap();
         assert_eq!(decoded_header.history_rows(), 3);
 
-        assert!(apply_snapshot_to_grid(&mut term, &decoded_header, &decoded_cells));
+        assert!(apply_snapshot_to_grid(
+            &mut term,
+            &decoded_header,
+            &decoded_cells
+        ));
 
         let grid = term.grid();
         // Newest history row sits directly above the screen.
-        assert_eq!(grid[alacritty_terminal::index::Line(-1)][alacritty_terminal::index::Column(0)].c, 'c');
-        assert_eq!(grid[alacritty_terminal::index::Line(-3)][alacritty_terminal::index::Column(0)].c, 'a');
+        assert_eq!(
+            grid[alacritty_terminal::index::Line(-1)][alacritty_terminal::index::Column(0)].c,
+            'c'
+        );
+        assert_eq!(
+            grid[alacritty_terminal::index::Line(-3)][alacritty_terminal::index::Column(0)].c,
+            'a'
+        );
         // Screen rows land top to bottom.
-        assert_eq!(grid[alacritty_terminal::index::Line(0)][alacritty_terminal::index::Column(0)].c, 'x');
-        assert_eq!(grid[alacritty_terminal::index::Line(1)][alacritty_terminal::index::Column(0)].c, 'y');
+        assert_eq!(
+            grid[alacritty_terminal::index::Line(0)][alacritty_terminal::index::Column(0)].c,
+            'x'
+        );
+        assert_eq!(
+            grid[alacritty_terminal::index::Line(1)][alacritty_terminal::index::Column(0)].c,
+            'y'
+        );
         // Cursor restored.
         assert_eq!(grid.cursor.point.line.0, 1);
         assert_eq!(grid.cursor.point.column.0, 2);
+    }
+
+    #[test]
+    fn bounded_ansi_snapshot_stops_at_limit() {
+        let terminal = TerminalState::new_headless("/bin/sh", &[], None, 80, 24)
+            .expect("create headless terminal");
+        let max_bytes = 64;
+
+        let (snapshot, truncated) = terminal.snapshot_ansi_bounded(max_bytes);
+
+        assert!(truncated);
+        assert!(snapshot.len() <= max_bytes);
+        assert!(snapshot.len() < terminal.snapshot_ansi().len());
+    }
+
+    #[test]
+    fn bounded_ansi_snapshot_marks_too_small_limit() {
+        let terminal = TerminalState::new_headless("/bin/sh", &[], None, 80, 24)
+            .expect("create headless terminal");
+
+        let (snapshot, truncated) = terminal.snapshot_ansi_bounded(1);
+
+        assert!(truncated);
+        assert!(snapshot.is_empty());
     }
 }

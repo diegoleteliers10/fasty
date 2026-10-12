@@ -1,9 +1,7 @@
 # fasttyd — protocolo del daemon local (v1)
 
-Implementación: `src/daemon.rs`. Habilita el ítem 10/11 del roadmap
-(`docs/plans/ideas-superlogical.md`): listar y adjuntarse a sesiones de
-fastty desde otro proceso (plugin de Neovim, extensión de Zed, cliente web
-Wasm) sin quitarle la pestaña a la ventana GPUI.
+Implementación: `src/daemon.rs`. Expone el control y la observación local de
+sesiones de Fastty sin quitarle la pestaña a la ventana GPUI.
 
 ## Transporte
 
@@ -28,13 +26,19 @@ Un objeto JSON por línea (`\n`-terminated) en ambas direcciones.
 ```jsonc
 {"cmd": "hello"}
 {"cmd": "hello", "read_only": true}
+{"cmd": "set_access_scope", "scope": "observe"}
+{"cmd": "set_access_scope", "scope": "interact"}
 {"cmd": "list"}
 {"cmd": "session_status", "id": 1}
 {"cmd": "subscribe_sessions"}
+{"cmd": "subscribe_events"}
+{"cmd": "capture", "id": 1}
 {"cmd": "attach", "id": 1}
 {"cmd": "attach", "id": 1, "mode": "read_only"}
 {"cmd": "detach", "id": 1}
 {"cmd": "write", "id": 1, "data": "<base64>"}
+{"cmd": "external_action", "id": 1, "action": {"action": "send", "text": "git status\r"}}
+{"cmd": "external_action", "id": 1, "action": {"action": "close"}}
 {"cmd": "resize", "id": 1, "cols": 80, "rows": 24}
 {"cmd": "spawn", "command": "zsh", "args": ["-l"], "cwd": "/home/user", "cols": 80, "rows": 24, "open": true}
 {"cmd": "close", "id": 1}
@@ -57,16 +61,35 @@ active command before it asks to close a restored session.
   el campo opcional `"read_only": true` para fijar la conexión completa en modo
   solo-lectura (sticky). En una conexión `read_only`, cualquier llamada a `write`,
   `spawn` o `close` es rechazada con código de error `"read_only"`.
+- `set_access_scope` limita la conexión a `observe`, `interact` o `manage`.
+  La conexión puede bajar su permiso, nunca subirlo. `observe` permite leer.
+  `interact` permite enviar texto y redimensionar una terminal. `manage`
+  permite crear, cerrar, enfocar y cambiar la estructura de sesiones. Las
+  conexiones antiguas que no envían este request conservan el permiso actual.
 - `subscribe_sessions`: inicia una suscripción push a los cambios de la
   lista de sesiones. Envía un evento inicial `sessions` con el estado actual,
   seguido de eventos `session_added`, `session_removed`, y `session_updated`
   a medida que cambian las pestañas/splits en fastty.
+- `subscribe_events`: inicia un flujo JSONL con una foto inicial y eventos de
+  sesión con versión, secuencia, hora y `session_id`. La primera versión
+  incluye altas, bajas y cambios de sesión. Fastty conserva los últimos 4.096
+  eventos. Si el cliente queda atrás, recibe `event_stream_gap` con una foto
+  completa y debe reemplazar su estado local antes de continuar desde la nueva
+  secuencia. Los cambios de estado de agente llegan en `program_status` cuando
+  el proceso emite OSC 7501.
+- `capture`: devuelve la pantalla visible como texto ANSI. La salida tiene un
+  límite de generación de 1 MiB y no incluye el scrollback.
 - `attach`: se adjunta a una sesión. Acepta el campo opcional `mode`:
   `"read_write"` (por defecto) o `"read_only"`. En modo `"read_only"`, cualquier
   `write` posterior a esa sesión en esa conexión será rechazado con error
   `read_only`.
 - `data` en `write` son bytes crudos en base64 (para poder mandar teclas de
   control, secuencias de escape, etc. sin pelear con el escaping de JSON).
+- `external_action` pide aprobación visible antes de enviar texto o cerrar una
+  sesión. Fastty responde `done` tras aprobar y ejecutar. Responde
+  `approval_denied`, `approval_timeout` o `approval_unavailable` si la acción
+  no se aprueba, vence el plazo de 60 segundos o no hay una ventana visible.
+  El permiso `interact` permite enviar texto y `manage` permite cerrar.
 - `detach` es por sesión **y por conexión**: solo corta el streaming de esa
   sesión en la conexión que lo pide, no afecta a otros clientes adjuntados
   a la misma sesión desde otra conexión.
@@ -79,7 +102,7 @@ active command before it asks to close a restored session.
 - `focus_pane`: trae el tab del pane al frente y lo hace activo, para que el usuario vea lo que el agente está tocando.
 - `layout`: devuelve `{"event": "layout", "tabs": [...]}` con la estructura completa de la ventana — cada tab con sus panes (id, title, cwd, activo, tamaño). Sesiones headless sin tab no aparecen aquí; están en `list`.
 - `resize_window`: redimensiona la ventana de fastty aproximándose a `cols` x `rows` del pane activo (con splits es aproximado; para mover divisores usar `resize_pane`). Responde `done` con `cmd: "resize_window"`.
-- `binary_snapshot`: solicita un snapshot binario ultrarrápido con cabecera `FST1` (comprimido con Deflate).
+- `binary_snapshot`: solicita un snapshot binario con cabecera `FST1` (comprimido con Deflate). `screen_only: true` excluye el scrollback. Los clientes antiguos omiten el campo y conservan el snapshot completo.
 
 ### Responses (daemon → cliente)
 
@@ -92,6 +115,12 @@ active command before it asks to close a restored session.
 {"event": "session_added", "session": {"id": 2, "title": "zsh", "cwd": "/tmp", "cols": 89, "rows": 32, "alive": true, "history_size": 0}}
 {"event": "session_removed", "id": 2}
 {"event": "session_updated", "session": {"id": 1, "title": "vim", "cwd": "/Users/you", "cols": 89, "rows": 32, "alive": true, "history_size": 120}}
+{"event": "event_stream_started", "version": 1, "sequence": 0, "sessions": []}
+{"event": "stream_event", "envelope": {"version": 1, "sequence": 1, "timestamp_unix_ms": 1791750000000, "session_id": 2, "kind": {"type": "session_added", "session": {"id": 2}}}}
+{"event": "event_stream_gap", "after_sequence": 1, "oldest_sequence": 4098, "latest_sequence": 8193, "sessions": []}
+{"event": "error", "code": "approval_denied", "message": "the user denied this action"}
+{"event": "captured", "id": 1, "data": "<ANSI screen>", "truncated": false}
+{"event": "done", "cmd": "set_access_scope"}
 {"event": "attached", "id": 1, "cols": 89, "rows": 32, "mode": "read_only"}
 {"event": "snapshot", "id": 1, "data": "<base64, ANSI/SGR>"}
 {"event": "binary_snapshot", "id": 1, "data": "<base64, FST1 binary snapshot>"}
@@ -106,6 +135,9 @@ active command before it asks to close a restored session.
 - `alive` refleja si el proceso de shell de la sesión sigue vivo
   (`TerminalState::is_alive`) — no si tiene un comando corriendo en este
   instante.
+- `program_status` es opcional y solo aparece cuando Fastty detecta estados
+  OSC 7501. Incluye el ID, estado, aplicación, progreso y tipo de espera. Omite
+  mensajes y texto libre para reducir la exposición de datos.
 - Un `attach` manda **un `snapshot` inmediatamente después del `attached`**,
   con el contenido actual de la pantalla (no el scrollback completo, solo lo
   visible) como bytes ANSI/SGR ya coloreados — ver
@@ -120,7 +152,9 @@ active command before it asks to close a restored session.
   va a llegar más `output` para ese `id` en esa conexión después de esto.
 - Los códigos de `error` son estables y pensados para matchear
   programáticamente, no solo mostrar: `bad_request`, `no_such_session`,
-  `invalid_base64`, `not_attached`, `read_only`, `unsupported`. Pueden
+  `invalid_base64`, `not_attached`, `read_only`, `access_denied`,
+  `permission_escalation`, `approval_denied`, `approval_timeout`,
+  `approval_unavailable`, `session_changed`, `input_too_large` y `unsupported`. Pueden
   agregarse códigos nuevos con el tiempo; un cliente debería tratar uno que
   no reconoce igual que una falla genérica.
 
@@ -132,6 +166,16 @@ integrados:
 ```bash
 # Listar sesiones activas
 fastty sessions
+
+# Capturar la pantalla visible y enfocar una sesión
+fastty capture 1
+fastty focus 1
+
+# Enviar texto. Fastty pide aprobación antes de escribirlo
+fastty send 1 --enter -- 'git status'
+
+# Leer cambios de sesión como JSONL
+fastty events --json
 
 # Observar cambios en vivo (subscribe_sessions)
 fastty sessions --watch
@@ -154,6 +198,27 @@ output en vivo, y reenvía todo lo que tipeés por stdin como `write` a la
 sesión real (poniendo la terminal local en modo raw, igual que `ssh`/`tmux attach`).
 `Ctrl+\` hace `detach` limpio sin cerrar la sesión. En modo `--read-only`, el input
 local se descarta excepto por `Ctrl+\` para desadjuntarse.
+
+### Límites de acceso
+
+- `attach --read-only` limita la escritura en esa sesión y conexión.
+- `attach` con `mode: "read_only"` aplica el permiso de observación a esa
+  sesión y conexión. `mode: "read_write"` necesita el permiso `interact`.
+- `hello` con `read_only: true` limita las acciones de escritura de toda la
+  conexión. Los eventos y las capturas son de solo lectura.
+- `send` necesita un ID explícito. No ejecuta texto hasta que el cliente usa
+  `--enter`. Fastty pide aprobación visible antes de enviar el texto.
+  `close --force` pide aprobación visible antes de cerrar una sesión.
+- Los permisos de scope son límites que el cliente declara. Ayudan a evitar
+  errores de integraciones cooperativas. No autentican al proceso cliente.
+- La aprobación visible protege el nuevo `external_action`. Las peticiones
+  directas `write` y `close` siguen disponibles para compatibilidad y para el
+  transporte interno de sesiones. No son una barrera contra procesos del mismo
+  usuario.
+- El socket `0600` bloquea a otros usuarios del sistema. Los procesos del mismo
+  usuario comparten el mismo límite de confianza. Estas reglas evitan acciones
+  accidentales de clientes cooperativos, no aíslan procesos hostiles del mismo
+  usuario.
 
 ### Control desde el CLI (`spawn` / `close` / `split` / `resize` / `write` / `list`)
 

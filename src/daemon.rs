@@ -15,7 +15,7 @@
 //! projection. It does not stop the session. Use the explicit close-session
 //! request to stop a host session.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
@@ -29,6 +29,9 @@ use crate::terminal_state::TerminalState;
 /// field, a new `cmd`/`event` variant) don't need a bump; a client should
 /// tolerate unknown fields and events either way.
 pub const PROTOCOL_VERSION: u32 = 1;
+pub const EVENT_API_VERSION: u16 = 1;
+const MAX_CAPTURE_BYTES: usize = 1_048_576;
+const EVENT_JOURNAL_CAPACITY: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionKind {
@@ -44,6 +47,93 @@ pub struct SessionEntry {
 
 type Registry = Mutex<HashMap<PaneId, SessionEntry>>;
 
+struct EventJournal {
+    sequence: u64,
+    events: VecDeque<EventEnvelope>,
+    latest_sessions: HashMap<PaneId, SessionInfo>,
+}
+
+struct EventBatch {
+    oldest_sequence: Option<u64>,
+    events: Vec<EventEnvelope>,
+}
+
+impl EventJournal {
+    fn new() -> Self {
+        Self {
+            sequence: 0,
+            events: VecDeque::with_capacity(EVENT_JOURNAL_CAPACITY),
+            latest_sessions: HashMap::new(),
+        }
+    }
+
+    fn publish(&mut self, session_id: Option<PaneId>, kind: SessionEvent) -> EventEnvelope {
+        self.sequence = self.sequence.saturating_add(1);
+        let event = EventEnvelope {
+            version: EVENT_API_VERSION,
+            sequence: self.sequence,
+            timestamp_unix_ms: unix_time_millis(),
+            session_id,
+            kind,
+        };
+        self.events.push_back(event.clone());
+        if self.events.len() > EVENT_JOURNAL_CAPACITY {
+            self.events.pop_front();
+        }
+        event
+    }
+
+    fn added(&mut self, session: SessionInfo) {
+        self.latest_sessions.insert(session.id, session.clone());
+        self.publish(Some(session.id), SessionEvent::SessionAdded { session });
+    }
+
+    fn removed(&mut self, id: PaneId) {
+        self.latest_sessions.remove(&id);
+        self.publish(Some(id), SessionEvent::SessionRemoved { id });
+    }
+
+    fn update_if_changed(&mut self, session: SessionInfo) {
+        if self.latest_sessions.get(&session.id) == Some(&session) {
+            return;
+        }
+        if !self.latest_sessions.contains_key(&session.id) {
+            return;
+        }
+        self.latest_sessions.insert(session.id, session.clone());
+        self.publish(Some(session.id), SessionEvent::SessionUpdated { session });
+    }
+
+    fn seed(&mut self, sessions: &[SessionInfo]) {
+        self.latest_sessions = sessions
+            .iter()
+            .cloned()
+            .map(|session| (session.id, session))
+            .collect();
+    }
+
+    fn batch_after(&self, sequence: u64) -> EventBatch {
+        EventBatch {
+            oldest_sequence: self.events.front().map(|event| event.sequence),
+            events: self
+                .events
+                .iter()
+                .filter(|event| event.sequence > sequence)
+                .cloned()
+                .collect(),
+        }
+    }
+
+    fn snapshot(&self) -> Vec<SessionInfo> {
+        self.latest_sessions.values().cloned().collect()
+    }
+}
+
+fn event_journal() -> &'static Mutex<EventJournal> {
+    static JOURNAL: OnceLock<Mutex<EventJournal>> = OnceLock::new();
+    JOURNAL.get_or_init(|| Mutex::new(EventJournal::new()))
+}
+
 fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(Default::default)
@@ -52,30 +142,37 @@ fn registry() -> &'static Registry {
 /// Called when a pane's `TerminalState` is created, so it becomes visible to
 /// `fastty sessions` / `fastty attach`.
 pub fn register(id: PaneId, terminal: Arc<TerminalState>) {
+    let mut journal = event_journal().lock();
     registry().lock().insert(
         id,
         SessionEntry {
-            terminal,
+            terminal: Arc::clone(&terminal),
             kind: SessionKind::Gui,
         },
     );
+    journal.added(session_info(id, &terminal));
 }
 
 /// Called when a headless session is created via IPC `spawn`.
 pub fn register_headless(id: PaneId, terminal: Arc<TerminalState>) {
+    let mut journal = event_journal().lock();
     registry().lock().insert(
         id,
         SessionEntry {
-            terminal,
+            terminal: Arc::clone(&terminal),
             kind: SessionKind::Headless,
         },
     );
+    journal.added(session_info(id, &terminal));
 }
 
 /// Called when a pane is closed in the GUI or terminated, so external clients stop seeing
 /// it in `fastty sessions`.
 pub fn unregister(id: PaneId) {
-    registry().lock().remove(&id);
+    let mut journal = event_journal().lock();
+    if registry().lock().remove(&id).is_some() {
+        journal.removed(id);
+    }
 }
 
 fn is_registered(pane_id: PaneId) -> bool {
@@ -127,20 +224,30 @@ pub enum GuiRequest {
         rows: usize,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
+    ExternalApproval {
+        request_id: u64,
+        session_id: PaneId,
+        action: ExternalAction,
+        reply: std::sync::mpsc::Sender<bool>,
+    },
+    CancelExternalApproval {
+        request_id: u64,
+    },
 }
 
 type GuiSender = async_channel::Sender<GuiRequest>;
 
 static GUI_SENDER: OnceLock<Mutex<Option<GuiSender>>> = OnceLock::new();
+static NEXT_APPROVAL_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+const EXTERNAL_APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Called by the GUI (`RootView`) at startup so the daemon can ask it to
 /// surface sessions; passing `None` detaches (e.g. when the view goes away).
 /// Sends after detach fail silently, which is the desired behavior: with no
 /// GUI there is nothing to show and the session stays headless.
 pub fn set_gui_sender(sender: Option<GuiSender>) {
-    *GUI_SENDER
-        .get_or_init(Default::default)
-        .lock() = sender;
+    *GUI_SENDER.get_or_init(Default::default).lock() = sender;
 }
 
 fn notify_gui_open(id: PaneId, terminal: Arc<TerminalState>) -> bool {
@@ -170,6 +277,53 @@ fn call_gui<T>(
         Ok(Ok(value)) => Ok(value),
         Ok(Err(message)) => Err(message),
         Err(_) => Err("timed out waiting for the fastty window".to_string()),
+    }
+}
+
+fn request_external_approval(
+    session_id: PaneId,
+    action: ExternalAction,
+) -> Result<(), String> {
+    request_external_approval_with_sender(
+        GUI_SENDER
+        .get_or_init(Default::default)
+        .lock()
+        .clone(),
+        session_id,
+        action,
+        EXTERNAL_APPROVAL_TIMEOUT,
+    )
+}
+
+fn request_external_approval_with_sender(
+    sender: Option<GuiSender>,
+    session_id: PaneId,
+    action: ExternalAction,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let sender = sender
+        .ok_or_else(|| "approval_unavailable: no Fastty window is running".to_string())?;
+    let request_id = NEXT_APPROVAL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    sender
+        .send_blocking(GuiRequest::ExternalApproval {
+            request_id,
+            session_id,
+            action,
+            reply: reply_tx,
+        })
+        .map_err(|_| "approval_unavailable: Fastty window is not responding".to_string())?;
+    match reply_rx.recv_timeout(timeout) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("approval_denied: the user denied this action".to_string()),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let _ = sender.send_blocking(GuiRequest::CancelExternalApproval { request_id });
+            Err("approval_timeout: no decision arrived within 60 seconds".to_string())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = sender.send_blocking(GuiRequest::CancelExternalApproval { request_id });
+            Err("approval_unavailable: the approval window closed".to_string())
+        }
     }
 }
 
@@ -204,15 +358,29 @@ pub enum Request {
     },
     List,
     /// Check whether a session ID is registered without creating a default session.
-    SessionExists { id: PaneId },
+    SessionExists {
+        id: PaneId,
+    },
     /// Get the live process state for a registered terminal session.
-    SessionStatus { id: PaneId },
+    SessionStatus {
+        id: PaneId,
+    },
     /// Push-updated session list: an initial `sessions` event with everything
     /// currently registered, followed by `session_added` / `session_removed`
     /// / `session_updated` as the registry changes, for as long as this
     /// connection stays open. No explicit unsubscribe in v1 -- a client that
     /// wants this typically dedicates one connection to it.
     SubscribeSessions,
+    /// Start a typed JSONL event stream with a session snapshot and deltas.
+    SubscribeEvents,
+    /// Capture the visible terminal screen as ANSI text.
+    Capture {
+        id: PaneId,
+    },
+    /// Lower this connection's access scope for its remaining lifetime.
+    SetAccessScope {
+        scope: AccessScope,
+    },
     Attach {
         id: PaneId,
         #[serde(default)]
@@ -229,6 +397,12 @@ pub enum Request {
         /// streaming behavior.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         ack: bool,
+    },
+    /// Ask the visible Fastty window to approve an external session action.
+    /// This command fails closed when no GUI can receive the request.
+    ExternalAction {
+        id: PaneId,
+        action: ExternalAction,
     },
     Resize {
         id: PaneId,
@@ -285,7 +459,9 @@ pub enum Request {
         delta: f32,
     },
     /// Bring a pane's tab to the front and make the pane active.
-    FocusPane { id: PaneId },
+    FocusPane {
+        id: PaneId,
+    },
     /// Full GUI layout: every tab with its panes, so a client can see which
     /// sessions share a tab before splitting/focusing. Headless sessions
     /// (spawned without a tab) are not part of any tab — see `list`.
@@ -293,11 +469,43 @@ pub enum Request {
     /// Best-effort resize of the fastty window so the (single-pane) active
     /// tab renders at `cols` x `rows`. With splits the result is
     /// approximate; use `resize_pane` to move dividers.
-    ResizeWindow { cols: usize, rows: usize },
+    ResizeWindow {
+        cols: usize,
+        rows: usize,
+    },
+    ReportProgramStatus {
+        source_id: u64,
+        payload: String,
+    },
     /// Fast microsecond binary snapshot of terminal state (magic b"FST1").
     BinarySnapshot {
         id: PaneId,
+        #[serde(default)]
+        screen_only: bool,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ExternalAction {
+    Send { text: String },
+    Close { force: bool },
+}
+
+impl ExternalAction {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Send { .. } => "Send input",
+            Self::Close { .. } => "Close session",
+        }
+    }
+
+    pub fn display_detail(&self) -> String {
+        match self {
+            Self::Send { text } => format!("Input: {:?}", text),
+            Self::Close { .. } => "Terminate the process and close this session".to_string(),
+        }
+    }
 }
 
 /// Whether an `attach` is allowed to `write` to the session it attached to,
@@ -311,6 +519,28 @@ pub enum AttachMode {
     ReadOnly,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessScope {
+    Observe,
+    Interact,
+    Manage,
+}
+
+impl AccessScope {
+    fn permits(self, required: Self) -> bool {
+        self.rank() >= required.rank()
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Observe => 0,
+            Self::Interact => 1,
+            Self::Manage => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: PaneId,
@@ -321,6 +551,37 @@ pub struct SessionInfo {
     pub alive: bool,
     #[serde(default)]
     pub history_size: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub program_status: Vec<ProgramStatusInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProgramStatusInfo {
+    pub id: String,
+    pub state: crate::program_status::ProgramState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::program_status::BlockedKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub version: u16,
+    pub sequence: u64,
+    pub timestamp_unix_ms: u64,
+    pub session_id: Option<PaneId>,
+    pub kind: SessionEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionEvent {
+    SessionAdded { session: SessionInfo },
+    SessionRemoved { id: PaneId },
+    SessionUpdated { session: SessionInfo },
 }
 
 /// One pane inside a tab, as reported by `layout`.
@@ -373,7 +634,32 @@ pub enum Response {
     Sessions {
         sessions: Vec<SessionInfo>,
     },
-    SessionExists { exists: bool },
+    EventStreamStarted {
+        version: u16,
+        sequence: u64,
+        sessions: Vec<SessionInfo>,
+    },
+    /// The bounded event journal no longer contains every event after the
+    /// subscriber's cursor. Replace local state with this snapshot, then
+    /// resume at `latest_sequence`.
+    EventStreamGap {
+        version: u16,
+        after_sequence: u64,
+        oldest_sequence: u64,
+        latest_sequence: u64,
+        sessions: Vec<SessionInfo>,
+    },
+    StreamEvent {
+        envelope: EventEnvelope,
+    },
+    Captured {
+        id: PaneId,
+        data: String,
+        truncated: bool,
+    },
+    SessionExists {
+        exists: bool,
+    },
     SessionStatus {
         alive: bool,
         process_running: bool,
@@ -442,9 +728,13 @@ pub enum Response {
         opened: bool,
     },
     /// The reply to `split_pane`: the new pane's session id.
-    PaneSplit { id: PaneId },
+    PaneSplit {
+        id: PaneId,
+    },
     /// The reply to `layout`.
-    Layout { tabs: Vec<TabLayout> },
+    Layout {
+        tabs: Vec<TabLayout>,
+    },
     /// Ack for `write` / `resize` requests that opted in with `ack: true`.
     /// `cmd` echoes the request name (`"write"` / `"resize"`). Clients that
     /// never set `ack` never receive this event.
@@ -515,7 +805,25 @@ fn session_info(id: PaneId, terminal: &TerminalState) -> SessionInfo {
         rows,
         alive: terminal.is_alive(),
         history_size: terminal.history_size(),
+        program_status: terminal
+            .program_status_snapshot()
+            .into_iter()
+            .map(|record| ProgramStatusInfo {
+                id: record.id,
+                state: record.state,
+                app: record.app,
+                progress: record.progress,
+                kind: record.kind,
+            })
+            .collect(),
     }
+}
+
+fn unix_time_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or_default()
 }
 
 /// Start the daemon's accept loop in a background thread. Safe to call more
@@ -615,6 +923,7 @@ mod unix_impl {
         pub(super) out: Arc<Mutex<UnixStream>>,
         pub(super) conn_alive: Arc<AtomicBool>,
         pub(super) read_only: bool,
+        pub(super) access_scope: AccessScope,
         pub(super) attachments: HashMap<PaneId, Attachment>,
     }
 
@@ -627,6 +936,7 @@ mod unix_impl {
             out: Arc::new(Mutex::new(write_half)),
             conn_alive: Arc::new(AtomicBool::new(true)),
             read_only: false,
+            access_scope: AccessScope::Manage,
             attachments: HashMap::new(),
         };
 
@@ -662,12 +972,32 @@ mod unix_impl {
             Request::Hello { read_only } => {
                 if read_only {
                     conn.read_only = true;
+                    conn.access_scope = AccessScope::Observe;
                 }
                 send(
                     &conn.out,
                     &Response::Hello {
                         version: PROTOCOL_VERSION,
                         fastty_version: env!("CARGO_PKG_VERSION").to_string(),
+                    },
+                );
+            }
+            Request::SetAccessScope { scope } => {
+                if scope.permits(conn.access_scope) && scope != conn.access_scope {
+                    send(
+                        &conn.out,
+                        &Response::Error {
+                            code: "permission_escalation".to_string(),
+                            message: "a connection can only lower its access scope".to_string(),
+                        },
+                    );
+                    return;
+                }
+                conn.access_scope = scope;
+                send(
+                    &conn.out,
+                    &Response::Done {
+                        cmd: "set_access_scope".to_string(),
                     },
                 );
             }
@@ -685,7 +1015,10 @@ mod unix_impl {
                 send(&conn.out, &Response::SessionExists { exists });
             }
             Request::SessionStatus { id } => {
-                let terminal = registry().lock().get(&id).map(|entry| Arc::clone(&entry.terminal));
+                let terminal = registry()
+                    .lock()
+                    .get(&id)
+                    .map(|entry| Arc::clone(&entry.terminal));
                 match terminal {
                     Some(terminal) => {
                         send(
@@ -707,6 +1040,35 @@ mod unix_impl {
                     }
                 }
             }
+            Request::Capture { id } => {
+                let terminal = registry()
+                    .lock()
+                    .get(&id)
+                    .map(|entry| Arc::clone(&entry.terminal));
+                match terminal {
+                    Some(terminal) => {
+                        let (snapshot, truncated) =
+                            terminal.snapshot_ansi_bounded(MAX_CAPTURE_BYTES);
+                        send(
+                            &conn.out,
+                            &Response::Captured {
+                                id,
+                                data: String::from_utf8_lossy(&snapshot).into_owned(),
+                                truncated,
+                            },
+                        );
+                    }
+                    None => {
+                        send(
+                            &conn.out,
+                            &Response::Error {
+                                code: "no_such_session".to_string(),
+                                message: format!("no such session {id}"),
+                            },
+                        );
+                    }
+                }
+            }
             Request::Attach { id, mode } => {
                 let terminal = registry().lock().get(&id).map(|e| Arc::clone(&e.terminal));
                 let Some(terminal) = terminal else {
@@ -719,7 +1081,8 @@ mod unix_impl {
                     );
                     return;
                 };
-                let effective_mode = if conn.read_only {
+                let effective_mode =
+                    if conn.read_only || !conn.access_scope.permits(AccessScope::Interact) {
                     AttachMode::ReadOnly
                 } else {
                     mode
@@ -810,14 +1173,7 @@ mod unix_impl {
                 }
             }
             Request::Write { id, data, ack } => {
-                if conn.read_only {
-                    send(
-                        &conn.out,
-                        &Response::Error {
-                            code: "read_only".to_string(),
-                            message: "connection is in read-only mode".to_string(),
-                        },
-                    );
+                if reject_access_scope(conn, AccessScope::Interact) {
                     return;
                 }
                 if conn.attachments.get(&id).is_some_and(|a| a.read_only) {
@@ -845,7 +1201,12 @@ mod unix_impl {
                 if let Some(entry) = registry().lock().get(&id) {
                     entry.terminal.write_to_pty(&bytes);
                     if ack {
-                        send(&conn.out, &Response::Done { cmd: "write".to_string() });
+                        send(
+                            &conn.out,
+                            &Response::Done {
+                                cmd: "write".to_string(),
+                            },
+                        );
                     }
                 } else {
                     send(
@@ -855,6 +1216,101 @@ mod unix_impl {
                             message: "no such session".to_string(),
                         },
                     );
+                }
+            }
+            Request::ExternalAction { id, action } => {
+                let required_scope = match &action {
+                    ExternalAction::Send { .. } => AccessScope::Interact,
+                    ExternalAction::Close { .. } => AccessScope::Manage,
+                };
+                if reject_access_scope(conn, required_scope) {
+                    return;
+                }
+                let Some(entry) = registry().lock().get(&id).cloned() else {
+                    send(
+                        &conn.out,
+                        &Response::Error {
+                            code: "no_such_session".to_string(),
+                            message: format!("no such session {id}"),
+                        },
+                    );
+                    return;
+                };
+                if let ExternalAction::Send { text } = &action {
+                    if text.len() > 65_536 {
+                        send(
+                            &conn.out,
+                            &Response::Error {
+                                code: "input_too_large".to_string(),
+                                message: "approved input cannot exceed 65536 bytes".to_string(),
+                            },
+                        );
+                        return;
+                    }
+                }
+                if let Err(error) = request_external_approval(id, action.clone()) {
+                    let (code, message) = error
+                        .split_once(": ")
+                        .unwrap_or(("approval_unavailable", error.as_str()));
+                    send(
+                        &conn.out,
+                        &Response::Error {
+                            code: code.to_string(),
+                            message: message.to_string(),
+                        },
+                    );
+                    return;
+                }
+                if !conn.conn_alive.load(Ordering::Relaxed) {
+                    return;
+                }
+                let active_entry = registry().lock().get(&id).cloned();
+                let Some(active_entry) = active_entry.filter(|active| {
+                    Arc::ptr_eq(&active.terminal, &entry.terminal)
+                }) else {
+                    send(
+                        &conn.out,
+                        &Response::Error {
+                            code: "session_changed".to_string(),
+                            message: "session ended or changed before approval completed".to_string(),
+                        },
+                    );
+                    return;
+                };
+                match action {
+                    ExternalAction::Send { text } if active_entry.terminal.is_alive() => {
+                        active_entry.terminal.write_to_pty(text.as_bytes());
+                        send(
+                            &conn.out,
+                            &Response::Done {
+                                cmd: "external_action".to_string(),
+                            },
+                        );
+                    }
+                    ExternalAction::Send { .. } => {
+                        send(
+                            &conn.out,
+                            &Response::Error {
+                                code: "session_ended".to_string(),
+                                message: "session ended before the approved input was sent".to_string(),
+                            },
+                        );
+                    }
+                    ExternalAction::Close { force } => {
+                        if active_entry.kind == SessionKind::Gui && !force {
+                            send(
+                                &conn.out,
+                                &Response::Error {
+                                    code: "not_closable".to_string(),
+                                    message: "GUI session cannot be closed without force: true".to_string(),
+                                },
+                            );
+                            return;
+                        }
+                        active_entry.terminal.terminate_process();
+                        unregister(id);
+                        send(&conn.out, &Response::Closed { id });
+                    }
                 }
             }
             Request::SubscribeSessions => {
@@ -889,7 +1345,8 @@ mod unix_impl {
 
                         for id in last.keys() {
                             if !current.contains_key(id)
-                                && !send(&out, &Response::SessionRemoved { id: *id }) {
+                                && !send(&out, &Response::SessionRemoved { id: *id })
+                            {
                                     return;
                                 }
                         }
@@ -921,11 +1378,110 @@ mod unix_impl {
                     }
                 });
             }
-            Request::Resize { id, cols, rows, ack } => {
+            Request::SubscribeEvents => {
+                let _ = ensure_default_session();
+                let (initial, sequence) = {
+                    let mut journal = event_journal().lock();
+                    let initial: Vec<SessionInfo> = registry()
+                        .lock()
+                        .iter()
+                        .map(|(id, entry)| session_info(*id, &entry.terminal))
+                        .collect();
+                    journal.seed(&initial);
+                    (initial, journal.sequence)
+                };
+                send(
+                    &conn.out,
+                    &Response::EventStreamStarted {
+                        version: EVENT_API_VERSION,
+                        sequence,
+                        sessions: initial.clone(),
+                    },
+                );
+
+                let out = Arc::clone(&conn.out);
+                let conn_alive = Arc::clone(&conn.conn_alive);
+                std::thread::spawn(move || {
+                    let mut sequence = sequence;
+                    let mut last: HashMap<PaneId, SessionInfo> = initial
+                        .into_iter()
+                        .map(|session| (session.id, session))
+                        .collect();
+                    while conn_alive.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(100));
+                        if !conn_alive.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let current: HashMap<PaneId, SessionInfo> = registry()
+                            .lock()
+                            .iter()
+                            .map(|(id, entry)| (*id, session_info(*id, &entry.terminal)))
+                            .collect();
+
+                        for (id, session) in &current {
+                            if last.get(id).is_some_and(|previous| previous != session) {
+                                event_journal().lock().update_if_changed(session.clone());
+                            }
+                        }
+                        last = current;
+
+                        let batch = event_journal().lock().batch_after(sequence);
+                        let is_gap = batch
+                            .oldest_sequence
+                            .is_some_and(|oldest| sequence.saturating_add(1) < oldest);
+                        if is_gap {
+                            let journal = event_journal().lock();
+                            let oldest_sequence = journal
+                                .events
+                                .front()
+                                .map(|event| event.sequence)
+                                .unwrap_or_else(|| journal.sequence.saturating_add(1));
+                            let latest_sequence = journal.sequence;
+                            let sessions = journal.snapshot();
+                            drop(journal);
+                            if !send(
+                                &out,
+                                &Response::EventStreamGap {
+                                    version: EVENT_API_VERSION,
+                                    after_sequence: sequence,
+                                    oldest_sequence,
+                                    latest_sequence,
+                                    sessions,
+                                },
+                            ) {
+                                return;
+                            }
+                            sequence = latest_sequence;
+                            continue;
+                        }
+
+                        for event in batch.events {
+                            sequence = event.sequence;
+                            if !send(&out, &Response::StreamEvent { envelope: event }) {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+            Request::Resize {
+                id,
+                cols,
+                rows,
+                ack,
+            } => {
+                if reject_access_scope(conn, AccessScope::Interact) {
+                    return;
+                }
                 if let Some(entry) = registry().lock().get(&id) {
                     entry.terminal.resize(cols, rows);
                     if ack {
-                        send(&conn.out, &Response::Done { cmd: "resize".to_string() });
+                        send(
+                            &conn.out,
+                            &Response::Done {
+                                cmd: "resize".to_string(),
+                            },
+                        );
                     }
                 } else {
                     send(
@@ -945,17 +1501,11 @@ mod unix_impl {
                 rows,
                 open,
             } => {
-                if conn.read_only {
-                    send(
-                        &conn.out,
-                        &Response::Error {
-                            code: "read_only".to_string(),
-                            message: "connection is in read-only mode".to_string(),
-                        },
-                    );
+                if reject_access_scope(conn, AccessScope::Manage) {
                     return;
                 }
-                match spawn_headless_session(command.as_deref(), &args, cwd.as_deref(), cols, rows) {
+                match spawn_headless_session(command.as_deref(), &args, cwd.as_deref(), cols, rows)
+                {
                     Ok(id) => {
                         let opened = if open {
                             get_session(id)
@@ -978,14 +1528,7 @@ mod unix_impl {
                 }
             }
             Request::Close { id, force } => {
-                if conn.read_only {
-                    send(
-                        &conn.out,
-                        &Response::Error {
-                            code: "read_only".to_string(),
-                            message: "connection is in read-only mode".to_string(),
-                        },
-                    );
+                if reject_access_scope(conn, AccessScope::Manage) {
                     return;
                 }
                 let entry = registry().lock().get(&id).cloned();
@@ -1017,7 +1560,7 @@ mod unix_impl {
                             },
                         );
                     }
-                }
+                };
             }
             Request::SplitPane {
                 id,
@@ -1026,14 +1569,7 @@ mod unix_impl {
                 args,
                 cwd,
             } => {
-                if conn.read_only {
-                    send(
-                        &conn.out,
-                        &Response::Error {
-                            code: "read_only".to_string(),
-                            message: "connection is in read-only mode".to_string(),
-                        },
-                    );
+                if reject_access_scope(conn, AccessScope::Manage) {
                     return;
                 }
                 let Some(dir) = parse_direction(&direction) else {
@@ -1071,14 +1607,7 @@ mod unix_impl {
                 direction,
                 delta,
             } => {
-                if conn.read_only {
-                    send(
-                        &conn.out,
-                        &Response::Error {
-                            code: "read_only".to_string(),
-                            message: "connection is in read-only mode".to_string(),
-                        },
-                    );
+                if reject_access_scope(conn, AccessScope::Manage) {
                     return;
                 }
                 let Some(dir) = parse_direction(&direction) else {
@@ -1100,7 +1629,12 @@ mod unix_impl {
                     delta,
                     reply,
                 }) {
-                    Ok(()) => send(&conn.out, &Response::Done { cmd: "resize_pane".to_string() }),
+                    Ok(()) => send(
+                        &conn.out,
+                        &Response::Done {
+                            cmd: "resize_pane".to_string(),
+                        },
+                    ),
                     Err(message) => send(
                         &conn.out,
                         &Response::Error {
@@ -1111,8 +1645,16 @@ mod unix_impl {
                 };
             }
             Request::FocusPane { id } => {
+                if reject_access_scope(conn, AccessScope::Manage) {
+                    return;
+                }
                 match call_gui(|reply| GuiRequest::FocusPane { target: id, reply }) {
-                    Ok(()) => send(&conn.out, &Response::Done { cmd: "focus_pane".to_string() }),
+                    Ok(()) => send(
+                        &conn.out,
+                        &Response::Done {
+                            cmd: "focus_pane".to_string(),
+                        },
+                    ),
                     Err(message) => send(
                         &conn.out,
                         &Response::Error {
@@ -1135,12 +1677,18 @@ mod unix_impl {
                 };
             }
             Request::ResizeWindow { cols, rows } => {
+                if reject_access_scope(conn, AccessScope::Manage) {
+                    return;
+                }
                 let cols = cols.max(20);
                 let rows = rows.max(5);
                 match call_gui(move |reply| GuiRequest::ResizeWindow { cols, rows, reply }) {
-                    Ok(()) => {
-                        send(&conn.out, &Response::Done { cmd: "resize_window".to_string() })
-                    }
+                    Ok(()) => send(
+                        &conn.out,
+                        &Response::Done {
+                            cmd: "resize_window".to_string(),
+                        },
+                    ),
                     Err(message) => send(
                         &conn.out,
                         &Response::Error {
@@ -1150,9 +1698,11 @@ mod unix_impl {
                     ),
                 };
             }
-            Request::BinarySnapshot { id } => {
+            Request::BinarySnapshot { id, screen_only } => {
                 if let Some(entry) = registry().lock().get(&id) {
-                    let bin = entry.terminal.snapshot_binary_compressed();
+                    let bin = entry
+                        .terminal
+                        .snapshot_binary_compressed_with_history(!screen_only);
                     send(
                         &conn.out,
                         &Response::BinarySnapshot {
@@ -1170,6 +1720,43 @@ mod unix_impl {
                     );
                 }
             }
+            Request::ReportProgramStatus { source_id, payload } => {
+                if reject_access_scope(conn, AccessScope::Interact) {
+                    return;
+                }
+                let entry = registry()
+                    .lock()
+                    .values()
+                    .find(|entry| entry.terminal.source_id() == source_id)
+                    .cloned();
+                let _ = match entry {
+                    Some(entry) => match entry
+                        .terminal
+                        .report_external_program_status(payload.as_bytes())
+                    {
+                        Ok(()) => send(
+                            &conn.out,
+                            &Response::Done {
+                                cmd: "report_program_status".to_string(),
+                            },
+                        ),
+                        Err(message) => send(
+                            &conn.out,
+                            &Response::Error {
+                                code: "invalid_status".to_string(),
+                                message,
+                            },
+                        ),
+                    },
+                    None => send(
+                        &conn.out,
+                        &Response::Error {
+                            code: "no_such_session".to_string(),
+                            message: "the Fastty session token is no longer active".to_string(),
+                        },
+                    ),
+                };
+            }
         }
     }
 
@@ -1179,6 +1766,30 @@ mod unix_impl {
         };
         line.push('\n');
         out.lock().write_all(line.as_bytes()).is_ok()
+    }
+
+    fn reject_access_scope(conn: &Conn, required: AccessScope) -> bool {
+        if conn.access_scope.permits(required) && !conn.read_only {
+            return false;
+        }
+        let code = if conn.access_scope == AccessScope::Observe || conn.read_only {
+            "read_only"
+        } else {
+            "access_denied"
+        };
+        let role = match required {
+            AccessScope::Observe => "observe",
+            AccessScope::Interact => "interact",
+            AccessScope::Manage => "manage",
+        };
+        send(
+            &conn.out,
+            &Response::Error {
+                code: code.to_string(),
+                message: format!("{role} access scope is required for this request"),
+            },
+        );
+        true
     }
 }
 
@@ -1291,6 +1902,11 @@ mod tests {
             Request::List,
             Request::SessionStatus { id: 42 },
             Request::SubscribeSessions,
+            Request::SubscribeEvents,
+            Request::Capture { id: 42 },
+            Request::SetAccessScope {
+                scope: AccessScope::Interact,
+            },
             Request::Attach {
                 id: 42,
                 mode: AttachMode::ReadWrite,
@@ -1319,7 +1935,10 @@ mod tests {
                 rows: Some(30),
                 open: true,
             },
-            Request::Close { id: 42, force: true },
+            Request::Close {
+                id: 42,
+                force: true,
+            },
             Request::SplitPane {
                 id: 7,
                 direction: "right".to_string(),
@@ -1334,7 +1953,10 @@ mod tests {
             },
             Request::FocusPane { id: 7 },
             Request::Layout,
-            Request::ResizeWindow { cols: 120, rows: 40 },
+            Request::ResizeWindow {
+                cols: 120,
+                rows: 40,
+            },
         ];
 
         for req in reqs {
@@ -1349,14 +1971,23 @@ mod tests {
                     assert_eq!(a, b);
                 }
                 (Request::SubscribeSessions, Request::SubscribeSessions) => {}
+                (Request::SubscribeEvents, Request::SubscribeEvents) => {}
+                (Request::Capture { id: a }, Request::Capture { id: b }) => assert_eq!(a, b),
+                (Request::SetAccessScope { scope: a }, Request::SetAccessScope { scope: b }) => {
+                    assert_eq!(a, b)
+                }
                 (Request::Attach { id: a, mode: m1 }, Request::Attach { id: b, mode: m2 }) => {
                     assert_eq!(a, b);
                     assert_eq!(m1, m2);
                 }
                 (Request::Detach { id: a }, Request::Detach { id: b }) => assert_eq!(a, b),
                 (
-                    Request::Write { id: a, data: d1, .. },
-                    Request::Write { id: b, data: d2, .. },
+                    Request::Write {
+                        id: a, data: d1, ..
+                    },
+                    Request::Write {
+                        id: b, data: d2, ..
+                    },
                 ) => {
                     assert_eq!(a, b);
                     assert_eq!(d1, d2);
@@ -1501,6 +2132,23 @@ mod tests {
     }
 
     #[test]
+    fn event_envelopes_have_stable_versioned_fields() {
+        let event = EventEnvelope {
+            version: EVENT_API_VERSION,
+            sequence: 7,
+            timestamp_unix_ms: 1234,
+            session_id: Some(42),
+            kind: SessionEvent::SessionRemoved { id: 42 },
+        };
+        let json = serde_json::to_value(event).expect("serialize event");
+        assert_eq!(json["version"], 1);
+        assert_eq!(json["sequence"], 7);
+        assert_eq!(json["session_id"], 42);
+        assert_eq!(json["kind"]["type"], "session_removed");
+        assert_eq!(json["kind"]["id"], 42);
+    }
+
+    #[test]
     fn test_hello_backward_compatibility() {
         let json_no_flag = r#"{"cmd":"hello"}"#;
         let req1: Request = serde_json::from_str(json_no_flag).expect("deserialize without flag");
@@ -1520,8 +2168,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_daemon_read_only_sticky_enforcement() {
-        use std::os::unix::net::UnixStream;
         use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
         use std::sync::atomic::AtomicBool;
         use unix_impl::{handle_request, Conn};
 
@@ -1530,6 +2178,7 @@ mod tests {
             out: Arc::new(Mutex::new(server)),
             conn_alive: Arc::new(AtomicBool::new(true)),
             read_only: false,
+            access_scope: AccessScope::Manage,
             attachments: HashMap::new(),
         };
 
@@ -1549,6 +2198,16 @@ mod tests {
         line.clear();
         client_reader.read_line(&mut line).unwrap();
         assert!(line.contains(r#""event":"hello""#));
+
+        handle_request(
+            Request::SetAccessScope {
+                scope: AccessScope::Manage,
+            },
+            &mut conn,
+        );
+        line.clear();
+        client_reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""code":"permission_escalation""#));
 
         // 3. Write command rejected with code "read_only"
         handle_request(
@@ -1584,13 +2243,32 @@ mod tests {
         line.clear();
         client_reader.read_line(&mut line).unwrap();
         assert!(line.contains(r#""code":"read_only""#));
+
+        // Resize and focus also change session or window state.
+        handle_request(
+            Request::Resize {
+                id: 1,
+                cols: 80,
+                rows: 24,
+                ack: true,
+            },
+            &mut conn,
+        );
+        line.clear();
+        client_reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""code":"read_only""#));
+
+        handle_request(Request::FocusPane { id: 1 }, &mut conn);
+        line.clear();
+        client_reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""code":"read_only""#));
     }
 
     #[cfg(unix)]
     #[test]
     fn test_close_gui_vs_headless_session() {
-        use std::os::unix::net::UnixStream;
         use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
         use std::sync::atomic::AtomicBool;
         use unix_impl::{handle_request, Conn};
 
@@ -1599,12 +2277,19 @@ mod tests {
             out: Arc::new(Mutex::new(server)),
             conn_alive: Arc::new(AtomicBool::new(true)),
             read_only: false,
+            access_scope: AccessScope::Manage,
             attachments: HashMap::new(),
         };
         let mut client_reader = BufReader::new(client);
 
         // 1. Non-existent session
-        handle_request(Request::Close { id: 999_999, force: false }, &mut conn);
+        handle_request(
+            Request::Close {
+                id: 999_999,
+                force: false,
+            },
+            &mut conn,
+        );
         let mut line = String::new();
         client_reader.read_line(&mut line).unwrap();
         assert!(line.contains(r#""code":"no_such_session""#));
@@ -1613,14 +2298,26 @@ mod tests {
         if let Ok(gui_term) = TerminalState::new_headless("/bin/sh", &[], None, 80, 24) {
             let gui_id = 999_001;
             register(gui_id, Arc::new(gui_term));
-            handle_request(Request::Close { id: gui_id, force: false }, &mut conn);
+            handle_request(
+                Request::Close {
+                    id: gui_id,
+                    force: false,
+                },
+                &mut conn,
+            );
             line.clear();
             client_reader.read_line(&mut line).unwrap();
             assert!(line.contains(r#""code":"not_closable""#));
             assert!(is_registered(gui_id));
 
             // 3. The same session with force closes and unregisters
-            handle_request(Request::Close { id: gui_id, force: true }, &mut conn);
+            handle_request(
+                Request::Close {
+                    id: gui_id,
+                    force: true,
+                },
+                &mut conn,
+            );
             line.clear();
             client_reader.read_line(&mut line).unwrap();
             assert!(line.contains(r#""event":"closed""#));
@@ -1632,7 +2329,13 @@ mod tests {
             let headless_id = 999_002;
             register_headless(headless_id, Arc::new(headless_term));
             assert!(is_registered(headless_id));
-            handle_request(Request::Close { id: headless_id, force: false }, &mut conn);
+            handle_request(
+                Request::Close {
+                    id: headless_id,
+                    force: false,
+                },
+                &mut conn,
+            );
             line.clear();
             client_reader.read_line(&mut line).unwrap();
             assert!(line.contains(r#""event":"closed""#));
@@ -1653,6 +2356,7 @@ mod tests {
             out: Arc::new(Mutex::new(server)),
             conn_alive: Arc::new(AtomicBool::new(true)),
             read_only: false,
+            access_scope: AccessScope::Manage,
             attachments: HashMap::new(),
         };
         let mut client_reader = BufReader::new(client);
@@ -1707,5 +2411,199 @@ mod tests {
         let old_json = r#"{"id":42,"title":"zsh","cwd":"/tmp","cols":80,"rows":24,"alive":true}"#;
         let old_info: SessionInfo = serde_json::from_str(old_json).unwrap();
         assert_eq!(old_info.history_size, 0);
+        assert!(old_info.program_status.is_empty());
+
+        let status_json = r#"{"id":42,"title":"claude","cwd":"/tmp","cols":80,"rows":24,"alive":true,"history_size":0,"program_status":[{"id":"assistant","state":"blocked","app":"claude","progress":45,"kind":"permission","msg":"private text"}]}"#;
+        let info: SessionInfo = serde_json::from_str(status_json).unwrap();
+        assert_eq!(
+            info.program_status[0].state,
+            crate::program_status::ProgramState::Blocked
+        );
+        let safe_json = serde_json::to_value(info).unwrap();
+        assert_eq!(safe_json["program_status"][0]["app"], "claude");
+        assert!(safe_json["program_status"][0].get("msg").is_none());
+    }
+
+    fn test_session(id: PaneId) -> SessionInfo {
+        SessionInfo {
+            id,
+            title: "shell".to_string(),
+            cwd: Some("/tmp".to_string()),
+            cols: 80,
+            rows: 24,
+            alive: true,
+            history_size: 0,
+            program_status: vec![],
+        }
+    }
+
+    #[test]
+    fn event_journal_preserves_add_remove_pairs_between_polls() {
+        let mut journal = EventJournal::new();
+        journal.added(test_session(7));
+        journal.removed(7);
+
+        let batch = journal.batch_after(0);
+        assert_eq!(batch.events.len(), 2);
+        assert_eq!(batch.events[0].sequence, 1);
+        assert!(matches!(
+            batch.events[0].kind,
+            SessionEvent::SessionAdded { .. }
+        ));
+        assert_eq!(batch.events[1].sequence, 2);
+        assert!(matches!(
+            batch.events[1].kind,
+            SessionEvent::SessionRemoved { id: 7 }
+        ));
+        assert!(journal.snapshot().is_empty());
+    }
+
+    #[test]
+    fn event_journal_reports_gap_after_bounded_history_overflows() {
+        let mut journal = EventJournal::new();
+        for id in 0..=EVENT_JOURNAL_CAPACITY {
+            journal.added(test_session(id));
+        }
+
+        let batch = journal.batch_after(0);
+        assert_eq!(batch.oldest_sequence, Some(2));
+        assert!(0_u64.saturating_add(1) < batch.oldest_sequence.unwrap());
+        assert_eq!(batch.events.len(), EVENT_JOURNAL_CAPACITY);
+        assert_eq!(journal.snapshot().len(), EVENT_JOURNAL_CAPACITY + 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn access_scope_can_only_decrease_and_blocks_manage_requests() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::AtomicBool;
+        use unix_impl::{handle_request, Conn};
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut conn = Conn {
+            out: Arc::new(Mutex::new(server)),
+            conn_alive: Arc::new(AtomicBool::new(true)),
+            read_only: false,
+            access_scope: AccessScope::Manage,
+            attachments: HashMap::new(),
+        };
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+
+        handle_request(
+            Request::SetAccessScope {
+                scope: AccessScope::Interact,
+            },
+            &mut conn,
+        );
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""cmd":"set_access_scope""#));
+
+        line.clear();
+        handle_request(Request::Close { id: 1, force: true }, &mut conn);
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""code":"access_denied""#));
+
+        line.clear();
+        handle_request(
+            Request::SetAccessScope {
+                scope: AccessScope::Manage,
+            },
+            &mut conn,
+        );
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""code":"permission_escalation""#));
+    }
+
+    #[test]
+    fn external_action_serializes_as_an_additive_request() {
+        let request = Request::ExternalAction {
+            id: 42,
+            action: ExternalAction::Send {
+                text: "hello\n".to_string(),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["cmd"], "external_action");
+        assert_eq!(value["id"], 42);
+        assert_eq!(value["action"]["action"], "send");
+        assert_eq!(value["action"]["text"], "hello\n");
+    }
+
+    #[test]
+    fn external_action_fails_closed_without_a_gui() {
+        let result = request_external_approval_with_sender(
+            None,
+            42,
+            ExternalAction::Send {
+                text: "hello".to_string(),
+            },
+            EXTERNAL_APPROVAL_TIMEOUT,
+        );
+        assert!(result
+            .unwrap_err()
+            .starts_with("approval_unavailable: no Fastty window"));
+    }
+
+    #[test]
+    fn external_action_returns_the_gui_decision() {
+        let (sender, receiver) = async_channel::unbounded();
+        let worker = std::thread::spawn(move || {
+            request_external_approval_with_sender(
+                Some(sender),
+                42,
+                ExternalAction::Send {
+                    text: "hello".to_string(),
+                },
+                EXTERNAL_APPROVAL_TIMEOUT,
+            )
+        });
+        let request = receiver.recv_blocking().unwrap();
+        match request {
+            GuiRequest::ExternalApproval {
+                session_id,
+                action,
+                reply,
+                ..
+            } => {
+                assert_eq!(session_id, 42);
+                assert_eq!(action, ExternalAction::Send {
+                    text: "hello".to_string(),
+                });
+                reply.send(true).unwrap();
+            }
+            _ => panic!("unexpected GUI request"),
+        }
+        assert!(worker.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn external_action_timeout_cancels_the_ui_prompt() {
+        let (sender, receiver) = async_channel::unbounded();
+        let worker = std::thread::spawn(move || {
+            request_external_approval_with_sender(
+                Some(sender),
+                42,
+                ExternalAction::Close { force: true },
+                std::time::Duration::from_millis(1),
+            )
+        });
+        let (request_id, _reply) = match receiver.recv_blocking().unwrap() {
+            GuiRequest::ExternalApproval {
+                request_id, reply, ..
+            } => (request_id, reply),
+            _ => panic!("expected an approval request"),
+        };
+        assert!(worker
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .starts_with("approval_timeout:"));
+        assert!(matches!(
+            receiver.recv_blocking().unwrap(),
+            GuiRequest::CancelExternalApproval { request_id: canceled_id }
+                if canceled_id == request_id
+        ));
     }
 }

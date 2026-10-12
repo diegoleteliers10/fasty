@@ -3,8 +3,10 @@
 use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
 use base64::engine::DecodePaddingMode;
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProgramState {
     Idle,
     Working,
@@ -25,7 +27,8 @@ impl ProgramState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BlockedKind {
     Permission,
     Question,
@@ -61,9 +64,10 @@ pub(crate) struct ProgramStatusStore {
 
 impl ProgramStatusStore {
     pub(crate) fn should_deliver_native_notification(&self) -> bool {
-        !self.records.iter().any(|record| {
-            matches!(record.state, ProgramState::Working | ProgramState::Blocked)
-        })
+        !self
+            .records
+            .iter()
+            .any(|record| matches!(record.state, ProgramState::Working | ProgramState::Blocked))
     }
 
     pub(crate) fn apply(&mut self, command: ProgramStatusCommand) {

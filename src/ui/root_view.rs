@@ -2,24 +2,32 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 use gpui::{
-    Bounds, Context, CursorStyle, Div, FocusHandle, FontFeatures, FontWeight, Hsla, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle,
-    ScrollWheelEvent, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions, div, prelude::*, px, size,
+    div, prelude::*, px, size, Bounds, Context, CursorStyle, Div, FocusHandle, FontFeatures,
+    FontWeight, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Render, ScrollHandle, ScrollWheelEvent, SharedString, TitlebarOptions, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 use std::sync::Arc;
 
-use super::project_sidebar::{GraphLayout, ProjectPanelTab, ProjectSidebar, cached_graph_layout};
+use super::project_sidebar::{cached_graph_layout, GraphLayout, ProjectPanelTab, ProjectSidebar};
 use super::settings_view::SettingsView;
 use super::status_bar::{StatusBar, StatusBarModel, StatusInfo};
 use super::tab_bar::{TabBar, TabItem, TabSidebar};
-use super::theme::{Theme, rgb_to_hsla};
+use super::theme::{rgb_to_hsla, Theme};
 use crate::config::{self, Config, TabLayout};
 use crate::event_listener::EventSender;
 use crate::git::GitStatus;
 use crate::pane_tree::{Direction, PaneId, PaneNode, PaneTree, SplitDirection, TerminalPane};
 use crate::program_status::{ProgramRecord, ProgramState};
 use crate::terminal_state::{AppEvent, TerminalState};
+
+#[derive(Clone)]
+struct PendingExternalApproval {
+    request_id: u64,
+    session_id: PaneId,
+    action: crate::daemon::ExternalAction,
+    reply: std::sync::mpsc::Sender<bool>,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RightPanel {
@@ -64,15 +72,19 @@ fn project_graph_scroll_target_changed(
 
 impl RightPanel {
     fn toggle(self, panel: Self) -> Self {
-        if self == panel { Self::Closed } else { panel }
+        if self == panel {
+            Self::Closed
+        } else {
+            panel
+        }
     }
 }
 
 #[cfg(test)]
 mod project_panel_state_tests {
     use super::{
-        ProjectGraphScrollTarget, ProjectPanelFeedback, RightPanel,
         project_graph_scroll_target_changed, project_panel_width_after_drag,
+        ProjectGraphScrollTarget, ProjectPanelFeedback, RightPanel,
     };
     use std::path::PathBuf;
 
@@ -141,6 +153,7 @@ mod project_panel_state_tests {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
+    pub pane_id: PaneId,
     pub start: alacritty_terminal::index::Point,
     pub end: alacritty_terminal::index::Point,
 }
@@ -433,7 +446,10 @@ mod host_restore_tests {
         });
 
         assert_eq!(report.stopped_ids, vec![stopped.id]);
-        assert_eq!(report.failures, vec![(failed.id, "host is unavailable".to_string())]);
+        assert_eq!(
+            report.failures,
+            vec![(failed.id, "host is unavailable".to_string())]
+        );
     }
 
     #[test]
@@ -490,6 +506,7 @@ mod host_restore_tests {
             rows: 24,
             alive: true,
             history_size: 0,
+            program_status: vec![],
         };
         assert!(verify_host_session_stopped(42, &[]).is_ok());
         assert!(verify_host_session_stopped(42, &[session]).is_err());
@@ -1018,7 +1035,11 @@ fn move_grid_selection(selected: usize, step: GridStep, cols: usize, items: usiz
             // The last row is short when the cell count is not a multiple of
             // the column count. A step into a cell that row does not have keeps
             // the selection put, rather than sliding it into another column.
-            if target > last { current } else { target }
+            if target > last {
+                current
+            } else {
+                target
+            }
         }
     }
 }
@@ -2757,6 +2778,7 @@ pub struct RootView {
     pub is_whats_new_open: bool,
     pub whats_new_notes: Option<String>,
     pub pending_close: Option<PendingClose>,
+    pending_external_approval: Option<PendingExternalApproval>,
     pub pressed_mouse_buttons: Vec<MouseButton>,
     pub reported_mouse_buttons: Vec<MouseButton>,
     pub(crate) ime_marked_text: Option<String>,
@@ -3419,6 +3441,7 @@ impl RootView {
             is_whats_new_open: show_whats_new,
             whats_new_notes: crate::whats_new::notes_for(env!("CARGO_PKG_VERSION")),
             pending_close: None,
+            pending_external_approval: None,
             pressed_mouse_buttons: Vec::new(),
             reported_mouse_buttons: Vec::new(),
             ime_marked_text: None,
@@ -3547,6 +3570,32 @@ impl RootView {
                     }
                     crate::daemon::GuiRequest::ResizeWindow { cols, rows, reply } => {
                         let _ = reply.send(this.daemon_resize_window(cols, rows, window, cx));
+                    }
+                    crate::daemon::GuiRequest::ExternalApproval {
+                        request_id,
+                        session_id,
+                        action,
+                        reply,
+                    } => {
+                        if let Some(previous) = this.pending_external_approval.take() {
+                            let _ = previous.reply.send(false);
+                        }
+                        this.pending_close = None;
+                        this.pending_external_approval = Some(PendingExternalApproval {
+                            request_id,
+                            session_id,
+                            action,
+                            reply,
+                        });
+                        cx.notify();
+                    }
+                    crate::daemon::GuiRequest::CancelExternalApproval { request_id } => {
+                        if this.pending_external_approval.as_ref().is_some_and(|pending| {
+                            pending.request_id == request_id
+                        }) {
+                            this.pending_external_approval = None;
+                            cx.notify();
+                        }
                     }
                 });
                 if res.is_err() {
@@ -3715,8 +3764,20 @@ impl RootView {
 
     pub fn get_selected_text(&self) -> Option<String> {
         let active_tab = self.tabs.get(self.active_tab_idx)?;
-        let terminal = active_tab.terminal.as_ref()?;
+        self.get_selected_text_for_pane(active_tab.pane_tree.active_pane_id)
+    }
+
+    fn get_selected_text_for_pane(&self, pane_id: PaneId) -> Option<String> {
+        let active_tab = self.tabs.get(self.active_tab_idx)?;
+        let terminal = active_tab
+            .pane_tree
+            .find_pane(pane_id)
+            .and_then(|pane| pane.terminal.as_ref())
+            .or(active_tab.terminal.as_ref())?;
         let sel = self.selection?;
+        if sel.pane_id != pane_id {
+            return None;
+        }
         let (min_p, max_p) = if sel.start <= sel.end {
             (sel.start, sel.end)
         } else {
@@ -3776,6 +3837,51 @@ impl RootView {
         } else {
             Some(text)
         }
+    }
+
+    fn attach_selection_to_agent(
+        &mut self,
+        pane_id: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selection) = self.get_selected_text_for_pane(pane_id) else {
+            return;
+        };
+        let Some(terminal) = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|tab| tab.pane_tree.find_pane(pane_id))
+            .and_then(|pane| pane.terminal.as_ref())
+        else {
+            return;
+        };
+        if !terminal.is_alive() || selection.len() > 16 * 1024 {
+            return;
+        }
+        let cwd = terminal
+            .get_current_working_directory()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unknown".to_string());
+        let command = terminal
+            .get_foreground_process_command()
+            .unwrap_or_else(|| "terminal".to_string());
+        let command = redact_process_command(&command);
+        let attachment = format_terminal_context(&selection, &cwd, &command);
+        let draft = append_terminal_context(&self.ai_input_state.text, &attachment);
+        let cursor = draft.chars().count();
+        self.ai_input_state.set_text_with_cursor(draft, cursor);
+        self.ai_input_text = self.ai_input_state.text.clone();
+        self.ai_input_focused = true;
+        let panel_was_open = self.right_panel == RightPanel::Ai;
+        self.right_panel = RightPanel::Ai;
+        window.focus(&self.focus_handle, cx);
+        if !panel_was_open {
+            self.persist_session();
+            self.trigger_ai_sidebar_animation(window, cx);
+        }
+        self.is_pane_context_menu_open = false;
+        cx.notify();
     }
 
     pub fn spawn_terminal_pane(
@@ -4036,8 +4142,9 @@ impl RootView {
     }
 
     fn retry_host_session(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((tab_id, session_id, title, custom_title, cwd)) = self.tabs.iter()
-            .find_map(|tab| tab.pane_tree.find_pane(pane_id).and_then(|pane| {
+        let Some((tab_id, session_id, title, custom_title, cwd)) =
+            self.tabs.iter().find_map(|tab| {
+                tab.pane_tree.find_pane(pane_id).and_then(|pane| {
                 if pane.terminal.is_some() {
                     return None;
                 }
@@ -4048,12 +4155,16 @@ impl RootView {
                     pane.custom_title.clone(),
                     pane.cwd.clone(),
                 ))
-            }))
+                })
+            })
         else {
             return;
         };
 
-        let shell = self.config.shell.clone()
+        let shell = self
+            .config
+            .shell
+            .clone()
             .or_else(|| std::env::var("SHELL").ok())
             .unwrap_or_else(crate::paths::default_system_shell);
         let mut replacement = self.spawn_terminal_pane_with_session(
@@ -5178,12 +5289,18 @@ impl RootView {
                 .iter()
                 .map(|(pane_id, _)| *pane_id)
                 .collect();
-            let running_processes = self.tabs.iter()
+            let running_processes = self
+                .tabs
+                .iter()
                 .find(|tab| tab.id == tab_id)
-                .map(|tab| tab.pane_tree.all_panes().into_iter()
+                .map(|tab| {
+                    tab.pane_tree
+                        .all_panes()
+                        .into_iter()
                     .filter(|pane| failed_ids.contains(&pane.id))
                     .filter_map(pane_close_info)
-                    .collect())
+                        .collect()
+                })
                 .unwrap_or_default();
             let error = stop_report.error_message();
             for pane_id in stop_report.stopped_ids {
@@ -5262,6 +5379,13 @@ impl RootView {
             CloseTarget::Tab { tab_id } => self.force_close_tab(tab_id, window, cx),
             CloseTarget::Pane { tab_id, pane_id } => self.force_close_pane(tab_id, pane_id, cx),
             CloseTarget::OtherTabs { keep_id } => self.force_close_other_tabs(keep_id, window, cx),
+        }
+    }
+
+    fn answer_external_approval(&mut self, approved: bool, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending_external_approval.take() {
+            let _ = pending.reply.send(approved);
+            cx.notify();
         }
     }
 
@@ -5539,27 +5663,34 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let stop_reports: Vec<(usize, PaneStopReport)> = self.tabs
+        let stop_reports: Vec<(usize, PaneStopReport)> = self
+            .tabs
             .iter()
             .filter(|tab| tab.id != keep_id)
             .map(|tab| (tab.id, stop_panes(&tab.pane_tree.all_panes())))
             .collect();
-        let failures: Vec<(usize, usize, String)> = stop_reports.iter()
-            .flat_map(|(tab_id, report)| report.failures.iter()
-                .map(|(pane_id, error)| (*tab_id, *pane_id, error.clone())))
+        let failures: Vec<(usize, usize, String)> = stop_reports
+            .iter()
+            .flat_map(|(tab_id, report)| {
+                report
+                    .failures
+                    .iter()
+                    .map(|(pane_id, error)| (*tab_id, *pane_id, error.clone()))
+            })
             .collect();
         if !failures.is_empty() {
-            let failed_ids: std::collections::HashSet<usize> = failures
+            let failed_ids: std::collections::HashSet<usize> =
+                failures.iter().map(|(_, pane_id, _)| *pane_id).collect();
+            let running_processes = self
+                .tabs
                 .iter()
-                .map(|(_, pane_id, _)| *pane_id)
-                .collect();
-            let running_processes = self.tabs.iter()
                 .filter(|tab| tab.id != keep_id)
                 .flat_map(|tab| tab.pane_tree.all_panes())
                 .filter(|pane| failed_ids.contains(&pane.id))
                 .filter_map(pane_close_info)
                 .collect();
-            let error = failures.iter()
+            let error = failures
+                .iter()
                 .map(|(tab_id, pane_id, error)| format!("tab {tab_id}, pane {pane_id}: {error}"))
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -8959,6 +9090,18 @@ impl RootView {
             return;
         }
 
+        if self.pending_external_approval.is_some() {
+            if key_lower == "escape" || key_lower == "esc" {
+                self.answer_external_approval(false, cx);
+                return;
+            }
+            if key_lower == "enter" || key_lower == "return" {
+                self.answer_external_approval(true, cx);
+                return;
+            }
+            return;
+        }
+
         // 0. Rename Tab Modal Keyboard Handler
         if self.is_rename_tab_open {
             if key_lower == "escape" || key_lower == "esc" {
@@ -10653,6 +10796,7 @@ impl RootView {
                             alacritty_terminal::index::Column(end_c.saturating_sub(1)),
                         );
                         self.selection = Some(Selection {
+                            pane_id: target_pane_id,
                             start: start_p,
                             end: end_p,
                         });
@@ -10690,6 +10834,7 @@ impl RootView {
                     )
                 };
                 self.selection = Some(Selection {
+                    pane_id: target_pane_id,
                     start: start_p,
                     end: end_p,
                 });
@@ -10723,6 +10868,7 @@ impl RootView {
                     )
                 };
                 self.selection = Some(Selection {
+                    pane_id: target_pane_id,
                     start: start_p,
                     end: end_p,
                 });
@@ -10777,6 +10923,7 @@ impl RootView {
                             alacritty_terminal::index::Column(end_c.saturating_sub(1)),
                         );
                         self.selection = Some(Selection {
+                            pane_id: target_pane_id,
                             start: start_p,
                             end: end_p,
                         });
@@ -11315,7 +11462,11 @@ impl RootView {
                 } else {
                     (updated_point, start_p)
                 };
-                self.selection = Some(Selection { start, end });
+                self.selection = Some(Selection {
+                    pane_id: active_pane.as_ref().map(|pane| pane.id).unwrap_or_default(),
+                    start,
+                    end,
+                });
                 cx.notify();
             }
         }
@@ -11777,8 +11928,11 @@ impl RootView {
                             content.cursor.shape
                         };
 
-                        let cursor_info =
-                            if cursor_visible && is_active && self.cursor_blink_visible && !ai_has_focus {
+                        let cursor_info = if cursor_visible
+                            && is_active
+                            && self.cursor_blink_visible
+                            && !ai_has_focus
+                        {
                                 Some((cursor_point.line.0, cursor_point.column.0, effective_shape))
                             } else {
                                 None
@@ -12064,7 +12218,8 @@ impl RootView {
                         )
                 });
 
-                let retry_panel = pane.host_session_id
+                let retry_panel = pane
+                    .host_session_id
                     .filter(|_| pane.terminal.is_none())
                     .map(|session_id| {
                         div()
@@ -13424,7 +13579,16 @@ impl Render for RootView {
                 let sc_rename = if cfg!(target_os = "macos") { "⌘⇧R" } else { "Ctrl+Shift+R" };
                 let sc_clear = if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl+Shift+K" };
                 let sc_search = if cfg!(target_os = "macos") { "⌘F" } else { "Ctrl+Shift+F" };
-                let has_selection = self.selection.is_some();
+                let has_selection = self
+                    .selection
+                    .is_some_and(|selection| selection.pane_id == target_pane_id);
+                let can_attach_to_ai_panel = has_selection
+                    && self
+                        .tabs
+                        .get(self.active_tab_idx)
+                        .and_then(|tab| tab.pane_tree.find_pane(target_pane_id))
+                        .and_then(|pane| pane.terminal.as_ref())
+                        .is_some_and(|terminal| terminal.is_alive());
                 let (can_zoom, is_zoomed) = self
                     .tabs
                     .get(self.active_tab_idx)
@@ -13436,7 +13600,7 @@ impl Render for RootView {
                     })
                     .unwrap_or((false, false));
                 let menu_w: f32 = 220.0;
-                let menu_h: f32 = if has_selection { 420.0 } else { 390.0 };
+                let menu_h: f32 = if has_selection { 456.0 } else { 390.0 };
                 let vp = _window.viewport_size();
                 let vp_w = vp.width.to_f64() as f32;
                 let vp_h = vp.height.to_f64() as f32;
@@ -13515,6 +13679,15 @@ impl Render for RootView {
                                 }),
                                 theme,
                             ))
+                            .when(can_attach_to_ai_panel, |menu| menu.child(render_context_menu_item(
+                                IconType::Sparkles,
+                                "Adjuntar al panel de IA",
+                                None,
+                                cx.listener(move |this, _ev, window, cx| {
+                                    this.attach_selection_to_agent(target_pane_id, window, cx);
+                                }),
+                                theme,
+                            )))
                         })
                         .child(render_context_menu_item(
                             IconType::ClipboardPaste,
@@ -17302,6 +17475,188 @@ impl Render for RootView {
                         ),
                 )
             })
+            .when(self.pending_external_approval.is_some(), |this| {
+                let pending = self.pending_external_approval.clone().unwrap();
+                let action_label = pending.action.label();
+                let detail = pending.action.display_detail();
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.55))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                            this.answer_external_approval(false, cx);
+                        }))
+                        .child(
+                            div()
+                                .w(px(420.))
+                                .p(px(16.))
+                                .rounded(px(10.))
+                                .bg(theme.surface)
+                                .border_1()
+                                .border_color(theme.border)
+                                .shadow_xl()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .pb(px(6.))
+                                        .border_b_1()
+                                        .border_color(theme.border)
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .px(px(6.))
+                                                        .py(px(1.))
+                                                        .rounded(px(4.))
+                                                        .bg(theme.yellow)
+                                                        .text_color(theme.black)
+                                                        .text_size(px(10.))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .child("APPROVAL"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(13.))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .text_color(theme.foreground)
+                                                        .child(action_label),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                    this.answer_external_approval(false, cx);
+                                                }))
+                                                .child(render_icon(IconType::X, theme.muted_strong, 12.0)),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(theme.foreground)
+                                        .child(format!("Session {}", pending.session_id)),
+                                )
+                                .child(
+                                    div()
+                                        .p(px(9.))
+                                        .rounded(px(6.))
+                                        .bg(theme.surface_raised)
+                                        .text_size(px(12.))
+                                        .text_color(theme.foreground)
+                                        .child(detail),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme.muted_strong)
+                                        .child("Only approve input that you recognize."),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .justify_end()
+                                        .gap_2()
+                                        .pt(px(4.))
+                                        .child(
+                                            div()
+                                                .px(px(12.))
+                                                .py(px(5.))
+                                                .rounded(px(5.))
+                                                .bg(theme.surface_raised)
+                                                .text_color(theme.foreground)
+                                                .text_size(px(11.))
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                    this.answer_external_approval(false, cx);
+                                                }))
+                                                .child("Deny"),
+                                        )
+                                        .child(
+                                            div()
+                                                .px(px(12.))
+                                                .py(px(5.))
+                                                .rounded(px(5.))
+                                                .bg(theme.accent)
+                                                .text_color(theme.black)
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_size(px(11.))
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                    this.answer_external_approval(true, cx);
+                                                }))
+                                                .child("Approve"),
+                                        ),
+                                ),
+                        ),
+                )
+            })
+    }
+}
+
+fn format_terminal_context(selection: &str, cwd: &str, command: &str) -> String {
+    let selection = selection
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .collect::<String>();
+    let longest_backtick_run = selection
+        .split('`')
+        .fold((0usize, 0usize), |(longest, current), part| {
+            if part.is_empty() {
+                let next = current + 1;
+                (longest.max(next), next)
+            } else {
+                (longest, 0)
+            }
+        })
+        .0;
+    let fence = "`".repeat(3.max(longest_backtick_run + 1));
+    format!(
+        "Analiza este texto de la terminal.\nDirectorio: `{cwd}`\nComando: {command:?}\n\n{fence}text\n{selection}\n{fence}"
+    )
+}
+
+fn append_terminal_context(draft: &str, attachment: &str) -> String {
+    if draft.trim().is_empty() {
+        attachment.to_string()
+    } else {
+        format!("{draft}\n\n{attachment}")
+    }
+}
+
+fn redact_process_command(command: &str) -> String {
+    let has_sensitive_argument = command.split_whitespace().any(|token| {
+        let key = token.split_once('=').map_or(token, |(key, _)| key);
+        let normalized = key
+            .trim_start_matches('-')
+            .to_ascii_lowercase()
+            .replace('-', "_");
+        ["token", "secret", "password", "passwd", "credential", "api_key", "auth"]
+            .iter()
+            .any(|marker| normalized.contains(marker))
+    });
+    if has_sensitive_argument {
+        "[REDACTED COMMAND]".to_string()
+    } else {
+        command.to_string()
     }
 }
 
@@ -17378,6 +17733,41 @@ fn render_about_spec_row(label: &'static str, value: &str, theme: Theme) -> Div 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_context_includes_command_and_directory() {
+        let context = format_terminal_context("line one\nline two", "/work/repo", "cargo test");
+        assert!(context.contains("Directorio: `/work/repo`"));
+        assert!(context.contains("Comando: \"cargo test\""));
+        assert!(context.contains("line one\nline two"));
+    }
+
+    #[test]
+    fn terminal_context_uses_a_fence_longer_than_selected_backticks() {
+        let context = format_terminal_context("run ``cargo test``", "/work", "cargo test");
+        assert!(context.contains("```text\nrun ``cargo test``\n```"));
+    }
+
+    #[test]
+    fn terminal_context_appends_to_the_existing_ai_draft() {
+        assert_eq!(append_terminal_context("", "output"), "output");
+        assert_eq!(
+            append_terminal_context("Check this", "output"),
+            "Check this\n\noutput"
+        );
+    }
+
+    #[test]
+    fn process_command_redacts_secret_arguments() {
+        assert_eq!(
+            redact_process_command("claude --model opus --api-key abc123 --password \"long secret\""),
+            "[REDACTED COMMAND]"
+        );
+        assert_eq!(
+            redact_process_command("claude --api-key=\"secret value\" --model opus"),
+            "[REDACTED COMMAND]"
+        );
+    }
 
     /// Every icon the tab rows, the project jumper and the attachment chips draw
     /// must produce real SVG geometry, not an empty path list. An empty list
@@ -18710,8 +19100,8 @@ mod ligature_tests {
     // rendered as `Tool {"cwd":"/Users/kagesyntax/Do...`.
     mod hosted_agent_tool_rows {
     use crate::ui::ai_sidebar::{
-            AiUiToolCall, humanize_tool_name, parse_tool_row, tool_label, tool_name_from_title,
-            tool_subject,
+            humanize_tool_name, parse_tool_row, tool_label, tool_name_from_title, tool_subject,
+            AiUiToolCall,
     };
 
     /// OpenCode's ACP layer emits `title: input.command ?? state.title ??

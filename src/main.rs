@@ -55,6 +55,136 @@ fn main() {
             }
             fastty::daemon_client::run_sessions_command(watch, wait, json);
         }
+        Some("capture") => {
+            let Some(id) = subcommand_args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+            else {
+                eprintln!("Usage: fastty capture <session-id> [--wait[=SECONDS]]");
+                std::process::exit(1);
+            };
+            let mut wait = None;
+            for arg in subcommand_args {
+                if let Some(seconds) = parse_wait_flag(&arg) {
+                    wait = Some(seconds);
+                } else {
+                    eprintln!("fastty capture: unknown flag {arg}");
+                    std::process::exit(1);
+                }
+            }
+            fastty::daemon_client::run_capture_command(id, wait);
+        }
+        Some("focus") => {
+            let Some(id) = subcommand_args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+            else {
+                eprintln!("Usage: fastty focus <session-id> [--wait[=SECONDS]]");
+                std::process::exit(1);
+            };
+            let mut wait = None;
+            for arg in subcommand_args {
+                if let Some(seconds) = parse_wait_flag(&arg) {
+                    wait = Some(seconds);
+                } else {
+                    eprintln!("fastty focus: unknown flag {arg}");
+                    std::process::exit(1);
+                }
+            }
+            fastty::daemon_client::run_focus_command(id, wait);
+        }
+        Some("send") => {
+            let mut enter = false;
+            let mut wait = None;
+            let mut rest = Vec::new();
+            let mut after_separator = false;
+            for arg in subcommand_args {
+                if !after_separator && arg == "--" {
+                    after_separator = true;
+                } else if !after_separator && arg == "--enter" {
+                    enter = true;
+                } else if !after_separator && parse_wait_flag(&arg).is_some() {
+                    wait = parse_wait_flag(&arg);
+                } else {
+                    rest.push(arg);
+                }
+            }
+            let Some(id) = rest.first().and_then(|value| value.parse::<usize>().ok()) else {
+                eprintln!("Usage: fastty send <session-id> [--enter] [--wait[=SECONDS]] -- <TEXT>");
+                std::process::exit(1);
+            };
+            if rest.len() < 2 {
+                eprintln!("Usage: fastty send <session-id> [--enter] [--wait[=SECONDS]] -- <TEXT>");
+                std::process::exit(1);
+            }
+            fastty::daemon_client::run_send_command(id, rest[1..].join(" "), enter, wait);
+        }
+        Some("events") => {
+            let mut wait = None;
+            for arg in subcommand_args {
+                if let Some(seconds) = parse_wait_flag(&arg) {
+                    wait = Some(seconds);
+                } else if arg != "--json" {
+                    eprintln!("fastty events: unknown flag {arg}");
+                    std::process::exit(1);
+                }
+            }
+            fastty::daemon_client::run_events_command(wait);
+        }
+        Some("agent-status") => {
+            let Some(state) = subcommand_args.next() else {
+                eprintln!("Usage: fastty agent-status <idle|working|done|blocked|error|clear> <claude|opencode|gemini|pi|codex> [permission|question|auth]");
+                std::process::exit(1);
+            };
+            let Some(app) = subcommand_args.next() else {
+                eprintln!("Usage: fastty agent-status <idle|working|done|blocked|error|clear> <claude|opencode|gemini|pi|codex> [permission|question|auth]");
+                std::process::exit(1);
+            };
+            let kind = subcommand_args.next();
+            if subcommand_args.next().is_some() {
+                eprintln!("fastty agent-status: too many arguments");
+                std::process::exit(1);
+            }
+            fastty::daemon_client::run_agent_status_command(state, app, kind);
+        }
+        Some("agent-hook") => {
+            let Some(provider) = subcommand_args.next() else {
+                eprintln!("Usage: fastty agent-hook <claude|gemini|codex> | install|uninstall <provider> --project|--user");
+                std::process::exit(1);
+            };
+            if matches!(provider.as_str(), "install" | "uninstall") {
+                let Some(agent) = subcommand_args.next() else {
+                    eprintln!("fastty agent-hook: provider is required");
+                    std::process::exit(1);
+                };
+                let scope = match subcommand_args.next().as_deref() {
+                    Some("--project") => fastty::agent_hooks::InstallScope::Project,
+                    Some("--user") => fastty::agent_hooks::InstallScope::User,
+                    _ => {
+                        eprintln!("fastty agent-hook: choose --project or --user");
+                        std::process::exit(1);
+                    }
+                };
+                if subcommand_args.next().is_some() {
+                    eprintln!("fastty agent-hook: too many arguments");
+                    std::process::exit(1);
+                }
+                let result = if provider == "install" {
+                    fastty::agent_hooks::install(&agent, scope)
+                } else {
+                    fastty::agent_hooks::uninstall(&agent, scope)
+                };
+                match result {
+                    Ok(path) => println!("{}: {}", provider, path.display()),
+                    Err(error) => {
+                        eprintln!("fastty agent-hook: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                fastty::daemon_client::run_agent_hook_command(provider);
+            }
+        }
         Some("gateway") => {
             let mut port: u16 = 8765;
             let mut host = "127.0.0.1".to_string();
@@ -103,9 +233,15 @@ fn main() {
                         std::process::exit(0);
                     }
                     unknown => {
-                        if let Some(p) = unknown.strip_prefix("--port=").and_then(|s| s.parse::<u16>().ok()) {
+                        if let Some(p) = unknown
+                            .strip_prefix("--port=")
+                            .and_then(|s| s.parse::<u16>().ok())
+                        {
                             port = p;
-                        } else if let Some(h) = unknown.strip_prefix("--host=").or_else(|| unknown.strip_prefix("--bind=")) {
+                        } else if let Some(h) = unknown
+                            .strip_prefix("--host=")
+                            .or_else(|| unknown.strip_prefix("--bind="))
+                        {
                             host = h.to_string();
                         } else if let Some(t) = unknown.strip_prefix("--token=") {
                             token = Some(t.to_string());
@@ -188,7 +324,9 @@ fn main() {
             if rest.len() > 1 {
                 args = rest[1..].to_vec();
             }
-            fastty::daemon_client::run_spawn_command(command, args, cwd, cols, rows, open, wait, json);
+            fastty::daemon_client::run_spawn_command(
+                command, args, cwd, cols, rows, open, wait, json,
+            );
         }
         Some("split") => {
             // `fastty split <pane-id> --direction right [--cwd DIR] [-- COMMAND]`
@@ -236,7 +374,9 @@ fn main() {
             if rest.len() > 1 {
                 args = rest[1..].to_vec();
             }
-            fastty::daemon_client::run_split_pane_command(pane_id, direction, command, args, cwd, wait, json);
+            fastty::daemon_client::run_split_pane_command(
+                pane_id, direction, command, args, cwd, wait, json,
+            );
         }
         Some("close") => {
             let Some(id) = subcommand_args.next().and_then(|s| s.parse::<usize>().ok()) else {
@@ -321,7 +461,6 @@ fn main() {
         }
         _ => {}
     }
-
 
     let cli_opts = CliOptions::parse();
     if let Err(error) = fastty::session_host::ensure_running() {
@@ -440,14 +579,7 @@ fn run_ask_command(mut args: impl Iterator<Item = String>) {
     let perm_handler = Arc::new(fastty::ai::CliPermissionHandler::new(checker.clone()));
     let ctx = fastty::ai::ToolCtx { cwd: cwd.clone() };
 
-    let mut agent = fastty::ai::Agent::new(
-        model,
-        model_name,
-        tools,
-        checker,
-        perm_handler,
-        ctx,
-    );
+    let mut agent = fastty::ai::Agent::new(model, model_name, tools, checker, perm_handler, ctx);
 
     agent.add_message(fastty::ai::Message::system(fastty::ai::system_prompt(&cwd)));
     agent.add_message(fastty::ai::Message::user(prompt));
@@ -464,7 +596,9 @@ fn run_ask_command(mut args: impl Iterator<Item = String>) {
         fastty::ai::AgentEvent::ToolStart { name, args, .. } => {
             println!("\n\x1b[36m⚡ Running tool '{}':\x1b[0m {}", name, args);
         }
-        fastty::ai::AgentEvent::ToolEnd { output, is_error, .. } => {
+        fastty::ai::AgentEvent::ToolEnd {
+            output, is_error, ..
+        } => {
             if is_error {
                 println!("\x1b[31m✗ Tool error:\x1b[0m\n{}", output);
             } else {

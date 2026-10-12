@@ -101,12 +101,14 @@ pub fn session_process_running(id: usize) -> Result<bool, String> {
     use std::os::unix::net::UnixStream;
 
     ensure_running()?;
-    let mut stream = UnixStream::connect(crate::daemon::socket_path())
-        .map_err(|error| error.to_string())?;
+    let mut stream =
+        UnixStream::connect(crate::daemon::socket_path()).map_err(|error| error.to_string())?;
     write_request(&mut stream, &Request::SessionStatus { id })
         .map_err(|error| error.to_string())?;
     match read_response(&mut BufReader::new(stream))? {
-        Response::SessionStatus { process_running, .. } => Ok(process_running),
+        Response::SessionStatus {
+            process_running, ..
+        } => Ok(process_running),
         Response::Error { code, .. } if code == "bad_request" => {
             let session = legacy_session_info(id)?;
             legacy_session_process_running(&session)
@@ -285,8 +287,7 @@ pub fn attach(id: usize) -> Result<RemoteSession, String> {
     let restore_legacy_mouse_modes = match query_session_status(id)? {
         Response::SessionStatus { .. } => false,
         Response::Error { code, .. } if code == "bad_request" => {
-            legacy_session_info(id)
-                .map(|session| legacy_session_needs_mouse_modes(&session))?
+            legacy_session_info(id).map(|session| legacy_session_needs_mouse_modes(&session))?
         }
         Response::Error { code, message } => return Err(format!("{code}: {message}")),
         other => return Err(format!("unexpected session status response: {other:?}")),
@@ -331,8 +332,8 @@ pub fn attach(id: usize) -> Result<RemoteSession, String> {
 fn query_session_status(id: usize) -> Result<Response, String> {
     use std::os::unix::net::UnixStream;
 
-    let mut stream = UnixStream::connect(crate::daemon::socket_path())
-        .map_err(|error| error.to_string())?;
+    let mut stream =
+        UnixStream::connect(crate::daemon::socket_path()).map_err(|error| error.to_string())?;
     write_request(&mut stream, &Request::SessionStatus { id })
         .map_err(|error| error.to_string())?;
     read_response(&mut BufReader::new(stream))
@@ -350,7 +351,12 @@ fn legacy_session_process_running(session: &SessionInfo) -> Option<bool> {
     if !session.alive {
         return Some(false);
     }
-    let process_name = session.title.trim().rsplit('/').next()?.to_ascii_lowercase();
+    let process_name = session
+        .title
+        .trim()
+        .rsplit('/')
+        .next()?
+        .to_ascii_lowercase();
     if process_name.is_empty() {
         return None;
     }
@@ -364,8 +370,17 @@ fn legacy_session_process_running(session: &SessionInfo) -> Option<bool> {
 }
 
 fn legacy_session_needs_mouse_modes(session: &SessionInfo) -> bool {
-    let process_name = session.title.trim().rsplit('/').next().unwrap_or_default().to_ascii_lowercase();
-    matches!(process_name.as_str(), "claude" | "opencode" | "agy" | "pi" | "codex")
+    let process_name = session
+        .title
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        process_name.as_str(),
+        "claude" | "opencode" | "agy" | "pi" | "codex"
+    )
 }
 
 #[cfg(unix)]
@@ -445,18 +460,38 @@ mod tests {
             rows: 24,
             alive,
             history_size: 0,
+            program_status: vec![],
         }
     }
 
     #[test]
     fn legacy_host_list_identifies_idle_shell_and_running_agent() {
-        assert_eq!(legacy_session_process_running(&legacy_session("zsh", true)), None);
-        assert_eq!(legacy_session_process_running(&legacy_session("opencode", true)), Some(true));
-        assert_eq!(legacy_session_process_running(&legacy_session("zsh", false)), Some(false));
-        assert_eq!(legacy_session_process_running(&legacy_session("", true)), None);
-        assert_eq!(legacy_session_process_running(&legacy_session("shell", true)), None);
-        assert!(legacy_session_needs_mouse_modes(&legacy_session("claude", true)));
-        assert!(!legacy_session_needs_mouse_modes(&legacy_session("zsh", true)));
+        assert_eq!(
+            legacy_session_process_running(&legacy_session("zsh", true)),
+            None
+        );
+        assert_eq!(
+            legacy_session_process_running(&legacy_session("opencode", true)),
+            Some(true)
+        );
+        assert_eq!(
+            legacy_session_process_running(&legacy_session("zsh", false)),
+            Some(false)
+        );
+        assert_eq!(
+            legacy_session_process_running(&legacy_session("", true)),
+            None
+        );
+        assert_eq!(
+            legacy_session_process_running(&legacy_session("shell", true)),
+            None
+        );
+        assert!(legacy_session_needs_mouse_modes(&legacy_session(
+            "claude", true
+        )));
+        assert!(!legacy_session_needs_mouse_modes(&legacy_session(
+            "zsh", true
+        )));
     }
 
     #[test]

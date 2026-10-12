@@ -265,14 +265,18 @@ pub fn get_clipboard_image(clip: &mut arboard::Clipboard) -> Option<PathBuf> {
 /// Writes paste text into the terminal PTY with bracketed paste if enabled.
 pub fn paste_text_to_terminal(terminal: &crate::terminal_state::TerminalState, text: &str) {
     if terminal.is_bracketed_paste_enabled() {
-        let mut buf = Vec::with_capacity(text.len() + 12);
-        buf.extend_from_slice(b"\x1b[200~");
-        buf.extend_from_slice(text.as_bytes());
-        buf.extend_from_slice(b"\x1b[201~");
-        terminal.write_to_pty(&buf);
+        terminal.write_to_pty(&bracketed_paste_bytes(text));
     } else {
         terminal.write_to_pty(text.as_bytes());
     }
+}
+
+fn bracketed_paste_bytes(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(text.len() + 12);
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
 }
 
 /// Handles external paths dropped into the terminal.
@@ -289,6 +293,17 @@ pub fn handle_dropped_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bracketed_paste_preserves_text_without_submitting_it() {
+        let text = "Salida: ñ\nerror: x";
+        let bytes = bracketed_paste_bytes(text);
+        assert!(bytes.starts_with(b"\x1b[200~"));
+        assert!(bytes.ends_with(b"\x1b[201~"));
+        assert_eq!(&bytes[6..bytes.len() - 6], text.as_bytes());
+        assert!(!bytes.ends_with(b"\r"));
+        assert!(!bytes.ends_with(b"\n"));
+    }
 
     #[test]
     fn test_percent_decode_str() {

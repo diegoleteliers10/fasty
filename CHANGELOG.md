@@ -3,6 +3,21 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.22.4 - 2026-10-12
+
+### AI panel
+
+- Attach selected terminal output, its working directory, and its safe process command to the AI draft.
+
+### Agent integrations
+
+- Track Claude Code, Gemini CLI, Codex CLI, OpenCode, and Pi activity in the terminal.
+- Install or remove project and user hooks without replacing unrelated settings.
+
+### Session API
+
+- Add scoped session access, event streaming with gap recovery, screen capture, and approval-gated actions.
+
 ## 0.22.3 - 2026-10-11
 
 ### Terminal sessions
