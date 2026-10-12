@@ -3,6 +3,13 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.22.5 - 2026-10-12
+
+### AI panel
+
+- Use the pane or tab working directory when Fastty cannot read the terminal host process directory.
+- Include the correct working directory when you attach selected output from a restored session to the AI draft.
+
 ## 0.22.4 - 2026-10-12
 
 ### AI panel
