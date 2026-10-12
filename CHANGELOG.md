@@ -3,6 +3,15 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.22.3 - 2026-10-11
+
+### Terminal sessions
+
+- Reconnect to older session hosts without restarting their running processes.
+- Ask before closing a restored session when an older host cannot confirm its process state.
+- Restore mouse, focus, and paste input for recognized agents on older hosts.
+- Open a new shell when a saved session no longer exists.
+
 ## 0.22.2 - 2026-10-11
 
 ### Terminal sessions
