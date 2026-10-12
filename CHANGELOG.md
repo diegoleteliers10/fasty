@@ -3,6 +3,14 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.22.6 - 2026-10-12
+
+### AI panel
+
+- Keep keyboard focus in the AI input after cursor movement.
+- Move the input cursor between visual lines with the up and down keys.
+- Close the AI panel with Escape when no menu or active response needs attention.
+
 ## 0.22.5 - 2026-10-12
 
 ### AI panel
