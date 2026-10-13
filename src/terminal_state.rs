@@ -556,16 +556,7 @@ impl TerminalState {
             viewport_height,
             sender,
             Some(remote),
-        )?;
-        if !terminal.program_status_snapshot().is_empty() {
-            terminal.program_status_pending.store(true, Ordering::Relaxed);
-            terminal
-                .event_listener
-                .send_app_event(AppEvent::ProgramStatusChanged {
-                    source_id: terminal.source_id,
-                });
-        }
-        Ok(terminal)
+        )
     }
 
     #[cfg(not(unix))]
@@ -977,7 +968,7 @@ impl TerminalState {
             let mut term = term.lock();
             let mut parser: Processor<StdSyncHandler> = Processor::new();
             if header.flags & SNAPSHOT_FLAG_ALT_SCREEN != 0 {
-                parser.advance(&mut term, b"\x1b[?1049h");
+                parser.advance(&mut *term, b"\x1b[?1049h");
             }
             if !apply_snapshot_to_grid(&mut term, header, cells) {
                 return Err(anyhow::anyhow!("session host sent an invalid binary snapshot"));
@@ -987,7 +978,7 @@ impl TerminalState {
             );
             let mut mode_commands = Vec::new();
             append_restored_terminal_modes(&mut mode_commands, mode);
-            parser.advance(&mut term, &mode_commands);
+            parser.advance(&mut *term, &mode_commands);
         }
         drop(binary_snapshot);
 
@@ -1808,9 +1799,10 @@ impl TerminalState {
         Vec<crate::program_status::ProgramRecord>,
         async_channel::Receiver<Vec<u8>>,
     ) {
-        self.output_hub.snapshot_and_subscribe(|| {
+        let ((snapshot, program_status), output) = self.output_hub.snapshot_and_subscribe(|| {
             (self.snapshot_ansi(), self.program_status_snapshot())
-        })
+        });
+        (snapshot, program_status, output)
     }
 
     pub fn snapshot_binary_and_subscribe_output(
@@ -1821,7 +1813,7 @@ impl TerminalState {
         async_channel::Receiver<Vec<u8>>,
     ) {
         const MAX_ATTACH_CELLS: usize = 16 * 1024 * 1024 / 16;
-        let ((header, cells), program_status, output) = self.output_hub.snapshot_and_subscribe(|| {
+        let (((header, cells), program_status), output) = self.output_hub.snapshot_and_subscribe(|| {
             (
                 self.snapshot_binary_parts(true, Some(MAX_ATTACH_CELLS)),
                 self.program_status_snapshot(),

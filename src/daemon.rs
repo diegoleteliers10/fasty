@@ -32,6 +32,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const EVENT_API_VERSION: u16 = 1;
 const MAX_CAPTURE_BYTES: usize = 1_048_576;
 const EVENT_JOURNAL_CAPACITY: usize = 4096;
+const MAX_EVENT_PROGRAM_STATUSES: usize = 32;
+const MAX_EVENT_TEXT_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionKind {
@@ -1147,13 +1149,15 @@ mod unix_impl {
                             },
                         );
                     }
-                    None => send(
-                        &conn.out,
-                        &Response::Error {
-                            code: "no_such_session".to_string(),
-                            message: "no such session".to_string(),
-                        },
-                    ),
+                    None => {
+                        send(
+                            &conn.out,
+                            &Response::Error {
+                                code: "no_such_session".to_string(),
+                                message: "no such session".to_string(),
+                            },
+                        );
+                    }
                 }
             }
             Request::CloseIfIdleBatch { ids } => {

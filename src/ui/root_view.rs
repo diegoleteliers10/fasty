@@ -15376,7 +15376,8 @@ impl Render for RootView {
                                                     .enumerate()
                                                     .map(|(idx, cmd)| {
                                                         let is_selected = idx == selected_idx;
-                                                        let cmd_id = cmd.id.clone();
+                                                        let preview_cmd_id = cmd.id.clone();
+                                                        let execute_cmd_id = cmd.id.clone();
                                                         div()
                                                             .flex()
                                                             .flex_row()
@@ -15392,12 +15393,12 @@ impl Render for RootView {
                                                                 if this.command_palette_selected != idx {
                                                                     this.command_palette_selected = idx;
                                                                     // Hover previews live, like keyboard nav.
-                                                                    this.preview_palette_command(&cmd_id, _window, cx);
+                                                                    this.preview_palette_command(&preview_cmd_id, _window, cx);
                                                                     cx.notify();
                                                                 }
                                                             }))
                                                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
-                                                                this.execute_palette_command(&cmd_id, window, cx);
+                                                                this.execute_palette_command(&execute_cmd_id, window, cx);
                                                             }))
                                                             .child(
                                                                 div()
