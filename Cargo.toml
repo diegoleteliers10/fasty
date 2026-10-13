@@ -55,7 +55,7 @@ git2 = { version = "0.21", default-features = false }
 getrandom = "0.3.4"
 trash = "5.2.9"
 notify = "8"
-dirs = "6"
+dirs = "7"
 icons = "0.18.3"
 smallvec = "1"
 fff-search = { version = "0.10.6", features = ["ripgrep"] }
