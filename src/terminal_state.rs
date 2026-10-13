@@ -449,6 +449,11 @@ fn append_restored_terminal_modes(out: &mut Vec<u8>, mode: alacritty_terminal::t
     }
 }
 
+const PROMPT_TERMINAL_RESET: &[u8] =
+    b"\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?47l\x1b[?1047l\x1b[?1049l";
+const IDLE_SESSION_MODE_RESET: &[u8] =
+    b"\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l\x1b[?2004l";
+
 #[cfg(unix)]
 fn append_legacy_mouse_modes(out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h");
@@ -675,6 +680,9 @@ impl TerminalState {
         sender: crate::event_listener::EventSender,
         remote: Option<crate::session_host::RemoteSession>,
     ) -> anyhow::Result<Self> {
+        let restored_idle_session = remote
+            .as_ref()
+            .is_some_and(|remote| remote.process_running == Some(false));
         let restored_program_status = remote
             .as_ref()
             .map(|remote| remote.program_status.clone())
@@ -979,6 +987,9 @@ impl TerminalState {
             let mut mode_commands = Vec::new();
             append_restored_terminal_modes(&mut mode_commands, mode);
             parser.advance(&mut *term, &mode_commands);
+            if restored_idle_session {
+                parser.advance(&mut *term, IDLE_SESSION_MODE_RESET);
+            }
         }
         drop(binary_snapshot);
 
@@ -1086,8 +1097,8 @@ impl TerminalState {
                                 source_id,
                                 |store| store.end_activity(),
                             );
-                            // Reset mouse tracking modes on prompt start to prevent leaked escape codes if a child exited uncleanly
-                            parser.advance(term, b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+                            // Reset terminal modes that a child may leave active before the next prompt.
+                            parser.advance(term, PROMPT_TERMINAL_RESET);
 
                             let scrolled = (base as i64 - screen_lines as i64).max(0);
                             let absolute_line = (scrolled + cursor_line as i64).max(0) as u64;
@@ -1797,12 +1808,18 @@ impl TerminalState {
     ) -> (
         Vec<u8>,
         Vec<crate::program_status::ProgramRecord>,
+        bool,
         async_channel::Receiver<Vec<u8>>,
     ) {
-        let ((snapshot, program_status), output) = self.output_hub.snapshot_and_subscribe(|| {
-            (self.snapshot_ansi(), self.program_status_snapshot())
-        });
-        (snapshot, program_status, output)
+        let ((snapshot, program_status, process_running), output) =
+            self.output_hub.snapshot_and_subscribe(|| {
+                (
+                    self.snapshot_ansi(),
+                    self.program_status_snapshot(),
+                    self.is_process_running(),
+                )
+            });
+        (snapshot, program_status, process_running, output)
     }
 
     pub fn snapshot_binary_and_subscribe_output(
@@ -1810,18 +1827,22 @@ impl TerminalState {
     ) -> (
         Vec<u8>,
         Vec<crate::program_status::ProgramRecord>,
+        bool,
         async_channel::Receiver<Vec<u8>>,
     ) {
         const MAX_ATTACH_CELLS: usize = 16 * 1024 * 1024 / 16;
-        let (((header, cells), program_status), output) = self.output_hub.snapshot_and_subscribe(|| {
-            (
-                self.snapshot_binary_parts(true, Some(MAX_ATTACH_CELLS)),
-                self.program_status_snapshot(),
-            )
-        });
+        let (((header, cells), program_status, process_running), output) =
+            self.output_hub.snapshot_and_subscribe(|| {
+                (
+                    self.snapshot_binary_parts(true, Some(MAX_ATTACH_CELLS)),
+                    self.program_status_snapshot(),
+                    self.is_process_running(),
+                )
+            });
         (
             crate::server::binary_snapshot::encode_snapshot_compressed(&header, &cells),
             program_status,
+            process_running,
             output,
         )
     }
@@ -4303,12 +4324,29 @@ mod tests {
         assert!(restored.mode().contains(TermMode::ALT_SCREEN));
         assert!(!restored.mode().contains(TermMode::SHOW_CURSOR));
 
-        // Reset mouse tracking
-        parser.advance(&mut term, b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+        // Reset modes that a child can leave active.
+        parser.advance(&mut term, PROMPT_TERMINAL_RESET);
         assert!(!term.mode().contains(TermMode::MOUSE_REPORT_CLICK));
         assert!(!term.mode().contains(TermMode::SGR_MOUSE));
         assert!(!term.mode().contains(TermMode::MOUSE_MOTION));
         assert!(!term.mode().contains(TermMode::MOUSE_DRAG));
+        assert!(!term.mode().contains(TermMode::APP_CURSOR));
+        assert!(!term.mode().contains(TermMode::APP_KEYPAD));
+        assert!(!term.mode().contains(TermMode::FOCUS_IN_OUT));
+        assert!(!term.mode().contains(TermMode::BRACKETED_PASTE));
+        assert!(!term.mode().contains(TermMode::ALT_SCREEN));
+        assert!(term.mode().contains(TermMode::SHOW_CURSOR));
+
+        parser.advance(
+            &mut term,
+            b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[?2004h",
+        );
+        parser.advance(&mut term, IDLE_SESSION_MODE_RESET);
+        assert!(term.mode().contains(TermMode::ALT_SCREEN));
+        assert!(!term.mode().contains(TermMode::MOUSE_REPORT_CLICK));
+        assert!(!term.mode().contains(TermMode::SGR_MOUSE));
+        assert!(!term.mode().contains(TermMode::FOCUS_IN_OUT));
+        assert!(!term.mode().contains(TermMode::BRACKETED_PASTE));
     }
 
     #[cfg(unix)]

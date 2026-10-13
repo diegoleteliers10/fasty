@@ -73,6 +73,7 @@ pub struct RemoteSession {
     pub id: usize,
     pub snapshot: Vec<u8>,
     pub program_status: Vec<crate::program_status::ProgramRecord>,
+    pub process_running: Option<bool>,
     pub restore_legacy_mouse_modes: bool,
     pub reader: BufReader<std::os::unix::net::UnixStream>,
     pub control: std::sync::Arc<RemoteControl>,
@@ -83,6 +84,7 @@ pub struct RemoteSession {
     pub id: usize,
     pub snapshot: Vec<u8>,
     pub program_status: Vec<crate::program_status::ProgramRecord>,
+    pub process_running: Option<bool>,
     pub restore_legacy_mouse_modes: bool,
     pub control: std::sync::Arc<RemoteControl>,
 }
@@ -163,6 +165,12 @@ pub fn close_if_idle_batch(ids: Vec<usize>) -> Result<CloseIfIdleBatchResult, St
             Ok(CloseIfIdleBatchResult::Closed)
         }
         Response::CloseBatch { blocked, .. } => Ok(CloseIfIdleBatchResult::Running(blocked)),
+        Response::Error { code, message }
+            if code == "bad_request"
+                && message.contains("unknown variant `close_if_idle_batch`") =>
+        {
+            Err(legacy_safe_close_error())
+        }
         Response::Error { code, message } => Err(format!("{code}: {message}")),
         other => Err(format!("unexpected batch close response: {other:?}")),
     }
@@ -188,9 +196,18 @@ pub fn close_if_idle(id: usize) -> Result<CloseIfIdleResult, String> {
         Response::Error { code, .. } if code == "no_such_session" => {
             Ok(CloseIfIdleResult::Closed)
         }
+        Response::Error { code, message }
+            if code == "bad_request" && message.contains("unknown variant `close_if_idle`") =>
+        {
+            Err(legacy_safe_close_error())
+        }
         Response::Error { code, message } => Err(format!("{code}: {message}")),
         other => Err(format!("unexpected close response: {other:?}")),
     }
+}
+
+fn legacy_safe_close_error() -> String {
+    "the Fastty session host is older than this app and cannot close idle sessions safely. Quit Fastty, including its background process, then reopen it.".to_string()
 }
 
 #[cfg(not(unix))]
@@ -335,8 +352,12 @@ pub fn spawn_attached(
     .map_err(|error| error.to_string())?;
     let control_stream = stream.try_clone().map_err(|error| error.to_string())?;
     let mut reader = BufReader::new(stream);
-    let program_status = match read_response(&mut reader)? {
-        Response::Attached { program_status, .. } => program_status,
+    let (program_status, process_running) = match read_response(&mut reader)? {
+        Response::Attached {
+            program_status,
+            process_running,
+            ..
+        } => (program_status, process_running),
         Response::Error { code, message } => return Err(format!("{code}: {message}")),
         other => return Err(format!("unexpected attach response: {other:?}")),
     };
@@ -355,6 +376,7 @@ pub fn spawn_attached(
         id,
         snapshot,
         program_status,
+        process_running,
         restore_legacy_mouse_modes: false,
         reader,
         control: std::sync::Arc::new(RemoteControl {
@@ -368,14 +390,6 @@ pub fn spawn_attached(
 #[cfg(unix)]
 pub fn attach(id: usize) -> Result<RemoteSession, String> {
     ensure_running()?;
-    let restore_legacy_mouse_modes = match query_session_status(id)? {
-        Response::SessionStatus { .. } => false,
-        Response::Error { code, .. } if code == "bad_request" => {
-            legacy_session_info(id).map(|session| legacy_session_needs_mouse_modes(&session))?
-        }
-        Response::Error { code, message } => return Err(format!("{code}: {message}")),
-        other => return Err(format!("unexpected session status response: {other:?}")),
-    };
     let mut stream = connect_for_handshake()?;
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -391,8 +405,12 @@ pub fn attach(id: usize) -> Result<RemoteSession, String> {
     .map_err(|error| error.to_string())?;
     let control_stream = stream.try_clone().map_err(|error| error.to_string())?;
     let mut reader = BufReader::new(stream);
-    let program_status = match read_response(&mut reader)? {
-        Response::Attached { program_status, .. } => program_status,
+    let (program_status, attached_process_running) = match read_response(&mut reader)? {
+        Response::Attached {
+            program_status,
+            process_running,
+            ..
+        } => (program_status, process_running),
         Response::Error { code, message } => return Err(format!("{code}: {message}")),
         other => return Err(format!("unexpected attach response: {other:?}")),
     };
@@ -406,10 +424,28 @@ pub fn attach(id: usize) -> Result<RemoteSession, String> {
         .get_mut()
         .set_read_timeout(None)
         .map_err(|error| error.to_string())?;
+    let (restore_legacy_mouse_modes, process_running) = match attached_process_running {
+        Some(process_running) => (false, Some(process_running)),
+        None => match query_session_status(id)? {
+            Response::SessionStatus {
+                process_running, ..
+            } => (false, Some(process_running)),
+            Response::Error { code, .. } if code == "bad_request" => {
+                let session = legacy_session_info(id)?;
+                (
+                    legacy_session_needs_mouse_modes(&session),
+                    legacy_session_process_running(&session),
+                )
+            }
+            Response::Error { code, message } => return Err(format!("{code}: {message}")),
+            other => return Err(format!("unexpected session status response: {other:?}")),
+        },
+    };
     Ok(RemoteSession {
         id,
         snapshot,
         program_status,
+        process_running,
         restore_legacy_mouse_modes,
         reader,
         control: std::sync::Arc::new(RemoteControl {

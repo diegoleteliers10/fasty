@@ -749,6 +749,8 @@ pub enum Response {
         mode: AttachMode,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         program_status: Vec<crate::program_status::ProgramRecord>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_running: Option<bool>,
     },
     /// Sent once, immediately after `attached`, with the pane's current
     /// on-screen contents as ANSI/SGR bytes (see
@@ -1268,7 +1270,7 @@ mod unix_impl {
                     mode
                 };
                 let (cols, rows) = terminal.dimensions();
-                let (snapshot, program_status, rx) = if binary_snapshot {
+                let (snapshot, program_status, process_running, rx) = if binary_snapshot {
                     terminal.snapshot_binary_and_subscribe_output()
                 } else {
                     terminal.snapshot_and_subscribe_output()
@@ -1304,6 +1306,7 @@ mod unix_impl {
                         rows,
                         mode: effective_mode,
                         program_status,
+                        process_running: Some(process_running),
                     },
                 );
                 send(
@@ -2364,6 +2367,7 @@ mod tests {
             rows: 24,
             mode: AttachMode::ReadOnly,
             program_status: vec![],
+            process_running: None,
         };
         let json = serde_json::to_string(&res).unwrap();
         assert!(json.contains(r#""mode":"read_only""#));
