@@ -3,6 +3,18 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.22.8 - 2026-10-13
+
+### Terminal sessions
+
+- Match restored CLI and TUI state to the terminal snapshot.
+- Reset terminal modes that a child process leaves active after it exits.
+- Keep idle session scroll and alternate-screen contents usable after restore.
+
+### Session hosts
+
+- Show safe recovery steps when an older background host cannot close an idle session.
+
 ## 0.22.7 - 2026-10-13
 
 ### Terminal sessions
