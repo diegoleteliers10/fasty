@@ -1507,6 +1507,7 @@ impl SettingsView {
         self.binding_conflict = None;
         self.save_config();
         crate::keybindings::init_resolver(self.config.keybindings.clone(), Some(preset));
+        crate::keybindings::init_key_modes(self.config.key_modes.clone());
         crate::config::increment_config_version();
         cx.notify();
     }
@@ -1517,6 +1518,7 @@ impl SettingsView {
             self.config.keybindings.clone(),
             Some(self.keybinding_preset),
         );
+        crate::keybindings::init_key_modes(self.config.key_modes.clone());
         crate::config::increment_config_version();
         cx.notify();
     }
@@ -1926,6 +1928,7 @@ impl SettingsView {
                     self.config.keybindings.clone(),
                     self.config.keybinding_preset,
                 );
+                crate::keybindings::init_key_modes(self.config.key_modes.clone());
                 crate::config::increment_config_version();
                 // "Software should be fun": the migration moment gets its
                 // celebration, a nod to the config-import confetti that

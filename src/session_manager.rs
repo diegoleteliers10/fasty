@@ -1,6 +1,48 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
+
+static NEXT_SAVE_REVISION: AtomicU64 = AtomicU64::new(1);
+static SAVED_REVISIONS: OnceLock<Mutex<std::collections::HashMap<String, u64>>> = OnceLock::new();
+
+pub fn next_save_revision() -> u64 {
+    NEXT_SAVE_REVISION.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(windows)]
+#[link(name = "Kernel32")]
+extern "system" {
+    fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let from_wide: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to_wide: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let moved = unsafe {
+        MoveFileExW(
+            from_wide.as_ptr(),
+            to_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedPane {
@@ -8,11 +50,49 @@ pub struct PersistedPane {
     pub title: String,
     pub custom_title: Option<String>,
     pub cwd: Option<String>,
-    /// Compressed binary terminal snapshot (FST1 v2, base64): scrollback
-    /// history + screen + cursor, restored into the freshly spawned pane.
-    /// Absent in sessions saved before content restore existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_session_id: Option<usize>,
+    /// Compressed FST1 snapshot. Restore normal-screen history into a new shell.
+    /// Do not replay an old TUI screen as a live process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<String>,
+    #[serde(default)]
+    pub snapshot_activity: SnapshotActivity,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SnapshotActivity {
+    #[default]
+    Unknown,
+    Shell,
+    ForegroundProcess,
+}
+
+impl PersistedPaneNode {
+    fn attach_snapshot(&mut self, pane_id: usize, encoded: &str) -> bool {
+        match self {
+            Self::Leaf(pane) if pane.id == pane_id => {
+                pane.snapshot = Some(encoded.to_string());
+                pane.snapshot_activity = pane
+                    .host_session_id
+                    .and_then(|id| crate::session_host::session_process_status(id).ok())
+                    .map(|(running, _)| {
+                        if running {
+                            SnapshotActivity::ForegroundProcess
+                        } else {
+                            SnapshotActivity::Shell
+                        }
+                    })
+                    .unwrap_or(SnapshotActivity::Unknown);
+                true
+            }
+            Self::Leaf(_) => false,
+            Self::Split { first, second, .. } => {
+                first.attach_snapshot(pane_id, encoded)
+                    || second.attach_snapshot(pane_id, encoded)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +117,8 @@ pub struct PersistedTab {
     pub custom_title: Option<String>,
     pub cwd: Option<String>,
     pub layout: Option<PersistedPaneNode>,
+    #[serde(default)]
+    pub active_pane_id: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,7 +182,47 @@ pub fn save_session(session: &SessionData) -> anyhow::Result<()> {
     let safe_name = session.name.replace(['/', '\\'], "_");
     let path = dir.join(format!("{safe_name}.json"));
     let json = serde_json::to_string_pretty(session)?;
-    fs::write(path, json)?;
+    let tmp = dir.join(format!("{safe_name}.json.tmp"));
+    let result = fs::write(&tmp, json).and_then(|_| replace_file(&tmp, &path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result?;
+    Ok(())
+}
+
+pub fn save_session_with_snapshots(
+    mut session: SessionData,
+    snapshots: Vec<(usize, Vec<u8>)>,
+    revision: u64,
+) -> anyhow::Result<()> {
+    use base64::prelude::*;
+
+    let mut saved_revisions = SAVED_REVISIONS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if saved_revisions
+        .get(&session.name)
+        .is_some_and(|saved| *saved > revision)
+    {
+        return Ok(());
+    }
+
+    for (pane_id, raw) in snapshots {
+        let compressed = crate::server::binary_snapshot::compress_snapshot(&raw)
+            .ok_or_else(|| anyhow::anyhow!("invalid snapshot for pane {pane_id}"))?;
+        let encoded = BASE64_STANDARD.encode(compressed);
+        if !session.tabs.iter_mut().any(|tab| {
+            tab.layout
+                .as_mut()
+                .is_some_and(|layout| layout.attach_snapshot(pane_id, &encoded))
+        }) {
+            return Err(anyhow::anyhow!("missing pane {pane_id} in workspace"));
+        }
+    }
+    save_session(&session)?;
+    saved_revisions.insert(session.name, revision);
     Ok(())
 }
 
@@ -140,6 +262,7 @@ mod tests {
                 title: "Terminal".to_string(),
                 custom_title: Some("Dev Split".to_string()),
                 cwd: Some("/tmp".to_string()),
+                active_pane_id: Some(2),
                 layout: Some(PersistedPaneNode::Split {
                     direction: "Horizontal".to_string(),
                     ratio: 0.5,
@@ -148,14 +271,18 @@ mod tests {
                         title: "Left".to_string(),
                         custom_title: None,
                         cwd: Some("/tmp/left".to_string()),
+                        host_session_id: None,
                         snapshot: None,
+                        snapshot_activity: SnapshotActivity::Unknown,
                     })),
                     second: Box::new(PersistedPaneNode::Leaf(PersistedPane {
                         id: 2,
                         title: "Right".to_string(),
                         custom_title: None,
                         cwd: Some("/tmp/right".to_string()),
+                        host_session_id: None,
                         snapshot: None,
+                        snapshot_activity: SnapshotActivity::Unknown,
                     })),
                 }),
             }],

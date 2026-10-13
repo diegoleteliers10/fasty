@@ -10,32 +10,113 @@
 
 use gpui::WindowId;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Latest session snapshot per open window. `on_window_closed` reads the
-/// snapshot of the window that was just closed and writes it to disk, so the
-/// path of the last window closed survives a restart even when several windows
-/// are open at once.
-static WINDOW_SNAPSHOTS: OnceLock<parking_lot::Mutex<HashMap<WindowId, Session>>> = OnceLock::new();
+#[derive(Default)]
+struct WindowSnapshots {
+    windows: Vec<(Option<WindowId>, WindowSession)>,
+    active_window: usize,
+    last_closed: Option<WindowSession>,
+    quitting: bool,
+}
 
-fn window_snapshots() -> &'static parking_lot::Mutex<HashMap<WindowId, Session>> {
+impl WindowSnapshots {
+    fn session(&self) -> Option<Session> {
+        let windows: Vec<_> = self.windows.iter().map(|(_, window)| window.clone()).collect();
+        let windows = if windows.is_empty() {
+            vec![self.last_closed.clone()?]
+        } else {
+            windows
+        };
+        Some(Session {
+            active_window: self.active_window.min(windows.len() - 1),
+            windows,
+            legacy_tabs: Vec::new(),
+            legacy_active_tab: 0,
+        })
+    }
+}
+
+static WINDOW_SNAPSHOTS: OnceLock<parking_lot::Mutex<WindowSnapshots>> = OnceLock::new();
+
+fn window_snapshots() -> &'static parking_lot::Mutex<WindowSnapshots> {
     WINDOW_SNAPSHOTS.get_or_init(Default::default)
 }
 
-/// Remember the latest state of `window_id` so it can be persisted when the
-/// window is closed and the `RootView` is no longer accessible.
-pub fn register_window(window_id: WindowId, session: Session) {
-    window_snapshots().lock().insert(window_id, session);
+/// Keep all saved windows until each restored window has a live WindowId.
+pub fn begin_restore(session: &Session) {
+    let mut snapshots = window_snapshots().lock();
+    snapshots.windows = session.windows.iter().cloned().map(|window| (None, window)).collect();
+    snapshots.active_window = session.active_window.min(snapshots.windows.len().saturating_sub(1));
+    snapshots.last_closed = None;
+    snapshots.quitting = false;
 }
 
-/// Persist the state of the window that was just closed.
-pub fn persist_window(window_id: WindowId) {
-    let snapshot = window_snapshots().lock().get(&window_id).cloned();
-    if let Some(session) = snapshot {
-        let _ = save(&session);
+pub fn bind_restored_window(index: usize, window_id: WindowId) {
+    if let Some((id, _)) = window_snapshots().lock().windows.get_mut(index) {
+        *id = Some(window_id);
     }
+}
+
+/// Save a full snapshot under one lock so two windows cannot overwrite each other.
+pub fn register_window(window_id: WindowId, mut window: WindowSession) -> anyhow::Result<()> {
+    let mut snapshots = window_snapshots().lock();
+    if let Some(index) = snapshots.windows.iter().position(|(id, _)| *id == Some(window_id)) {
+        if window.position.is_none() {
+            window.position = snapshots.windows[index].1.position;
+        }
+        if window.size.is_none() {
+            window.size = snapshots.windows[index].1.size;
+        }
+        snapshots.windows[index].1 = window;
+        snapshots.active_window = index;
+    } else {
+        snapshots.windows.push((Some(window_id), window));
+        snapshots.active_window = snapshots.windows.len() - 1;
+    }
+    snapshots.last_closed = None;
+    if let Some(session) = snapshots.session() {
+        save(&session)?;
+    }
+    Ok(())
+}
+
+/// Remove a closed window. Keep the final window as the restart target.
+pub fn persist_window(window_id: WindowId) -> anyhow::Result<()> {
+    let mut snapshots = window_snapshots().lock();
+    if snapshots.quitting {
+        return Ok(());
+    }
+    let Some(index) = snapshots.windows.iter().position(|(id, _)| *id == Some(window_id)) else {
+        return Ok(());
+    };
+    let (_, closed) = snapshots.windows.remove(index);
+    snapshots.active_window = snapshots.active_window.min(snapshots.windows.len().saturating_sub(1));
+    if snapshots.windows.is_empty() {
+        snapshots.last_closed = Some(closed);
+    }
+    if let Some(session) = snapshots.session() {
+        save(&session)?;
+    }
+    Ok(())
+}
+
+pub fn persist_before_quit(active_window: Option<WindowId>) -> anyhow::Result<()> {
+    let mut snapshots = window_snapshots().lock();
+    if let Some(window_id) = active_window {
+        if let Some(index) = snapshots.windows.iter().position(|(id, _)| *id == Some(window_id)) {
+            snapshots.active_window = index;
+        }
+    }
+    snapshots.quitting = true;
+    if let Some(session) = snapshots.session() {
+        save(&session)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,28 +298,79 @@ pub fn session_path() -> PathBuf {
     crate::paths::get().state_dir.join("session.json")
 }
 
-pub fn load() -> Option<Session> {
+pub fn load_result() -> anyhow::Result<Option<Session>> {
     let path = session_path();
-    let content = std::fs::read_to_string(&path).ok()?;
-    let s: Session = match serde_json::from_str(&content) {
-        Ok(s) => s,
-        Err(_) => {
-            return None;
-        }
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
-    Some(s.migrate())
+    let session: Session = serde_json::from_str(&content)?;
+    Ok(Some(session.migrate()))
 }
+
+pub fn load() -> Option<Session> {
+    load_result().ok().flatten()
+}
+
+#[cfg(windows)]
+#[link(name = "Kernel32")]
+extern "system" {
+    fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let from_wide: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to_wide: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let moved = unsafe {
+        MoveFileExW(
+            from_wide.as_ptr(),
+            to_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
+}
+
+static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
 pub fn save(session: &Session) -> anyhow::Result<()> {
     let path = session_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)?;
     }
     let mut tmp_os = path.as_os_str().to_owned();
-    tmp_os.push(".tmp");
+    tmp_os.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+    ));
     let tmp = PathBuf::from(tmp_os);
-    let content = serde_json::to_string_pretty(session)?;
-    std::fs::write(&tmp, content)?;
-    std::fs::rename(&tmp, &path)?;
+    let content = serde_json::to_vec_pretty(session)?;
+    let result = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        file.write_all(&content)?;
+        file.sync_all()?;
+        drop(file);
+        replace_file(&tmp, &path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result?;
     Ok(())
 }

@@ -39,6 +39,12 @@ enum RightPanel {
 
 const PROJECT_PANEL_WIDTH: f32 = 300.0;
 
+#[derive(Clone, Copy)]
+enum WheelAccumulator {
+    History(f32),
+    Mouse(f32),
+}
+
 fn project_panel_width_after_drag(viewport_width: f32, cursor_x: f32) -> f32 {
     (viewport_width - cursor_x).clamp(240.0, 750.0)
 }
@@ -231,6 +237,15 @@ enum HostAttachOutcome<T> {
     Failed(String),
 }
 
+const HOST_ATTACH_RETRY_DELAYS_MS: [u64; 3] = [500, 1_000, 2_000];
+
+#[derive(Clone, Copy)]
+struct HostAttachRetry {
+    session_id: usize,
+    attempt: usize,
+    generation: u64,
+}
+
 #[derive(Clone, Copy)]
 enum MissingSessionPolicy {
     StartFresh,
@@ -281,15 +296,19 @@ fn unavailable_terminal_pane(
 
 fn pane_close_info(pane: &crate::pane_tree::TerminalPane) -> Option<RunningProcessInfo> {
     let terminal = pane.terminal.as_ref();
-    let requires_confirmation = should_confirm_pane_close(
-        terminal.map(|terminal| terminal.needs_close_confirmation()),
-        pane.host_session_id.is_some() && terminal.is_none(),
-    );
+    let process_status = terminal
+        .map(|terminal| terminal.close_process_status())
+        .or_else(|| {
+            pane.host_session_id.map(|session_id| {
+                crate::session_host::session_process_status(session_id).unwrap_or((true, None))
+            })
+        });
+    let requires_confirmation =
+        should_confirm_pane_close(process_status.as_ref().map(|(running, _)| *running), false);
+    let process_name = process_status.and_then(|(_, name)| name);
     requires_confirmation.then(|| RunningProcessInfo {
         pane_id: pane.id,
-        process_name: terminal
-            .and_then(|terminal| terminal.get_foreground_process_name())
-            .unwrap_or_else(|| "process".to_string()),
+        process_name: process_name.unwrap_or_else(|| "unknown command".to_string()),
         pid: terminal
             .and_then(|terminal| terminal.shell_pid())
             .unwrap_or(0),
@@ -367,9 +386,41 @@ fn stop_pane_session(pane: &crate::pane_tree::TerminalPane) -> Result<(), String
     Ok(())
 }
 
+fn stop_pane_if_idle(
+    pane: &crate::pane_tree::TerminalPane,
+) -> Result<Option<RunningProcessInfo>, String> {
+    if let Some(session_id) = pane_host_session_id(pane) {
+        return match crate::session_host::close_if_idle(session_id)? {
+            crate::session_host::CloseIfIdleResult::Closed => Ok(None),
+            crate::session_host::CloseIfIdleResult::Running(process_name) => {
+                Ok(Some(RunningProcessInfo {
+                    pane_id: pane.id,
+                    process_name: process_name.unwrap_or_else(|| "unknown command".to_string()),
+                    pid: pane.terminal.as_ref().and_then(|t| t.shell_pid()).unwrap_or(0),
+                }))
+            }
+        };
+    }
+    let Some(terminal) = &pane.terminal else {
+        return Ok(None);
+    };
+    if terminal.terminate_if_idle() {
+        Ok(None)
+    } else {
+        Ok(Some(RunningProcessInfo {
+            pane_id: pane.id,
+            process_name: terminal
+                .get_foreground_process_name()
+                .unwrap_or_else(|| "unknown command".to_string()),
+            pid: terminal.shell_pid().unwrap_or(0),
+        }))
+    }
+}
+
 #[derive(Default)]
 struct PaneStopReport {
     stopped_ids: Vec<usize>,
+    blocked: Vec<RunningProcessInfo>,
     failures: Vec<(usize, String)>,
 }
 
@@ -385,6 +436,85 @@ impl PaneStopReport {
 
 fn stop_panes(panes: &[&crate::pane_tree::TerminalPane]) -> PaneStopReport {
     collect_stop_results(panes, stop_pane_session)
+}
+
+fn stop_panes_if_idle(panes: &[&crate::pane_tree::TerminalPane]) -> PaneStopReport {
+    let blocked: Vec<RunningProcessInfo> = panes
+        .iter()
+        .filter_map(|pane| pane_close_info(pane))
+        .collect();
+    if !blocked.is_empty() {
+        return PaneStopReport {
+            blocked,
+            ..PaneStopReport::default()
+        };
+    }
+    let mut report = PaneStopReport::default();
+    let hosted: Vec<(&crate::pane_tree::TerminalPane, usize)> = panes
+        .iter()
+        .filter_map(|pane| pane_host_session_id(pane).map(|session_id| (*pane, session_id)))
+        .collect();
+    if hosted.len() > 1 {
+        match crate::session_host::close_if_idle_batch(
+            hosted.iter().map(|(_, session_id)| *session_id).collect(),
+        ) {
+            Ok(crate::session_host::CloseIfIdleBatchResult::Closed) => {
+                report
+                    .stopped_ids
+                    .extend(hosted.iter().map(|(pane, _)| pane.id));
+            }
+            Ok(crate::session_host::CloseIfIdleBatchResult::Running(blocked)) => {
+                report
+                    .blocked
+                    .extend(blocked.into_iter().filter_map(|blocked| {
+                        let pane = hosted
+                            .iter()
+                            .find(|(_, session_id)| *session_id == blocked.id)
+                            .map(|(pane, _)| *pane)?;
+                        Some(RunningProcessInfo {
+                            pane_id: pane.id,
+                            process_name: blocked
+                                .foreground_process_label
+                                .unwrap_or_else(|| "unknown command".to_string()),
+                            pid: pane.terminal.as_ref().and_then(|t| t.shell_pid()).unwrap_or(0),
+                        })
+                    }));
+                return report;
+            }
+            Err(error) => {
+                report
+                    .failures
+                    .extend(hosted.iter().map(|(pane, _)| (pane.id, error.clone())));
+                return report;
+            }
+        }
+    }
+    if hosted.len() == 1 {
+        let (pane, _) = hosted[0];
+        match stop_pane_if_idle(pane) {
+            Ok(None) => report.stopped_ids.push(pane.id),
+            Ok(Some(process)) => {
+                report.blocked.push(process);
+                return report;
+            }
+            Err(error) => {
+                report.failures.push((pane.id, error));
+                return report;
+            }
+        }
+    }
+    for pane in panes
+        .iter()
+        .copied()
+        .filter(|pane| pane_host_session_id(pane).is_none())
+    {
+        match stop_pane_if_idle(pane) {
+            Ok(None) => report.stopped_ids.push(pane.id),
+            Ok(Some(process)) => report.blocked.push(process),
+            Err(error) => report.failures.push((pane.id, error)),
+        }
+    }
+    report
 }
 
 fn collect_stop_results(
@@ -468,13 +598,8 @@ mod host_restore_tests {
 
     #[test]
     fn unresolved_host_session_requires_close_confirmation() {
-        let unresolved = pane(Some(41));
-        let ordinary_placeholder = pane(None);
-        assert_eq!(
-            pane_close_info(&unresolved).map(|info| info.pane_id),
-            Some(7)
-        );
-        assert!(pane_close_info(&ordinary_placeholder).is_none());
+        assert!(should_confirm_pane_close(None, true));
+        assert!(!should_confirm_pane_close(None, false));
     }
 
     #[test]
@@ -1753,10 +1878,10 @@ pub struct GlobalSearchResult {
 
 #[derive(Clone, Debug)]
 pub struct PaletteCommand {
-    pub id: &'static str,
+    pub id: String,
     pub icon: IconType,
-    pub title: &'static str,
-    pub category: &'static str,
+    pub title: String,
+    pub category: String,
     pub shortcut: Option<&'static str>,
 }
 
@@ -1787,290 +1912,297 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
     let is_mac = cfg!(target_os = "macos");
     vec![
         PaletteCommand {
-            id: "tab_overview",
+            id: "tab_overview".to_string(),
             icon: IconType::Layers,
-            title: "Mission Control / Tab Peek Overview",
-            category: "Navigation",
+            title: "Mission Control / Tab Peek Overview".to_string(),
+            category: "Navigation".to_string(),
             shortcut: Some(if is_mac { "⌘⇧O" } else { "Ctrl+Shift+M" }),
         },
         PaletteCommand {
-            id: "global_search",
+            id: "global_search".to_string(),
             icon: IconType::TextSearch,
-            title: "Find in All Tabs (Global Search)",
-            category: "Terminal",
+            title: "Find in All Tabs (Global Search)".to_string(),
+            category: "Terminal".to_string(),
             shortcut: Some(if is_mac { "⌘⇧F" } else { "Ctrl+Shift+F" }),
         },
         PaletteCommand {
-            id: "save_session",
+            id: "save_session".to_string(),
             icon: IconType::Folder,
-            title: "Session: Save Current Workspace Snapshot",
-            category: "Session",
+            title: "Session: Save Current Workspace Snapshot".to_string(),
+            category: "Session".to_string(),
             shortcut: None,
         },
         PaletteCommand {
-            id: "restore_session",
+            id: "restore_session".to_string(),
             icon: IconType::RotateCcw,
-            title: "Session: Attach / Restore Last Workspace",
-            category: "Session",
+            title: "Session: Attach / Restore Last Workspace".to_string(),
+            category: "Session".to_string(),
             shortcut: None,
         },
         PaletteCommand {
-            id: "new_tab",
+            id: "new_tab".to_string(),
             icon: IconType::Plus,
-            title: "New Tab",
-            category: "Terminal",
+            title: "New Tab".to_string(),
+            category: "Terminal".to_string(),
             shortcut: Some(if is_mac { "⌘T" } else { "Ctrl+Shift+T" }),
         },
         PaletteCommand {
-            id: "new_window",
+            id: "new_window".to_string(),
             icon: IconType::ExternalLink,
-            title: "New Window",
-            category: "Window",
+            title: "New Window".to_string(),
+            category: "Window".to_string(),
             shortcut: Some(if is_mac { "⌘⇧N" } else { "Ctrl+Shift+N" }),
         },
         PaletteCommand {
-            id: "rename_tab",
+            id: "rename_tab".to_string(),
             icon: IconType::Pencil,
-            title: "Rename Active Tab",
-            category: "Terminal",
+            title: "Rename Active Tab".to_string(),
+            category: "Terminal".to_string(),
             shortcut: Some(if is_mac { "⌘⇧R" } else { "Ctrl+Shift+R" }),
         },
         PaletteCommand {
-            id: "close_tab",
+            id: "close_tab".to_string(),
             icon: IconType::X,
-            title: "Close Active Tab",
-            category: "Terminal",
+            title: "Close Active Tab".to_string(),
+            category: "Terminal".to_string(),
             shortcut: Some(if is_mac { "⌘⇧W" } else { "Ctrl+Shift+Q" }),
         },
         PaletteCommand {
-            id: "search",
+            id: "search".to_string(),
             icon: IconType::Search,
-            title: "Search in Buffer",
-            category: "Terminal",
+            title: "Search in Buffer".to_string(),
+            category: "Terminal".to_string(),
             shortcut: Some(if is_mac { "⌘F" } else { "Ctrl+Shift+F" }),
         },
         PaletteCommand {
-            id: "clear",
+            id: "clear".to_string(),
             icon: IconType::Trash2,
-            title: "Clear Scrollback",
-            category: "Terminal",
+            title: "Clear Scrollback".to_string(),
+            category: "Terminal".to_string(),
             shortcut: Some(if is_mac { "⌘K" } else { "Ctrl+Shift+K" }),
         },
         PaletteCommand {
-            id: "worktree",
+            id: "worktree".to_string(),
             icon: IconType::FolderGit2,
-            title: "Git Worktree Picker",
-            category: "Git",
+            title: "Git Worktree Picker".to_string(),
+            category: "Git".to_string(),
             shortcut: Some(if is_mac { "⌘⌥W" } else { "Ctrl+Alt+W" }),
         },
         PaletteCommand {
-            id: "project_jumper",
+            id: "project_jumper".to_string(),
             icon: IconType::Folder,
-            title: "Project / Tab Jumper",
-            category: "Navigation",
+            title: "Project / Tab Jumper".to_string(),
+            category: "Navigation".to_string(),
             shortcut: Some(if is_mac { "⌘J" } else { "Ctrl+Shift+J" }),
         },
         PaletteCommand {
-            id: "file_picker",
+            id: "file_picker".to_string(),
             icon: IconType::Sparkles,
-            title: "Universal Insert (Files, SSH, Git, Snippets)",
-            category: "Tools",
+            title: "Universal Insert (Files, SSH, Git, Snippets)".to_string(),
+            category: "Tools".to_string(),
             shortcut: Some(if is_mac { "⌃⌘," } else { "Ctrl+Super+," }),
         },
         PaletteCommand {
-            id: "ssh",
+            id: "ssh".to_string(),
             icon: IconType::Server,
-            title: "SSH Host Manager",
-            category: "Tools",
+            title: "SSH Host Manager".to_string(),
+            category: "Tools".to_string(),
             shortcut: Some(if is_mac { "⌘O" } else { "Ctrl+Shift+O" }),
         },
         PaletteCommand {
-            id: "snippets",
+            id: "snippets".to_string(),
             icon: IconType::Terminal,
-            title: "Snippets: Insert Snippet...",
-            category: "Tools",
+            title: "Snippets: Insert Snippet...".to_string(),
+            category: "Tools".to_string(),
             shortcut: None,
         },
         PaletteCommand {
-            id: "prs",
+            id: "prs".to_string(),
             icon: IconType::GitPullRequest,
-            title: "GitHub: Pull Requests (Checkout/Approve/Merge)",
-            category: "Git",
+            title: "GitHub: Pull Requests (Checkout/Approve/Merge)".to_string(),
+            category: "Git".to_string(),
             shortcut: None,
         },
         PaletteCommand {
-            id: "settings",
+            id: "settings".to_string(),
             icon: IconType::Settings,
-            title: "Open Settings",
-            category: "Preferences",
+            title: "Open Settings".to_string(),
+            category: "Preferences".to_string(),
             shortcut: Some(if is_mac { "⌘," } else { "Ctrl+," }),
         },
         PaletteCommand {
-            id: "about",
+            id: "about".to_string(),
             icon: IconType::Zap,
-            title: "About Fastty",
-            category: "Application",
+            title: "About Fastty".to_string(),
+            category: "Application".to_string(),
             shortcut: None,
         },
         PaletteCommand {
-            id: "check_updates",
+            id: "check_updates".to_string(),
             icon: IconType::RotateCcw,
-            title: "Check for Updates",
-            category: "Application",
+            title: "Check for Updates".to_string(),
+            category: "Application".to_string(),
             shortcut: None,
         },
         PaletteCommand {
-            id: "fullscreen",
+            id: "fullscreen".to_string(),
             icon: IconType::Maximize2,
-            title: "Toggle Fullscreen",
-            category: "Window",
+            title: "Toggle Fullscreen".to_string(),
+            category: "Window".to_string(),
             shortcut: Some(if is_mac { "⌃⌘F" } else { "F11" }),
         },
         PaletteCommand {
-            id: "zoom_in",
+            id: "zoom_in".to_string(),
             icon: IconType::ZoomIn,
-            title: "Font: Increase Size (+1)",
-            category: "View",
+            title: "Font: Increase Size (+1)".to_string(),
+            category: "View".to_string(),
             shortcut: Some(if is_mac { "⌘=" } else { "Ctrl=" }),
         },
         PaletteCommand {
-            id: "zoom_out",
+            id: "zoom_out".to_string(),
             icon: IconType::ZoomOut,
-            title: "Font: Decrease Size (-1)",
-            category: "View",
+            title: "Font: Decrease Size (-1)".to_string(),
+            category: "View".to_string(),
             shortcut: Some(if is_mac { "⌘-" } else { "Ctrl-" }),
         },
         PaletteCommand {
-            id: "zoom_reset",
+            id: "zoom_reset".to_string(),
             icon: IconType::RotateCcw,
-            title: "Font: Reset Size (Default)",
-            category: "View",
+            title: "Font: Reset Size (Default)".to_string(),
+            category: "View".to_string(),
             shortcut: Some(if is_mac { "⌘0" } else { "Ctrl+0" }),
         },
         PaletteCommand {
-            id: "theme_default",
+            id: "theme_default".to_string(),
             icon: IconType::Palette,
-            title: "Theme: Switch to Default (Fastty)",
-            category: "Theme",
+            title: "Theme: Switch to Default (Fastty)".to_string(),
+            category: "Theme".to_string(),
             shortcut: None,
         },
         PaletteCommand {
-            id: "open_config",
+            id: "open_config".to_string(),
             icon: IconType::FolderOpen,
-            title: "Open Config Folder",
-            category: "Preferences",
+            title: "Open Config Folder".to_string(),
+            category: "Preferences".to_string(),
             shortcut: None,
         },
         PaletteCommand {
-            id: "edit_config",
+            id: "edit_config".to_string(),
             icon: IconType::FileCode,
-            title: "Edit config.toml",
-            category: "Preferences",
+            title: "Edit config.toml".to_string(),
+            category: "Preferences".to_string(),
             shortcut: None,
         },
         PaletteCommand {
-            id: "split_right",
+            id: "split_right".to_string(),
             icon: IconType::PanelRight,
-            title: "Split Pane Right",
-            category: "Panes",
+            title: "Split Pane Right".to_string(),
+            category: "Panes".to_string(),
             shortcut: Some(if is_mac { "⌘D" } else { "Ctrl+Shift+E" }),
         },
         PaletteCommand {
-            id: "split_down",
+            id: "split_down".to_string(),
             icon: IconType::PanelBottom,
-            title: "Split Pane Down",
-            category: "Panes",
+            title: "Split Pane Down".to_string(),
+            category: "Panes".to_string(),
             shortcut: Some(if is_mac { "⌘⇧D" } else { "Ctrl+Shift+O" }),
         },
         PaletteCommand {
-            id: "split_left",
+            id: "split_left".to_string(),
             icon: IconType::PanelLeft,
-            title: "Split Pane Left",
-            category: "Panes",
+            title: "Split Pane Left".to_string(),
+            category: "Panes".to_string(),
             shortcut: None,
         },
         PaletteCommand {
-            id: "split_top",
+            id: "split_top".to_string(),
             icon: IconType::PanelTop,
-            title: "Split Pane Top",
-            category: "Panes",
+            title: "Split Pane Top".to_string(),
+            category: "Panes".to_string(),
             shortcut: None,
         },
         PaletteCommand {
-            id: "focus_left",
+            id: "focus_left".to_string(),
             icon: IconType::ChevronLeft,
-            title: "Focus Pane Left",
-            category: "Panes",
+            title: "Focus Pane Left".to_string(),
+            category: "Panes".to_string(),
             shortcut: Some(if is_mac { "⌥⌘←" } else { "Alt+←" }),
         },
         PaletteCommand {
-            id: "focus_right",
+            id: "focus_right".to_string(),
             icon: IconType::ChevronRight,
-            title: "Focus Pane Right",
-            category: "Panes",
+            title: "Focus Pane Right".to_string(),
+            category: "Panes".to_string(),
             shortcut: Some(if is_mac { "⌥⌘→" } else { "Alt+→" }),
         },
         PaletteCommand {
-            id: "focus_top",
+            id: "focus_top".to_string(),
             icon: IconType::ChevronUp,
-            title: "Focus Pane Top",
-            category: "Panes",
+            title: "Focus Pane Top".to_string(),
+            category: "Panes".to_string(),
             shortcut: Some(if is_mac { "⌥⌘↑" } else { "Alt+↑" }),
         },
         PaletteCommand {
-            id: "focus_down",
+            id: "focus_down".to_string(),
             icon: IconType::ChevronDown,
-            title: "Focus Pane Down",
-            category: "Panes",
+            title: "Focus Pane Down".to_string(),
+            category: "Panes".to_string(),
             shortcut: Some(if is_mac { "⌥⌘↓" } else { "Alt+↓" }),
         },
         PaletteCommand {
-            id: "close_pane",
+            id: "close_pane".to_string(),
             icon: IconType::X,
-            title: "Close Active Pane",
-            category: "Panes",
+            title: "Close Active Pane".to_string(),
+            category: "Panes".to_string(),
             shortcut: Some(if is_mac { "⌘W" } else { "Ctrl+Shift+W" }),
         },
         PaletteCommand {
-            id: "zoom_pane",
+            id: "zoom_pane".to_string(),
             icon: IconType::Maximize2,
-            title: "Zoom Active Pane (Toggle)",
-            category: "Panes",
+            title: "Zoom Active Pane (Toggle)".to_string(),
+            category: "Panes".to_string(),
             shortcut: None,
         },
         PaletteCommand {
-            id: "toggle_tab_sidebar",
+            id: "toggle_tab_sidebar".to_string(),
             icon: IconType::Folder,
-            title: "Toggle Tabs Sidebar",
-            category: "View",
+            title: "Toggle Tabs Sidebar".to_string(),
+            category: "View".to_string(),
             shortcut: Some(if is_mac { "⌘B" } else { "Ctrl+B" }),
         },
         PaletteCommand {
-            id: "toggle_ai_sidebar",
+            id: "toggle_ai_sidebar".to_string(),
             icon: IconType::Sparkles,
-            title: "Fastty AI: Toggle Assistant Sidebar",
-            category: "AI",
+            title: "Fastty AI: Toggle Assistant Sidebar".to_string(),
+            category: "AI".to_string(),
             shortcut: Some(if is_mac { "⌘L" } else { "Ctrl+Shift+L" }),
         },
         PaletteCommand {
-            id: "layout_horizontal",
+            id: "toggle_project_sidebar".to_string(),
+            icon: IconType::FolderGit2,
+            title: "Toggle Project Sidebar".to_string(),
+            category: "View".to_string(),
+            shortcut: None,
+        },
+        PaletteCommand {
+            id: "layout_horizontal".to_string(),
             icon: IconType::LayoutPanelTop,
-            title: "Tabs Layout: Horizontal Top Bar",
-            category: "View",
+            title: "Tabs Layout: Horizontal Top Bar".to_string(),
+            category: "View".to_string(),
             shortcut: None,
         },
         PaletteCommand {
-            id: "layout_vertical",
+            id: "layout_vertical".to_string(),
             icon: IconType::LayoutPanelLeft,
-            title: "Tabs Layout: Vertical Sidebar",
-            category: "View",
+            title: "Tabs Layout: Vertical Sidebar".to_string(),
+            category: "View".to_string(),
             shortcut: None,
         },
         PaletteCommand {
-            id: "quit",
+            id: "quit".to_string(),
             icon: IconType::LogOut,
-            title: "Quit Fastty",
-            category: "Application",
+            title: "Quit Fastty".to_string(),
+            category: "Application".to_string(),
             shortcut: Some(if is_mac { "⌘Q" } else { "Alt+F4" }),
         },
     ]
@@ -2085,10 +2217,10 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
         *name != "default"
             })
             .map(|(_, id, title, _)| PaletteCommand {
-        id,
+        id: id.to_string(),
         icon: IconType::Palette,
-        title,
-        category: "Theme",
+        title: title.to_string(),
+        category: "Theme".to_string(),
         shortcut: None,
             }),
     )
@@ -2146,19 +2278,33 @@ impl RootView {
     /// so repeat actions are one `Enter` away.
     pub fn filtered_palette_commands(&self) -> Vec<PaletteCommand> {
         let query = self.command_palette_query.to_lowercase();
-        let mut cmds: Vec<PaletteCommand> = get_all_palette_commands()
+        let mut commands = get_all_palette_commands();
+        let mut workflows: Vec<_> = self.config.workflows.iter().collect();
+        workflows.sort_by(|left, right| left.0.cmp(right.0));
+        commands.extend(workflows.into_iter().filter_map(|(id, workflow)| {
+            (!workflow.label.trim().is_empty() && !workflow.actions.is_empty()).then(|| {
+                PaletteCommand {
+                    id: format!("workflow:{id}"),
+                    icon: IconType::Zap,
+                    title: workflow.label.clone(),
+                    category: "Workflows".to_string(),
+                    shortcut: None,
+                }
+            })
+        }));
+        let mut cmds: Vec<PaletteCommand> = commands
             .into_iter()
             .filter(|c| {
                 query.is_empty()
-                    || fuzzy_match_str(&query, c.title)
-                    || fuzzy_match_str(&query, c.category)
+                    || fuzzy_match_str(&query, &c.title)
+                    || fuzzy_match_str(&query, &c.category)
             })
             .collect();
         if query.is_empty() && !self.palette_recent.is_empty() {
             cmds.sort_by_key(|c| {
                 self.palette_recent
                     .iter()
-                    .position(|r| r == c.id)
+                    .position(|r| r == &c.id)
                     .unwrap_or(usize::MAX)
             });
         }
@@ -2604,7 +2750,15 @@ pub struct RunningProcessInfo {
 pub struct PendingClose {
     pub target: CloseTarget,
     pub running_processes: Vec<RunningProcessInfo>,
-    pub failure: Option<String>,
+    pub checked_panes: Vec<(usize, usize)>,
+    pub state: PendingCloseState,
+}
+
+#[derive(Clone, Debug)]
+pub enum PendingCloseState {
+    Checking(u64),
+    Confirming,
+    Failed(String),
 }
 
 #[derive(Default)]
@@ -2649,6 +2803,12 @@ impl Drop for RootView {
 pub struct RootView {
     config: Config,
     window_id: gpui::WindowId,
+    terminal_render_retry_pending: Arc<std::sync::atomic::AtomicBool>,
+    terminal_render_retry_state: Arc<parking_lot::Mutex<std::collections::HashMap<PaneId, u8>>>,
+    host_attach_retry_state: std::collections::HashMap<PaneId, HostAttachRetry>,
+    host_attach_retry_generation: u64,
+    host_missing_sessions: std::collections::HashSet<PaneId>,
+    close_check_generation: u64,
     theme: Theme,
     tabs: Vec<TabData>,
     active_tab_idx: usize,
@@ -2763,7 +2923,10 @@ pub struct RootView {
     pub cursor_blink_visible: bool,
     pub last_cursor_activity: std::time::Instant,
     pub last_scroll_activity: std::time::Instant,
-    pub scroll_accum: f32,
+    scroll_accum: std::collections::HashMap<PaneId, WheelAccumulator>,
+    active_key_mode: Option<String>,
+    pending_key_sequence: Vec<crate::keybindings::KeyCombo>,
+    key_sequence_generation: u64,
     pub is_dragging_scrollbar: bool,
     pub dragging_scrollbar_pane_id: Option<usize>,
     pub last_scrolled_pane_id: Option<usize>,
@@ -3133,13 +3296,24 @@ impl RootView {
         cli_opts: crate::cli::CliOptions,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::with_options_internal(_window, cli_opts, None, cx)
+        Self::with_options_internal(_window, cli_opts, None, None, cx)
+    }
+
+    pub fn with_restored_window(
+        window: &mut Window,
+        cli_opts: crate::cli::CliOptions,
+        index: usize,
+        saved_window: crate::session::WindowSession,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_options_internal(window, cli_opts, None, Some((index, saved_window)), cx)
     }
 
     pub fn with_options_internal(
         _window: &mut Window,
         cli_opts: crate::cli::CliOptions,
         initial_tab: Option<TabData>,
+        restored_window: Option<(usize, crate::session::WindowSession)>,
         cx: &mut Context<Self>,
     ) -> Self {
         config::load_custom_themes();
@@ -3307,14 +3481,10 @@ impl RootView {
         let mut restored_active_tab = 0usize;
         let ai_permission_mode = loaded_config.ai.permission_mode;
         if initial_tab.is_none() && loaded_config.session_restore {
-            if let Some(session) = crate::session::load() {
-                if let Some(win) = session.windows.first() {
-                    restored_ai_sidebar_open = win.ai_sidebar_open;
-                    restored_active_tab = win.active_tab;
-                    for tab_info in &win.tabs {
-                        restored_tabs.push(tab_info.clone());
-                    }
-                }
+            if let Some((_, win)) = restored_window.as_ref() {
+                restored_ai_sidebar_open = win.ai_sidebar_open;
+                restored_active_tab = win.active_tab;
+                restored_tabs = win.tabs.clone();
             }
         }
 
@@ -3330,6 +3500,14 @@ impl RootView {
         let mut view = Self {
             config: loaded_config,
             window_id: _window.window_handle().window_id(),
+            terminal_render_retry_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            terminal_render_retry_state: Arc::new(parking_lot::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            host_attach_retry_state: std::collections::HashMap::new(),
+            host_attach_retry_generation: 0,
+            host_missing_sessions: std::collections::HashSet::new(),
+            close_check_generation: 0,
             theme,
             tabs: Vec::new(),
             active_tab_idx: 0,
@@ -3426,7 +3604,10 @@ impl RootView {
             cursor_blink_visible: true,
             last_cursor_activity: std::time::Instant::now(),
             last_scroll_activity: std::time::Instant::now() - std::time::Duration::from_secs(10),
-            scroll_accum: 0.0,
+            scroll_accum: std::collections::HashMap::new(),
+            active_key_mode: None,
+            pending_key_sequence: Vec::new(),
+            key_sequence_generation: 0,
             is_dragging_scrollbar: false,
             dragging_scrollbar_pane_id: None,
             last_scrolled_pane_id: None,
@@ -3527,6 +3708,7 @@ impl RootView {
             view.config.keybindings.clone(),
             view.config.keybinding_preset,
         );
+        crate::keybindings::init_key_modes(view.config.key_modes.clone());
 
         // Daemon → GUI requests: a `spawn { open: true }` (e.g. from an MCP
         // agent's `fastty_spawn_session`) surfaces as a visible tab. The
@@ -3672,6 +3854,10 @@ impl RootView {
             }
         }).detach();
 
+        if let Some((index, _)) = restored_window {
+            crate::session::bind_restored_window(index, view.window_id);
+        }
+
         if let Some(tab_data) = initial_tab {
             view.attach_tab(tab_data, _window, cx);
         } else if cli_opts.command.is_some()
@@ -3718,15 +3904,39 @@ impl RootView {
                 view.create_restored_tab(tab_info, &shell, _window, cx);
             }
             if !view.tabs.is_empty() {
-                view.active_tab_idx = restored_active_tab.min(view.tabs.len() - 1);
-                let conversation_id = view.tabs[view.active_tab_idx].ai_conversation_id.clone();
-                view.load_ai_conversation(&conversation_id);
+                view.activate_tab_index(restored_active_tab.min(view.tabs.len() - 1));
+                view.persist_session();
             }
         }
+        view.persist_session_for_quit(_window);
         view
     }
 
     pub fn persist_session(&self) {
+        self.persist_session_with_bounds(None);
+    }
+
+    pub fn persist_session_for_quit(&self, window: &Window) {
+        let bounds = window.bounds();
+        let x: f32 = bounds.origin.x.into();
+        let y: f32 = bounds.origin.y.into();
+        let width: f32 = bounds.size.width.into();
+        let height: f32 = bounds.size.height.into();
+        let bounds = if x.is_finite()
+            && y.is_finite()
+            && width.is_finite()
+            && height.is_finite()
+            && width >= 640.0
+            && height >= 420.0
+        {
+            Some(((x.round() as i32, y.round() as i32), (width.round() as u32, height.round() as u32)))
+        } else {
+            None
+        };
+        self.persist_session_with_bounds(bounds);
+    }
+
+    fn persist_session_with_bounds(&self, bounds: Option<((i32, i32), (u32, u32))>) {
         if !self.config.session_restore {
             return;
         }
@@ -3746,20 +3956,24 @@ impl RootView {
             })
             .collect();
 
-        let session = crate::session::Session {
-            windows: vec![crate::session::WindowSession {
-                tabs: tab_infos,
-                active_tab: self.active_tab_idx,
-                position: None,
-                size: None,
-                ai_sidebar_open: self.right_panel == RightPanel::Ai,
-            }],
-            active_window: 0,
-            legacy_tabs: Vec::new(),
-            legacy_active_tab: 0,
+        let saved_window = crate::session::WindowSession {
+            tabs: tab_infos,
+            active_tab: self.active_tab_idx,
+            position: bounds.map(|(position, _)| position),
+            size: bounds.map(|(_, size)| size),
+            ai_sidebar_open: self.right_panel == RightPanel::Ai,
         };
-        crate::session::register_window(self.window_id, session.clone());
-        let _ = crate::session::save(&session);
+        static SAVE_ERROR_SHOWN: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        match crate::session::register_window(self.window_id, saved_window) {
+            Ok(()) => SAVE_ERROR_SHOWN.store(false, std::sync::atomic::Ordering::Relaxed),
+            Err(error) => {
+                eprintln!("Fastty could not save the session: {error}");
+                if !SAVE_ERROR_SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    send_system_notification("Session save failed", &error.to_string());
+                }
+            }
+        }
     }
 
     pub fn get_selected_text(&self) -> Option<String> {
@@ -3908,6 +4122,7 @@ impl RootView {
             None,
             None,
             MissingSessionPolicy::StartFresh,
+            None,
             window,
             cx,
         )
@@ -3922,6 +4137,7 @@ impl RootView {
         host_session_id: Option<usize>,
         restored_pane_id: Option<PaneId>,
         missing_session_policy: MissingSessionPolicy,
+        pre_attached_remote: Option<crate::session_host::RemoteSession>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> TerminalPane {
@@ -3946,7 +4162,33 @@ impl RootView {
             .unwrap_or("fastty");
         let pane_title = title_override.unwrap_or_else(|| default_shell_name.to_string());
 
-        let attach = if let Some(session_id) = host_session_id {
+        let attach = if let Some(remote) = pre_attached_remote {
+            #[cfg(unix)]
+            {
+                classify_host_attach(
+                    TerminalState::attach_hosted_from_remote(
+                        remote,
+                        cmd,
+                        args,
+                        cwd_str,
+                        self.config.scrollback,
+                        font_config.clone(),
+                        cell_w,
+                        line_h,
+                        960.0,
+                        640.0,
+                        event_sender.clone(),
+                    )
+                    .map(Some)
+                    .map_err(|error| error.to_string()),
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = remote;
+                HostAttachOutcome::Failed("Hosted sessions are not supported on this platform".into())
+            }
+        } else if let Some(session_id) = host_session_id {
             #[cfg(unix)]
             {
                 classify_host_attach(
@@ -4003,6 +4245,12 @@ impl RootView {
             }
             HostAttachOutcome::Failed(error) => {
                 eprintln!("Fastty could not restore host session {host_session_id:?}: {error}");
+                #[cfg(unix)]
+                if let (Some(session_id), Some(restored_pane_id)) =
+                    (host_session_id, restored_pane_id)
+                {
+                    self.schedule_host_attach_retry(restored_pane_id, session_id, window, cx);
+                }
                 return unavailable_terminal_pane(
                     pane_id,
                     host_session_id,
@@ -4148,26 +4396,147 @@ impl RootView {
         }
     }
 
-    fn retry_host_session(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((tab_id, session_id, title, custom_title, cwd)) =
-            self.tabs.iter().find_map(|tab| {
-                tab.pane_tree.find_pane(pane_id).and_then(|pane| {
-                if pane.terminal.is_some() {
-                    return None;
-                }
-                Some((
-                    tab.id,
-                    pane.host_session_id?,
-                    pane.title.clone(),
-                    pane.custom_title.clone(),
-                    pane.cwd.clone(),
-                ))
-                })
-            })
-        else {
+    #[cfg(unix)]
+    fn schedule_host_attach_retry(
+        &mut self,
+        pane_id: PaneId,
+        session_id: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let attempt = self
+            .host_attach_retry_state
+            .get(&pane_id)
+            .filter(|state| state.session_id == session_id)
+            .map_or(1, |state| state.attempt + 1);
+        let Some(delay_ms) = HOST_ATTACH_RETRY_DELAYS_MS.get(attempt - 1).copied() else {
+            self.host_attach_retry_state.remove(&pane_id);
+            cx.notify();
             return;
         };
+        self.host_attach_retry_generation = self.host_attach_retry_generation.wrapping_add(1);
+        let generation = self.host_attach_retry_generation;
+        self.host_attach_retry_state.insert(
+            pane_id,
+            HostAttachRetry {
+                session_id,
+                attempt,
+                generation,
+            },
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(delay_ms))
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.host_attach_retry_state.get(&pane_id).is_some_and(|state| {
+                    state.session_id == session_id && state.generation == generation
+                }) {
+                    this.start_host_attach_retry(pane_id, session_id, generation, window, cx);
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
 
+    #[cfg(unix)]
+    fn retry_host_session(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session_id) = self.tabs.iter().find_map(|tab| {
+            tab.pane_tree
+                .find_pane(pane_id)
+                .filter(|pane| pane.terminal.is_none())
+                .and_then(|pane| pane.host_session_id)
+        }) else {
+            return;
+        };
+        self.host_missing_sessions.remove(&pane_id);
+        self.host_attach_retry_generation = self.host_attach_retry_generation.wrapping_add(1);
+        let generation = self.host_attach_retry_generation;
+        self.host_attach_retry_state.insert(
+            pane_id,
+            HostAttachRetry {
+                session_id,
+                attempt: 0,
+                generation,
+            },
+        );
+        self.start_host_attach_retry(pane_id, session_id, generation, window, cx);
+        cx.notify();
+    }
+
+    #[cfg(not(unix))]
+    fn retry_host_session(&mut self, _pane_id: PaneId, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    #[cfg(unix)]
+    fn start_host_attach_retry(
+        &mut self,
+        pane_id: PaneId,
+        session_id: usize,
+        generation: u64,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pane_exists = self.tabs.iter().any(|tab| {
+            tab.pane_tree.find_pane(pane_id).is_some_and(|pane| {
+                pane.host_session_id == Some(session_id) && pane.terminal.is_none()
+            })
+        });
+        if !pane_exists {
+            self.host_attach_retry_state.remove(&pane_id);
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let attached = cx
+                .background_executor()
+                .spawn(async move { crate::session_host::attach(session_id) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.finish_host_attach_retry(pane_id, session_id, generation, attached, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(unix)]
+    fn finish_host_attach_retry(
+        &mut self,
+        pane_id: PaneId,
+        session_id: usize,
+        generation: u64,
+        attached: Result<crate::session_host::RemoteSession, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.host_attach_retry_state.get(&pane_id).is_some_and(|state| {
+            state.session_id == session_id && state.generation == generation
+        }) {
+            return;
+        }
+        let Some((tab_id, title, custom_title, cwd)) = self.tabs.iter().find_map(|tab| {
+            tab.pane_tree.find_pane(pane_id).and_then(|pane| {
+                (pane.host_session_id == Some(session_id) && pane.terminal.is_none()).then(|| {
+                    (tab.id, pane.title.clone(), pane.custom_title.clone(), pane.cwd.clone())
+                })
+            })
+        }) else {
+            self.host_attach_retry_state.remove(&pane_id);
+            return;
+        };
+        let remote = match attached {
+            Ok(remote) => remote,
+            Err(error) if error.starts_with("no_such_session: ") => {
+                self.host_attach_retry_state.remove(&pane_id);
+                self.host_missing_sessions.insert(pane_id);
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                eprintln!("Fastty could not reconnect host session {session_id}: {error}");
+                self.schedule_host_attach_retry(pane_id, session_id, window, cx);
+                return;
+            }
+        };
         let shell = self
             .config
             .shell
@@ -4182,15 +4551,18 @@ impl RootView {
             Some(session_id),
             Some(pane_id),
             MissingSessionPolicy::KeepUnavailable,
+            Some(remote),
             window,
             cx,
         );
         replacement.custom_title = custom_title;
-
+        let restored = replacement.terminal.is_some();
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            self.host_attach_retry_state.remove(&pane_id);
             return;
         };
         let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) else {
+            self.host_attach_retry_state.remove(&pane_id);
             return;
         };
         if pane.host_session_id != Some(session_id) || pane.terminal.is_some() {
@@ -4203,6 +4575,10 @@ impl RootView {
                 tab.cwd = active.cwd.clone();
                 tab.git_status = active.git_status.clone();
             }
+        }
+        if restored {
+            self.host_attach_retry_state.remove(&pane_id);
+            self.host_missing_sessions.remove(&pane_id);
         }
         self.persist_session();
         cx.notify();
@@ -4244,8 +4620,6 @@ impl RootView {
             zoomed_pane: None,
         });
 
-        self.activate_tab_index(self.tabs.len() - 1);
-        self.persist_session();
         cx.notify();
     }
 
@@ -4269,6 +4643,7 @@ impl RootView {
                     persisted.host_session_id,
                     Some(persisted.pane_id),
                     MissingSessionPolicy::StartFresh,
+                    None,
                     window,
                     cx,
                 );
@@ -4319,6 +4694,7 @@ impl RootView {
                     None,
                     None,
                     MissingSessionPolicy::StartFresh,
+                    None,
                     window,
                     cx,
                 );
@@ -4446,20 +4822,20 @@ impl RootView {
         if pane_count <= 1 {
             self.close_tab(tab_id, window, cx);
         } else {
-            if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
-                if let Some(pane) = tab.pane_tree.find_pane(pane_id) {
-                    if let Some(process) = pane_close_info(pane) {
-                            self.pending_close = Some(PendingClose {
-                                target: CloseTarget::Pane { tab_id, pane_id },
-                            running_processes: vec![process],
-                            failure: None,
-                            });
-                            cx.notify();
-                            return;
-                        }
-                    }
-                }
-            self.force_close_pane(tab_id, pane_id, cx);
+            let pane = self
+                .tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .and_then(|tab| tab.pane_tree.find_pane(pane_id))
+                .cloned();
+            if let Some(pane) = pane {
+                self.check_close_processes(
+                    CloseTarget::Pane { tab_id, pane_id },
+                    vec![pane],
+                    window,
+                    cx,
+                );
+            }
         }
     }
 
@@ -4504,7 +4880,8 @@ impl RootView {
             self.pending_close = Some(PendingClose {
                 target: CloseTarget::Pane { tab_id, pane_id },
                 running_processes,
-                failure: Some(error),
+                checked_panes: Vec::new(),
+                state: PendingCloseState::Failed(error),
             });
             cx.notify();
             return;
@@ -4514,6 +4891,9 @@ impl RootView {
     }
 
     fn remove_stopped_pane(&mut self, tab_id: usize, pane_id: usize, cx: &mut Context<Self>) {
+        self.host_attach_retry_state.remove(&pane_id);
+        self.host_missing_sessions.remove(&pane_id);
+        self.scroll_accum.remove(&pane_id);
         self.selection = None;
         self.is_selecting = false;
         self.selection_start = None;
@@ -4544,7 +4924,7 @@ impl RootView {
         tab_data: TabData,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::with_options_internal(window, cli_opts, Some(tab_data), cx)
+        Self::with_options_internal(window, cli_opts, Some(tab_data), None, cx)
     }
 
     /// Surface a daemon-spawned session (`spawn { open: true }`, e.g. an MCP
@@ -5243,6 +5623,8 @@ impl RootView {
             return;
         }
         self.save_active_ai_conversation();
+        self.active_key_mode = None;
+        self.clear_pending_key_sequence();
         self.active_tab_idx = idx;
         let conversation_id = self.tabs[idx].ai_conversation_id.clone();
         self.load_ai_conversation(&conversation_id);
@@ -5261,26 +5643,222 @@ impl RootView {
         }
     }
 
-    pub fn close_tab(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
-            let running: Vec<RunningProcessInfo> = tab
+    fn check_close_processes(
+        &mut self,
+        target: CloseTarget,
+        panes: Vec<crate::pane_tree::TerminalPane>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(
+            self.pending_close.as_ref().map(|pending| &pending.state),
+            Some(PendingCloseState::Checking(_))
+        ) {
+            return;
+        }
+        self.close_check_generation = self.close_check_generation.wrapping_add(1);
+        let check_id = self.close_check_generation;
+        self.pending_close = Some(PendingClose {
+            target,
+            running_processes: Vec::new(),
+            checked_panes: Vec::new(),
+            state: PendingCloseState::Checking(check_id),
+        });
+        cx.notify();
+
+        let pane_tabs: Vec<(usize, crate::pane_tree::TerminalPane)> = panes
+            .into_iter()
+            .filter_map(|pane| {
+                self.tabs
+                    .iter()
+                    .find(|tab| tab.pane_tree.find_pane(pane.id).is_some())
+                    .map(|tab| (tab.id, pane))
+            })
+            .collect();
+        let idle_stop = cx.background_executor().spawn(async move {
+            let report = stop_panes_if_idle(
+                &pane_tabs.iter().map(|(_, pane)| pane).collect::<Vec<_>>(),
+            );
+            (pane_tabs, report)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let (panes, report) = idle_stop.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let Some(pending) = this.pending_close.as_ref() else {
+                    return;
+                };
+                if !matches!(&pending.state, PendingCloseState::Checking(id) if *id == check_id) {
+                    return;
+                }
+                let target = pending.target.clone();
+                this.finish_idle_close(target, panes, report, window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn finish_idle_close(
+        &mut self,
+        target: CloseTarget,
+        panes: Vec<(usize, crate::pane_tree::TerminalPane)>,
+        report: PaneStopReport,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.close_snapshot_matches(&target, &panes) {
+            self.remove_stopped_snapshot_panes(&panes, &report.stopped_ids, window, cx);
+            let target_exists = match target {
+                CloseTarget::Pane { tab_id, pane_id } => self.tabs.iter().any(|tab| {
+                    tab.id == tab_id && tab.pane_tree.find_pane(pane_id).is_some()
+                }),
+                CloseTarget::Tab { tab_id } => self.tabs.iter().any(|tab| tab.id == tab_id),
+                CloseTarget::OtherTabs { keep_id } => self.tabs.iter().any(|tab| tab.id == keep_id),
+            };
+            self.pending_close = target_exists.then(|| PendingClose {
+                target,
+                running_processes: Vec::new(),
+                checked_panes: Vec::new(),
+                state: PendingCloseState::Failed(
+                    "Tabs changed during close. Retry to check the current panes.".to_string(),
+                ),
+            });
+            cx.notify();
+            return;
+        }
+        if report.blocked.is_empty() && report.failures.is_empty() {
+            self.pending_close = None;
+            match target {
+                CloseTarget::Pane { tab_id, pane_id } => {
+                    self.remove_stopped_pane(tab_id, pane_id, cx)
+                }
+                CloseTarget::Tab { tab_id } => self.remove_tab_after_stop(tab_id, window, cx),
+                CloseTarget::OtherTabs { keep_id } => {
+                    let tab_ids: std::collections::HashSet<usize> =
+                        panes.iter().map(|(tab_id, _)| *tab_id).collect();
+                    for tab_id in tab_ids {
+                        self.remove_tab_after_stop(tab_id, window, cx);
+                    }
+                    if let Some(idx) = self.tabs.iter().position(|tab| tab.id == keep_id) {
+                        self.activate_tab_index(idx);
+                        self.persist_session();
+                        cx.notify();
+                    }
+                }
+            }
+            return;
+        }
+        self.remove_stopped_snapshot_panes(&panes, &report.stopped_ids, window, cx);
+        let state = if report.failures.is_empty() {
+            PendingCloseState::Confirming
+        } else {
+            PendingCloseState::Failed(report.error_message())
+        };
+        self.pending_close = Some(PendingClose {
+            target,
+            running_processes: report.blocked,
+            checked_panes: panes.iter().filter_map(|(tab_id, pane)| {
+                self.tabs.iter().find(|tab| tab.id == *tab_id)
+                    .and_then(|tab| tab.pane_tree.find_pane(pane.id))
+                    .map(|_| (*tab_id, pane.id))
+            }).collect(),
+            state,
+        });
+        cx.notify();
+    }
+
+    fn close_snapshot_matches(
+        &self,
+        target: &CloseTarget,
+        panes: &[(usize, crate::pane_tree::TerminalPane)],
+    ) -> bool {
+        let matches_tab = |tab_id: usize| {
+            let expected: std::collections::HashSet<usize> = panes
+                .iter()
+                .filter(|(pane_tab_id, _)| *pane_tab_id == tab_id)
+                .map(|(_, pane)| pane.id)
+                .collect();
+            self.tabs.iter().find(|tab| tab.id == tab_id).is_some_and(|tab| {
+                tab.pane_tree
+                    .all_panes()
+                    .into_iter()
+                    .map(|pane| pane.id)
+                    .collect::<std::collections::HashSet<_>>() == expected
+            })
+        };
+        match target {
+            CloseTarget::Pane { tab_id, pane_id } => self.tabs.iter().any(|tab| {
+                tab.id == *tab_id
+                    && tab.pane_tree.find_pane(*pane_id).is_some()
+                    && tab.pane_tree.pane_count() > 1
+                    && panes.iter().any(|(id, pane)| id == tab_id && pane.id == *pane_id)
+            }),
+            CloseTarget::Tab { tab_id } => matches_tab(*tab_id),
+            CloseTarget::OtherTabs { keep_id } => {
+                self.tabs.iter().any(|tab| tab.id == *keep_id)
+                    && self.tabs.iter().filter(|tab| tab.id != *keep_id)
+                        .map(|tab| tab.id)
+                        .collect::<std::collections::HashSet<_>>()
+                        == panes.iter().map(|(tab_id, _)| *tab_id)
+                            .collect::<std::collections::HashSet<_>>()
+                    && panes
+                        .iter()
+                        .map(|(tab_id, _)| *tab_id)
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .all(matches_tab)
+            }
+        }
+    }
+
+    fn remove_stopped_snapshot_panes(
+        &mut self,
+        panes: &[(usize, crate::pane_tree::TerminalPane)],
+        stopped_ids: &[usize],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let stopped: std::collections::HashSet<usize> = stopped_ids.iter().copied().collect();
+        let tab_ids: std::collections::HashSet<usize> =
+            panes.iter().map(|(tab_id, _)| *tab_id).collect();
+        for tab_id in tab_ids {
+            let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
+                continue;
+            };
+            let current_ids: Vec<usize> = tab
                 .pane_tree
                 .all_panes()
                 .into_iter()
-                .filter_map(pane_close_info)
+                .map(|pane| pane.id)
                 .collect();
-
-            if !running.is_empty() {
-                self.pending_close = Some(PendingClose {
-                    target: CloseTarget::Tab { tab_id },
-                    running_processes: running,
-                    failure: None,
-                });
-                cx.notify();
-                return;
+            if current_ids.iter().all(|id| stopped.contains(id)) {
+                self.remove_tab_after_stop(tab_id, window, cx);
+            } else {
+                for pane_id in current_ids {
+                    if stopped.contains(&pane_id)
+                        && panes.iter().any(|(id, pane)| *id == tab_id && pane.id == pane_id)
+                    {
+                        self.remove_stopped_pane(tab_id, pane_id, cx);
+                    }
+                }
             }
         }
-        self.force_close_tab(tab_id, window, cx);
+    }
+
+    pub fn close_tab(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let panes = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| {
+                tab.pane_tree
+                    .all_panes()
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.check_close_processes(CloseTarget::Tab { tab_id }, panes, window, cx);
     }
 
     pub fn force_close_tab(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -5316,17 +5894,26 @@ impl RootView {
             self.pending_close = Some(PendingClose {
                 target: CloseTarget::Tab { tab_id },
                 running_processes,
-                failure: Some(error),
+                checked_panes: Vec::new(),
+                state: PendingCloseState::Failed(error),
             });
             cx.notify();
             return;
         }
+        self.remove_tab_after_stop(tab_id, window, cx);
+    }
+
+    fn remove_tab_after_stop(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_close = None;
         self.selection = None;
         self.is_selecting = false;
         self.selection_start = None;
         if let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) {
             let was_active = idx == self.active_tab_idx;
+            if was_active {
+                self.active_key_mode = None;
+                self.clear_pending_key_sequence();
+            }
             self.cancel_tab_ai_turns(tab_id);
             if was_active && self.ai_is_streaming {
                 self.cancel_ai_stream();
@@ -5346,6 +5933,9 @@ impl RootView {
             self.ai_opencode_manager.remove(&removed_conversation_id);
             let removed = self.tabs.remove(idx);
             for pane in removed.pane_tree.all_panes() {
+                self.host_attach_retry_state.remove(&pane.id);
+                self.host_missing_sessions.remove(&pane.id);
+                self.scroll_accum.remove(&pane.id);
                 if self.exec_pane_id == Some(pane.id) {
                     self.exec_pane_id = None;
                 }
@@ -5382,6 +5972,58 @@ impl RootView {
         let Some(pending) = self.pending_close.clone() else {
             return;
         };
+        if matches!(&pending.state, PendingCloseState::Checking(_)) {
+            return;
+        }
+        let target_exists = match &pending.target {
+            CloseTarget::Pane { tab_id, pane_id } => self.tabs.iter().any(|tab| {
+                tab.id == *tab_id && tab.pane_tree.find_pane(*pane_id).is_some()
+            }),
+            CloseTarget::Tab { tab_id } => self.tabs.iter().any(|tab| tab.id == *tab_id),
+            CloseTarget::OtherTabs { keep_id } => self.tabs.iter().any(|tab| tab.id == *keep_id),
+        };
+        if !target_exists {
+            self.pending_close = None;
+            cx.notify();
+            return;
+        }
+        let current_panes: Vec<(usize, usize)> = match &pending.target {
+            CloseTarget::Pane { tab_id, pane_id } => self.tabs.iter()
+                .find(|tab| tab.id == *tab_id)
+                .and_then(|tab| tab.pane_tree.find_pane(*pane_id))
+                .map(|pane| vec![(*tab_id, pane.id)])
+                .unwrap_or_default(),
+            CloseTarget::Tab { tab_id } => self.tabs.iter()
+                .find(|tab| tab.id == *tab_id)
+                .map(|tab| tab.pane_tree.all_panes().into_iter()
+                    .map(|pane| (*tab_id, pane.id)).collect())
+                .unwrap_or_default(),
+            CloseTarget::OtherTabs { keep_id } => self.tabs.iter()
+                .filter(|tab| tab.id != *keep_id)
+                .flat_map(|tab| tab.pane_tree.all_panes().into_iter()
+                    .map(|pane| (tab.id, pane.id)))
+                .collect(),
+        };
+        let checked: std::collections::HashSet<_> = pending.checked_panes.iter().copied().collect();
+        let current: std::collections::HashSet<_> = current_panes.into_iter().collect();
+        let pane_still_split = match &pending.target {
+            CloseTarget::Pane { tab_id, .. } => self.tabs.iter().any(|tab| {
+                tab.id == *tab_id && tab.pane_tree.pane_count() > 1
+            }),
+            _ => true,
+        };
+        if !matches!(pending.state, PendingCloseState::Confirming)
+            || checked != current
+            || !pane_still_split
+        {
+            self.pending_close = None;
+            match pending.target {
+                CloseTarget::Tab { tab_id } => self.close_tab(tab_id, window, cx),
+                CloseTarget::Pane { pane_id, .. } => self.close_pane_by_id(pane_id, window, cx),
+                CloseTarget::OtherTabs { keep_id } => self.close_other_tabs(keep_id, window, cx),
+            }
+            return;
+        }
         match pending.target {
             CloseTarget::Tab { tab_id } => self.force_close_tab(tab_id, window, cx),
             CloseTarget::Pane { tab_id, pane_id } => self.force_close_pane(tab_id, pane_id, cx),
@@ -5643,25 +6285,19 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let other_running: Vec<RunningProcessInfo> = self
+        let panes = self
             .tabs
             .iter()
             .filter(|t| t.id != keep_id)
-            .flat_map(|t| t.pane_tree.all_panes())
-            .filter_map(pane_close_info)
+            .flat_map(|tab| tab.pane_tree.all_panes())
+            .cloned()
             .collect();
-
-        if !other_running.is_empty() {
-            self.pending_close = Some(PendingClose {
-                target: CloseTarget::OtherTabs { keep_id },
-                running_processes: other_running,
-                failure: None,
-            });
-            cx.notify();
-            return;
-        }
-
-        self.force_close_other_tabs(keep_id, window, cx);
+        self.check_close_processes(
+            CloseTarget::OtherTabs { keep_id },
+            panes,
+            window,
+            cx,
+        );
     }
 
     pub fn force_close_other_tabs(
@@ -5704,7 +6340,7 @@ impl RootView {
 
             for (tab_id, report) in stop_reports {
                 if report.failures.is_empty() {
-                    self.force_close_tab(tab_id, window, cx);
+                    self.remove_tab_after_stop(tab_id, window, cx);
                 } else {
                     for pane_id in report.stopped_ids {
                         self.remove_stopped_pane(tab_id, pane_id, cx);
@@ -5714,11 +6350,16 @@ impl RootView {
             self.pending_close = Some(PendingClose {
                 target: CloseTarget::OtherTabs { keep_id },
                 running_processes,
-                failure: Some(error),
+                checked_panes: Vec::new(),
+                state: PendingCloseState::Failed(error),
             });
             cx.notify();
             return;
         }
+        self.remove_other_tabs_after_stop(keep_id, cx);
+    }
+
+    fn remove_other_tabs_after_stop(&mut self, keep_id: usize, cx: &mut Context<Self>) {
         self.pending_close = None;
         if self.ai_is_streaming
             && self.tabs.get(self.active_tab_idx).map(|tab| tab.id) != Some(keep_id)
@@ -5739,6 +6380,9 @@ impl RootView {
         for tab in self.tabs.iter().filter(|t| t.id != keep_id) {
             self.ai_opencode_manager.remove(&tab.ai_conversation_id);
             for pane in tab.pane_tree.all_panes() {
+                self.host_attach_retry_state.remove(&pane.id);
+                self.host_missing_sessions.remove(&pane.id);
+                self.scroll_accum.remove(&pane.id);
                 crate::daemon::unregister(pane.id);
             }
         }
@@ -6208,10 +6852,15 @@ impl RootView {
         cx.notify();
     }
 
-    pub fn save_workspace_session(&mut self, session_name: &str) -> anyhow::Result<()> {
+    pub fn save_workspace_session(
+        &mut self,
+        session_name: &str,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
         let mut persisted_tabs = Vec::new();
+        let mut snapshots = Vec::new();
         for tab in &self.tabs {
-            let layout = Some(tab.pane_tree.root.to_persisted());
+            let layout = Some(tab.pane_tree.root.to_persisted(&mut snapshots));
             persisted_tabs.push(crate::session_manager::PersistedTab {
                 id: tab.id,
                 ai_tab_key: Some(tab.ai_tab_key.clone()),
@@ -6220,6 +6869,7 @@ impl RootView {
                 custom_title: tab.custom_title.clone(),
                 cwd: tab.cwd.as_ref().map(|c| c.to_string_lossy().to_string()),
                 layout,
+                active_pane_id: Some(tab.pane_tree.active_pane_id),
             });
         }
 
@@ -6234,7 +6884,23 @@ impl RootView {
             active_tab_idx: self.active_tab_idx,
             tabs: persisted_tabs,
         };
-        crate::session_manager::save_session(&data)
+        let revision = crate::session_manager::next_save_revision();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::Builder::new()
+            .name("fastty-workspace-save".into())
+            .spawn(move || {
+                let result = crate::session_manager::save_session_with_snapshots(data, snapshots, revision)
+                    .map_err(|error| error.to_string());
+                let _ = tx.send_blocking(result);
+            })?;
+        cx.spawn(async move |_this, _cx| {
+            if let Ok(Err(error)) = rx.recv().await {
+                eprintln!("Fastty could not save workspace: {error}");
+                send_system_notification("Workspace save failed", &error);
+            }
+        })
+        .detach();
+        Ok(())
     }
 
     pub fn restore_workspace_session(
@@ -6244,21 +6910,91 @@ impl RootView {
         cx: &mut Context<Self>,
     ) {
         if let Some(session) = crate::session_manager::load_session(session_name) {
+            let first_restored_tab_idx = self.tabs.len();
+            let restored_active_tab_idx = session.active_tab_idx;
             let shell = self
                 .config
                 .shell
                 .clone()
                 .or_else(|| std::env::var("SHELL").ok())
                 .unwrap_or_else(crate::paths::default_system_shell);
+            let mut attached_session_ids: std::collections::HashSet<usize> = self
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.pane_tree.root.all_panes())
+                .filter_map(|pane| pane.host_session_id)
+                .collect();
             for tab_data in session.tabs {
                 let tab_id = self.next_tab_id;
                 self.next_tab_id += 1;
+                let mut historical_snapshot_label = None;
 
                 let pane_tree = if let Some(ref persisted_layout) = tab_data.layout {
+                    let mut restored_active_pane_id = None;
                     let root_node = crate::pane_tree::PaneNode::restore_from_persisted(
                         persisted_layout,
-                        &mut |cwd, title| {
-                            self.spawn_terminal_pane(&shell, &[], cwd, title, window, cx)
+                        &mut |persisted| {
+                            let cwd = persisted.cwd.as_deref().map(std::path::Path::new);
+                            let title = persisted
+                                .custom_title
+                                .clone()
+                                .or(Some(persisted.title.clone()));
+                            let host_session_id = persisted
+                                .host_session_id
+                                .filter(|id| !attached_session_ids.contains(id));
+                            attached_session_ids.extend(host_session_id);
+                            let pane_id = self.next_pane_id;
+                            let mut pane = self.spawn_terminal_pane_with_session(
+                                &shell,
+                                &[],
+                                cwd,
+                                title,
+                                host_session_id,
+                                Some(pane_id),
+                                MissingSessionPolicy::StartFresh,
+                                None,
+                                window,
+                                cx,
+                            );
+                            let attached_live = host_session_id.is_some()
+                                && pane.host_session_id == host_session_id
+                                && pane.terminal.is_some();
+                            if !attached_live {
+                                if let (Some(encoded), Some(term)) =
+                                    (&persisted.snapshot, &pane.terminal)
+                                {
+                                    use base64::prelude::*;
+                                    if let Ok(bytes) = BASE64_STANDARD.decode(encoded) {
+                                        let was_alt_screen = crate::server::binary_snapshot::FasttyBinarySnapshotHeader::from_bytes(&bytes)
+                                            .is_some_and(|header| {
+                                                header.flags
+                                                    & crate::server::binary_snapshot::SNAPSHOT_FLAG_ALT_SCREEN
+                                                    != 0
+                                            });
+                                        if was_alt_screen
+                                            || persisted.snapshot_activity
+                                                != crate::session_manager::SnapshotActivity::Shell
+                                        {
+                                            historical_snapshot_label = Some("previous TUI ended");
+                                            pane.custom_title = Some(format!(
+                                                "{} (previous TUI ended)",
+                                                persisted.title
+                                            ));
+                                        } else if term.restore_binary_snapshot(&bytes) {
+                                            historical_snapshot_label
+                                                .get_or_insert("previous output");
+                                            pane.custom_title = Some(format!(
+                                                "{} (previous output)",
+                                                persisted.title
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            if tab_data.active_pane_id == Some(persisted.id) {
+                                restored_active_pane_id = Some(pane.id);
+                            }
+                            pane
                         },
                     );
                     let first_pane_id = root_node
@@ -6268,7 +7004,7 @@ impl RootView {
                         .unwrap_or(tab_id);
                     crate::pane_tree::PaneTree {
                         root: root_node,
-                        active_pane_id: first_pane_id,
+                        active_pane_id: restored_active_pane_id.unwrap_or(first_pane_id),
                     }
                 } else {
                     let cwd = tab_data.cwd.as_deref().map(std::path::Path::new);
@@ -6288,6 +7024,14 @@ impl RootView {
                     .and_then(|p| p.cwd.clone())
                     .or_else(|| tab_data.cwd.map(std::path::PathBuf::from));
                 let pane_term = active_pane.and_then(|p| p.terminal.clone());
+                let tab_custom_title = if let Some(label) = historical_snapshot_label {
+                    Some(format!(
+                        "{} ({label})",
+                        tab_data.custom_title.unwrap_or_else(|| pane_title.clone()),
+                    ))
+                } else {
+                    tab_data.custom_title
+                };
 
                 self.tabs.push(TabData {
                     id: tab_id,
@@ -6297,7 +7041,7 @@ impl RootView {
                         .unwrap_or_else(|| new_ai_key("chat")),
                     pane_tree,
                     title: pane_title,
-                    custom_title: tab_data.custom_title,
+                    custom_title: tab_custom_title,
                     terminal: pane_term,
                     cwd: pane_cwd.clone(),
                     git_status: None,
@@ -6309,10 +7053,12 @@ impl RootView {
                 });
             }
 
-            if session.active_tab_idx < self.tabs.len() {
-                self.active_tab_idx = session.active_tab_idx;
-                let conversation_id = self.tabs[self.active_tab_idx].ai_conversation_id.clone();
-                self.load_ai_conversation(&conversation_id);
+            if self.tabs.len() > first_restored_tab_idx {
+                let last_restored_tab_idx = self.tabs.len() - 1;
+                let active_idx = first_restored_tab_idx
+                    .saturating_add(restored_active_tab_idx)
+                    .min(last_restored_tab_idx);
+                self.activate_tab_index(active_idx);
             }
             self.persist_session();
             cx.notify();
@@ -6327,6 +7073,19 @@ impl RootView {
     ) {
         self.is_command_palette_open = false;
         self.record_palette_recent(cmd_id);
+        if let Some(workflow_id) = cmd_id.strip_prefix("workflow:") {
+            let actions = self
+                .config
+                .workflows
+                .get(workflow_id)
+                .map(|workflow| workflow.actions.clone())
+                .unwrap_or_default();
+            for action in actions {
+                self.execute_palette_command(action.palette_command_id(), _window, cx);
+            }
+            self.record_palette_recent(cmd_id);
+            return;
+        }
         // Leaving the palette on a non-preview command discards any preview;
         // previewable commands (theme, font size, layout) commit in their
         // arms below: theme/layout are absolute (idempotent), font size
@@ -6338,7 +7097,10 @@ impl RootView {
             "tab_overview" => self.toggle_tab_overview(_window, cx),
             "global_search" => self.toggle_global_search(_window, cx),
             "save_session" => {
-                let _ = self.save_workspace_session("default-workspace");
+                if let Err(error) = self.save_workspace_session("default-workspace", cx) {
+                    eprintln!("Fastty could not start workspace save: {error}");
+                    send_system_notification("Workspace save failed", &error.to_string());
+                }
                 cx.notify();
             }
             "restore_session" => {
@@ -6463,6 +7225,7 @@ impl RootView {
             "close_pane" => self.close_active_pane(_window, cx),
             "zoom_pane" => self.toggle_pane_zoom(cx),
             "toggle_tab_sidebar" => self.toggle_tab_sidebar(_window, cx),
+            "toggle_project_sidebar" => self.toggle_project_sidebar(_window, cx),
             "toggle_ai_sidebar" => self.toggle_ai_sidebar(_window, cx),
             "layout_horizontal" => self.set_tab_layout_mode(TabLayout::Horizontal, _window, cx),
             "layout_vertical" => self.set_tab_layout_mode(TabLayout::Vertical, _window, cx),
@@ -6596,11 +7359,13 @@ impl RootView {
                 .tabs
                 .get(self.active_tab_idx)
                 .is_some_and(|tab| tab.pane_tree.active_pane_id == pane_id);
+        let is_initial_status = !self.program_statuses.contains_key(&pane_id);
         let status = self.program_statuses.entry(pane_id).or_default();
         let changed_attention: Vec<ProgramRecord> = records
             .iter()
             .filter(|record| {
-                matches!(
+                !is_initial_status
+                    && matches!(
                     record.state,
                     ProgramState::Done | ProgramState::Blocked | ProgramState::Error
                 ) && !status.records.iter().any(|previous| {
@@ -8453,6 +9218,9 @@ impl RootView {
             loaded_config.keybindings.clone(),
             loaded_config.keybinding_preset,
         );
+        crate::keybindings::init_key_modes(loaded_config.key_modes.clone());
+        self.active_key_mode = None;
+        self.clear_pending_key_sequence();
         self.config = loaded_config;
         if context_window_changed {
             let active_conversation_id = self
@@ -8814,8 +9582,111 @@ impl RootView {
             return;
         }
 
+        if self.any_input_overlay_open() || self.ai_keys_own_input() {
+            self.active_key_mode = None;
+            self.clear_pending_key_sequence();
+        }
+
         let is_alt_gr = modifiers.control && !modifiers.platform && modifiers.alt;
         let is_ctrl = modifiers.control && !is_alt_gr;
+        let combo_opt = crate::keybindings::combo_from_key(
+            key,
+            is_ctrl,
+            modifiers.shift,
+            modifiers.alt && !is_alt_gr,
+            modifiers.platform,
+        );
+        let mut mode_action_opt = None;
+
+        if let Some(combo) = combo_opt {
+            if let Some(mode) = self.active_key_mode.clone() {
+                if matches!(key_lower.as_str(), "escape" | "esc" | "enter" | "return") {
+                    self.active_key_mode = None;
+                    cx.notify();
+                    return;
+                }
+                if let Some(command) = crate::keybindings::with_key_modes(|modes| modes.resolve(&mode, &combo)) {
+                    match command {
+                        crate::keybindings::ModeCommand::Exit => {
+                            self.active_key_mode = None;
+                            cx.notify();
+                            return;
+                        }
+                        crate::keybindings::ModeCommand::Resize(key) => {
+                            let direction = match key {
+                                crate::keybindings::NamedKey::Left => Some(Direction::Left),
+                                crate::keybindings::NamedKey::Right => Some(Direction::Right),
+                                crate::keybindings::NamedKey::Up => Some(Direction::Top),
+                                crate::keybindings::NamedKey::Down => Some(Direction::Down),
+                                _ => None,
+                            };
+                            if let (Some(direction), Some(tab)) = (direction, self.tabs.get_mut(self.active_tab_idx)) {
+                                let delta = if modifiers.shift { 0.12 } else { 0.04 };
+                                if tab.pane_tree.resize_pane(tab.pane_tree.active_pane_id, direction, delta) {
+                                    self.persist_session();
+                                    cx.notify();
+                                }
+                            }
+                            return;
+                        }
+                        crate::keybindings::ModeCommand::Action(action) => {
+                            self.active_key_mode = None;
+                            self.clear_pending_key_sequence();
+                            mode_action_opt = Some(action);
+                        }
+                    }
+                } else if key_lower == "escape" || crate::keybindings::with_key_modes(|modes| modes.exclusive(&mode)) {
+                    if key_lower == "escape" {
+                        self.active_key_mode = None;
+                        cx.notify();
+                    }
+                    return;
+                }
+            } else if let Some(mode) = crate::keybindings::with_key_modes(|modes| modes.mode_for_entry(&combo).map(str::to_string)) {
+                self.clear_pending_key_sequence();
+                self.active_key_mode = Some(mode);
+                cx.notify();
+                return;
+            }
+        }
+
+        let mut sequence_action_opt = None;
+        if mode_action_opt.is_none() && !self.pending_key_sequence.is_empty() {
+            if key_lower == "escape" || key_lower == "esc" {
+                self.clear_pending_key_sequence();
+                cx.notify();
+                return;
+            }
+            if let Some(combo) = combo_opt {
+                let mut candidate = self.pending_key_sequence.clone();
+                candidate.push(combo);
+                let (action, has_longer) = crate::keybindings::RESOLVER
+                    .get_or_init(|| parking_lot::RwLock::new(crate::keybindings::KeyBindingResolver::with_defaults()))
+                    .read()
+                    .resolve_sequence(&candidate);
+                if action.is_none() && has_longer {
+                    self.pending_key_sequence = candidate;
+                    self.restart_key_sequence_timeout(cx);
+                    cx.notify();
+                    return;
+                }
+                self.clear_pending_key_sequence();
+                sequence_action_opt = action;
+            }
+        } else if mode_action_opt.is_none() {
+            if let Some(combo) = combo_opt {
+                let is_prefix = crate::keybindings::RESOLVER
+                    .get_or_init(|| parking_lot::RwLock::new(crate::keybindings::KeyBindingResolver::with_defaults()))
+                    .read()
+                    .is_sequence_prefix(&combo);
+                if is_prefix {
+                    self.pending_key_sequence = vec![combo];
+                    self.restart_key_sequence_timeout(cx);
+                    cx.notify();
+                    return;
+                }
+            }
+        }
 
         let project_panel_shortcut = if cfg!(target_os = "macos") {
             modifiers.platform && modifiers.shift && key_lower == "g"
@@ -9111,8 +9982,13 @@ impl RootView {
 
         if self.pending_close.is_some() {
             if key_lower == "escape" || key_lower == "esc" {
-                self.pending_close = None;
-                cx.notify();
+                if !matches!(
+                    self.pending_close.as_ref().map(|pending| &pending.state),
+                    Some(PendingCloseState::Checking(_))
+                ) {
+                    self.pending_close = None;
+                    cx.notify();
+                }
                 return;
             }
             if key_lower == "enter" || key_lower == "return" {
@@ -9355,8 +10231,8 @@ impl RootView {
 
             if key_lower == "enter" || key_lower == "return" {
                 if let Some(cmd) = filtered.get(self.command_palette_selected) {
-                    let id = cmd.id;
-                    self.execute_palette_command(id, _window, cx);
+                    let id = cmd.id.clone();
+                    self.execute_palette_command(&id, _window, cx);
                 }
                 return;
             }
@@ -9365,9 +10241,11 @@ impl RootView {
                     self.command_palette_selected = (self.command_palette_selected + 1) % count;
                     self.command_palette_scroll_handle
                         .scroll_to_item(self.command_palette_selected);
-                    let selected_id = filtered.get(self.command_palette_selected).map(|c| c.id);
+                    let selected_id = filtered
+                        .get(self.command_palette_selected)
+                        .map(|c| c.id.clone());
                     if let Some(id) = selected_id {
-                        self.preview_palette_command(id, _window, cx);
+                        self.preview_palette_command(&id, _window, cx);
                     }
                     cx.notify();
                 }
@@ -9382,9 +10260,11 @@ impl RootView {
                     };
                     self.command_palette_scroll_handle
                         .scroll_to_item(self.command_palette_selected);
-                    let selected_id = filtered.get(self.command_palette_selected).map(|c| c.id);
+                    let selected_id = filtered
+                        .get(self.command_palette_selected)
+                        .map(|c| c.id.clone());
                     if let Some(id) = selected_id {
-                        self.preview_palette_command(id, _window, cx);
+                        self.preview_palette_command(&id, _window, cx);
                     }
                     cx.notify();
                 }
@@ -9399,9 +10279,9 @@ impl RootView {
                     .filtered_palette_commands()
                     .into_iter()
                     .next()
-                    .map(|c| c.id);
+                    .map(|c| c.id.clone());
                 if let Some(id) = selected_id {
-                    self.preview_palette_command(id, _window, cx);
+                    self.preview_palette_command(&id, _window, cx);
                 }
                 cx.notify();
                 return;
@@ -9415,9 +10295,9 @@ impl RootView {
                         .filtered_palette_commands()
                         .into_iter()
                         .next()
-                        .map(|c| c.id);
+                        .map(|c| c.id.clone());
                     if let Some(id) = selected_id {
-                        self.preview_palette_command(id, _window, cx);
+                        self.preview_palette_command(&id, _window, cx);
                     }
                     cx.notify();
                     return;
@@ -9430,9 +10310,9 @@ impl RootView {
                     .filtered_palette_commands()
                     .into_iter()
                     .next()
-                    .map(|c| c.id);
+                    .map(|c| c.id.clone());
                 if let Some(id) = selected_id {
-                    self.preview_palette_command(id, _window, cx);
+                    self.preview_palette_command(&id, _window, cx);
                 }
                 cx.notify();
                 return;
@@ -10089,19 +10969,12 @@ impl RootView {
         }
 
         // Dynamic Keybinding Resolver Check (Default, Ghostty, Tmux, ITerm2 presets + User overrides)
-        let combo_opt = crate::keybindings::combo_from_key(
-            key,
-            is_ctrl,
-            modifiers.shift,
-            modifiers.alt && !is_alt_gr,
-            modifiers.platform,
-        );
-        let action_opt = combo_opt.and_then(|combo| {
+        let action_opt = mode_action_opt.or(sequence_action_opt).or_else(|| combo_opt.and_then(|combo| {
             let resolver_lock = crate::keybindings::RESOLVER.get_or_init(|| {
                 parking_lot::RwLock::new(crate::keybindings::KeyBindingResolver::with_defaults())
             });
             resolver_lock.read().resolve(&combo)
-        });
+        }));
 
         if let Some(action) = action_opt {
             use crate::keybindings::Action;
@@ -10112,6 +10985,11 @@ impl RootView {
                 }
                 Action::NewWindow => {
                     self.execute_palette_command("new_window", _window, cx);
+                    return;
+                }
+                Action::EnterResizeMode => {
+                    self.active_key_mode = Some("resize".to_string());
+                    cx.notify();
                     return;
                 }
                 Action::SshManager => {
@@ -10563,6 +11441,29 @@ impl RootView {
             terminal.write_to_pty(&bytes);
             cx.notify();
         }
+    }
+
+    fn clear_pending_key_sequence(&mut self) {
+        self.pending_key_sequence.clear();
+        self.key_sequence_generation = self.key_sequence_generation.wrapping_add(1);
+    }
+
+    fn restart_key_sequence_timeout(&mut self, cx: &mut Context<Self>) {
+        self.key_sequence_generation = self.key_sequence_generation.wrapping_add(1);
+        let generation = self.key_sequence_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(crate::keybindings::KEY_SEQUENCE_TIMEOUT)
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.key_sequence_generation == generation {
+                    this.pending_key_sequence.clear();
+                    this.key_sequence_generation = this.key_sequence_generation.wrapping_add(1);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn any_input_overlay_open(&self) -> bool {
@@ -11601,24 +12502,61 @@ impl RootView {
                 }
             })
             .or_else(|| active_tab.pane_tree.active_pane());
-        let target_pane_id = target_pane.as_ref().map(|p| p.id);
+        let Some(target_pane_id) = target_pane.as_ref().map(|p| p.id) else {
+            return;
+        };
         let target_bounds = target_pane.as_ref().and_then(|p| p.last_bounds);
         let Some(terminal) = target_pane.as_ref().and_then(|p| p.terminal.as_ref()) else {
             return;
         };
 
         let (_, line_h) = self.measure_cell_metrics(_window);
-        let px_per_line = if line_h > 0.0 { line_h } else { 18.0 };
+        let px_per_line = if line_h.is_finite() && line_h > 0.0 {
+            line_h
+        } else {
+            18.0
+        };
 
         let delta_y = match event.delta {
             gpui::ScrollDelta::Pixels(p) => p.y.as_f32(),
             gpui::ScrollDelta::Lines(l) => l.y * px_per_line * 3.0,
         };
+        let mouse_delta_y = match event.delta {
+            gpui::ScrollDelta::Pixels(p) => p.y.as_f32(),
+            gpui::ScrollDelta::Lines(l) => l.y * px_per_line,
+        };
 
-        if delta_y.abs() > 0.1 {
+        if delta_y.is_finite() && delta_y != 0.0 {
             self.last_scroll_activity = std::time::Instant::now();
-            self.last_scrolled_pane_id = target_pane_id;
+            self.last_scrolled_pane_id = Some(target_pane_id);
             if terminal.is_mouse_mode_enabled() {
+                let accumulator = self
+                    .scroll_accum
+                    .entry(target_pane_id)
+                    .or_insert(WheelAccumulator::Mouse(0.0));
+                if !matches!(&*accumulator, WheelAccumulator::Mouse(_)) {
+                    *accumulator = WheelAccumulator::Mouse(0.0);
+                }
+                let WheelAccumulator::Mouse(remainder) = accumulator else {
+                    return;
+                };
+                const MAX_MOUSE_WHEEL_STEPS: i32 = 32;
+                *remainder += mouse_delta_y.clamp(
+                    -(MAX_MOUSE_WHEEL_STEPS as f32) * px_per_line,
+                    (MAX_MOUSE_WHEEL_STEPS as f32) * px_per_line,
+                );
+                let steps = (*remainder / px_per_line)
+                    .trunc()
+                    .clamp(-(MAX_MOUSE_WHEEL_STEPS as f32), MAX_MOUSE_WHEEL_STEPS as f32)
+                    as i32;
+                if steps.abs() == MAX_MOUSE_WHEEL_STEPS {
+                    *remainder = 0.0;
+                } else {
+                    *remainder -= steps as f32 * px_per_line;
+                }
+                if steps == 0 {
+                    return;
+                }
                 let (cell_w, _) = self.measure_cell_metrics(_window);
                 let (pane_x, pane_y) = if let Some(b) = target_bounds {
                     (b.origin.x.to_f64() as f32, b.origin.y.to_f64() as f32)
@@ -11630,35 +12568,47 @@ impl RootView {
                 let local_y = (mouse_y - pane_y).max(0.0);
                 let col = ((local_x / cell_w).floor() as usize) + 1;
                 let row = ((local_y / px_per_line).floor() as usize) + 1;
-                let btn = if delta_y > 0.0 { 64 } else { 65 };
-                terminal.send_mouse_button_with_mods(
-                    btn,
-                    col,
-                    row,
-                    true,
-                    event.modifiers.shift,
-                    event.modifiers.alt,
-                    event.modifiers.control,
-                );
+                let btn = if steps > 0 { 64 } else { 65 };
+                for _ in 0..steps.abs() {
+                    terminal.send_mouse_button_with_mods(
+                        btn,
+                        col,
+                        row,
+                        true,
+                        event.modifiers.shift,
+                        event.modifiers.alt,
+                        event.modifiers.control,
+                    );
+                }
             } else {
+                let accumulator = self
+                    .scroll_accum
+                    .entry(target_pane_id)
+                    .or_insert(WheelAccumulator::History(0.0));
+                if !matches!(&*accumulator, WheelAccumulator::History(_)) {
+                    *accumulator = WheelAccumulator::History(0.0);
+                }
+                let WheelAccumulator::History(remainder) = accumulator else {
+                    return;
+                };
                 let display_offset = terminal.display_offset();
                 let history_size = terminal.history_size();
 
                 // If already at the bottom and trying to scroll down, stop immediately
                 if display_offset == 0 && delta_y < 0.0 {
-                    self.scroll_accum = 0.0;
+                    *remainder = 0.0;
                     return;
                 }
                 // If already at the top of history and trying to scroll up, stop immediately
                 if display_offset >= history_size && delta_y > 0.0 {
-                    self.scroll_accum = 0.0;
+                    *remainder = 0.0;
                     return;
                 }
 
-                self.scroll_accum += delta_y;
-                let lines = (self.scroll_accum / px_per_line) as isize;
+                *remainder += delta_y;
+                let lines = (*remainder / px_per_line) as isize;
                 if lines != 0 {
-                    self.scroll_accum -= (lines as f32) * px_per_line;
+                    *remainder -= (lines as f32) * px_per_line;
 
                     let new_offset =
                         (display_offset as isize + lines).clamp(0, history_size as isize) as usize;
@@ -11669,11 +12619,61 @@ impl RootView {
 
                     // Clear remainder when reaching boundary
                     if new_offset == 0 || new_offset == history_size {
-                        self.scroll_accum = 0.0;
+                        *remainder = 0.0;
                     }
                 }
             }
         }
+    }
+
+    fn schedule_terminal_render_retry(
+        &self,
+        pane_id: PaneId,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        if self
+            .terminal_render_retry_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let should_retry = {
+            let mut state = self.terminal_render_retry_state.lock();
+            let retry_count = state.entry(pane_id).or_default();
+            if *retry_count >= 5 {
+                false
+            } else {
+                *retry_count += 1;
+                true
+            }
+        };
+        if !should_retry {
+            self.terminal_render_retry_pending
+                .store(false, Ordering::Release);
+            return;
+        }
+
+        let pending = Arc::clone(&self.terminal_render_retry_pending);
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(33))
+                .await;
+            if this
+                .update_in(cx, |this, _window, cx| {
+                    this.terminal_render_retry_pending
+                        .store(false, Ordering::Relaxed);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                pending.store(false, Ordering::Relaxed);
+            }
+        })
+        .detach();
     }
 
     fn render_pane_tree_node(
@@ -12064,6 +13064,7 @@ impl RootView {
                             all_search_highlights.resize(num_lines, Vec::new());
                         }
 
+                        self.terminal_render_retry_state.lock().remove(&pane.id);
                         Some(crate::ui::terminal_grid_element::TerminalGridElement {
                             lines,
                             cell_w,
@@ -12082,6 +13083,7 @@ impl RootView {
                             ligatures: self.config.font.ligatures,
                         })
                     } else {
+                        self.schedule_terminal_render_retry(pane.id, window, cx);
                         None
                     }
                 } else {
@@ -12254,6 +13256,13 @@ impl RootView {
                     .host_session_id
                     .filter(|_| pane.terminal.is_none())
                     .map(|session_id| {
+                        let message = if self.host_missing_sessions.contains(&pane_id) {
+                            format!("Session {session_id} no longer exists")
+                        } else if self.host_attach_retry_state.contains_key(&pane_id) {
+                            format!("Reconnecting to session {session_id}")
+                        } else {
+                            format!("Could not reconnect to session {session_id}")
+                        };
                         div()
                             .absolute()
                             .inset_0()
@@ -12267,7 +13276,7 @@ impl RootView {
                                 div()
                                     .text_size(px(12.))
                                     .text_color(theme.muted_strong)
-                                    .child(format!("Could not reconnect to session {session_id}")),
+                                    .child(message),
                             )
                             .child(
                                 div()
@@ -12291,6 +13300,47 @@ impl RootView {
                                     .child("Retry connection"),
                             )
                     });
+                let render_retry_panel = (pane.terminal.is_some() && grid_el.is_none()).then(|| {
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .bg(theme.background)
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme.muted_strong)
+                                .child("Terminal is waiting to render"),
+                        )
+                        .child(
+                            div()
+                                .id(("retry-terminal-render", pane_id))
+                                .px(px(12.))
+                                .py(px(6.))
+                                .rounded(px(5.))
+                                .bg(theme.surface_raised)
+                                .border_1()
+                                .border_color(theme.border)
+                                .text_size(px(12.))
+                                .text_color(theme.foreground)
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _ev, _window, cx| {
+                                        this.terminal_render_retry_state
+                                            .lock()
+                                            .insert(pane_id, 0);
+                                        cx.notify();
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .child("Retry render"),
+                        )
+                });
 
                 div()
                     .size_full()
@@ -12347,6 +13397,7 @@ impl RootView {
                     )
                     .when_some(grid_el, |d, el| d.child(el))
                     .when_some(retry_panel, |d, panel| d.child(panel))
+                    .when_some(render_retry_panel, |d, panel| d.child(panel))
                     .when_some(pane_scrollbar_thumb, |d, thumb| d.child(thumb))
                     .when_some(program_badge, |d, badge| d.child(badge))
             }
@@ -12534,6 +13585,9 @@ impl Render for RootView {
         }
         self.program_statuses
             .retain(|id, _| live_panes.contains(id));
+        self.terminal_render_retry_state
+            .lock()
+            .retain(|id, _| live_panes.contains(id));
         if self.ai_response_is_visible(_window) {
             if let Some(tab) = self.tabs.get(self.active_tab_idx) {
                 if let Some(completion) = self.ai_turn_completions.get_mut(&tab.ai_conversation_id)
@@ -12711,11 +13765,23 @@ impl Render for RootView {
                 (None, None, StatusInfo::default())
             };
 
-        let (left_segs, right_segs) = self.status_bar_model.render_segments(
+        let (mut left_segs, right_segs) = self.status_bar_model.render_segments(
             active_cwd,
             active_git.as_ref(),
             _window.is_window_active(),
         );
+        if let Some(mode) = &self.active_key_mode {
+            left_segs.push(crate::widgets::Segment::text(
+                format!("{} MODE · Esc/Enter to exit", mode.to_uppercase()),
+                [0.95, 0.75, 0.35, 1.0],
+            ));
+        }
+        if !self.pending_key_sequence.is_empty() {
+            left_segs.push(crate::widgets::Segment::text(
+                "KEY SEQUENCE · Esc to cancel".to_string(),
+                [0.65, 0.72, 0.92, 1.0],
+            ));
+        }
 
         let (cell_w, line_h) = self.measure_cell_metrics(_window);
         let viewport_size = _window.viewport_size();
@@ -13533,6 +14599,9 @@ impl Render for RootView {
                                     let conversation_id = this.tabs[idx].ai_conversation_id.clone();
                                     this.ai_opencode_manager.remove(&conversation_id);
                                     let tab_data = this.tabs.remove(idx);
+                                    for pane in tab_data.pane_tree.all_panes() {
+                                        this.scroll_accum.remove(&pane.id);
+                                    }
                                     if this.active_tab_idx >= this.tabs.len() {
                                         this.active_tab_idx = this.tabs.len().saturating_sub(1);
                                     } else if idx < this.active_tab_idx {
@@ -14307,7 +15376,7 @@ impl Render for RootView {
                                                     .enumerate()
                                                     .map(|(idx, cmd)| {
                                                         let is_selected = idx == selected_idx;
-                                                        let cmd_id = cmd.id;
+                                                        let cmd_id = cmd.id.clone();
                                                         div()
                                                             .flex()
                                                             .flex_row()
@@ -14323,12 +15392,12 @@ impl Render for RootView {
                                                                 if this.command_palette_selected != idx {
                                                                     this.command_palette_selected = idx;
                                                                     // Hover previews live, like keyboard nav.
-                                                                    this.preview_palette_command(cmd_id, _window, cx);
+                                                                    this.preview_palette_command(&cmd_id, _window, cx);
                                                                     cx.notify();
                                                                 }
                                                             }))
                                                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
-                                                                this.execute_palette_command(cmd_id, window, cx);
+                                                                this.execute_palette_command(&cmd_id, window, cx);
                                                             }))
                                                             .child(
                                                                 div()
@@ -17330,27 +18399,53 @@ impl Render for RootView {
             })
             .when(self.pending_close.is_some(), |this| {
                 let pending = self.pending_close.clone().unwrap();
-                let close_failure = pending.failure.clone();
+                let is_checking = matches!(&pending.state, PendingCloseState::Checking(_));
+                let close_failure = match &pending.state {
+                    PendingCloseState::Failed(failure) => Some(failure.clone()),
+                    PendingCloseState::Checking(_) | PendingCloseState::Confirming => None,
+                };
                 let process_names: Vec<String> = pending
                     .running_processes
                     .iter()
                     .map(|p| p.process_name.clone())
                     .collect();
 
-                let (target_label, desc) = match pending.target {
+                let (target_label, desc) = if is_checking {
+                    let label = match pending.target {
+                        CloseTarget::Pane { .. } => "Close Pane?",
+                        CloseTarget::Tab { .. } => "Close Tab?",
+                        CloseTarget::OtherTabs { .. } => "Close Other Tabs?",
+                    };
+                    (label, "Checking and closing idle sessions...".to_string())
+                } else {
+                    match pending.target {
                     CloseTarget::Pane { .. } => {
-                        let name = process_names.first().cloned().unwrap_or_else(|| "process".to_string());
-                        ("Close Pane?", format!("Process '{}' is still running in this pane.", name))
+                        let name = process_names
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "unknown command".to_string());
+                        let description = if name == "unknown command" {
+                            "A command is still running in this pane.".to_string()
+                        } else {
+                            format!("Process '{}' is still running in this pane.", name)
+                        };
+                        ("Close Pane?", description)
                     }
                     CloseTarget::Tab { .. } => {
                         if process_names.len() == 1 {
-                            ("Close Tab?", format!("Process '{}' is still running in this tab.", process_names[0]))
+                            let description = if process_names[0] == "unknown command" {
+                                "A command is still running in this tab.".to_string()
+                            } else {
+                                format!("Process '{}' is still running in this tab.", process_names[0])
+                            };
+                            ("Close Tab?", description)
                         } else {
                             ("Close Tab?", format!("{} processes are still running in this tab.", process_names.len()))
                         }
                     }
                     CloseTarget::OtherTabs { .. } => {
                         ("Close Other Tabs?", format!("{} processes are still running in other tabs.", process_names.len()))
+                    }
                     }
                 };
 
@@ -17363,8 +18458,13 @@ impl Render for RootView {
                         .items_center()
                         .justify_center()
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                            this.pending_close = None;
-                            cx.notify();
+                            if !matches!(
+                                this.pending_close.as_ref().map(|pending| &pending.state),
+                                Some(PendingCloseState::Checking(_))
+                            ) {
+                                this.pending_close = None;
+                                cx.notify();
+                            }
                         }))
                         .child(
                             div()
@@ -17405,7 +18505,7 @@ impl Render for RootView {
                                                         .text_color(theme.black)
                                                         .text_size(px(10.))
                                                         .font_weight(FontWeight::BOLD)
-                                                        .child("ACTIVE"),
+                                                        .child(if is_checking { "CHECKING" } else { "ACTIVE" }),
                                                 )
                                                 .child(
                                                     div()
@@ -17415,7 +18515,7 @@ impl Render for RootView {
                                                         .child(target_label),
                                                 ),
                                         )
-                                        .child(
+                                        .when(!is_checking, |header| header.child(
                                             div()
                                                 .cursor(CursorStyle::PointingHand)
                                                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
@@ -17423,7 +18523,7 @@ impl Render for RootView {
                                                     cx.notify();
                                                 }))
                                                 .child(render_icon(IconType::X, theme.muted_strong, 12.0)),
-                                        ),
+                                        )),
                                 )
                                 .child(
                                     div()
@@ -17460,12 +18560,12 @@ impl Render for RootView {
                                                 .child(name)
                                         })),
                                 )
-                                .child(
+                                .when(!is_checking, |content| content.child(
                                     div()
                                         .text_size(px(11.))
                                         .text_color(theme.muted_strong)
                                         .child("Do you want to terminate the running process and close?"),
-                                )
+                                ))
                                 .child(
                                     div()
                                         .flex()
@@ -17473,7 +18573,7 @@ impl Render for RootView {
                                         .justify_end()
                                         .gap_2()
                                         .pt(px(4.))
-                                        .child(
+                                        .when(!is_checking, |actions| actions.child(
                                             div()
                                                 .px(px(12.))
                                                 .py(px(5.))
@@ -17487,21 +18587,29 @@ impl Render for RootView {
                                                     cx.notify();
                                                 }))
                                                 .child("Cancel"),
-                                        )
+                                        ))
                                         .child(
                                             div()
                                                 .px(px(12.))
                                                 .py(px(5.))
                                                 .rounded(px(5.))
-                                                .bg(theme.red)
+                                                .bg(if is_checking { theme.surface_raised } else { theme.red })
                                                 .text_color(theme.white)
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .text_size(px(11.))
                                                 .cursor(CursorStyle::PointingHand)
-                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, window, cx| {
-                                                    this.confirm_pending_close(window, cx);
-                                                }))
-                                                .child(if pending.failure.is_some() { "Retry Close" } else { "Terminate & Close" }),
+                                                .when(!is_checking, |button| {
+                                                    button.on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, window, cx| {
+                                                        this.confirm_pending_close(window, cx);
+                                                    }))
+                                                })
+                                                .child(if is_checking {
+                                                    "Closing..."
+                                                } else if close_failure.is_some() {
+                                                    "Retry Close"
+                                                } else {
+                                                    "Terminate & Close"
+                                                }),
                                         ),
                                 ),
                         ),
@@ -17924,9 +19032,9 @@ mod tests {
             std::collections::HashMap::new();
         for cmd in cmds.iter().filter(|c| c.category != "Theme") {
             by_category
-                .entry(cmd.category)
+                .entry(cmd.category.as_str())
                 .or_default()
-                .push((cmd.title, format!("{:?}", cmd.icon)));
+                .push((cmd.title.as_str(), format!("{:?}", cmd.icon)));
         }
         let mut clashes: Vec<String> = Vec::new();
         for (category, items) in &by_category {

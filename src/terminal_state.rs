@@ -357,16 +357,18 @@ struct OutputHub {
     subscribers: ParkingMutex<Vec<async_channel::Sender<Vec<u8>>>>,
 }
 
+const OUTPUT_SUBSCRIBER_CAPACITY: usize = 256;
+
 impl OutputHub {
     fn subscribe(&self) -> async_channel::Receiver<Vec<u8>> {
         let _boundary = self.boundary.lock();
         self.subscribe_at_boundary()
     }
 
-    fn snapshot_and_subscribe(
+    fn snapshot_and_subscribe<T>(
         &self,
-        snapshot: impl FnOnce() -> Vec<u8>,
-    ) -> (Vec<u8>, async_channel::Receiver<Vec<u8>>) {
+        snapshot: impl FnOnce() -> T,
+    ) -> (T, async_channel::Receiver<Vec<u8>>) {
         let _boundary = self.boundary.lock();
         let snapshot = snapshot();
         (snapshot, self.subscribe_at_boundary())
@@ -381,13 +383,18 @@ impl OutputHub {
 
     fn publish_at_boundary(&self, bytes: &[u8]) {
         let chunk = bytes.to_vec();
-        self.subscribers
-            .lock()
-            .retain(|subscriber| subscriber.try_send(chunk.clone()).is_ok());
+        self.subscribers.lock().retain(|subscriber| {
+            match subscriber.try_send(chunk.clone()) {
+                Ok(()) => true,
+                // A slow subscriber must not retain unbounded PTY output.
+                // Drop it on either a full queue or a closed receiver.
+                Err(_) => false,
+            }
+        });
     }
 
     fn subscribe_at_boundary(&self) -> async_channel::Receiver<Vec<u8>> {
-        let (sender, receiver) = async_channel::unbounded();
+        let (sender, receiver) = async_channel::bounded(OUTPUT_SUBSCRIBER_CAPACITY);
         self.subscribers.lock().push(sender);
         receiver
     }
@@ -549,7 +556,16 @@ impl TerminalState {
             viewport_height,
             sender,
             Some(remote),
-        )
+        )?;
+        if !terminal.program_status_snapshot().is_empty() {
+            terminal.program_status_pending.store(true, Ordering::Relaxed);
+            terminal
+                .event_listener
+                .send_app_event(AppEvent::ProgramStatusChanged {
+                    source_id: terminal.source_id,
+                });
+        }
+        Ok(terminal)
     }
 
     #[cfg(not(unix))]
@@ -600,7 +616,38 @@ impl TerminalState {
             Err(error) if is_missing_host_session_error(&error) => return Ok(None),
             Err(error) => return Err(anyhow::Error::msg(error)),
         };
-        Self::new_internal(
+        Self::attach_hosted_from_remote(
+            remote,
+            executable,
+            exec_args,
+            cwd,
+            scrollback,
+            font_config,
+            cell_width,
+            cell_height,
+            viewport_width,
+            viewport_height,
+            sender,
+        )
+        .map(Some)
+    }
+
+    /// Build a GUI projection after the host attachment completes off thread.
+    #[cfg(unix)]
+    pub fn attach_hosted_from_remote(
+        remote: crate::session_host::RemoteSession,
+        executable: &str,
+        exec_args: &[String],
+        cwd: Option<&str>,
+        scrollback: usize,
+        font_config: FontConfig,
+        cell_width: f32,
+        cell_height: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+        sender: crate::event_listener::EventSender,
+    ) -> anyhow::Result<Self> {
+        let terminal = Self::new_internal(
             executable,
             exec_args,
             cwd,
@@ -612,8 +659,16 @@ impl TerminalState {
             viewport_height,
             sender,
             Some(remote),
-        )
-        .map(Some)
+        )?;
+        if !terminal.program_status_snapshot().is_empty() {
+            terminal.program_status_pending.store(true, Ordering::Relaxed);
+            terminal
+                .event_listener
+                .send_app_event(AppEvent::ProgramStatusChanged {
+                    source_id: terminal.source_id,
+                });
+        }
+        Ok(terminal)
     }
 
     fn new_internal(
@@ -629,10 +684,34 @@ impl TerminalState {
         sender: crate::event_listener::EventSender,
         remote: Option<crate::session_host::RemoteSession>,
     ) -> anyhow::Result<Self> {
+        let restored_program_status = remote
+            .as_ref()
+            .map(|remote| remote.program_status.clone())
+            .unwrap_or_default();
         let cell_w = (cell_width as usize).max(1);
         let cell_h = (cell_height as usize).max(1);
-        let cols = ((viewport_width as usize) / cell_w).max(80);
-        let rows = ((viewport_height as usize) / cell_h).max(24);
+        let binary_snapshot = match remote.as_ref() {
+            Some(remote) if remote.snapshot.starts_with(b"FST1") => Some(
+                crate::server::binary_snapshot::decode_snapshot(&remote.snapshot)
+                    .ok_or_else(|| anyhow::anyhow!("session host sent an invalid binary snapshot"))?,
+            ),
+            _ => None,
+        };
+        if binary_snapshot
+            .as_ref()
+            .is_some_and(|(header, _)| header.cols == 0 || header.rows == 0)
+        {
+            return Err(anyhow::anyhow!("session host sent an invalid binary snapshot"));
+        }
+        let has_binary_snapshot = binary_snapshot.is_some();
+        let cols = binary_snapshot
+            .as_ref()
+            .map(|(header, _)| header.cols as usize)
+            .unwrap_or_else(|| ((viewport_width as usize) / cell_w).max(80));
+        let rows = binary_snapshot
+            .as_ref()
+            .map(|(header, _)| header.rows as usize)
+            .unwrap_or_else(|| ((viewport_height as usize) / cell_h).max(24));
 
         let config = AlacrittyConfig {
             scrolling_history: scrollback.clamp(500, 100_000),
@@ -893,6 +972,24 @@ impl TerminalState {
             &size,
             event_listener.clone(),
         )));
+        if let Some((header, cells)) = binary_snapshot.as_ref() {
+            use crate::server::binary_snapshot::SNAPSHOT_FLAG_ALT_SCREEN;
+            let mut term = term.lock();
+            let mut parser: Processor<StdSyncHandler> = Processor::new();
+            if header.flags & SNAPSHOT_FLAG_ALT_SCREEN != 0 {
+                parser.advance(&mut term, b"\x1b[?1049h");
+            }
+            if !apply_snapshot_to_grid(&mut term, header, cells) {
+                return Err(anyhow::anyhow!("session host sent an invalid binary snapshot"));
+            }
+            let mode = alacritty_terminal::term::TermMode::from_bits_truncate(
+                header.terminal_modes(),
+            );
+            let mut mode_commands = Vec::new();
+            append_restored_terminal_modes(&mut mode_commands, mode);
+            parser.advance(&mut term, &mode_commands);
+        }
+        drop(binary_snapshot);
 
         let render_generation = Arc::new(AtomicU64::new(0));
         let render_gen_clone = Arc::clone(&render_generation);
@@ -908,7 +1005,7 @@ impl TerminalState {
         let next_image_id_clone = Arc::clone(&next_image_id);
         let writer_clone = Arc::clone(&writer_arc);
         let program_status = Arc::new(ParkingMutex::new(
-            crate::program_status::ProgramStatusStore::default(),
+            crate::program_status::ProgramStatusStore::from_records(restored_program_status),
         ));
         let program_status_clone = Arc::clone(&program_status);
         let program_status_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -976,7 +1073,9 @@ impl TerminalState {
                             crate::program_status::ProgramStatusCommand::Query,
                         ) => {
                             let mut writer = writer_clone.lock();
-                            let _ = writer.write_all(b"\x1b]7501;?\x1b\\");
+                            let _ = writer.write_all(
+                                b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\",
+                            );
                             let _ = writer.flush();
                         }
                         OscCommand::ProgramStatus(command) => {
@@ -1312,6 +1411,7 @@ impl TerminalState {
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => {
+                            let _output_boundary = output_hub_clone.boundary.lock();
                             update_program_status(
                                 &program_status_clone,
                                 &program_status_pending_clone,
@@ -1575,6 +1675,7 @@ impl TerminalState {
                             continue;
                         }
                         Err(_) => {
+                            let _output_boundary = output_hub_clone.boundary.lock();
                             update_program_status(
                                 &program_status_clone,
                                 &program_status_pending_clone,
@@ -1595,11 +1696,13 @@ impl TerminalState {
 
         #[cfg(unix)]
         if let (Some(remote), Some(mut output_sink)) = (remote, remote_output) {
-            let mut snapshot = remote.snapshot;
-            if remote.restore_legacy_mouse_modes {
-                append_legacy_mouse_modes(&mut snapshot);
+            if !has_binary_snapshot {
+                let mut snapshot = remote.snapshot;
+                if remote.restore_legacy_mouse_modes {
+                    append_legacy_mouse_modes(&mut snapshot);
+                }
+                let _ = output_sink.write_all(&snapshot);
             }
-            let _ = output_sink.write_all(&snapshot);
             thread::spawn(move || {
                 let mut reader = remote.reader;
                 loop {
@@ -1610,7 +1713,14 @@ impl TerminalState {
                             }
                         }
                         Ok(Some(_)) => {}
-                        Ok(None) | Err(_) => break,
+                        Ok(None) => break,
+                        Err(error) => {
+                            let message = format!(
+                                "\r\n\r\n[Fastty: terminal output stopped: {error}]\r\n"
+                            );
+                            let _ = output_sink.write_all(message.as_bytes());
+                            break;
+                        }
                     }
                 }
             });
@@ -1657,6 +1767,7 @@ impl TerminalState {
     pub fn report_external_program_status(&self, payload: &[u8]) -> Result<(), String> {
         let command = crate::program_status::parse(payload, payload.len() + 9)
             .ok_or_else(|| "invalid program status report".to_string())?;
+        let _output_boundary = self.output_hub.boundary.lock();
         update_program_status(
             &self.program_status,
             &self.program_status_pending,
@@ -1690,18 +1801,53 @@ impl TerminalState {
         self.output_hub.subscribe()
     }
 
-    pub fn snapshot_and_subscribe_output(&self) -> (Vec<u8>, async_channel::Receiver<Vec<u8>>) {
-        self.output_hub
-            .snapshot_and_subscribe(|| self.snapshot_ansi())
+    pub fn snapshot_and_subscribe_output(
+        &self,
+    ) -> (
+        Vec<u8>,
+        Vec<crate::program_status::ProgramRecord>,
+        async_channel::Receiver<Vec<u8>>,
+    ) {
+        self.output_hub.snapshot_and_subscribe(|| {
+            (self.snapshot_ansi(), self.program_status_snapshot())
+        })
+    }
+
+    pub fn snapshot_binary_and_subscribe_output(
+        &self,
+    ) -> (
+        Vec<u8>,
+        Vec<crate::program_status::ProgramRecord>,
+        async_channel::Receiver<Vec<u8>>,
+    ) {
+        const MAX_ATTACH_CELLS: usize = 16 * 1024 * 1024 / 16;
+        let ((header, cells), program_status, output) = self.output_hub.snapshot_and_subscribe(|| {
+            (
+                self.snapshot_binary_parts(true, Some(MAX_ATTACH_CELLS)),
+                self.program_status_snapshot(),
+            )
+        });
+        (
+            crate::server::binary_snapshot::encode_snapshot_compressed(&header, &cells),
+            program_status,
+            output,
+        )
     }
 
     pub fn needs_close_confirmation(&self) -> bool {
+        self.close_process_status().0
+    }
+
+    pub fn close_process_status(&self) -> (bool, Option<String>) {
         if let Some(session_id) = self.remote_session_id {
-            let has_foreground_process =
-                crate::session_host::session_process_running(session_id).unwrap_or(true);
-            remote_session_needs_close_confirmation(Some(session_id), has_foreground_process)
+            let (process_running, process_name) =
+                crate::session_host::session_process_status(session_id).unwrap_or((true, None));
+            (
+                remote_session_needs_close_confirmation(Some(session_id), process_running),
+                process_name,
+            )
         } else {
-            self.is_process_running()
+            (self.is_process_running(), self.get_foreground_process_name())
         }
     }
 
@@ -1723,64 +1869,68 @@ impl TerminalState {
     }
 
     pub fn get_foreground_process_name(&self) -> Option<String> {
-        let pid = self.shell_pid?;
+        let _shell_pid = self.shell_pid?;
+        #[cfg(unix)]
+        let pid = {
+            let master = self.master.lock();
+            let fd = master.as_raw_fd()?;
+            let pid = unsafe { libc::tcgetpgrp(fd) };
+            (pid > 0).then_some(pid as u32)?
+        };
         #[cfg(target_os = "macos")]
         {
-            get_foreground_process_name_macos(pid)
+            get_process_name_macos(pid)
         }
         #[cfg(target_os = "linux")]
         {
-            get_foreground_process_name_linux(pid)
+            std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .ok()
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty())
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            get_foreground_process_name_other(pid)
+            get_foreground_process_name_other(_shell_pid)
         }
     }
 
     pub fn get_foreground_process_command(&self) -> Option<String> {
-        let shell_pid = self.shell_pid?;
+        let _shell_pid = self.shell_pid?;
         #[cfg(unix)]
         {
+            let foreground_pgid = {
+                let master = self.master.lock();
+                let fd = master.as_raw_fd()?;
+                unsafe { libc::tcgetpgrp(fd) }
+            };
+            if foreground_pgid <= 0 {
+                return None;
+            }
             let output = std::process::Command::new("ps")
-                .args(["-axo", "pid=,ppid=,command="])
+                .args(["-axo", "pid=,pgid=,command="])
                 .output()
                 .ok()?;
             if !output.status.success() {
                 return None;
             }
-            let mut processes = std::string::String::from_utf8_lossy(&output.stdout)
+            let processes = std::string::String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .filter_map(|line| {
                     let mut fields = line.split_whitespace();
                     let pid = fields.next()?.parse::<u32>().ok()?;
-                    let parent = fields.next()?.parse::<u32>().ok()?;
+                    let pgid = fields.next()?.parse::<libc::pid_t>().ok()?;
                     let command = fields.collect::<Vec<_>>().join(" ");
-                    (!command.is_empty()).then_some((pid, parent, command))
+                    (pgid == foreground_pgid && !command.is_empty()).then_some((pid, command))
                 })
                 .collect::<Vec<_>>();
-            processes.sort_by_key(|(pid, _, _)| *pid);
-            let mut current = shell_pid;
-            let mut selected = processes
+            processes
                 .iter()
-                .find(|(pid, _, _)| *pid == shell_pid)
-                .map(|(_, _, command)| command.clone());
-            for _ in 0..32 {
-                let next = processes
-                    .iter()
-                    .rev()
-                    .find(|(_, parent, _)| *parent == current);
-                let Some((pid, _, command)) = next else {
-                    break;
-                };
-                current = *pid;
-                selected = Some(command.clone());
-            }
-            selected
+                .find(|(pid, _)| *pid == foreground_pgid as u32)
+                .map(|(_, command)| command.clone())
         }
         #[cfg(not(unix))]
         {
-            let _ = shell_pid;
+            let _ = _shell_pid;
             None
         }
     }
@@ -1829,6 +1979,41 @@ impl TerminalState {
     }
 
     pub fn terminate_process(&self) {
+        self.terminate_process_without_writer_lock();
+    }
+
+    pub fn terminate_if_idle(&self) -> bool {
+        let _writer = self.writer.lock();
+        if self.is_process_running() {
+            return false;
+        }
+        self.terminate_process_without_writer_lock();
+        true
+    }
+
+    pub fn terminate_all_if_idle(terminals: &[Arc<Self>]) -> Vec<usize> {
+        let mut lock_order: Vec<usize> = (0..terminals.len()).collect();
+        lock_order.sort_unstable_by_key(|index| Arc::as_ptr(&terminals[*index]) as usize);
+        lock_order.dedup_by_key(|index| Arc::as_ptr(&terminals[*index]) as usize);
+        let _writers: Vec<_> = lock_order
+            .iter()
+            .map(|index| terminals[*index].writer.lock())
+            .collect();
+
+        let blocked: Vec<usize> = terminals
+            .iter()
+            .enumerate()
+            .filter_map(|(index, terminal)| terminal.is_process_running().then_some(index))
+            .collect();
+        if blocked.is_empty() {
+            for terminal in terminals {
+                terminal.terminate_process_without_writer_lock();
+            }
+        }
+        blocked
+    }
+
+    fn terminate_process_without_writer_lock(&self) {
         if self
             .has_terminated
             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -1901,6 +2086,9 @@ pub struct PreviewLine {
 impl TerminalState {
     pub fn write_to_pty(&self, bytes: &[u8]) {
         let mut w = self.writer.lock();
+        if self.has_terminated.load(Ordering::SeqCst) {
+            return;
+        }
         let _ = w.write_all(bytes);
         let _ = w.flush();
     }
@@ -2456,9 +2644,8 @@ impl TerminalState {
             .collect()
     }
 
-    /// Render the current screen (not scrollback) as ANSI/SGR bytes, so an
-    /// attaching daemon client sees what's already on screen instead of a
-    /// blank pane until the next write. Colors/attributes that depend on the
+    /// Render the current screen as ANSI/SGR bytes. Capture calls use this
+    /// screen-only form. Colors/attributes that depend on the
     /// active GPUI theme (`NamedColor::Foreground/Background/Cursor/Dim*`)
     /// fall back to the terminal's default rather than being resolved here --
     /// this method has no theme to resolve them against, and a client-side
@@ -2472,6 +2659,10 @@ impl TerminalState {
     /// The renderer stops when the next complete ANSI command or character
     /// does not fit. This bounds both the returned buffer and cell traversal.
     pub fn snapshot_ansi_bounded(&self, max_bytes: usize) -> (Vec<u8>, bool) {
+        self.render_ansi_snapshot(max_bytes)
+    }
+
+    fn render_ansi_snapshot(&self, max_bytes: usize) -> (Vec<u8>, bool) {
         use alacritty_terminal::index::Line;
         use alacritty_terminal::term::cell::Flags;
         use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
@@ -2619,11 +2810,7 @@ impl TerminalState {
                     cur_bg = Some(cell.bg);
                 }
                 if cell.flags != cur_flags {
-                    // Attribute changes don't compose incrementally in SGR the
-                    // way colors do (there's no "turn off just italic"), so
-                    // reset and reapply everything for this cell whenever the
-                    // flag set changes at all.
-                    out.extend_from_slice(b"\x1b[22;23;24;27;28;29m"); // clear bold/dim, italic, underline, inverse, strikethrough
+                    out.extend_from_slice(b"\x1b[22;23;24;27;28;29m");
                     if cell.flags.contains(Flags::BOLD) {
                         out.extend_from_slice(b"\x1b[1m");
                     }
@@ -2645,7 +2832,6 @@ impl TerminalState {
                     if cell.flags.contains(Flags::STRIKEOUT) {
                         out.extend_from_slice(b"\x1b[9m");
                     }
-                    // Re-send colors too -- the blanket reset above cleared them.
                     push_color(&mut out, cell.fg, false);
                     push_color(&mut out, cell.bg, true);
                     cur_flags = cell.flags;
@@ -2678,6 +2864,7 @@ impl TerminalState {
     fn snapshot_binary_parts(
         &self,
         include_history: bool,
+        max_cells: Option<usize>,
     ) -> (
         crate::server::binary_snapshot::FasttyBinarySnapshotHeader,
         Vec<crate::server::binary_snapshot::FasttyPackedCell>,
@@ -2840,7 +3027,10 @@ impl TerminalState {
         let history_rows = if snapshot_is_alt || !include_history {
             0
         } else {
-            grid.total_lines().saturating_sub(screen_lines)
+            let max_history_rows = max_cells
+                .map(|max| max.saturating_sub(screen_lines.saturating_mul(cols)) / cols.max(1))
+                .unwrap_or(usize::MAX);
+            grid.total_lines().saturating_sub(screen_lines).min(max_history_rows)
         };
 
         let total_cells = (history_rows + screen_lines) * cols;
@@ -2887,23 +3077,33 @@ impl TerminalState {
             _reserved2: [0; 10],
         };
         header.set_history_rows(history_rows as u32);
+        header.set_terminal_modes(mode.bits());
 
         (header, cells)
     }
 
     /// Take a full binary terminal state snapshot in microseconds.
     pub fn snapshot_binary(&self) -> Vec<u8> {
-        let (header, cells) = self.snapshot_binary_parts(true);
+        let (header, cells) = self.snapshot_binary_parts(true, None);
         crate::server::binary_snapshot::encode_snapshot(&header, &cells)
     }
 
     /// Take a full binary terminal state snapshot compressed with Deflate.
     pub fn snapshot_binary_compressed(&self) -> Vec<u8> {
-        self.snapshot_binary_compressed_with_history(true)
+        const MAX_SAVED_CELLS: usize = 16 * 1024 * 1024 / 16;
+        let (header, cells) = self.snapshot_binary_parts(true, Some(MAX_SAVED_CELLS));
+        crate::server::binary_snapshot::encode_snapshot_compressed(&header, &cells)
+    }
+
+    /// Capture a bounded snapshot without compression for a background save.
+    pub fn snapshot_binary_for_save(&self) -> Vec<u8> {
+        const MAX_SAVED_CELLS: usize = 16 * 1024 * 1024 / 16;
+        let (header, cells) = self.snapshot_binary_parts(true, Some(MAX_SAVED_CELLS));
+        crate::server::binary_snapshot::encode_snapshot(&header, &cells)
     }
 
     pub fn snapshot_binary_compressed_with_history(&self, include_history: bool) -> Vec<u8> {
-        let (header, cells) = self.snapshot_binary_parts(include_history);
+        let (header, cells) = self.snapshot_binary_parts(include_history, None);
         crate::server::binary_snapshot::encode_snapshot_compressed(&header, &cells)
     }
 
@@ -3030,28 +3230,24 @@ fn apply_snapshot_to_grid(
         if flags & CELL_FLAG_STRIKETHROUGH != 0 {
             out.extend_from_slice(b"\x1b[9m");
         }
-        if fg != 0 {
-            out.extend_from_slice(
-                format!(
-                    "\x1b[38;2;{};{};{}m",
-                    (fg >> 16) & 0xff,
-                    (fg >> 8) & 0xff,
-                    fg & 0xff
-                )
-                .as_bytes(),
-            );
-        }
-        if bg != 0 {
-            out.extend_from_slice(
-                format!(
-                    "\x1b[48;2;{};{};{}m",
-                    (bg >> 16) & 0xff,
-                    (bg >> 8) & 0xff,
-                    bg & 0xff
-                )
-                .as_bytes(),
-            );
-        }
+        out.extend_from_slice(
+            format!(
+                "\x1b[38;2;{};{};{}m",
+                (fg >> 16) & 0xff,
+                (fg >> 8) & 0xff,
+                fg & 0xff
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(
+            format!(
+                "\x1b[48;2;{};{};{}m",
+                (bg >> 16) & 0xff,
+                (bg >> 8) & 0xff,
+                bg & 0xff
+            )
+            .as_bytes(),
+        );
     };
 
     let mut emit_row = |out: &mut Vec<u8>,
@@ -3669,45 +3865,6 @@ fn get_process_name_macos(pid: u32) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn get_foreground_process_name_macos(shell_pid: u32) -> Option<String> {
-    use std::os::raw::{c_int, c_uint, c_void};
-
-    extern "C" {
-        fn proc_listpids(
-            proc_type: c_uint,
-            proc_type_arg: c_uint,
-            buffer: *mut c_void,
-            buffersize: c_int,
-        ) -> c_int;
-    }
-    const PROC_PPID_ONLY: c_uint = 6;
-
-    let mut pids = [0i32; 64];
-    let res = unsafe {
-        proc_listpids(
-            PROC_PPID_ONLY,
-            shell_pid as c_uint,
-            pids.as_mut_ptr() as *mut c_void,
-            std::mem::size_of_val(&pids) as c_int,
-        )
-    };
-    if res > 0 {
-        let count = (res as usize) / std::mem::size_of::<i32>();
-        for &p in pids[..count].iter().rev() {
-            if p > 0 && p != (shell_pid as i32) {
-                if let Some(child_name) = get_foreground_process_name_macos(p as u32) {
-                    return Some(child_name);
-                }
-                if let Some(name) = get_process_name_macos(p as u32) {
-                    return Some(name);
-                }
-            }
-        }
-    }
-    get_process_name_macos(shell_pid)
-}
-
-#[cfg(target_os = "macos")]
 fn has_active_child_macos(shell_pid: u32, foreground_pgid: libc::pid_t) -> bool {
     use std::os::raw::{c_int, c_uint, c_void};
 
@@ -3747,35 +3904,6 @@ fn has_active_child_macos(shell_pid: u32, foreground_pgid: libc::pid_t) -> bool 
 #[cfg(target_os = "linux")]
 fn get_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
     std::fs::read_link(format!("/proc/{}/cwd", pid)).ok()
-}
-
-#[cfg(target_os = "linux")]
-fn get_foreground_process_name_linux(shell_pid: u32) -> Option<String> {
-    if let Ok(content) =
-        std::fs::read_to_string(format!("/proc/{}/task/{}/children", shell_pid, shell_pid))
-    {
-        let children: Vec<&str> = content.split_whitespace().collect();
-        if let Some(&child) = children.last() {
-            if let Ok(child_pid) = child.parse::<u32>() {
-                if let Some(name) = get_foreground_process_name_linux(child_pid) {
-                    return Some(name);
-                }
-                if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", child_pid)) {
-                    let trimmed = comm.trim().to_string();
-                    if !trimmed.is_empty() {
-                        return Some(trimmed);
-                    }
-                }
-            }
-        }
-    }
-    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{}/comm", shell_pid)) {
-        let trimmed = comm.trim().to_string();
-        if !trimmed.is_empty() {
-            return Some(trimmed);
-        }
-    }
-    None
 }
 
 #[cfg(target_os = "linux")]

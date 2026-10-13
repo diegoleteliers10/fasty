@@ -3,6 +3,28 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.22.7 - 2026-10-13
+
+### Terminal sessions
+
+- Restore OSC 7501 agent status when Fastty reconnects to a running session.
+- Capture terminal contents, agent status, and live output from one session boundary.
+- Keep session status updates in the daemon event stream.
+
+### Keyboard controls
+
+- Add multi-key sequences and configurable key modes.
+- Show key actions and bindings as JSON from the CLI.
+
+### Workflows
+
+- Add declarative workflows that run approved Fastty actions from the command palette.
+- Show available Fastty actions as JSON from the CLI.
+
+### OSC 7501
+
+- Reply to status protocol queries with supported states and blocked kinds.
+
 ## 0.22.6 - 2026-10-12
 
 ### AI panel

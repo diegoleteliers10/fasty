@@ -107,25 +107,10 @@ pub fn is_loopback_host(host: &str) -> bool {
 }
 
 /// Generate a cryptographically random 32-character hex token.
-pub fn generate_random_token() -> String {
-    #[cfg(unix)]
-    {
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let mut buf = [0u8; 16];
-            if f.read_exact(&mut buf).is_ok() {
-                return buf.iter().map(|b| format!("{:02x}", b)).collect();
-            }
-        }
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let seed = format!("{}:{}:fastty_gateway_token", now, pid);
-    let h1 = seahash::hash(seed.as_bytes());
-    let h2 = seahash::hash(&h1.to_le_bytes());
-    format!("{:016x}{:016x}", h1, h2)
+pub fn generate_random_token() -> Result<String, getrandom::Error> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// Extract a query parameter by key from an HTTP request path.
@@ -264,7 +249,16 @@ pub fn run_gateway(host: &str, port: u16, read_only: bool, token: Option<String>
 
     let token_required = token.is_some() || !is_loopback_host(host);
     let auth_token = if token_required {
-        Some(token.unwrap_or_else(generate_random_token))
+        match token {
+            Some(token) => Some(token),
+            None => match generate_random_token() {
+                Ok(token) => Some(token),
+                Err(error) => {
+                    eprintln!("fastty gateway: cannot generate a secure access token: {error}");
+                    return;
+                }
+            },
+        }
     } else {
         None
     };
@@ -302,14 +296,17 @@ pub fn run_gateway(host: &str, port: u16, read_only: bool, token: Option<String>
 }
 
 fn handle_client(mut stream: TcpStream, read_only: bool, auth_token: Option<&str>) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let mut header_buf = [0u8; 4096];
-    let n = match stream.read(&mut header_buf) {
-        Ok(n) if n > 0 => n,
-        _ => return,
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let request_bytes = match read_http_headers(&mut stream) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(response.as_bytes());
+            return;
+        }
     };
 
-    let request_str = String::from_utf8_lossy(&header_buf[..n]);
+    let request_str = String::from_utf8_lossy(&request_bytes);
     let mut lines = request_str.lines();
     let first_line = match lines.next() {
         Some(l) => l,
@@ -434,6 +431,41 @@ fn handle_client(mut stream: TcpStream, read_only: bool, auth_token: Option<&str
                 body
             );
             let _ = stream.write_all(resp.as_bytes());
+        }
+    }
+}
+
+fn read_http_headers(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    const MAX_HEADER_BYTES: usize = 4096;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut headers = Vec::with_capacity(512);
+    let mut byte = [0u8; 1];
+
+    loop {
+        if headers.len() == MAX_HEADER_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP headers exceed the size limit",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "HTTP headers were not complete before the deadline",
+            ));
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        let count = stream.read(&mut byte)?;
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed before HTTP headers ended",
+            ));
+        }
+        headers.push(byte[0]);
+        if headers.ends_with(b"\r\n\r\n") {
+            return Ok(headers);
         }
     }
 }

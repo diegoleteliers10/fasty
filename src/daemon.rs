@@ -43,6 +43,7 @@ pub enum SessionKind {
 pub struct SessionEntry {
     pub terminal: Arc<TerminalState>,
     pub kind: SessionKind,
+    output_receivers: Arc<Mutex<Vec<async_channel::Receiver<Vec<u8>>>>>,
 }
 
 type Registry = Mutex<HashMap<PaneId, SessionEntry>>;
@@ -94,14 +95,24 @@ impl EventJournal {
     }
 
     fn update_if_changed(&mut self, session: SessionInfo) {
-        if self.latest_sessions.get(&session.id) == Some(&session) {
+        let Some(previous) = self.latest_sessions.get(&session.id) else {
+            return;
+        };
+        if previous == &session {
             return;
         }
-        if !self.latest_sessions.contains_key(&session.id) {
-            return;
-        }
+        let terminal_changed = previous.title != session.title
+            || previous.cwd != session.cwd
+            || previous.alive != session.alive
+            || previous.program_status != session.program_status;
         self.latest_sessions.insert(session.id, session.clone());
-        self.publish(Some(session.id), SessionEvent::SessionUpdated { session });
+        self.publish(
+            Some(session.id),
+            SessionEvent::SessionUpdated {
+                session,
+                terminal_state_changed: terminal_changed,
+            },
+        );
     }
 
     fn seed(&mut self, sessions: &[SessionInfo]) {
@@ -143,26 +154,34 @@ fn registry() -> &'static Registry {
 /// `fastty sessions` / `fastty attach`.
 pub fn register(id: PaneId, terminal: Arc<TerminalState>) {
     let mut journal = event_journal().lock();
-    registry().lock().insert(
+    let previous = registry().lock().insert(
         id,
         SessionEntry {
             terminal: Arc::clone(&terminal),
             kind: SessionKind::Gui,
+            output_receivers: Arc::new(Mutex::new(Vec::new())),
         },
     );
+    if let Some(previous) = previous {
+        close_output_receivers(&previous);
+    }
     journal.added(session_info(id, &terminal));
 }
 
 /// Called when a headless session is created via IPC `spawn`.
 pub fn register_headless(id: PaneId, terminal: Arc<TerminalState>) {
     let mut journal = event_journal().lock();
-    registry().lock().insert(
+    let previous = registry().lock().insert(
         id,
         SessionEntry {
             terminal: Arc::clone(&terminal),
             kind: SessionKind::Headless,
+            output_receivers: Arc::new(Mutex::new(Vec::new())),
         },
     );
+    if let Some(previous) = previous {
+        close_output_receivers(&previous);
+    }
     journal.added(session_info(id, &terminal));
 }
 
@@ -170,8 +189,15 @@ pub fn register_headless(id: PaneId, terminal: Arc<TerminalState>) {
 /// it in `fastty sessions`.
 pub fn unregister(id: PaneId) {
     let mut journal = event_journal().lock();
-    if registry().lock().remove(&id).is_some() {
+    if let Some(entry) = registry().lock().remove(&id) {
+        close_output_receivers(&entry);
         journal.removed(id);
+    }
+}
+
+fn close_output_receivers(entry: &SessionEntry) {
+    for receiver in entry.output_receivers.lock().drain(..) {
+        receiver.close();
     }
 }
 
@@ -365,6 +391,12 @@ pub enum Request {
     SessionStatus {
         id: PaneId,
     },
+    CloseIfIdle {
+        id: PaneId,
+    },
+    CloseIfIdleBatch {
+        ids: Vec<PaneId>,
+    },
     /// Push-updated session list: an initial `sessions` event with everything
     /// currently registered, followed by `session_added` / `session_removed`
     /// / `session_updated` as the registry changes, for as long as this
@@ -385,6 +417,8 @@ pub enum Request {
         id: PaneId,
         #[serde(default)]
         mode: AttachMode,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        binary_snapshot: bool,
     },
     Detach {
         id: PaneId,
@@ -581,7 +615,11 @@ pub struct EventEnvelope {
 pub enum SessionEvent {
     SessionAdded { session: SessionInfo },
     SessionRemoved { id: PaneId },
-    SessionUpdated { session: SessionInfo },
+    SessionUpdated {
+        session: SessionInfo,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        terminal_state_changed: bool,
+    },
 }
 
 /// One pane inside a tab, as reported by `layout`.
@@ -619,6 +657,13 @@ fn parse_direction(s: &str) -> Option<crate::pane_tree::Direction> {
 
 fn default_resize_delta() -> f32 {
     0.05
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockedSession {
+    pub id: PaneId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_process_label: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -663,6 +708,17 @@ pub enum Response {
     SessionStatus {
         alive: bool,
         process_running: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        foreground_process_label: Option<String>,
+    },
+    CloseBlocked {
+        id: PaneId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        foreground_process_label: Option<String>,
+    },
+    CloseBatch {
+        closed_ids: Vec<PaneId>,
+        blocked: Vec<BlockedSession>,
     },
     /// A session appeared (new tab/split) while `subscribe_sessions` was
     /// active on this connection.
@@ -689,6 +745,8 @@ pub enum Response {
         cols: usize,
         rows: usize,
         mode: AttachMode,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        program_status: Vec<crate::program_status::ProgramRecord>,
     },
     /// Sent once, immediately after `attached`, with the pane's current
     /// on-screen contents as ANSI/SGR bytes (see
@@ -795,12 +853,14 @@ fn session_info(id: PaneId, terminal: &TerminalState) -> SessionInfo {
     let (cols, rows) = terminal.dimensions();
     SessionInfo {
         id,
-        title: terminal
-            .get_foreground_process_name()
-            .unwrap_or_else(|| "shell".to_string()),
-        cwd: terminal
-            .get_current_working_directory()
-            .map(|p| p.to_string_lossy().into_owned()),
+        title: bounded_event_text(
+            &terminal
+                .get_foreground_process_name()
+                .unwrap_or_else(|| "shell".to_string()),
+        ),
+        cwd: terminal.get_current_working_directory().map(|path| {
+            bounded_event_text(&path.to_string_lossy())
+        }),
         cols,
         rows,
         alive: terminal.is_alive(),
@@ -808,15 +868,25 @@ fn session_info(id: PaneId, terminal: &TerminalState) -> SessionInfo {
         program_status: terminal
             .program_status_snapshot()
             .into_iter()
+            .take(MAX_EVENT_PROGRAM_STATUSES)
             .map(|record| ProgramStatusInfo {
-                id: record.id,
+                id: bounded_event_text(&record.id),
                 state: record.state,
-                app: record.app,
+                app: record.app.map(|app| bounded_event_text(&app)),
                 progress: record.progress,
                 kind: record.kind,
             })
             .collect(),
     }
+}
+
+fn bounded_event_text(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_EVENT_TEXT_BYTES)
+        .collect();
+    sanitized
 }
 
 fn unix_time_millis() -> u64 {
@@ -916,6 +986,7 @@ mod unix_impl {
     /// this `id` is allowed on this connection.
     pub(super) struct Attachment {
         pub(super) alive: Arc<AtomicBool>,
+        pub(super) output: async_channel::Receiver<Vec<u8>>,
         pub(super) read_only: bool,
     }
 
@@ -964,6 +1035,7 @@ mod unix_impl {
         conn.conn_alive.store(false, Ordering::Relaxed);
         for attachment in conn.attachments.values() {
             attachment.alive.store(false, Ordering::Relaxed);
+            attachment.output.close();
         }
     }
 
@@ -1021,11 +1093,22 @@ mod unix_impl {
                     .map(|entry| Arc::clone(&entry.terminal));
                 match terminal {
                     Some(terminal) => {
+                        let alive = terminal.is_alive();
+                        let process_running = terminal.is_process_running();
+                        let foreground_process_label = if process_running {
+                            terminal
+                                .get_foreground_process_command()
+                                .and_then(foreground_command_label)
+                                .or_else(|| terminal.get_foreground_process_name())
+                        } else {
+                            None
+                        };
                         send(
                             &conn.out,
                             &Response::SessionStatus {
-                                alive: terminal.is_alive(),
-                                process_running: terminal.is_process_running(),
+                                alive,
+                                process_running,
+                                foreground_process_label,
                             },
                         );
                     }
@@ -1039,6 +1122,95 @@ mod unix_impl {
                         );
                     }
                 }
+            }
+            Request::CloseIfIdle { id } => {
+                if reject_access_scope(conn, AccessScope::Manage) {
+                    return;
+                }
+                let entry = registry().lock().get(&id).cloned();
+                match entry {
+                    Some(entry) if entry.terminal.terminate_if_idle() => {
+                        unregister(id);
+                        send(&conn.out, &Response::Closed { id });
+                    }
+                    Some(entry) => {
+                        let foreground_process_label = entry
+                            .terminal
+                            .get_foreground_process_command()
+                            .and_then(foreground_command_label)
+                            .or_else(|| entry.terminal.get_foreground_process_name());
+                        send(
+                            &conn.out,
+                            &Response::CloseBlocked {
+                                id,
+                                foreground_process_label,
+                            },
+                        );
+                    }
+                    None => send(
+                        &conn.out,
+                        &Response::Error {
+                            code: "no_such_session".to_string(),
+                            message: "no such session".to_string(),
+                        },
+                    ),
+                }
+            }
+            Request::CloseIfIdleBatch { ids } => {
+                if reject_access_scope(conn, AccessScope::Manage) {
+                    return;
+                }
+                let ids: Vec<PaneId> = ids
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                let entries: Vec<(PaneId, Arc<TerminalState>)> = {
+                    let sessions = registry().lock();
+                    ids.iter()
+                        .filter_map(|id| {
+                            sessions
+                                .get(id)
+                                .map(|entry| (*id, Arc::clone(&entry.terminal)))
+                        })
+                        .collect()
+                };
+                let terminals: Vec<Arc<TerminalState>> = entries
+                    .iter()
+                    .map(|(_, terminal)| Arc::clone(terminal))
+                    .collect();
+                let blocked_indices = TerminalState::terminate_all_if_idle(&terminals);
+                if !blocked_indices.is_empty() {
+                    let blocked = blocked_indices
+                        .into_iter()
+                        .filter_map(|index| entries.get(index))
+                        .map(|(id, terminal)| BlockedSession {
+                            id: *id,
+                            foreground_process_label: terminal
+                                .get_foreground_process_command()
+                                .and_then(foreground_command_label)
+                                .or_else(|| terminal.get_foreground_process_name()),
+                        })
+                        .collect();
+                    send(
+                        &conn.out,
+                        &Response::CloseBatch {
+                            closed_ids: Vec::new(),
+                            blocked,
+                        },
+                    );
+                    return;
+                }
+                for id in &ids {
+                    unregister(*id);
+                }
+                send(
+                    &conn.out,
+                    &Response::CloseBatch {
+                        closed_ids: ids,
+                        blocked: Vec::new(),
+                    },
+                );
             }
             Request::Capture { id } => {
                 let terminal = registry()
@@ -1069,7 +1241,11 @@ mod unix_impl {
                     }
                 }
             }
-            Request::Attach { id, mode } => {
+            Request::Attach {
+                id,
+                mode,
+                binary_snapshot,
+            } => {
                 let terminal = registry().lock().get(&id).map(|e| Arc::clone(&e.terminal));
                 let Some(terminal) = terminal else {
                     send(
@@ -1088,7 +1264,34 @@ mod unix_impl {
                     mode
                 };
                 let (cols, rows) = terminal.dimensions();
-                let (snapshot, rx) = terminal.snapshot_and_subscribe_output();
+                let (snapshot, program_status, rx) = if binary_snapshot {
+                    terminal.snapshot_binary_and_subscribe_output()
+                } else {
+                    terminal.snapshot_and_subscribe_output()
+                };
+                let registered = {
+                    let sessions = registry().lock();
+                    sessions.get(&id).is_some_and(|entry| {
+                        if !Arc::ptr_eq(&entry.terminal, &terminal) {
+                            return false;
+                        }
+                        let mut receivers = entry.output_receivers.lock();
+                        receivers.retain(|receiver| !receiver.is_closed());
+                        receivers.push(rx.clone());
+                        true
+                    })
+                };
+                if !registered {
+                    rx.close();
+                    send(
+                        &conn.out,
+                        &Response::Error {
+                            code: "no_such_session".to_string(),
+                            message: "no such session".to_string(),
+                        },
+                    );
+                    return;
+                }
                 send(
                     &conn.out,
                     &Response::Attached {
@@ -1096,6 +1299,7 @@ mod unix_impl {
                         cols,
                         rows,
                         mode: effective_mode,
+                        program_status,
                     },
                 );
                 send(
@@ -1110,12 +1314,14 @@ mod unix_impl {
                 // same connection) stops the old thread cleanly first.
                 if let Some(old) = conn.attachments.remove(&id) {
                     old.alive.store(false, Ordering::Relaxed);
+                    old.output.close();
                 }
                 let alive = Arc::new(AtomicBool::new(true));
                 conn.attachments.insert(
                     id,
                     Attachment {
                         alive: Arc::clone(&alive),
+                        output: rx.clone(),
                         read_only: effective_mode == AttachMode::ReadOnly,
                     },
                 );
@@ -1126,8 +1332,11 @@ mod unix_impl {
                     let should_run =
                         || conn_alive.load(Ordering::Relaxed) && alive.load(Ordering::Relaxed);
                     while should_run() {
-                        match rx.try_recv() {
+                        match rx.recv_blocking() {
                             Ok(mut bytes) => {
+                                if !should_run() {
+                                    break;
+                                }
                                 // Coalesce consecutive waiting chunks to avoid NDJSON
                                 // framing & IPC context-switch overhead during high throughput.
                                 while let Ok(next) = rx.try_recv() {
@@ -1136,31 +1345,39 @@ mod unix_impl {
                                         break;
                                     }
                                 }
+                                if !should_run() {
+                                    break;
+                                }
                                 let data = base64_encode(&bytes);
                                 if !send(&out, &Response::Output { id, data }) {
                                     break;
                                 }
                             }
-                            Err(async_channel::TryRecvError::Empty) => {
-                                if !is_registered(id) {
-                                    send(&out, &Response::Closed { id });
-                                    break;
-                                }
-                                std::thread::sleep(Duration::from_millis(20));
-                            }
-                            Err(async_channel::TryRecvError::Closed) => {
-                                if !is_registered(id) {
-                                    send(&out, &Response::Closed { id });
+                            Err(_) => {
+                                if should_run() {
+                                    if is_registered(id) {
+                                        send(
+                                            &out,
+                                            &Response::Error {
+                                                code: "output_overflow".to_string(),
+                                                message: "terminal output stopped because the attached client could not keep up".to_string(),
+                                            },
+                                        );
+                                    } else {
+                                        send(&out, &Response::Closed { id });
+                                    }
                                 }
                                 break;
                             }
                         }
                     }
+                    rx.close();
                 });
             }
             Request::Detach { id } => {
                 if let Some(attachment) = conn.attachments.remove(&id) {
                     attachment.alive.store(false, Ordering::Relaxed);
+                    attachment.output.close();
                     send(&conn.out, &Response::Detached { id });
                 } else {
                     send(
@@ -1793,6 +2010,21 @@ mod unix_impl {
     }
 }
 
+fn foreground_command_label(command: String) -> Option<String> {
+    let known_cli = ["claude", "opencode", "agy", "gemini", "codex", "pi"];
+    command.split_whitespace().find_map(|argument| {
+        std::path::Path::new(argument)
+            .components()
+            .filter_map(|component| component.as_os_str().to_str())
+            .find_map(|name| {
+                known_cli
+                    .iter()
+                    .find(|known| name == **known || name.starts_with(&format!("{known}-")))
+                    .map(|known| (*known).to_string())
+            })
+    })
+}
+
 /// Minimal base64 (standard alphabet, `=` padding) -- shared by the daemon
 /// (encoding PTY bytes into `output`/`snapshot` events) and
 /// `crate::daemon_client` (encoding keystrokes into `write` requests,
@@ -1910,10 +2142,12 @@ mod tests {
             Request::Attach {
                 id: 42,
                 mode: AttachMode::ReadWrite,
+                binary_snapshot: false,
             },
             Request::Attach {
                 id: 42,
                 mode: AttachMode::ReadOnly,
+                binary_snapshot: true,
             },
             Request::Detach { id: 42 },
             Request::Write {
@@ -1976,9 +2210,13 @@ mod tests {
                 (Request::SetAccessScope { scope: a }, Request::SetAccessScope { scope: b }) => {
                     assert_eq!(a, b)
                 }
-                (Request::Attach { id: a, mode: m1 }, Request::Attach { id: b, mode: m2 }) => {
+                (
+                    Request::Attach { id: a, mode: m1, binary_snapshot: s1 },
+                    Request::Attach { id: b, mode: m2, binary_snapshot: s2 },
+                ) => {
                     assert_eq!(a, b);
                     assert_eq!(m1, m2);
+                    assert_eq!(s1, s2);
                 }
                 (Request::Detach { id: a }, Request::Detach { id: b }) => assert_eq!(a, b),
                 (
@@ -2096,9 +2334,10 @@ mod tests {
         let json = r#"{"cmd":"attach","id":1}"#;
         let req: Request = serde_json::from_str(json).expect("deserialize");
         match req {
-            Request::Attach { id, mode } => {
+            Request::Attach { id, mode, binary_snapshot } => {
                 assert_eq!(id, 1);
                 assert_eq!(mode, AttachMode::ReadWrite);
+                assert!(!binary_snapshot);
             }
             _ => panic!("wrong variant"),
         }
@@ -2109,6 +2348,7 @@ mod tests {
         let status = Response::SessionStatus {
             alive: true,
             process_running: false,
+            foreground_process_label: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["event"], "session_status");
@@ -2119,6 +2359,7 @@ mod tests {
             cols: 80,
             rows: 24,
             mode: AttachMode::ReadOnly,
+            program_status: vec![],
         };
         let json = serde_json::to_string(&res).unwrap();
         assert!(json.contains(r#""mode":"read_only""#));

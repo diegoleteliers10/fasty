@@ -5,7 +5,7 @@
 use fastty::cli::CliOptions;
 use fastty::ui::RootView;
 use gpui::{
-    actions, prelude::*, px, size, App, Bounds, KeyBinding, Menu, MenuItem, QuitMode,
+    actions, point, prelude::*, px, size, App, Bounds, KeyBinding, Menu, MenuItem, QuitMode,
     TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
@@ -20,6 +20,95 @@ fn parse_wait_flag(arg: &str) -> Option<u64> {
         return Some(10);
     }
     arg.strip_prefix("--wait=")?.parse().ok()
+}
+
+fn run_actions_command(args: impl Iterator<Item = String>) {
+    let mut json = false;
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else {
+            eprintln!("fastty actions: unknown flag {arg}");
+            std::process::exit(2);
+        }
+    }
+    if !json {
+        eprintln!("Usage: fastty actions --json");
+        std::process::exit(2);
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut actions: Vec<_> = fastty::keybindings::Action::all()
+        .into_iter()
+        .map(|action| {
+            seen.insert(action.binding_id());
+            serde_json::json!({
+                "id": action.binding_id(),
+                "label": action.display_name(),
+                "category": action.category(),
+            })
+        })
+        .collect();
+    for action in fastty::config::WorkflowAction::all() {
+        let id = action.palette_command_id();
+        if seen.insert(id.to_string()) {
+            actions.push(serde_json::json!({
+                "id": id,
+                "label": id,
+                "category": "Workflow",
+            }));
+        }
+    }
+    println!(
+        "{}",
+        serde_json::json!({ "schema_version": 1, "actions": actions })
+    );
+}
+
+fn run_keybindings_command(args: impl Iterator<Item = String>) {
+    let mut json = false;
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else {
+            eprintln!("fastty keybindings: unknown flag {arg}");
+            std::process::exit(2);
+        }
+    }
+    if !json {
+        eprintln!("Usage: fastty keybindings --json");
+        std::process::exit(2);
+    }
+
+    let config = fastty::config::load_lenient();
+    let preset = config.keybinding_preset.unwrap_or_default();
+    let resolver = fastty::keybindings::effective_resolver(preset, &config.keybindings);
+    let modes = fastty::keybindings::KeyModeResolver::new(&config.key_modes).descriptions();
+    let bindings: Vec<_> = fastty::keybindings::Action::all()
+        .into_iter()
+        .map(|action| {
+            serde_json::json!({
+                "action": action.binding_id(),
+                "label": action.display_name(),
+                "category": action.category(),
+                "keys": resolver.combos_for(action).iter().map(ToString::to_string).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let sequences: Vec<_> = resolver
+        .sequences()
+        .into_iter()
+        .map(|(sequence, action)| {
+            serde_json::json!({
+                "keys": sequence.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "action": action.binding_id(),
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::json!({ "schema_version": 1, "preset": preset.to_string(), "bindings": bindings, "sequences": sequences, "modes": modes })
+    );
 }
 
 fn main() {
@@ -131,6 +220,8 @@ fn main() {
             }
             fastty::daemon_client::run_events_command(wait);
         }
+        Some("actions") => run_actions_command(subcommand_args),
+        Some("keybindings") => run_keybindings_command(subcommand_args),
         Some("agent-status") => {
             let Some(state) = subcommand_args.next() else {
                 eprintln!("Usage: fastty agent-status <idle|working|done|blocked|error|clear> <claude|opencode|gemini|pi|codex> [permission|question|auth]");
@@ -463,6 +554,21 @@ fn main() {
     }
 
     let cli_opts = CliOptions::parse();
+    let restore_session = fastty::config::load_lenient().session_restore
+        && cli_opts.command.is_none()
+        && cli_opts.working_dir.is_none()
+        && cli_opts.title.is_none();
+    let saved_session = if restore_session {
+        match fastty::session::load_result() {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("Fastty could not load the saved session: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     if let Err(error) = fastty::session_host::ensure_running() {
         eprintln!("fastty: {error}");
         std::process::exit(1);
@@ -473,7 +579,28 @@ fn main() {
         .run(move |cx: &mut App| {
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.on_window_closed(|_cx, window_id| {
-                fastty::session::persist_window(window_id);
+                if let Err(error) = fastty::session::persist_window(window_id) {
+                    eprintln!("Fastty could not save the session after closing a window: {error}");
+                }
+            })
+            .detach();
+            cx.on_app_quit(|cx| {
+                let active_window = cx
+                    .window_stack()
+                    .and_then(|windows| windows.first().map(|window| window.window_id()));
+                for window in cx.windows() {
+                    if let Some(root) = window.downcast::<RootView>() {
+                        if let Err(error) = root.update(cx, |view, window, _cx| {
+                            view.persist_session_for_quit(window);
+                        }) {
+                            eprintln!("Fastty could not read a window before quit: {error}");
+                        }
+                    }
+                }
+                if let Err(error) = fastty::session::persist_before_quit(active_window) {
+                    eprintln!("Fastty could not save the session before quit: {error}");
+                }
+                std::future::ready(())
             })
             .detach();
             cx.bind_keys([
@@ -482,13 +609,45 @@ fn main() {
             ]);
             cx.set_menus([Menu::new("Fastty").items([MenuItem::action("Quit Fastty", Quit)])]);
 
-            open_main_window(cx, cli_opts);
+            if let Some(session) = saved_session.filter(|session| !session.windows.is_empty()) {
+                let active_window = session.active_window.min(session.windows.len() - 1);
+                fastty::session::begin_restore(&session);
+                for (index, saved_window) in session.windows.iter().cloned().enumerate() {
+                    if index != active_window {
+                        open_main_window(cx, CliOptions::default(), Some((index, saved_window)));
+                    }
+                }
+                open_main_window(
+                    cx,
+                    CliOptions::default(),
+                    Some((active_window, session.windows[active_window].clone())),
+                );
+            } else {
+                open_main_window(cx, cli_opts, None);
+            }
             cx.activate(true);
         });
 }
 
-fn open_main_window(cx: &mut App, cli_opts: CliOptions) {
-    let bounds = Bounds::centered(None, size(px(960.), px(640.)), cx);
+fn open_main_window(
+    cx: &mut App,
+    cli_opts: CliOptions,
+    restored_window: Option<(usize, fastty::session::WindowSession)>,
+) {
+    let bounds = restored_window
+        .as_ref()
+        .and_then(|(_, saved)| match (saved.position, saved.size) {
+            (Some((x, y)), Some((width, height)))
+                if (640..=10_000).contains(&width) && (420..=10_000).contains(&height) =>
+            {
+                Some(Bounds {
+                    origin: point(px(x as f32), px(y as f32)),
+                    size: size(px(width as f32), px(height as f32)),
+                })
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| Bounds::centered(None, size(px(960.), px(640.)), cx));
 
     cx.open_window(
         WindowOptions {
@@ -505,7 +664,12 @@ fn open_main_window(cx: &mut App, cli_opts: CliOptions) {
         },
         |window, cx| {
             window.set_background_appearance(WindowBackgroundAppearance::Blurred);
-            cx.new(|cx| RootView::with_options(window, cli_opts, cx))
+            cx.new(|cx| match restored_window {
+                Some((index, saved)) => {
+                    RootView::with_restored_window(window, cli_opts, index, saved, cx)
+                }
+                None => RootView::with_options(window, cli_opts, cx),
+            })
         },
     )
     .expect("failed to open Fastty window");

@@ -1,6 +1,6 @@
 # Report program status
 
-Fastty accepts [OSC 7501](https://www.superlogical.com/rex/docs/build/program-status), revision 0.2, from programs in each terminal pane. Support is always active. Programs must send the reports.
+Fastty accepts [OSC 7501](https://www.superlogical.com/rex/docs/build/program-status), revision 0.4, from programs in each terminal pane. Support is always active. Programs must send the reports.
 
 ## Send a report
 
@@ -35,7 +35,9 @@ printf '\033]7501;state=clear\033\\'
 
 ## Check support
 
-Send `ESC ] 7501 ; ? ESC \`. Fastty writes the same sequence to the program's input. Programs must read and consume this reply. Do not send a query from an interactive shell without a reader for the reply.
+Programs can send `ESC ] 7501 ; ? ESC \` to check support. Fastty replies with the states and kinds it accepts. A program can use the reply to select a supported state. If no reply arrives, treat OSC 7501 as unsupported.
+
+Fastty supports `idle`, `working`, `done`, `blocked`, and `error` states. It supports `permission`, `question`, and `auth` kinds.
 
 ## Set notifications
 

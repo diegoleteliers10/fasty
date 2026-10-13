@@ -272,6 +272,10 @@ pub struct Config {
     pub theme: Option<String>,
     #[serde(default)]
     pub keybindings: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub key_modes: std::collections::HashMap<String, crate::keybindings::KeyModeConfig>,
+    #[serde(default)]
+    pub workflows: std::collections::HashMap<String, WorkflowConfig>,
     #[serde(default = "default_session_restore")]
     pub session_restore: bool,
     #[serde(default)]
@@ -495,6 +499,8 @@ impl Default for Config {
             scrollback: default_scrollback(),
             theme: default_theme(),
             keybindings: std::collections::HashMap::new(),
+            key_modes: std::collections::HashMap::new(),
+            workflows: std::collections::HashMap::new(),
             keybinding_preset: None,
             session_restore: default_session_restore(),
             copy_on_select: false,
@@ -513,6 +519,97 @@ impl Default for Config {
         }
     }
 
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowConfig {
+    pub label: String,
+    #[serde(default)]
+    pub actions: Vec<WorkflowAction>,
+}
+
+/// Commands that a workflow may run. This list contains UI actions only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowAction {
+    NewTab,
+    NewWindow,
+    SplitRight,
+    SplitDown,
+    SplitLeft,
+    SplitTop,
+    FocusRight,
+    FocusDown,
+    FocusLeft,
+    FocusTop,
+    ZoomPane,
+    ToggleTabSidebar,
+    ToggleProjectSidebar,
+    ToggleAiSidebar,
+    Search,
+    GlobalSearch,
+    TabOverview,
+    Clear,
+    Fullscreen,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+}
+
+impl WorkflowAction {
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::NewTab,
+            Self::NewWindow,
+            Self::SplitRight,
+            Self::SplitDown,
+            Self::SplitLeft,
+            Self::SplitTop,
+            Self::FocusRight,
+            Self::FocusDown,
+            Self::FocusLeft,
+            Self::FocusTop,
+            Self::ZoomPane,
+            Self::ToggleTabSidebar,
+            Self::ToggleProjectSidebar,
+            Self::ToggleAiSidebar,
+            Self::Search,
+            Self::GlobalSearch,
+            Self::TabOverview,
+            Self::Clear,
+            Self::Fullscreen,
+            Self::ZoomIn,
+            Self::ZoomOut,
+            Self::ZoomReset,
+        ]
+    }
+
+    pub fn palette_command_id(self) -> &'static str {
+        match self {
+            Self::NewTab => "new_tab",
+            Self::NewWindow => "new_window",
+            Self::SplitRight => "split_right",
+            Self::SplitDown => "split_down",
+            Self::SplitLeft => "split_left",
+            Self::SplitTop => "split_top",
+            Self::FocusRight => "focus_right",
+            Self::FocusDown => "focus_down",
+            Self::FocusLeft => "focus_left",
+            Self::FocusTop => "focus_top",
+            Self::ZoomPane => "zoom_pane",
+            Self::ToggleTabSidebar => "toggle_tab_sidebar",
+            Self::ToggleProjectSidebar => "toggle_project_sidebar",
+            Self::ToggleAiSidebar => "toggle_ai_sidebar",
+            Self::Search => "search",
+            Self::GlobalSearch => "global_search",
+            Self::TabOverview => "tab_overview",
+            Self::Clear => "clear",
+            Self::Fullscreen => "fullscreen",
+            Self::ZoomIn => "zoom_in",
+            Self::ZoomOut => "zoom_out",
+            Self::ZoomReset => "zoom_reset",
+        }
+    }
 }
 
 impl Default for FontConfig {
@@ -652,6 +749,33 @@ fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
     if let Some(kb) = doc["keybindings"].as_table_mut() {
         for (k, v) in &c.keybindings {
             kb[k.as_str()] = value(v.as_str());
+        }
+    }
+    ensure_table(doc, "key_modes");
+    if let Some(modes) = doc["key_modes"].as_table_mut() {
+        for (name, mode) in &c.key_modes {
+            let mut table = Table::new();
+            table["entry"] = value(mode.entry.as_str());
+            table["exclusive"] = value(mode.exclusive);
+            let mut bindings = Table::new();
+            for (combo, action) in &mode.bindings {
+                bindings[combo.as_str()] = value(action.as_str());
+            }
+            table["bindings"] = Item::Table(bindings);
+            modes[name.as_str()] = Item::Table(table);
+        }
+    }
+    ensure_table(doc, "workflows");
+    if let Some(workflows) = doc["workflows"].as_table_mut() {
+        for (name, workflow) in &c.workflows {
+            let mut table = Table::new();
+            table["label"] = value(workflow.label.as_str());
+            let mut actions = toml_edit::Array::new();
+            for action in &workflow.actions {
+                actions.push(action.palette_command_id());
+            }
+            table["actions"] = Item::Value(toml_edit::Value::Array(actions));
+            workflows[name.as_str()] = Item::Table(table);
         }
     }
     apply_ai_to_doc(doc, &c.ai);
@@ -919,6 +1043,45 @@ fn parse_lenient_from_doc(doc: &DocumentMut) -> Option<Config> {
                 cfg.keybindings.insert(k.to_string(), action.to_string());
                 any_recognized = true;
             }
+        }
+    }
+    if let Some(modes) = doc.get("key_modes").and_then(|v| v.as_table()) {
+        for (name, item) in modes.iter() {
+            let Some(table) = item.as_table() else { continue };
+            let Some(entry) = table.get("entry").and_then(|v| v.as_str()) else { continue };
+            let exclusive = table
+                .get("exclusive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let bindings = table
+                .get("bindings")
+                .and_then(|v| v.as_table())
+                .map(|table| {
+                    table
+                        .iter()
+                        .filter_map(|(combo, value)| {
+                            value
+                                .as_str()
+                                .map(|action| (combo.to_string(), action.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            cfg.key_modes.insert(
+                name.to_string(),
+                crate::keybindings::KeyModeConfig {
+                    entry: entry.to_string(),
+                    exclusive,
+                    bindings,
+                },
+            );
+            any_recognized = true;
+        }
+    }
+    if let Some(workflows) = doc.get("workflows") {
+        if let Ok(parsed) = toml_edit::de::from_str::<HashMap<String, WorkflowConfig>>(&workflows.to_string()) {
+            cfg.workflows = parsed;
+            any_recognized = true;
         }
     }
     if doc.get("ai").is_some() {
@@ -1191,6 +1354,8 @@ mod tests {
             scrollback: 5000,
             theme: Some("tokyo-night".to_string()),
             keybindings,
+            key_modes: std::collections::HashMap::new(),
+            workflows: std::collections::HashMap::new(),
             session_restore: true,
             copy_on_select: true,
             contrast_correction: true,

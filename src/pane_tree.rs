@@ -265,22 +265,27 @@ impl PaneNode {
         }
     }
 
-    pub fn to_persisted(&self) -> crate::session_manager::PersistedPaneNode {
+    pub fn to_persisted(
+        &self,
+        snapshots: &mut Vec<(PaneId, Vec<u8>)>,
+    ) -> crate::session_manager::PersistedPaneNode {
         match self {
             PaneNode::Leaf(pane) => {
-                // Freeze the pane's terminal content (scrollback + screen +
-                // cursor) into a compressed binary snapshot so restoring the
-                // session brings the output back, not just the cwd.
-                let snapshot = pane.terminal.as_ref().map(|term| {
-                    use base64::prelude::*;
-                    BASE64_STANDARD.encode(term.snapshot_binary_compressed())
-                });
+                if let Some(term) = &pane.terminal {
+                    snapshots.push((pane.id, term.snapshot_binary_for_save()));
+                }
                 crate::session_manager::PersistedPaneNode::Leaf(crate::session_manager::PersistedPane {
                     id: pane.id,
                     title: pane.title.clone(),
                     custom_title: pane.custom_title.clone(),
                     cwd: pane.cwd.as_ref().map(|c| c.to_string_lossy().to_string()),
-                    snapshot,
+                    host_session_id: pane.host_session_id.or_else(|| {
+                        pane.terminal
+                            .as_ref()
+                            .and_then(|terminal| terminal.remote_session_id())
+                    }),
+                    snapshot: None,
+                    snapshot_activity: crate::session_manager::SnapshotActivity::Unknown,
                 })
             }
             PaneNode::Split { direction, ratio, first, second } => crate::session_manager::PersistedPaneNode::Split {
@@ -289,33 +294,19 @@ impl PaneNode {
                     SplitDirection::Vertical => "Vertical".to_string(),
                 },
                 ratio: *ratio,
-                first: Box::new(first.to_persisted()),
-                second: Box::new(second.to_persisted()),
+                first: Box::new(first.to_persisted(snapshots)),
+                second: Box::new(second.to_persisted(snapshots)),
             },
         }
     }
 
     pub fn restore_from_persisted<F>(persisted: &crate::session_manager::PersistedPaneNode, spawn_pane: &mut F) -> Self
     where
-        F: FnMut(Option<&std::path::Path>, Option<String>) -> TerminalPane,
+        F: FnMut(&crate::session_manager::PersistedPane) -> TerminalPane,
     {
         match persisted {
             crate::session_manager::PersistedPaneNode::Leaf(p) => {
-                let cwd = p.cwd.as_deref().map(std::path::Path::new);
-                let title = p.custom_title.clone().or(Some(p.title.clone()));
-                let pane = spawn_pane(cwd, title);
-                // Replay the saved terminal content into the fresh shell:
-                // scrollback reappears above, the prompt prints at the
-                // restored cursor (tmux respawn-pane semantics).
-                if let Some(ref b64) = p.snapshot {
-                    use base64::prelude::*;
-                    if let Ok(bytes) = BASE64_STANDARD.decode(b64) {
-                        if let Some(ref term) = pane.terminal {
-                            term.restore_binary_snapshot(&bytes);
-                        }
-                    }
-                }
-                PaneNode::Leaf(pane)
+                PaneNode::Leaf(spawn_pane(p))
             }
             crate::session_manager::PersistedPaneNode::Split { direction, ratio, first, second } => {
                 let dir = if direction == "Vertical" {

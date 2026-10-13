@@ -30,11 +30,14 @@ Un objeto JSON por línea (`\n`-terminated) en ambas direcciones.
 {"cmd": "set_access_scope", "scope": "interact"}
 {"cmd": "list"}
 {"cmd": "session_status", "id": 1}
+{"cmd": "close_if_idle", "id": 1}
+{"cmd": "close_if_idle_batch", "ids": [1, 2]}
 {"cmd": "subscribe_sessions"}
 {"cmd": "subscribe_events"}
 {"cmd": "capture", "id": 1}
 {"cmd": "attach", "id": 1}
 {"cmd": "attach", "id": 1, "mode": "read_only"}
+{"cmd": "attach", "id": 1, "binary_snapshot": true}
 {"cmd": "detach", "id": 1}
 {"cmd": "write", "id": 1, "data": "<base64>"}
 {"cmd": "external_action", "id": 1, "action": {"action": "send", "text": "git status\r"}}
@@ -50,9 +53,24 @@ Un objeto JSON por línea (`\n`-terminated) en ambas direcciones.
 {"cmd": "resize_window", "cols": 120, "rows": 40}
 ```
 
-`session_status` returns whether the shell is alive and whether it has a
-foreground child process. Fastty uses this data to tell an idle shell from an
-active command before it asks to close a restored session.
+`session_status` returns whether the shell is alive, whether it has a foreground
+child process, and the foreground command when the host can read it. Older
+hosts can omit `foreground_process_label`.
+
+`close_if_idle` closes the session only when it has no foreground command.
+It returns `closed` or `close_blocked`. `close_blocked` includes the command
+name when the host can read it. The host checks the process and stops the
+session in one operation.
+
+`close_if_idle_batch` checks every listed session under its writer locks before
+it stops any session. It returns `close_batch` with all `closed_ids` when every
+session is idle. If any session has a foreground command, it stops none and
+returns the blocked session IDs and command labels.
+
+`attach` sends an ANSI snapshot by default. Set `binary_snapshot` to `true` to
+get a compressed FST1 snapshot with scrollback in the `snapshot` event. The
+attach snapshot keeps the newest history that fits in 16 MiB of cells. The
+field is optional so older clients keep the ANSI format.
 
 - `id` es el `PaneId` de fastty (un `usize`, único por proceso — cada split
   cuenta como su propia sesión, no solo cada tab).
@@ -71,12 +89,19 @@ active command before it asks to close a restored session.
   seguido de eventos `session_added`, `session_removed`, y `session_updated`
   a medida que cambian las pestañas/splits en fastty.
 - `subscribe_events`: inicia un flujo JSONL con una foto inicial y eventos de
-  sesión con versión, secuencia, hora y `session_id`. La primera versión
-  incluye altas, bajas y cambios de sesión. Fastty conserva los últimos 4.096
-  eventos. Si el cliente queda atrás, recibe `event_stream_gap` con una foto
-  completa y debe reemplazar su estado local antes de continuar desde la nueva
-  secuencia. Los cambios de estado de agente llegan en `program_status` cuando
-  el proceso emite OSC 7501.
+  sesión con versión, secuencia, hora y `session_id`. Fastty conserva los últimos
+  4.096 eventos. Si el cliente queda atrás, recibe `event_stream_gap` con una
+  foto completa y debe reemplazar su estado local antes de continuar desde la
+  nueva secuencia. `session_updated` incluye el campo opcional
+  `terminal_state_changed: true` cuando cambia el proceso visible, el cwd, el
+  estado del shell o el estado OSC 7501. `fastty events` presenta esos cambios
+  como `terminal_state_changed`. El campo `session.title` es el nombre del
+  proceso en primer plano cuando el sistema puede leerlo. `session.alive`
+  indica si el proceso del shell sigue vivo. `program_status` incluye el estado
+  que un programa informó por OSC 7501. Estos valores salen de la foto de sesión
+  que Fastty ya expone y se actualizan por sondeo cada 100 ms. Fastty limita
+  cada texto a 256 caracteres y cada lista de estados a 16 registros. El flujo
+  no informa inicio ni fin de comandos.
 - `capture`: devuelve la pantalla visible como texto ANSI. La salida tiene un
   límite de generación de 1 MiB y no incluye el scrollback.
 - `attach`: se adjunta a una sesión. Acepta el campo opcional `mode`:
@@ -111,7 +136,7 @@ active command before it asks to close a restored session.
 {"event": "sessions", "sessions": [
   {"id": 1, "title": "zsh", "cwd": "/Users/you", "cols": 89, "rows": 32, "alive": true, "history_size": 0}
 ]}
-{"event": "session_status", "alive": true, "process_running": false}
+{"event": "session_status", "alive": true, "process_running": true, "foreground_process_label": "claude"}
 {"event": "session_added", "session": {"id": 2, "title": "zsh", "cwd": "/tmp", "cols": 89, "rows": 32, "alive": true, "history_size": 0}}
 {"event": "session_removed", "id": 2}
 {"event": "session_updated", "session": {"id": 1, "title": "vim", "cwd": "/Users/you", "cols": 89, "rows": 32, "alive": true, "history_size": 120}}
@@ -121,7 +146,7 @@ active command before it asks to close a restored session.
 {"event": "error", "code": "approval_denied", "message": "the user denied this action"}
 {"event": "captured", "id": 1, "data": "<ANSI screen>", "truncated": false}
 {"event": "done", "cmd": "set_access_scope"}
-{"event": "attached", "id": 1, "cols": 89, "rows": 32, "mode": "read_only"}
+{"event": "attached", "id": 1, "cols": 89, "rows": 32, "mode": "read_only", "program_status": []}
 {"event": "snapshot", "id": 1, "data": "<base64, ANSI/SGR>"}
 {"event": "binary_snapshot", "id": 1, "data": "<base64, FST1 binary snapshot>"}
 {"event": "detached", "id": 1}
@@ -138,6 +163,8 @@ active command before it asks to close a restored session.
 - `program_status` es opcional y solo aparece cuando Fastty detecta estados
   OSC 7501. Incluye el ID, estado, aplicación, progreso y tipo de espera. Omite
   mensajes y texto libre para reducir la exposición de datos.
+- `attached.program_status` conserva el estado OSC 7501 al reconectar una
+  sesión. Es opcional para clientes antiguos y omite mensajes vacíos.
 - Un `attach` manda **un `snapshot` inmediatamente después del `attached`**,
   con el contenido actual de la pantalla (no el scrollback completo, solo lo
   visible) como bytes ANSI/SGR ya coloreados — ver

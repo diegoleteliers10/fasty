@@ -432,10 +432,13 @@ pub fn run_events_command(wait_secs: Option<u64>) -> ! {
                             "session_id": metadata["session_id"],
                             "id": id,
                         }),
-                        crate::daemon::SessionEvent::SessionUpdated { session } => {
+                        crate::daemon::SessionEvent::SessionUpdated {
+                            session,
+                            terminal_state_changed,
+                        } => {
                             serde_json::json!({
                                 "version": metadata["version"],
-                                "type": "session_updated",
+                                "type": if terminal_state_changed { "terminal_state_changed" } else { "session_updated" },
                                 "sequence": metadata["sequence"],
                                 "timestamp_unix_ms": metadata["timestamp_unix_ms"],
                                 "session_id": metadata["session_id"],
@@ -583,7 +586,7 @@ pub fn run_attach_command(id: usize, read_only: bool, wait_secs: Option<u64>) ->
         let mut printed_waiting = false;
         let (mut reader, write_half, cols, rows) = loop {
             let attempt = connect().and_then(|mut stream| {
-                send_request(&mut stream, &Request::Attach { id, mode })?;
+                send_request(&mut stream, &Request::Attach { id, mode, binary_snapshot: false })?;
                 let write_half = stream.try_clone().map_err(|e| e.to_string())?;
                 let mut reader = std::io::BufReader::new(stream);
                 match read_response(&mut reader) {

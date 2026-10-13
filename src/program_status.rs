@@ -35,7 +35,7 @@ pub enum BlockedKind {
     Auth,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgramRecord {
     pub id: String,
     pub state: ProgramState,
@@ -63,6 +63,12 @@ pub(crate) struct ProgramStatusStore {
 }
 
 impl ProgramStatusStore {
+    pub(crate) fn from_records(records: Vec<ProgramRecord>) -> Self {
+        Self {
+            records: records.into_iter().take(256).collect(),
+        }
+    }
+
     pub(crate) fn should_deliver_native_notification(&self) -> bool {
         !self
             .records

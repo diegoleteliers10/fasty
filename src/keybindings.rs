@@ -7,6 +7,7 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -49,6 +50,25 @@ pub struct KeyCombo {
     pub alt: bool,
     pub logo: bool,
     pub key: NamedKey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyModeConfig {
+    #[serde(default)]
+    pub entry: String,
+    #[serde(default = "mode_exclusive_default")]
+    pub exclusive: bool,
+    #[serde(default)]
+    pub bindings: HashMap<String, String>,
+}
+
+fn mode_exclusive_default() -> bool { true }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeCommand {
+    Exit,
+    Resize(NamedKey),
+    Action(Action),
 }
 
 impl std::fmt::Display for KeyCombo {
@@ -139,6 +159,7 @@ pub enum Action {
     FocusDown,
     FocusLeft,
     FocusTop,
+    EnterResizeMode,
     ClosePane,
     GlobalSearch,
     TabOverview,
@@ -175,6 +196,7 @@ impl Action {
             Action::FocusDown,
             Action::FocusLeft,
             Action::FocusTop,
+            Action::EnterResizeMode,
             Action::ClosePane,
             Action::PrevPrompt,
             Action::NextPrompt,
@@ -241,6 +263,7 @@ impl Action {
             Action::FocusDown => "focus_down".to_string(),
             Action::FocusLeft => "focus_left".to_string(),
             Action::FocusTop => "focus_top".to_string(),
+            Action::EnterResizeMode => "enter_resize_mode".to_string(),
             Action::ClosePane => "close_pane".to_string(),
             Action::GlobalSearch => "global_search".to_string(),
             Action::TabOverview => "tab_overview".to_string(),
@@ -287,6 +310,7 @@ impl Action {
                 Action::FocusDown => "Focus Down Pane",
                 Action::FocusLeft => "Focus Left Pane",
                 Action::FocusTop => "Focus Top Pane",
+                Action::EnterResizeMode => "Enter Pane Resize Mode",
                 Action::ClosePane => "Close Pane",
                 Action::GlobalSearch => "Global Search (All Tabs)",
                 Action::TabOverview => "Tab Overview",
@@ -304,7 +328,7 @@ impl Action {
             | Action::SelectTab(_) => "Tabs",
             Action::SplitRight | Action::SplitDown | Action::SplitLeft | Action::SplitTop
             | Action::FocusRight | Action::FocusDown | Action::FocusLeft | Action::FocusTop
-            | Action::ClosePane => "Panes",
+            | Action::EnterResizeMode | Action::ClosePane => "Panes",
             Action::PrevPrompt | Action::NextPrompt => "Navigation",
             Action::Copy | Action::Paste => "Clipboard",
             Action::IncreaseFontSize | Action::DecreaseFontSize | Action::ResetFontSize
@@ -336,6 +360,7 @@ impl Action {
 
 pub struct KeyBindingResolver {
     bindings: HashMap<KeyCombo, Action>,
+    sequences: HashMap<Vec<KeyCombo>, Action>,
 }
 
 impl KeyBindingResolver {
@@ -395,6 +420,7 @@ impl KeyBindingResolver {
                     insert("super+alt+right", Action::FocusRight);
                     insert("super+alt+up", Action::FocusTop);
                     insert("super+alt+down", Action::FocusDown);
+                    insert("super+alt+r", Action::EnterResizeMode);
                     insert("super+shift+f", Action::GlobalSearch);
                     insert("super+shift+o", Action::TabOverview);
                     insert("ctrl+super+comma", Action::InsertFilePath);
@@ -412,6 +438,7 @@ impl KeyBindingResolver {
                     insert("alt+right", Action::FocusRight);
                     insert("alt+up", Action::FocusTop);
                     insert("alt+down", Action::FocusDown);
+                    insert("alt+shift+r", Action::EnterResizeMode);
                     insert("ctrl+f", Action::OpenSearch);
                     insert("ctrl+shift+f", Action::GlobalSearch);
                     insert("ctrl+shift+m", Action::TabOverview);
@@ -521,7 +548,7 @@ impl KeyBindingResolver {
             }
         }
 
-        Self { bindings: b }
+        Self { bindings: b, sequences: HashMap::new() }
     }
 
     pub fn with_defaults() -> Self {
@@ -529,7 +556,21 @@ impl KeyBindingResolver {
     }
 
     pub fn apply_user(&mut self, user: HashMap<String, String>) {
-        for (combo_str, action_str) in user {
+        let mut entries: Vec<_> = user.into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (combo_str, action_str) in entries {
+            if let Some(sequence) = parse_key_sequence(&combo_str) {
+                if is_unbound_marker(&action_str) {
+                    self.sequences.remove(&sequence);
+                    continue;
+                }
+                if let Some(action) = parse_action(&action_str) {
+                    if self.sequences.insert(sequence.clone(), action).is_some() {
+                        eprintln!("[fastty] duplicate key sequence after normalization: {}", printable_sequence(&sequence));
+                    }
+                }
+                continue;
+            }
             let Some(combo) = parse_combo(&combo_str) else {
                 continue;
             };
@@ -548,6 +589,57 @@ impl KeyBindingResolver {
         self.bindings.get(combo).copied()
     }
 
+    /// Returns the matching action and whether more keys can extend this prefix.
+    pub fn resolve_sequence(&self, prefix: &[KeyCombo]) -> (Option<Action>, bool) {
+        let action = self.sequences.get(prefix).copied();
+        let has_longer = self.sequences.keys().any(|sequence| {
+            sequence.len() > prefix.len() && sequence.starts_with(prefix)
+        });
+        (action, has_longer)
+    }
+
+    pub fn is_sequence_prefix(&self, combo: &KeyCombo) -> bool {
+        self.sequences.keys().any(|sequence| sequence.first() == Some(combo))
+    }
+
+    pub fn sequence_conflicts(&self) -> Vec<String> {
+        let mut conflicts = Vec::new();
+        for sequence in self.sequences.keys() {
+            if let Some(first) = sequence.first() {
+                if let Some(action) = self.bindings.get(first) {
+                    conflicts.push(format!(
+                        "{} starts a sequence and runs {action:?}; the sequence takes priority",
+                        first
+                    ));
+                }
+            }
+            for other in self.sequences.keys() {
+                if sequence.len() < other.len() && other.starts_with(sequence) {
+                    conflicts.push(format!(
+                        "{} is a prefix of {}; the shorter sequence takes priority",
+                        printable_sequence(sequence), printable_sequence(other)
+                    ));
+                }
+            }
+        }
+        conflicts.sort();
+        conflicts.dedup();
+        conflicts
+    }
+
+    /// Configured multi-key bindings, ordered by their printable sequence.
+    pub fn sequences(&self) -> Vec<(Vec<KeyCombo>, Action)> {
+        let mut sequences: Vec<_> = self
+            .sequences
+            .iter()
+            .map(|(sequence, action)| (sequence.clone(), *action))
+            .collect();
+        sequences.sort_by_key(|(sequence, _)| {
+            sequence.iter().map(ToString::to_string).collect::<Vec<_>>().join(" > ")
+        });
+        sequences
+    }
+
     /// All combos currently bound to `action`, sorted for stable display.
     pub fn combos_for(&self, action: Action) -> Vec<KeyCombo> {
         let mut v: Vec<KeyCombo> = self
@@ -564,6 +656,167 @@ impl KeyBindingResolver {
     pub fn preset_combos(preset: KeybindingPreset, action: Action) -> Vec<KeyCombo> {
         Self::for_preset(preset).combos_for(action)
     }
+}
+
+fn printable_sequence(sequence: &[KeyCombo]) -> String {
+    sequence.iter().map(ToString::to_string).collect::<Vec<_>>().join(" > ")
+}
+
+pub const KEY_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(900);
+
+pub fn parse_key_sequence(s: &str) -> Option<Vec<KeyCombo>> {
+    if !s.contains('>') { return None; }
+    let sequence = s.split('>').map(str::trim).map(parse_combo).collect::<Option<Vec<_>>>()?;
+    (sequence.len() >= 2).then_some(sequence)
+}
+
+pub struct KeyModeResolver {
+    modes: HashMap<String, (bool, HashMap<KeyCombo, ModeCommand>)>,
+    entries: HashMap<KeyCombo, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KeyModeDescription {
+    pub id: String,
+    pub entry: String,
+    pub exclusive: bool,
+    pub bindings: Vec<KeyModeBindingDescription>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KeyModeBindingDescription {
+    pub keys: String,
+    pub action: String,
+}
+
+impl KeyModeResolver {
+    pub fn new(configured: &HashMap<String, KeyModeConfig>) -> Self {
+        let mut definitions = HashMap::new();
+        definitions.insert("resize".to_string(), KeyModeConfig {
+            entry: if cfg!(target_os = "macos") { "super+alt+r" } else { "alt+shift+r" }.to_string(),
+            exclusive: true,
+            bindings: HashMap::from([
+                ("left".to_string(), "resize_left".to_string()),
+                ("right".to_string(), "resize_right".to_string()),
+                ("up".to_string(), "resize_up".to_string()),
+                ("down".to_string(), "resize_down".to_string()),
+                ("shift+left".to_string(), "resize_left".to_string()),
+                ("shift+right".to_string(), "resize_right".to_string()),
+                ("shift+up".to_string(), "resize_up".to_string()),
+                ("shift+down".to_string(), "resize_down".to_string()),
+                ("escape".to_string(), "exit".to_string()),
+                ("enter".to_string(), "exit".to_string()),
+            ]),
+        });
+        for (name, mode) in configured {
+            if let Some(existing) = definitions.get_mut(name) {
+                existing.entry = mode.entry.clone();
+                existing.exclusive = mode.exclusive;
+                existing.bindings.extend(mode.bindings.clone());
+            } else {
+                definitions.insert(name.clone(), mode.clone());
+            }
+        }
+
+        let mut modes = HashMap::new();
+        let mut entries = HashMap::new();
+        let mut definitions: Vec<_> = definitions.into_iter().collect();
+        definitions.sort_by(|left, right| left.0.cmp(&right.0));
+        for (name, config) in definitions {
+            if let Some(entry) = parse_combo(&config.entry) {
+                if let Some(previous) = entries.insert(entry, name.clone()) {
+                    eprintln!("[fastty] key mode entry conflict: {previous} and {name} use {entry}");
+                }
+            } else {
+                eprintln!("[fastty] invalid entry key for mode {name}: {}", config.entry);
+            }
+            let bindings = config.bindings.into_iter().filter_map(|(combo, command)| {
+                let Some(combo) = parse_combo(&combo) else {
+                    eprintln!("[fastty] invalid key in mode {name}: {combo}");
+                    return None;
+                };
+                let command = match command.as_str() {
+                    "exit" | "exit_mode" => ModeCommand::Exit,
+                    "resize_left" => ModeCommand::Resize(NamedKey::Left),
+                    "resize_right" => ModeCommand::Resize(NamedKey::Right),
+                    "resize_up" => ModeCommand::Resize(NamedKey::Up),
+                    "resize_down" => ModeCommand::Resize(NamedKey::Down),
+                    _ => match parse_action(&command) {
+                        Some(action) => ModeCommand::Action(action),
+                        None => {
+                            eprintln!("[fastty] invalid action in mode {name}: {command}");
+                            return None;
+                        }
+                    },
+                };
+                Some((combo, command))
+            }).collect();
+            modes.insert(name, (config.exclusive, bindings));
+        }
+        Self { modes, entries }
+    }
+
+    pub fn mode_for_entry(&self, combo: &KeyCombo) -> Option<&str> {
+        self.entries.get(combo).map(String::as_str)
+    }
+
+    pub fn exclusive(&self, mode: &str) -> bool {
+        self.modes.get(mode).is_some_and(|(exclusive, _)| *exclusive)
+    }
+
+    pub fn resolve(&self, mode: &str, combo: &KeyCombo) -> Option<ModeCommand> {
+        self.modes.get(mode)?.1.get(combo).copied()
+    }
+
+    pub fn descriptions(&self) -> Vec<KeyModeDescription> {
+        let mut ids: Vec<_> = self.modes.keys().cloned().collect();
+        ids.sort();
+        ids.into_iter()
+            .filter_map(|id| {
+                let (exclusive, bindings) = self.modes.get(&id)?;
+                let entry = self
+                    .entries
+                    .iter()
+                    .find_map(|(combo, mode)| (mode == &id).then(|| combo.to_string()))
+                    .unwrap_or_default();
+                let mut bindings: Vec<_> = bindings
+                    .iter()
+                    .map(|(combo, command)| KeyModeBindingDescription {
+                        keys: combo.to_string(),
+                        action: match command {
+                            ModeCommand::Exit => "exit".to_string(),
+                            ModeCommand::Resize(NamedKey::Left) => "resize_left".to_string(),
+                            ModeCommand::Resize(NamedKey::Right) => "resize_right".to_string(),
+                            ModeCommand::Resize(NamedKey::Up) => "resize_up".to_string(),
+                            ModeCommand::Resize(NamedKey::Down) => "resize_down".to_string(),
+                            ModeCommand::Resize(_) => "resize".to_string(),
+                            ModeCommand::Action(action) => action.binding_id(),
+                        },
+                    })
+                    .collect();
+                bindings.sort_by(|left, right| left.keys.cmp(&right.keys));
+                Some(KeyModeDescription {
+                    id,
+                    entry,
+                    exclusive: *exclusive,
+                    bindings,
+                })
+            })
+            .collect()
+    }
+}
+
+static KEY_MODES: std::sync::OnceLock<RwLock<KeyModeResolver>> = std::sync::OnceLock::new();
+
+pub fn init_key_modes(configured: HashMap<String, KeyModeConfig>) {
+    let resolver = KeyModeResolver::new(&configured);
+    let lock = KEY_MODES.get_or_init(|| RwLock::new(KeyModeResolver::new(&HashMap::new())));
+    *lock.write() = resolver;
+}
+
+pub fn with_key_modes<R>(f: impl FnOnce(&KeyModeResolver) -> R) -> R {
+    let lock = KEY_MODES.get_or_init(|| RwLock::new(KeyModeResolver::new(&HashMap::new())));
+    f(&lock.read())
 }
 
 pub fn parse_combo(s: &str) -> Option<KeyCombo> {
@@ -689,6 +942,7 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "focus_down" => Some(Action::FocusDown),
         "focus_left" => Some(Action::FocusLeft),
         "focus_top" => Some(Action::FocusTop),
+        "enter_resize_mode" => Some(Action::EnterResizeMode),
         "close_pane" => Some(Action::ClosePane),
         "global_search" | "search_all" | "multi_tab_search" => Some(Action::GlobalSearch),
         "tab_overview" | "mission_control" | "tab_peek" => Some(Action::TabOverview),
@@ -845,8 +1099,16 @@ pub static RESOLVER: std::sync::OnceLock<RwLock<KeyBindingResolver>> = std::sync
 
 pub fn init_resolver(user: HashMap<String, String>, preset: Option<KeybindingPreset>) {
     let mut r = KeyBindingResolver::for_preset(preset.unwrap_or_default());
+    for combo in user.keys().filter(|combo| combo.contains('>')) {
+        if parse_key_sequence(combo).is_none() {
+            eprintln!("[fastty] invalid key sequence: {combo}");
+        }
+    }
     r.apply_user(user);
-    let lock = RESOLVER.get_or_init(|| RwLock::new(KeyBindingResolver { bindings: HashMap::new() }));
+    for conflict in r.sequence_conflicts() {
+        eprintln!("[fastty] keybinding conflict: {conflict}");
+    }
+    let lock = RESOLVER.get_or_init(|| RwLock::new(KeyBindingResolver { bindings: HashMap::new(), sequences: HashMap::new() }));
     *lock.write() = r;
 }
 

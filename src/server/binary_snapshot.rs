@@ -16,6 +16,7 @@ pub const BINARY_SNAPSHOT_VERSION: u16 = 2;
 /// Versions this decoder accepts. v1 snapshots (screen only) decode with
 /// zero history rows because v1 left the history field zeroed.
 pub const SUPPORTED_SNAPSHOT_VERSIONS: [u16; 2] = [1, 2];
+const MAX_DECODED_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 
 /// Flags for terminal display attributes in FasttyPackedCell.
 pub const CELL_FLAG_BOLD: u16 = 1 << 0;
@@ -84,6 +85,15 @@ impl FasttyBinarySnapshotHeader {
 
     pub fn set_history_rows(&mut self, rows: u32) {
         self._reserved2[0..4].copy_from_slice(&rows.to_le_bytes());
+    }
+
+    /// Terminal modes at capture time. Zero is valid for older snapshots.
+    pub fn terminal_modes(&self) -> u32 {
+        u32::from_le_bytes(self._reserved2[4..8].try_into().unwrap_or([0; 4]))
+    }
+
+    pub fn set_terminal_modes(&mut self, modes: u32) {
+        self._reserved2[4..8].copy_from_slice(&modes.to_le_bytes());
     }
 }
 
@@ -219,24 +229,46 @@ pub fn encode_snapshot_compressed(
     out
 }
 
+/// Compress a validated, uncompressed snapshot after the UI captures it.
+pub fn compress_snapshot(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut header = FasttyBinarySnapshotHeader::from_bytes(bytes)?;
+    if header.flags & SNAPSHOT_FLAG_DEFLATE != 0 {
+        return None;
+    }
+    let payload_len = (header.cell_count as usize).checked_mul(16)?;
+    if payload_len > MAX_DECODED_SNAPSHOT_BYTES || bytes.len() != payload_len.checked_add(32)? {
+        return None;
+    }
+    header.flags |= SNAPSHOT_FLAG_DEFLATE;
+    let compressed = miniz_oxide::deflate::compress_to_vec(&bytes[32..], 6);
+    let mut out = Vec::with_capacity(32 + compressed.len());
+    out.extend_from_slice(&header.to_bytes());
+    out.extend_from_slice(&compressed);
+    Some(out)
+}
+
 /// Decode full binary snapshot into header and cells.
 pub fn decode_snapshot(bytes: &[u8]) -> Option<(FasttyBinarySnapshotHeader, Vec<FasttyPackedCell>)> {
     if bytes.len() < 32 {
         return None;
     }
     let header = FasttyBinarySnapshotHeader::from_bytes(&bytes[0..32])?;
+    let expected_len = (header.cell_count as usize).checked_mul(16)?;
+    if expected_len > MAX_DECODED_SNAPSHOT_BYTES {
+        return None;
+    }
     if (header.flags & SNAPSHOT_FLAG_DEFLATE) != 0 {
-        let decompressed = miniz_oxide::inflate::decompress_to_vec(&bytes[32..]).ok()?;
-        let expected_len = (header.cell_count as usize).checked_mul(16)?;
-        if decompressed.len() < expected_len {
+        let decompressed = miniz_oxide::inflate::decompress_to_vec_with_limit(
+            &bytes[32..],
+            expected_len,
+        ).ok()?;
+        if decompressed.len() != expected_len {
             return None;
         }
         let cells = bytes_to_cells(&decompressed[0..expected_len])?;
         Some((header, cells))
     } else {
-        let required_len = (header.cell_count as usize)
-            .checked_mul(16)
-            .and_then(|n| n.checked_add(32));
+        let required_len = expected_len.checked_add(32);
         let expected_len = match required_len {
             Some(len) if bytes.len() >= len => len,
             _ => return None,

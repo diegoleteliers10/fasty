@@ -1,7 +1,22 @@
 //! Local process host for PTY sessions.
 
-use crate::daemon::{AttachMode, Request, Response, SessionInfo};
+use crate::daemon::{AttachMode, BlockedSession, Request, Response, SessionInfo};
 use std::io::{BufRead, BufReader, Write};
+
+#[cfg(unix)]
+fn connect_for_handshake() -> Result<std::os::unix::net::UnixStream, String> {
+    use std::time::Duration;
+
+    let stream = std::os::unix::net::UnixStream::connect(crate::daemon::socket_path())
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| error.to_string())?;
+    Ok(stream)
+}
 
 const HOST_ARGUMENT: &str = "--fastty-session-host";
 
@@ -57,6 +72,7 @@ pub fn run_host() {
 pub struct RemoteSession {
     pub id: usize,
     pub snapshot: Vec<u8>,
+    pub program_status: Vec<crate::program_status::ProgramRecord>,
     pub restore_legacy_mouse_modes: bool,
     pub reader: BufReader<std::os::unix::net::UnixStream>,
     pub control: std::sync::Arc<RemoteControl>,
@@ -66,6 +82,7 @@ pub struct RemoteSession {
 pub struct RemoteSession {
     pub id: usize,
     pub snapshot: Vec<u8>,
+    pub program_status: Vec<crate::program_status::ProgramRecord>,
     pub restore_legacy_mouse_modes: bool,
     pub control: std::sync::Arc<RemoteControl>,
 }
@@ -98,25 +115,92 @@ impl RemoteControl {
 
 #[cfg(unix)]
 pub fn session_process_running(id: usize) -> Result<bool, String> {
-    use std::os::unix::net::UnixStream;
+    session_process_status(id).map(|(process_running, _)| process_running)
+}
 
+#[cfg(unix)]
+pub fn session_process_status(id: usize) -> Result<(bool, Option<String>), String> {
     ensure_running()?;
-    let mut stream =
-        UnixStream::connect(crate::daemon::socket_path()).map_err(|error| error.to_string())?;
+    let mut stream = connect_for_handshake()?;
     write_request(&mut stream, &Request::SessionStatus { id })
         .map_err(|error| error.to_string())?;
     match read_response(&mut BufReader::new(stream))? {
         Response::SessionStatus {
-            process_running, ..
-        } => Ok(process_running),
+            process_running,
+            foreground_process_label,
+            ..
+        } => Ok((process_running, foreground_process_label)),
         Response::Error { code, .. } if code == "bad_request" => {
             let session = legacy_session_info(id)?;
-            legacy_session_process_running(&session)
-                .ok_or_else(|| "legacy host returned an unknown process name".to_string())
+            let process_running = legacy_session_process_running(&session)
+                .ok_or_else(|| "legacy host returned an unknown process name".to_string())?;
+            let process_name = process_running.then(|| session.title.clone());
+            Ok((process_running, process_name))
         }
         Response::Error { code, message } => Err(format!("{code}: {message}")),
         other => Err(format!("unexpected session status response: {other:?}")),
     }
+}
+
+pub enum CloseIfIdleResult {
+    Closed,
+    Running(Option<String>),
+}
+
+pub enum CloseIfIdleBatchResult {
+    Closed,
+    Running(Vec<BlockedSession>),
+}
+
+#[cfg(unix)]
+pub fn close_if_idle_batch(ids: Vec<usize>) -> Result<CloseIfIdleBatchResult, String> {
+    ensure_running()?;
+    let mut stream = connect_for_handshake()?;
+    write_request(&mut stream, &Request::CloseIfIdleBatch { ids })
+        .map_err(|error| error.to_string())?;
+    match read_response(&mut BufReader::new(stream))? {
+        Response::CloseBatch { blocked, .. } if blocked.is_empty() => {
+            Ok(CloseIfIdleBatchResult::Closed)
+        }
+        Response::CloseBatch { blocked, .. } => Ok(CloseIfIdleBatchResult::Running(blocked)),
+        Response::Error { code, message } => Err(format!("{code}: {message}")),
+        other => Err(format!("unexpected batch close response: {other:?}")),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn close_if_idle_batch(_ids: Vec<usize>) -> Result<CloseIfIdleBatchResult, String> {
+    Err("host sessions are not supported on this platform".to_string())
+}
+
+#[cfg(unix)]
+pub fn close_if_idle(id: usize) -> Result<CloseIfIdleResult, String> {
+    ensure_running()?;
+    let mut stream = connect_for_handshake()?;
+    write_request(&mut stream, &Request::CloseIfIdle { id })
+        .map_err(|error| error.to_string())?;
+    match read_response(&mut BufReader::new(stream))? {
+        Response::Closed { .. } => Ok(CloseIfIdleResult::Closed),
+        Response::CloseBlocked {
+            foreground_process_label,
+            ..
+        } => Ok(CloseIfIdleResult::Running(foreground_process_label)),
+        Response::Error { code, .. } if code == "no_such_session" => {
+            Ok(CloseIfIdleResult::Closed)
+        }
+        Response::Error { code, message } => Err(format!("{code}: {message}")),
+        other => Err(format!("unexpected close response: {other:?}")),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn close_if_idle(_id: usize) -> Result<CloseIfIdleResult, String> {
+    Err("host sessions are not supported on this platform".to_string())
+}
+
+#[cfg(not(unix))]
+pub fn session_process_status(_id: usize) -> Result<(bool, Option<String>), String> {
+    Ok((false, None))
 }
 
 #[cfg(not(unix))]
@@ -218,11 +302,8 @@ pub fn spawn_attached(
     cols: usize,
     rows: usize,
 ) -> Result<RemoteSession, String> {
-    use std::os::unix::net::UnixStream;
-
     ensure_running()?;
-    let mut stream =
-        UnixStream::connect(crate::daemon::socket_path()).map_err(|error| error.to_string())?;
+    let mut stream = connect_for_handshake()?;
     write_request(
         &mut stream,
         &Request::Spawn {
@@ -242,33 +323,38 @@ pub fn spawn_attached(
         other => return Err(format!("unexpected spawn response: {other:?}")),
     };
 
-    let mut stream =
-        UnixStream::connect(crate::daemon::socket_path()).map_err(|error| error.to_string())?;
+    let mut stream = connect_for_handshake()?;
     write_request(
         &mut stream,
         &Request::Attach {
             id,
             mode: AttachMode::ReadWrite,
+            binary_snapshot: false,
         },
     )
     .map_err(|error| error.to_string())?;
     let control_stream = stream.try_clone().map_err(|error| error.to_string())?;
     let mut reader = BufReader::new(stream);
-    match read_response(&mut reader)? {
-        Response::Attached { .. } => {}
+    let program_status = match read_response(&mut reader)? {
+        Response::Attached { program_status, .. } => program_status,
         Response::Error { code, message } => return Err(format!("{code}: {message}")),
         other => return Err(format!("unexpected attach response: {other:?}")),
-    }
+    };
     let snapshot = match read_response(&mut reader)? {
         Response::Snapshot { data, .. } => crate::daemon::base64_decode(&data)
             .ok_or_else(|| "session host sent an invalid snapshot".to_string())?,
         Response::Error { code, message } => return Err(format!("{code}: {message}")),
         other => return Err(format!("unexpected snapshot response: {other:?}")),
     };
+    reader
+        .get_mut()
+        .set_read_timeout(None)
+        .map_err(|error| error.to_string())?;
 
     Ok(RemoteSession {
         id,
         snapshot,
+        program_status,
         restore_legacy_mouse_modes: false,
         reader,
         control: std::sync::Arc::new(RemoteControl {
@@ -281,8 +367,6 @@ pub fn spawn_attached(
 
 #[cfg(unix)]
 pub fn attach(id: usize) -> Result<RemoteSession, String> {
-    use std::os::unix::net::UnixStream;
-
     ensure_running()?;
     let restore_legacy_mouse_modes = match query_session_status(id)? {
         Response::SessionStatus { .. } => false,
@@ -292,32 +376,40 @@ pub fn attach(id: usize) -> Result<RemoteSession, String> {
         Response::Error { code, message } => return Err(format!("{code}: {message}")),
         other => return Err(format!("unexpected session status response: {other:?}")),
     };
-    let mut stream =
-        UnixStream::connect(crate::daemon::socket_path()).map_err(|error| error.to_string())?;
+    let mut stream = connect_for_handshake()?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .map_err(|error| error.to_string())?;
     write_request(
         &mut stream,
         &Request::Attach {
             id,
             mode: AttachMode::ReadWrite,
+            binary_snapshot: true,
         },
     )
     .map_err(|error| error.to_string())?;
     let control_stream = stream.try_clone().map_err(|error| error.to_string())?;
     let mut reader = BufReader::new(stream);
-    match read_response(&mut reader)? {
-        Response::Attached { .. } => {}
+    let program_status = match read_response(&mut reader)? {
+        Response::Attached { program_status, .. } => program_status,
         Response::Error { code, message } => return Err(format!("{code}: {message}")),
         other => return Err(format!("unexpected attach response: {other:?}")),
-    }
+    };
     let snapshot = match read_response(&mut reader)? {
         Response::Snapshot { data, .. } => crate::daemon::base64_decode(&data)
             .ok_or_else(|| "session host sent an invalid snapshot".to_string())?,
         Response::Error { code, message } => return Err(format!("{code}: {message}")),
         other => return Err(format!("unexpected snapshot response: {other:?}")),
     };
+    reader
+        .get_mut()
+        .set_read_timeout(None)
+        .map_err(|error| error.to_string())?;
     Ok(RemoteSession {
         id,
         snapshot,
+        program_status,
         restore_legacy_mouse_modes,
         reader,
         control: std::sync::Arc::new(RemoteControl {
@@ -330,10 +422,7 @@ pub fn attach(id: usize) -> Result<RemoteSession, String> {
 
 #[cfg(unix)]
 fn query_session_status(id: usize) -> Result<Response, String> {
-    use std::os::unix::net::UnixStream;
-
-    let mut stream =
-        UnixStream::connect(crate::daemon::socket_path()).map_err(|error| error.to_string())?;
+    let mut stream = connect_for_handshake()?;
     write_request(&mut stream, &Request::SessionStatus { id })
         .map_err(|error| error.to_string())?;
     read_response(&mut BufReader::new(stream))
@@ -418,10 +507,8 @@ pub fn read_output(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, String>
 
 #[cfg(unix)]
 pub fn list_sessions() -> Result<Vec<SessionInfo>, String> {
-    use std::os::unix::net::UnixStream;
     ensure_running()?;
-    let mut stream =
-        UnixStream::connect(crate::daemon::socket_path()).map_err(|error| error.to_string())?;
+    let mut stream = connect_for_handshake()?;
     write_request(&mut stream, &Request::List).map_err(|error| error.to_string())?;
     match read_response(&mut BufReader::new(stream))? {
         Response::Sessions { sessions } => Ok(sessions),
@@ -432,10 +519,8 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>, String> {
 
 #[cfg(unix)]
 pub fn session_exists(id: usize) -> Result<bool, String> {
-    use std::os::unix::net::UnixStream;
     ensure_running()?;
-    let mut stream =
-        UnixStream::connect(crate::daemon::socket_path()).map_err(|error| error.to_string())?;
+    let mut stream = connect_for_handshake()?;
     write_request(&mut stream, &Request::SessionExists { id })
         .map_err(|error| error.to_string())?;
     match read_response(&mut BufReader::new(stream))? {
