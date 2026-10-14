@@ -19,10 +19,19 @@ pub enum Direction {
 
 pub type PaneId = usize;
 
+#[derive(Clone)]
+pub struct TerminalStartRequest {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
 pub struct TerminalPane {
     pub id: PaneId,
     pub terminal: Option<Arc<TerminalState>>,
     pub host_session_id: Option<usize>,
+    pub terminal_error: Option<String>,
+    pub terminal_start_request: Option<TerminalStartRequest>,
+    pub terminal_retry_allowed: bool,
     pub title: String,
     pub custom_title: Option<String>,
     pub cwd: Option<std::path::PathBuf>,
@@ -40,6 +49,9 @@ impl Clone for TerminalPane {
             id: self.id,
             terminal: self.terminal.clone(),
             host_session_id: self.host_session_id,
+            terminal_error: self.terminal_error.clone(),
+            terminal_start_request: self.terminal_start_request.clone(),
+            terminal_retry_allowed: self.terminal_retry_allowed,
             title: self.title.clone(),
             custom_title: self.custom_title.clone(),
             cwd: self.cwd.clone(),
@@ -399,6 +411,9 @@ impl PaneTree {
                 id: 0,
                 terminal: None,
                 host_session_id: None,
+                terminal_error: None,
+                terminal_start_request: None,
+                terminal_retry_allowed: true,
                 title: String::new(),
                 custom_title: None,
                 cwd: None,
@@ -433,6 +448,9 @@ impl PaneTree {
                 id: 0,
                 terminal: None,
                 host_session_id: None,
+                terminal_error: None,
+                terminal_start_request: None,
+                terminal_retry_allowed: true,
                 title: String::new(),
                 custom_title: None,
                 cwd: None,
@@ -506,6 +524,9 @@ impl PaneTree {
                 id: 0,
                 terminal: None,
                 host_session_id: None,
+                terminal_error: None,
+                terminal_start_request: None,
+                terminal_retry_allowed: true,
                 title: String::new(),
                 custom_title: None,
                 cwd: None,
@@ -619,6 +640,9 @@ mod tests {
             id,
             terminal: None,
             host_session_id: None,
+            terminal_error: None,
+            terminal_start_request: None,
+            terminal_retry_allowed: true,
             title: format!("Pane {}", id),
             custom_title: None,
             cwd: None,

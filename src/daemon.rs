@@ -24,14 +24,25 @@ use serde::{Deserialize, Serialize};
 use crate::pane_tree::PaneId;
 use crate::terminal_state::TerminalState;
 
-/// Bumped whenever a breaking change is made to the request/response shapes
-/// documented in `docs/daemon-protocol.md`. Additive changes (a new optional
-/// field, a new `cmd`/`event` variant) don't need a bump; a client should
-/// tolerate unknown fields and events either way.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Protocol generation used by session hosts and clients. The session-host
+/// handshake uses capabilities for command support across generations.
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const EVENT_API_VERSION: u16 = 1;
 const MAX_CAPTURE_BYTES: usize = 1_048_576;
 const EVENT_JOURNAL_CAPACITY: usize = 4096;
+
+pub(crate) fn session_host_capabilities() -> Vec<String> {
+    [
+        "close_if_idle",
+        "close_if_idle_batch",
+        "binary_snapshot_attach",
+        "attached_process_running",
+        "spawn_request_status",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
 const MAX_EVENT_PROGRAM_STATUSES: usize = 32;
 const MAX_EVENT_TEXT_BYTES: usize = 512;
 
@@ -150,6 +161,11 @@ fn event_journal() -> &'static Mutex<EventJournal> {
 fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(Default::default)
+}
+
+fn spawn_requests() -> &'static Mutex<HashMap<String, PaneId>> {
+    static REQUESTS: OnceLock<Mutex<HashMap<String, PaneId>>> = OnceLock::new();
+    REQUESTS.get_or_init(Default::default)
 }
 
 /// Called when a pane's `TerminalState` is created, so it becomes visible to
@@ -393,6 +409,10 @@ pub enum Request {
     SessionStatus {
         id: PaneId,
     },
+    /// Resolve a possibly lost `spawn` response by its client request ID.
+    SpawnStatus {
+        request_id: String,
+    },
     CloseIfIdle {
         id: PaneId,
     },
@@ -449,6 +469,8 @@ pub enum Request {
         ack: bool,
     },
     Spawn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         #[serde(default)]
         command: Option<String>,
         #[serde(default)]
@@ -674,6 +696,8 @@ pub enum Response {
     Hello {
         version: u32,
         fastty_version: String,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     /// Full session list -- the reply to `list`, and also the first thing
     /// sent after `subscribe_sessions` (as a baseline before any
@@ -788,6 +812,9 @@ pub enum Response {
         /// attached to this daemon, or when the spawn didn't ask to open).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         opened: bool,
+    },
+    SpawnStatus {
+        id: Option<PaneId>,
     },
     /// The reply to `split_pane`: the new pane's session id.
     PaneSplit {
@@ -1055,6 +1082,7 @@ mod unix_impl {
                     &Response::Hello {
                         version: PROTOCOL_VERSION,
                         fastty_version: env!("CARGO_PKG_VERSION").to_string(),
+                        capabilities: session_host_capabilities(),
                     },
                 );
             }
@@ -1126,6 +1154,14 @@ mod unix_impl {
                         );
                     }
                 }
+            }
+            Request::SpawnStatus { request_id } => {
+                let id = spawn_requests()
+                    .lock()
+                    .get(&request_id)
+                    .copied()
+                    .filter(|id| is_registered(*id));
+                send(&conn.out, &Response::SpawnStatus { id });
             }
             Request::CloseIfIdle { id } => {
                 if reject_access_scope(conn, AccessScope::Manage) {
@@ -1718,6 +1754,7 @@ mod unix_impl {
                 }
             }
             Request::Spawn {
+                request_id,
                 command,
                 args,
                 cwd,
@@ -1728,9 +1765,27 @@ mod unix_impl {
                 if reject_access_scope(conn, AccessScope::Manage) {
                     return;
                 }
-                match spawn_headless_session(command.as_deref(), &args, cwd.as_deref(), cols, rows)
+                let mut requests = spawn_requests().lock();
+                requests.retain(|_, id| is_registered(*id));
+                if let Some(id) = request_id
+                    .as_ref()
+                    .and_then(|request_id| requests.get(request_id).copied())
                 {
+                    let opened = if open {
+                        get_session(id)
+                            .map(|terminal| notify_gui_open(id, terminal))
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    send(&conn.out, &Response::Spawned { id, opened });
+                    return;
+                }
+                match spawn_headless_session(command.as_deref(), &args, cwd.as_deref(), cols, rows) {
                     Ok(id) => {
+                        if let Some(request_id) = request_id {
+                            requests.insert(request_id, id);
+                        }
                         let opened = if open {
                             get_session(id)
                                 .map(|terminal| notify_gui_open(id, terminal))
@@ -2169,6 +2224,7 @@ mod tests {
                 ack: false,
             },
             Request::Spawn {
+                request_id: None,
                 command: Some("bash".to_string()),
                 args: vec!["-l".to_string()],
                 cwd: Some("/tmp".to_string()),
@@ -2257,6 +2313,7 @@ mod tests {
                 }
                 (
                     Request::Spawn {
+                        request_id: i1,
                         command: c1,
                         args: a1,
                         cwd: cw1,
@@ -2265,6 +2322,7 @@ mod tests {
                         open: o1,
                     },
                     Request::Spawn {
+                        request_id: i2,
                         command: c2,
                         args: a2,
                         cwd: cw2,
@@ -2273,6 +2331,7 @@ mod tests {
                         open: o2,
                     },
                 ) => {
+                    assert_eq!(i1, i2);
                     assert_eq!(c1, c2);
                     assert_eq!(a1, a2);
                     assert_eq!(cw1, cw2);
@@ -2440,6 +2499,12 @@ mod tests {
         let mut line = String::new();
         client_reader.read_line(&mut line).unwrap();
         assert!(line.contains(r#""event":"hello""#));
+        let hello: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(hello["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "close_if_idle"));
 
         // 2. Try to disable read_only with Hello { read_only: false } -> should remain sticky true
         handle_request(Request::Hello { read_only: false }, &mut conn);
@@ -2474,6 +2539,7 @@ mod tests {
         // 4. Spawn command rejected with code "read_only"
         handle_request(
             Request::Spawn {
+                request_id: None,
                 command: None,
                 args: vec![],
                 cwd: None,

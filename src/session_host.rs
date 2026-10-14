@@ -3,6 +3,83 @@
 use crate::daemon::{AttachMode, BlockedSession, Request, Response, SessionInfo};
 use std::io::{BufRead, BufReader, Write};
 
+#[derive(Debug)]
+pub struct SpawnAttachError {
+    pub session_id: Option<usize>,
+    pub retry_safe: bool,
+    pub message: String,
+}
+
+impl std::fmt::Display for SpawnAttachError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SpawnAttachError {}
+
+impl From<String> for SpawnAttachError {
+    fn from(message: String) -> Self {
+        Self {
+            session_id: None,
+            retry_safe: true,
+            message,
+        }
+    }
+}
+
+impl SpawnAttachError {
+    pub fn ambiguous(message: String) -> Self {
+        Self {
+            session_id: None,
+            retry_safe: false,
+            message: format!("{message}; the session may still be running"),
+        }
+    }
+
+    pub fn orphaned_session(session_id: usize, message: String) -> Self {
+        Self {
+            session_id: Some(session_id),
+            retry_safe: false,
+            message: format!("{message}; session {session_id} may still be running"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HostInfo {
+    version: u32,
+    fastty_version: String,
+    capabilities: Vec<String>,
+}
+
+impl HostInfo {
+    fn supports(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|item| item == capability)
+    }
+}
+
+static HOST_INFO: std::sync::OnceLock<std::sync::Mutex<Option<HostInfo>>> =
+    std::sync::OnceLock::new();
+
+fn remember_host_info(info: HostInfo) -> bool {
+    let cache = HOST_INFO.get_or_init(|| std::sync::Mutex::new(None));
+    let mut cached = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let changed = cached.as_ref() != Some(&info);
+    *cached = Some(info);
+    changed
+}
+
+fn forget_host_info() {
+    if let Some(cache) = HOST_INFO.get() {
+        *cache.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    }
+}
+
+fn host_info() -> Option<HostInfo> {
+    HOST_INFO.get().and_then(|cache| cache.lock().ok()?.clone())
+}
+
 #[cfg(unix)]
 fn connect_for_handshake() -> Result<std::os::unix::net::UnixStream, String> {
     use std::time::Duration;
@@ -18,6 +95,25 @@ fn connect_for_handshake() -> Result<std::os::unix::net::UnixStream, String> {
     Ok(stream)
 }
 
+#[cfg(unix)]
+fn probe_host(mut stream: std::os::unix::net::UnixStream) -> Result<HostInfo, String> {
+    write_request(&mut stream, &Request::Hello { read_only: true })
+        .map_err(|error| error.to_string())?;
+    match read_response(&mut BufReader::new(stream))? {
+        Response::Hello {
+            version,
+            fastty_version,
+            capabilities,
+        } => Ok(HostInfo {
+            version,
+            fastty_version,
+            capabilities,
+        }),
+        Response::Error { code, message } => Err(format!("{code}: {message}")),
+        other => Err(format!("unexpected session-host hello response: {other:?}")),
+    }
+}
+
 const HOST_ARGUMENT: &str = "--fastty-session-host";
 
 #[cfg(unix)]
@@ -28,6 +124,31 @@ pub fn ensure_running() -> Result<(), String> {
 
     let path = crate::daemon::socket_path();
     if UnixStream::connect(&path).is_ok() {
+        if let Ok(stream) = connect_for_handshake() {
+            match probe_host(stream) {
+                Ok(info) => {
+                    let changed = remember_host_info(info.clone());
+                    if changed
+                        && (info.fastty_version != env!("CARGO_PKG_VERSION")
+                            || info.version != crate::daemon::PROTOCOL_VERSION)
+                    {
+                        eprintln!(
+                            "Fastty session host differs from this app: app={}, host={}, protocol={}, capabilities={:?}",
+                            env!("CARGO_PKG_VERSION"),
+                            info.fastty_version,
+                            info.version,
+                            info.capabilities
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    forget_host_info();
+                    eprintln!("Fastty session host hello failed: {error}");
+                    return Ok(());
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -42,8 +163,11 @@ pub fn ensure_running() -> Result<(), String> {
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if UnixStream::connect(&path).is_ok() {
-            return Ok(());
+        if let Ok(stream) = connect_for_handshake() {
+            if let Ok(info) = probe_host(stream) {
+                remember_host_info(info);
+                return Ok(());
+            }
         }
         if Instant::now() >= deadline {
             return Err(format!(
@@ -113,6 +237,11 @@ impl RemoteControl {
     pub fn detach(&self) {}
 
     pub fn stop(&self) {}
+
+    pub fn stop_with_result(&self) -> Result<(), String> {
+        self.stop();
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -157,6 +286,9 @@ pub enum CloseIfIdleBatchResult {
 #[cfg(unix)]
 pub fn close_if_idle_batch(ids: Vec<usize>) -> Result<CloseIfIdleBatchResult, String> {
     ensure_running()?;
+    if host_info().is_some_and(|info| !info.supports("close_if_idle_batch")) {
+        return Err(legacy_batch_close_error());
+    }
     let mut stream = connect_for_handshake()?;
     write_request(&mut stream, &Request::CloseIfIdleBatch { ids })
         .map_err(|error| error.to_string())?;
@@ -169,7 +301,7 @@ pub fn close_if_idle_batch(ids: Vec<usize>) -> Result<CloseIfIdleBatchResult, St
             if code == "bad_request"
                 && message.contains("unknown variant `close_if_idle_batch`") =>
         {
-            Err(legacy_safe_close_error())
+            Err(legacy_batch_close_error())
         }
         Response::Error { code, message } => Err(format!("{code}: {message}")),
         other => Err(format!("unexpected batch close response: {other:?}")),
@@ -184,6 +316,9 @@ pub fn close_if_idle_batch(_ids: Vec<usize>) -> Result<CloseIfIdleBatchResult, S
 #[cfg(unix)]
 pub fn close_if_idle(id: usize) -> Result<CloseIfIdleResult, String> {
     ensure_running()?;
+    if host_info().is_some_and(|info| !info.supports("close_if_idle")) {
+        return close_if_idle_on_legacy_host(id);
+    }
     let mut stream = connect_for_handshake()?;
     write_request(&mut stream, &Request::CloseIfIdle { id })
         .map_err(|error| error.to_string())?;
@@ -199,15 +334,45 @@ pub fn close_if_idle(id: usize) -> Result<CloseIfIdleResult, String> {
         Response::Error { code, message }
             if code == "bad_request" && message.contains("unknown variant `close_if_idle`") =>
         {
-            Err(legacy_safe_close_error())
+            close_if_idle_on_legacy_host(id)
         }
         Response::Error { code, message } => Err(format!("{code}: {message}")),
         other => Err(format!("unexpected close response: {other:?}")),
     }
 }
 
-fn legacy_safe_close_error() -> String {
-    "the Fastty session host is older than this app and cannot close idle sessions safely. Quit Fastty, including its background process, then reopen it.".to_string()
+#[cfg(unix)]
+fn close_if_idle_on_legacy_host(id: usize) -> Result<CloseIfIdleResult, String> {
+    close_legacy_session_if_idle(
+        id,
+        session_process_status,
+        force_close_session,
+    )
+}
+
+fn close_legacy_session_if_idle(
+    id: usize,
+    status: impl FnOnce(usize) -> Result<(bool, Option<String>), String>,
+    close: impl FnOnce(usize) -> Result<(), String>,
+) -> Result<CloseIfIdleResult, String> {
+    match status(id) {
+        Ok((true, process_name)) => Ok(CloseIfIdleResult::Running(process_name)),
+        Ok((false, _)) => {
+            // Old hosts cannot make this status check and close atomic. Only
+            // close after the host reports that the foreground process is idle.
+            close(id)
+                .map(|()| CloseIfIdleResult::Closed)
+                .map_err(|error| format!("legacy idle close failed: {error}"))
+        }
+        Err(error) if error.starts_with("no_such_session:") => Ok(CloseIfIdleResult::Closed),
+        Err(error) => Err(format!(
+            "cannot verify that legacy host session {id} is idle. The tab stays open: {error}"
+        )),
+    }
+}
+
+fn legacy_batch_close_error() -> String {
+    "the session host cannot close several tabs as one safe operation. Close tabs one at a time.".to_string()
 }
 
 #[cfg(not(unix))]
@@ -265,14 +430,19 @@ impl RemoteControl {
     }
 
     pub fn stop(&self) {
+        let _ = self.stop_with_result();
+    }
+
+    pub fn stop_with_result(&self) -> Result<(), String> {
         if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return;
+            return Ok(());
         }
-        let _ = self.send(&Request::Close {
+        let result = self.send(&Request::Close {
             id: self.id,
             force: true,
-        });
+        }).map_err(|error| error.to_string());
         self.shutdown();
+        result
     }
 
     fn shutdown(&self) {
@@ -318,12 +488,15 @@ pub fn spawn_attached(
     cwd: Option<&str>,
     cols: usize,
     rows: usize,
-) -> Result<RemoteSession, String> {
-    ensure_running()?;
+) -> Result<RemoteSession, SpawnAttachError> {
+    ensure_running().map_err(SpawnAttachError::from)?;
+    let spawn_started = std::time::Instant::now();
+    let request_id = next_spawn_request_id();
     let mut stream = connect_for_handshake()?;
-    write_request(
+    let spawn_response = write_request(
         &mut stream,
         &Request::Spawn {
+            request_id: Some(request_id.clone()),
             command: Some(command.to_string()),
             args: args.to_vec(),
             cwd: cwd.map(str::to_string),
@@ -331,60 +504,137 @@ pub fn spawn_attached(
             rows: Some(rows),
             open: false,
         },
-    )
-    .map_err(|error| error.to_string())?;
-    let mut spawn_reader = BufReader::new(stream);
-    let id = match read_response(&mut spawn_reader)? {
-        Response::Spawned { id, .. } => id,
-        Response::Error { code, message } => return Err(format!("{code}: {message}")),
-        other => return Err(format!("unexpected spawn response: {other:?}")),
+    );
+    let id = match spawn_response {
+        Err(error) => resolve_ambiguous_spawn(&request_id)
+            .map_err(|_| SpawnAttachError::ambiguous(error.to_string()))?,
+        Ok(()) => match read_response(&mut BufReader::new(stream)) {
+            Ok(Response::Spawned { id, .. }) => id,
+            Ok(Response::Error { code, message }) => {
+                return Err(SpawnAttachError::from(format!("{code}: {message}")));
+            }
+            Ok(other) => resolve_ambiguous_spawn(&request_id).map_err(|_| {
+                SpawnAttachError::ambiguous(format!("unexpected spawn response: {other:?}"))
+            })?,
+            Err(error) => resolve_ambiguous_spawn(&request_id)
+                .map_err(|_| SpawnAttachError::ambiguous(error))?,
+        },
     };
+    eprintln!(
+        "Fastty session host spawn complete: session_id={id}, elapsed_ms={}",
+        spawn_started.elapsed().as_millis()
+    );
 
+    let attach_started = std::time::Instant::now();
+    let attached = (|| -> Result<RemoteSession, String> {
+        let mut stream = connect_for_handshake()?;
+        write_request(
+            &mut stream,
+            &Request::Attach {
+                id,
+                mode: AttachMode::ReadWrite,
+                binary_snapshot: false,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let control_stream = stream.try_clone().map_err(|error| error.to_string())?;
+        let mut reader = BufReader::new(stream);
+        let (program_status, process_running) = match read_response(&mut reader)? {
+            Response::Attached {
+                program_status,
+                process_running,
+                ..
+            } => (program_status, process_running),
+            Response::Error { code, message } => return Err(format!("{code}: {message}")),
+            other => return Err(format!("unexpected attach response: {other:?}")),
+        };
+        let snapshot = match read_response(&mut reader)? {
+            Response::Snapshot { data, .. } => crate::daemon::base64_decode(&data)
+                .ok_or_else(|| "session host sent an invalid snapshot".to_string())?,
+            Response::Error { code, message } => return Err(format!("{code}: {message}")),
+            other => return Err(format!("unexpected snapshot response: {other:?}")),
+        };
+        eprintln!(
+            "Fastty session host attach complete: session_id={id}, snapshot_bytes={}, elapsed_ms={}",
+            snapshot.len(),
+            attach_started.elapsed().as_millis()
+        );
+        reader
+            .get_mut()
+            .set_read_timeout(None)
+            .map_err(|error| error.to_string())?;
+        Ok(RemoteSession {
+            id,
+            snapshot,
+            program_status,
+            process_running,
+            restore_legacy_mouse_modes: false,
+            reader,
+            control: std::sync::Arc::new(RemoteControl {
+                id,
+                stream: std::sync::Mutex::new(control_stream),
+                closed: std::sync::atomic::AtomicBool::new(false),
+            }),
+        })
+    })();
+    attached.map_err(|message| {
+        let cleanup = force_close_session(id).err();
+        SpawnAttachError {
+            session_id: cleanup.as_ref().map(|_| id),
+            retry_safe: true,
+            message: match cleanup {
+            Some(cleanup_error) => {
+                format!("{message}; session {id} could not be stopped: {cleanup_error}")
+            }
+                None => message,
+            },
+        }
+    })
+}
+
+#[cfg(unix)]
+fn next_spawn_request_id() -> String {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!(
+        "{}-{timestamp}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+#[cfg(unix)]
+fn resolve_ambiguous_spawn(request_id: &str) -> Result<usize, String> {
+    ensure_running()?;
     let mut stream = connect_for_handshake()?;
     write_request(
         &mut stream,
-        &Request::Attach {
-            id,
-            mode: AttachMode::ReadWrite,
-            binary_snapshot: false,
+        &Request::SpawnStatus {
+            request_id: request_id.to_string(),
         },
     )
     .map_err(|error| error.to_string())?;
-    let control_stream = stream.try_clone().map_err(|error| error.to_string())?;
-    let mut reader = BufReader::new(stream);
-    let (program_status, process_running) = match read_response(&mut reader)? {
-        Response::Attached {
-            program_status,
-            process_running,
-            ..
-        } => (program_status, process_running),
-        Response::Error { code, message } => return Err(format!("{code}: {message}")),
-        other => return Err(format!("unexpected attach response: {other:?}")),
-    };
-    let snapshot = match read_response(&mut reader)? {
-        Response::Snapshot { data, .. } => crate::daemon::base64_decode(&data)
-            .ok_or_else(|| "session host sent an invalid snapshot".to_string())?,
-        Response::Error { code, message } => return Err(format!("{code}: {message}")),
-        other => return Err(format!("unexpected snapshot response: {other:?}")),
-    };
-    reader
-        .get_mut()
-        .set_read_timeout(None)
-        .map_err(|error| error.to_string())?;
+    match read_response(&mut BufReader::new(stream))? {
+        Response::SpawnStatus { id: Some(id) } => Ok(id),
+        Response::SpawnStatus { id: None } => Err("host has no record of this spawn request".into()),
+        Response::Error { code, message } => Err(format!("{code}: {message}")),
+        other => Err(format!("unexpected spawn-status response: {other:?}")),
+    }
+}
 
-    Ok(RemoteSession {
-        id,
-        snapshot,
-        program_status,
-        process_running,
-        restore_legacy_mouse_modes: false,
-        reader,
-        control: std::sync::Arc::new(RemoteControl {
-            id,
-            stream: std::sync::Mutex::new(control_stream),
-            closed: std::sync::atomic::AtomicBool::new(false),
-        }),
-    })
+#[cfg(unix)]
+fn force_close_session(id: usize) -> Result<(), String> {
+    let mut stream = connect_for_handshake()?;
+    write_request(&mut stream, &Request::Close { id, force: true })
+        .map_err(|error| error.to_string())?;
+    match read_response(&mut BufReader::new(stream))? {
+        Response::Closed { .. } => Ok(()),
+        Response::Error { code, .. } if code == "no_such_session" => Ok(()),
+        Response::Error { code, message } => Err(format!("{code}: {message}")),
+        other => Err(format!("unexpected close response: {other:?}")),
+    }
 }
 
 #[cfg(unix)]
@@ -613,6 +863,107 @@ mod tests {
         assert!(!legacy_session_needs_mouse_modes(&legacy_session(
             "zsh", true
         )));
+    }
+
+    #[test]
+    fn legacy_idle_close_checks_status_before_force_close() {
+        let close_called = std::cell::Cell::new(false);
+        let active = close_legacy_session_if_idle(
+            17,
+            |_| Ok((true, Some("opencode".to_string()))),
+            |_| {
+                close_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(active, CloseIfIdleResult::Running(Some(label)) if label == "opencode"));
+        assert!(!close_called.get());
+
+        let idle = close_legacy_session_if_idle(
+            17,
+            |_| Ok((false, None)),
+            |_| {
+                close_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(idle, CloseIfIdleResult::Closed));
+        assert!(close_called.get());
+
+        close_called.set(false);
+        let unknown = close_legacy_session_if_idle(
+            17,
+            |_| Err("legacy host returned an unknown process name".to_string()),
+            |_| {
+                close_called.set(true);
+                Ok(())
+            },
+        );
+        assert!(unknown.is_err());
+        assert!(!close_called.get());
+    }
+
+    #[test]
+    fn old_host_hello_without_capabilities_is_detected_as_legacy() {
+        let response: Response =
+            serde_json::from_str(r#"{"event":"hello","version":1,"fastty_version":"0.22.6"}"#)
+                .unwrap();
+        let Response::Hello {
+            version,
+            fastty_version,
+            capabilities,
+        } = response
+        else {
+            panic!("expected hello response");
+        };
+        let info = HostInfo {
+            version,
+            fastty_version,
+            capabilities,
+        };
+        assert_eq!(info.fastty_version, "0.22.6");
+        assert!(!info.supports("close_if_idle"));
+    }
+
+    #[test]
+    fn handshake_reads_version_from_a_legacy_host() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let responder = std::thread::spawn(move || {
+            let read_end = server.try_clone().unwrap();
+            let mut request = String::new();
+            BufReader::new(read_end).read_line(&mut request).unwrap();
+            assert!(request.contains(r#""cmd":"hello""#));
+            server
+                .write_all(b"{\"event\":\"hello\",\"version\":1,\"fastty_version\":\"0.22.6\"}\n")
+                .unwrap();
+        });
+
+        let info = probe_host(client).unwrap();
+        responder.join().unwrap();
+        assert_eq!(info.fastty_version, "0.22.6");
+        assert!(!info.supports("close_if_idle"));
+    }
+
+    #[test]
+    fn current_host_hello_advertises_safe_close_capabilities() {
+        let capabilities = crate::daemon::session_host_capabilities();
+        let info = HostInfo {
+            version: crate::daemon::PROTOCOL_VERSION,
+            fastty_version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities,
+        };
+        assert!(info.supports("close_if_idle"));
+        assert!(info.supports("close_if_idle_batch"));
+    }
+
+    #[test]
+    fn ambiguous_spawn_error_disables_fresh_start_retry() {
+        let error = SpawnAttachError::ambiguous("host disconnected".into());
+        assert_eq!(error.session_id, None);
+        assert!(!error.retry_safe);
+        assert!(error.message.contains("session may still be running"));
     }
 
     #[test]
@@ -945,7 +1296,12 @@ mod tests {
         );
 
         let resumed = attach(session_id).expect("reattach after GUI driver exit");
-        let snapshot = String::from_utf8_lossy(&resumed.snapshot);
+        let (_, cells) = crate::server::binary_snapshot::decode_snapshot(&resumed.snapshot)
+            .expect("reattach snapshot uses the requested binary format");
+        let snapshot: String = cells
+            .iter()
+            .filter_map(|cell| char::from_u32(cell.c))
+            .collect();
         assert!(
             snapshot.contains("output-after-detach-marker"),
             "reattach snapshot contains output produced after GUI driver exit"

@@ -327,6 +327,7 @@ impl ImageStore {
 pub struct TerminalState {
     term: Arc<ParkingMutex<alacritty_terminal::term::Term<EventListenerProxy>>>,
     render_generation: Arc<AtomicU64>,
+    remote_resize_sender: Option<async_channel::Sender<(usize, usize)>>,
     writer: Arc<ParkingMutex<Box<dyn Write + Send>>>,
     master: Arc<ParkingMutex<Box<dyn MasterPty + Send>>>,
     shell_pid: Option<u32>,
@@ -464,11 +465,84 @@ fn is_missing_host_session_error(error: &str) -> bool {
     error.starts_with("no_such_session: ")
 }
 
-struct RemoteInputWriter(Arc<crate::session_host::RemoteControl>);
+struct RemoteInputWriter {
+    sender: std::sync::mpsc::SyncSender<Vec<u8>>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+    queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    warned_queue_full: bool,
+}
+
+const REMOTE_WRITE_QUEUE_CAPACITY: usize = 128;
+const REMOTE_WRITE_QUEUE_BYTE_LIMIT: usize = 4 * 1024 * 1024;
+
+fn remote_worker_start_error(
+    remote_control: Option<&Arc<crate::session_host::RemoteControl>>,
+    session_id: Option<usize>,
+    spawned_here: bool,
+    error: std::io::Error,
+) -> anyhow::Error {
+    let message = format!("could not start session worker: {error}");
+    if spawned_here {
+        if let (Some(remote), Some(session_id)) = (remote_control, session_id) {
+            if let Err(cleanup_error) = remote.stop_with_result() {
+                return anyhow::Error::new(
+                    crate::session_host::SpawnAttachError::orphaned_session(
+                        session_id,
+                        format!("{message}; cleanup failed: {cleanup_error}"),
+                    ),
+                );
+            }
+        }
+    }
+    anyhow::Error::msg(message)
+}
 
 impl Write for RemoteInputWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.write(bytes)?;
+        if self.failed.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "session host writer stopped",
+            ));
+        }
+        let len = bytes.len();
+        let reservation = self.queued_bytes.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |queued| queued.checked_add(len).filter(|total| *total <= REMOTE_WRITE_QUEUE_BYTE_LIMIT),
+        );
+        if reservation.is_err() {
+            if !self.warned_queue_full {
+                eprintln!("Fastty session input write queue is full; dropping terminal response");
+                self.warned_queue_full = true;
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "session host write queue is full",
+            ));
+        }
+        match self.sender.try_send(bytes.to_vec()) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                if !self.warned_queue_full {
+                    eprintln!("Fastty session input write queue is full; dropping terminal response");
+                    self.warned_queue_full = true;
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "session host write queue is full",
+                ));
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                self.queued_bytes.fetch_sub(len, Ordering::AcqRel);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "session host writer stopped",
+                ));
+            }
+        }
+        self.warned_queue_full = false;
         Ok(bytes.len())
     }
 
@@ -529,6 +603,7 @@ impl TerminalState {
             viewport_height,
             sender,
             None,
+            false,
         )
     }
 
@@ -548,7 +623,7 @@ impl TerminalState {
         let cols = ((viewport_width as usize) / (cell_width as usize).max(1)).max(80);
         let rows = ((viewport_height as usize) / (cell_height as usize).max(1)).max(24);
         let remote = crate::session_host::spawn_attached(executable, exec_args, cwd, cols, rows)
-            .map_err(anyhow::Error::msg)?;
+            .map_err(anyhow::Error::new)?;
         Self::new_internal(
             executable,
             exec_args,
@@ -561,6 +636,7 @@ impl TerminalState {
             viewport_height,
             sender,
             Some(remote),
+            true,
         )
     }
 
@@ -655,6 +731,7 @@ impl TerminalState {
             viewport_height,
             sender,
             Some(remote),
+            false,
         )?;
         if !terminal.program_status_snapshot().is_empty() {
             terminal.program_status_pending.store(true, Ordering::Relaxed);
@@ -679,6 +756,7 @@ impl TerminalState {
         viewport_height: f32,
         sender: crate::event_listener::EventSender,
         remote: Option<crate::session_host::RemoteSession>,
+        spawned_here: bool,
     ) -> anyhow::Result<Self> {
         let restored_idle_session = remote
             .as_ref()
@@ -947,7 +1025,42 @@ impl TerminalState {
             .expect("Failed to clone reader");
 
         let writer_boxed: Box<dyn Write + Send> = match &remote_control {
-            Some(control) => Box::new(RemoteInputWriter(Arc::clone(control))),
+            Some(control) => {
+                let (sender, receiver) =
+                    std::sync::mpsc::sync_channel::<Vec<u8>>(REMOTE_WRITE_QUEUE_CAPACITY);
+                let control = Arc::clone(control);
+                let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let worker_failed = Arc::clone(&failed);
+                let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let worker_queued_bytes = Arc::clone(&queued_bytes);
+                let worker = std::thread::Builder::new()
+                    .name("fastty-session-writer".into())
+                    .spawn(move || {
+                        while let Ok(bytes) = receiver.recv() {
+                            let result = control.write(&bytes);
+                            worker_queued_bytes.fetch_sub(bytes.len(), Ordering::AcqRel);
+                            if let Err(error) = result {
+                                worker_failed.store(true, Ordering::Release);
+                                eprintln!("Fastty session input write failed: {error}");
+                                break;
+                            }
+                        }
+                    });
+                if let Err(error) = worker {
+                    return Err(remote_worker_start_error(
+                        remote_control.as_ref(),
+                        remote_session_id,
+                        spawned_here,
+                        error,
+                    ));
+                }
+                Box::new(RemoteInputWriter {
+                    sender,
+                    failed,
+                    queued_bytes,
+                    warned_queue_full: false,
+                })
+            }
             None => Box::new(
                 master_arc
                     .lock()
@@ -1730,9 +1843,36 @@ impl TerminalState {
         #[cfg(not(unix))]
         drop(remote);
 
+        let remote_resize_sender = if let Some(remote) = remote_control.as_ref() {
+            let worker_remote = Arc::clone(remote);
+            let (sender, receiver) = async_channel::unbounded::<(usize, usize)>();
+            let worker = thread::Builder::new()
+                .name("fastty-session-resize".into())
+                .spawn(move || {
+                    while let Ok(mut size) = receiver.recv_blocking() {
+                        while let Ok(latest) = receiver.try_recv() {
+                            size = latest;
+                        }
+                        worker_remote.resize(size.0, size.1);
+                    }
+                });
+            if let Err(error) = worker {
+                return Err(remote_worker_start_error(
+                    remote_control.as_ref(),
+                    remote_session_id,
+                    spawned_here,
+                    error,
+                ));
+            }
+            Some(sender)
+        } else {
+            None
+        };
+
         Ok(Self {
             term,
             render_generation,
+            remote_resize_sender,
             writer: writer_arc,
             master: master_arc,
             shell_pid,
@@ -2098,12 +2238,18 @@ pub struct PreviewLine {
 
 impl TerminalState {
     pub fn write_to_pty(&self, bytes: &[u8]) {
-        let mut w = self.writer.lock();
         if self.has_terminated.load(Ordering::SeqCst) {
             return;
         }
-        let _ = w.write_all(bytes);
-        let _ = w.flush();
+        if let Some(remote) = &self.remote_control {
+            if let Err(error) = remote.write(bytes) {
+                eprintln!("Fastty session input write failed: {error}");
+            }
+        } else {
+            let mut w = self.writer.lock();
+            let _ = w.write_all(bytes);
+            let _ = w.flush();
+        }
     }
 
     pub fn update_scrollback(&self, scrollback: usize) {
@@ -2301,6 +2447,46 @@ impl TerminalState {
         self.render_generation.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn try_resize_with_pixels(
+        &self,
+        cols: usize,
+        rows: usize,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> bool {
+        if cols == 0 || rows == 0 {
+            return true;
+        }
+        let Some(master) = self.master.try_lock() else {
+            return false;
+        };
+        let Some(mut term) = self.term.try_lock() else {
+            return false;
+        };
+        let cur_cols = term.grid().columns();
+        let cur_rows = term.grid().screen_lines();
+        if cur_cols == cols && cur_rows == rows {
+            return true;
+        }
+        term.resize(TermSize::new(cols, rows));
+        drop(term);
+        master
+            .resize(PtySize {
+                rows: rows as u16,
+                cols: cols as u16,
+                pixel_width,
+                pixel_height,
+            })
+            .ok();
+        drop(master);
+
+        if let Some(sender) = &self.remote_resize_sender {
+            let _ = sender.try_send((cols, rows));
+        }
+        self.render_generation.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     pub fn scroll(&self, delta: isize) {
         let mut term = self.term.lock();
         use alacritty_terminal::grid::Scroll;
@@ -2351,6 +2537,12 @@ impl TerminalState {
     pub fn display_offset(&self) -> usize {
         let term = self.term.lock();
         term.grid().display_offset()
+    }
+
+    pub fn try_history_metrics(&self) -> Option<(usize, usize)> {
+        use alacritty_terminal::grid::Dimensions;
+        let term = self.term.try_lock()?;
+        Some((term.history_size(), term.grid().display_offset()))
     }
 
     /// Cursor position in visible screen cells: (line from top, column).
@@ -3951,6 +4143,55 @@ mod tests {
     fn run(bytes: &[u8]) -> Vec<CsiEvent> {
         let mut w = CsiWatcher::new();
         bytes.iter().filter_map(|&b| w.feed(b)).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_resize_returns_without_waiting_for_the_terminal_lock() {
+        let terminal = TerminalState::new_headless("/bin/sh", &[], None, 80, 24)
+            .expect("create terminal for resize test");
+        let term = terminal.term();
+        let guard = term.lock();
+        let started = std::time::Instant::now();
+        assert!(!terminal.try_resize_with_pixels(100, 30, 800, 480));
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        drop(guard);
+
+        assert!(terminal.try_resize_with_pixels(100, 30, 800, 480));
+        assert_eq!(terminal.dimensions(), (100, 30));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_history_metrics_returns_without_waiting_for_the_terminal_lock() {
+        let terminal = TerminalState::new_headless("/bin/sh", &[], None, 80, 24)
+            .expect("create terminal for history metrics test");
+        let term = terminal.term();
+        let guard = term.lock();
+        let started = std::time::Instant::now();
+        assert_eq!(terminal.try_history_metrics(), None);
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        drop(guard);
+
+        assert_eq!(terminal.try_history_metrics(), Some((0, 0)));
+    }
+
+    #[test]
+    fn remote_input_queue_rejects_writes_without_blocking_when_full() {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(0);
+        let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut writer = RemoteInputWriter {
+            sender,
+            failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            queued_bytes: Arc::clone(&queued_bytes),
+            warned_queue_full: false,
+        };
+
+        let started = std::time::Instant::now();
+        let error = writer.write(b"response").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(queued_bytes.load(Ordering::Acquire), 0);
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
     }
 
     #[test]

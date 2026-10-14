@@ -1,4 +1,4 @@
-# fasttyd — protocolo del daemon local (v1)
+# fasttyd — protocolo del daemon local (v2)
 
 Implementación: `src/daemon.rs`. Expone el control y la observación local de
 sesiones de Fastty sin quitarle la pestaña a la ventana GPUI.
@@ -44,6 +44,7 @@ Un objeto JSON por línea (`\n`-terminated) en ambas direcciones.
 {"cmd": "external_action", "id": 1, "action": {"action": "close"}}
 {"cmd": "resize", "id": 1, "cols": 80, "rows": 24}
 {"cmd": "spawn", "command": "zsh", "args": ["-l"], "cwd": "/home/user", "cols": 80, "rows": 24, "open": true}
+{"cmd": "spawn_status", "request_id": "<client request ID>"}
 {"cmd": "close", "id": 1}
 {"cmd": "close", "id": 1, "force": true}
 {"cmd": "split_pane", "id": 1, "direction": "right", "cwd": "/home/user"}
@@ -67,6 +68,14 @@ it stops any session. It returns `close_batch` with all `closed_ids` when every
 session is idle. If any session has a foreground command, it stops none and
 returns the blocked session IDs and command labels.
 
+The `hello` response reports the protocol version, Fastty version, and optional
+capabilities. A client must check capabilities before it sends newer commands.
+When an older host does not support `close_if_idle`, Fastty checks process status
+and sends `close` with `force: true` only when the host reports no foreground
+process. The old protocol cannot make these two requests atomic, so a process
+that starts between them can still be stopped. Fastty does not use this fallback
+for batch close because separate checks could close only part of the batch.
+
 `attach` sends an ANSI snapshot by default. Set `binary_snapshot` to `true` to
 get a compressed FST1 snapshot with scrollback in the `snapshot` event. The
 attach snapshot keeps the newest history that fits in 16 MiB of cells. The
@@ -79,6 +88,10 @@ field is optional so older clients keep the ANSI format.
   el campo opcional `"read_only": true` para fijar la conexión completa en modo
   solo-lectura (sticky). En una conexión `read_only`, cualquier llamada a `write`,
   `spawn` o `close` es rechazada con código de error `"read_only"`.
+  La respuesta incluye `fastty_version` y `capabilities`. Clientes antiguos pueden
+  omitir `capabilities`. Los clientes deben usar esta lista para detectar comandos
+  opcionales y mantener sesiones cuando el host no los admite. Una versión distinta
+  de Fastty no implica por sí sola que el host sea incompatible.
 - `set_access_scope` limita la conexión a `observe`, `interact` o `manage`.
   La conexión puede bajar su permiso, nunca subirlo. `observe` permite leer.
   `interact` permite enviar texto y redimensionar una terminal. `manage`
@@ -120,7 +133,8 @@ field is optional so older clients keep the ANSI format.
   a la misma sesión desde otra conexión.
 - `resize`: actualiza dinámicamente las dimensiones en columnas y filas de la
   terminal (`cols`, `rows`) y emite `SIGWINCH` en el kernel PTY.
-- `spawn`: crea una nueva sesión de terminal headless/remota y devuelve `{"event": "spawned", "id": <id>, "opened": <bool>}`. Con `"open": true` la sesión además se abre como un tab visible en la ventana de fastty; `"opened"` en la respuesta indica si eso sucedió (`false` cuando no hay ventana corriendo o no se pidió `open`). La sesión sigue siendo la misma — mismo `id`, cerrable vía `close` — y el renderizado la redimensiona a la geometría real del tab.
+- `spawn`: crea una nueva sesión de terminal headless/remota y devuelve `{"event": "spawned", "id": <id>, "opened": <bool>}`. El campo opcional `request_id` hace que los reintentos de la misma solicitud devuelvan el mismo ID. Con `"open": true` la sesión además se abre como un tab visible en la ventana de fastty; `"opened"` en la respuesta indica si eso sucedió (`false` cuando no hay ventana corriendo o no se pidió `open`). La sesión sigue siendo la misma — mismo `id`, cerrable vía `close` — y el renderizado la redimensiona a la geometría real del tab.
+- `spawn_status`: busca el resultado de un `spawn` por su `request_id`. Fastty usa este comando si pierde la respuesta inicial, para recuperar el ID sin crear una segunda sesión. Los hosts antiguos pueden no tener este comando.
 - `close`: cierra y desregistra la sesión especificada por `id`. Las sesiones headless (creadas vía `spawn`, con o sin `open`) se cierran directo. Las sesiones GUI abiertas por el usuario en la ventana devuelven error `not_closable` — son tabs del usuario — salvo que se mande `"force": true`, que mata su proceso (igual que cerrar el tab en la ventana) y la desregistra.
 - `split_pane`: parte un pane visible de la ventana creando un pane nuevo a su lado (mismo tab, `"direction"`: `left`/`right`/`top`/`down`) y devuelve `{"event": "pane_split", "id": <nuevo id>}`. El pane nuevo es una sesión GUI normal (list/write/close funcionan). `command`/`args`/`cwd` opcionales (por defecto el shell del usuario y el cwd del pane objetivo). Sin ventana corriendo: error `no_gui`.
 - `resize_pane`: mueve el divisor del lado indicado (`"direction"`) del pane, `delta` es una fracción del eje del split (default 0.05, se clampea a ±0.5). Responde `done` con `cmd: "resize_pane"`.
@@ -132,11 +146,12 @@ field is optional so older clients keep the ANSI format.
 ### Responses (daemon → cliente)
 
 ```jsonc
-{"event": "hello", "version": 1, "fastty_version": "0.7.6"}
+{"event": "hello", "version": 2, "fastty_version": "0.22.9", "capabilities": ["close_if_idle", "close_if_idle_batch", "binary_snapshot_attach", "attached_process_running", "spawn_request_status"]}
 {"event": "sessions", "sessions": [
   {"id": 1, "title": "zsh", "cwd": "/Users/you", "cols": 89, "rows": 32, "alive": true, "history_size": 0}
 ]}
 {"event": "session_status", "alive": true, "process_running": true, "foreground_process_label": "claude"}
+{"event": "spawn_status", "id": 42}
 {"event": "session_added", "session": {"id": 2, "title": "zsh", "cwd": "/tmp", "cols": 89, "rows": 32, "alive": true, "history_size": 0}}
 {"event": "session_removed", "id": 2}
 {"event": "session_updated", "session": {"id": 1, "title": "vim", "cwd": "/Users/you", "cols": 89, "rows": 32, "alive": true, "history_size": 120}}

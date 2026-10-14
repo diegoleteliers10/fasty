@@ -747,6 +747,7 @@ pub fn run_spawn_command(
             }
         };
         let req = Request::Spawn {
+            request_id: None,
             command,
             args,
             cwd,

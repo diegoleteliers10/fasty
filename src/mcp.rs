@@ -344,7 +344,7 @@ fn call_tool(name: &str, args: &Value) -> Result<String, String> {
             let cols = args.get("cols").and_then(Value::as_u64).map(|v| v as usize);
             let rows = args.get("rows").and_then(Value::as_u64).map(|v| v as usize);
             let open = args.get("open").and_then(Value::as_bool).unwrap_or(true);
-            match send_and_read(&Request::Spawn { command: command.map(str::to_string), args: tool_args, cwd: cwd.map(str::to_string), cols, rows, open })? {
+            match send_and_read(&Request::Spawn { request_id: None, command: command.map(str::to_string), args: tool_args, cwd: cwd.map(str::to_string), cols, rows, open })? {
                 Response::Spawned { id, opened } => Ok(json!({
                     "id": id,
                     "note": if open && opened {
@@ -522,6 +522,7 @@ fn run_command(command: &str, cwd: Option<&str>, timeout_ms: u64) -> Result<Stri
     let (shell, shell_args) = (shell.as_str(), shell_args);
 
     let id = match send_and_read(&Request::Spawn {
+        request_id: None,
         command: Some(shell.to_string()),
         args: shell_args,
         cwd: cwd.map(str::to_string),

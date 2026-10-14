@@ -282,6 +282,9 @@ fn unavailable_terminal_pane(
         id: pane_id,
         terminal: None,
         host_session_id,
+        terminal_error: None,
+        terminal_start_request: None,
+        terminal_retry_allowed: true,
         title,
         custom_title: None,
         cwd: cwd.clone(),
@@ -292,6 +295,36 @@ fn unavailable_terminal_pane(
         last_exit_code: None,
         last_bounds: None,
     }
+}
+
+fn failed_terminal_pane(
+    pane_id: PaneId,
+    host_session_id: Option<usize>,
+    title: String,
+    cwd: Option<std::path::PathBuf>,
+    command: &str,
+    args: &[String],
+    error: String,
+    retry_allowed: bool,
+) -> TerminalPane {
+    let mut pane = unavailable_terminal_pane(pane_id, host_session_id, title, cwd);
+    pane.terminal_error = Some(error);
+    pane.terminal_start_request = Some(crate::pane_tree::TerminalStartRequest {
+        command: command.to_string(),
+        args: args.to_vec(),
+    });
+    pane.terminal_retry_allowed = retry_allowed;
+    pane
+}
+
+fn terminal_render_retry_delay(attempt: u8) -> std::time::Duration {
+    let milliseconds = match attempt {
+        0 | 1 => 33,
+        2 => 100,
+        3 => 250,
+        _ => 500,
+    };
+    std::time::Duration::from_millis(milliseconds)
 }
 
 fn pane_close_info(pane: &crate::pane_tree::TerminalPane) -> Option<RunningProcessInfo> {
@@ -379,6 +412,11 @@ fn stop_pane_session(pane: &crate::pane_tree::TerminalPane) -> Result<(), String
     if let Some(session_id) = pane_host_session_id(pane) {
         stop_host_session(session_id)?;
         return Ok(());
+    }
+    if !pane.terminal_retry_allowed {
+        return Err(
+            "the session host may still run this pane. Check `fastty sessions`, close its ID, then remove the pane".into(),
+        );
     }
     if let Some(terminal) = &pane.terminal {
         terminal.terminate_process();
@@ -535,11 +573,23 @@ fn collect_stop_results(
 mod host_restore_tests {
     use super::*;
 
+    #[test]
+    fn terminal_render_retry_uses_backoff_without_a_retry_limit() {
+        assert_eq!(terminal_render_retry_delay(1), std::time::Duration::from_millis(33));
+        assert_eq!(terminal_render_retry_delay(2), std::time::Duration::from_millis(100));
+        assert_eq!(terminal_render_retry_delay(3), std::time::Duration::from_millis(250));
+        assert_eq!(terminal_render_retry_delay(6), std::time::Duration::from_millis(500));
+        assert_eq!(terminal_render_retry_delay(u8::MAX), std::time::Duration::from_millis(500));
+    }
+
     fn pane(host_session_id: Option<usize>) -> crate::pane_tree::TerminalPane {
         crate::pane_tree::TerminalPane {
             id: 7,
             terminal: None,
             host_session_id,
+            terminal_error: None,
+            terminal_start_request: None,
+            terminal_retry_allowed: true,
             title: "restored".into(),
             custom_title: None,
             cwd: None,
@@ -2803,7 +2853,7 @@ impl Drop for RootView {
 pub struct RootView {
     config: Config,
     window_id: gpui::WindowId,
-    terminal_render_retry_pending: Arc<std::sync::atomic::AtomicBool>,
+    terminal_render_retry_pending: Arc<parking_lot::Mutex<std::collections::HashSet<PaneId>>>,
     terminal_render_retry_state: Arc<parking_lot::Mutex<std::collections::HashMap<PaneId, u8>>>,
     host_attach_retry_state: std::collections::HashMap<PaneId, HostAttachRetry>,
     host_attach_retry_generation: u64,
@@ -3500,7 +3550,9 @@ impl RootView {
         let mut view = Self {
             config: loaded_config,
             window_id: _window.window_handle().window_id(),
-            terminal_render_retry_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            terminal_render_retry_pending: Arc::new(parking_lot::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             terminal_render_retry_state: Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -4162,6 +4214,7 @@ impl RootView {
             .unwrap_or("fastty");
         let pane_title = title_override.unwrap_or_else(|| default_shell_name.to_string());
 
+        let session_start = std::time::Instant::now();
         let attach = if let Some(remote) = pre_attached_remote {
             #[cfg(unix)]
             {
@@ -4229,7 +4282,7 @@ impl RootView {
                         initial_cwd,
                     );
                 }
-                TerminalState::new_hosted(
+                let terminal = TerminalState::new_hosted(
                     cmd,
                     args,
                     cwd_str,
@@ -4240,8 +4293,24 @@ impl RootView {
                     960.0,
                     640.0,
                     event_sender.clone(),
-                )
-                .expect("Failed to initialize terminal state")
+                );
+                match terminal {
+                    Ok(terminal) => terminal,
+                    Err(error) => {
+                        eprintln!("Fastty could not start terminal session: {error}");
+                        let spawn_error = error.downcast_ref::<crate::session_host::SpawnAttachError>();
+                        return failed_terminal_pane(
+                            pane_id,
+                            spawn_error.and_then(|error| error.session_id),
+                            pane_title,
+                            initial_cwd,
+                            cmd,
+                            args,
+                            error.to_string(),
+                            spawn_error.is_none_or(|error| error.retry_safe),
+                        );
+                    }
+                }
             }
             HostAttachOutcome::Failed(error) => {
                 eprintln!("Fastty could not restore host session {host_session_id:?}: {error}");
@@ -4262,6 +4331,10 @@ impl RootView {
 
         let terminal_arc = Arc::new(terminal);
         let terminal_host_session_id = terminal_arc.remote_session_id();
+        eprintln!(
+            "Fastty pane session ready: pane_id={pane_id}, host_session_id={terminal_host_session_id:?}, elapsed_ms={}",
+            session_start.elapsed().as_millis()
+        );
         // The session host owns this PTY. The local TerminalState is only the
         // renderer projection fed by the host's attach stream.
         cx.spawn_in(window, async move |this, cx| {
@@ -4384,6 +4457,9 @@ impl RootView {
             id: pane_id,
             terminal: Some(terminal_arc),
             host_session_id: terminal_host_session_id,
+            terminal_error: None,
+            terminal_start_request: None,
+            terminal_retry_allowed: true,
             title: pane_title,
             custom_title: None,
             cwd: initial_cwd.clone(),
@@ -4462,6 +4538,66 @@ impl RootView {
             },
         );
         self.start_host_attach_retry(pane_id, session_id, generation, window, cx);
+        cx.notify();
+    }
+
+    fn retry_terminal_start(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((tab_index, session_id, request, cwd, title, custom_title)) = self
+            .tabs
+            .iter()
+            .enumerate()
+            .find_map(|(index, tab)| {
+                let pane = tab.pane_tree.find_pane(pane_id)?;
+                if pane.terminal.is_some() {
+                    return None;
+                }
+                if !pane.terminal_retry_allowed {
+                    return None;
+                }
+                if let Some(session_id) = pane.host_session_id {
+                    return Some((index, Some(session_id), None, None, None, None));
+                }
+                Some((
+                    index,
+                    None,
+                    pane.terminal_start_request.clone(),
+                    pane.cwd.clone(),
+                    Some(pane.title.clone()),
+                    pane.custom_title.clone(),
+                ))
+            })
+        else {
+            return;
+        };
+        if session_id.is_some() {
+            self.retry_host_session(pane_id, window, cx);
+            return;
+        }
+        let (Some(request), cwd) = (request, cwd) else {
+            return;
+        };
+        let replacement = self.spawn_terminal_pane_with_session(
+            &request.command,
+            &request.args,
+            cwd.as_deref(),
+            title,
+            None,
+            Some(pane_id),
+            MissingSessionPolicy::StartFresh,
+            None,
+            window,
+            cx,
+        );
+        let mut replacement = replacement;
+        replacement.custom_title = custom_title;
+        if let Some(pane) = self
+            .tabs
+            .get_mut(tab_index)
+            .and_then(|tab| tab.pane_tree.find_pane_mut(pane_id))
+        {
+            *pane = replacement;
+        }
+        self.persist_session();
         cx.notify();
     }
 
@@ -4620,6 +4756,9 @@ impl RootView {
             zoomed_pane: None,
         });
 
+        let new_tab_index = self.tabs.len() - 1;
+        self.activate_tab_index(new_tab_index);
+        self.persist_session();
         cx.notify();
     }
 
@@ -4846,6 +4985,18 @@ impl RootView {
         }
     }
 
+    fn remove_untracked_terminal_pane(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        let Some(tab_id) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.pane_tree.find_pane(pane_id).is_some())
+            .map(|tab| tab.id)
+        else {
+            return;
+        };
+        self.remove_stopped_pane(tab_id, pane_id, cx);
+    }
+
     /// F2: toggles zoom on the active pane (tmux `prefix+z` semantics): the
     /// pane takes the whole terminal area until toggled off. No-op with a
     /// single pane. Per-tab and transient (not persisted, not previewed).
@@ -4967,6 +5118,9 @@ impl RootView {
             id,
             terminal: Some(terminal.clone()),
             host_session_id: terminal.remote_session_id(),
+            terminal_error: None,
+            terminal_start_request: None,
+            terminal_retry_allowed: true,
             title: title.clone(),
             custom_title: None,
             cwd: cwd.clone(),
@@ -5985,6 +6139,18 @@ impl RootView {
         if !target_exists {
             self.pending_close = None;
             cx.notify();
+            return;
+        }
+        if matches!(pending.state, PendingCloseState::Failed(_)) {
+            match pending.target {
+                CloseTarget::Tab { tab_id } => self.force_close_tab(tab_id, window, cx),
+                CloseTarget::Pane { tab_id, pane_id } => {
+                    self.force_close_pane(tab_id, pane_id, cx)
+                }
+                CloseTarget::OtherTabs { keep_id } => {
+                    self.force_close_other_tabs(keep_id, window, cx)
+                }
+            }
             return;
         }
         let current_panes: Vec<(usize, usize)> = match &pending.target {
@@ -12632,45 +12798,31 @@ impl RootView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        use std::sync::atomic::Ordering;
-
-        if self
-            .terminal_render_retry_pending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        if !self.terminal_render_retry_pending.lock().insert(pane_id) {
             return;
         }
-        let should_retry = {
+        let (delay, retry_count) = {
             let mut state = self.terminal_render_retry_state.lock();
             let retry_count = state.entry(pane_id).or_default();
-            if *retry_count >= 5 {
-                false
-            } else {
-                *retry_count += 1;
-                true
-            }
+            *retry_count = retry_count.saturating_add(1);
+            (terminal_render_retry_delay(*retry_count), *retry_count)
         };
-        if !should_retry {
-            self.terminal_render_retry_pending
-                .store(false, Ordering::Release);
-            return;
-        }
+        eprintln!(
+            "Fastty terminal render deferred: pane_id={pane_id}, retry={retry_count}, delay_ms={}",
+            delay.as_millis()
+        );
 
         let pending = Arc::clone(&self.terminal_render_retry_pending);
         cx.spawn_in(window, async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(33))
-                .await;
+            cx.background_executor().timer(delay).await;
             if this
                 .update_in(cx, |this, _window, cx| {
-                    this.terminal_render_retry_pending
-                        .store(false, Ordering::Relaxed);
+                    this.terminal_render_retry_pending.lock().remove(&pane_id);
                     cx.notify();
                 })
                 .is_err()
             {
-                pending.store(false, Ordering::Relaxed);
+                pending.lock().remove(&pane_id);
             }
         })
         .detach();
@@ -12707,12 +12859,14 @@ impl RootView {
                 let target_rows = ((avail_h / line_h) as usize).max(5);
 
                 let grid_el = if let Some(ref terminal) = pane.terminal {
-                    terminal.resize_with_pixels(
+                    if !terminal.try_resize_with_pixels(
                         target_cols,
                         target_rows,
                         (target_cols as f32 * cell_w).round() as u16,
                         (target_rows as f32 * line_h).round() as u16,
-                    );
+                    ) {
+                        self.schedule_terminal_render_retry(pane_id, window, cx);
+                    }
                     let term = terminal.term();
                     if let Some(term_guard) = term.try_lock() {
                         let content = term_guard.renderable_content();
@@ -13091,7 +13245,10 @@ impl RootView {
                 };
 
                 let (history_size, display_offset) = if let Some(ref terminal) = pane.terminal {
-                    (terminal.history_size(), terminal.display_offset())
+                    terminal.try_history_metrics().unwrap_or_else(|| {
+                        self.schedule_terminal_render_retry(pane.id, window, cx);
+                        (0, 0)
+                    })
                 } else {
                     (0, 0)
                 };
@@ -13300,6 +13457,73 @@ impl RootView {
                                     .child("Retry connection"),
                             )
                     });
+                let terminal_error_panel = pane
+                    .terminal_error
+                    .as_ref()
+                    .filter(|_| pane.terminal.is_none())
+                    .map(|error| {
+                        let has_host_session = pane.host_session_id.is_some();
+                        let retry_control = div()
+                                .id(("retry-terminal-start", pane_id))
+                                .when(pane.terminal_retry_allowed, |control| {
+                                    control
+                                .px(px(12.))
+                                .py(px(6.))
+                                .rounded(px(5.))
+                                .bg(theme.surface_raised)
+                                .border_1()
+                                .border_color(theme.border)
+                                .text_size(px(12.))
+                                .text_color(theme.foreground)
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
+                                    this.retry_terminal_start(pane_id, window, cx);
+                                    cx.stop_propagation();
+                                }))
+                                .child(if has_host_session { "Retry connection" } else { "Retry" })
+                                })
+                                .when(!pane.terminal_retry_allowed, |control| {
+                                    control
+                                        .text_size(px(12.))
+                                        .text_color(theme.yellow)
+                                        .child("The session may still run. Run `fastty sessions`, close its ID, then remove this pane.")
+                                });
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(theme.background)
+                            .child(div().flex().flex_col().items_center().gap_2().child(
+                                div()
+                                    .max_w(px(420.))
+                                    .px(px(16.))
+                                    .text_size(px(12.))
+                                    .text_color(theme.red)
+                                    .child(format!("Could not start terminal: {error}")),
+                            )
+                            .child(retry_control)
+                            .when(!pane.terminal_retry_allowed && pane.host_session_id.is_none(), |panel| {
+                                panel.child(
+                                    div()
+                                        .px(px(12.))
+                                        .py(px(6.))
+                                        .rounded(px(5.))
+                                        .bg(theme.surface_raised)
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .text_size(px(12.))
+                                        .text_color(theme.foreground)
+                                        .cursor(CursorStyle::PointingHand)
+                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                            this.remove_untracked_terminal_pane(pane_id, cx);
+                                            cx.stop_propagation();
+                                        }))
+                                        .child("Remove pane after cleanup"),
+                                )
+                            }))
+                    });
                 let render_retry_panel = (pane.terminal.is_some() && grid_el.is_none()).then(|| {
                     div()
                         .absolute()
@@ -13397,6 +13621,7 @@ impl RootView {
                     )
                     .when_some(grid_el, |d, el| d.child(el))
                     .when_some(retry_panel, |d, panel| d.child(panel))
+                    .when_some(terminal_error_panel, |d, panel| d.child(panel))
                     .when_some(render_retry_panel, |d, panel| d.child(panel))
                     .when_some(pane_scrollbar_thumb, |d, thumb| d.child(thumb))
                     .when_some(program_badge, |d, badge| d.child(badge))
@@ -13588,6 +13813,9 @@ impl Render for RootView {
         self.terminal_render_retry_state
             .lock()
             .retain(|id, _| live_panes.contains(id));
+        self.terminal_render_retry_pending
+            .lock()
+            .retain(|id| live_panes.contains(id));
         if self.ai_response_is_visible(_window) {
             if let Some(tab) = self.tabs.get(self.active_tab_idx) {
                 if let Some(completion) = self.ai_turn_completions.get_mut(&tab.ai_conversation_id)
@@ -18565,7 +18793,11 @@ impl Render for RootView {
                                     div()
                                         .text_size(px(11.))
                                         .text_color(theme.muted_strong)
-                                        .child("Do you want to terminate the running process and close?"),
+                                        .child(if close_failure.is_some() {
+                                            "Safe close failed. Force close will terminate the session."
+                                        } else {
+                                            "Do you want to terminate the running process and close?"
+                                        }),
                                 ))
                                 .child(
                                     div()
@@ -18606,8 +18838,6 @@ impl Render for RootView {
                                                 })
                                                 .child(if is_checking {
                                                     "Closing..."
-                                                } else if close_failure.is_some() {
-                                                    "Retry Close"
                                                 } else {
                                                     "Terminate & Close"
                                                 }),
