@@ -3,6 +3,16 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.22.9 - 2026-10-14
+
+### Terminal sessions
+
+- Detect older session hosts and use safe compatibility paths for idle tab close.
+- Activate and save new tabs created with Cmd+T.
+- Keep panes visible while terminal rendering waits for a lock.
+- Move terminal replies off the parser thread and bound queued data.
+- Recover from uncertain session starts without creating duplicate sessions.
+
 ## 0.22.8 - 2026-10-13
 
 ### Terminal sessions
