@@ -71,6 +71,118 @@ fn read_response(reader: &mut impl std::io::BufRead) -> Result<Response, String>
     serde_json::from_str(line.trim_end()).map_err(|e| format!("bad response from daemon: {e}"))
 }
 
+enum ApiCommand {
+    List,
+    Describe(String),
+}
+
+fn parse_api_command(args: impl Iterator<Item = String>) -> Result<(ApiCommand, bool), String> {
+    let mut args = args;
+    let command = match args.next().as_deref() {
+        Some("list") => ApiCommand::List,
+        Some("describe") => {
+            let method = args.next().filter(|method| !method.starts_with('-'))
+                .ok_or_else(|| "Usage: fastty api describe METHOD [--json]".to_string())?;
+            ApiCommand::Describe(method)
+        }
+        _ => return Err("Usage: fastty api list [--json] | describe METHOD [--json]".to_string()),
+    };
+    let mut json = false;
+    for argument in args {
+        if argument != "--json" || json {
+            return Err(format!("unknown API argument: {argument}"));
+        }
+        json = true;
+    }
+    Ok((command, json))
+}
+
+#[cfg(test)]
+mod api_cli_tests {
+    use super::{parse_api_command, ApiCommand};
+
+    fn args(values: &[&str]) -> impl Iterator<Item = String> {
+        values.iter().map(|value| value.to_string()).collect::<Vec<_>>().into_iter()
+    }
+
+    #[test]
+    fn api_parser_accepts_list_and_describe() {
+        let (command, json) = parse_api_command(args(&["list", "--json"])).unwrap();
+        assert!(matches!(command, ApiCommand::List));
+        assert!(json);
+        let (command, json) = parse_api_command(args(&["describe", "attach"])).unwrap();
+        assert!(matches!(command, ApiCommand::Describe(method) if method == "attach"));
+        assert!(!json);
+    }
+
+    #[test]
+    fn api_parser_rejects_missing_methods_and_unknown_arguments() {
+        for arguments in [
+            vec![],
+            vec!["describe"],
+            vec!["describe", "--json"],
+            vec!["list", "attach"],
+            vec!["list", "--json", "--json"],
+            vec!["describe", "attach", "--other"],
+        ] {
+            assert!(parse_api_command(args(&arguments)).is_err());
+        }
+    }
+}
+
+pub fn run_api_command(args: impl Iterator<Item = String>) {
+    let result = parse_api_command(args).and_then(|(command, json)| query_api(command, json));
+    if let Err(error) = result {
+        eprintln!("fastty api: {error}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}
+
+#[cfg(not(unix))]
+fn query_api(_command: ApiCommand, _json: bool) -> Result<(), String> {
+    Err("API discovery requires a Unix socket".to_string())
+}
+
+#[cfg(unix)]
+fn query_api(command: ApiCommand, json_output: bool) -> Result<(), String> {
+    let request = match command {
+        ApiCommand::List => Request::ApiList,
+        ApiCommand::Describe(method) => Request::ApiDescribe { method },
+    };
+    let mut stream = connect()?;
+    let timeout = Some(std::time::Duration::from_secs(5));
+    stream.set_read_timeout(timeout).map_err(|error| error.to_string())?;
+    stream.set_write_timeout(timeout).map_err(|error| error.to_string())?;
+    send_request(&mut stream, &request)?;
+    let response = read_response(&mut std::io::BufReader::new(stream))?;
+    match (request, response) {
+        (Request::ApiList, Response::ApiList { api }) => {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&api).map_err(|error| error.to_string())?);
+            } else {
+                println!("Fastty {} protocol {}", api.server.server_version, api.server.protocol_version);
+                for method in api.methods {
+                    println!("{}", method.name);
+                }
+            }
+        }
+        (Request::ApiDescribe { .. }, Response::ApiDescribe { api }) => {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&api).map_err(|error| error.to_string())?);
+            } else {
+                println!("{}: {}", api.method.name, api.method.description);
+                println!("Server: {}. Protocol: {}", api.server.server_version, api.server.protocol_version);
+                println!("Request:\n{}", serde_json::to_string_pretty(&api.request_schema).map_err(|error| error.to_string())?);
+                println!("Response:\n{}", serde_json::to_string_pretty(&api.response_schema).map_err(|error| error.to_string())?);
+            }
+        }
+        (_, Response::Error { code, message }) => return Err(format!("{code}: {message}")),
+        (_, response) => return Err(format!("unexpected API response: {response:?}")),
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn print_sessions_table(sessions: &[crate::daemon::SessionInfo]) {
     if sessions.is_empty() {
@@ -358,7 +470,7 @@ pub fn run_events_command(wait_secs: Option<u64>) -> ! {
             std::process::exit(1);
         }
         let mut stream = reader.into_inner();
-        if let Err(error) = send_request(&mut stream, &Request::SubscribeEvents) {
+        if let Err(error) = send_request(&mut stream, &Request::SubscribeEvents { process_events: true }) {
             eprintln!("fastty events: {error}");
             std::process::exit(1);
         }
@@ -406,6 +518,9 @@ pub fn run_events_command(wait_secs: Option<u64>) -> ! {
                     let _ = std::io::stdout().flush();
                     continue;
                 }
+                Response::ProcessStates { states } => serde_json::json!({
+                    "type": "process_snapshot", "states": states,
+                }),
                 Response::StreamEvent { envelope } => {
                     let metadata = serde_json::json!({
                         "version": envelope.version,
@@ -414,6 +529,11 @@ pub fn run_events_command(wait_secs: Option<u64>) -> ! {
                         "session_id": envelope.session_id,
                     });
                     match envelope.kind {
+                        crate::daemon::SessionEvent::ProcessChanged { state } => serde_json::json!({
+                            "version": metadata["version"], "type": "process_changed",
+                            "sequence": metadata["sequence"], "timestamp_unix_ms": metadata["timestamp_unix_ms"],
+                            "session_id": metadata["session_id"], "state": state,
+                        }),
                         crate::daemon::SessionEvent::SessionAdded { session } => {
                             serde_json::json!({
                                 "version": metadata["version"],
@@ -586,7 +706,7 @@ pub fn run_attach_command(id: usize, read_only: bool, wait_secs: Option<u64>) ->
         let mut printed_waiting = false;
         let (mut reader, write_half, cols, rows) = loop {
             let attempt = connect().and_then(|mut stream| {
-                send_request(&mut stream, &Request::Attach { id, mode, binary_snapshot: false })?;
+                send_request(&mut stream, &Request::Attach { id, mode, expected_host_instance: None, binary_snapshot: false, snapshot_format: crate::daemon::SnapshotFormat::Legacy })?;
                 let write_half = stream.try_clone().map_err(|e| e.to_string())?;
                 let mut reader = std::io::BufReader::new(stream);
                 match read_response(&mut reader) {

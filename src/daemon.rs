@@ -22,6 +22,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::pane_tree::PaneId;
+use crate::process_state::{ProcessObservation, ProcessTable, ProcessUnavailableReason, SessionProcessState};
 use crate::terminal_state::TerminalState;
 
 /// Protocol generation used by session hosts and clients. The session-host
@@ -38,11 +39,121 @@ pub(crate) fn session_host_capabilities() -> Vec<String> {
         "binary_snapshot_attach",
         "attached_process_running",
         "spawn_request_status",
+        "terminal_state_snapshot_v1",
+        "api_discovery_v1",
+        "session_identity_v1",
+        "host_status_v1",
+        "safe_host_restart_v1",
+        "process_events_v1",
     ]
     .into_iter()
     .map(str::to_string)
     .collect()
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(transparent)]
+pub struct HostInstanceId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionIdentity {
+    pub host_instance: HostInstanceId,
+    pub session_id: PaneId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct HostStatus {
+    pub host_instance: HostInstanceId,
+    pub protocol_version: u32,
+    pub fastty_version: String,
+    pub capabilities: Vec<String>,
+    pub sessions: usize,
+    pub connections: usize,
+    pub restart_available: bool,
+}
+
+struct HostLifecycle {
+    instance: HostInstanceId,
+    next_id: usize,
+    reserved_until: usize,
+    connections: usize,
+    stopping: bool,
+}
+
+fn instance_identity() -> &'static HostInstanceId {
+    static INSTANCE: OnceLock<HostInstanceId> = OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).expect("host identity requires system randomness");
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let hex = hex::encode(bytes);
+        HostInstanceId(format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]))
+    })
+}
+
+impl HostLifecycle {
+    fn restart_if_empty(&mut self, expected: &HostInstanceId, sessions: usize) -> Result<(), &'static str> {
+        if expected != &self.instance { return Err("host_instance_changed"); }
+        if sessions != 0 || self.connections > 1 || self.stopping { return Err("host_restart_blocked"); }
+        self.stopping = true;
+        Ok(())
+    }
+}
+
+fn host_lifecycle() -> &'static Mutex<HostLifecycle> {
+    static HOST: OnceLock<Mutex<HostLifecycle>> = OnceLock::new();
+    HOST.get_or_init(|| {
+        Mutex::new(HostLifecycle {
+            instance: instance_identity().clone(),
+            next_id: 0,
+            reserved_until: 0,
+            connections: 0,
+            stopping: false,
+        })
+    })
+}
+
+pub fn host_instance_id() -> HostInstanceId {
+    instance_identity().clone()
+}
+
+fn reserve_session_ids(host: &mut HostLifecycle) -> Result<(), String> {
+    reserve_session_ids_in(host, &crate::paths::get().state_dir)
+}
+
+fn reserve_session_ids_in(host: &mut HostLifecycle, directory: &std::path::Path) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let path = directory.join("host-session-high-water");
+    let high_water = match std::fs::File::open(&path) {
+        Ok(file) => {
+            let mut value = String::new();
+            file.take(33).read_to_string(&mut value).map_err(|error| error.to_string())?;
+            if value.len() > 32 { return Err("invalid host session high-water mark".into()); }
+            value.trim().parse::<usize>().map_err(|_| "invalid host session high-water mark".to_string())?
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 100,
+        Err(error) => return Err(error.to_string()),
+    };
+    let start = high_water.max(100);
+    let end = start.checked_add(1024).ok_or_else(|| "host session IDs exhausted".to_string())?;
+    let pending = directory.join("host-session-high-water.pending");
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&pending).map_err(|error| error.to_string())?;
+    writeln!(file, "{end}").map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    std::fs::rename(&pending, &path).map_err(|error| error.to_string())?;
+    std::fs::File::open(directory).and_then(|file| file.sync_all()).map_err(|error| error.to_string())?;
+    host.next_id = start;
+    host.reserved_until = end;
+    Ok(())
+}
+
+fn allocate_session_id(host: &mut HostLifecycle) -> Result<PaneId, String> {
+    if host.next_id == host.reserved_until { reserve_session_ids(host)?; }
+    let id = host.next_id;
+    host.next_id += 1;
+    Ok(id)
+}
+
 const MAX_EVENT_PROGRAM_STATUSES: usize = 32;
 const MAX_EVENT_TEXT_BYTES: usize = 512;
 
@@ -65,6 +176,7 @@ struct EventJournal {
     sequence: u64,
     events: VecDeque<EventEnvelope>,
     latest_sessions: HashMap<PaneId, SessionInfo>,
+    latest_processes: HashMap<PaneId, SessionProcessState>,
 }
 
 struct EventBatch {
@@ -78,6 +190,7 @@ impl EventJournal {
             sequence: 0,
             events: VecDeque::with_capacity(EVENT_JOURNAL_CAPACITY),
             latest_sessions: HashMap::new(),
+            latest_processes: HashMap::new(),
         }
     }
 
@@ -99,11 +212,17 @@ impl EventJournal {
 
     fn added(&mut self, session: SessionInfo) {
         self.latest_sessions.insert(session.id, session.clone());
+        self.latest_processes.insert(session.id, SessionProcessState {
+            session: SessionIdentity { host_instance: host_instance_id(), session_id: session.id },
+            generation: 0,
+            observation: ProcessObservation::Unavailable { reason: ProcessUnavailableReason::PendingObservation },
+        });
         self.publish(Some(session.id), SessionEvent::SessionAdded { session });
     }
 
     fn removed(&mut self, id: PaneId) {
         self.latest_sessions.remove(&id);
+        self.latest_processes.remove(&id);
         self.publish(Some(id), SessionEvent::SessionRemoved { id });
     }
 
@@ -148,14 +267,59 @@ impl EventJournal {
         }
     }
 
+    fn process_changed(&mut self, id: PaneId, observation: ProcessObservation) {
+        let Some(previous) = self.latest_processes.get_mut(&id) else { return; };
+        if previous.observation == observation { return; }
+        previous.generation = previous.generation.saturating_add(1);
+        previous.observation = observation;
+        let state = previous.clone();
+        self.publish(Some(id), SessionEvent::ProcessChanged { state });
+    }
+
+    fn process_snapshot(&self) -> Vec<SessionProcessState> {
+        let mut states: Vec<_> = self.latest_processes.values().cloned().collect();
+        states.sort_by_key(|state| state.session.session_id);
+        states
+    }
+
     fn snapshot(&self) -> Vec<SessionInfo> {
         self.latest_sessions.values().cloned().collect()
     }
 }
 
+fn event_is_visible(event: &SessionEvent, process_events: bool) -> bool {
+    process_events || !matches!(event, SessionEvent::ProcessChanged { .. })
+}
+
 fn event_journal() -> &'static Mutex<EventJournal> {
     static JOURNAL: OnceLock<Mutex<EventJournal>> = OnceLock::new();
     JOURNAL.get_or_init(|| Mutex::new(EventJournal::new()))
+}
+
+fn start_process_sampler() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        std::thread::spawn(|| {
+            let mut table = ProcessTable::new();
+            loop {
+                if host_lifecycle().lock().stopping { return; }
+                let terminals: Vec<_> = registry().lock().iter()
+                    .map(|(id, entry)| (*id, Arc::clone(&entry.terminal))).collect();
+                if !terminals.is_empty() {
+                    table.refresh();
+                    for (id, terminal) in terminals {
+                        let (shell, foreground) = terminal.process_coordinates();
+                        let observation = table.observe(shell, foreground);
+                        let mut journal = event_journal().lock();
+                        let still_registered = registry().lock().get(&id)
+                            .is_some_and(|entry| Arc::ptr_eq(&entry.terminal, &terminal));
+                        if still_registered { journal.process_changed(id, observation); }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(350));
+            }
+        });
+    });
 }
 
 fn registry() -> &'static Registry {
@@ -393,7 +557,7 @@ pub fn socket_path() -> std::path::PathBuf {
 /// running daemon over the exact same wire format documented in
 /// `docs/daemon-protocol.md` -- there's no separate hand-rolled client-side
 /// copy of the protocol to drift out of sync with this one.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Hello {
@@ -401,6 +565,10 @@ pub enum Request {
         read_only: bool,
     },
     List,
+    ApiList,
+    ApiDescribe { method: String },
+    HostStatus,
+    RestartHost { expected_host_instance: HostInstanceId },
     /// Check whether a session ID is registered without creating a default session.
     SessionExists {
         id: PaneId,
@@ -426,7 +594,10 @@ pub enum Request {
     /// wants this typically dedicates one connection to it.
     SubscribeSessions,
     /// Start a typed JSONL event stream with a session snapshot and deltas.
-    SubscribeEvents,
+    SubscribeEvents {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        process_events: bool,
+    },
     /// Capture the visible terminal screen as ANSI text.
     Capture {
         id: PaneId,
@@ -437,10 +608,14 @@ pub enum Request {
     },
     Attach {
         id: PaneId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_host_instance: Option<HostInstanceId>,
         #[serde(default)]
         mode: AttachMode,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         binary_snapshot: bool,
+        #[serde(default, skip_serializing_if = "SnapshotFormat::is_legacy")]
+        snapshot_format: SnapshotFormat,
     },
     Detach {
         id: PaneId,
@@ -543,7 +718,7 @@ pub enum Request {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ExternalAction {
     Send { text: String },
@@ -566,10 +741,24 @@ impl ExternalAction {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotFormat {
+    #[default]
+    Legacy,
+    TerminalState,
+}
+
+impl SnapshotFormat {
+    fn is_legacy(&self) -> bool {
+        *self == Self::Legacy
+    }
+}
+
 /// Whether an `attach` is allowed to `write` to the session it attached to,
 /// on the connection that attached. Omitting `mode` in an `attach` request
 /// defaults to `read_write`, matching the original (mode-less) behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachMode {
     #[default]
@@ -577,7 +766,7 @@ pub enum AttachMode {
     ReadOnly,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessScope {
     Observe,
@@ -599,9 +788,11 @@ impl AccessScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionInfo {
     pub id: PaneId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<SessionIdentity>,
     pub title: String,
     pub cwd: Option<String>,
     pub cols: usize,
@@ -613,7 +804,7 @@ pub struct SessionInfo {
     pub program_status: Vec<ProgramStatusInfo>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProgramStatusInfo {
     pub id: String,
     pub state: crate::program_status::ProgramState,
@@ -625,7 +816,7 @@ pub struct ProgramStatusInfo {
     pub kind: Option<crate::program_status::BlockedKind>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EventEnvelope {
     pub version: u16,
     pub sequence: u64,
@@ -634,9 +825,10 @@ pub struct EventEnvelope {
     pub kind: SessionEvent,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
+    ProcessChanged { state: SessionProcessState },
     SessionAdded { session: SessionInfo },
     SessionRemoved { id: PaneId },
     SessionUpdated {
@@ -647,7 +839,7 @@ pub enum SessionEvent {
 }
 
 /// One pane inside a tab, as reported by `layout`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneLayoutInfo {
     pub id: PaneId,
     pub title: String,
@@ -658,7 +850,7 @@ pub struct PaneLayoutInfo {
 }
 
 /// One tab of the GUI layout, as reported by `layout`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TabLayout {
     pub tab_id: usize,
     pub title: String,
@@ -683,17 +875,23 @@ fn default_resize_delta() -> f32 {
     0.05
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BlockedSession {
     pub id: PaneId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_process_label: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Response {
+    ApiList { api: crate::server_api::ApiCatalog },
+    ApiDescribe { api: crate::server_api::ApiMethodDescription },
+    HostStatus { status: HostStatus },
+    HostRestarting,
     Hello {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_instance: Option<HostInstanceId>,
         version: u32,
         fastty_version: String,
         #[serde(default)]
@@ -705,6 +903,7 @@ pub enum Response {
     Sessions {
         sessions: Vec<SessionInfo>,
     },
+    ProcessStates { states: Vec<SessionProcessState> },
     EventStreamStarted {
         version: u16,
         sequence: u64,
@@ -848,7 +1047,10 @@ pub fn spawn_headless_session(
     cols: Option<usize>,
     rows: Option<usize>,
 ) -> Result<PaneId, String> {
-    static NEXT_PANE_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(100);
+    let mut lifecycle = host_lifecycle().lock();
+    if lifecycle.stopping { return Err("host is stopping".into()); }
+    let mut id = allocate_session_id(&mut lifecycle)?;
+    while is_registered(id) { id = allocate_session_id(&mut lifecycle)?; }
 
     let shell = cmd
         .map(|s| s.to_string())
@@ -863,12 +1065,8 @@ pub fn spawn_headless_session(
     let terminal = TerminalState::new_headless(&shell, args, default_cwd, cols, rows)
         .map_err(|e| format!("failed to spawn terminal: {e}"))?;
 
-    let mut id = NEXT_PANE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    while is_registered(id) {
-        id = NEXT_PANE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
     register_headless(id, Arc::new(terminal));
+    drop(lifecycle);
     Ok(id)
 }
 
@@ -884,6 +1082,7 @@ fn session_info(id: PaneId, terminal: &TerminalState) -> SessionInfo {
     let (cols, rows) = terminal.dimensions();
     SessionInfo {
         id,
+        identity: Some(SessionIdentity { host_instance: host_instance_id(), session_id: id }),
         title: bounded_event_text(
             &terminal
                 .get_foreground_process_name()
@@ -977,6 +1176,7 @@ mod unix_impl {
                 return;
             }
         }
+        if reserve_session_ids(&mut host_lifecycle().lock()).is_err() { return; }
         let listener = match UnixListener::bind(&path) {
             Ok(l) => l,
             Err(_) => return, // e.g. state_dir not writable; daemon is best-effort
@@ -989,9 +1189,27 @@ mod unix_impl {
             let _ = std::fs::set_permissions(&path, perms);
         }
 
-        for stream in listener.incoming().flatten() {
-            std::thread::spawn(move || handle_connection(stream));
+        if listener.set_nonblocking(true).is_err() { return; }
+        start_process_sampler();
+        loop {
+            let mut lifecycle = host_lifecycle().lock();
+            if lifecycle.stopping { break; }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    if stream.set_nonblocking(false).is_err() { continue; }
+                    lifecycle.connections += 1;
+                    std::thread::spawn(move || {
+                        handle_connection(stream);
+                        host_lifecycle().lock().connections -= 1;
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => break,
+            }
+            drop(lifecycle);
+            std::thread::sleep(Duration::from_millis(20));
         }
+        let _ = std::fs::remove_file(&path);
     }
 
     fn acquire_instance_lock() -> Option<std::fs::File> {
@@ -1062,6 +1280,7 @@ mod unix_impl {
                 }
             };
             handle_request(request, &mut conn);
+            if host_lifecycle().lock().stopping { break; }
         }
         conn.conn_alive.store(false, Ordering::Relaxed);
         for attachment in conn.attachments.values() {
@@ -1072,6 +1291,14 @@ mod unix_impl {
 
     pub(super) fn handle_request(request: Request, conn: &mut Conn) {
         match request {
+            Request::ApiList => { match crate::server_api::api_list() {
+                Ok(api) => send(&conn.out, &Response::ApiList { api }),
+                Err(message) => send(&conn.out, &Response::Error { code: "api_schema_error".into(), message }),
+            }; },
+            Request::ApiDescribe { method } => { match crate::server_api::api_describe(&method) {
+                Ok(api) => send(&conn.out, &Response::ApiDescribe { api }),
+                Err(message) => send(&conn.out, &Response::Error { code: "unknown_method".into(), message }),
+            }; },
             Request::Hello { read_only } => {
                 if read_only {
                     conn.read_only = true;
@@ -1080,12 +1307,39 @@ mod unix_impl {
                 send(
                     &conn.out,
                     &Response::Hello {
+                        host_instance: Some(host_instance_id()),
                         version: PROTOCOL_VERSION,
                         fastty_version: env!("CARGO_PKG_VERSION").to_string(),
                         capabilities: session_host_capabilities(),
                     },
                 );
             }
+            Request::HostStatus => {
+                let lifecycle = host_lifecycle().lock();
+                let sessions = registry().lock().len();
+                send(&conn.out, &Response::HostStatus { status: HostStatus {
+                    host_instance: lifecycle.instance.clone(),
+                    protocol_version: PROTOCOL_VERSION,
+                    fastty_version: env!("CARGO_PKG_VERSION").into(),
+                    capabilities: session_host_capabilities(),
+                    sessions,
+                    connections: lifecycle.connections.saturating_sub(1),
+                    restart_available: sessions == 0 && lifecycle.connections <= 1 && !lifecycle.stopping,
+                }});
+            }
+            Request::RestartHost { expected_host_instance } => {
+                if reject_access_scope(conn, AccessScope::Manage) { return; }
+                let mut lifecycle = host_lifecycle().lock();
+                let sessions = registry().lock().len();
+                match lifecycle.restart_if_empty(&expected_host_instance, sessions) {
+                    Ok(()) => send(&conn.out, &Response::HostRestarting),
+                    Err(code) => send(&conn.out, &Response::Error {
+                        code: code.into(),
+                        message: if code == "host_restart_blocked" { "host has sessions or other connections" } else { "host instance changed" }.into(),
+                    }),
+                };
+            }
+
             Request::SetAccessScope { scope } => {
                 if scope.permits(conn.access_scope) && scope != conn.access_scope {
                     send(
@@ -1287,7 +1541,13 @@ mod unix_impl {
                 id,
                 mode,
                 binary_snapshot,
+                snapshot_format,
+                expected_host_instance,
             } => {
+                if expected_host_instance.as_ref().is_some_and(|expected| expected != &host_instance_id()) {
+                    send(&conn.out, &Response::Error { code: "host_instance_changed".into(), message: "the saved session belongs to another host instance".into() });
+                    return;
+                }
                 let terminal = registry().lock().get(&id).map(|e| Arc::clone(&e.terminal));
                 let Some(terminal) = terminal else {
                     send(
@@ -1306,7 +1566,18 @@ mod unix_impl {
                     mode
                 };
                 let (cols, rows) = terminal.dimensions();
-                let (snapshot, program_status, process_running, rx) = if binary_snapshot {
+                let (snapshot, program_status, process_running, rx) = if snapshot_format == SnapshotFormat::TerminalState {
+                    match terminal.snapshot_state_and_subscribe_output() {
+                        Ok(snapshot) => snapshot,
+                        Err(message) => {
+                            send(&conn.out, &Response::Error {
+                                code: "invalid_snapshot".into(),
+                                message,
+                            });
+                            return;
+                        }
+                    }
+                } else if binary_snapshot {
                     terminal.snapshot_binary_and_subscribe_output()
                 } else {
                     terminal.snapshot_and_subscribe_output()
@@ -1638,9 +1909,9 @@ mod unix_impl {
                     }
                 });
             }
-            Request::SubscribeEvents => {
+            Request::SubscribeEvents { process_events } => {
                 let _ = ensure_default_session();
-                let (initial, sequence) = {
+                let (initial, sequence, process_states) = {
                     let mut journal = event_journal().lock();
                     let initial: Vec<SessionInfo> = registry()
                         .lock()
@@ -1648,7 +1919,7 @@ mod unix_impl {
                         .map(|(id, entry)| session_info(*id, &entry.terminal))
                         .collect();
                     journal.seed(&initial);
-                    (initial, journal.sequence)
+                    (initial, journal.sequence, journal.process_snapshot())
                 };
                 send(
                     &conn.out,
@@ -1658,6 +1929,7 @@ mod unix_impl {
                         sessions: initial.clone(),
                     },
                 );
+                if process_events && !send(&conn.out, &Response::ProcessStates { states: process_states }) { return; }
 
                 let out = Arc::clone(&conn.out);
                 let conn_alive = Arc::clone(&conn.conn_alive);
@@ -1698,6 +1970,7 @@ mod unix_impl {
                                 .unwrap_or_else(|| journal.sequence.saturating_add(1));
                             let latest_sequence = journal.sequence;
                             let sessions = journal.snapshot();
+                            let process_states = journal.process_snapshot();
                             drop(journal);
                             if !send(
                                 &out,
@@ -1711,12 +1984,14 @@ mod unix_impl {
                             ) {
                                 return;
                             }
+                            if process_events && !send(&out, &Response::ProcessStates { states: process_states }) { return; }
                             sequence = latest_sequence;
                             continue;
                         }
 
                         for event in batch.events {
                             sequence = event.sequence;
+                            if !event_is_visible(&event.kind, process_events) { continue; }
                             if !send(&out, &Response::StreamEvent { envelope: event }) {
                                 return;
                             }
@@ -2162,6 +2437,61 @@ pub(crate) fn base64_decode(input: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn test_lifecycle() -> HostLifecycle {
+        HostLifecycle { instance: HostInstanceId("test-host".into()), next_id: 0, reserved_until: 0, connections: 1, stopping: false }
+    }
+
+    #[test]
+    fn durable_host_session_reservations_survive_restart() {
+        let directory = std::env::temp_dir().join(format!("fastty-ids-{}-{}", std::process::id(), host_instance_id().0));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut first = test_lifecycle();
+        reserve_session_ids_in(&mut first, &directory).unwrap();
+        let first_id = first.next_id;
+        let reserved_until = first.reserved_until;
+        let mut restarted = test_lifecycle();
+        reserve_session_ids_in(&mut restarted, &directory).unwrap();
+        assert!(restarted.next_id >= reserved_until);
+        assert!(restarted.next_id > first_id);
+        std::fs::write(directory.join("host-session-high-water"), "x".repeat(33)).unwrap();
+        assert!(reserve_session_ids_in(&mut restarted, &directory).is_err());
+        std::fs::write(directory.join("host-session-high-water"), usize::MAX.to_string()).unwrap();
+        assert!(reserve_session_ids_in(&mut restarted, &directory).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn host_restart_preserves_sessions_and_connections() {
+        let mut lifecycle = test_lifecycle();
+        let instance = lifecycle.instance.clone();
+        assert_eq!(lifecycle.restart_if_empty(&instance, 1), Err("host_restart_blocked"));
+        assert!(!lifecycle.stopping);
+        lifecycle.connections = 2;
+        assert_eq!(lifecycle.restart_if_empty(&instance, 0), Err("host_restart_blocked"));
+        lifecycle.connections = 1;
+        assert_eq!(lifecycle.restart_if_empty(&HostInstanceId("old-host".into()), 0), Err("host_instance_changed"));
+        assert_eq!(lifecycle.restart_if_empty(&instance, 0), Ok(()));
+        assert!(lifecycle.stopping);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_rejects_another_host_before_session_lookup() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::AtomicBool;
+        use unix_impl::{handle_request, Conn};
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut conn = Conn { out: Arc::new(Mutex::new(server)), conn_alive: Arc::new(AtomicBool::new(true)), read_only: false, access_scope: AccessScope::Manage, attachments: HashMap::new() };
+        handle_request(Request::Attach { id: usize::MAX, expected_host_instance: Some(HostInstanceId("previous-host".into())), mode: AttachMode::ReadWrite, binary_snapshot: false, snapshot_format: SnapshotFormat::Legacy }, &mut conn);
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        assert!(line.contains("host_instance_changed"));
+        assert!(!line.contains("no_such_session"));
+        assert!(conn.attachments.is_empty());
+    }
+
+
     #[test]
     fn test_base64_roundtrip() {
         let cases: &[&[u8]] = &[
@@ -2196,20 +2526,32 @@ mod tests {
             Request::List,
             Request::SessionStatus { id: 42 },
             Request::SubscribeSessions,
-            Request::SubscribeEvents,
+            Request::SubscribeEvents { process_events: false },
+            Request::SubscribeEvents { process_events: true },
             Request::Capture { id: 42 },
             Request::SetAccessScope {
                 scope: AccessScope::Interact,
             },
             Request::Attach {
+                expected_host_instance: None,
                 id: 42,
                 mode: AttachMode::ReadWrite,
                 binary_snapshot: false,
+                snapshot_format: crate::daemon::SnapshotFormat::Legacy,
             },
             Request::Attach {
+                expected_host_instance: None,
                 id: 42,
                 mode: AttachMode::ReadOnly,
                 binary_snapshot: true,
+                snapshot_format: crate::daemon::SnapshotFormat::Legacy,
+            },
+            Request::Attach {
+                expected_host_instance: None,
+                id: 42,
+                mode: AttachMode::ReadWrite,
+                binary_snapshot: true,
+                snapshot_format: SnapshotFormat::TerminalState,
             },
             Request::Detach { id: 42 },
             Request::Write {
@@ -2268,18 +2610,19 @@ mod tests {
                     assert_eq!(a, b);
                 }
                 (Request::SubscribeSessions, Request::SubscribeSessions) => {}
-                (Request::SubscribeEvents, Request::SubscribeEvents) => {}
+                (Request::SubscribeEvents { process_events: a }, Request::SubscribeEvents { process_events: b }) => assert_eq!(a, b),
                 (Request::Capture { id: a }, Request::Capture { id: b }) => assert_eq!(a, b),
                 (Request::SetAccessScope { scope: a }, Request::SetAccessScope { scope: b }) => {
                     assert_eq!(a, b)
                 }
                 (
-                    Request::Attach { id: a, mode: m1, binary_snapshot: s1 },
-                    Request::Attach { id: b, mode: m2, binary_snapshot: s2 },
+                    Request::Attach { id: a, mode: m1, binary_snapshot: s1, snapshot_format: f1, .. },
+                    Request::Attach { id: b, mode: m2, binary_snapshot: s2, snapshot_format: f2, .. },
                 ) => {
                     assert_eq!(a, b);
                     assert_eq!(m1, m2);
                     assert_eq!(s1, s2);
+                    assert_eq!(f1, f2);
                 }
                 (Request::Detach { id: a }, Request::Detach { id: b }) => assert_eq!(a, b),
                 (
@@ -2400,10 +2743,11 @@ mod tests {
         let json = r#"{"cmd":"attach","id":1}"#;
         let req: Request = serde_json::from_str(json).expect("deserialize");
         match req {
-            Request::Attach { id, mode, binary_snapshot } => {
+            Request::Attach { id, mode, binary_snapshot, snapshot_format, .. } => {
                 assert_eq!(id, 1);
                 assert_eq!(mode, AttachMode::ReadWrite);
                 assert!(!binary_snapshot);
+                assert_eq!(snapshot_format, SnapshotFormat::Legacy);
             }
             _ => panic!("wrong variant"),
         }
@@ -2742,6 +3086,7 @@ mod tests {
     fn test_session(id: PaneId) -> SessionInfo {
         SessionInfo {
             id,
+            identity: None,
             title: "shell".to_string(),
             cwd: Some("/tmp".to_string()),
             cols: 80,
@@ -2771,6 +3116,46 @@ mod tests {
             SessionEvent::SessionRemoved { id: 7 }
         ));
         assert!(journal.snapshot().is_empty());
+    }
+
+    #[test]
+    fn legacy_event_subscriptions_do_not_receive_process_events() {
+        let request: Request = serde_json::from_str(r#"{"cmd":"subscribe_events"}"#).unwrap();
+        assert!(matches!(request, Request::SubscribeEvents { process_events: false }));
+        assert_eq!(serde_json::to_string(&request).unwrap(), r#"{"cmd":"subscribe_events"}"#);
+        let mut journal = EventJournal::new();
+        journal.added(test_session(7));
+        journal.process_changed(7, ProcessObservation::Unavailable { reason: ProcessUnavailableReason::ShellUnavailable });
+        journal.removed(7);
+        let batch = journal.batch_after(0);
+        let visible: Vec<_> = batch.events.iter().filter(|event| event_is_visible(&event.kind, false)).collect();
+        assert_eq!(visible.len(), 2);
+        assert!(matches!(visible[0].kind, SessionEvent::SessionAdded { .. }));
+        assert!(matches!(visible[1].kind, SessionEvent::SessionRemoved { .. }));
+        assert_eq!(batch.events.last().unwrap().sequence, 3);
+        assert!(batch.events.iter().all(|event| event_is_visible(&event.kind, true)));
+    }
+
+    #[test]
+    fn process_journal_publishes_changes_once_and_keeps_a_baseline() {
+        let mut journal = EventJournal::new();
+        journal.added(test_session(7));
+        let observation = ProcessObservation::Unavailable { reason: ProcessUnavailableReason::ShellUnavailable };
+        journal.process_changed(7, observation.clone());
+        journal.process_changed(7, observation.clone());
+        assert_eq!(journal.sequence, 2);
+        let states = journal.process_snapshot();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].generation, 1);
+        assert_eq!(states[0].session.session_id, 7);
+        assert_eq!(states[0].observation, observation);
+        assert!(matches!(journal.batch_after(1).events[0].kind, SessionEvent::ProcessChanged { .. }));
+        journal.process_changed(7, ProcessObservation::Unavailable { reason: ProcessUnavailableReason::ForegroundUnavailable });
+        assert_eq!(journal.process_snapshot()[0].generation, 2);
+        journal.removed(7);
+        journal.process_changed(7, observation);
+        assert!(journal.process_snapshot().is_empty());
+        assert_eq!(journal.sequence, 4);
     }
 
     #[test]

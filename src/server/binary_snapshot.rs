@@ -30,6 +30,10 @@ pub const CELL_FLAG_STRIKETHROUGH: u16 = 1 << 6;
 pub const CELL_FLAG_WIDE_CHAR: u16 = 1 << 7;
 /// The blank spacer cell that follows a double-width glyph.
 pub const CELL_FLAG_WIDE_CHAR_SPACER: u16 = 1 << 8;
+/// Use the theme foreground. Keep the RGB field for older readers.
+pub const CELL_FLAG_DEFAULT_FG: u16 = 1 << 9;
+/// Use the theme background. Keep the RGB field for older readers.
+pub const CELL_FLAG_DEFAULT_BG: u16 = 1 << 10;
 
 /// Flat 16-byte cell representation with explicit memory alignment.
 #[repr(C)]
@@ -231,6 +235,9 @@ pub fn encode_snapshot_compressed(
 
 /// Compress a validated, uncompressed snapshot after the UI captures it.
 pub fn compress_snapshot(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.starts_with(crate::server::native_snapshot::MAGIC) {
+        return crate::server::native_snapshot::compress(bytes);
+    }
     let mut header = FasttyBinarySnapshotHeader::from_bytes(bytes)?;
     if header.flags & SNAPSHOT_FLAG_DEFLATE != 0 {
         return None;

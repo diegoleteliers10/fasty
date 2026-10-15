@@ -1,8 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use serde::{Deserialize, Serialize};
 
 static NEXT_SAVE_REVISION: AtomicU64 = AtomicU64::new(1);
 static SAVED_REVISIONS: OnceLock<Mutex<std::collections::HashMap<String, u64>>> = OnceLock::new();
@@ -52,7 +52,9 @@ pub struct PersistedPane {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_session_id: Option<usize>,
-    /// Compressed FST1 snapshot. Restore normal-screen history into a new shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_session_identity: Option<crate::daemon::SessionIdentity>,
+    /// Compressed terminal snapshot. Restore normal-screen history into a new shell.
     /// Do not replay an old TUI screen as a live process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<String>,
@@ -88,8 +90,7 @@ impl PersistedPaneNode {
             }
             Self::Leaf(_) => false,
             Self::Split { first, second, .. } => {
-                first.attach_snapshot(pane_id, encoded)
-                    || second.attach_snapshot(pane_id, encoded)
+                first.attach_snapshot(pane_id, encoded) || second.attach_snapshot(pane_id, encoded)
             }
         }
     }
@@ -272,6 +273,7 @@ mod tests {
                         custom_title: None,
                         cwd: Some("/tmp/left".to_string()),
                         host_session_id: None,
+                        host_session_identity: None,
                         snapshot: None,
                         snapshot_activity: SnapshotActivity::Unknown,
                     })),
@@ -281,6 +283,7 @@ mod tests {
                         custom_title: None,
                         cwd: Some("/tmp/right".to_string()),
                         host_session_id: None,
+                        host_session_identity: None,
                         snapshot: None,
                         snapshot_activity: SnapshotActivity::Unknown,
                     })),
@@ -291,6 +294,9 @@ mod tests {
         let json = serde_json::to_string(&session).unwrap();
         let deserialized: SessionData = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, "split-workspace");
-        assert!(matches!(deserialized.tabs[0].layout, Some(PersistedPaneNode::Split { .. })));
+        assert!(matches!(
+            deserialized.tabs[0].layout,
+            Some(PersistedPaneNode::Split { .. })
+        ));
     }
 }

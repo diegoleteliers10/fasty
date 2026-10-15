@@ -210,6 +210,7 @@ fn persist_pane_node(node: &crate::pane_tree::PaneNode) -> crate::session::Persi
         PaneNode::Leaf(pane) => PersistedPaneNode::Leaf(PersistedTerminalPane {
             pane_id: pane.id,
             host_session_id: pane_host_session_id(pane),
+            host_session_identity: pane.host_session_identity.clone(),
             cwd: pane.cwd.clone(),
             title: pane.title.clone(),
             custom_title: pane.custom_title.clone(),
@@ -275,6 +276,7 @@ fn pane_host_session_id(pane: &crate::pane_tree::TerminalPane) -> Option<usize> 
 fn unavailable_terminal_pane(
     pane_id: PaneId,
     host_session_id: Option<usize>,
+    host_session_identity: Option<crate::daemon::SessionIdentity>,
     title: String,
     cwd: Option<std::path::PathBuf>,
 ) -> TerminalPane {
@@ -282,6 +284,7 @@ fn unavailable_terminal_pane(
         id: pane_id,
         terminal: None,
         host_session_id,
+        host_session_identity,
         terminal_error: None,
         terminal_start_request: None,
         terminal_retry_allowed: true,
@@ -307,7 +310,7 @@ fn failed_terminal_pane(
     error: String,
     retry_allowed: bool,
 ) -> TerminalPane {
-    let mut pane = unavailable_terminal_pane(pane_id, host_session_id, title, cwd);
+    let mut pane = unavailable_terminal_pane(pane_id, host_session_id, None, title, cwd);
     pane.terminal_error = Some(error);
     pane.terminal_start_request = Some(crate::pane_tree::TerminalStartRequest {
         command: command.to_string(),
@@ -327,13 +330,26 @@ fn terminal_render_retry_delay(attempt: u8) -> std::time::Duration {
     std::time::Duration::from_millis(milliseconds)
 }
 
+fn fresh_shell_recovery_allowed(pane: &TerminalPane) -> bool {
+    pane.terminal.is_none() && pane.host_session_id.is_some()
+}
+
+fn has_unidentified_saved_reference(pane: &TerminalPane) -> bool {
+    fresh_shell_recovery_allowed(pane) && pane.host_session_identity.is_none()
+}
+
 fn pane_close_info(pane: &crate::pane_tree::TerminalPane) -> Option<RunningProcessInfo> {
+    if has_unidentified_saved_reference(pane) { return None; }
     let terminal = pane.terminal.as_ref();
     let process_status = terminal
         .map(|terminal| terminal.close_process_status())
         .or_else(|| {
             pane.host_session_id.map(|session_id| {
-                crate::session_host::session_process_status(session_id).unwrap_or((true, None))
+                match crate::session_host::session_process_status_reference(session_id, pane.host_session_identity.clone()) {
+                    Ok(status) => status,
+                    Err(error) if is_missing_host_session(&error) => (false, None),
+                    Err(_) => (true, None),
+                }
             })
         });
     let requires_confirmation =
@@ -355,10 +371,10 @@ fn should_confirm_pane_close(
     terminal_has_process.unwrap_or(hosted_session_unavailable)
 }
 
-fn stop_host_session(session_id: usize) -> Result<(), String> {
+fn stop_host_session(session_id: usize, identity: Option<crate::daemon::SessionIdentity>) -> Result<(), String> {
     #[cfg(unix)]
     {
-        let session = match crate::session_host::attach(session_id) {
+        let session = match crate::session_host::attach_reference(session_id, identity.clone()) {
             Ok(session) => session,
             Err(error) if is_missing_host_session(&error) => return Ok(()),
             Err(error) => {
@@ -370,7 +386,7 @@ fn stop_host_session(session_id: usize) -> Result<(), String> {
         session.control.stop();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         loop {
-            let exists = crate::session_host::session_exists(session_id).map_err(|error| {
+            let exists = crate::session_host::session_exists_reference(session_id, identity.clone()).map_err(|error| {
                 format!("could not verify host session {session_id} stop: {error}")
             })?;
             if !exists {
@@ -386,15 +402,16 @@ fn stop_host_session(session_id: usize) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        let _ = session_id;
+        let _ = (session_id, identity);
         Err("host sessions are not supported on this platform".to_string())
     }
 }
 
 fn is_missing_host_session(error: &str) -> bool {
-    error.starts_with("no_such_session:")
+    error.starts_with("no_such_session:") || error.starts_with("host_instance_changed:")
 }
 
+#[cfg(test)]
 fn verify_host_session_stopped(
     session_id: usize,
     sessions: &[crate::daemon::SessionInfo],
@@ -409,8 +426,12 @@ fn verify_host_session_stopped(
 }
 
 fn stop_pane_session(pane: &crate::pane_tree::TerminalPane) -> Result<(), String> {
+    if has_unidentified_saved_reference(pane) { return Ok(()); }
+    if pane.host_session_identity.is_none() {
+        if let Some(terminal) = &pane.terminal { terminal.terminate_process(); return Ok(()); }
+    }
     if let Some(session_id) = pane_host_session_id(pane) {
-        stop_host_session(session_id)?;
+        stop_host_session(session_id, pane.host_session_identity.clone())?;
         return Ok(());
     }
     if !pane.terminal_retry_allowed {
@@ -427,8 +448,9 @@ fn stop_pane_session(pane: &crate::pane_tree::TerminalPane) -> Result<(), String
 fn stop_pane_if_idle(
     pane: &crate::pane_tree::TerminalPane,
 ) -> Result<Option<RunningProcessInfo>, String> {
+    if has_unidentified_saved_reference(pane) { return Ok(None); }
     if let Some(session_id) = pane_host_session_id(pane) {
-        return match crate::session_host::close_if_idle(session_id)? {
+        return match crate::session_host::close_if_idle_reference(session_id, pane.host_session_identity.clone())? {
             crate::session_host::CloseIfIdleResult::Closed => Ok(None),
             crate::session_host::CloseIfIdleResult::Running(process_name) => {
                 Ok(Some(RunningProcessInfo {
@@ -490,11 +512,12 @@ fn stop_panes_if_idle(panes: &[&crate::pane_tree::TerminalPane]) -> PaneStopRepo
     let mut report = PaneStopReport::default();
     let hosted: Vec<(&crate::pane_tree::TerminalPane, usize)> = panes
         .iter()
+        .filter(|pane| !has_unidentified_saved_reference(pane))
         .filter_map(|pane| pane_host_session_id(pane).map(|session_id| (*pane, session_id)))
         .collect();
     if hosted.len() > 1 {
-        match crate::session_host::close_if_idle_batch(
-            hosted.iter().map(|(_, session_id)| *session_id).collect(),
+        match crate::session_host::close_if_idle_batch_references(
+            hosted.iter().map(|(pane, session_id)| (*session_id, pane.host_session_identity.clone())).collect(),
         ) {
             Ok(crate::session_host::CloseIfIdleBatchResult::Closed) => {
                 report
@@ -544,7 +567,7 @@ fn stop_panes_if_idle(panes: &[&crate::pane_tree::TerminalPane]) -> PaneStopRepo
     for pane in panes
         .iter()
         .copied()
-        .filter(|pane| pane_host_session_id(pane).is_none())
+        .filter(|pane| pane_host_session_id(pane).is_none() || has_unidentified_saved_reference(pane))
     {
         match stop_pane_if_idle(pane) {
             Ok(None) => report.stopped_ids.push(pane.id),
@@ -574,6 +597,18 @@ mod host_restore_tests {
     use super::*;
 
     #[test]
+    fn terminal_text_keeps_combining_characters_in_the_base_column() {
+        let mut cell = alacritty_terminal::term::cell::Cell::default();
+        cell.c = 'e';
+        cell.push_zerowidth('\u{301}');
+        let mut text = String::new();
+        let mut columns = Vec::new();
+        append_terminal_cell_text(&mut text, &mut columns, &cell, 4);
+        assert_eq!(text, "e\u{301}");
+        assert_eq!(columns, vec![4, 4]);
+    }
+
+    #[test]
     fn terminal_render_retry_uses_backoff_without_a_retry_limit() {
         assert_eq!(terminal_render_retry_delay(1), std::time::Duration::from_millis(33));
         assert_eq!(terminal_render_retry_delay(2), std::time::Duration::from_millis(100));
@@ -587,6 +622,7 @@ mod host_restore_tests {
             id: 7,
             terminal: None,
             host_session_id,
+            host_session_identity: None,
             terminal_error: None,
             terminal_start_request: None,
             terminal_retry_allowed: true,
@@ -600,6 +636,34 @@ mod host_restore_tests {
             last_exit_code: None,
             last_bounds: None,
         }
+    }
+
+    #[test]
+    fn unavailable_legacy_pane_has_safe_local_recovery() {
+        let legacy = pane(Some(100));
+        assert!(fresh_shell_recovery_allowed(&legacy));
+        assert!(has_unidentified_saved_reference(&legacy));
+        assert!(pane_close_info(&legacy).is_none());
+        assert!(stop_pane_session(&legacy).is_ok());
+        assert!(stop_pane_if_idle(&legacy).unwrap().is_none());
+        assert_eq!(legacy.host_session_id, Some(100));
+        assert!(legacy.host_session_identity.is_none());
+        assert!(!fresh_shell_recovery_allowed(&pane(None)));
+    }
+
+    #[test]
+    fn same_numeric_refs_keep_each_panes_immutable_host_identity() {
+        let mut old = pane(Some(100));
+        old.host_session_identity = Some(crate::daemon::SessionIdentity { host_instance: crate::daemon::HostInstanceId("old-host".into()), session_id: 100 });
+        let mut current = pane(Some(100));
+        current.host_session_identity = Some(crate::daemon::SessionIdentity { host_instance: crate::daemon::HostInstanceId("new-host".into()), session_id: 100 });
+        let old_saved = persist_pane_node(&crate::pane_tree::PaneNode::Leaf(old.clone()));
+        let _current_saved = persist_pane_node(&crate::pane_tree::PaneNode::Leaf(current));
+        let crate::session::PersistedPaneNode::Leaf(old_saved) = old_saved else { panic!("expected leaf"); };
+        assert_eq!(old_saved.host_session_identity, old.host_session_identity);
+        assert_eq!(old_saved.host_session_identity.unwrap().host_instance.0, "old-host");
+        let legacy = pane(Some(100));
+        assert!(legacy.host_session_identity.is_none());
     }
 
     #[test]
@@ -675,6 +739,7 @@ mod host_restore_tests {
     fn saved_session_can_be_removed_only_after_host_list_confirms_stop() {
         let session = crate::daemon::SessionInfo {
             id: 42,
+            identity: None,
             title: "shell".into(),
             cwd: None,
             cols: 80,
@@ -717,6 +782,22 @@ pub struct StyledSpan {
     /// which share the column of their base cell). Used by search highlight
     /// to compute exact pixel positions without floating-point interpolation.
     pub char_cols: Vec<usize>,
+}
+
+fn append_terminal_cell_text(
+    text: &mut String,
+    columns: &mut Vec<usize>,
+    cell: &alacritty_terminal::term::cell::Cell,
+    column: usize,
+) {
+    text.push(if matches!(cell.c, '\t' | '\0') { ' ' } else { cell.c });
+    columns.push(column);
+    if let Some(characters) = cell.zerowidth() {
+        for character in characters {
+            text.push(*character);
+            columns.push(column);
+        }
+    }
 }
 
 fn trim_row_spans(spans: &mut Vec<StyledSpan>) {
@@ -2071,6 +2152,22 @@ pub fn get_all_palette_commands() -> Vec<PaletteCommand> {
             icon: IconType::GitPullRequest,
             title: "GitHub: Pull Requests (Checkout/Approve/Merge)".to_string(),
             category: "Git".to_string(),
+            shortcut: None,
+        },
+        #[cfg(unix)]
+        PaletteCommand {
+            id: "host_status".to_string(),
+            icon: IconType::Server,
+            title: crate::session_host::host_status_label(),
+            category: "Application".to_string(),
+            shortcut: None,
+        },
+        #[cfg(unix)]
+        PaletteCommand {
+            id: "restart_host".to_string(),
+            icon: IconType::RefreshCw,
+            title: "Session Host: Restart or Upgrade".to_string(),
+            category: "Application".to_string(),
             shortcut: None,
         },
         PaletteCommand {
@@ -4173,6 +4270,7 @@ impl RootView {
             title_override,
             None,
             None,
+            None,
             MissingSessionPolicy::StartFresh,
             None,
             window,
@@ -4187,6 +4285,7 @@ impl RootView {
         cwd: Option<&std::path::Path>,
         title_override: Option<String>,
         host_session_id: Option<usize>,
+        host_session_identity: Option<crate::daemon::SessionIdentity>,
         restored_pane_id: Option<PaneId>,
         missing_session_policy: MissingSessionPolicy,
         pre_attached_remote: Option<crate::session_host::RemoteSession>,
@@ -4247,6 +4346,7 @@ impl RootView {
                 classify_host_attach(
                     TerminalState::attach_hosted(
                         session_id,
+                        host_session_identity.clone(),
             cmd,
             args,
                         cwd_str,
@@ -4278,6 +4378,7 @@ impl RootView {
                     return unavailable_terminal_pane(
                         pane_id,
                         host_session_id,
+                        host_session_identity.clone(),
                         pane_title,
                         initial_cwd,
                     );
@@ -4315,17 +4416,22 @@ impl RootView {
             HostAttachOutcome::Failed(error) => {
                 eprintln!("Fastty could not restore host session {host_session_id:?}: {error}");
                 #[cfg(unix)]
+                if !error.starts_with("session_identity_unknown:") {
                 if let (Some(session_id), Some(restored_pane_id)) =
                     (host_session_id, restored_pane_id)
                 {
                     self.schedule_host_attach_retry(restored_pane_id, session_id, window, cx);
                 }
-                return unavailable_terminal_pane(
+                }
+                let mut pane = unavailable_terminal_pane(
                     pane_id,
                     host_session_id,
+                    host_session_identity.clone(),
                     pane_title,
                     initial_cwd,
                 );
+                pane.terminal_error = Some(error);
+                return pane;
             }
         };
 
@@ -4453,10 +4559,12 @@ impl RootView {
         })
         .detach();
 
+        let terminal_identity = terminal_arc.remote_session_identity();
         TerminalPane {
             id: pane_id,
             terminal: Some(terminal_arc),
             host_session_id: terminal_host_session_id,
+            host_session_identity: terminal_identity,
             terminal_error: None,
             terminal_start_request: None,
             terminal_retry_allowed: true,
@@ -4541,6 +4649,21 @@ impl RootView {
         cx.notify();
     }
 
+    fn start_new_shell_for_unavailable_pane(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((tab_index, cwd, title, custom_title)) = self.tabs.iter().enumerate().find_map(|(index, tab)| {
+            let pane = tab.pane_tree.find_pane(pane_id)?;
+            fresh_shell_recovery_allowed(pane).then(|| (index, pane.cwd.clone(), pane.title.clone(), pane.custom_title.clone()))
+        }) else { return; };
+        self.host_attach_retry_state.remove(&pane_id);
+        self.host_missing_sessions.remove(&pane_id);
+        let shell = self.config.shell.clone().or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(crate::paths::default_system_shell);
+        let mut replacement = self.spawn_terminal_pane_with_session(&shell, &[], cwd.as_deref(), Some(title), None, None, Some(pane_id), MissingSessionPolicy::StartFresh, None, window, cx);
+        replacement.custom_title = custom_title;
+        if let Some(pane) = self.tabs.get_mut(tab_index).and_then(|tab| tab.pane_tree.find_pane_mut(pane_id)) { *pane = replacement; }
+        self.persist_session();
+        cx.notify();
+    }
+
     fn retry_terminal_start(&mut self, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
         let Some((tab_index, session_id, request, cwd, title, custom_title)) = self
             .tabs
@@ -4582,6 +4705,7 @@ impl RootView {
             cwd.as_deref(),
             title,
             None,
+            None,
             Some(pane_id),
             MissingSessionPolicy::StartFresh,
             None,
@@ -4622,10 +4746,11 @@ impl RootView {
             self.host_attach_retry_state.remove(&pane_id);
             return;
         }
+        let identity = self.tabs.iter().find_map(|tab| tab.pane_tree.find_pane(pane_id)).and_then(|pane| pane.host_session_identity.clone());
         cx.spawn_in(window, async move |this, cx| {
             let attached = cx
                 .background_executor()
-                .spawn(async move { crate::session_host::attach(session_id) })
+                .spawn(async move { crate::session_host::attach_reference(session_id, identity) })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.finish_host_attach_retry(pane_id, session_id, generation, attached, window, cx);
@@ -4661,7 +4786,7 @@ impl RootView {
         };
         let remote = match attached {
             Ok(remote) => remote,
-            Err(error) if error.starts_with("no_such_session: ") => {
+            Err(error) if is_missing_host_session(&error) => {
                 self.host_attach_retry_state.remove(&pane_id);
                 self.host_missing_sessions.insert(pane_id);
                 cx.notify();
@@ -4685,6 +4810,7 @@ impl RootView {
             cwd.as_deref(),
             Some(title),
             Some(session_id),
+            remote.identity.clone(),
             Some(pane_id),
             MissingSessionPolicy::KeepUnavailable,
             Some(remote),
@@ -4780,6 +4906,7 @@ impl RootView {
                     persisted.cwd.as_deref(),
                     Some(persisted.title),
                     persisted.host_session_id,
+                    persisted.host_session_identity.clone(),
                     Some(persisted.pane_id),
                     MissingSessionPolicy::StartFresh,
                     None,
@@ -4830,6 +4957,7 @@ impl RootView {
                         .title_override
                         .clone()
                         .or(tab_info.custom_name.clone()),
+                    None,
                     None,
                     None,
                     MissingSessionPolicy::StartFresh,
@@ -5118,6 +5246,7 @@ impl RootView {
             id,
             terminal: Some(terminal.clone()),
             host_session_id: terminal.remote_session_id(),
+            host_session_identity: terminal.remote_session_identity(),
             terminal_error: None,
             terminal_start_request: None,
             terminal_retry_allowed: true,
@@ -7026,7 +7155,8 @@ impl RootView {
         let mut persisted_tabs = Vec::new();
         let mut snapshots = Vec::new();
         for tab in &self.tabs {
-            let layout = Some(tab.pane_tree.root.to_persisted(&mut snapshots));
+            let layout = Some(tab.pane_tree.root.to_persisted(&mut snapshots)
+                .map_err(anyhow::Error::msg)?);
             persisted_tabs.push(crate::session_manager::PersistedTab {
                 id: tab.id,
                 ai_tab_key: Some(tab.ai_tab_key.clone()),
@@ -7116,6 +7246,7 @@ impl RootView {
                                 cwd,
                                 title,
                                 host_session_id,
+                                persisted.host_session_identity.clone(),
                                 Some(pane_id),
                                 MissingSessionPolicy::StartFresh,
                                 None,
@@ -7131,12 +7262,15 @@ impl RootView {
                                 {
                                     use base64::prelude::*;
                                     if let Ok(bytes) = BASE64_STANDARD.decode(encoded) {
-                                        let was_alt_screen = crate::server::binary_snapshot::FasttyBinarySnapshotHeader::from_bytes(&bytes)
+                                        let was_alt_screen = if bytes.starts_with(crate::server::native_snapshot::MAGIC) {
+                                            crate::server::native_snapshot::decode(&bytes)
+                                                .is_ok_and(|state| state.modes & alacritty_terminal::term::TermMode::ALT_SCREEN.bits() != 0)
+                                        } else { crate::server::binary_snapshot::FasttyBinarySnapshotHeader::from_bytes(&bytes)
                                             .is_some_and(|header| {
                                                 header.flags
                                                     & crate::server::binary_snapshot::SNAPSHOT_FLAG_ALT_SCREEN
                                                     != 0
-                                            });
+                                            }) };
                                         if was_alt_screen
                                             || persisted.snapshot_activity
                                                 != crate::session_manager::SnapshotActivity::Shell
@@ -7146,7 +7280,7 @@ impl RootView {
                                                 "{} (previous TUI ended)",
                                                 persisted.title
                                             ));
-                                        } else if term.restore_binary_snapshot(&bytes) {
+                                        } else if term.restore_saved_snapshot(&bytes) {
                                             historical_snapshot_label
                                                 .get_or_insert("previous output");
                                             pane.custom_title = Some(format!(
@@ -7325,6 +7459,31 @@ impl RootView {
             "ssh" => self.toggle_ssh_manager(_window, cx),
             "snippets" => self.toggle_snippet_picker(_window, cx),
             "prs" => self.toggle_pr_picker(_window, cx),
+            "host_status" | "restart_host" => {
+                #[cfg(unix)]
+                {
+                    let restart = cmd_id == "restart_host";
+                    cx.spawn_in(_window, async move |_this, cx| {
+                        let result = cx.background_executor().spawn(async move {
+                            if restart {
+                                crate::session_host::restart_host().map(|_| "Host restarted".to_string())
+                            } else {
+                                crate::session_host::host_status().map(|status| format!(
+                                    "App {} · Host {} · Protocol {} · Sessions {} · Connections {} · Restart {} · Instance {} · {}",
+                                    env!("CARGO_PKG_VERSION"), status.fastty_version, status.protocol_version,
+                                    status.sessions, status.connections,
+                                    if status.restart_available { "Available" } else { "Blocked" },
+                                    status.host_instance.0, status.capabilities.join(", ")
+                                ))
+                            }
+                        }).await;
+                        match result {
+                            Ok(message) => send_system_notification("Session Host", &message),
+                            Err(error) => send_system_notification("Session Host", &error),
+                        }
+                    }).detach();
+                }
+            }
             "settings" => self.toggle_settings(_window, cx),
             "about" => self.toggle_about(_window, cx),
             "check_updates" => self.check_for_updates_manual(_window, cx),
@@ -13077,13 +13236,12 @@ impl RootView {
                                 current_is_kbd = is_kbd;
                                 current_span_start_col = col;
                             }
-                            let display_c = if cell.c == '\t' || cell.c == '\0' {
-                                ' '
-                            } else {
-                                cell.c
-                            };
-                            current_span_text.push(display_c);
-                            current_span_char_cols.push(col);
+                            append_terminal_cell_text(
+                                &mut current_span_text,
+                                &mut current_span_char_cols,
+                                &cell,
+                                col,
+                            );
                             current_span_end_col = end_col;
                         }
 
@@ -13456,6 +13614,19 @@ impl RootView {
                                     )
                                     .child("Retry connection"),
                             )
+                            .when(fresh_shell_recovery_allowed(pane), |panel| {
+                                panel.child(div()
+                                    .id(("fresh-shell", pane_id))
+                                    .px(px(12.)).py(px(6.)).rounded(px(5.))
+                                    .bg(theme.surface_raised).border_1().border_color(theme.border)
+                                    .text_size(px(12.)).text_color(theme.foreground)
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
+                                        this.start_new_shell_for_unavailable_pane(pane_id, window, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child("Start new shell"))
+                            })
                     });
                 let terminal_error_panel = pane
                     .terminal_error
@@ -13504,6 +13675,19 @@ impl RootView {
                                     .child(format!("Could not start terminal: {error}")),
                             )
                             .child(retry_control)
+                            .when(fresh_shell_recovery_allowed(pane), |panel| {
+                                panel.child(div()
+                                    .id(("fresh-shell", pane_id))
+                                    .px(px(12.)).py(px(6.)).rounded(px(5.))
+                                    .bg(theme.surface_raised).border_1().border_color(theme.border)
+                                    .text_size(px(12.)).text_color(theme.foreground)
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
+                                        this.start_new_shell_for_unavailable_pane(pane_id, window, cx);
+                                        cx.stop_propagation();
+                                    }))
+                                    .child("Start new shell"))
+                            })
                             .when(!pane.terminal_retry_allowed && pane.host_session_id.is_none(), |panel| {
                                 panel.child(
                                     div()

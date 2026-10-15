@@ -127,6 +127,7 @@ fn main() {
     // and exit the process themselves.
     let mut subcommand_args = std::env::args().skip(1);
     match subcommand_args.next().as_deref() {
+        Some("api") => fastty::daemon_client::run_api_command(subcommand_args),
         Some("sessions") | Some("list") => {
             let mut watch = false;
             let mut json = false;

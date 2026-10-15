@@ -37,3 +37,6 @@ pub mod updater;
 pub mod whats_new;
 pub mod widgets;
 pub mod server;
+
+pub mod server_api;
+pub mod process_state;

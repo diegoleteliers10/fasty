@@ -1,16 +1,16 @@
 //! Terminal state wrapper using alacritty_terminal.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::Config as AlacrittyConfig;
+use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use parking_lot::Mutex as ParkingMutex;
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::config::FontConfig;
 use crate::event_listener::EventListenerProxy;
@@ -92,10 +92,12 @@ mod dws_regression_tests {
 
     #[cfg(unix)]
     #[test]
-    fn only_no_such_session_allows_restore_fallback() {
+    fn definitive_absence_allows_restore_fallback() {
         assert!(super::is_missing_host_session_error(
             "no_such_session: session ID 12 not found"
         ));
+        assert!(super::is_missing_host_session_error("host_instance_changed: host replaced"));
+        assert!(!super::is_missing_host_session_error("session_identity_unknown: legacy reference"));
         assert!(!super::is_missing_host_session_error("connection refused"));
         assert!(!super::is_missing_host_session_error(
             "invalid session-host response: malformed JSON"
@@ -158,7 +160,7 @@ pub enum CsiEvent {
 /// a silent no-op. TUI frameworks (ratatui, bubbletea, Ink) wrap each frame
 /// in `?2026h`/`?2026l`, so the frontend must suppress repaints between the
 /// two to avoid painting half-built frames.
-#[derive(Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CsiWatcher {
     state: CsiState,
     private: bool,
@@ -168,7 +170,7 @@ pub struct CsiWatcher {
     intermediate: Option<u8>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 enum CsiState {
     Ground,
     Esc,
@@ -324,7 +326,136 @@ impl ImageStore {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+enum SequenceParseState {
+    #[default]
+    Normal,
+    Esc,
+    Osc,
+    OscEsc,
+    Apc,
+    ApcEsc,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct SideCheckpoint {
+    seq_state: SequenceParseState,
+    osc_buf: Vec<u8>,
+    apc_buf: Vec<u8>,
+    csi_watcher: CsiWatcher,
+    sync_output_active: bool,
+}
+
+impl Default for SideCheckpoint {
+    fn default() -> Self {
+        Self {
+            seq_state: SequenceParseState::Normal,
+            osc_buf: Vec::new(),
+            apc_buf: Vec::new(),
+            csi_watcher: CsiWatcher::new(),
+            sync_output_active: false,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SequenceFrame {
+    Reset,
+    Osc { bytes: Vec<u8>, framing: usize },
+    Apc(Vec<u8>),
+}
+
+impl SideCheckpoint {
+    fn feed(&mut self, byte: u8) -> Option<SequenceFrame> {
+        match self.seq_state {
+            SequenceParseState::Normal => {
+                if byte == 0x1b {
+                    self.seq_state = SequenceParseState::Esc;
+                }
+            }
+            SequenceParseState::Esc => {
+                self.seq_state = match byte {
+                    b']' => {
+                        self.osc_buf.clear();
+                        SequenceParseState::Osc
+                    }
+                    b'_' => {
+                        self.apc_buf.clear();
+                        SequenceParseState::Apc
+                    }
+                    b'c' => {
+                        self.seq_state = SequenceParseState::Normal;
+                        return Some(SequenceFrame::Reset);
+                    }
+                    _ => SequenceParseState::Normal,
+                };
+            }
+            SequenceParseState::Osc | SequenceParseState::OscEsc => {
+                let escaped = self.seq_state == SequenceParseState::OscEsc;
+                if (escaped && byte == b'\\') || (!escaped && byte == 0x07) {
+                    self.seq_state = SequenceParseState::Normal;
+                    return Some(SequenceFrame::Osc {
+                        bytes: std::mem::take(&mut self.osc_buf),
+                        framing: if escaped { 4 } else { 3 },
+                    });
+                }
+                if !escaped && byte == 0x1b {
+                    self.seq_state = SequenceParseState::OscEsc;
+                } else {
+                    if escaped {
+                        self.osc_buf.push(0x1b);
+                    }
+                    self.osc_buf.push(byte);
+                    self.seq_state = if self.osc_buf.len() > 131072 {
+                        SequenceParseState::Normal
+                    } else {
+                        SequenceParseState::Osc
+                    };
+                }
+            }
+            SequenceParseState::Apc | SequenceParseState::ApcEsc => {
+                let escaped = self.seq_state == SequenceParseState::ApcEsc;
+                if (escaped && byte == b'\\') || (!escaped && byte == 0x07) {
+                    self.seq_state = SequenceParseState::Normal;
+                    return Some(SequenceFrame::Apc(std::mem::take(&mut self.apc_buf)));
+                }
+                if !escaped && byte == 0x1b {
+                    self.seq_state = SequenceParseState::ApcEsc;
+                } else {
+                    if escaped {
+                        self.apc_buf.push(0x1b);
+                    }
+                    self.apc_buf.push(byte);
+                    self.seq_state = if self.apc_buf.len() > 16 * 1024 * 1024 {
+                        SequenceParseState::Normal
+                    } else {
+                        SequenceParseState::Apc
+                    };
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.osc_buf.len() > 131074
+            || self.apc_buf.len() > 16 * 1024 * 1024 + 2
+            || self.csi_watcher.param_count > self.csi_watcher.params.len()
+        {
+            return Err("Invalid terminal reader continuation".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ReaderIngress {
+    processor: Processor<StdSyncHandler>,
+    side: SideCheckpoint,
+}
+
 pub struct TerminalState {
+    ingress: Arc<ParkingMutex<ReaderIngress>>,
     term: Arc<ParkingMutex<alacritty_terminal::term::Term<EventListenerProxy>>>,
     render_generation: Arc<AtomicU64>,
     remote_resize_sender: Option<async_channel::Sender<(usize, usize)>>,
@@ -349,6 +480,7 @@ pub struct TerminalState {
     alive: Arc<std::sync::atomic::AtomicBool>,
     has_terminated: std::sync::atomic::AtomicBool,
     remote_session_id: Option<usize>,
+    remote_session_identity: Option<crate::daemon::SessionIdentity>,
     remote_control: Option<Arc<crate::session_host::RemoteControl>>,
 }
 
@@ -462,7 +594,7 @@ fn append_legacy_mouse_modes(out: &mut Vec<u8>) {
 
 #[cfg(unix)]
 fn is_missing_host_session_error(error: &str) -> bool {
-    error.starts_with("no_such_session: ")
+    error.starts_with("no_such_session: ") || error.starts_with("host_instance_changed: ")
 }
 
 struct RemoteInputWriter {
@@ -506,11 +638,13 @@ impl Write for RemoteInputWriter {
             ));
         }
         let len = bytes.len();
-        let reservation = self.queued_bytes.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |queued| queued.checked_add(len).filter(|total| *total <= REMOTE_WRITE_QUEUE_BYTE_LIMIT),
-        );
+        let reservation =
+            self.queued_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                    queued
+                        .checked_add(len)
+                        .filter(|total| *total <= REMOTE_WRITE_QUEUE_BYTE_LIMIT)
+                });
         if reservation.is_err() {
             if !self.warned_queue_full {
                 eprintln!("Fastty session input write queue is full; dropping terminal response");
@@ -526,7 +660,9 @@ impl Write for RemoteInputWriter {
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 self.queued_bytes.fetch_sub(len, Ordering::AcqRel);
                 if !self.warned_queue_full {
-                    eprintln!("Fastty session input write queue is full; dropping terminal response");
+                    eprintln!(
+                        "Fastty session input write queue is full; dropping terminal response"
+                    );
                     self.warned_queue_full = true;
                 }
                 return Err(std::io::Error::new(
@@ -672,6 +808,7 @@ impl TerminalState {
     #[cfg(unix)]
     pub fn attach_hosted(
         session_id: usize,
+        expected_identity: Option<crate::daemon::SessionIdentity>,
         executable: &str,
         exec_args: &[String],
         cwd: Option<&str>,
@@ -683,7 +820,7 @@ impl TerminalState {
         viewport_height: f32,
         sender: crate::event_listener::EventSender,
     ) -> anyhow::Result<Option<Self>> {
-        let remote = match crate::session_host::attach(session_id) {
+        let remote = match crate::session_host::attach_reference(session_id, expected_identity) {
             Ok(remote) => remote,
             Err(error) if is_missing_host_session_error(&error) => return Ok(None),
             Err(error) => return Err(anyhow::Error::msg(error)),
@@ -734,7 +871,9 @@ impl TerminalState {
             false,
         )?;
         if !terminal.program_status_snapshot().is_empty() {
-            terminal.program_status_pending.store(true, Ordering::Relaxed);
+            terminal
+                .program_status_pending
+                .store(true, Ordering::Relaxed);
             terminal
                 .event_listener
                 .send_app_event(AppEvent::ProgramStatusChanged {
@@ -769,8 +908,9 @@ impl TerminalState {
         let cell_h = (cell_height as usize).max(1);
         let binary_snapshot = match remote.as_ref() {
             Some(remote) if remote.snapshot.starts_with(b"FST1") => Some(
-                crate::server::binary_snapshot::decode_snapshot(&remote.snapshot)
-                    .ok_or_else(|| anyhow::anyhow!("session host sent an invalid binary snapshot"))?,
+                crate::server::binary_snapshot::decode_snapshot(&remote.snapshot).ok_or_else(
+                    || anyhow::anyhow!("session host sent an invalid binary snapshot"),
+                )?,
             ),
             _ => None,
         };
@@ -778,16 +918,41 @@ impl TerminalState {
             .as_ref()
             .is_some_and(|(header, _)| header.cols == 0 || header.rows == 0)
         {
-            return Err(anyhow::anyhow!("session host sent an invalid binary snapshot"));
+            return Err(anyhow::anyhow!(
+                "session host sent an invalid binary snapshot"
+            ));
         }
-        let has_binary_snapshot = binary_snapshot.is_some();
+        let native_snapshot = match remote.as_ref() {
+            Some(remote)
+                if remote
+                    .snapshot
+                    .starts_with(crate::server::native_snapshot::MAGIC) =>
+            {
+                Some(
+                    crate::server::native_snapshot::decode_state(&remote.snapshot)
+                        .map_err(anyhow::Error::msg)?,
+                )
+            }
+            _ => None,
+        };
+        let has_binary_snapshot = binary_snapshot.is_some() || native_snapshot.is_some();
         let cols = binary_snapshot
             .as_ref()
             .map(|(header, _)| header.cols as usize)
+            .or_else(|| {
+                native_snapshot
+                    .as_ref()
+                    .map(|state| state.terminal.main.columns)
+            })
             .unwrap_or_else(|| ((viewport_width as usize) / cell_w).max(80));
         let rows = binary_snapshot
             .as_ref()
             .map(|(header, _)| header.rows as usize)
+            .or_else(|| {
+                native_snapshot
+                    .as_ref()
+                    .map(|state| state.terminal.main.screen_lines)
+            })
             .unwrap_or_else(|| ((viewport_height as usize) / cell_h).max(24));
 
         let config = AlacrittyConfig {
@@ -801,8 +966,8 @@ impl TerminalState {
             .openpty(PtySize {
                 rows: rows as u16,
                 cols: cols as u16,
-                pixel_width: (cols as u16) * (cell_width as u16),
-                pixel_height: (rows as u16) * (cell_height as u16),
+                pixel_width: (cols as u16).saturating_mul(cell_width as u16),
+                pixel_height: (rows as u16).saturating_mul(cell_height as u16),
             })
             .expect("Failed to open PTY");
 
@@ -1003,6 +1168,7 @@ impl TerminalState {
         let master_arc: Arc<ParkingMutex<Box<dyn MasterPty + Send>>> =
             Arc::new(ParkingMutex::new(master));
         let remote_session_id = remote.as_ref().map(|session| session.id);
+        let remote_session_identity = remote.as_ref().and_then(|session| session.identity.clone());
         let remote_control = remote.as_ref().map(|session| Arc::clone(&session.control));
         #[cfg(unix)]
         let (mut reader, remote_output) = if remote.is_some() {
@@ -1092,11 +1258,12 @@ impl TerminalState {
                 parser.advance(&mut *term, b"\x1b[?1049h");
             }
             if !apply_snapshot_to_grid(&mut term, header, cells) {
-                return Err(anyhow::anyhow!("session host sent an invalid binary snapshot"));
+                return Err(anyhow::anyhow!(
+                    "session host sent an invalid binary snapshot"
+                ));
             }
-            let mode = alacritty_terminal::term::TermMode::from_bits_truncate(
-                header.terminal_modes(),
-            );
+            let mode =
+                alacritty_terminal::term::TermMode::from_bits_truncate(header.terminal_modes());
             let mut mode_commands = Vec::new();
             append_restored_terminal_modes(&mut mode_commands, mode);
             parser.advance(&mut *term, &mode_commands);
@@ -1105,10 +1272,27 @@ impl TerminalState {
             }
         }
         drop(binary_snapshot);
+        let ingress = Arc::new(ParkingMutex::new(ReaderIngress::default()));
+        if let Some(snapshot) = native_snapshot {
+            let mut term = term.lock();
+            term.restore_snapshot(snapshot.terminal)
+                .map_err(anyhow::Error::new)?;
+            if let Some(continuation) = snapshot.continuation {
+                let mut ingress = ingress.lock();
+                ingress.processor =
+                    Processor::from_snapshot(continuation.parser).map_err(anyhow::Error::msg)?;
+                ingress.side = continuation.side;
+            }
+            if restored_idle_session {
+                let mut parser: Processor<StdSyncHandler> = Processor::new();
+                parser.advance(&mut *term, IDLE_SESSION_MODE_RESET);
+            }
+        }
 
         let render_generation = Arc::new(AtomicU64::new(0));
         let render_gen_clone = Arc::clone(&render_generation);
         let term_clone = Arc::clone(&term);
+        let ingress_clone = Arc::clone(&ingress);
         let event_listener_clone = event_listener.clone();
         let total_lines_pushed = Arc::new(AtomicU64::new(0));
         let total_lines_pushed_clone = Arc::clone(&total_lines_pushed);
@@ -1130,21 +1314,6 @@ impl TerminalState {
                 use std::io::Read;
 
                 let mut buf = [0u8; 65536];
-                let mut parser: Processor<StdSyncHandler> = Processor::new();
-
-                #[derive(Clone, Copy, Debug, PartialEq)]
-                enum SequenceParseState {
-                    Normal,
-                    Esc,
-                    Osc,
-                    OscEsc,
-                    Apc,
-                    ApcEsc,
-                }
-
-                let mut seq_state = SequenceParseState::Normal;
-                let mut osc_buf: Vec<u8> = Vec::new();
-                let mut apc_buf: Vec<u8> = Vec::new();
                 let mut kitty_reassembler = crate::parser::kitty_graphics::KittyReassembler::new();
                 let mut kitty_clip_write: Option<crate::parser::kitty_clipboard::WriteSession> =
                     None;
@@ -1153,7 +1322,6 @@ impl TerminalState {
                 // CSI detection: see `CsiWatcher` (module level). The watcher
                 // emits events for `CSI 2J` scrollback wipes and for Synchronized
                 // Output mode 2026, which alacritty_terminal 0.24 ignores.
-                let mut csi_watcher = CsiWatcher::new();
                 let mut clear_history_flag = false;
 
                 const SYNC_OUTPUT_TIMEOUT: std::time::Duration =
@@ -1544,6 +1712,14 @@ impl TerminalState {
                             let output_boundary = output_hub_clone.boundary.lock();
 
                             let mut term_locked = term_clone.lock();
+                            let mut ingress = ingress_clone.lock();
+                            let mut scanner = std::mem::take(&mut ingress.side);
+                            if sync_output_active != scanner.sync_output_active {
+                                sync_started =
+                                    scanner.sync_output_active.then(std::time::Instant::now);
+                            }
+                            sync_output_active = scanner.sync_output_active;
+                            let mut parser = &mut ingress.processor;
                             let mut local_lines = 0;
 
                             // Debug: write raw PTY bytes to log file
@@ -1580,155 +1756,58 @@ impl TerminalState {
 
                                 parser.advance(&mut *term_locked, &[byte]);
 
-                                match seq_state {
-                                    SequenceParseState::Normal => {
-                                        if byte == 0x1b {
-                                            seq_state = SequenceParseState::Esc;
-                                        }
+                                match scanner.feed(byte) {
+                                    Some(SequenceFrame::Reset) => {
+                                        update_program_status(
+                                            &program_status_clone,
+                                            &program_status_pending_clone,
+                                            &event_listener_clone,
+                                            source_id,
+                                            |store| store.reset(),
+                                        );
                                     }
-                                    SequenceParseState::Esc => {
-                                        if byte == b']' {
-                                            seq_state = SequenceParseState::Osc;
-                                            osc_buf.clear();
-                                        } else if byte == b'c' {
-                                            update_program_status(
-                                                &program_status_clone,
-                                                &program_status_pending_clone,
-                                                &event_listener_clone,
-                                                source_id,
-                                                |store| store.reset(),
-                                            );
-                                            seq_state = SequenceParseState::Normal;
-                                        } else if byte == b'_' {
-                                            seq_state = SequenceParseState::Apc;
-                                            apc_buf.clear();
-                                        } else {
-                                            seq_state = SequenceParseState::Normal;
-                                        }
-                                    }
-                                    SequenceParseState::Osc => {
-                                        if byte == 0x07 {
-                                            if let Some(cmd) =
-                                                parse_osc_framed(&osc_buf, &mut cmd_start_time, 3)
-                                            {
-                                                let cursor_line =
-                                                    term_locked.grid().cursor.point.line.0 as i32;
-                                                let screen_lines =
-                                                    term_locked.grid().screen_lines() as i32;
-                                                let base = total_lines_pushed_clone
-                                                    .load(Ordering::Relaxed)
-                                                    + local_lines;
-                                                handle_cmd(
-                                                    cmd,
-                                                    cursor_line,
-                                                    screen_lines,
-                                                    base,
-                                                    &mut term_locked,
-                                                    &mut parser,
-                                                );
-                                            }
-                                            seq_state = SequenceParseState::Normal;
-                                        } else if byte == 0x1b {
-                                            seq_state = SequenceParseState::OscEsc;
-                                        } else {
-                                            osc_buf.push(byte);
-                                            if osc_buf.len() > 131072 {
-                                                seq_state = SequenceParseState::Normal;
-                                            }
-                                        }
-                                    }
-                                    SequenceParseState::OscEsc => {
-                                        if byte == b'\\' {
-                                            if let Some(cmd) =
-                                                parse_osc_framed(&osc_buf, &mut cmd_start_time, 4)
-                                            {
-                                                let cursor_line =
-                                                    term_locked.grid().cursor.point.line.0 as i32;
-                                                let screen_lines =
-                                                    term_locked.grid().screen_lines() as i32;
-                                                let base = total_lines_pushed_clone
-                                                    .load(Ordering::Relaxed)
-                                                    + local_lines;
-                                                handle_cmd(
-                                                    cmd,
-                                                    cursor_line,
-                                                    screen_lines,
-                                                    base,
-                                                    &mut term_locked,
-                                                    &mut parser,
-                                                );
-                                            }
-                                            seq_state = SequenceParseState::Normal;
-                                        } else {
-                                            osc_buf.push(0x1b);
-                                            osc_buf.push(byte);
-                                            seq_state = SequenceParseState::Osc;
-                                            if osc_buf.len() > 131072 {
-                                                seq_state = SequenceParseState::Normal;
-                                            }
-                                        }
-                                    }
-                                    SequenceParseState::Apc => {
-                                        if byte == 0x07 {
+                                    Some(SequenceFrame::Osc { bytes, framing }) => {
+                                        if let Some(cmd) =
+                                            parse_osc_framed(&bytes, &mut cmd_start_time, framing)
+                                        {
                                             let cursor_line =
                                                 term_locked.grid().cursor.point.line.0 as i32;
-                                            let cursor_col =
-                                                term_locked.grid().cursor.point.column.0;
+                                            let screen_lines =
+                                                term_locked.grid().screen_lines() as i32;
                                             let base = total_lines_pushed_clone
                                                 .load(Ordering::Relaxed)
                                                 + local_lines;
-                                            let added = handle_apc(
-                                                &apc_buf,
+                                            handle_cmd(
+                                                cmd,
                                                 cursor_line,
-                                                cursor_col,
+                                                screen_lines,
                                                 base,
                                                 &mut term_locked,
                                                 &mut parser,
                                             );
-                                            local_lines += added;
-                                            seq_state = SequenceParseState::Normal;
-                                        } else if byte == 0x1b {
-                                            seq_state = SequenceParseState::ApcEsc;
-                                        } else {
-                                            apc_buf.push(byte);
-                                            if apc_buf.len() > 16 * 1024 * 1024 {
-                                                seq_state = SequenceParseState::Normal;
-                                            }
                                         }
                                     }
-                                    SequenceParseState::ApcEsc => {
-                                        if byte == b'\\' {
-                                            let cursor_line =
-                                                term_locked.grid().cursor.point.line.0 as i32;
-                                            let cursor_col =
-                                                term_locked.grid().cursor.point.column.0;
-                                            let base = total_lines_pushed_clone
-                                                .load(Ordering::Relaxed)
-                                                + local_lines;
-                                            let added = handle_apc(
-                                                &apc_buf,
-                                                cursor_line,
-                                                cursor_col,
-                                                base,
-                                                &mut term_locked,
-                                                &mut parser,
-                                            );
-                                            local_lines += added;
-                                            seq_state = SequenceParseState::Normal;
-                                        } else {
-                                            apc_buf.push(0x1b);
-                                            apc_buf.push(byte);
-                                            seq_state = SequenceParseState::Apc;
-                                            if apc_buf.len() > 16 * 1024 * 1024 {
-                                                seq_state = SequenceParseState::Normal;
-                                            }
-                                        }
+                                    Some(SequenceFrame::Apc(bytes)) => {
+                                        let cursor_line =
+                                            term_locked.grid().cursor.point.line.0 as i32;
+                                        let cursor_col = term_locked.grid().cursor.point.column.0;
+                                        let base = total_lines_pushed_clone.load(Ordering::Relaxed)
+                                            + local_lines;
+                                        local_lines += handle_apc(
+                                            &bytes,
+                                            cursor_line,
+                                            cursor_col,
+                                            base,
+                                            &mut term_locked,
+                                            &mut parser,
+                                        );
                                     }
+                                    None => {}
                                 }
 
                                 // CSI detection: dispatch watcher events for
                                 // scrollback wipes and Synchronized Output.
-                                match csi_watcher.feed(byte) {
+                                match scanner.csi_watcher.feed(byte) {
                                     Some(CsiEvent::ClearHistory) => clear_history_flag = true,
                                     Some(CsiEvent::QueryKittyClipboard) => {
                                         // DECRQM for mode 5522: reply "set" —
@@ -1783,6 +1862,9 @@ impl TerminalState {
                                 render_gen_clone.fetch_add(1, Ordering::Relaxed);
                                 event_listener_clone.send_app_event(AppEvent::Wakeup);
                             }
+                            scanner.sync_output_active = sync_output_active;
+                            ingress.side = scanner;
+                            drop(ingress);
                             output_hub_clone.publish_at_boundary(&buf[..n]);
                             drop(output_boundary);
                         }
@@ -1830,9 +1912,8 @@ impl TerminalState {
                         Ok(Some(_)) => {}
                         Ok(None) => break,
                         Err(error) => {
-                            let message = format!(
-                                "\r\n\r\n[Fastty: terminal output stopped: {error}]\r\n"
-                            );
+                            let message =
+                                format!("\r\n\r\n[Fastty: terminal output stopped: {error}]\r\n");
                             let _ = output_sink.write_all(message.as_bytes());
                             break;
                         }
@@ -1870,6 +1951,7 @@ impl TerminalState {
         };
 
         Ok(Self {
+            ingress,
             term,
             render_generation,
             remote_resize_sender,
@@ -1887,6 +1969,7 @@ impl TerminalState {
             alive,
             has_terminated: std::sync::atomic::AtomicBool::new(false),
             remote_session_id,
+            remote_session_identity,
             remote_control,
         })
     }
@@ -1926,6 +2009,10 @@ impl TerminalState {
 
     pub fn remote_session_id(&self) -> Option<usize> {
         self.remote_session_id
+    }
+
+    pub fn remote_session_identity(&self) -> Option<crate::daemon::SessionIdentity> {
+        self.remote_session_identity.clone()
     }
 
     /// Whether the pane's shell process is still there — `false` once the
@@ -1987,6 +2074,86 @@ impl TerminalState {
         )
     }
 
+    #[cfg(test)]
+    fn capture_terminal_snapshot(&self) -> alacritty_terminal::snapshot::TerminalSnapshot {
+        use alacritty_terminal::grid::Dimensions;
+        let term = self.term.lock();
+        let grid = term.grid();
+        let visible_cells = grid
+            .columns()
+            .saturating_mul(grid.screen_lines())
+            .saturating_mul(2);
+        let max_history = alacritty_terminal::snapshot::MAX_SNAPSHOT_CELLS
+            .saturating_sub(visible_cells)
+            / grid.columns().max(1);
+        term.snapshot(max_history)
+    }
+
+    fn capture_native_state(&self) -> Result<crate::server::native_snapshot::NativeState, String> {
+        use alacritty_terminal::grid::Dimensions;
+        let term = self.term.lock();
+        let ingress = self.ingress.lock();
+        let grid = term.grid();
+        let visible_cells = grid
+            .columns()
+            .saturating_mul(grid.screen_lines())
+            .saturating_mul(2);
+        let max_history = alacritty_terminal::snapshot::MAX_SNAPSHOT_CELLS
+            .saturating_sub(visible_cells)
+            / grid.columns().max(1);
+        Ok(crate::server::native_snapshot::NativeState {
+            terminal: term.snapshot(max_history),
+            continuation: Some(crate::server::native_snapshot::Continuation {
+                parser: ingress.processor.snapshot().map_err(str::to_string)?,
+                side: ingress.side.clone(),
+            }),
+        })
+    }
+
+    pub fn snapshot_state_for_save(&self) -> Result<Vec<u8>, String> {
+        let state = {
+            let _boundary = self.output_hub.boundary.lock();
+            self.capture_native_state()?
+        };
+        crate::server::native_snapshot::encode_state(
+            &state,
+            crate::server::native_snapshot::Encoding::Raw,
+        )
+    }
+
+    pub fn snapshot_state_and_subscribe_output(
+        &self,
+    ) -> Result<
+        (
+            Vec<u8>,
+            Vec<crate::program_status::ProgramRecord>,
+            bool,
+            async_channel::Receiver<Vec<u8>>,
+        ),
+        String,
+    > {
+        let ((state, program_status, process_running), output) =
+            self.output_hub.snapshot_and_subscribe(|| {
+                (
+                    self.capture_native_state(),
+                    self.program_status_snapshot(),
+                    self.is_process_running(),
+                )
+            });
+        match state.and_then(|state| {
+            crate::server::native_snapshot::encode_state(
+                &state,
+                crate::server::native_snapshot::Encoding::Deflate,
+            )
+        }) {
+            Ok(bytes) => Ok((bytes, program_status, process_running, output)),
+            Err(error) => {
+                output.close();
+                Err(error)
+            }
+        }
+    }
+
     pub fn needs_close_confirmation(&self) -> bool {
         self.close_process_status().0
     }
@@ -1994,13 +2161,16 @@ impl TerminalState {
     pub fn close_process_status(&self) -> (bool, Option<String>) {
         if let Some(session_id) = self.remote_session_id {
             let (process_running, process_name) =
-                crate::session_host::session_process_status(session_id).unwrap_or((true, None));
+                crate::session_host::session_process_status_reference(session_id, self.remote_session_identity()).unwrap_or((true, None));
             (
                 remote_session_needs_close_confirmation(Some(session_id), process_running),
                 process_name,
             )
         } else {
-            (self.is_process_running(), self.get_foreground_process_name())
+            (
+                self.is_process_running(),
+                self.get_foreground_process_name(),
+            )
         }
     }
 
@@ -2019,6 +2189,20 @@ impl TerminalState {
     pub fn get_current_working_directory(&self) -> Option<std::path::PathBuf> {
         let pid = self.shell_pid?;
         get_process_cwd(pid)
+    }
+
+    pub fn process_coordinates(&self) -> (Option<u32>, Option<u32>) {
+        if self.remote_session_id.is_some() {
+            return (None, None);
+        }
+        #[cfg(unix)]
+        let foreground = self.master.lock().as_raw_fd().and_then(|fd| {
+            let group = unsafe { libc::tcgetpgrp(fd) };
+            (group > 0).then_some(group as u32)
+        });
+        #[cfg(not(unix))]
+        let foreground = None;
+        (self.shell_pid, foreground)
     }
 
     pub fn get_foreground_process_name(&self) -> Option<String> {
@@ -2698,8 +2882,8 @@ impl TerminalState {
 
     pub fn get_screen_preview(&self, max_lines: usize) -> Vec<PreviewLine> {
         use alacritty_terminal::index::{Column, Line};
-        use alacritty_terminal::term::cell::Flags;
         use alacritty_terminal::term::TermMode;
+        use alacritty_terminal::term::cell::Flags;
 
         let term = self.term.lock();
         let grid = term.grid();
@@ -3075,11 +3259,11 @@ impl TerminalState {
         Vec<crate::server::binary_snapshot::FasttyPackedCell>,
     ) {
         use crate::server::binary_snapshot::{
-            FasttyBinarySnapshotHeader, FasttyPackedCell, BINARY_SNAPSHOT_MAGIC,
-            BINARY_SNAPSHOT_VERSION, CELL_FLAG_BOLD, CELL_FLAG_DIM, CELL_FLAG_HIDDEN,
-            CELL_FLAG_INVERSE, CELL_FLAG_ITALIC, CELL_FLAG_STRIKETHROUGH, CELL_FLAG_UNDERLINE,
-            CELL_FLAG_WIDE_CHAR, CELL_FLAG_WIDE_CHAR_SPACER, SNAPSHOT_FLAG_ALT_SCREEN,
-            SNAPSHOT_FLAG_CURSOR_VISIBLE,
+            BINARY_SNAPSHOT_MAGIC, BINARY_SNAPSHOT_VERSION, CELL_FLAG_BOLD, CELL_FLAG_DEFAULT_BG,
+            CELL_FLAG_DEFAULT_FG, CELL_FLAG_DIM, CELL_FLAG_HIDDEN, CELL_FLAG_INVERSE,
+            CELL_FLAG_ITALIC, CELL_FLAG_STRIKETHROUGH, CELL_FLAG_UNDERLINE, CELL_FLAG_WIDE_CHAR,
+            CELL_FLAG_WIDE_CHAR_SPACER, FasttyBinarySnapshotHeader, FasttyPackedCell,
+            SNAPSHOT_FLAG_ALT_SCREEN, SNAPSHOT_FLAG_CURSOR_VISIBLE,
         };
         use alacritty_terminal::index::Line;
         use alacritty_terminal::term::cell::Flags;
@@ -3148,11 +3332,7 @@ impl TerminalState {
                     let mapped = named_to_rgb(n);
                     // Foreground/Background/Dim resolve per channel via the
                     // caller's default (theme fg for fg, theme bg for bg).
-                    if mapped == 0 {
-                        default
-                    } else {
-                        mapped
-                    }
+                    if mapped == 0 { default } else { mapped }
                 }
                 AnsiColor::Indexed(i) => {
                     if i < 16 {
@@ -3179,6 +3359,12 @@ impl TerminalState {
 
         let cell_to_packed = |cell: &alacritty_terminal::term::cell::Cell| -> FasttyPackedCell {
             let mut flags = 0u16;
+            if cell.fg == AnsiColor::Named(NamedColor::Foreground) {
+                flags |= CELL_FLAG_DEFAULT_FG;
+            }
+            if cell.bg == AnsiColor::Named(NamedColor::Background) {
+                flags |= CELL_FLAG_DEFAULT_BG;
+            }
             if cell.flags.contains(Flags::BOLD) {
                 flags |= CELL_FLAG_BOLD;
             }
@@ -3235,7 +3421,9 @@ impl TerminalState {
             let max_history_rows = max_cells
                 .map(|max| max.saturating_sub(screen_lines.saturating_mul(cols)) / cols.max(1))
                 .unwrap_or(usize::MAX);
-            grid.total_lines().saturating_sub(screen_lines).min(max_history_rows)
+            grid.total_lines()
+                .saturating_sub(screen_lines)
+                .min(max_history_rows)
         };
 
         let total_cells = (history_rows + screen_lines) * cols;
@@ -3318,8 +3506,59 @@ impl TerminalState {
     /// same semantics as tmux's `respawn-pane`. Returns false on malformed
     /// input, leaving the terminal untouched.
     pub fn restore_binary_snapshot(&self, data: &[u8]) -> bool {
+        self.restore_binary_snapshot_internal(data, true)
+    }
+
+    fn restore_binary_snapshot_internal(&self, data: &[u8], resume_parser: bool) -> bool {
         use crate::server::binary_snapshot::decode_snapshot;
         use alacritty_terminal::term::TermMode;
+
+        if data.starts_with(crate::server::native_snapshot::MAGIC) {
+            let Ok(snapshot) = crate::server::native_snapshot::decode_state(data) else {
+                return false;
+            };
+            let (cols, rows) = (
+                snapshot.terminal.main.columns,
+                snapshot.terminal.main.screen_lines,
+            );
+            let restored_ingress = match snapshot.continuation.filter(|_| resume_parser) {
+                Some(continuation) => match Processor::from_snapshot(continuation.parser) {
+                    Ok(processor) => ReaderIngress {
+                        processor,
+                        side: continuation.side,
+                    },
+                    Err(_) => return false,
+                },
+                None => ReaderIngress::default(),
+            };
+            let boundary = self.output_hub.boundary.lock();
+            let mut term = self.term.lock();
+            let mut ingress = self.ingress.lock();
+            if term.restore_snapshot(snapshot.terminal).is_err() {
+                return false;
+            }
+            *ingress = restored_ingress;
+            if !resume_parser {
+                ingress.processor.advance(&mut *term, PROMPT_TERMINAL_RESET);
+            }
+            drop(ingress);
+            drop(term);
+            drop(boundary);
+            self.master
+                .lock()
+                .resize(PtySize {
+                    rows: rows as u16,
+                    cols: cols as u16,
+                    pixel_width: (cols as u16).saturating_mul(8),
+                    pixel_height: (rows as u16).saturating_mul(16),
+                })
+                .ok();
+            if let Some(remote) = &self.remote_control {
+                remote.resize(cols, rows);
+            }
+            self.render_generation.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
 
         let Some((header, cells)) = decode_snapshot(data) else {
             return false;
@@ -3360,6 +3599,22 @@ impl TerminalState {
         ok
     }
 
+    pub fn restore_saved_snapshot(&self, data: &[u8]) -> bool {
+        if data.starts_with(crate::server::native_snapshot::MAGIC) {
+            return self.restore_binary_snapshot_internal(data, false);
+        }
+        if !self.restore_binary_snapshot(data) {
+            return false;
+        }
+        let _boundary = self.output_hub.boundary.lock();
+        let mut term = self.term.lock();
+        let mut ingress = self.ingress.lock();
+        *ingress = ReaderIngress::default();
+        ingress.processor.advance(&mut *term, PROMPT_TERMINAL_RESET);
+        self.render_generation.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     pub fn render_generation(&self) -> u64 {
         self.render_generation.load(Ordering::Relaxed)
     }
@@ -3387,9 +3642,9 @@ fn apply_snapshot_to_grid(
     cells: &[crate::server::binary_snapshot::FasttyPackedCell],
 ) -> bool {
     use crate::server::binary_snapshot::{
-        CELL_FLAG_BOLD, CELL_FLAG_DIM, CELL_FLAG_HIDDEN, CELL_FLAG_INVERSE, CELL_FLAG_ITALIC,
-        CELL_FLAG_STRIKETHROUGH, CELL_FLAG_UNDERLINE, CELL_FLAG_WIDE_CHAR_SPACER,
-        SNAPSHOT_FLAG_CURSOR_VISIBLE,
+        CELL_FLAG_BOLD, CELL_FLAG_DEFAULT_BG, CELL_FLAG_DEFAULT_FG, CELL_FLAG_DIM,
+        CELL_FLAG_HIDDEN, CELL_FLAG_INVERSE, CELL_FLAG_ITALIC, CELL_FLAG_STRIKETHROUGH,
+        CELL_FLAG_UNDERLINE, CELL_FLAG_WIDE_CHAR_SPACER, SNAPSHOT_FLAG_CURSOR_VISIBLE,
     };
     use alacritty_terminal::vte::ansi::Processor;
 
@@ -3435,24 +3690,32 @@ fn apply_snapshot_to_grid(
         if flags & CELL_FLAG_STRIKETHROUGH != 0 {
             out.extend_from_slice(b"\x1b[9m");
         }
-        out.extend_from_slice(
-            format!(
-                "\x1b[38;2;{};{};{}m",
-                (fg >> 16) & 0xff,
-                (fg >> 8) & 0xff,
-                fg & 0xff
-            )
-            .as_bytes(),
-        );
-        out.extend_from_slice(
-            format!(
-                "\x1b[48;2;{};{};{}m",
-                (bg >> 16) & 0xff,
-                (bg >> 8) & 0xff,
-                bg & 0xff
-            )
-            .as_bytes(),
-        );
+        if flags & CELL_FLAG_DEFAULT_FG != 0 {
+            out.extend_from_slice(b"\x1b[39m");
+        } else {
+            out.extend_from_slice(
+                format!(
+                    "\x1b[38;2;{};{};{}m",
+                    (fg >> 16) & 0xff,
+                    (fg >> 8) & 0xff,
+                    fg & 0xff
+                )
+                .as_bytes(),
+            );
+        }
+        if flags & CELL_FLAG_DEFAULT_BG != 0 {
+            out.extend_from_slice(b"\x1b[49m");
+        } else {
+            out.extend_from_slice(
+                format!(
+                    "\x1b[48;2;{};{};{}m",
+                    (bg >> 16) & 0xff,
+                    (bg >> 8) & 0xff,
+                    bg & 0xff
+                )
+                .as_bytes(),
+            );
+        }
     };
 
     let mut emit_row = |out: &mut Vec<u8>,
@@ -3678,11 +3941,7 @@ fn parse_osc_framed(
                 let (title, body) = if let Some(idx) = msg.find(';') {
                     let t = msg[..idx].trim();
                     let b = msg[idx + 1..].trim();
-                    if t.is_empty() {
-                        ("Fastty", b)
-                    } else {
-                        (t, b)
-                    }
+                    if t.is_empty() { ("Fastty", b) } else { (t, b) }
                 } else {
                     ("Fastty", msg.trim())
                 };
@@ -4709,10 +4968,116 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn binary_snapshot_roundtrip_preserves_default_and_explicit_colors() {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
+
+        let source = TerminalState::new_headless("/bin/cat", &[], None, 10, 5)
+            .expect("create snapshot source");
+        let initial = source.snapshot_binary();
+        let (_, initial_cells) = crate::server::binary_snapshot::decode_snapshot(&initial)
+            .expect("decode initial snapshot");
+        let background = initial_cells[0].bg;
+        let explicit_bg = Rgb {
+            r: (background >> 16) as u8,
+            g: (background >> 8) as u8,
+            b: background as u8,
+        };
+        let mut parser: Processor<StdSyncHandler> = Processor::new();
+        parser.advance(
+            &mut *source.term.lock(),
+            b"\x1b[?1049h\x1b[48;2;23;23;23m\x1b[2Jopencode",
+        );
+        parser.advance(&mut *source.term.lock(), PROMPT_TERMINAL_RESET);
+        let contents = format!(
+            "a\x1b[38;2;200;100;50m\x1b[48;2;{};{};{}mb\x1b[0mc\x1b[7md\x1b[0m",
+            explicit_bg.r, explicit_bg.g, explicit_bg.b,
+        );
+        parser.advance(&mut *source.term.lock(), contents.as_bytes());
+        let encoded = source.snapshot_binary();
+        assert_eq!(source.term.lock().grid()[Line(0)][Column(1)].c, 'b');
+        source.terminate_process();
+        assert!(source.restore_binary_snapshot(&encoded));
+        let encoded = source.snapshot_binary();
+        let (header, cells) =
+            crate::server::binary_snapshot::decode_snapshot(&encoded).expect("decode snapshot");
+        let proxy = EventListenerProxy::from_arc(Arc::new(ParkingMutex::new(
+            Box::new(std::io::sink()) as Box<dyn Write + Send>,
+        )));
+        let mut restored = Term::new(
+            Config::default(),
+            &TermSize::new(header.cols as usize, header.rows as usize),
+            proxy,
+        );
+        assert!(apply_snapshot_to_grid(&mut restored, &header, &cells));
+        let grid = restored.grid();
+        assert_eq!(grid[Line(0)][Column(1)].c, 'b');
+        for column in [0, 2, 9] {
+            assert_eq!(
+                grid[Line(0)][Column(column)].bg,
+                Color::Named(NamedColor::Background)
+            );
+            assert_eq!(
+                grid[Line(0)][Column(column)].fg,
+                Color::Named(NamedColor::Foreground)
+            );
+        }
+        assert_eq!(grid[Line(0)][Column(1)].bg, Color::Spec(explicit_bg));
+        assert_eq!(
+            grid[Line(0)][Column(1)].fg,
+            Color::Spec(Rgb {
+                r: 200,
+                g: 100,
+                b: 50
+            })
+        );
+        assert!(grid[Line(0)][Column(3)].flags.contains(Flags::INVERSE));
+        assert_eq!(
+            grid[Line(0)][Column(3)].bg,
+            Color::Named(NamedColor::Background)
+        );
+
+        let mut legacy_cells = cells.clone();
+        for cell in &mut legacy_cells {
+            cell.flags &= !(crate::server::binary_snapshot::CELL_FLAG_DEFAULT_FG
+                | crate::server::binary_snapshot::CELL_FLAG_DEFAULT_BG);
+        }
+        assert!(apply_snapshot_to_grid(
+            &mut restored,
+            &header,
+            &legacy_cells
+        ));
+        assert_eq!(
+            restored.grid()[Line(0)][Column(0)].bg,
+            Color::Spec(explicit_bg)
+        );
+
+        parser.advance(&mut restored, b"\x1b[?1049h");
+        assert!(apply_snapshot_to_grid(&mut restored, &header, &cells));
+        assert!(
+            restored
+                .mode()
+                .contains(alacritty_terminal::term::TermMode::ALT_SCREEN)
+        );
+        assert_eq!(
+            restored.grid()[Line(0)][Column(1)].bg,
+            Color::Spec(explicit_bg)
+        );
+        assert_eq!(
+            restored.grid()[Line(0)][Column(0)].bg,
+            Color::Named(NamedColor::Background)
+        );
+    }
+
     #[test]
     fn test_apply_snapshot_to_grid_restores_history_and_cursor() {
         use crate::server::binary_snapshot::{
-            encode_snapshot, FasttyBinarySnapshotHeader, FasttyPackedCell,
+            CELL_FLAG_DEFAULT_BG, CELL_FLAG_DEFAULT_FG, FasttyBinarySnapshotHeader,
+            FasttyPackedCell, encode_snapshot,
         };
         use alacritty_terminal::term::{Config as AlacrittyTestConfig, Term as TestTerm};
         use parking_lot::Mutex as ParkingMutex;
@@ -4738,7 +5103,7 @@ mod tests {
             c: ch as u32,
             fg: 0x00FFFFFF,
             bg: 0x00000000,
-            flags: 0,
+            flags: CELL_FLAG_DEFAULT_BG | CELL_FLAG_DEFAULT_FG,
             _reserved: 0,
         };
         let mut cells = Vec::new();
@@ -4794,6 +5159,12 @@ mod tests {
         // Cursor restored.
         assert_eq!(grid.cursor.point.line.0, 1);
         assert_eq!(grid.cursor.point.column.0, 2);
+        assert_eq!(
+            grid[alacritty_terminal::index::Line(-1)][alacritty_terminal::index::Column(0)].bg,
+            alacritty_terminal::vte::ansi::Color::Named(
+                alacritty_terminal::vte::ansi::NamedColor::Background,
+            ),
+        );
     }
 
     #[test]
@@ -4820,3 +5191,7 @@ mod tests {
         assert!(snapshot.is_empty());
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "terminal_restore_tests.rs"]
+mod restore_tests;

@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 #[derive(Default)]
 struct WindowSnapshots {
@@ -26,7 +26,11 @@ struct WindowSnapshots {
 
 impl WindowSnapshots {
     fn session(&self) -> Option<Session> {
-        let windows: Vec<_> = self.windows.iter().map(|(_, window)| window.clone()).collect();
+        let windows: Vec<_> = self
+            .windows
+            .iter()
+            .map(|(_, window)| window.clone())
+            .collect();
         let windows = if windows.is_empty() {
             vec![self.last_closed.clone()?]
         } else {
@@ -50,8 +54,15 @@ fn window_snapshots() -> &'static parking_lot::Mutex<WindowSnapshots> {
 /// Keep all saved windows until each restored window has a live WindowId.
 pub fn begin_restore(session: &Session) {
     let mut snapshots = window_snapshots().lock();
-    snapshots.windows = session.windows.iter().cloned().map(|window| (None, window)).collect();
-    snapshots.active_window = session.active_window.min(snapshots.windows.len().saturating_sub(1));
+    snapshots.windows = session
+        .windows
+        .iter()
+        .cloned()
+        .map(|window| (None, window))
+        .collect();
+    snapshots.active_window = session
+        .active_window
+        .min(snapshots.windows.len().saturating_sub(1));
     snapshots.last_closed = None;
     snapshots.quitting = false;
 }
@@ -65,7 +76,11 @@ pub fn bind_restored_window(index: usize, window_id: WindowId) {
 /// Save a full snapshot under one lock so two windows cannot overwrite each other.
 pub fn register_window(window_id: WindowId, mut window: WindowSession) -> anyhow::Result<()> {
     let mut snapshots = window_snapshots().lock();
-    if let Some(index) = snapshots.windows.iter().position(|(id, _)| *id == Some(window_id)) {
+    if let Some(index) = snapshots
+        .windows
+        .iter()
+        .position(|(id, _)| *id == Some(window_id))
+    {
         if window.position.is_none() {
             window.position = snapshots.windows[index].1.position;
         }
@@ -91,11 +106,17 @@ pub fn persist_window(window_id: WindowId) -> anyhow::Result<()> {
     if snapshots.quitting {
         return Ok(());
     }
-    let Some(index) = snapshots.windows.iter().position(|(id, _)| *id == Some(window_id)) else {
+    let Some(index) = snapshots
+        .windows
+        .iter()
+        .position(|(id, _)| *id == Some(window_id))
+    else {
         return Ok(());
     };
     let (_, closed) = snapshots.windows.remove(index);
-    snapshots.active_window = snapshots.active_window.min(snapshots.windows.len().saturating_sub(1));
+    snapshots.active_window = snapshots
+        .active_window
+        .min(snapshots.windows.len().saturating_sub(1));
     if snapshots.windows.is_empty() {
         snapshots.last_closed = Some(closed);
     }
@@ -108,7 +129,11 @@ pub fn persist_window(window_id: WindowId) -> anyhow::Result<()> {
 pub fn persist_before_quit(active_window: Option<WindowId>) -> anyhow::Result<()> {
     let mut snapshots = window_snapshots().lock();
     if let Some(window_id) = active_window {
-        if let Some(index) = snapshots.windows.iter().position(|(id, _)| *id == Some(window_id)) {
+        if let Some(index) = snapshots
+            .windows
+            .iter()
+            .position(|(id, _)| *id == Some(window_id))
+        {
             snapshots.active_window = index;
         }
     }
@@ -170,7 +195,6 @@ pub struct WindowSession {
     pub ai_sidebar_open: bool,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabInfo {
     pub cwd: Option<PathBuf>,
@@ -215,6 +239,8 @@ pub struct PersistedTerminalPane {
     /// Absent in old session files and when a pane has no live host session.
     #[serde(default)]
     pub host_session_id: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_session_identity: Option<crate::daemon::SessionIdentity>,
     #[serde(default)]
     pub cwd: Option<PathBuf>,
     pub title: String,
@@ -264,6 +290,10 @@ mod tests {
                     first: Box::new(PersistedPaneNode::Leaf(PersistedTerminalPane {
                         pane_id: 10,
                         host_session_id: Some(41),
+                        host_session_identity: Some(crate::daemon::SessionIdentity {
+                            host_instance: crate::daemon::HostInstanceId("original-host".into()),
+                            session_id: 41,
+                        }),
                         cwd: Some(PathBuf::from("/work/one")),
                         title: "one".into(),
                         custom_title: Some("first".into()),
@@ -271,6 +301,7 @@ mod tests {
                     second: Box::new(PersistedPaneNode::Leaf(PersistedTerminalPane {
                         pane_id: 11,
                         host_session_id: Some(42),
+                        host_session_identity: None,
                         cwd: Some(PathBuf::from("/work/two")),
                         title: "two".into(),
                         custom_title: None,
@@ -283,12 +314,34 @@ mod tests {
         let encoded = serde_json::to_string(&tab).unwrap();
         let decoded: TabInfo = serde_json::from_str(&encoded).unwrap();
 
-        let Some(PersistedPaneTree { root: PersistedPaneNode::Split { first, second, .. }, active_pane_id }) = decoded.pane_tree else {
+        let Some(PersistedPaneTree {
+            root: PersistedPaneNode::Split { first, second, .. },
+            active_pane_id,
+        }) = decoded.pane_tree
+        else {
             panic!("persisted split must round-trip");
         };
-        let PersistedPaneNode::Leaf(first) = *first else { panic!("first pane must be a leaf"); };
-        let PersistedPaneNode::Leaf(second) = *second else { panic!("second pane must be a leaf"); };
+        let PersistedPaneNode::Leaf(first) = *first else {
+            panic!("first pane must be a leaf");
+        };
+        let PersistedPaneNode::Leaf(second) = *second else {
+            panic!("second pane must be a leaf");
+        };
         assert_eq!(first.host_session_id, Some(41));
+        assert_eq!(
+            first
+                .host_session_identity
+                .as_ref()
+                .map(|identity| identity.session_id),
+            Some(41)
+        );
+        assert_eq!(
+            first
+                .host_session_identity
+                .as_ref()
+                .map(|identity| identity.host_instance.0.as_str()),
+            Some("original-host")
+        );
         assert_eq!(second.host_session_id, Some(42));
         assert_eq!(active_pane_id, 11);
     }

@@ -51,6 +51,7 @@ struct HostInfo {
     version: u32,
     fastty_version: String,
     capabilities: Vec<String>,
+    host_instance: Option<crate::daemon::HostInstanceId>,
 }
 
 impl HostInfo {
@@ -80,6 +81,26 @@ fn host_info() -> Option<HostInfo> {
     HOST_INFO.get().and_then(|cache| cache.lock().ok()?.clone())
 }
 
+pub fn host_status_label() -> String {
+    match host_info() {
+        Some(info) => format!(
+            "Session Host: {} · App {}",
+            info.fastty_version,
+            env!("CARGO_PKG_VERSION")
+        ),
+        None => "Session Host: Unavailable".into(),
+    }
+}
+
+fn attach_snapshot_format() -> crate::daemon::SnapshotFormat {
+    match host_info() {
+        Some(info) if info.supports("terminal_state_snapshot_v1") => {
+            crate::daemon::SnapshotFormat::TerminalState
+        }
+        _ => crate::daemon::SnapshotFormat::Legacy,
+    }
+}
+
 #[cfg(unix)]
 fn connect_for_handshake() -> Result<std::os::unix::net::UnixStream, String> {
     use std::time::Duration;
@@ -96,22 +117,91 @@ fn connect_for_handshake() -> Result<std::os::unix::net::UnixStream, String> {
 }
 
 #[cfg(unix)]
-fn probe_host(mut stream: std::os::unix::net::UnixStream) -> Result<HostInfo, String> {
-    write_request(&mut stream, &Request::Hello { read_only: true })
-        .map_err(|error| error.to_string())?;
+fn probe_host(stream: std::os::unix::net::UnixStream) -> Result<HostInfo, String> {
+    probe_host_with_access(stream, true)
+}
+
+#[cfg(unix)]
+fn probe_host_with_access(
+    mut stream: std::os::unix::net::UnixStream,
+    read_only: bool,
+) -> Result<HostInfo, String> {
+    write_request(&mut stream, &Request::Hello { read_only }).map_err(|error| error.to_string())?;
     match read_response(&mut BufReader::new(stream))? {
         Response::Hello {
             version,
             fastty_version,
             capabilities,
+            host_instance,
         } => Ok(HostInfo {
             version,
             fastty_version,
             capabilities,
+            host_instance,
         }),
         Response::Error { code, message } => Err(format!("{code}: {message}")),
         other => Err(format!("unexpected session-host hello response: {other:?}")),
     }
+}
+
+fn reference_host(
+    id: usize,
+    identity: Option<crate::daemon::SessionIdentity>,
+) -> Result<crate::daemon::HostInstanceId, String> {
+    identity
+        .filter(|identity| identity.session_id == id)
+        .map(|identity| identity.host_instance)
+        .ok_or_else(|| "session_identity_unknown: the saved session has no host identity".into())
+}
+
+#[cfg(unix)]
+pub fn host_status() -> Result<crate::daemon::HostStatus, String> {
+    let mut stream = connect_for_handshake()?;
+    write_request(&mut stream, &Request::HostStatus).map_err(|error| error.to_string())?;
+    match read_response(&mut BufReader::new(stream))? {
+        Response::HostStatus { status } => Ok(status),
+        Response::Error { code, message } => Err(format!("{code}: {message}")),
+        other => Err(format!("unexpected host status response: {other:?}")),
+    }
+}
+
+#[cfg(unix)]
+pub fn restart_host() -> Result<(), String> {
+    let mut stream = connect_for_handshake()?;
+    write_request(&mut stream, &Request::HostStatus).map_err(|error| error.to_string())?;
+    let status = match read_response(&mut BufReader::new(&mut stream))? {
+        Response::HostStatus { status } => status,
+        Response::Error { code, message } => return Err(format!("{code}: {message}")),
+        other => return Err(format!("unexpected host status response: {other:?}")),
+    };
+    if !status
+        .capabilities
+        .iter()
+        .any(|capability| capability == "safe_host_restart_v1")
+    {
+        return Err("host_restart_unsupported: this host does not support a safe restart".into());
+    }
+    write_request(
+        &mut stream,
+        &Request::RestartHost {
+            expected_host_instance: status.host_instance.clone(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    match read_response(&mut BufReader::new(stream))? {
+        Response::HostRestarting => {}
+        Response::Error { code, message } => return Err(format!("{code}: {message}")),
+        other => return Err(format!("unexpected host restart response: {other:?}")),
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::os::unix::net::UnixStream::connect(crate::daemon::socket_path()).is_ok() {
+        if std::time::Instant::now() >= deadline {
+            return Err("host restart timed out".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    forget_host_info();
+    ensure_running()
 }
 
 const HOST_ARGUMENT: &str = "--fastty-session-host";
@@ -195,6 +285,7 @@ pub fn run_host() {
 #[cfg(unix)]
 pub struct RemoteSession {
     pub id: usize,
+    pub identity: Option<crate::daemon::SessionIdentity>,
     pub snapshot: Vec<u8>,
     pub program_status: Vec<crate::program_status::ProgramRecord>,
     pub process_running: Option<bool>,
@@ -206,6 +297,7 @@ pub struct RemoteSession {
 #[cfg(not(unix))]
 pub struct RemoteSession {
     pub id: usize,
+    pub identity: Option<crate::daemon::SessionIdentity>,
     pub snapshot: Vec<u8>,
     pub program_status: Vec<crate::program_status::ProgramRecord>,
     pub process_running: Option<bool>,
@@ -253,6 +345,7 @@ pub fn session_process_running(id: usize) -> Result<bool, String> {
 pub fn session_process_status(id: usize) -> Result<(bool, Option<String>), String> {
     ensure_running()?;
     let mut stream = connect_for_handshake()?;
+    validate_session_connection(&mut stream, id)?;
     write_request(&mut stream, &Request::SessionStatus { id })
         .map_err(|error| error.to_string())?;
     match read_response(&mut BufReader::new(stream))? {
@@ -273,6 +366,130 @@ pub fn session_process_status(id: usize) -> Result<(bool, Option<String>), Strin
     }
 }
 
+fn reference_request(
+    id: usize,
+    identity: Option<crate::daemon::SessionIdentity>,
+    request: Request,
+) -> Result<Response, String> {
+    let expected = reference_host(id, identity)?;
+    #[cfg(unix)]
+    {
+        let mut stream = connect_for_handshake()?;
+        validate_host_connection(&mut stream, &expected)?;
+        write_request(&mut stream, &request).map_err(|error| error.to_string())?;
+        return read_response(&mut BufReader::new(stream));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (expected, request);
+        Err("host sessions are not supported on this platform".into())
+    }
+}
+
+pub fn session_process_status_reference(
+    id: usize,
+    identity: Option<crate::daemon::SessionIdentity>,
+) -> Result<(bool, Option<String>), String> {
+    match reference_request(id, identity, Request::SessionStatus { id })? {
+        Response::SessionStatus {
+            process_running,
+            foreground_process_label,
+            ..
+        } => Ok((process_running, foreground_process_label)),
+        Response::Error { code, message } => Err(format!("{code}: {message}")),
+        other => Err(format!("unexpected session status response: {other:?}")),
+    }
+}
+
+pub fn session_exists_reference(
+    id: usize,
+    identity: Option<crate::daemon::SessionIdentity>,
+) -> Result<bool, String> {
+    match reference_request(id, identity, Request::SessionExists { id })? {
+        Response::SessionExists { exists } => Ok(exists),
+        Response::Error { code, message } => Err(format!("{code}: {message}")),
+        other => Err(format!("unexpected session existence response: {other:?}")),
+    }
+}
+
+pub fn close_if_idle_reference(
+    id: usize,
+    identity: Option<crate::daemon::SessionIdentity>,
+) -> Result<CloseIfIdleResult, String> {
+    let response = match reference_request(id, identity, Request::CloseIfIdle { id }) {
+        Ok(response) => response,
+        Err(error) if error.starts_with("host_instance_changed:") => {
+            return Ok(CloseIfIdleResult::Closed)
+        }
+        Err(error) => return Err(error),
+    };
+    match response {
+        Response::Closed { .. } => Ok(CloseIfIdleResult::Closed),
+        Response::CloseBlocked {
+            foreground_process_label,
+            ..
+        } => Ok(CloseIfIdleResult::Running(foreground_process_label)),
+        Response::Error { code, .. }
+            if code == "no_such_session" || code == "host_instance_changed" =>
+        {
+            Ok(CloseIfIdleResult::Closed)
+        }
+        Response::Error { code, message } => Err(format!("{code}: {message}")),
+        other => Err(format!("unexpected close response: {other:?}")),
+    }
+}
+
+fn current_batch_reference_ids(
+    references: &[(usize, Option<crate::daemon::SessionIdentity>)],
+    current: Option<&crate::daemon::HostInstanceId>,
+) -> Result<Vec<usize>, String> {
+    let mut ids = Vec::new();
+    for (id, identity) in references {
+        let expected = reference_host(*id, identity.clone())?;
+        if Some(&expected) == current {
+            ids.push(*id);
+        }
+    }
+    Ok(ids)
+}
+
+pub fn close_if_idle_batch_references(
+    references: Vec<(usize, Option<crate::daemon::SessionIdentity>)>,
+) -> Result<CloseIfIdleBatchResult, String> {
+    for (id, identity) in &references {
+        reference_host(*id, identity.clone())?;
+    }
+    if references.is_empty() {
+        return Ok(CloseIfIdleBatchResult::Closed);
+    }
+    #[cfg(unix)]
+    {
+        let mut stream = connect_for_handshake()?;
+        let info = probe_host_with_access(
+            stream.try_clone().map_err(|error| error.to_string())?,
+            false,
+        )?;
+        let ids = current_batch_reference_ids(&references, info.host_instance.as_ref())?;
+        if ids.is_empty() {
+            return Ok(CloseIfIdleBatchResult::Closed);
+        }
+        write_request(&mut stream, &Request::CloseIfIdleBatch { ids })
+            .map_err(|error| error.to_string())?;
+        match read_response(&mut BufReader::new(stream))? {
+            Response::CloseBatch { blocked, .. } if blocked.is_empty() => {
+                Ok(CloseIfIdleBatchResult::Closed)
+            }
+            Response::CloseBatch { blocked, .. } => Ok(CloseIfIdleBatchResult::Running(blocked)),
+            Response::Error { code, message } => Err(format!("{code}: {message}")),
+            other => Err(format!("unexpected batch close response: {other:?}")),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Err("host sessions are not supported on this platform".into())
+    }
+}
+
 pub enum CloseIfIdleResult {
     Closed,
     Running(Option<String>),
@@ -290,6 +507,9 @@ pub fn close_if_idle_batch(ids: Vec<usize>) -> Result<CloseIfIdleBatchResult, St
         return Err(legacy_batch_close_error());
     }
     let mut stream = connect_for_handshake()?;
+    for id in &ids {
+        validate_session_connection(&mut stream, *id)?;
+    }
     write_request(&mut stream, &Request::CloseIfIdleBatch { ids })
         .map_err(|error| error.to_string())?;
     match read_response(&mut BufReader::new(stream))? {
@@ -320,17 +540,15 @@ pub fn close_if_idle(id: usize) -> Result<CloseIfIdleResult, String> {
         return close_if_idle_on_legacy_host(id);
     }
     let mut stream = connect_for_handshake()?;
-    write_request(&mut stream, &Request::CloseIfIdle { id })
-        .map_err(|error| error.to_string())?;
+    validate_session_connection(&mut stream, id)?;
+    write_request(&mut stream, &Request::CloseIfIdle { id }).map_err(|error| error.to_string())?;
     match read_response(&mut BufReader::new(stream))? {
         Response::Closed { .. } => Ok(CloseIfIdleResult::Closed),
         Response::CloseBlocked {
             foreground_process_label,
             ..
         } => Ok(CloseIfIdleResult::Running(foreground_process_label)),
-        Response::Error { code, .. } if code == "no_such_session" => {
-            Ok(CloseIfIdleResult::Closed)
-        }
+        Response::Error { code, .. } if code == "no_such_session" => Ok(CloseIfIdleResult::Closed),
         Response::Error { code, message }
             if code == "bad_request" && message.contains("unknown variant `close_if_idle`") =>
         {
@@ -343,11 +561,7 @@ pub fn close_if_idle(id: usize) -> Result<CloseIfIdleResult, String> {
 
 #[cfg(unix)]
 fn close_if_idle_on_legacy_host(id: usize) -> Result<CloseIfIdleResult, String> {
-    close_legacy_session_if_idle(
-        id,
-        session_process_status,
-        force_close_session,
-    )
+    close_legacy_session_if_idle(id, session_process_status, force_close_session)
 }
 
 fn close_legacy_session_if_idle(
@@ -372,7 +586,8 @@ fn close_legacy_session_if_idle(
 }
 
 fn legacy_batch_close_error() -> String {
-    "the session host cannot close several tabs as one safe operation. Close tabs one at a time.".to_string()
+    "the session host cannot close several tabs as one safe operation. Close tabs one at a time."
+        .to_string()
 }
 
 #[cfg(not(unix))]
@@ -437,10 +652,12 @@ impl RemoteControl {
         if self.closed.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
         }
-        let result = self.send(&Request::Close {
-            id: self.id,
-            force: true,
-        }).map_err(|error| error.to_string());
+        let result = self
+            .send(&Request::Close {
+                id: self.id,
+                force: true,
+            })
+            .map_err(|error| error.to_string());
         self.shutdown();
         result
     }
@@ -493,6 +710,12 @@ pub fn spawn_attached(
     let spawn_started = std::time::Instant::now();
     let request_id = next_spawn_request_id();
     let mut stream = connect_for_handshake()?;
+    let info = probe_host_with_access(
+        stream.try_clone().map_err(|error| error.to_string())?,
+        false,
+    )?;
+    let expected_host_instance = info.host_instance.clone();
+    remember_host_info(info);
     let spawn_response = write_request(
         &mut stream,
         &Request::Spawn {
@@ -506,17 +729,18 @@ pub fn spawn_attached(
         },
     );
     let id = match spawn_response {
-        Err(error) => resolve_ambiguous_spawn(&request_id)
+        Err(error) => resolve_ambiguous_spawn(&request_id, expected_host_instance.as_ref())
             .map_err(|_| SpawnAttachError::ambiguous(error.to_string()))?,
         Ok(()) => match read_response(&mut BufReader::new(stream)) {
             Ok(Response::Spawned { id, .. }) => id,
             Ok(Response::Error { code, message }) => {
                 return Err(SpawnAttachError::from(format!("{code}: {message}")));
             }
-            Ok(other) => resolve_ambiguous_spawn(&request_id).map_err(|_| {
-                SpawnAttachError::ambiguous(format!("unexpected spawn response: {other:?}"))
-            })?,
-            Err(error) => resolve_ambiguous_spawn(&request_id)
+            Ok(other) => resolve_ambiguous_spawn(&request_id, expected_host_instance.as_ref())
+                .map_err(|_| {
+                    SpawnAttachError::ambiguous(format!("unexpected spawn response: {other:?}"))
+                })?,
+            Err(error) => resolve_ambiguous_spawn(&request_id, expected_host_instance.as_ref())
                 .map_err(|_| SpawnAttachError::ambiguous(error))?,
         },
     };
@@ -528,12 +752,15 @@ pub fn spawn_attached(
     let attach_started = std::time::Instant::now();
     let attached = (|| -> Result<RemoteSession, String> {
         let mut stream = connect_for_handshake()?;
+        validate_session_connection(&mut stream, id)?;
         write_request(
             &mut stream,
             &Request::Attach {
                 id,
+                expected_host_instance: expected_host_instance.clone(),
                 mode: AttachMode::ReadWrite,
                 binary_snapshot: false,
+                snapshot_format: attach_snapshot_format(),
             },
         )
         .map_err(|error| error.to_string())?;
@@ -565,6 +792,12 @@ pub fn spawn_attached(
             .map_err(|error| error.to_string())?;
         Ok(RemoteSession {
             id,
+            identity: expected_host_instance.clone().map(|host_instance| {
+                crate::daemon::SessionIdentity {
+                    host_instance,
+                    session_id: id,
+                }
+            }),
             snapshot,
             program_status,
             process_running,
@@ -578,14 +811,23 @@ pub fn spawn_attached(
         })
     })();
     attached.map_err(|message| {
-        let cleanup = force_close_session(id).err();
+        let cleanup = force_close_reference(
+            id,
+            expected_host_instance
+                .clone()
+                .map(|host_instance| crate::daemon::SessionIdentity {
+                    host_instance,
+                    session_id: id,
+                }),
+        )
+        .err();
         SpawnAttachError {
             session_id: cleanup.as_ref().map(|_| id),
             retry_safe: true,
             message: match cleanup {
-            Some(cleanup_error) => {
-                format!("{message}; session {id} could not be stopped: {cleanup_error}")
-            }
+                Some(cleanup_error) => {
+                    format!("{message}; session {id} could not be stopped: {cleanup_error}")
+                }
                 None => message,
             },
         }
@@ -606,9 +848,15 @@ fn next_spawn_request_id() -> String {
 }
 
 #[cfg(unix)]
-fn resolve_ambiguous_spawn(request_id: &str) -> Result<usize, String> {
-    ensure_running()?;
+fn resolve_ambiguous_spawn(
+    request_id: &str,
+    expected_host_instance: Option<&crate::daemon::HostInstanceId>,
+) -> Result<usize, String> {
+    let expected = expected_host_instance.ok_or_else(|| {
+        "spawn_recovery_unsupported: the original host has no instance identity".to_string()
+    })?;
     let mut stream = connect_for_handshake()?;
+    validate_host_connection(&mut stream, expected)?;
     write_request(
         &mut stream,
         &Request::SpawnStatus {
@@ -618,15 +866,30 @@ fn resolve_ambiguous_spawn(request_id: &str) -> Result<usize, String> {
     .map_err(|error| error.to_string())?;
     match read_response(&mut BufReader::new(stream))? {
         Response::SpawnStatus { id: Some(id) } => Ok(id),
-        Response::SpawnStatus { id: None } => Err("host has no record of this spawn request".into()),
+        Response::SpawnStatus { id: None } => {
+            Err("host has no record of this spawn request".into())
+        }
         Response::Error { code, message } => Err(format!("{code}: {message}")),
         other => Err(format!("unexpected spawn-status response: {other:?}")),
+    }
+}
+
+fn force_close_reference(
+    id: usize,
+    identity: Option<crate::daemon::SessionIdentity>,
+) -> Result<(), String> {
+    match reference_request(id, identity, Request::Close { id, force: true })? {
+        Response::Closed { .. } => Ok(()),
+        Response::Error { code, .. } if code == "no_such_session" => Ok(()),
+        Response::Error { code, message } => Err(format!("{code}: {message}")),
+        other => Err(format!("unexpected close response: {other:?}")),
     }
 }
 
 #[cfg(unix)]
 fn force_close_session(id: usize) -> Result<(), String> {
     let mut stream = connect_for_handshake()?;
+    validate_session_connection(&mut stream, id)?;
     write_request(&mut stream, &Request::Close { id, force: true })
         .map_err(|error| error.to_string())?;
     match read_response(&mut BufReader::new(stream))? {
@@ -640,16 +903,39 @@ fn force_close_session(id: usize) -> Result<(), String> {
 #[cfg(unix)]
 pub fn attach(id: usize) -> Result<RemoteSession, String> {
     ensure_running()?;
+    attach_expected(id, host_info().and_then(|info| info.host_instance))
+}
+
+#[cfg(unix)]
+pub fn attach_reference(
+    id: usize,
+    identity: Option<crate::daemon::SessionIdentity>,
+) -> Result<RemoteSession, String> {
+    let expected = reference_host(id, identity)?;
+    ensure_running()?;
+    attach_expected(id, Some(expected))
+}
+
+#[cfg(unix)]
+fn attach_expected(
+    id: usize,
+    expected_host_instance: Option<crate::daemon::HostInstanceId>,
+) -> Result<RemoteSession, String> {
     let mut stream = connect_for_handshake()?;
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(10)))
         .map_err(|error| error.to_string())?;
+    if let Some(expected) = &expected_host_instance {
+        validate_host_connection(&mut stream, expected)?;
+    }
     write_request(
         &mut stream,
         &Request::Attach {
             id,
+            expected_host_instance: expected_host_instance.clone(),
             mode: AttachMode::ReadWrite,
             binary_snapshot: true,
+            snapshot_format: attach_snapshot_format(),
         },
     )
     .map_err(|error| error.to_string())?;
@@ -693,6 +979,12 @@ pub fn attach(id: usize) -> Result<RemoteSession, String> {
     };
     Ok(RemoteSession {
         id,
+        identity: expected_host_instance.clone().map(|host_instance| {
+            crate::daemon::SessionIdentity {
+                host_instance,
+                session_id: id,
+            }
+        }),
         snapshot,
         program_status,
         process_running,
@@ -709,6 +1001,7 @@ pub fn attach(id: usize) -> Result<RemoteSession, String> {
 #[cfg(unix)]
 fn query_session_status(id: usize) -> Result<Response, String> {
     let mut stream = connect_for_handshake()?;
+    validate_session_connection(&mut stream, id)?;
     write_request(&mut stream, &Request::SessionStatus { id })
         .map_err(|error| error.to_string())?;
     read_response(&mut BufReader::new(stream))
@@ -804,9 +1097,39 @@ pub fn list_sessions() -> Result<Vec<SessionInfo>, String> {
 }
 
 #[cfg(unix)]
+fn validate_session_connection(
+    stream: &mut std::os::unix::net::UnixStream,
+    _id: usize,
+) -> Result<(), String> {
+    let expected = host_info().and_then(|info| info.host_instance);
+    if let Some(expected) = expected {
+        validate_host_connection(stream, &expected)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_host_connection(
+    stream: &mut std::os::unix::net::UnixStream,
+    expected: &crate::daemon::HostInstanceId,
+) -> Result<(), String> {
+    let info = probe_host_with_access(
+        stream.try_clone().map_err(|error| error.to_string())?,
+        false,
+    )?;
+    if info.host_instance.as_ref() != Some(expected) {
+        return Err(
+            "host_instance_changed: the saved session belongs to another host instance".into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 pub fn session_exists(id: usize) -> Result<bool, String> {
     ensure_running()?;
     let mut stream = connect_for_handshake()?;
+    validate_session_connection(&mut stream, id)?;
     write_request(&mut stream, &Request::SessionExists { id })
         .map_err(|error| error.to_string())?;
     match read_response(&mut BufReader::new(stream))? {
@@ -818,12 +1141,88 @@ pub fn session_exists(id: usize) -> Result<bool, String> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn connection_identity_check_keeps_manage_access_and_rejects_legacy_host() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let responder = std::thread::spawn(move || {
+            let mut request = String::new();
+            BufReader::new(server.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: Request = serde_json::from_str(&request).unwrap();
+            assert!(matches!(request, Request::Hello { read_only: false }));
+            server
+                .write_all(b"{\"event\":\"hello\",\"version\":1,\"fastty_version\":\"0.22.6\"}\n")
+                .unwrap();
+        });
+        let error = validate_host_connection(
+            &mut client,
+            &crate::daemon::HostInstanceId("saved-host".into()),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("host_instance_changed:"));
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn close_batch_excludes_stale_refs_and_keeps_current_refs() {
+        let old = crate::daemon::HostInstanceId("old-host".into());
+        let current = crate::daemon::HostInstanceId("current-host".into());
+        let refs = vec![
+            (
+                100,
+                Some(crate::daemon::SessionIdentity {
+                    host_instance: old,
+                    session_id: 100,
+                }),
+            ),
+            (
+                100,
+                Some(crate::daemon::SessionIdentity {
+                    host_instance: current.clone(),
+                    session_id: 100,
+                }),
+            ),
+        ];
+        assert_eq!(
+            current_batch_reference_ids(&refs, Some(&current)).unwrap(),
+            vec![100]
+        );
+        assert!(current_batch_reference_ids(&refs, None).unwrap().is_empty());
+        assert!(current_batch_reference_ids(&[(100, None)], Some(&current)).is_err());
+    }
+
+    #[test]
+    fn saved_legacy_sessions_cannot_attach_by_number() {
+        assert!(reference_host(100, None)
+            .unwrap_err()
+            .starts_with("session_identity_unknown:"));
+        let old = crate::daemon::SessionIdentity {
+            host_instance: crate::daemon::HostInstanceId("old-host".into()),
+            session_id: 100,
+        };
+        let new = crate::daemon::SessionIdentity {
+            host_instance: crate::daemon::HostInstanceId("new-host".into()),
+            session_id: 100,
+        };
+        assert_ne!(
+            reference_host(100, Some(old.clone())).unwrap(),
+            reference_host(100, Some(new)).unwrap()
+        );
+        assert_eq!(
+            reference_host(100, Some(old.clone())).unwrap(),
+            old.host_instance
+        );
+        assert!(reference_host(101, Some(old)).is_err());
+    }
+
     use super::*;
     use std::io::BufRead;
     use std::os::unix::net::UnixStream;
 
     fn legacy_session(title: &str, alive: bool) -> SessionInfo {
         SessionInfo {
+            identity: None,
             id: 7,
             title: title.to_string(),
             cwd: None,
@@ -914,6 +1313,7 @@ mod tests {
             version,
             fastty_version,
             capabilities,
+            host_instance,
         } = response
         else {
             panic!("expected hello response");
@@ -922,6 +1322,7 @@ mod tests {
             version,
             fastty_version,
             capabilities,
+            host_instance,
         };
         assert_eq!(info.fastty_version, "0.22.6");
         assert!(!info.supports("close_if_idle"));
@@ -953,6 +1354,7 @@ mod tests {
             version: crate::daemon::PROTOCOL_VERSION,
             fastty_version: env!("CARGO_PKG_VERSION").to_string(),
             capabilities,
+            host_instance: None,
         };
         assert!(info.supports("close_if_idle"));
         assert!(info.supports("close_if_idle_batch"));
@@ -1296,11 +1698,14 @@ mod tests {
         );
 
         let resumed = attach(session_id).expect("reattach after GUI driver exit");
-        let (_, cells) = crate::server::binary_snapshot::decode_snapshot(&resumed.snapshot)
-            .expect("reattach snapshot uses the requested binary format");
-        let snapshot: String = cells
+        let state = crate::server::native_snapshot::decode(&resumed.snapshot)
+            .expect("reattach snapshot uses the negotiated native format");
+        let snapshot: String = state
+            .main
+            .rows
             .iter()
-            .filter_map(|cell| char::from_u32(cell.c))
+            .flatten()
+            .map(|cell| cell.c)
             .collect();
         assert!(
             snapshot.contains("output-after-detach-marker"),

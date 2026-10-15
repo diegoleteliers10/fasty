@@ -81,6 +81,17 @@ get a compressed FST1 snapshot with scrollback in the `snapshot` event. The
 attach snapshot keeps the newest history that fits in 16 MiB of cells. The
 field is optional so older clients keep the ANSI format.
 
+The `terminal_state_snapshot_v1` capability enables `snapshot_format: "terminal_state"`
+on `attach`. This format takes priority over `binary_snapshot`. It returns an FST2
+snapshot with both screen buffers, cursor state, wrap state, symbolic colors,
+and complete cells. Native clients request this format only when the host reports
+the capability. Legacy requests and WASM clients keep FST1 or ANSI.
+
+FST2 uses a 12-byte header with magic, schema version, encoding, and decoded payload
+length. Version 1 uses a bounded JSON state payload, optionally compressed with
+Deflate. The decoder checks the state before it changes the terminal. The format
+does not store a parser that is inside an incomplete escape sequence.
+
 - `id` es el `PaneId` de fastty (un `usize`, único por proceso — cada split
   cuenta como su propia sesión, no solo cada tab).
 - `hello` es opcional pero recomendado como primer mensaje: te confirma que
@@ -341,3 +352,70 @@ while True:
     elif msg.get("event") == "closed":
         break
 ```
+
+
+## Host identity and restart
+
+The `hello` reply includes `host_instance`, a UUID for this host process. The
+`session_identity_v1` capability permits `expected_host_instance` in `attach`.
+The host checks this value before it looks up the session. A mismatch returns
+`host_instance_changed`.
+
+Each session record includes `identity` with `host_instance` and `session_id`.
+The host reserves numeric IDs in blocks of 1024. It saves and syncs the upper
+limit before it uses an ID. A host restart skips unused IDs in the last block.
+
+Saved panes retain `host_session_identity`. A saved numeric reference without
+an identity stays unavailable. The app does not infer its identity from a
+session number, title, or directory.
+
+The `host_status` request returns `host_status` with `status`. This record has
+the host instance, app version, protocol version, capabilities, session count,
+other connection count, and `restart_available`.
+
+The `restart_host` request requires `expected_host_instance`. The host accepts
+it only with zero sessions and zero other connections. The host applies this
+check under the same lock that permits new sessions and connections. It then
+returns `host_restarting`, removes its socket, and exits. A blocked request
+returns `host_restart_blocked`. The app starts its current host executable
+after the old socket closes. The app does not stop a shell to permit an upgrade.
+
+The command palette has `Session Host: Status` and
+`Session Host: Restart or Upgrade`. Old hosts retain their negotiated snapshot
+format. The app does not force a restart when a host lacks the restart command.
+
+## Process events
+
+Clients must set `"process_events": true` in `subscribe_events` to get process
+states and events. The default is `false`. Existing clients keep the same
+response types. Filtered events still advance the stream sequence.
+
+The `process_events_v1` capability adds `process_changed` events to the typed
+event stream. One host sampler reads the process table every 350 ms.
+Each state has a session identity, a generation, and an observation.
+The generation changes only when the observation changes.
+
+An available observation has the shell identity, foreground process group,
+group members, and ancestors. A process identity has its PID, start time in
+Unix seconds, and name. It excludes command arguments. Ancestor traversal
+stops after 64 parents per member and detects cycles.
+
+A failed or incomplete observation has `status: "unavailable"` and a reason.
+It does not prove that the terminal is idle. The sample can miss processes
+that start and exit between reads. Close safety still uses a live query.
+
+The host sends `process_states` after `event_stream_started` and after
+`event_stream_gap`. This baseline includes the current generations.
+`fastty events` prints it as `process_snapshot`. Later changes use
+`process_changed`. Observe access can read these events.
+
+
+Each GUI pane holds its saved identity. The app passes that identity to each
+attach, retry, status, and close request. Panes with the same numeric ID do not
+share an identity cache. A fresh session cannot change a saved pane reference.
+
+If the host instance changes, workspace restore can start a new shell. A
+connection retry keeps the pane unavailable until the user selects recovery.
+A saved pane with no identity offers `Start new shell`. This action replaces
+the GUI pane and leaves the old host session alone. Closing an unavailable
+legacy pane removes only its GUI reference.

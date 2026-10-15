@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/fastty-wasm",
 ]
+exclude = ["vendor/alacritty_terminal", "vendor/vte"]
 
 [package]
 name = "fastty"
@@ -33,7 +34,7 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
     "x11",
     "runtime_shaders",
 ] }
-alacritty_terminal = { version = "0.26", default-features = false }
+alacritty_terminal = { version = "=0.26.0", path = "vendor/alacritty_terminal", default-features = false, features = ["serde"] }
 # Already in the lock file via alacritty_terminal; direct dep for unicode_width
 # so table columns measure CJK/emoji as 2 cells instead of 1.
 unicode-width = "0.2"
@@ -66,6 +67,7 @@ base64 = "0.22"
 semver = "1.0"
 sha2 = "0.10"
 hex = "0.4"
+sysinfo = "=0.31.4"
 
 
 [build-dependencies]

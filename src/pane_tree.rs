@@ -29,6 +29,7 @@ pub struct TerminalPane {
     pub id: PaneId,
     pub terminal: Option<Arc<TerminalState>>,
     pub host_session_id: Option<usize>,
+    pub host_session_identity: Option<crate::daemon::SessionIdentity>,
     pub terminal_error: Option<String>,
     pub terminal_start_request: Option<TerminalStartRequest>,
     pub terminal_retry_allowed: bool,
@@ -49,6 +50,7 @@ impl Clone for TerminalPane {
             id: self.id,
             terminal: self.terminal.clone(),
             host_session_id: self.host_session_id,
+            host_session_identity: self.host_session_identity.clone(),
             terminal_error: self.terminal_error.clone(),
             terminal_start_request: self.terminal_start_request.clone(),
             terminal_retry_allowed: self.terminal_retry_allowed,
@@ -280,11 +282,11 @@ impl PaneNode {
     pub fn to_persisted(
         &self,
         snapshots: &mut Vec<(PaneId, Vec<u8>)>,
-    ) -> crate::session_manager::PersistedPaneNode {
-        match self {
+    ) -> Result<crate::session_manager::PersistedPaneNode, String> {
+        Ok(match self {
             PaneNode::Leaf(pane) => {
                 if let Some(term) = &pane.terminal {
-                    snapshots.push((pane.id, term.snapshot_binary_for_save()));
+                    snapshots.push((pane.id, term.snapshot_state_for_save()?));
                 }
                 crate::session_manager::PersistedPaneNode::Leaf(crate::session_manager::PersistedPane {
                     id: pane.id,
@@ -296,6 +298,7 @@ impl PaneNode {
                             .as_ref()
                             .and_then(|terminal| terminal.remote_session_id())
                     }),
+                    host_session_identity: pane.host_session_identity.clone(),
                     snapshot: None,
                     snapshot_activity: crate::session_manager::SnapshotActivity::Unknown,
                 })
@@ -306,10 +309,10 @@ impl PaneNode {
                     SplitDirection::Vertical => "Vertical".to_string(),
                 },
                 ratio: *ratio,
-                first: Box::new(first.to_persisted(snapshots)),
-                second: Box::new(second.to_persisted(snapshots)),
+                first: Box::new(first.to_persisted(snapshots)?),
+                second: Box::new(second.to_persisted(snapshots)?),
             },
-        }
+        })
     }
 
     pub fn restore_from_persisted<F>(persisted: &crate::session_manager::PersistedPaneNode, spawn_pane: &mut F) -> Self
@@ -411,6 +414,7 @@ impl PaneTree {
                 id: 0,
                 terminal: None,
                 host_session_id: None,
+                host_session_identity: None,
                 terminal_error: None,
                 terminal_start_request: None,
                 terminal_retry_allowed: true,
@@ -448,6 +452,7 @@ impl PaneTree {
                 id: 0,
                 terminal: None,
                 host_session_id: None,
+                host_session_identity: None,
                 terminal_error: None,
                 terminal_start_request: None,
                 terminal_retry_allowed: true,
@@ -524,6 +529,7 @@ impl PaneTree {
                 id: 0,
                 terminal: None,
                 host_session_id: None,
+                host_session_identity: None,
                 terminal_error: None,
                 terminal_start_request: None,
                 terminal_retry_allowed: true,
@@ -640,6 +646,7 @@ mod tests {
             id,
             terminal: None,
             host_session_id: None,
+                host_session_identity: None,
             terminal_error: None,
             terminal_start_request: None,
             terminal_retry_allowed: true,

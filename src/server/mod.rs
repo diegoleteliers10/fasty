@@ -5,6 +5,7 @@
 //! - `compression`: In-memory chunked scrollback and session compression.
 
 pub mod binary_snapshot;
+pub mod native_snapshot;
 pub mod compression;
 
 pub use binary_snapshot::{
