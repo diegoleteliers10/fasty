@@ -3,6 +3,42 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.22.10 - 2026-10-14
+
+### Terminal sessions
+
+- Restore both terminal grids, history, cursor state, color identities, tab stops, and scroll regions.
+- Continue partial UTF-8 and escape sequences after a live session restore.
+- Preserve combining characters and pending line wraps after restore and resize.
+- Reject invalid snapshots before they change terminal state.
+- Clear pending parser input when Fastty restores history into a new shell.
+
+### Session hosts
+
+- Bind each saved pane to its original host instance and session ID.
+- Keep numeric session IDs across host restarts without reuse.
+- Add host version, capability, and restart status to the command palette.
+- Restart or upgrade the host only when it has no sessions or other connections.
+- Add Start new shell for unavailable panes without stopping their old processes.
+- Close stale panes and mixed session batches without touching another host instance.
+- Fix macOS connections that closed between requests after a host accepted a socket.
+
+### Session API
+
+- Add opt-in process events with session identity, generation, foreground group, members, and ancestors.
+- Keep the existing event responses for clients that do not request process events.
+- Add `fastty api list` and `fastty api describe METHOD` with schemas from the connected server.
+
+### Compatibility
+
+- Saved panes without a host identity require the Start new shell action. Fastty leaves their old processes untouched.
+- Older hosts retain their supported snapshot format. Fastty does not force a host restart.
+
+### Automated checks
+
+- Passed 468 Fastty tests, 56 parser tests, 5 terminal snapshot tests, and 8 WASM tests.
+- Passed the binary compile check and the final code review.
+
 ## 0.22.9 - 2026-10-14
 
 ### Terminal sessions
