@@ -3,6 +3,39 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.22.12 - 2026-10-16
+
+### Settings
+
+- Preserve recent settings when another window saves a change.
+- Save only the fields that each action changes.
+- Lock config updates across Fastty processes and reject detected file conflicts.
+- Preserve custom TOML fields and comments during settings updates.
+- Keep automatic saves and live updates without a Save button or an app restart.
+- Preserve the current AI model when a provider refreshes its model list.
+- Open the folder that contains the active config file from Settings.
+
+### Git and AI panels
+
+- Track working directory changes from older session hosts after an app update.
+- Use the current terminal directory for Git panels, Git widgets, and AI project context.
+- Reject directory updates from a different host instance.
+
+### Sessions and tab close
+
+- Close active and idle tabs without a process confirmation modal.
+- Keep the retry dialog when a close action fails.
+- Keep hosted sessions alive when the app closes.
+- Remove sessions that belong to a stopped host instead of restoring replacement shells.
+- Remove empty saved tabs and repair split layouts after stale sessions are removed.
+- Ignore exit events from an old terminal after a pane changes its session.
+
+### Validation
+
+- Passed 482 library tests before release preparation.
+- Reviewed the configuration and session changes.
+- GUI behavior has not been checked in the app.
+
 ## 0.22.11 - 2026-10-16
 
 ### Settings
