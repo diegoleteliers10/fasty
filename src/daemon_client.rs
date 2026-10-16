@@ -1233,7 +1233,7 @@ pub fn run_agent_status_command(state: String, app: String, kind: Option<String>
                 .parse::<u64>()
                 .map_err(|_| "FASTTY_SESSION_TOKEN is invalid".to_string())?;
             let valid_state = matches!(state.as_str(), "idle" | "working" | "done" | "blocked" | "error" | "clear");
-            let valid_app = matches!(app.as_str(), "claude" | "opencode" | "gemini" | "pi" | "codex");
+            let valid_app = matches!(app.as_str(), "claude" | "opencode" | "gemini" | "pi" | "codex" | "hermes");
             let valid_kind = kind.as_deref().is_none_or(|value| matches!(value, "permission" | "question" | "auth"));
             if !valid_state || !valid_app || !valid_kind {
                 return Err("invalid state, agent, or blocked kind".to_string());

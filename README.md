@@ -68,6 +68,7 @@ Then visit `http://localhost:8765` in your browser. The embedded WebAssembly eng
 See [docs/daemon-protocol.md](docs/daemon-protocol.md) for the complete JSON IPC protocol specification.
 
 See [Report program status](docs/program-status.md) for OSC 7501 and native notification settings.
+See [Agent integrations](docs/agent-integrations.md) to install status adapters for OpenCode, Hermes, Claude Code, Gemini CLI, Pi, and Codex.
 
 ---
 

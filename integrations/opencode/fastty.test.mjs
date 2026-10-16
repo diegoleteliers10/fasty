@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { stateForEvent } from "./fastty.js";
+import { Fastty } from "./fastty.js";
+
+const { stateForEvent } = Fastty;
 
 test("publishes working while an OpenCode session is busy", () => {
   assert.deepEqual(

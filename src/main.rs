@@ -225,11 +225,11 @@ fn main() {
         Some("keybindings") => run_keybindings_command(subcommand_args),
         Some("agent-status") => {
             let Some(state) = subcommand_args.next() else {
-                eprintln!("Usage: fastty agent-status <idle|working|done|blocked|error|clear> <claude|opencode|gemini|pi|codex> [permission|question|auth]");
+                eprintln!("Usage: fastty agent-status <idle|working|done|blocked|error|clear> <claude|opencode|gemini|pi|codex|hermes> [permission|question|auth]");
                 std::process::exit(1);
             };
             let Some(app) = subcommand_args.next() else {
-                eprintln!("Usage: fastty agent-status <idle|working|done|blocked|error|clear> <claude|opencode|gemini|pi|codex> [permission|question|auth]");
+                eprintln!("Usage: fastty agent-status <idle|working|done|blocked|error|clear> <claude|opencode|gemini|pi|codex|hermes> [permission|question|auth]");
                 std::process::exit(1);
             };
             let kind = subcommand_args.next();
@@ -267,7 +267,12 @@ fn main() {
                     fastty::agent_hooks::uninstall(&agent, scope)
                 };
                 match result {
-                    Ok(path) => println!("{}: {}", provider, path.display()),
+                    Ok(path) => {
+                        println!("{}: {}", provider, path.display());
+                        if provider == "install" && agent == "hermes" {
+                            println!("Enable the plugin with: hermes plugins enable fastty-status");
+                        }
+                    }
                     Err(error) => {
                         eprintln!("fastty agent-hook: {error}");
                         std::process::exit(1);

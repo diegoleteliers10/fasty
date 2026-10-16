@@ -55,6 +55,10 @@ impl CliOptions {
                         close <id>                            Terminate a headless session\n    \
                         resize <id> <cols> <rows>             Resize a session's PTY\n    \
                         write <id> [--enter] <TEXT...>        Type text into a session\n    \
+                        agent-hook install|uninstall <provider> --project|--user\n    \
+                                                           Install or remove agent status hooks\n    \
+                        agent-status <state> <provider> [kind]\n    \
+                                                           Report agent status to its pane\n    \
                         mcp [setup [AGENT]]                   Run the MCP server over stdio for AI\n    \
                                                               agents (Claude Code, OpenCode, Codex,\n    \
                                                               ...), or register it into an agent's\n    \

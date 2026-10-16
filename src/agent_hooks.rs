@@ -11,20 +11,32 @@ pub enum InstallScope {
 
 pub fn install(provider: &str, scope: InstallScope) -> Result<PathBuf, String> {
     let path = provider_path(provider, scope)?;
-    if matches!(provider, "opencode" | "pi") {
-        let contents = plugin_contents(provider)?;
-        if path.exists() {
-            let existing = fs::read(&path).map_err(|error| error.to_string())?;
-            return if existing == contents {
-                Ok(path)
-            } else {
-                Err(format!(
-                    "{} already exists and differs from the Fastty adapter. It was not changed.",
-                    path.display()
-                ))
-            };
+    if matches!(provider, "opencode" | "opencode-v2" | "pi" | "hermes") {
+        let files = plugin_files(provider, &path)?;
+        let registration = opencode_cli_registration(provider, &path, true)?;
+        for (target, contents) in &files {
+            if target.exists() {
+                let existing = fs::read(target).map_err(|error| error.to_string())?;
+                if existing != *contents && !is_previous_plugin(provider, &existing) {
+                    return Err(format!(
+                        "{} differs from the Fastty adapter. It was not changed.",
+                        target.display()
+                    ));
+                }
+            }
         }
-        write_new_file(&path, &contents)?;
+        for (target, contents) in files {
+            if target.exists() {
+                if fs::read(&target).map_err(|error| error.to_string())? != contents {
+                    write_preserving_backup(&target, &contents)?;
+                }
+            } else {
+                write_new_file(&target, &contents)?;
+            }
+        }
+        if let Some((config_path, document)) = registration {
+            write_json(&config_path, &document)?;
+        }
         return Ok(path);
     }
 
@@ -57,19 +69,33 @@ pub fn install(provider: &str, scope: InstallScope) -> Result<PathBuf, String> {
 
 pub fn uninstall(provider: &str, scope: InstallScope) -> Result<PathBuf, String> {
     let path = provider_path(provider, scope)?;
-    if matches!(provider, "opencode" | "pi") {
-        if !path.exists() {
-            return Ok(path);
+    if matches!(provider, "opencode" | "opencode-v2" | "pi" | "hermes") {
+        let files = plugin_files(provider, &path)?;
+        let registration = opencode_cli_registration(provider, &path, false)?;
+        for (target, expected) in &files {
+            if target.exists() {
+                let actual = fs::read(target).map_err(|error| error.to_string())?;
+                if actual != *expected && !is_previous_plugin(provider, &actual) {
+                    return Err(format!(
+                        "{} differs from the Fastty adapter. It was not removed.",
+                        target.display()
+                    ));
+                }
+            }
         }
-        let expected = plugin_contents(provider)?;
-        let actual = fs::read(&path).map_err(|error| error.to_string())?;
-        if actual != expected {
-            return Err(format!(
-                "{} differs from the Fastty adapter. It was not removed.",
-                path.display()
-            ));
+        if let Some((config_path, document)) = registration {
+            write_json(&config_path, &document)?;
         }
-        fs::remove_file(&path).map_err(|error| error.to_string())?;
+        for (target, _) in files {
+            if target.exists() {
+                fs::remove_file(&target).map_err(|error| error.to_string())?;
+            }
+        }
+        if provider == "hermes" {
+            if let Some(parent) = path.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+        }
         return Ok(path);
     }
 
@@ -105,6 +131,44 @@ pub fn uninstall(provider: &str, scope: InstallScope) -> Result<PathBuf, String>
 }
 
 fn provider_path(provider: &str, scope: InstallScope) -> Result<PathBuf, String> {
+    if provider == "hermes" {
+        if scope == InstallScope::Project {
+            return Err("Hermes uses profile plugins. Use --user. Set HERMES_HOME to select a profile.".into());
+        }
+        let home = match std::env::var_os("HERMES_HOME").filter(|value| !value.is_empty()) {
+            Some(home) => PathBuf::from(home),
+            None => PathBuf::from(std::env::var_os("HOME")
+                .ok_or_else(|| "HOME is not set".to_string())?).join(".hermes"),
+        };
+        if !home.is_absolute() {
+            return Err("HERMES_HOME must be an absolute path".into());
+        }
+        return Ok(home.join("plugins/fastty-status/__init__.py"));
+    }
+    if matches!(provider, "opencode" | "opencode-v2") {
+        let root = match scope {
+            InstallScope::Project => std::env::current_dir()
+                .map_err(|error| error.to_string())?.join(".opencode"),
+            InstallScope::User => {
+                if let Some(root) = std::env::var_os("OPENCODE_CONFIG_DIR").filter(|value| !value.is_empty()) {
+                    PathBuf::from(root)
+                } else if let Some(root) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+                    PathBuf::from(root).join("opencode")
+                } else {
+                    PathBuf::from(std::env::var_os("HOME")
+                        .ok_or_else(|| "HOME is not set".to_string())?).join(".config/opencode")
+                }
+            }
+        };
+        if !root.is_absolute() {
+            return Err("The OpenCode config directory must be an absolute path".into());
+        }
+        return Ok(root.join(if provider == "opencode-v2" {
+            "fastty/fastty-status-v2.js"
+        } else {
+            "plugins/fastty-status.js"
+        }));
+    }
     let root = match scope {
         InstallScope::Project => std::env::current_dir().map_err(|error| error.to_string())?,
         InstallScope::User => {
@@ -116,8 +180,6 @@ fn provider_path(provider: &str, scope: InstallScope) -> Result<PathBuf, String>
         ("claude", InstallScope::User) => root.join(".claude/settings.json"),
         ("gemini", _) => root.join(".gemini/settings.json"),
         ("codex", _) => root.join(".codex/hooks.json"),
-        ("opencode", InstallScope::Project) => root.join(".opencode/plugins/fastty-status.js"),
-        ("opencode", InstallScope::User) => root.join(".config/opencode/plugins/fastty-status.js"),
         ("pi", InstallScope::Project) => root.join(".pi/extensions/fastty-status.js"),
         ("pi", InstallScope::User) => root.join(".pi/agent/extensions/fastty-status.js"),
         _ => return Err(format!("unsupported agent provider: {provider}")),
@@ -177,10 +239,65 @@ fn hook_entry(provider: &str, matcher: Option<&str>) -> Value {
 fn plugin_contents(provider: &str) -> Result<Vec<u8>, String> {
     let contents = match provider {
         "opencode" => include_bytes!("../integrations/opencode/fastty.js").as_slice(),
+        "opencode-v2" => include_bytes!("../integrations/opencode/fastty-v2.js").as_slice(),
         "pi" => include_bytes!("../integrations/pi/fastty-extension.js").as_slice(),
+        "hermes" => include_bytes!("../integrations/hermes/__init__.py").as_slice(),
         _ => return Err(format!("unsupported extension provider: {provider}")),
     };
     Ok(contents.to_vec())
+}
+
+fn plugin_files(provider: &str, path: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
+    let mut files = vec![(path.to_path_buf(), plugin_contents(provider)?)];
+    if provider == "hermes" {
+        files.push((path.with_file_name("plugin.yaml"),
+            include_bytes!("../integrations/hermes/plugin.yaml").to_vec()));
+    }
+    Ok(files)
+}
+
+fn is_previous_plugin(provider: &str, contents: &[u8]) -> bool {
+    provider == "opencode"
+        && contents == include_bytes!("../integrations/opencode/legacy/fastty.js")
+}
+
+fn opencode_cli_registration(
+    provider: &str,
+    plugin: &Path,
+    install: bool,
+) -> Result<Option<(PathBuf, Value)>, String> {
+    if provider != "opencode-v2" {
+        return Ok(None);
+    }
+    let root = plugin.parent().and_then(Path::parent)
+        .ok_or_else(|| "The OpenCode plugin has no config directory".to_string())?;
+    let path = root.join("cli.json");
+    if root.join("cli.jsonc").exists() {
+        return Err("OpenCode uses cli.jsonc. Add or remove the Fastty CLI plugin in that file manually.".into());
+    }
+    if !install && !path.exists() {
+        return Ok(None);
+    }
+    let mut document = read_json_object(&path)?;
+    let original = document.clone();
+    let plugin = plugin.to_str()
+        .ok_or_else(|| "The OpenCode plugin path must use UTF-8".to_string())?;
+    if install {
+        let entries = document.as_object_mut().unwrap()
+            .entry("plugins").or_insert_with(|| json!([]))
+            .as_array_mut().ok_or_else(|| "OpenCode cli.json: plugins must be an array".to_string())?;
+        if !entries.iter().any(|entry| entry.as_str() == Some(plugin)) {
+            entries.push(json!(plugin));
+        }
+    } else if let Some(entries) = document.get_mut("plugins") {
+        let entries = entries.as_array_mut()
+            .ok_or_else(|| "OpenCode cli.json: plugins must be an array".to_string())?;
+        entries.retain(|entry| entry.as_str() != Some(plugin));
+        if entries.is_empty() {
+            document.as_object_mut().unwrap().remove("plugins");
+        }
+    }
+    Ok((document != original).then_some((path, document)))
 }
 
 fn read_json_object(path: &Path) -> Result<Value, String> {

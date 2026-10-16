@@ -9,11 +9,13 @@ La API no expone mensajes libres del agente.
 | Orden | Proceso | Punto de integración | Estado |
 | --- | --- | --- | --- |
 | 1 | Claude Code | Hooks de sesión y fin de turno | Implementado |
-| 2 | OpenCode | Plugin de ciclo de vida | Implementado |
+| 2 | OpenCode v1 | Plugin del servidor | Implementado |
+| 2 | OpenCode v2 | Plugin de la CLI | Implementado |
 | 3 | Gemini CLI | Hooks de sesión y turnos | Implementado |
 | 4 | Pi | Extensión de ciclo de vida | Implementado |
 | 5 | Codex CLI | Hooks de turno y sesión | Implementado. Codex puede pedir aprobación de confianza. |
 | 6 | Aider | Integración de shell y OSC | Sin hook estructurado verificado. |
+| 7 | Hermes Agent | Plugin de turnos y solicitudes al usuario | Implementado |
 
 Fuentes oficiales: [Claude Code hooks](https://code.claude.com/docs/en/hooks),
 [OpenCode plugins](https://docs.opencode.ai/docs/plugins/),
@@ -40,7 +42,7 @@ solo las entradas de Fastty. Los archivos JSON existentes se conservan y se
 respaldan antes de cada cambio. El instalador no reemplaza archivos de
 extensión que ya tengan contenido distinto.
 
-Proveedores: `claude`, `gemini`, `codex`, `opencode` y `pi`. Claude, Gemini y
+Proveedores: `claude`, `gemini`, `codex`, `opencode`, `opencode-v2`, `pi` y `hermes`. Claude, Gemini y
 Codex usan hooks JSON. OpenCode y Pi usan archivos de extensión del proyecto o
 del usuario. Codex puede pedir que confirmes la confianza del proyecto después
 de la instalación.
@@ -52,6 +54,87 @@ fastty agent-hook install gemini --project
 fastty agent-hook install pi --project
 fastty agent-hook install codex --project
 ```
+
+## OpenCode
+
+Para OpenCode v1, instala el adaptador de servidor:
+
+```sh
+fastty agent-hook install opencode --user
+```
+
+Para OpenCode v2, instala el adaptador de la CLI:
+
+```sh
+fastty agent-hook install opencode-v2 --user
+```
+
+Ambos aceptan `--project`. El instalador usa `OPENCODE_CONFIG_DIR`, después
+`XDG_CONFIG_HOME/opencode` y después `~/.config/opencode` para el alcance de
+usuario. El adaptador v2 se registra en `cli.json`, en la lista `plugins`.
+Se instala fuera de la carpeta de plugins v1 para evitar que v1 intente cargarlo.
+Si existe `cli.jsonc` o el JSON contiene comentarios, el instalador no lo cambia.
+Usa el archivo `integrations/opencode/fastty-v2.js` del repositorio y registra su
+ruta absoluta en la lista `plugins` de tu configuración CLI.
+
+V1 y v2 tienen APIs distintas. No registres el adaptador v1 como plugin v2.
+Abre OpenCode después de instalar el adaptador. Una instancia que ya está
+abierta puede conservar sus plugins anteriores.
+
+Los adaptadores informan trabajo, reintento, permiso, pregunta, fin y error.
+Cada respuesta elimina solo su solicitud pendiente. Mientras queda otra
+solicitud, Fastty conserva el estado bloqueado. Los informes salen en orden.
+V1 conserva el error cuando llega el evento de reposo que lo sigue.
+
+V1 informa el estado conjunto de las sesiones raíz de su servidor. Su API no
+expone la selección de la TUI. V2 usa la sesión visible y las tabs abiertas de
+la CLI. No atribuye formularios globales de MCP a una sesión del terminal.
+Los eventos de subagentes no completan ni borran el estado de su sesión raíz.
+
+Al reinstalar, Fastty puede actualizar su adaptador v1 original y guarda una
+copia de respaldo. Si el archivo tiene otros cambios, Fastty no lo reemplaza.
+
+Fuentes: [migración de plugins v2](https://opencode.ai/v2/docs/migrate-v1/#plugins),
+[plugins de CLI v2](https://opencode.ai/v2/docs/build/plugins/cli/),
+[eventos v1](https://github.com/anomalyco/opencode/blob/v1.2.27/packages/opencode/src/session/status.ts).
+
+## Hermes Agent
+
+Instala y habilita el plugin en el perfil que uses:
+
+```sh
+fastty agent-hook install hermes --user
+hermes plugins enable fastty-status
+```
+
+El instalador usa `HERMES_HOME/plugins/fastty-status` si `HERMES_HOME` está
+definido. En otro caso usa `~/.hermes/plugins/fastty-status`. `HERMES_HOME` debe
+ser una ruta absoluta. Usa el mismo perfil para los dos comandos. El alcance
+`--project` no está disponible para Hermes.
+
+El plugin usa `pre_llm_call` para informar trabajo y `on_session_end` para
+informar fin, error o interrupción. Las solicitudes `approval`, `clarify` y
+`sudo` muestran bloqueo por permiso, pregunta o autenticación. No publica
+preguntas, comandos, respuestas ni contraseñas. No interpreta un error de API
+con reintento como un fallo final.
+
+`/new` borra el estado anterior y permite informar el turno de la nueva sesión.
+Los eventos de subagentes y del gateway no cambian el estado del terminal CLI.
+Hermes debe incluir los hooks `on_human_input_request` y
+`on_human_input_resolved` para informar esos bloqueos.
+
+Para quitarlo, deshabilita el plugin y elimina sus archivos:
+
+```sh
+hermes plugins disable fastty-status
+fastty agent-hook uninstall hermes --user
+```
+
+Fastty conserva `config.yaml` y los archivos de plugin que el usuario modificó.
+
+Fuentes: [plugins de Hermes](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/plugins.md),
+[hooks de entrada del usuario](https://github.com/NousResearch/hermes-agent/blob/main/tools/human_input_hooks.py),
+[fin de turno](https://github.com/NousResearch/hermes-agent/blob/main/agent/turn_finalizer.py).
 
 ## Límites actuales
 
