@@ -487,6 +487,7 @@ pub struct TerminalState {
     remote_session_id: Option<usize>,
     remote_session_identity: Option<crate::daemon::SessionIdentity>,
     remote_control: Option<Arc<crate::session_host::RemoteControl>>,
+    _cwd_observation: Option<crate::session_host::CwdObservation>,
 }
 
 #[derive(Default)]
@@ -1976,6 +1977,25 @@ impl TerminalState {
             None
         };
 
+        let cwd_observation = remote_session_identity.clone().and_then(|identity| {
+            let ingress = Arc::clone(&ingress);
+            let listener = event_listener.clone();
+            crate::session_host::observe_cwd(identity, move |path| {
+                let changed = {
+                    let mut ingress = ingress.lock();
+                    if ingress.side.cwd.as_ref() == Some(&path) {
+                        false
+                    } else {
+                        ingress.side.cwd = Some(path.clone());
+                        true
+                    }
+                };
+                if changed {
+                    listener.send_app_event(AppEvent::CwdChanged(path));
+                }
+            })
+        });
+
         Ok(Self {
             ingress,
             term,
@@ -1998,6 +2018,7 @@ impl TerminalState {
             remote_session_id,
             remote_session_identity,
             remote_control,
+            _cwd_observation: cwd_observation,
         })
     }
 
@@ -2396,6 +2417,9 @@ impl TerminalState {
         }
         if let Some(remote) = &self.remote_control {
             remote.stop();
+            return;
+        }
+        if !self.is_alive() {
             return;
         }
         let Some(pid) = self.shell_pid else {

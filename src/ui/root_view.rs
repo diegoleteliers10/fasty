@@ -340,6 +340,11 @@ fn has_unidentified_saved_reference(pane: &TerminalPane) -> bool {
 
 fn pane_close_info(pane: &crate::pane_tree::TerminalPane) -> Option<RunningProcessInfo> {
     if has_unidentified_saved_reference(pane) { return None; }
+    if let Some(session_id) = pane_host_session_id(pane) {
+        if matches!(reconcile_host_session_reference(session_id, pane.host_session_identity.clone()), crate::session_host::SessionReferenceStatus::Absent) {
+            return None;
+        }
+    }
     let terminal = pane.terminal.as_ref();
     let process_status = terminal
         .map(|terminal| terminal.close_process_status())
@@ -378,6 +383,9 @@ fn stop_host_session(session_id: usize, identity: Option<crate::daemon::SessionI
             Ok(session) => session,
             Err(error) if is_missing_host_session(&error) => return Ok(()),
             Err(error) => {
+                if matches!(reconcile_host_session_reference(session_id, identity.clone()), crate::session_host::SessionReferenceStatus::Absent) {
+                    return Ok(());
+                }
                 return Err(format!(
                     "could not attach to host session {session_id}: {error}"
                 ));
@@ -386,11 +394,10 @@ fn stop_host_session(session_id: usize, identity: Option<crate::daemon::SessionI
         session.control.stop();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         loop {
-            let exists = crate::session_host::session_exists_reference(session_id, identity.clone()).map_err(|error| {
-                format!("could not verify host session {session_id} stop: {error}")
-            })?;
-            if !exists {
-                return Ok(());
+            match reconcile_host_session_reference(session_id, identity.clone()) {
+                crate::session_host::SessionReferenceStatus::Absent => return Ok(()),
+                crate::session_host::SessionReferenceStatus::Present | crate::session_host::SessionReferenceStatus::Ended => {},
+                crate::session_host::SessionReferenceStatus::Unknown(error) => return Err(format!("could not verify host session {session_id} stop: {error}")),
             }
             if std::time::Instant::now() >= deadline {
                 return Err(format!(
@@ -404,6 +411,18 @@ fn stop_host_session(session_id: usize, identity: Option<crate::daemon::SessionI
     {
         let _ = (session_id, identity);
         Err("host sessions are not supported on this platform".to_string())
+    }
+}
+
+fn reconcile_host_session_reference(session_id: usize, identity: Option<crate::daemon::SessionIdentity>) -> crate::session_host::SessionReferenceStatus {
+    use crate::session_host::{SessionReferenceStatus, CloseIfIdleResult};
+    match crate::session_host::probe_session_reference(session_id, identity.clone()) {
+        SessionReferenceStatus::Ended => match crate::session_host::close_if_idle_reference(session_id, identity) {
+            Ok(CloseIfIdleResult::Closed) => SessionReferenceStatus::Absent,
+            Ok(CloseIfIdleResult::Running(_)) => SessionReferenceStatus::Unknown("the ended session still has a running process".into()),
+            Err(error) => SessionReferenceStatus::Unknown(error),
+        },
+        status => status,
     }
 }
 
@@ -4086,11 +4105,18 @@ impl RootView {
                 .clone()
                 .or_else(|| std::env::var("SHELL").ok())
                 .unwrap_or_else(crate::paths::default_system_shell);
-            for tab_info in restored_tabs {
+            let mut selected_restored_tab = 0;
+            for (saved_index, tab_info) in restored_tabs.into_iter().enumerate() {
+                let previous_count = view.tabs.len();
                 view.create_restored_tab(tab_info, &shell, _window, cx);
+                if saved_index < restored_active_tab && view.tabs.len() > previous_count {
+                    selected_restored_tab += 1;
+                }
             }
-            if !view.tabs.is_empty() {
-                view.activate_tab_index(restored_active_tab.min(view.tabs.len() - 1));
+            if view.tabs.is_empty() {
+                view.create_tab(_window, cx);
+            } else {
+                view.activate_tab_index(selected_restored_tab.min(view.tabs.len() - 1));
                 view.persist_session();
             }
         }
@@ -4411,7 +4437,7 @@ impl RootView {
         let terminal = match attach {
             HostAttachOutcome::Attached(terminal) => terminal,
             HostAttachOutcome::Missing => {
-                if !should_start_shell_for_missing_session(missing_session_policy) {
+                if host_session_id.is_some() || !should_start_shell_for_missing_session(missing_session_policy) {
                     return unavailable_terminal_pane(
                         pane_id,
                         host_session_id,
@@ -4474,6 +4500,7 @@ impl RootView {
 
         let terminal_arc = Arc::new(terminal);
         let terminal_host_session_id = terminal_arc.remote_session_id();
+        let terminal_source_id = terminal_arc.source_id();
         eprintln!(
             "Fastty pane session ready: pane_id={pane_id}, host_session_id={terminal_host_session_id:?}, elapsed_ms={}",
             session_start.elapsed().as_millis()
@@ -4550,21 +4577,7 @@ impl RootView {
                         send_system_notification(&title, &body);
                     }
                     AppEvent::Exit { .. } => {
-                        if this.exec_pane_id == Some(pane_id) {
-                            cx.quit();
-                        } else if let Some(tab) = this
-                            .tabs
-                            .iter()
-                            .find(|t| t.pane_tree.find_pane(pane_id).is_some())
-                        {
-                            let tab_id = tab.id;
-                            let pane_count = tab.pane_tree.pane_count();
-                            if pane_count > 1 {
-                                this.force_close_pane(tab_id, pane_id, cx);
-                            } else {
-                                this.close_tab(tab_id, _window, cx);
-                            }
-                        }
+                        this.handle_terminal_exit(pane_id, terminal_source_id, _window, cx);
                     }
                     _ => {
                         cx.notify();
@@ -4597,6 +4610,74 @@ impl RootView {
             last_exit_code: None,
             last_bounds: None,
         }
+    }
+
+    fn close_owns_pane(&self, tab_id: usize, pane_id: PaneId) -> bool {
+        self.pending_close.as_ref().is_some_and(|pending| matches!(pending.state, PendingCloseState::Checking(_)) && match pending.target {
+            CloseTarget::Pane { tab_id: target_tab, pane_id: target_pane } => target_tab == tab_id && target_pane == pane_id,
+            CloseTarget::Tab { tab_id: target_tab } => target_tab == tab_id,
+            CloseTarget::OtherTabs { keep_id } => tab_id != keep_id,
+        })
+    }
+
+    fn remove_exited_pane(&mut self, tab_id: usize, pane_id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.exec_pane_id == Some(pane_id) {
+            cx.quit();
+        } else if self.tabs.iter().find(|tab| tab.id == tab_id).is_some_and(|tab| tab.pane_tree.pane_count() > 1) {
+            self.remove_stopped_pane(tab_id, pane_id, cx);
+        } else {
+            self.remove_tab_after_stop(tab_id, window, cx);
+        }
+    }
+
+    fn handle_terminal_exit(&mut self, pane_id: PaneId, source_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((tab_id, session_id, identity)) = self.tabs.iter().find_map(|tab| {
+            let pane = tab.pane_tree.find_pane(pane_id)?;
+            let terminal = pane.terminal.as_ref().filter(|terminal| terminal.source_id() == source_id)?;
+            Some((tab.id, terminal.remote_session_id(), terminal.remote_session_identity()))
+        }) else { return; };
+        if self.close_owns_pane(tab_id, pane_id) {
+            return;
+        }
+        let Some(session_id) = session_id else {
+            self.remove_exited_pane(tab_id, pane_id, window, cx);
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let status = cx.background_executor().spawn(async move {
+                reconcile_host_session_reference(session_id, identity.clone())
+            }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.close_owns_pane(tab_id, pane_id) {
+                    return;
+                }
+                let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else { return; };
+                let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) else { return; };
+                if !pane.terminal.as_ref().is_some_and(|terminal| terminal.source_id() == source_id) {
+                    return;
+                }
+                match status {
+                    crate::session_host::SessionReferenceStatus::Absent => {
+                        this.remove_exited_pane(tab_id, pane_id, window, cx);
+                    }
+                    status => {
+                        let mut replacement = unavailable_terminal_pane(pane_id, Some(session_id), pane.host_session_identity.clone(), pane.title.clone(), pane.cwd.clone());
+                        replacement.custom_title = pane.custom_title.clone();
+                        if let crate::session_host::SessionReferenceStatus::Unknown(error) = status {
+                            replacement.terminal_error = Some(error);
+                        }
+                        *pane = replacement;
+                        if tab.pane_tree.active_pane_id == pane_id {
+                            tab.terminal = None;
+                        }
+                        #[cfg(unix)]
+                        this.retry_host_session(pane_id, window, cx);
+                        this.persist_session();
+                        cx.notify();
+                    }
+                }
+            });
+        }).detach();
     }
 
     #[cfg(unix)]
@@ -4769,7 +4850,12 @@ impl RootView {
         cx.spawn_in(window, async move |this, cx| {
             let attached = cx
                 .background_executor()
-                .spawn(async move { crate::session_host::attach_reference(session_id, identity) })
+                .spawn(async move {
+                    match reconcile_host_session_reference(session_id, identity.clone()) {
+                        crate::session_host::SessionReferenceStatus::Absent => Err("no_such_session: the saved session has stopped".into()),
+                        _ => crate::session_host::attach_reference(session_id, identity),
+                    }
+                })
                 .await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.finish_host_attach_retry(pane_id, session_id, generation, attached, window, cx);
@@ -4807,8 +4893,7 @@ impl RootView {
             Ok(remote) => remote,
             Err(error) if is_missing_host_session(&error) => {
                 self.host_attach_retry_state.remove(&pane_id);
-                self.host_missing_sessions.insert(pane_id);
-                cx.notify();
+                self.remove_exited_pane(tab_id, pane_id, window, cx);
                 return;
             }
             Err(error) => {
@@ -4907,48 +4992,72 @@ impl RootView {
         cx.notify();
     }
 
+    fn restore_terminal_pane(
+        &mut self,
+        shell: &str,
+        cwd: Option<&std::path::Path>,
+        title: String,
+        session_id: Option<usize>,
+        identity: Option<crate::daemon::SessionIdentity>,
+        pane_id: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<TerminalPane> {
+        let remote = if let Some(session_id) = session_id {
+            #[cfg(unix)]
+            {
+                if matches!(reconcile_host_session_reference(session_id, identity.clone()), crate::session_host::SessionReferenceStatus::Absent) {
+                    return None;
+                }
+                match crate::session_host::attach_reference(session_id, identity.clone()) {
+                    Ok(remote) => Some(remote),
+                    Err(error) => {
+                        if is_missing_host_session(&error) || matches!(reconcile_host_session_reference(session_id, identity.clone()), crate::session_host::SessionReferenceStatus::Absent) {
+                            return None;
+                        }
+                        self.next_pane_id = self.next_pane_id.max(pane_id.saturating_add(1));
+                        let mut pane = unavailable_terminal_pane(pane_id, Some(session_id), identity, title, cwd.map(std::path::Path::to_path_buf));
+                        pane.terminal_error = Some(error);
+                        self.schedule_host_attach_retry(pane_id, session_id, window, cx);
+                        return Some(pane);
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            { let _ = session_id; None }
+        } else { None };
+        Some(self.spawn_terminal_pane_with_session(shell, &[], cwd, Some(title), session_id, identity, Some(pane_id), if session_id.is_some() { MissingSessionPolicy::KeepUnavailable } else { MissingSessionPolicy::StartFresh }, remote, window, cx))
+    }
+
     fn restore_persisted_pane_node(
         &mut self,
         node: crate::session::PersistedPaneNode,
         shell: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> crate::pane_tree::PaneNode {
+    ) -> Option<crate::pane_tree::PaneNode> {
         use crate::pane_tree::{PaneNode, SplitDirection};
         use crate::session::{PersistedPaneNode, PersistedSplitDirection};
-
         match node {
             PersistedPaneNode::Leaf(persisted) => {
-                let mut pane = self.spawn_terminal_pane_with_session(
-                    shell,
-                    &[],
-                    persisted.cwd.as_deref(),
-                    Some(persisted.title),
-                    persisted.host_session_id,
-                    persisted.host_session_identity.clone(),
-                    Some(persisted.pane_id),
-                    MissingSessionPolicy::StartFresh,
-                    None,
-                    window,
-                    cx,
-                );
+                let mut pane = self.restore_terminal_pane(shell, persisted.cwd.as_deref(), persisted.title, persisted.host_session_id, persisted.host_session_identity, persisted.pane_id, window, cx)?;
                 pane.custom_title = persisted.custom_title;
-                PaneNode::Leaf(pane)
+                Some(PaneNode::Leaf(pane))
             }
-            PersistedPaneNode::Split {
-                direction,
-                ratio,
-                first,
-                second,
-            } => PaneNode::Split {
-                direction: match direction {
-                    PersistedSplitDirection::Horizontal => SplitDirection::Horizontal,
-                    PersistedSplitDirection::Vertical => SplitDirection::Vertical,
-                },
-                ratio,
-                first: Box::new(self.restore_persisted_pane_node(*first, shell, window, cx)),
-                second: Box::new(self.restore_persisted_pane_node(*second, shell, window, cx)),
-            },
+            PersistedPaneNode::Split { direction, ratio, first, second } => {
+                let first = self.restore_persisted_pane_node(*first, shell, window, cx);
+                let second = self.restore_persisted_pane_node(*second, shell, window, cx);
+                match (first, second) {
+                    (Some(first), Some(second)) => Some(PaneNode::Split {
+                        direction: match direction {
+                            PersistedSplitDirection::Horizontal => SplitDirection::Horizontal,
+                            PersistedSplitDirection::Vertical => SplitDirection::Vertical,
+                        },
+                        ratio, first: Box::new(first), second: Box::new(second),
+                    }),
+                    (node, None) | (None, node) => node,
+                }
+            }
         }
     }
 
@@ -4963,10 +5072,10 @@ impl RootView {
         self.next_tab_id += 1;
 
         let (root, active_pane_id) = match tab_info.pane_tree {
-            Some(tree) => (
-                self.restore_persisted_pane_node(tree.root, shell, window, cx),
-                tree.active_pane_id,
-            ),
+            Some(tree) => {
+                let Some(root) = self.restore_persisted_pane_node(tree.root, shell, window, cx) else { return; };
+                (root, tree.active_pane_id)
+            },
             None => {
                 let pane = self.spawn_terminal_pane_with_session(
                     shell,
@@ -5578,34 +5687,15 @@ impl RootView {
                     AppEvent::Notification { title, body } => {
                         send_system_notification(&title, &body);
                     }
-                    AppEvent::Exit { shell_pid } => {
-                        // Mirror `spawn_terminal_pane`'s exit handling for
-                        // restored and daemon-adopted tabs. One pump serves
-                        // every pane in the tab, so match the exited pane by
-                        // shell pid; close that pane, or the whole tab when
-                        // it was the only one.
-                        let exited_pane =
-                            this.tabs.iter().find(|t| t.id == tab_id).and_then(|tab| {
-                                tab.pane_tree.all_panes().iter().find_map(|p| {
-                                    let matches = p
-                                        .terminal
-                                        .as_ref()
-                                        .map(|t| t.shell_pid() == shell_pid)
-                                        .unwrap_or(false);
-                                    matches.then_some(p.id)
-                                })
-                            });
-                        if let Some(pane_id) = exited_pane {
-                            if this.exec_pane_id == Some(pane_id) {
-                                cx.quit();
-                            } else if let Some(tab) = this.tabs.iter().find(|t| t.id == tab_id) {
-                                let pane_count = tab.pane_tree.pane_count();
-                                if pane_count > 1 {
-                                    this.force_close_pane(tab_id, pane_id, cx);
-                                } else {
-                                    this.close_tab(tab_id, _window, cx);
-                                }
-                            }
+                    AppEvent::Exit { .. } => {
+                        let pane_id = this.tabs.iter().find(|tab| tab.id == tab_id)
+                            .and_then(|tab| tab.pane_tree.all_panes().into_iter().find_map(|pane| {
+                                pane.terminal.as_ref()
+                                    .filter(|terminal| terminal.source_id() == source_id)
+                                    .map(|_| pane.id)
+                            }));
+                        if let Some(pane_id) = pane_id {
+                            this.handle_terminal_exit(pane_id, source_id, _window, cx);
                         }
                     }
                     _ => {
@@ -6040,6 +6130,12 @@ impl RootView {
             }).collect(),
             state,
         });
+        if matches!(
+            self.pending_close.as_ref().map(|pending| &pending.state),
+            Some(PendingCloseState::Confirming)
+        ) {
+            self.confirm_pending_close(window, cx);
+        }
         cx.notify();
     }
 
@@ -7213,7 +7309,8 @@ impl RootView {
                 .flat_map(|tab| tab.pane_tree.root.all_panes())
                 .filter_map(|pane| pane.host_session_id)
                 .collect();
-            for tab_data in session.tabs {
+            let mut selected_restored_tab = 0;
+            for (saved_index, tab_data) in session.tabs.into_iter().enumerate() {
                 let tab_id = self.next_tab_id;
                 self.next_tab_id += 1;
                 let mut historical_snapshot_label = None;
@@ -7224,28 +7321,16 @@ impl RootView {
                         persisted_layout,
                         &mut |persisted| {
                             let cwd = persisted.cwd.as_deref().map(std::path::Path::new);
-                            let title = persisted
-                                .custom_title
-                                .clone()
-                                .or(Some(persisted.title.clone()));
-                            let host_session_id = persisted
-                                .host_session_id
-                                .filter(|id| !attached_session_ids.contains(id));
-                            attached_session_ids.extend(host_session_id);
+                            let title = persisted.custom_title.clone().unwrap_or_else(|| persisted.title.clone());
+                            let host_session_id = persisted.host_session_id;
+                            if host_session_id.is_some_and(|id| attached_session_ids.contains(&id)) {
+                                return None;
+                            }
                             let pane_id = self.next_pane_id;
-                            let mut pane = self.spawn_terminal_pane_with_session(
-                                &shell,
-                                &[],
-                                cwd,
-                                title,
-                                host_session_id,
-                                persisted.host_session_identity.clone(),
-                                Some(pane_id),
-                                MissingSessionPolicy::StartFresh,
-                                None,
-                                window,
-                                cx,
-                            );
+                            let mut pane = self.restore_terminal_pane(
+                                &shell, cwd, title, host_session_id, persisted.host_session_identity.clone(), pane_id, window, cx,
+                            )?;
+                            attached_session_ids.extend(host_session_id);
                             let attached_live = host_session_id.is_some()
                                 && pane.host_session_id == host_session_id
                                 && pane.terminal.is_some();
@@ -7287,9 +7372,10 @@ impl RootView {
                             if tab_data.active_pane_id == Some(persisted.id) {
                                 restored_active_pane_id = Some(pane.id);
                             }
-                            pane
+                            Some(pane)
                         },
                     );
+                    let Some(root_node) = root_node else { continue; };
                     let first_pane_id = root_node
                         .all_panes()
                         .first()
@@ -7326,6 +7412,9 @@ impl RootView {
                     tab_data.custom_title
                 };
 
+                if saved_index < restored_active_tab_idx {
+                    selected_restored_tab += 1;
+                }
                 self.tabs.push(TabData {
                     id: tab_id,
                     ai_tab_key: tab_data.ai_tab_key.unwrap_or_else(|| new_ai_key("tab")),
@@ -7349,7 +7438,7 @@ impl RootView {
             if self.tabs.len() > first_restored_tab_idx {
                 let last_restored_tab_idx = self.tabs.len() - 1;
                 let active_idx = first_restored_tab_idx
-                    .saturating_add(restored_active_tab_idx)
+                    .saturating_add(selected_restored_tab)
                     .min(last_restored_tab_idx);
                 self.activate_tab_index(active_idx);
             }
@@ -7555,10 +7644,11 @@ impl RootView {
 
     pub fn toggle_tab_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tab_layout == TabLayout::Horizontal {
-            self.tab_layout = TabLayout::Vertical;
-            self.config.tab_layout = TabLayout::Vertical;
-            self.save_config();
-            crate::config::increment_config_version();
+            if !self.save_config(|config| config.tab_layout = TabLayout::Vertical) {
+                cx.notify();
+                return;
+            }
+            self.tab_layout = self.config.tab_layout;
             self.sidebar_open = true;
         } else {
             self.sidebar_open = !self.sidebar_open;
@@ -9414,15 +9504,12 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Committed selection: persist. Any in-flight preview ends here.
-        self.palette_preview_original = None;
-        if self.tab_layout == layout {
+        if !self.save_config(move |config| config.tab_layout = layout) {
+            cx.notify();
             return;
         }
-        self.tab_layout = layout;
-        self.config.tab_layout = layout;
-        self.save_config();
-        crate::config::increment_config_version();
+        self.palette_preview_original = None;
+        self.tab_layout = self.config.tab_layout;
         if self.tab_layout == TabLayout::Vertical {
             self.sidebar_open = true;
         }
@@ -9471,10 +9558,17 @@ impl RootView {
         .detach();
     }
 
-    fn save_config(&mut self) {
-        match self.config.save_default() {
-            Ok(()) => self.config_error = None,
-            Err(error) => self.config_error = Some(format!("Could not save settings: {error}")),
+    fn save_config(&mut self, edit: impl FnOnce(&mut crate::config::Config)) -> bool {
+        match crate::config::Config::update_default(edit) {
+            Ok(config) => {
+                self.config = config;
+                self.config_error = None;
+                true
+            }
+            Err(error) => {
+                self.config_error = Some(format!("Could not save settings: {error}"));
+                false
+            }
         }
     }
 
@@ -9574,13 +9668,13 @@ impl RootView {
     }
 
     pub fn set_theme(&mut self, theme_name: &str, cx: &mut Context<Self>) {
-        // Committed selection: persist. Any in-flight preview ends here.
-        self.palette_preview_original = None;
-        self.current_theme_name = theme_name.to_string();
-        self.config.theme = Some(self.current_theme_name.clone());
-        self.save_config();
-        self.theme = Theme::from_name(theme_name).with_opacity(self.config.opacity);
-        self.status_bar_model = StatusBarModel::new(&self.config, self.theme);
+        let theme = theme_name.to_string();
+        if self.save_config(move |config| config.theme = Some(theme)) {
+            self.palette_preview_original = None;
+            self.current_theme_name = self.config.theme.clone().unwrap_or_default();
+            self.theme = Theme::from_name(&self.current_theme_name).with_opacity(self.config.opacity);
+            self.status_bar_model = StatusBarModel::new(&self.config, self.theme);
+        }
         cx.notify();
     }
 
@@ -9696,11 +9790,10 @@ impl RootView {
     }
 
     pub fn adjust_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
-        // Committed change (e.g. keyboard shortcut): persist.
-        self.palette_preview_original = None;
-        self.font_size = (self.font_size + delta).clamp(9.0, 36.0);
-        self.config.font.size = self.font_size;
-        self.save_config();
+        if self.save_config(|config| config.font.size = (config.font.size + delta).clamp(9.0, 36.0)) {
+            self.palette_preview_original = None;
+            self.font_size = self.config.font.size;
+        }
         cx.notify();
     }
 
@@ -9708,9 +9801,11 @@ impl RootView {
     /// Used by palette `zoom_*` Enter: the value was already previewed while
     /// navigating, so re-applying the delta would double it.
     pub fn commit_font_size(&mut self, cx: &mut Context<Self>) {
-        self.palette_preview_original = None;
-        self.config.font.size = self.font_size;
-        self.save_config();
+        let size = self.font_size;
+        if self.save_config(move |config| config.font.size = size) {
+            self.palette_preview_original = None;
+            self.font_size = self.config.font.size;
+        }
         cx.notify();
     }
 
@@ -9753,9 +9848,10 @@ impl RootView {
                 family.to_string()
             }
         };
-        self.font_family = resolved.into();
-        self.config.font.family = family.to_string();
-        self.save_config();
+        let family = family.to_string();
+        if self.save_config(move |config| config.font.family = family) {
+            self.font_family = resolved.into();
+        }
         cx.notify();
     }
 
@@ -10311,9 +10407,10 @@ impl RootView {
             }
         }
 
-        // Pending Close Modal Keyboard Handler
-
-        if self.pending_close.is_some() {
+        if matches!(
+            self.pending_close.as_ref().map(|pending| &pending.state),
+            Some(PendingCloseState::Failed(_))
+        ) {
             if key_lower == "escape" || key_lower == "esc" {
                 if !matches!(
                     self.pending_close.as_ref().map(|pending| &pending.state),
@@ -11460,9 +11557,10 @@ impl RootView {
                     return;
                 }
                 Action::ResetFontSize => {
-                    self.font_size = 13.0;
-                    self.config.font.size = 13.0;
-                    self.save_config();
+                    if self.save_config(|config| config.font.size = 13.0) {
+                        self.palette_preview_original = None;
+                        self.font_size = self.config.font.size;
+                    }
                     cx.notify();
                     return;
                 }
@@ -11815,7 +11913,10 @@ impl RootView {
             || self.is_about_open
             || self.is_update_modal_open
             || self.is_whats_new_open
-            || self.pending_close.is_some()
+            || matches!(
+                self.pending_close.as_ref().map(|pending| &pending.state),
+                Some(PendingCloseState::Failed(_))
+            )
             || (self.right_panel == RightPanel::Ai && self.ai_input_focused)
     }
 
@@ -18586,7 +18687,6 @@ impl Render for RootView {
                                                             .cursor(CursorStyle::PointingHand)
                                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, _cx| {
                                                                 this.persist_session();
-                                                                this.save_config();
                                                                 crate::updater::relaunch_fastty();
                                                             }))
                                                             .child("Restart Now"),
@@ -18796,7 +18896,10 @@ impl Render for RootView {
                         ),
                 )
             })
-            .when(self.pending_close.is_some(), |this| {
+            .when(matches!(
+                self.pending_close.as_ref().map(|pending| &pending.state),
+                Some(PendingCloseState::Failed(_))
+            ), |this| {
                 let pending = self.pending_close.clone().unwrap();
                 let is_checking = matches!(&pending.state, PendingCloseState::Checking(_));
                 let close_failure = match &pending.state {

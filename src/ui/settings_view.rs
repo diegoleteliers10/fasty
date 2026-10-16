@@ -659,17 +659,35 @@ impl SettingsView {
         self.stale = false;
     }
 
-    /// Single choke point for every settings save (replaces the previously
-    /// scattered `save_default` calls): persists, then re-baselines so our
-    /// own writes never read as external edits.
-    fn save_config(&mut self) {
-        match self.config.save_default() {
-            Ok(()) => {
+    fn save_config(&mut self, edit: impl FnOnce(&mut Config)) -> bool {
+        match Config::update_default(edit) {
+            Ok(config) => {
+                self.config = config;
+                self.opacity = self.config.opacity;
+                self.scrollback = self.config.scrollback;
+                self.cursor_blink = self.config.cursor.blink;
+                self.copy_on_select = self.config.copy_on_select;
+                self.contrast_correction = self.config.contrast_correction;
+                self.update_channel = self.config.update_channel.clone();
+                self.tab_layout = self.config.tab_layout;
+                self.font_size = self.config.font.size;
+                self.font_family = self.config.font.family.clone();
+                self.font_ligatures = self.config.font.ligatures;
+                self.monospace_fonts_only = self.config.font.monospace_only;
+                self.keybinding_preset = self.config.keybinding_preset.unwrap_or_default();
+                self.ai_permission_mode = self.config.ai.permission_mode;
+                self.ai_context_window = self.config.ai.context_window;
+                if let Some(name) = &self.config.theme {
+                    self.current_theme_name = name.clone();
+                }
+                self.theme = Theme::from_name(&self.current_theme_name).with_opacity(self.opacity);
                 self.config_error = None;
                 self.refresh_baseline();
+                true
             }
             Err(error) => {
                 self.config_error = Some(format!("Cannot save settings: {error}"));
+                false
             }
         }
     }
@@ -770,31 +788,52 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn save_ai_provider_config(&mut self) {
-        self.config.ai.default = self.ai_provider.clone();
-        if let Some(prov) = self.config.ai.providers.get_mut(&self.ai_provider) {
-            if prov.command().is_some() {
-                prov.set_command(self.ai_base_url_input.clone());
-            } else {
-                prov.set_base_url(self.ai_base_url_input.clone());
+    fn catalog_model_selection(
+        current: Option<&str>,
+        models: &[String],
+        variants: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Option<String> {
+        current.filter(|current| models.iter().any(|model| {
+            *current == model.as_str() || current.strip_prefix(&format!("{model}/"))
+                .is_some_and(|variant| variants.get(model)
+                    .is_some_and(|values| values.iter().any(|value| value == variant)))
+        })).map(str::to_string).or_else(|| models.first().cloned())
+    }
+
+    fn save_ai_provider_config(&mut self, field: ActiveInputField) {
+        let provider = self.ai_provider.clone();
+        let value = match field {
+            ActiveInputField::AiBaseUrl => self.ai_base_url_input.clone(),
+            ActiveInputField::AiApiKey => self.ai_api_key_input.trim().to_string(),
+            ActiveInputField::AiModel => self.ai_model_input.trim().to_string(),
+            _ => return,
+        };
+        if self.save_config(move |latest| {
+            match field {
+                ActiveInputField::AiBaseUrl => {
+                    if let Some(prov) = latest.ai.providers.get_mut(&provider) {
+                        if prov.command().is_some() {
+                            prov.set_command(value);
+                        } else {
+                            prov.set_base_url(value);
+                        }
+                    }
+                }
+                ActiveInputField::AiApiKey => {
+                    if let Some(prov) = latest.ai.providers.get_mut(&provider) {
+                        prov.set_api_key((!value.is_empty()).then_some(value));
+                    }
+                }
+                ActiveInputField::AiModel => {
+                    latest.ai.default = provider;
+                    latest.ai.default_model = (!value.is_empty()).then_some(value);
+                }
+                _ => {}
             }
-            let key = if self.ai_api_key_input.trim().is_empty() {
-                None
-            } else {
-                Some(self.ai_api_key_input.trim().to_string())
-            };
-            prov.set_api_key(key);
+        }) {
+            self.ai_model = self.config.ai.default_model.clone();
+            self.ai_test_status = AiTestStatus::Idle;
         }
-        if !self.ai_model_input.trim().is_empty() {
-            self.config.ai.default_model = Some(self.ai_model_input.trim().to_string());
-            self.ai_model = Some(self.ai_model_input.trim().to_string());
-        } else {
-            self.config.ai.default_model = None;
-            self.ai_model = None;
-        }
-        self.ai_test_status = AiTestStatus::Idle;
-        self.save_config();
-        crate::config::increment_config_version();
     }
 
     fn sync_active_field_text(&mut self, field: ActiveInputField, cx: &mut Context<Self>) {
@@ -805,17 +844,17 @@ impl SettingsView {
             }
             ActiveInputField::AiBaseUrl => {
                 self.ai_base_url_input = self.ai_base_url_state.text.clone();
-                self.save_ai_provider_config();
+                self.save_ai_provider_config(field);
                 cx.notify();
             }
             ActiveInputField::AiApiKey => {
                 self.ai_api_key_input = self.ai_api_key_state.text.clone();
-                self.save_ai_provider_config();
+                self.save_ai_provider_config(field);
                 cx.notify();
             }
             ActiveInputField::AiModel => {
                 self.ai_model_input = self.ai_model_state.text.clone();
-                self.save_ai_provider_config();
+                self.save_ai_provider_config(field);
                 cx.notify();
             }
             ActiveInputField::FontSearch => {
@@ -1204,11 +1243,11 @@ impl SettingsView {
     }
 
     pub fn set_theme(&mut self, theme_name: &str, cx: &mut Context<Self>) {
-        self.current_theme_name = theme_name.to_string();
-        self.config.theme = Some(self.current_theme_name.clone());
-        self.save_config();
-        crate::config::increment_config_version();
-        self.theme = Theme::from_name(theme_name).with_opacity(self.config.opacity);
+        let name = theme_name.to_string();
+        if self.save_config(move |latest| latest.theme = Some(name)) {
+            self.current_theme_name = self.config.theme.clone().unwrap_or_default();
+            self.theme = Theme::from_name(&self.current_theme_name).with_opacity(self.config.opacity);
+        }
         cx.notify();
     }
 
@@ -1238,43 +1277,41 @@ impl SettingsView {
     }
 
     pub fn adjust_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
-        self.font_size = (self.font_size + delta).clamp(8.0, 36.0);
-        self.config.font.size = self.font_size;
-        self.save_config();
-        crate::config::increment_config_version();
+        if self.save_config(|latest| latest.font.size = (latest.font.size + delta).clamp(8.0, 36.0)) {
+            self.font_size = self.config.font.size;
+        }
         cx.notify();
     }
 
     pub fn set_font_family(&mut self, family: &str, cx: &mut Context<Self>) {
-        self.font_family = family.to_string();
-        self.config.font.family = family.to_string();
-        self.save_config();
-        crate::config::increment_config_version();
+        let family = family.to_string();
+        if self.save_config(move |latest| latest.font.family = family) {
+            self.font_family = self.config.font.family.clone();
+        }
         cx.notify();
     }
 
     pub fn adjust_opacity(&mut self, opacity: f32, cx: &mut Context<Self>) {
-        self.opacity = opacity.clamp(0.2, 1.0);
-        self.config.opacity = self.opacity;
-        self.save_config();
-        crate::config::increment_config_version();
-        self.theme = Theme::from_name(&self.current_theme_name).with_opacity(self.config.opacity);
+        if self.save_config(|latest| latest.opacity = opacity.clamp(0.2, 1.0)) {
+            self.opacity = self.config.opacity;
+            self.theme = Theme::from_name(&self.current_theme_name).with_opacity(self.opacity);
+        }
         cx.notify();
     }
 
     pub fn toggle_font_ligatures(&mut self, cx: &mut Context<Self>) {
-        self.font_ligatures = !self.font_ligatures;
-        self.config.font.ligatures = self.font_ligatures;
-        self.save_config();
-        crate::config::increment_config_version();
+        if self.save_config(|latest| latest.font.ligatures = !latest.font.ligatures) {
+            self.font_ligatures = self.config.font.ligatures;
+        }
         cx.notify();
     }
 
     pub fn toggle_monospace_fonts_only(&mut self, cx: &mut Context<Self>) {
-        self.monospace_fonts_only = !self.monospace_fonts_only;
-        self.config.font.monospace_only = self.monospace_fonts_only;
-        self.save_config();
-        crate::config::increment_config_version();
+        if !self.save_config(|latest| latest.font.monospace_only = !latest.font.monospace_only) {
+            cx.notify();
+            return;
+        }
+        self.monospace_fonts_only = self.config.font.monospace_only;
         // Refilter the cached enumeration rather than rediscovering fonts.
         #[cfg(target_os = "macos")]
         {
@@ -1291,40 +1328,33 @@ impl SettingsView {
     }
 
     pub fn toggle_cursor_blink(&mut self, cx: &mut Context<Self>) {
-        self.cursor_blink = !self.cursor_blink;
-        self.config.cursor.blink = self.cursor_blink;
-        self.save_config();
-        crate::config::increment_config_version();
+        if self.save_config(|latest| latest.cursor.blink = !latest.cursor.blink) {
+            self.cursor_blink = self.config.cursor.blink;
+        }
         cx.notify();
     }
 
     pub fn toggle_copy_on_select(&mut self, cx: &mut Context<Self>) {
-        self.copy_on_select = !self.copy_on_select;
-        self.config.copy_on_select = self.copy_on_select;
-        self.save_config();
-        crate::config::increment_config_version();
+        if self.save_config(|latest| latest.copy_on_select = !latest.copy_on_select) {
+            self.copy_on_select = self.config.copy_on_select;
+        }
         cx.notify();
     }
 
     pub fn toggle_contrast_correction(&mut self, cx: &mut Context<Self>) {
-        self.contrast_correction = !self.contrast_correction;
-        self.config.contrast_correction = self.contrast_correction;
-        self.save_config();
-        crate::config::increment_config_version();
+        if self.save_config(|latest| latest.contrast_correction = !latest.contrast_correction) {
+            self.contrast_correction = self.config.contrast_correction;
+        }
         cx.notify();
     }
 
     pub fn toggle_notify_on_ai_status(&mut self, cx: &mut Context<Self>) {
-        self.config.notify_on_ai_status = !self.config.notify_on_ai_status;
-        self.save_config();
-        crate::config::increment_config_version();
+        self.save_config(|latest| latest.notify_on_ai_status = !latest.notify_on_ai_status);
         cx.notify();
     }
 
     pub fn toggle_notify_on_program_status(&mut self, cx: &mut Context<Self>) {
-        self.config.notify_on_program_status = !self.config.notify_on_program_status;
-        self.save_config();
-        crate::config::increment_config_version();
+        self.save_config(|latest| latest.notify_on_program_status = !latest.notify_on_program_status);
         cx.notify();
     }
 
@@ -1375,10 +1405,9 @@ impl SettingsView {
 
     pub fn set_update_channel(&mut self, channel: &str, cx: &mut Context<Self>) {
         let normalized = crate::updater::UpdateChannel::parse(channel).as_str().to_string();
-        self.update_channel = normalized.clone();
-        self.config.update_channel = normalized;
-        self.save_config();
-        crate::config::increment_config_version();
+        if self.save_config(move |latest| latest.update_channel = normalized) {
+            self.update_channel = self.config.update_channel.clone();
+        }
         cx.notify();
     }
 
@@ -1444,7 +1473,6 @@ impl SettingsView {
             return;
         }
         if self.update_ready {
-            let _ = self.config.save_default();
             crate::updater::relaunch_fastty();
             return;
         }
@@ -1502,41 +1530,34 @@ impl SettingsView {
     }
 
     pub fn set_tab_layout(&mut self, layout: crate::config::TabLayout, cx: &mut Context<Self>) {
-        self.tab_layout = layout;
-        self.config.tab_layout = layout;
-        self.save_config();
-        crate::config::increment_config_version();
+        if self.save_config(move |latest| latest.tab_layout = layout) {
+            self.tab_layout = self.config.tab_layout;
+        }
         cx.notify();
     }
 
     pub fn set_scrollback(&mut self, scrollback: usize, cx: &mut Context<Self>) {
-        self.scrollback = scrollback;
-        self.config.scrollback = scrollback;
-        self.save_config();
-        crate::config::increment_config_version();
+        if self.save_config(move |latest| latest.scrollback = scrollback) {
+            self.scrollback = self.config.scrollback;
+        }
         cx.notify();
     }
 
     pub fn set_keybinding_preset(&mut self, preset: crate::keybindings::KeybindingPreset, cx: &mut Context<Self>) {
-        self.keybinding_preset = preset;
-        self.config.keybinding_preset = Some(preset);
+        self.persist_bindings(|latest| latest.keybinding_preset = Some(preset), cx);
         self.capturing_action = None;
         self.binding_conflict = None;
-        self.save_config();
-        crate::keybindings::init_resolver(self.config.keybindings.clone(), Some(preset));
-        crate::keybindings::init_key_modes(self.config.key_modes.clone());
-        crate::config::increment_config_version();
-        cx.notify();
     }
 
-    fn persist_bindings(&mut self, cx: &mut Context<Self>) {
-        self.save_config();
-        crate::keybindings::init_resolver(
-            self.config.keybindings.clone(),
-            Some(self.keybinding_preset),
-        );
-        crate::keybindings::init_key_modes(self.config.key_modes.clone());
-        crate::config::increment_config_version();
+    fn persist_bindings(&mut self, edit: impl FnOnce(&mut Config), cx: &mut Context<Self>) {
+        if self.save_config(edit) {
+            self.keybinding_preset = self.config.keybinding_preset.unwrap_or_default();
+            crate::keybindings::init_resolver(
+                self.config.keybindings.clone(),
+                self.config.keybinding_preset,
+            );
+            crate::keybindings::init_key_modes(self.config.key_modes.clone());
+        }
         cx.notify();
     }
 
@@ -1562,27 +1583,20 @@ impl SettingsView {
     }
 
     fn apply_action_binding(
-        &mut self,
+        latest: &mut Config,
         target: crate::keybindings::Action,
         combo: crate::keybindings::KeyCombo,
     ) {
         let id = target.binding_id();
         let target_combo_str = combo.to_string();
-        // Remove existing user entries for this action
-        self.config
-            .keybindings
-            .retain(|k, v| v != &id || k == &target_combo_str);
-        // Suppress preset combos for this action that aren't the newly assigned combo
-        let preset_combos =
-            crate::keybindings::KeyBindingResolver::preset_combos(self.keybinding_preset, target);
-        for pc in preset_combos {
+        latest.keybindings.retain(|k, v| v != &id || k == &target_combo_str);
+        let preset = latest.keybinding_preset.unwrap_or_default();
+        for pc in crate::keybindings::KeyBindingResolver::preset_combos(preset, target) {
             if pc != combo {
-                self.config
-                    .keybindings
-                    .insert(pc.to_string(), "none".to_string());
+                latest.keybindings.insert(pc.to_string(), "none".to_string());
             }
         }
-        self.config.keybindings.insert(target_combo_str, id);
+        latest.keybindings.insert(target_combo_str, id);
     }
 
     fn finish_binding_capture(
@@ -1593,33 +1607,27 @@ impl SettingsView {
         let Some(target) = self.capturing_action.take() else {
             return;
         };
-        let effective = self.effective_bindings();
-        match effective.resolve(&combo) {
-            None => {
-                self.apply_action_binding(target, combo);
-                self.binding_conflict = None;
-                self.persist_bindings(cx);
+        let mut conflict = None;
+        self.persist_bindings(|latest| {
+            let effective = crate::keybindings::effective_resolver(
+                latest.keybinding_preset.unwrap_or_default(),
+                &latest.keybindings,
+            );
+            match effective.resolve(&combo) {
+                Some(owner) if owner != target => {
+                    conflict = Some(BindingConflict { target, combo, owner });
+                }
+                _ => Self::apply_action_binding(latest, target, combo),
             }
-            Some(owner) if owner == target => {
-                self.apply_action_binding(target, combo);
-                self.binding_conflict = None;
-                self.persist_bindings(cx);
-            }
-            Some(owner) => {
-                self.binding_conflict = Some(BindingConflict {
-                    target,
-                    combo,
-                    owner,
-                });
-                cx.notify();
-            }
-        }
+        }, cx);
+        self.binding_conflict = conflict;
     }
 
     pub fn confirm_binding_conflict(&mut self, cx: &mut Context<Self>) {
         if let Some(conflict) = self.binding_conflict.take() {
-            self.apply_action_binding(conflict.target, conflict.combo);
-            self.persist_bindings(cx);
+            self.persist_bindings(|latest| {
+                Self::apply_action_binding(latest, conflict.target, conflict.combo);
+            }, cx);
         }
     }
 
@@ -1634,16 +1642,18 @@ impl SettingsView {
         action: crate::keybindings::Action,
         cx: &mut Context<Self>,
     ) {
-        let effective = self.effective_bindings();
-        let id = action.binding_id();
-        self.config.keybindings.retain(|_, v| v != &id);
-        for combo in effective.combos_for(action) {
-            self.config
-                .keybindings
-                .insert(combo.to_string(), "none".to_string());
-        }
         self.binding_conflict = None;
-        self.persist_bindings(cx);
+        self.persist_bindings(|latest| {
+            let effective = crate::keybindings::effective_resolver(
+                latest.keybinding_preset.unwrap_or_default(),
+                &latest.keybindings,
+            );
+            let id = action.binding_id();
+            latest.keybindings.retain(|_, value| value != &id);
+            for combo in effective.combos_for(action) {
+                latest.keybindings.insert(combo.to_string(), "none".to_string());
+            }
+        }, cx);
     }
 
     pub fn reset_action_bindings_ui(
@@ -1651,47 +1661,37 @@ impl SettingsView {
         action: crate::keybindings::Action,
         cx: &mut Context<Self>,
     ) {
-        crate::keybindings::reset_action_bindings(
-            &mut self.config.keybindings,
-            self.keybinding_preset,
-            action,
-        );
         self.binding_conflict = None;
-        self.persist_bindings(cx);
+        self.persist_bindings(|latest| {
+            crate::keybindings::reset_action_bindings(
+                &mut latest.keybindings,
+                latest.keybinding_preset.unwrap_or_default(),
+                action,
+            );
+        }, cx);
     }
 
     pub fn reset_all_bindings(&mut self, cx: &mut Context<Self>) {
-        self.config.keybindings.clear();
         self.capturing_action = None;
         self.binding_conflict = None;
-        self.persist_bindings(cx);
+        self.persist_bindings(|latest| latest.keybindings.clear(), cx);
     }
 
     pub fn set_ai_permission_mode(&mut self, mode: crate::ai::PermissionMode, cx: &mut Context<Self>) {
-        self.ai_permission_mode = mode;
-        self.config.ai.permission_mode = mode;
-        self.save_config();
-        crate::config::increment_config_version();
+        if self.save_config(|latest| latest.ai.permission_mode = mode) {
+            self.ai_permission_mode = self.config.ai.permission_mode;
+        }
         cx.notify();
     }
 
     pub fn set_ai_context_window(&mut self, tokens: u32, cx: &mut Context<Self>) {
         let clamped = tokens.clamp(4_000, 2_000_000);
-        let previous = self.config.ai.context_window;
-        self.config.ai.context_window = clamped;
-        match self.config.save_default() {
-            Ok(()) => {
-                self.ai_context_window = clamped;
-                self.ai_context_window_error = None;
-                crate::config::set_ai_context_window(clamped);
-                self.refresh_baseline();
-            }
-            Err(error) => {
-                self.config.ai.context_window = previous;
-                self.ai_context_window = previous;
-                self.ai_context_window_error = Some(format!("Could not save: {error}"));
-                eprintln!("[fastty] could not save AI context window: {error}");
-            }
+        if self.save_config(|latest| latest.ai.context_window = clamped) {
+            self.ai_context_window = self.config.ai.context_window;
+            self.ai_context_window_error = None;
+            crate::config::set_ai_context_window(self.ai_context_window);
+        } else {
+            self.ai_context_window_error = self.config_error.clone();
         }
         cx.notify();
     }
@@ -1702,35 +1702,46 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.ai_provider = provider.to_string();
-        self.config.ai.default = self.ai_provider.clone();
-        if provider == "opencode" {
-            self.config.ai.providers.entry("opencode".to_string()).or_insert_with(|| {
-                crate::ai::ProviderConfig::Opencode {
-                    command: "opencode".to_string(),
-                    models: Vec::new(),
-                    variants: std::collections::HashMap::new(),
-                }
-            });
-        } else if provider == "claude-acp" {
-            self.config.ai.providers.entry("claude-acp".to_string()).or_insert_with(|| {
-                crate::ai::ProviderConfig::Acp {
-                    command: "claude-agent-acp".to_string(),
-                    args: Vec::new(),
-                    models: Vec::new(),
-                    variants: std::collections::HashMap::new(),
-                }
-            });
-        } else if provider == "antigravity-acp" {
-            self.config.ai.providers.entry("antigravity-acp".to_string()).or_insert_with(|| {
-                crate::ai::ProviderConfig::Acp {
-                    command: "agy_acp_server".to_string(),
-                    args: Vec::new(),
-                    models: Vec::new(),
-                    variants: std::collections::HashMap::new(),
-                }
-            });
+        let detected_model = self.detected_ollama_models.first().cloned();
+        if !self.save_config(|latest| {
+            latest.ai.default = provider.to_string();
+            if provider == "opencode" {
+                latest.ai.providers.entry("opencode".to_string()).or_insert_with(|| {
+                    crate::ai::ProviderConfig::Opencode {
+                        command: "opencode".to_string(),
+                        models: Vec::new(),
+                        variants: std::collections::HashMap::new(),
+                    }
+                });
+            } else if provider == "claude-acp" {
+                latest.ai.providers.entry("claude-acp".to_string()).or_insert_with(|| {
+                    crate::ai::ProviderConfig::Acp {
+                        command: "claude-agent-acp".to_string(),
+                        args: Vec::new(),
+                        models: Vec::new(),
+                        variants: std::collections::HashMap::new(),
+                    }
+                });
+            } else if provider == "antigravity-acp" {
+                latest.ai.providers.entry("antigravity-acp".to_string()).or_insert_with(|| {
+                    crate::ai::ProviderConfig::Acp {
+                        command: "agy_acp_server".to_string(),
+                        args: Vec::new(),
+                        models: Vec::new(),
+                        variants: std::collections::HashMap::new(),
+                    }
+                });
+            }
+            latest.ai.default_model = latest.ai.providers.get(provider)
+                .and_then(|entry| entry.models().first().cloned());
+            if provider == "ollama" {
+                latest.ai.default_model = detected_model.or_else(|| latest.ai.default_model.clone());
+            }
+        }) {
+            cx.notify();
+            return;
         }
+        self.ai_provider = self.config.ai.default.clone();
         let prov_info = self
             .config
             .ai
@@ -1751,17 +1762,13 @@ impl SettingsView {
                 self.ai_model = chosen.clone();
                 self.ai_model_input = chosen.clone().unwrap_or_default();
                 self.ai_model_state.set_text(self.ai_model_input.clone());
-                self.config.ai.default_model = chosen;
             } else {
                 self.ai_model = first_prov_model.clone();
                 self.ai_model_input = first_prov_model.clone().unwrap_or_default();
                 self.ai_model_state.set_text(self.ai_model_input.clone());
-                self.config.ai.default_model = first_prov_model;
             }
         }
         self.ai_test_status = AiTestStatus::Idle;
-        self.save_config();
-        crate::config::increment_config_version();
         cx.notify();
         if self.config.ai.providers.get(provider).is_some_and(crate::ai::ProviderConfig::is_acp) {
             self.test_ai_connection(window, cx);
@@ -1782,27 +1789,29 @@ impl SettingsView {
         };
         self.ai_base_url_input = default_url.to_string();
         self.ai_base_url_state.set_text(self.ai_base_url_input.clone());
-        self.save_ai_provider_config();
+        self.save_ai_provider_config(ActiveInputField::AiBaseUrl);
         cx.notify();
     }
 
     pub fn clear_ai_api_key(&mut self, cx: &mut Context<Self>) {
         self.ai_api_key_input.clear();
         self.ai_api_key_state.clear();
-        self.save_ai_provider_config();
+        self.save_ai_provider_config(ActiveInputField::AiApiKey);
         cx.notify();
     }
 
     pub fn set_ai_model(&mut self, model: &str, cx: &mut Context<Self>) {
         let trimmed = model.trim().to_string();
-        self.ai_model = Some(trimmed.clone());
-        self.ai_model_input = trimmed.clone();
-        self.ai_model_state.set_text(trimmed.clone());
-        self.config.ai.default_model = Some(trimmed);
-        self.config.ai.default = self.ai_provider.clone();
-        self.ai_test_status = AiTestStatus::Idle;
-        self.save_config();
-        crate::config::increment_config_version();
+        let provider = self.ai_provider.clone();
+        if self.save_config(|latest| {
+            latest.ai.default_model = Some(trimmed.clone());
+            latest.ai.default = provider;
+        }) {
+            self.ai_model = self.config.ai.default_model.clone();
+            self.ai_model_input = trimmed.clone();
+            self.ai_model_state.set_text(trimmed);
+            self.ai_test_status = AiTestStatus::Idle;
+        }
         cx.notify();
     }
 
@@ -1812,13 +1821,12 @@ impl SettingsView {
     }
 
     pub fn clear_ai_model(&mut self, cx: &mut Context<Self>) {
-        self.ai_model_input.clear();
-        self.ai_model_state.clear();
-        self.ai_model = None;
-        self.config.ai.default_model = None;
-        self.ai_test_status = AiTestStatus::Idle;
-        self.save_config();
-        crate::config::increment_config_version();
+        if self.save_config(|latest| latest.ai.default_model = None) {
+            self.ai_model_input.clear();
+            self.ai_model_state.clear();
+            self.ai_model = None;
+            self.ai_test_status = AiTestStatus::Idle;
+        }
         cx.notify();
     }
 
@@ -1864,25 +1872,39 @@ impl SettingsView {
                         }
                         match result {
                             Ok((duration, models, variants)) => {
-                                let current_model = this.ai_model_input.trim();
-                                let selected = models.iter().find(|model| model.as_str() == current_model).cloned()
-                                    .or_else(|| models.iter().find(|model| {
-                                        current_model.strip_prefix(&format!("{}/", model))
-                                            .is_some_and(|effort| variants.get(model.as_str()).is_some_and(|values| values.iter().any(|value| value == effort)))
-                                    }).cloned())
-                                    .or_else(|| models.first().cloned());
-                                if let Some(provider) = this.config.ai.providers.get_mut(&provider_name) {
-                                    provider.set_acp_catalog(models.clone(), variants);
+                                let mut accepted = false;
+                                let saved = this.save_config(|latest| {
+                                    if latest.ai.default != provider_name {
+                                        return;
+                                    }
+                                    let selected = Self::catalog_model_selection(
+                                        latest.ai.default_model.as_deref(), &models, &variants,
+                                    );
+                                    let Some(provider) = latest.ai.providers.get_mut(&provider_name) else {
+                                        return;
+                                    };
+                                    if provider.command() != Some(command_for_check.as_str())
+                                        || provider.acp_args().as_deref() != Some(args_for_check.as_slice()) {
+                                        return;
+                                    }
+                                    provider.set_acp_catalog(models, variants);
+                                    if selected.is_some() {
+                                        latest.ai.default_model = selected;
+                                    }
+                                    accepted = true;
+                                });
+                                if saved && accepted {
+                                    this.ai_model = this.config.ai.default_model.clone();
+                                    this.ai_model_input = this.ai_model.clone().unwrap_or_default();
+                                    this.ai_model_state.set_text(this.ai_model_input.clone());
+                                    this.ai_test_status = AiTestStatus::Success(duration);
+                                } else if !saved {
+                                    this.ai_test_status = AiTestStatus::Failed(
+                                        this.config_error.clone().unwrap_or_else(|| "Cannot save settings".to_string()),
+                                    );
+                                } else {
+                                    this.ai_test_status = AiTestStatus::Idle;
                                 }
-                                if let Some(model) = selected {
-                                    this.ai_model = Some(model.clone());
-                                    this.ai_model_input = model.clone();
-                                    this.ai_model_state.set_text(model.clone());
-                                    this.config.ai.default_model = Some(model);
-                                }
-                                this.ai_test_status = AiTestStatus::Success(duration);
-                                this.save_config();
-                                crate::config::increment_config_version();
                             }
                             Err(error) => this.ai_test_status = AiTestStatus::Failed(error),
                         }
@@ -1936,17 +1958,13 @@ impl SettingsView {
                 if let Some(p) = self.config.keybinding_preset {
                     self.keybinding_preset = p;
                 }
-                // Persist and apply right away. Without this the imported
-                // preset only lives in memory: the next unrelated settings
-                // save silently bakes it into the config file, and the new
-                // keybindings did not apply until restart.
-                self.save_config();
+                self.config_error = None;
+                self.refresh_baseline();
                 crate::keybindings::init_resolver(
                     self.config.keybindings.clone(),
                     self.config.keybinding_preset,
                 );
                 crate::keybindings::init_key_modes(self.config.key_modes.clone());
-                crate::config::increment_config_version();
                 // "Software should be fun": the migration moment gets its
                 // celebration, a nod to the config-import confetti that
                 // made the rounds in September.
@@ -1954,7 +1972,8 @@ impl SettingsView {
                 cx.notify();
             }
             Err(e) => {
-                self.import_status_message = Some(format!("Error importing: {e}"));
+                self.config_error = Some(format!("Cannot import settings: {e}"));
+                self.import_status_message = self.config_error.clone();
                 cx.notify();
             }
         }
@@ -1972,10 +1991,10 @@ impl SettingsView {
     }
 
     pub fn open_config_folder() {
-        let config_dir = dirs::home_dir().map(|h| h.join(".config/fastty")).unwrap_or_default();
-        let _ = std::fs::create_dir_all(&config_dir);
-        if let Some(path_str) = config_dir.to_str() {
-            open_path_or_url(path_str);
+        let path = Config::get_active_config_path();
+        if let Some(config_dir) = path.parent() {
+            let _ = std::fs::create_dir_all(config_dir);
+            open_path_or_url(config_dir);
         }
     }
 }
@@ -5325,6 +5344,30 @@ impl SettingsView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn catalog_selection_keeps_current_models_and_variants() {
+        let models = vec!["first-model".to_string(), "selected-model".to_string()];
+        let variants = std::collections::HashMap::from([
+            ("selected-model".to_string(), vec!["high".to_string()]),
+        ]);
+        for current in ["selected-model", "selected-model/high"] {
+            assert_eq!(super::SettingsView::catalog_model_selection(
+                Some(current), &models, &variants,
+            ).as_deref(), Some(current));
+        }
+    }
+
+    #[test]
+    fn catalog_selection_replaces_removed_models_and_variants() {
+        let models = vec!["available-model".to_string()];
+        let variants = std::collections::HashMap::new();
+        for current in [Some("removed-model"), Some("available-model/removed-variant"), None] {
+            assert_eq!(super::SettingsView::catalog_model_selection(
+                current, &models, &variants,
+            ).as_deref(), Some("available-model"));
+        }
+    }
+
     use super::SettingsView;
 
     #[test]

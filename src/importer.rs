@@ -136,7 +136,7 @@ pub fn import_external_config(app: ExternalApp, path: &Path, cfg: &mut Config) -
     let content = std::fs::read_to_string(path)?;
     let mut imported_items = Vec::new();
 
-    match app {
+    let committed = Config::update_default(|cfg| match app {
         ExternalApp::Ghostty => {
             cfg.keybinding_preset = Some(KeybindingPreset::Ghostty);
             imported_items.push("Preset: Ghostty keybindings".to_string());
@@ -298,10 +298,8 @@ pub fn import_external_config(app: ExternalApp, path: &Path, cfg: &mut Config) -
                 }
             }
         }
-    }
-
-    // Persist changes
-    cfg.save_default()?;
+    })?;
+    *cfg = committed;
 
     if imported_items.is_empty() {
         Ok(format!("Imported default preset for {app}"))

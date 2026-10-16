@@ -315,27 +315,23 @@ impl PaneNode {
         })
     }
 
-    pub fn restore_from_persisted<F>(persisted: &crate::session_manager::PersistedPaneNode, spawn_pane: &mut F) -> Self
+    pub fn restore_from_persisted<F>(persisted: &crate::session_manager::PersistedPaneNode, spawn_pane: &mut F) -> Option<Self>
     where
-        F: FnMut(&crate::session_manager::PersistedPane) -> TerminalPane,
+        F: FnMut(&crate::session_manager::PersistedPane) -> Option<TerminalPane>,
     {
         match persisted {
-            crate::session_manager::PersistedPaneNode::Leaf(p) => {
-                PaneNode::Leaf(spawn_pane(p))
-            }
+            crate::session_manager::PersistedPaneNode::Leaf(pane) => spawn_pane(pane).map(PaneNode::Leaf),
             crate::session_manager::PersistedPaneNode::Split { direction, ratio, first, second } => {
-                let dir = if direction == "Vertical" {
-                    SplitDirection::Vertical
-                } else {
-                    SplitDirection::Horizontal
-                };
-                let first_node = Self::restore_from_persisted(first, spawn_pane);
-                let second_node = Self::restore_from_persisted(second, spawn_pane);
-                PaneNode::Split {
-                    direction: dir,
-                    ratio: *ratio,
-                    first: Box::new(first_node),
-                    second: Box::new(second_node),
+                let first = Self::restore_from_persisted(first, spawn_pane);
+                let second = Self::restore_from_persisted(second, spawn_pane);
+                match (first, second) {
+                    (Some(first), Some(second)) => Some(PaneNode::Split {
+                        direction: if direction == "Vertical" { SplitDirection::Vertical } else { SplitDirection::Horizontal },
+                        ratio: *ratio,
+                        first: Box::new(first),
+                        second: Box::new(second),
+                    }),
+                    (node, None) | (None, node) => node,
                 }
             }
         }

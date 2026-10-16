@@ -580,6 +580,20 @@ fn main() {
         eprintln!("fastty: {error}");
         std::process::exit(1);
     }
+    let saved_session = saved_session.map(|session| {
+        let Some(host) = fastty::session_host::current_host_instance() else {
+            return session;
+        };
+        let (session, changed) = session.prune_other_hosts(&host);
+        if changed {
+            if let Err(error) = fastty::session::save(&session) {
+                eprintln!(
+                    "Fastty could not save the session after removing stopped sessions: {error}"
+                );
+            }
+        }
+        session
+    });
 
     application()
         .with_quit_mode(QuitMode::LastWindowClosed)

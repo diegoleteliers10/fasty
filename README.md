@@ -154,15 +154,20 @@ cargo build --target wasm32-unknown-unknown -p fastty-wasm --release
 
 ## Configuration
 
-Fastty searches for configuration in the following locations:
-1. `./fastty.toml` or `./config.toml` (portable mode)
-2. `/etc/fastty/fastty.toml` (system-wide)
-3. User directory:
-   - **macOS**: `~/Library/Application Support/fastty/fastty.toml`
-   - **Linux**: `~/.config/fastty/fastty.toml`
-   - **Windows**: `%APPDATA%\fastty\config\fastty.toml`
+Fastty uses the first existing file in this order:
 
-### Example `fastty.toml`
+1. `$XDG_CONFIG_HOME/fastty/`, when `XDG_CONFIG_HOME` is set.
+2. The platform user directory:
+   - **macOS**: `~/Library/Application Support/fastty/`
+   - **Linux**: `~/.config/fastty/`
+   - **Windows**: `%APPDATA%\fastty\config\`
+3. `~/.config/fastty/`, then `~/.fastty.toml`.
+4. `./fastty.toml` in the startup directory.
+5. `/etc/fastty/`.
+
+In each directory, Fastty checks `config.toml` before `fastty.toml`. The startup directory only supports `fastty.toml`. Fastty keeps the selected absolute path for the process lifetime. An invalid selected file does not select another file.
+
+### Example `config.toml`
 
 ```toml
 theme = "default"

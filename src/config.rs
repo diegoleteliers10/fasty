@@ -1,9 +1,7 @@
 //! Configuration for fastty terminal emulator.
 //!
-//! Primary source: `fastty.toml`. Search order:
-//!   1. `./fastty.toml` (cwd, portable)
-//!   2. `/etc/fastty/fastty.toml` (system-wide)
-//!   3. `~/.config/fastty/fastty.toml` (user)
+//! Search the explicit XDG directory first, then the native user directory,
+//! home fallbacks, the working directory, and the system directory.
 //!
 //! Legacy `config.json` from <= v0.2.7 is auto-migrated on first launch
 //! (user path only) and the original is renamed to `config.json.bak`.
@@ -52,6 +50,7 @@ pub fn increment_config_version() {
 static LAST_APPLIED_HASH: RwLock<u64> = RwLock::new(0);
 static ACTIVE_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 static CONFIG_SOURCE_PRESENT: AtomicBool = AtomicBool::new(false);
+static CONFIG_UPDATE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(250);
 
@@ -719,6 +718,65 @@ fn ensure_table(doc: &mut DocumentMut, key: &str) {
     }
 }
 
+fn lock_config_file(path: &Path) -> anyhow::Result<std::fs::File> {
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true)
+        .truncate(false).open(PathBuf::from(lock_path))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => anyhow::bail!("Cannot lock {}: {error}", path.display()),
+        }
+    }
+}
+
+fn apply_config_changes(
+    target: &mut dyn toml_edit::TableLike,
+    before: &dyn toml_edit::TableLike,
+    after: &dyn toml_edit::TableLike,
+) {
+    for (key, _) in before.iter() {
+        if !after.contains_key(key) {
+            target.remove(key);
+        }
+    }
+    for (key, updated) in after.iter() {
+        let previous = before.get(key);
+        if previous.is_some_and(|item| item.to_string() == updated.to_string()) {
+            continue;
+        }
+        if let (Some(old_table), Some(new_table), Some(target_table)) = (
+            previous.and_then(Item::as_table_like),
+            updated.as_table_like(),
+            target.get_mut(key).and_then(Item::as_table_like_mut),
+        ) {
+            if old_table.get("type").map(ToString::to_string)
+                != new_table.get("type").map(ToString::to_string)
+            {
+                for field in ["base_url", "api_key_env", "api_key", "command", "args", "models", "variants"] {
+                    if !new_table.contains_key(field) {
+                        target_table.remove(field);
+                    }
+                }
+            }
+            apply_config_changes(target_table, old_table, new_table);
+        } else {
+            let mut replacement = updated.clone();
+            if let (Some(old_value), Some(new_value)) = (
+                target.get(key).and_then(Item::as_value), replacement.as_value_mut(),
+            ) {
+                *new_value.decor_mut() = old_value.decor().clone();
+            }
+            target.insert(key, replacement);
+        }
+    }
+}
+
 fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
     doc["scrollback"] = value(c.scrollback as i64);
     doc["opacity"] = value(c.opacity as f64);
@@ -1171,6 +1229,65 @@ impl Config {
         Ok(def)
     }
 
+    pub fn update(path: &Path, edit: impl FnOnce(&mut Config)) -> anyhow::Result<Config> {
+        Self::update_at(path, edit, false)
+    }
+
+    pub fn update_default(edit: impl FnOnce(&mut Config)) -> anyhow::Result<Config> {
+        Self::update_at(&Self::get_active_config_path(), edit, true)
+    }
+
+    fn update_at(
+        path: &Path,
+        edit: impl FnOnce(&mut Config),
+        publish: bool,
+    ) -> anyhow::Result<Config> {
+        let _process_lock = CONFIG_UPDATE_LOCK.try_lock_for(Duration::from_secs(1))
+            .ok_or_else(|| anyhow::anyhow!("Cannot lock config updates"))?;
+        if publish && CONFIG_LOAD_FAILED.load(Ordering::Relaxed) {
+            anyhow::bail!("Cannot save config after a load error. Fix {} and reload it.", path.display());
+        }
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let _file_lock = lock_config_file(path)?;
+        let original = match std::fs::read_to_string(path) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                && !(publish && CONFIG_SOURCE_PRESENT.load(Ordering::Relaxed)) => None,
+            Err(error) => return Err(anyhow::anyhow!("read {}: {error}", path.display())),
+        };
+        let content = original.as_deref().unwrap_or("");
+        let mut config: Config = toml_edit::de::from_str(&content)
+            .map_err(|error| anyhow::anyhow!("parse {}: {error}", path.display()))?;
+        let mut doc = content.parse::<DocumentMut>()?;
+        let before = toml_edit::ser::to_document(&config)?;
+        edit(&mut config);
+        let after = toml_edit::ser::to_document(&config)?;
+        apply_config_changes(doc.as_table_mut(), before.as_table(), after.as_table());
+        let serialized = doc.to_string();
+        let committed: Config = toml_edit::de::from_str(&serialized)
+            .map_err(|error| anyhow::anyhow!("validate {}: {error}", path.display()))?;
+        let current = match std::fs::read(path) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(anyhow::anyhow!("read {}: {error}", path.display())),
+        };
+        if original.as_deref().map(str::as_bytes) != current.as_deref() {
+            anyhow::bail!("Settings changed on disk. Retry the change: {}", path.display());
+        }
+        atomic_write(path, serialized.as_bytes())?;
+        if publish {
+            sync_runtime_statics(&committed);
+            set_ai_context_window(committed.ai.context_window);
+            set_last_applied_hash(content_hash(serialized.as_bytes()));
+            CONFIG_SOURCE_PRESENT.store(true, Ordering::Relaxed);
+            increment_config_version();
+        }
+        Ok(committed)
+    }
+
+    #[cfg(test)]
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let mut doc: DocumentMut = match std::fs::read_to_string(path) {
             Ok(s) => {
@@ -1189,7 +1306,6 @@ impl Config {
         let serialized = doc.to_string();
         let bytes = serialized.as_bytes();
         atomic_write(path, bytes)?;
-        set_last_applied_hash(content_hash(bytes));
         Ok(())
     }
 
@@ -1229,23 +1345,6 @@ impl Config {
         }
     }
 
-    pub fn save_default(&self) -> anyhow::Result<()> {
-        let path = Self::get_active_config_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        // Block saves after a load error until the config loads again.
-        if CONFIG_LOAD_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
-            anyhow::bail!(
-                "Cannot save config after a load error. Fix {} and reload it.",
-                path.display()
-            );
-        }
-        self.save(&path)?;
-        CONFIG_SOURCE_PRESENT.store(true, Ordering::Relaxed);
-        increment_config_version();
-        Ok(())
-    }
 }
 
 static CONFIG_LOAD_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1346,6 +1445,245 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TempConfig(PathBuf);
+
+    impl TempConfig {
+        fn new() -> Self {
+            let mut nonce = [0u8; 16];
+            getrandom::fill(&mut nonce).unwrap();
+            Self(std::env::temp_dir().join(format!("fastty-config-{}.toml", hex::encode(nonce))))
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_dir(&self.0);
+            let mut lock_path = self.0.as_os_str().to_owned();
+            lock_path.push(".lock");
+            let _ = std::fs::remove_file(PathBuf::from(lock_path));
+        }
+    }
+
+    #[test]
+    fn stale_config_save_preserves_unrelated_changes() {
+        let file = TempConfig::new();
+        let mut base = Config::default();
+        base.theme = Some("catppuccin".into());
+        base.font.family = "Fira Code".into();
+        base.ai.providers.clear();
+        base.ai.providers.insert("custom".into(), crate::ai::ProviderConfig::OpenaiCompat {
+            base_url: "https://example.invalid/v1".into(),
+            api_key_env: Some("TEST_AI_KEY".into()),
+            api_key: None,
+            models: vec!["initial-model".into()],
+        });
+        base.bottombar.widgets = vec![WidgetSpec::Git { align: None, interval_ms: None }];
+        base.save(&file.0).unwrap();
+
+        let mut settings = base.clone();
+        let mut stale_root = base.clone();
+        settings.theme = Some("tokyo-night".into());
+        settings.font.family = "JetBrains Mono".into();
+        settings.ai.providers.get_mut("custom").unwrap()
+            .set_base_url("https://updated.invalid/v1".into());
+        settings.bottombar.widgets = vec![WidgetSpec::Aws { align: None, interval_ms: None }];
+        settings.save(&file.0).unwrap();
+
+        stale_root.tab_layout = TabLayout::Vertical;
+        Config::update(&file.0, |latest| latest.tab_layout = stale_root.tab_layout).unwrap();
+        let saved: Config = toml_edit::de::from_str(&std::fs::read_to_string(&file.0).unwrap()).unwrap();
+        assert_eq!(saved.tab_layout, TabLayout::Vertical);
+        let preserved_fields = |cfg: &Config| serde_json::json!({
+            "theme": cfg.theme,
+            "font": cfg.font,
+            "providers": cfg.ai.providers,
+            "widgets": cfg.bottombar.widgets,
+        });
+        assert_eq!(preserved_fields(&saved), preserved_fields(&settings));
+    }
+
+    #[test]
+    fn config_update_preserves_unknown_fields_and_removes_known_entries() {
+        let file = TempConfig::new();
+        std::fs::write(&file.0, r#"# User comment
+custom_root = "keep"
+shell = "/bin/zsh"
+[font]
+family = "Fira Code"
+size = 14.0 # Keep this comment
+custom_font = "keep"
+[keybindings]
+ctrl-a = "select_all"
+ctrl-b = "new_tab"
+[key_modes.test]
+entry = "ctrl-g"
+exclusive = true
+custom_mode = "keep"
+[key_modes.test.bindings]
+a = "new_tab"
+b = "close_tab"
+[workflows.test]
+label = "Old"
+actions = ["new_tab"]
+custom_workflow = "keep"
+[ai.providers.custom]
+type = "openai-compat"
+base_url = "https://example.invalid/v1"
+api_key = "fixture-key"
+command = "old-unknown-command"
+custom_provider = "keep"
+[ai.providers.removed]
+type = "opencode"
+command = "old"
+"#).unwrap();
+        let saved = Config::update(&file.0, |config| {
+            config.shell = None;
+            config.font.size = 18.0;
+            config.keybindings.remove("ctrl-a");
+            config.key_modes.get_mut("test").unwrap().bindings.remove("a");
+            config.workflows.get_mut("test").unwrap().label = "New".into();
+            config.ai.providers.remove("removed");
+            config.ai.providers.insert("custom".into(), crate::ai::ProviderConfig::Acp {
+                command: "new-agent".into(), args: vec![], models: vec![], variants: HashMap::new(),
+            });
+        }).unwrap();
+        assert_eq!(saved.shell, None);
+        assert!(!saved.keybindings.contains_key("ctrl-a"));
+        assert!(!saved.key_modes["test"].bindings.contains_key("a"));
+        assert!(!saved.ai.providers.contains_key("removed"));
+        let content = std::fs::read_to_string(&file.0).unwrap();
+        let doc = content.parse::<DocumentMut>().unwrap();
+        assert!(content.starts_with("# User comment"));
+        assert!(content.contains("size = 18.0 # Keep this comment"));
+        assert_eq!(doc["custom_root"].as_str(), Some("keep"));
+        assert_eq!(doc["font"]["custom_font"].as_str(), Some("keep"));
+        assert_eq!(doc["key_modes"]["test"]["custom_mode"].as_str(), Some("keep"));
+        assert_eq!(doc["workflows"]["test"]["custom_workflow"].as_str(), Some("keep"));
+        assert_eq!(doc["ai"]["providers"]["custom"]["custom_provider"].as_str(), Some("keep"));
+        assert!(!doc["ai"]["providers"]["custom"].as_table_like().unwrap().contains_key("base_url"));
+        assert!(!doc["ai"]["providers"]["custom"].as_table_like().unwrap().contains_key("api_key"));
+    }
+
+    #[test]
+    fn config_update_rejects_an_external_edit_during_the_transaction() {
+        let file = TempConfig::new();
+        std::fs::write(&file.0, "theme = \"catppuccin\"\n").unwrap();
+        let external = "theme = \"external-theme\"\nopacity = 0.75\n";
+        let result = Config::update(&file.0, |config| {
+            config.font.size = 18.0;
+            std::fs::write(&file.0, external).unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&file.0).unwrap(), external);
+    }
+
+    #[test]
+    fn config_update_rejects_invalid_input_and_output() {
+        let file = TempConfig::new();
+        let invalid = "theme = 42\n";
+        std::fs::write(&file.0, invalid).unwrap();
+        let called = std::cell::Cell::new(false);
+        assert!(Config::update(&file.0, |_| called.set(true)).is_err());
+        assert!(!called.get());
+        assert_eq!(std::fs::read_to_string(&file.0).unwrap(), invalid);
+        std::fs::write(&file.0, "scrollback = 1000\n").unwrap();
+        assert!(Config::update(&file.0, |config| config.scrollback = usize::MAX).is_err());
+        assert_eq!(std::fs::read_to_string(&file.0).unwrap(), "scrollback = 1000\n");
+    }
+
+    #[test]
+    fn config_update_keeps_runtime_state_after_write_failure() {
+        let file = TempConfig::new();
+        std::fs::write(&file.0, "theme = \"catppuccin\"\n").unwrap();
+        let previous_hash = last_applied_hash();
+        let previous_version = current_config_version();
+        let previous_theme = ACTIVE_THEME.read().clone();
+        let previous_context_window = ai_context_window();
+        let previous_clipboard = clipboard_read_allowed();
+        let result = Config::update_at(&file.0, |config| {
+            config.theme = Some("tokyo-night".into());
+            std::fs::remove_file(&file.0).unwrap();
+            std::fs::create_dir(&file.0).unwrap();
+        }, true);
+        assert!(result.is_err());
+        assert!(file.0.is_dir());
+        assert_eq!(last_applied_hash(), previous_hash);
+        assert_eq!(current_config_version(), previous_version);
+        assert_eq!(*ACTIVE_THEME.read(), previous_theme);
+        assert_eq!(ai_context_window(), previous_context_window);
+        assert_eq!(clipboard_read_allowed(), previous_clipboard);
+    }
+
+    #[test]
+    fn config_update_serializes_threads_and_repeated_edits() {
+        let file = TempConfig::new();
+        std::fs::write(&file.0, "scrollback = 1000\n").unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let barrier = &barrier;
+            let path = &file.0;
+            let worker = scope.spawn(move || {
+                barrier.wait();
+                for _ in 0..10 {
+                    Config::update(path, |config| config.scrollback += 1).unwrap();
+                }
+            });
+            barrier.wait();
+            for _ in 0..10 {
+                Config::update(path, |config| config.scrollback += 1).unwrap();
+            }
+            worker.join().unwrap();
+        });
+        let saved = Config::update(&file.0, |config| config.font.size = 20.0).unwrap();
+        assert_eq!(saved.scrollback, 1020);
+        assert_eq!(saved.font.size, 20.0);
+    }
+
+    #[test]
+    fn config_update_lock_child() {
+        if let Some(path) = std::env::var_os("FASTTY_CONFIG_INCREMENT_TEST") {
+            for _ in 0..10 {
+                Config::update(Path::new(&path), |config| config.scrollback += 1).unwrap();
+            }
+            return;
+        }
+        let Some(path) = std::env::var_os("FASTTY_CONFIG_LOCK_TEST") else { return; };
+        assert!(Config::update(Path::new(&path), |config| config.opacity = 0.5).is_err());
+    }
+
+    #[test]
+    fn config_update_serializes_process_edits() {
+        let file = TempConfig::new();
+        std::fs::write(&file.0, "scrollback = 1000\n").unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "config::tests::config_update_lock_child", "--nocapture"])
+            .env("FASTTY_CONFIG_INCREMENT_TEST", &file.0)
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+            .spawn().unwrap();
+        for _ in 0..10 {
+            Config::update(&file.0, |config| config.scrollback += 1).unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let saved = Config::update(&file.0, |_| {}).unwrap();
+        assert_eq!(saved.scrollback, 1020);
+    }
+
+    #[test]
+    fn config_update_respects_another_process_lock() {
+        let file = TempConfig::new();
+        std::fs::write(&file.0, "opacity = 1.0\n").unwrap();
+        let lock = lock_config_file(&file.0).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "config::tests::config_update_lock_child", "--nocapture"])
+            .env("FASTTY_CONFIG_LOCK_TEST", &file.0)
+            .output().unwrap();
+        drop(lock);
+        assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stderr));
+        assert_eq!(std::fs::read_to_string(&file.0).unwrap(), "opacity = 1.0\n");
+    }
 
     #[test]
     fn test_cursor_config_toml_parsing() {

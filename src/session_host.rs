@@ -81,6 +81,69 @@ fn host_info() -> Option<HostInfo> {
     HOST_INFO.get().and_then(|cache| cache.lock().ok()?.clone())
 }
 
+pub fn current_host_instance() -> Option<crate::daemon::HostInstanceId> {
+    host_info().and_then(|info| info.host_instance)
+}
+
+#[derive(Debug)]
+pub enum SessionReferenceStatus {
+    Present,
+    Absent,
+    Ended,
+    Unknown(String),
+}
+
+pub fn probe_session_reference(
+    id: usize,
+    identity: Option<crate::daemon::SessionIdentity>,
+) -> SessionReferenceStatus {
+    let expected = match reference_host(id, identity) {
+        Ok(expected) => expected,
+        Err(error) => return SessionReferenceStatus::Unknown(error),
+    };
+    #[cfg(unix)]
+    {
+        use std::io::ErrorKind;
+        let stream = match std::os::unix::net::UnixStream::connect(crate::daemon::socket_path()) {
+            Ok(stream) => stream,
+            Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
+                return SessionReferenceStatus::Absent;
+            }
+            Err(error) => return SessionReferenceStatus::Unknown(error.to_string()),
+        };
+        let probe = || -> Result<SessionReferenceStatus, String> {
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).map_err(|error| error.to_string())?;
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(3))).map_err(|error| error.to_string())?;
+            let mut stream = stream;
+            validate_host_connection(&mut stream, &expected)?;
+            write_request(&mut stream, &Request::SessionExists { id }).map_err(|error| error.to_string())?;
+            match read_response(&mut BufReader::new(&mut stream))? {
+                Response::SessionExists { exists: false } => return Ok(SessionReferenceStatus::Absent),
+                Response::SessionExists { exists: true } => {},
+                Response::Error { code, message } => return Err(format!("{code}: {message}")),
+                other => return Err(format!("unexpected session existence response: {other:?}")),
+            }
+            write_request(&mut stream, &Request::SessionStatus { id }).map_err(|error| error.to_string())?;
+            match read_response(&mut BufReader::new(stream))? {
+                Response::SessionStatus { alive: true, .. } => Ok(SessionReferenceStatus::Present),
+                Response::SessionStatus { alive: false, .. } => Ok(SessionReferenceStatus::Ended),
+                Response::Error { code, message } => Err(format!("{code}: {message}")),
+                other => Err(format!("unexpected session status response: {other:?}")),
+            }
+        };
+        match probe() {
+            Ok(status) => status,
+            Err(error) if error.starts_with("host_instance_changed:") || error.starts_with("no_such_session:") => SessionReferenceStatus::Absent,
+            Err(error) => SessionReferenceStatus::Unknown(error),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = expected;
+        SessionReferenceStatus::Unknown("host sessions are not supported on this platform".into())
+    }
+}
+
 pub fn host_status_label() -> String {
     match host_info() {
         Some(info) => format!(
@@ -420,12 +483,17 @@ pub fn close_if_idle_reference(
     id: usize,
     identity: Option<crate::daemon::SessionIdentity>,
 ) -> Result<CloseIfIdleResult, String> {
-    let response = match reference_request(id, identity, Request::CloseIfIdle { id }) {
+    let response = match reference_request(id, identity.clone(), Request::CloseIfIdle { id }) {
         Ok(response) => response,
         Err(error) if error.starts_with("host_instance_changed:") => {
             return Ok(CloseIfIdleResult::Closed)
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            if matches!(probe_session_reference(id, identity), SessionReferenceStatus::Absent) {
+                return Ok(CloseIfIdleResult::Closed);
+            }
+            return Err(error);
+        }
     };
     match response {
         Response::Closed { .. } => Ok(CloseIfIdleResult::Closed),
@@ -468,6 +536,7 @@ pub fn close_if_idle_batch_references(
     }
     #[cfg(unix)]
     {
+        let close = || -> Result<CloseIfIdleBatchResult, String> {
         let mut stream = connect_for_handshake()?;
         let info = probe_host_with_access(
             stream.try_clone().map_err(|error| error.to_string())?,
@@ -486,6 +555,17 @@ pub fn close_if_idle_batch_references(
             Response::CloseBatch { blocked, .. } => Ok(CloseIfIdleBatchResult::Running(blocked)),
             Response::Error { code, message } => Err(format!("{code}: {message}")),
             other => Err(format!("unexpected batch close response: {other:?}")),
+        }
+        };
+        match close() {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                if references.iter().all(|(id, identity)| matches!(probe_session_reference(*id, identity.clone()), SessionReferenceStatus::Absent)) {
+                    Ok(CloseIfIdleBatchResult::Closed)
+                } else {
+                    Err(error)
+                }
+            }
         }
     }
     #[cfg(not(unix))]
@@ -920,7 +1000,6 @@ pub fn attach_reference(
     identity: Option<crate::daemon::SessionIdentity>,
 ) -> Result<RemoteSession, String> {
     let expected = reference_host(id, identity)?;
-    ensure_running()?;
     attach_expected(id, Some(expected))
 }
 
@@ -1166,8 +1245,642 @@ pub fn session_exists(id: usize) -> Result<bool, String> {
     }
 }
 
+#[cfg(unix)]
+type CwdCallback = dyn Fn(std::path::PathBuf) + Send + Sync;
+
+#[cfg(unix)]
+struct CwdConsumer {
+    identity: crate::daemon::SessionIdentity,
+    callback: Box<CwdCallback>,
+    revision: std::sync::Mutex<u64>,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct CwdObservers {
+    consumers: Vec<std::sync::Weak<CwdConsumer>>,
+    running: bool,
+    sessions: Vec<SessionInfo>,
+    revision: u64,
+}
+
+#[cfg(unix)]
+struct CwdObserver {
+    host: crate::daemon::HostInstanceId,
+    state: std::sync::Mutex<CwdObservers>,
+}
+
+#[cfg(unix)]
+pub(crate) struct CwdObservation {
+    _consumer: std::sync::Arc<CwdConsumer>,
+    _observer: std::sync::Arc<CwdObserver>,
+}
+
+#[cfg(not(unix))]
+pub(crate) struct CwdObservation;
+
+#[cfg(not(unix))]
+pub(crate) fn observe_cwd(
+    _identity: crate::daemon::SessionIdentity,
+    _callback: impl Fn(std::path::PathBuf) + Send + Sync + 'static,
+) -> Option<CwdObservation> {
+    None
+}
+
+#[cfg(unix)]
+pub(crate) fn observe_cwd(
+    identity: crate::daemon::SessionIdentity,
+    callback: impl Fn(std::path::PathBuf) + Send + Sync + 'static,
+) -> Option<CwdObservation> {
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    static OBSERVERS: OnceLock<Mutex<Vec<Weak<CwdObserver>>>> = OnceLock::new();
+    let mut observers = OBSERVERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    observers.retain(|observer| observer.strong_count() > 0);
+    let observer = observers
+        .iter()
+        .filter_map(Weak::upgrade)
+        .find(|observer| observer.host == identity.host_instance)
+        .unwrap_or_else(|| {
+            let observer = Arc::new(CwdObserver {
+                host: identity.host_instance.clone(),
+                state: Mutex::new(CwdObservers::default()),
+            });
+            observers.push(Arc::downgrade(&observer));
+            observer
+        });
+    let consumer = Arc::new(CwdConsumer {
+        identity,
+        callback: Box::new(callback),
+        revision: std::sync::Mutex::new(0),
+    });
+    let mut state = observer
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    state.consumers.push(Arc::downgrade(&consumer));
+    let cached = state
+        .sessions
+        .iter()
+        .find(|session| session.id == consumer.identity.session_id && session.alive)
+        .and_then(|session| session.cwd.as_ref())
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute());
+    let revision = state.revision;
+    if !state.running {
+        state.running = true;
+        let worker = Arc::clone(&observer);
+        #[cfg(test)]
+        let test_connection = CWD_TEST_CONNECTION.with(|slot| slot.borrow_mut().take());
+        let started = std::thread::Builder::new().name("fastty-session-cwd".into()).spawn(move || {
+            #[cfg(test)]
+            let test_only = test_connection.is_some();
+            #[cfg(test)]
+            let mut test_connection = test_connection;
+            let mut backoff_ms = 100;
+            loop {
+                if worker.consumers().is_empty() {
+                    let mut state = worker.state.lock().unwrap_or_else(|error| error.into_inner());
+                    state.consumers.retain(|consumer| consumer.strong_count() > 0);
+                    if state.consumers.is_empty() {
+                        state.running = false;
+                        return;
+                    }
+                }
+                #[cfg(test)]
+                let connection = match test_connection.take() {
+                    Some(stream) => Ok(stream),
+                    None if test_only => Err("test connection closed".into()),
+                    None => connect_for_handshake(),
+                };
+                #[cfg(not(test))]
+                let connection = connect_for_handshake();
+                if let Ok(stream) = connection {
+                    if matches!(worker.follow(stream), Err(error) if error == "host_instance_changed") {
+                        let mut state = worker.state.lock().unwrap_or_else(|error| error.into_inner());
+                        state.consumers.clear();
+                        state.sessions.clear();
+                        state.running = false;
+                        return;
+                    }
+                }
+                for _ in 0..backoff_ms / 100 {
+                    if worker.consumers().is_empty() { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                backoff_ms = (backoff_ms * 2).min(5_000);
+            }
+        });
+        if started.is_err() {
+            state.running = false;
+            return None;
+        }
+    }
+    drop(state);
+    drop(observers);
+    if let Some(path) = cached {
+        consumer.publish(revision, path);
+    }
+    Some(CwdObservation {
+        _consumer: consumer,
+        _observer: observer,
+    })
+}
+
+#[cfg(unix)]
+impl CwdConsumer {
+    fn publish(&self, revision: u64, path: std::path::PathBuf) {
+        let mut applied = self
+            .revision
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if revision > *applied {
+            *applied = revision;
+            (self.callback)(path);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl CwdObserver {
+    fn consumers(&self) -> Vec<std::sync::Arc<CwdConsumer>> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state
+            .consumers
+            .retain(|consumer| consumer.strong_count() > 0);
+        state
+            .consumers
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect()
+    }
+
+    fn valid_session(&self, session: &SessionInfo) -> bool {
+        session.identity.as_ref().is_none_or(|identity| {
+            identity.host_instance == self.host && identity.session_id == session.id
+        })
+    }
+
+    fn apply(&self, response: Response) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.revision += 1;
+        let revision = state.revision;
+        let sessions = match response {
+            Response::Sessions { sessions } => {
+                let sessions: Vec<_> = sessions
+                    .into_iter()
+                    .filter(|session| self.valid_session(session))
+                    .collect();
+                state.sessions = sessions.clone();
+                sessions
+            }
+            Response::SessionAdded { session } | Response::SessionUpdated { session }
+                if self.valid_session(&session) =>
+            {
+                state.sessions.retain(|cached| cached.id != session.id);
+                state.sessions.push(session.clone());
+                vec![session]
+            }
+            Response::SessionRemoved { id } => {
+                state.sessions.retain(|session| session.id != id);
+                state.consumers.retain(|consumer| {
+                    consumer
+                        .upgrade()
+                        .is_some_and(|consumer| consumer.identity.session_id != id)
+                });
+                Vec::new()
+            }
+            _ => Vec::new(),
+        };
+        let mut updates = Vec::new();
+        for session in sessions.into_iter().filter(|session| session.alive) {
+            let Some(path) = session
+                .cwd
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_absolute())
+            else {
+                continue;
+            };
+            for consumer in state.consumers.iter().filter_map(std::sync::Weak::upgrade) {
+                if consumer.identity.session_id == session.id {
+                    updates.push((consumer, path.clone()));
+                }
+            }
+        }
+        drop(state);
+        for (consumer, path) in updates {
+            consumer.publish(revision, path);
+        }
+    }
+
+    fn follow(&self, mut stream: std::os::unix::net::UnixStream) -> Result<(), String> {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .map_err(|error| error.to_string())?;
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(3)))
+            .map_err(|error| error.to_string())?;
+        let info =
+            probe_host_with_access(stream.try_clone().map_err(|error| error.to_string())?, true)?;
+        if info.host_instance.as_ref() != Some(&self.host) {
+            return Err("host_instance_changed".into());
+        }
+        let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
+        let mut attached = false;
+        for consumer in self.consumers() {
+            write_request(
+                &mut stream,
+                &Request::SessionExists {
+                    id: consumer.identity.session_id,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            match read_response(&mut reader)? {
+                Response::SessionExists { exists: true } => attached = true,
+                Response::SessionExists { exists: false } => {
+                    self.state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .consumers
+                        .retain(|registered| {
+                            registered.upgrade().is_some_and(|registered| {
+                                !std::sync::Arc::ptr_eq(&registered, &consumer)
+                            })
+                        });
+                }
+                Response::Error { code, message } => return Err(format!("{code}: {message}")),
+                other => return Err(format!("unexpected session-exists response: {other:?}")),
+            }
+        }
+        if !attached || self.consumers().is_empty() {
+            return Ok(());
+        }
+        write_request(&mut stream, &Request::SubscribeSessions)
+            .map_err(|error| error.to_string())?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(250)))
+            .map_err(|error| error.to_string())?;
+        let mut frame = Vec::new();
+        while !self.consumers().is_empty() {
+            match reader.read_until(b'\n', &mut frame) {
+                Ok(0) => return Err("session host closed the connection".into()),
+                Ok(_) if frame.last() == Some(&b'\n') => {
+                    let response =
+                        serde_json::from_slice(&frame).map_err(|error| error.to_string())?;
+                    frame.clear();
+                    if let Response::Error { code, message } = response {
+                        return Err(format!("{code}: {message}"));
+                    }
+                    self.apply(response);
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            if frame.len() > 4 * 1024 * 1024 {
+                return Err("session registry frame is too large".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static CWD_TEST_CONNECTION: std::cell::RefCell<Option<std::os::unix::net::UnixStream>> = const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn cwd_baseline_keeps_a_consumer_registered_after_the_snapshot() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let consumer = std::sync::Arc::new(CwdConsumer {
+            identity: crate::daemon::SessionIdentity {
+                host_instance: crate::daemon::HostInstanceId("baseline-host".into()),
+                session_id: 42,
+            },
+            callback: Box::new(move |path| {
+                tx.send(path).unwrap();
+            }),
+            revision: std::sync::Mutex::new(0),
+        });
+        let observer = CwdObserver {
+            host: consumer.identity.host_instance.clone(),
+            state: std::sync::Mutex::new(CwdObservers {
+                consumers: vec![std::sync::Arc::downgrade(&consumer)],
+                ..Default::default()
+            }),
+        };
+        observer.apply(Response::Sessions { sessions: vec![] });
+        observer.apply(Response::SessionAdded {
+            session: SessionInfo {
+                id: 42,
+                cwd: Some("/work/new-repository".into()),
+                ..legacy_session("zsh", true)
+            },
+        });
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            std::path::PathBuf::from("/work/new-repository")
+        );
+    }
+
+    #[test]
+    fn cwd_consumer_rejects_a_cached_revision_after_a_new_update() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let consumer = CwdConsumer {
+            identity: crate::daemon::SessionIdentity {
+                host_instance: crate::daemon::HostInstanceId("revision-host".into()),
+                session_id: 42,
+            },
+            callback: Box::new(move |path| {
+                tx.send(path).unwrap();
+            }),
+            revision: std::sync::Mutex::new(0),
+        };
+        consumer.publish(2, "/work/current".into());
+        consumer.publish(1, "/work/stale".into());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            std::path::PathBuf::from("/work/current")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn legacy_remote_projection_tracks_cwd_without_osc_after_spawn_and_restore() {
+        for restored in [false, true] {
+            let (reader, peer) = UnixStream::pair().unwrap();
+            let control = reader.try_clone().unwrap();
+            let (observer_client, mut observer_server) = UnixStream::pair().unwrap();
+            CWD_TEST_CONNECTION.with(|slot| *slot.borrow_mut() = Some(observer_client));
+            let host_instance = crate::daemon::HostInstanceId(format!("cwd-test-{restored}"));
+            let identity = crate::daemon::SessionIdentity {
+                host_instance: host_instance.clone(),
+                session_id: 731,
+            };
+            let legacy: Response = serde_json::from_str(
+                r#"{"event":"attached","id":731,"cols":80,"rows":24,"mode":"read_write"}"#,
+            )
+            .unwrap();
+            let Response::Attached { cwd, shell_pid, .. } = legacy else {
+                panic!("attached")
+            };
+            assert!(cwd.is_none() && shell_pid.is_none());
+            let remote = super::RemoteSession {
+                id: 731,
+                identity: Some(identity.clone()),
+                snapshot: Vec::new(),
+                program_status: Vec::new(),
+                process_running: Some(false),
+                cwd,
+                shell_pid,
+                restore_legacy_mouse_modes: restored,
+                reader: BufReader::new(reader),
+                control: std::sync::Arc::new(super::RemoteControl {
+                    id: 731,
+                    stream: std::sync::Mutex::new(control),
+                    closed: std::sync::atomic::AtomicBool::new(false),
+                }),
+            };
+            let (events, received) = std::sync::mpsc::channel();
+            let terminal = crate::terminal_state::TerminalState::attach_hosted_from_remote(
+                remote,
+                "/bin/sh",
+                &[],
+                Some("/home/stale"),
+                100,
+                crate::config::FontConfig::default(),
+                10.0,
+                20.0,
+                800.0,
+                480.0,
+                crate::event_listener::EventSender::None,
+            )
+            .unwrap();
+            terminal.set_event_sender(crate::event_listener::EventSender::Callback(
+                std::sync::Arc::new(move |event| {
+                    if let crate::terminal_state::AppEvent::CwdChanged(path) = event {
+                        let _ = events.send(path);
+                    }
+                }),
+            ));
+            observer_server
+                .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                .unwrap();
+            let mut requests = BufReader::new(observer_server.try_clone().unwrap());
+            let mut line = String::new();
+            // A legacy host exposes the cwd only in the session registry.
+            let hello = requests.read_line(&mut line);
+            assert!(
+                hello.is_ok_and(|bytes| bytes > 0),
+                "remote projection must observe the host registry"
+            );
+            assert!(matches!(
+                serde_json::from_str::<Request>(&line).unwrap(),
+                Request::Hello { read_only: true }
+            ));
+            writeln!(
+                observer_server,
+                "{}",
+                serde_json::to_string(&Response::Hello {
+                    version: 1,
+                    fastty_version: "0.22.10".into(),
+                    capabilities: Vec::new(),
+                    host_instance: Some(host_instance),
+                })
+                .unwrap()
+            )
+            .unwrap();
+            line.clear();
+            requests.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&line).unwrap(),
+                Request::SessionExists { id: 731 }
+            ));
+            writeln!(
+                observer_server,
+                "{}",
+                serde_json::to_string(&Response::SessionExists { exists: true }).unwrap()
+            )
+            .unwrap();
+            line.clear();
+            requests.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&line).unwrap(),
+                Request::SubscribeSessions
+            ));
+            let mut session = crate::daemon::SessionInfo {
+                id: 731,
+                identity: None,
+                title: "sh".into(),
+                cwd: Some("/home/live".into()),
+                cols: 80,
+                rows: 24,
+                alive: true,
+                history_size: 0,
+                program_status: Vec::new(),
+            };
+            writeln!(
+                observer_server,
+                "{}",
+                serde_json::to_string(&Response::Sessions {
+                    sessions: vec![session.clone()]
+                })
+                .unwrap()
+            )
+            .unwrap();
+            assert_eq!(
+                received
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap(),
+                std::path::PathBuf::from("/home/live")
+            );
+            assert_eq!(
+                terminal.get_current_working_directory(),
+                Some("/home/live".into())
+            );
+            let saved_snapshot = terminal.snapshot_state_for_save().unwrap();
+            let (late_events, late_received) = std::sync::mpsc::channel();
+            let late = super::observe_cwd(identity.clone(), move |path| {
+                let _ = late_events.send(path);
+            })
+            .unwrap();
+            assert_eq!(
+                late_received
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap(),
+                std::path::PathBuf::from("/home/live")
+            );
+            // Replay and updates use the same subscription, including consumers added after the baseline.
+            assert_eq!(late._observer.consumers().len(), 2);
+            for invalid in [
+                crate::daemon::SessionInfo {
+                    id: 999,
+                    cwd: Some("/wrong/session".into()),
+                    ..session.clone()
+                },
+                crate::daemon::SessionInfo {
+                    cwd: Some("relative/path".into()),
+                    ..session.clone()
+                },
+                crate::daemon::SessionInfo {
+                    identity: Some(crate::daemon::SessionIdentity {
+                        host_instance: crate::daemon::HostInstanceId("other-host".into()),
+                        session_id: 731,
+                    }),
+                    cwd: Some("/wrong/host".into()),
+                    ..session.clone()
+                },
+                session.clone(),
+            ] {
+                writeln!(
+                    observer_server,
+                    "{}",
+                    serde_json::to_string(&Response::SessionUpdated { session: invalid }).unwrap()
+                )
+                .unwrap();
+            }
+            assert!(received
+                .recv_timeout(std::time::Duration::from_millis(80))
+                .is_err());
+            assert_eq!(
+                terminal.get_current_working_directory(),
+                Some("/home/live".into())
+            );
+            session.cwd = Some("/work/biovity".into());
+            writeln!(
+                observer_server,
+                "{}",
+                serde_json::to_string(&Response::SessionUpdated {
+                    session: session.clone()
+                })
+                .unwrap()
+            )
+            .unwrap();
+            assert_eq!(
+                received
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap(),
+                std::path::PathBuf::from("/work/biovity")
+            );
+            assert_eq!(
+                terminal.get_current_working_directory(),
+                Some("/work/biovity".into())
+            );
+            let (restored_reader, restored_peer) = UnixStream::pair().unwrap();
+            let restored_control = restored_reader.try_clone().unwrap();
+            let restored_terminal = crate::terminal_state::TerminalState::attach_hosted_from_remote(
+                super::RemoteSession {
+                    id: 731,
+                    identity: Some(identity.clone()),
+                    snapshot: saved_snapshot,
+                    program_status: Vec::new(),
+                    process_running: Some(false),
+                    cwd: None,
+                    shell_pid: None,
+                    restore_legacy_mouse_modes: false,
+                    reader: BufReader::new(restored_reader),
+                    control: std::sync::Arc::new(super::RemoteControl {
+                        id: 731,
+                        stream: std::sync::Mutex::new(restored_control),
+                        closed: std::sync::atomic::AtomicBool::new(false),
+                    }),
+                },
+                "/bin/sh",
+                &[],
+                Some("/home/stale"),
+                100,
+                crate::config::FontConfig::default(),
+                10.0,
+                20.0,
+                800.0,
+                480.0,
+                crate::event_listener::EventSender::None,
+            )
+            .unwrap();
+            assert_eq!(
+                restored_terminal.get_current_working_directory(),
+                Some("/work/biovity".into())
+            );
+            // The late observer also gets changes from the existing stream.
+            while late_received.try_recv().is_ok() {}
+            writeln!(
+                observer_server,
+                "{}",
+                serde_json::to_string(&Response::SessionRemoved { id: 731 }).unwrap()
+            )
+            .unwrap();
+            writeln!(
+                observer_server,
+                "{}",
+                serde_json::to_string(&Response::SessionUpdated {
+                    session: crate::daemon::SessionInfo {
+                        cwd: Some("/removed".into()),
+                        ..session.clone()
+                    },
+                })
+                .unwrap()
+            )
+            .unwrap();
+            assert!(received
+                .recv_timeout(std::time::Duration::from_millis(80))
+                .is_err());
+            drop(late);
+            drop(restored_terminal);
+            drop(restored_peer);
+            drop(terminal);
+            drop(peer);
+        }
+    }
+
     #[test]
     fn connection_identity_check_keeps_manage_access_and_rejects_legacy_host() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
