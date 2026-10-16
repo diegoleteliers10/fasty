@@ -3,6 +3,36 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.22.11 - 2026-10-16
+
+### Settings
+
+- Use the same config file for reads, writes, and file watches.
+- Save widget settings and preserve them during legacy config migration.
+- Keep the current settings when a reload fails or a known config file disappears.
+- Block saves after a partial or failed config load to protect existing settings.
+- Use unique temporary files for config writes.
+- Show save and reload errors in all settings tabs.
+
+### Terminal directories
+
+- Send the host shell directory and process ID when a window attaches to a session.
+- Preserve the working directory in native snapshots and OSC updates.
+- Read older host directory data from the validated connection.
+- Preserve spaces and UTF-8 characters in escaped directory paths.
+
+### Git and AI panels
+
+- Use the terminal working directory for Git status, branches, commits, and AI project context.
+- Clear relative file menus when the active project changes.
+- Clear stale Git widget data before the next poll interval.
+- Refresh Git widgets when focus returns and reject results from a previous project.
+
+### Validation
+
+- Reviewed the source changes and checked Rust syntax.
+- The full cold-start settings case remains unverified in the GUI.
+
 ## 0.22.10 - 2026-10-14
 
 ### Terminal sessions
