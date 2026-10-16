@@ -3,6 +3,33 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.23.0 - 2026-10-16
+
+### Agent status
+
+- Add an OpenCode v2 CLI plugin for OSC 7501 status reports.
+- Extend OpenCode v1 reports with retries, questions, and pending permissions.
+- Add a Hermes Agent plugin for work, completion, errors, interruption, and human input.
+- Keep blocked status until all pending requests resolve.
+- Clear pending requests when a turn ends, fails, or stops.
+- Send reports in order and keep subagent events from completing the root session.
+- Keep OpenCode v1 errors visible through the next idle event.
+
+### Installation
+
+- Add `fastty agent-hook install opencode-v2 --user` and project scope.
+- Add `fastty agent-hook install hermes --user` with `HERMES_HOME` profile support.
+- Enable the Hermes plugin with `hermes plugins enable fastty-status` in the same profile.
+- Register the OpenCode v2 plugin in `cli.json` without changing other entries.
+- Back up the original Fastty OpenCode v1 adapter before an upgrade.
+- Preserve adapter files that the user changed.
+
+### Validation
+
+- Checked JavaScript, Python, and Rust syntax.
+- Completed source review.
+- Live agent behavior has not been checked in the app.
+
 ## 0.22.12 - 2026-10-16
 
 ### Settings
