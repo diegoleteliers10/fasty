@@ -559,6 +559,12 @@ fn main() {
         && cli_opts.command.is_none()
         && cli_opts.working_dir.is_none()
         && cli_opts.title.is_none();
+    if let Err(error) = fastty::config::start_config_watcher(
+        fastty::config::Config::get_active_config_path(),
+        fastty::config::increment_config_version,
+    ) {
+        eprintln!("Fastty could not watch its settings file: {error}");
+    }
     let saved_session = if restore_session {
         match fastty::session::load_result() {
             Ok(session) => session,

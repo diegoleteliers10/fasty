@@ -3183,6 +3183,43 @@ pub struct RootView {
 }
 
 impl RootView {
+    fn update_pane_working_directory(
+        &mut self,
+        pane_id: PaneId,
+        cwd: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        let mut active_pane_changed = false;
+        for tab in &mut self.tabs {
+            let is_active = tab.pane_tree.active_pane_id == pane_id;
+            let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) else { continue; };
+            if pane.cwd.as_ref() != Some(&cwd) {
+                pane.cwd = Some(cwd.clone());
+                pane.git_status = None;
+                pane.git_checked_cwd = None;
+                pane.git_last_poll = None;
+                changed = true;
+            }
+            if is_active && tab.cwd.as_ref() != Some(&cwd) {
+                tab.cwd = Some(cwd.clone());
+                tab.git_status = None;
+                tab.git_checked_cwd = None;
+                tab.git_last_poll = None;
+                active_pane_changed = true;
+                changed = true;
+            }
+            break;
+        }
+        if !changed { return; }
+        crate::git::invalidate_git_info_cache(&cwd);
+        if active_pane_changed {
+            self.request_git_status_refresh(cwd, cx);
+        }
+        self.persist_session();
+        cx.notify();
+    }
+
     #[inline]
     pub fn current_sidebar_width(&self) -> f32 {
         if self.tab_layout == TabLayout::Vertical || self.sidebar_anim_progress > 0.001 {
@@ -4476,26 +4513,7 @@ impl RootView {
                         cx.notify();
                     }
                     AppEvent::CwdChanged(cwd) => {
-                        let p = std::path::PathBuf::from(&cwd);
-                        let now = std::time::Instant::now();
-                        for tab in &mut this.tabs {
-                            if let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) {
-                                pane.git_checked_cwd = Some(p.clone());
-                                pane.git_last_poll = Some(now);
-                                pane.cwd = Some(p.clone());
-                                pane.git_status = None;
-                                if tab.pane_tree.active_pane_id == pane_id {
-                                    tab.git_checked_cwd = Some(p.clone());
-                                    tab.git_last_poll = Some(now);
-                                    tab.cwd = Some(p.clone());
-                                    tab.git_status = None;
-                                }
-                            }
-                        }
-                        this.persist_session();
-                        cx.notify();
-                        crate::git::invalidate_git_info_cache(&p);
-                        this.request_git_status_refresh(p, cx);
+                        this.update_pane_working_directory(pane_id, cwd, cx);
                     }
                     AppEvent::CommandFinished {
                         duration_ms,
@@ -4560,6 +4578,7 @@ impl RootView {
         .detach();
 
         let terminal_identity = terminal_arc.remote_session_identity();
+        let initial_cwd = terminal_arc.get_current_working_directory().or(initial_cwd);
         TerminalPane {
             id: pane_id,
             terminal: Some(terminal_arc),
@@ -5522,40 +5541,14 @@ impl RootView {
                         cx.notify();
                     }
                     AppEvent::CwdChanged(cwd) => {
-                        let p = std::path::PathBuf::from(&cwd);
-                        let now = std::time::Instant::now();
-                        let mut refresh_active_cwd = false;
-                        if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
-                            let source_pane_id =
-                                tab.pane_tree.all_panes().into_iter().find_map(|pane| {
-                                pane.terminal
-                                    .as_ref()
+                        let pane_id = this.tabs.iter().find(|tab| tab.id == tab_id)
+                            .and_then(|tab| tab.pane_tree.all_panes().into_iter().find_map(|pane| {
+                                pane.terminal.as_ref()
                                     .filter(|terminal| terminal.source_id() == source_id)
                                     .map(|_| pane.id)
-                            });
-                            if let Some(source_pane_id) = source_pane_id {
-                                let is_active = tab.pane_tree.active_pane_id == source_pane_id;
-                                let pane = tab.pane_tree.find_pane_mut(source_pane_id);
-                                if let Some(pane) = pane {
-                                    pane.cwd = Some(p.clone());
-                                    pane.git_status = None;
-                                    pane.git_checked_cwd = Some(p.clone());
-                                    pane.git_last_poll = Some(now);
-                                }
-                                if is_active {
-                                    refresh_active_cwd = true;
-                                    tab.git_checked_cwd = Some(p.clone());
-                                    tab.git_last_poll = Some(now);
-                                    tab.cwd = Some(p.clone());
-                                    tab.git_status = None;
-                                }
-                            }
-                        }
-                        this.persist_session();
-                        cx.notify();
-                        crate::git::invalidate_git_info_cache(&p);
-                        if refresh_active_cwd {
-                            this.request_git_status_refresh(p, cx);
+                            }));
+                        if let Some(pane_id) = pane_id {
+                            this.update_pane_working_directory(pane_id, cwd, cx);
                         }
                     }
                     AppEvent::CommandFinished {
@@ -7526,8 +7519,9 @@ impl RootView {
                 self.set_theme(theme_name, cx);
             }
             "open_config" => {
-                let config_dir = dirs::home_dir()
-                    .map(|h| h.join(".config/fastty"))
+                let config_dir = crate::config::Config::get_active_config_path()
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
                     .unwrap_or_default();
                 let _ = std::fs::create_dir_all(&config_dir);
                 if let Some(path_str) = config_dir.to_str() {
@@ -7563,7 +7557,7 @@ impl RootView {
         if self.tab_layout == TabLayout::Horizontal {
             self.tab_layout = TabLayout::Vertical;
             self.config.tab_layout = TabLayout::Vertical;
-            let _ = self.config.save_default();
+            self.save_config();
             crate::config::increment_config_version();
             self.sidebar_open = true;
         } else {
@@ -9427,7 +9421,7 @@ impl RootView {
         }
         self.tab_layout = layout;
         self.config.tab_layout = layout;
-        let _ = self.config.save_default();
+        self.save_config();
         crate::config::increment_config_version();
         if self.tab_layout == TabLayout::Vertical {
             self.sidebar_open = true;
@@ -9477,8 +9471,22 @@ impl RootView {
         .detach();
     }
 
+    fn save_config(&mut self) {
+        match self.config.save_default() {
+            Ok(()) => self.config_error = None,
+            Err(error) => self.config_error = Some(format!("Could not save settings: {error}")),
+        }
+    }
+
     pub fn reload_config(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let loaded_config = crate::config::load_lenient();
+        let loaded_config = match crate::config::load_result() {
+            Ok(config) => config,
+            Err(error) => {
+                self.config_error = Some(format!("Could not reload settings: {error}"));
+                cx.notify();
+                return;
+            }
+        };
         // External reload wins over any in-flight palette preview, and
         // refreshes the config-error banner (fixing the file clears it).
         self.palette_preview_original = None;
@@ -9570,7 +9578,7 @@ impl RootView {
         self.palette_preview_original = None;
         self.current_theme_name = theme_name.to_string();
         self.config.theme = Some(self.current_theme_name.clone());
-        let _ = self.config.save_default();
+        self.save_config();
         self.theme = Theme::from_name(theme_name).with_opacity(self.config.opacity);
         self.status_bar_model = StatusBarModel::new(&self.config, self.theme);
         cx.notify();
@@ -9692,7 +9700,7 @@ impl RootView {
         self.palette_preview_original = None;
         self.font_size = (self.font_size + delta).clamp(9.0, 36.0);
         self.config.font.size = self.font_size;
-        let _ = self.config.save_default();
+        self.save_config();
         cx.notify();
     }
 
@@ -9702,7 +9710,7 @@ impl RootView {
     pub fn commit_font_size(&mut self, cx: &mut Context<Self>) {
         self.palette_preview_original = None;
         self.config.font.size = self.font_size;
-        let _ = self.config.save_default();
+        self.save_config();
         cx.notify();
     }
 
@@ -9747,7 +9755,7 @@ impl RootView {
         };
         self.font_family = resolved.into();
         self.config.font.family = family.to_string();
-        let _ = self.config.save_default();
+        self.save_config();
         cx.notify();
     }
 
@@ -11454,7 +11462,7 @@ impl RootView {
                 Action::ResetFontSize => {
                     self.font_size = 13.0;
                     self.config.font.size = 13.0;
-                    let _ = self.config.save_default();
+                    self.save_config();
                     cx.notify();
                     return;
                 }
@@ -13966,6 +13974,36 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_directory = self.tabs.get(self.active_tab_idx).and_then(|tab| {
+            let pane = tab.pane_tree.active_pane()?;
+            let terminal = pane.terminal.as_ref().or(tab.terminal.as_ref())?;
+            terminal.get_current_working_directory().map(|cwd| (pane.id, cwd))
+        });
+        if let Some((pane_id, cwd)) = active_directory {
+            self.update_pane_working_directory(pane_id, cwd, cx);
+        }
+        let graph_scroll_target =
+            self.tabs
+                .get(self.active_tab_idx)
+                .map(|tab| ProjectGraphScrollTarget {
+            tab_id: tab.id,
+            cwd: tab.cwd.clone(),
+        });
+        if graph_scroll_target.as_ref().is_some_and(|target| {
+            project_graph_scroll_target_changed(self.project_graph_scroll_target.as_ref(), target)
+        }) {
+            self.project_graph_scroll_handle
+                .set_offset(gpui::point(px(0.), px(0.)));
+            self.project_graph_rendered_range.set((0, 0));
+            self.ai_at_menu_open = false;
+            self.ai_at_matches.clear();
+            self.ai_at_selected = 0;
+            self.is_file_picker_open = false;
+            self.file_picker_root = None;
+            self.file_picker_index.clear();
+            self.file_picker_selected = 0;
+        }
+        self.project_graph_scroll_target = graph_scroll_target;
         let theme = self.theme;
         let mut live_panes = std::collections::HashSet::new();
         for tab in &self.tabs {
@@ -14082,58 +14120,6 @@ impl Render for RootView {
                 *pane_id,
             )
         });
-
-        let cwd_changed = {
-            let active_tab = self.tabs.get_mut(self.active_tab_idx);
-            if let Some(active_tab) = active_tab {
-                if let Some(ref term) = active_tab.terminal {
-                    if let Some(proc_cwd) = term.get_current_working_directory() {
-                        if active_tab.cwd.as_ref() != Some(&proc_cwd) {
-                            active_tab.cwd = Some(proc_cwd.clone());
-                            active_tab.git_status = None;
-                            active_tab.git_checked_cwd = None;
-                            active_tab.git_last_poll = None;
-                            let active_pane = active_tab.pane_tree.active_pane_id;
-                            if let Some(pane) = active_tab.pane_tree.find_pane_mut(active_pane) {
-                                pane.cwd = Some(proc_cwd.clone());
-                                pane.git_status = None;
-                                pane.git_checked_cwd = None;
-                                pane.git_last_poll = None;
-                            }
-                            Some(proc_cwd)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        let graph_scroll_target =
-            self.tabs
-                .get(self.active_tab_idx)
-                .map(|tab| ProjectGraphScrollTarget {
-            tab_id: tab.id,
-            cwd: tab.cwd.clone(),
-        });
-        if graph_scroll_target.as_ref().is_some_and(|target| {
-            project_graph_scroll_target_changed(self.project_graph_scroll_target.as_ref(), target)
-        }) {
-            self.project_graph_scroll_handle
-                .set_offset(gpui::point(px(0.), px(0.)));
-            self.project_graph_rendered_range.set((0, 0));
-        }
-        self.project_graph_scroll_target = graph_scroll_target;
-        if let Some(cwd) = cwd_changed {
-            self.persist_session();
-            crate::git::invalidate_git_info_cache(&cwd);
-            self.request_git_status_refresh(cwd, cx);
-        }
 
         let (active_cwd, active_git, fallback_info) =
             if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
@@ -18600,7 +18586,7 @@ impl Render for RootView {
                                                             .cursor(CursorStyle::PointingHand)
                                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, _cx| {
                                                                 this.persist_session();
-                                                                let _ = this.config.save_default();
+                                                                this.save_config();
                                                                 crate::updater::relaunch_fastty();
                                                             }))
                                                             .child("Restart Now"),

@@ -344,6 +344,8 @@ pub struct SideCheckpoint {
     apc_buf: Vec<u8>,
     csi_watcher: CsiWatcher,
     sync_output_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cwd: Option<std::path::PathBuf>,
 }
 
 impl Default for SideCheckpoint {
@@ -354,6 +356,7 @@ impl Default for SideCheckpoint {
             apc_buf: Vec::new(),
             csi_watcher: CsiWatcher::new(),
             sync_output_active: false,
+            cwd: None,
         }
     }
 }
@@ -441,6 +444,7 @@ impl SideCheckpoint {
         if self.osc_buf.len() > 131074
             || self.apc_buf.len() > 16 * 1024 * 1024 + 2
             || self.csi_watcher.param_count > self.csi_watcher.params.len()
+            || self.cwd.as_ref().is_some_and(|path| !path.is_absolute())
         {
             return Err("Invalid terminal reader continuation".into());
         }
@@ -462,6 +466,7 @@ pub struct TerminalState {
     writer: Arc<ParkingMutex<Box<dyn Write + Send>>>,
     master: Arc<ParkingMutex<Box<dyn MasterPty + Send>>>,
     shell_pid: Option<u32>,
+    remote_shell_pid: Option<u32>,
     source_id: u64,
     program_status: Arc<ParkingMutex<crate::program_status::ProgramStatusStore>>,
     program_status_pending: Arc<std::sync::atomic::AtomicBool>,
@@ -897,6 +902,13 @@ impl TerminalState {
         remote: Option<crate::session_host::RemoteSession>,
         spawned_here: bool,
     ) -> anyhow::Result<Self> {
+        let remote_shell_pid = remote.as_ref().and_then(|session| session.shell_pid);
+        let initial_cwd = remote
+            .as_ref()
+            .and_then(|session| session.cwd.as_deref())
+            .or(cwd)
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute());
         let restored_idle_session = remote
             .as_ref()
             .is_some_and(|remote| remote.process_running == Some(false));
@@ -1286,6 +1298,13 @@ impl TerminalState {
             if restored_idle_session {
                 let mut parser: Processor<StdSyncHandler> = Processor::new();
                 parser.advance(&mut *term, IDLE_SESSION_MODE_RESET);
+            }
+        }
+
+        {
+            let mut ingress = ingress.lock();
+            if ingress.side.cwd.is_none() {
+                ingress.side.cwd = initial_cwd;
             }
         }
 
@@ -1777,6 +1796,13 @@ impl TerminalState {
                                             let base = total_lines_pushed_clone
                                                 .load(Ordering::Relaxed)
                                                 + local_lines;
+                                            if let OscCommand::Cwd(path) = &cmd {
+                                                if let Some(path) = file_url_to_path(path.as_bytes()) {
+                                                    if path.is_absolute() {
+                                                        scanner.cwd = Some(path);
+                                                    }
+                                                }
+                                            }
                                             handle_cmd(
                                                 cmd,
                                                 cursor_line,
@@ -1958,6 +1984,7 @@ impl TerminalState {
             writer: writer_arc,
             master: master_arc,
             shell_pid,
+            remote_shell_pid,
             source_id,
             program_status,
             program_status_pending,
@@ -2101,11 +2128,15 @@ impl TerminalState {
         let max_history = alacritty_terminal::snapshot::MAX_SNAPSHOT_CELLS
             .saturating_sub(visible_cells)
             / grid.columns().max(1);
+        let mut side = ingress.side.clone();
+        if let Some(cwd) = self.cwd_process_id().and_then(get_process_cwd) {
+            side.cwd = Some(cwd);
+        }
         Ok(crate::server::native_snapshot::NativeState {
             terminal: term.snapshot(max_history),
             continuation: Some(crate::server::native_snapshot::Continuation {
                 parser: ingress.processor.snapshot().map_err(str::to_string)?,
-                side: ingress.side.clone(),
+                side,
             }),
         })
     }
@@ -2186,9 +2217,15 @@ impl TerminalState {
             });
     }
 
+    fn cwd_process_id(&self) -> Option<u32> {
+        self.shell_pid
+            .or(self.remote_shell_pid.filter(|_| self.is_alive()))
+    }
+
     pub fn get_current_working_directory(&self) -> Option<std::path::PathBuf> {
-        let pid = self.shell_pid?;
-        get_process_cwd(pid)
+        self.cwd_process_id()
+            .and_then(get_process_cwd)
+            .or_else(|| self.ingress.lock().side.cwd.clone())
     }
 
     pub fn process_coordinates(&self) -> (Option<u32>, Option<u32>) {
@@ -3788,13 +3825,12 @@ fn file_url_to_path(buf: &[u8]) -> Option<std::path::PathBuf> {
         let decoded = percent_decode(path);
         Some(std::path::PathBuf::from(decoded))
     } else {
-        let trimmed = s.trim();
-        if !trimmed.is_empty()
-            && (trimmed.starts_with('/')
-                || trimmed.starts_with('~')
-                || (trimmed.len() >= 2 && trimmed.chars().nth(1) == Some(':')))
+        if !s.is_empty()
+            && (s.starts_with('/')
+                || s.starts_with('~')
+                || (s.len() >= 2 && s.chars().nth(1) == Some(':')))
         {
-            Some(std::path::PathBuf::from(trimmed))
+            Some(std::path::PathBuf::from(s))
         } else {
             None
         }
@@ -3803,23 +3839,21 @@ fn file_url_to_path(buf: &[u8]) -> Option<std::path::PathBuf> {
 
 /// Minimal percent-decode for file:// paths.
 fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
-                if let Some(c) = char::from_u32((h as u32) * 16 + (l as u32)) {
-                    out.push(c);
-                    i += 3;
-                    continue;
-                }
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn hex_digit(b: u8) -> Option<u8> {

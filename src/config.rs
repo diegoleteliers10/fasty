@@ -50,6 +50,8 @@ pub fn increment_config_version() {
 }
 
 static LAST_APPLIED_HASH: RwLock<u64> = RwLock::new(0);
+static ACTIVE_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
+static CONFIG_SOURCE_PRESENT: AtomicBool = AtomicBool::new(false);
 
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(250);
 
@@ -671,20 +673,43 @@ fn candidate_toml_paths() -> Vec<PathBuf> {
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    let mut tmp_os = path.as_os_str().to_owned();
-    tmp_os.push(".tmp");
-    let tmp = PathBuf::from(tmp_os);
-    std::fs::write(&tmp, contents)?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
+    for _ in 0..16 {
+        let mut tmp_os = path.as_os_str().to_owned();
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        tmp_os.push(format!(".{}.{}.tmp", std::process::id(), id));
+        let tmp = PathBuf::from(tmp_os);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&tmp) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let result = file.write_all(contents)
+            .and_then(|_| file.flush())
+            .and_then(|_| file.sync_all());
+        drop(file);
+        let result = result.and_then(|_| std::fs::rename(&tmp, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        return result.map_err(Into::into);
     }
-    Ok(())
+    anyhow::bail!("Cannot create a temporary config file for {}", path.display())
 }
 
 fn ensure_table(doc: &mut DocumentMut, key: &str) {
@@ -902,7 +927,7 @@ fn migrate_legacy_json_to_toml(toml_path: &Path, json_path: &Path) -> anyhow::Re
     let content = std::fs::read_to_string(json_path)?;
     let mut parsed: Config = serde_json::from_str(&content)?;
     parsed.scrollback = parsed.scrollback.clamp(500, 100_000);
-    atomic_write(toml_path, config_to_toml_string(&parsed).as_bytes())?;
+    atomic_write(toml_path, toml_edit::ser::to_string(&parsed)?.as_bytes())?;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1090,6 +1115,12 @@ fn parse_lenient_from_doc(doc: &DocumentMut) -> Option<Config> {
             any_recognized = true;
         }
     }
+    if let Some(bottombar) = doc.get("bottombar") {
+        if let Ok(parsed) = toml_edit::de::from_str::<BottombarConfig>(&bottombar.to_string()) {
+            cfg.bottombar = parsed;
+            any_recognized = true;
+        }
+    }
 
     if any_recognized {
         Some(cfg)
@@ -1102,22 +1133,24 @@ impl Config {
     pub fn load() -> anyhow::Result<Self> {
         let target = user_toml_path();
         let legacy = user_legacy_json_path();
-        if !target.exists() && legacy.exists() {
-            let _ = migrate_legacy_json_to_toml(&target, &legacy);
+        if !CONFIG_SOURCE_PRESENT.load(Ordering::Relaxed)
+            && !candidate_toml_paths().iter().any(|path| path.exists())
+            && legacy.exists()
+        {
+            migrate_legacy_json_to_toml(&target, &legacy)?;
         }
 
-        let mut any_existed = false;
-        let mut last_err: Option<anyhow::Error> = None;
-        for path in candidate_toml_paths() {
-            if !path.exists() { continue; }
-            any_existed = true;
-            let content = match std::fs::read_to_string(&path) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(anyhow::anyhow!("read {}: {e}", path.display()));
-                    continue;
-                }
-            };
+        let path = Self::get_active_config_path();
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                CONFIG_SOURCE_PRESENT.store(true, Ordering::Relaxed);
+                Some(content)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                && !CONFIG_SOURCE_PRESENT.load(Ordering::Relaxed) => None,
+            Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
+        };
+        if let Some(content) = content {
             let h = content_hash(content.as_bytes());
             match toml_edit::de::from_str::<Config>(&content) {
                 Ok(mut cfg) => {
@@ -1127,23 +1160,8 @@ impl Config {
                     return Ok(cfg);
                 }
                 Err(e) => {
-                    if let Ok(doc) = content.parse::<DocumentMut>() {
-                        if let Some(mut cfg) = parse_lenient_from_doc(&doc) {
-                            eprintln!("[fastty] partial config parse for {}: {e}; preserved valid user settings", path.display());
-                            cfg.scrollback = cfg.scrollback.clamp(500, 100_000);
-                            sync_runtime_statics(&cfg);
-                            set_last_applied_hash(h);
-                            return Ok(cfg);
-                        }
-                    }
-                    last_err = Some(anyhow::anyhow!("parse {}: {e}", path.display()));
+                    return Err(anyhow::anyhow!("parse {}: {e}", path.display()));
                 }
-            }
-        }
-
-        if any_existed {
-            if let Some(err) = last_err {
-                return Err(err.context("all existing config files failed to load; keeping previous state"));
             }
         }
 
@@ -1155,14 +1173,23 @@ impl Config {
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let mut doc: DocumentMut = match std::fs::read_to_string(path) {
-            Ok(s) => s.parse::<DocumentMut>().unwrap_or_else(|_| DocumentMut::new()),
-            Err(_) => DocumentMut::new(),
+            Ok(s) => {
+                toml_edit::de::from_str::<Config>(&s)
+                    .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
+                s.parse::<DocumentMut>()
+                    .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => DocumentMut::new(),
+            Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
         };
         apply_to_doc(&mut doc, self);
+        let bottombar = toml_edit::ser::to_document(&self.bottombar)?;
+        ensure_table(&mut doc, "bottombar");
+        doc["bottombar"]["widgets"] = bottombar["widgets"].clone();
         let serialized = doc.to_string();
         let bytes = serialized.as_bytes();
-        set_last_applied_hash(content_hash(bytes));
         atomic_write(path, bytes)?;
+        set_last_applied_hash(content_hash(bytes));
         Ok(())
     }
 
@@ -1171,8 +1198,18 @@ impl Config {
     }
 
     pub fn get_active_config_path() -> PathBuf {
+        ACTIVE_CONFIG_PATH.get_or_init(Self::resolve_config_path).clone()
+    }
+
+    fn resolve_config_path() -> PathBuf {
         for path in candidate_toml_paths() {
             if path.exists() {
+                CONFIG_SOURCE_PRESENT.store(true, Ordering::Relaxed);
+                if path.is_relative() {
+                    if let Ok(cwd) = std::env::current_dir() {
+                        return cwd.join(path);
+                    }
+                }
                 return path;
             }
         }
@@ -1197,26 +1234,21 @@ impl Config {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // Never persist an in-memory default config over an existing file
-        // whose load previously failed: that would silently destroy the
-        // user's settings (providers, api keys, keybindings).
-        if CONFIG_LOAD_FAILED.load(std::sync::atomic::Ordering::Relaxed)
-            && path.exists()
-            && *CONFIG_LOADED_FROM_EXISTING.lock().unwrap_or_else(|p| p.into_inner()) == false
-        {
+        // Block saves after a load error until the config loads again.
+        if CONFIG_LOAD_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
             anyhow::bail!(
-                "Refusing to save config: the existing file failed to load earlier this session. Fix {} and restart.",
+                "Cannot save config after a load error. Fix {} and reload it.",
                 path.display()
             );
         }
         self.save(&path)?;
+        CONFIG_SOURCE_PRESENT.store(true, Ordering::Relaxed);
         increment_config_version();
         Ok(())
     }
 }
 
 static CONFIG_LOAD_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static CONFIG_LOADED_FROM_EXISTING: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 /// Human-readable cause of the last config load failure (path + parse
 /// error), so the UI can show it instead of failing silently to defaults.
 static CONFIG_LOAD_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -1228,31 +1260,39 @@ pub fn load_error() -> Option<String> {
     CONFIG_LOAD_ERROR.lock().ok().and_then(|g| g.clone())
 }
 
-/// Loads the config, falling back to defaults on failure while remembering
-/// that the on-disk file was unreadable so a later save cannot destroy it.
-pub fn load_lenient() -> Config {
+pub fn load_result() -> anyhow::Result<Config> {
     match Config::load() {
         Ok(cfg) => {
             set_ai_context_window(cfg.ai.context_window);
-            if let Ok(mut flag) = CONFIG_LOADED_FROM_EXISTING.lock() {
-                *flag = true;
-            }
+            CONFIG_LOAD_FAILED.store(false, Ordering::Relaxed);
             if let Ok(mut err) = CONFIG_LOAD_ERROR.lock() {
                 *err = None;
             }
-            cfg
+            Ok(cfg)
         }
         Err(e) => {
-            eprintln!("[fastty] config load failed, using defaults until restart: {e}");
-            CONFIG_LOAD_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            CONFIG_LOAD_FAILED.store(true, Ordering::Relaxed);
             if let Ok(mut err) = CONFIG_LOAD_ERROR.lock() {
                 *err = Some(e.to_string());
             }
-            let cfg = Config::default();
-            set_ai_context_window(cfg.ai.context_window);
-            cfg
+            Err(e)
         }
     }
+}
+
+/// Recover valid settings at startup. Block saves until the full config loads.
+pub fn load_lenient() -> Config {
+    load_result().unwrap_or_else(|e| {
+        eprintln!("[fastty] config load failed, config saves blocked: {e}");
+        let cfg = std::fs::read_to_string(Config::get_active_config_path())
+            .ok()
+            .and_then(|content| content.parse::<DocumentMut>().ok())
+            .and_then(|doc| parse_lenient_from_doc(&doc))
+            .unwrap_or_default();
+        sync_runtime_statics(&cfg);
+        set_ai_context_window(cfg.ai.context_window);
+        cfg
+    })
 }
 
 pub fn start_config_watcher<F>(file_path: PathBuf, on_change: F) -> anyhow::Result<()>

@@ -157,6 +157,8 @@ pub trait Widget: Send {
     }
     /// Produce the segments that make up this widget's text.
     fn render(&mut self, ctx: &WidgetContext) -> Vec<Segment>;
+    /// Update context before the poll interval check.
+    fn update_context(&mut self, _ctx: &WidgetContext) {}
     /// Refresh internal state from the world.
     fn poll(&mut self, _ctx: &WidgetContext) {}
     /// How often [`Widget::poll`] should fire.

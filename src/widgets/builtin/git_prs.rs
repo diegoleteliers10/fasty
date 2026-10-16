@@ -14,12 +14,12 @@ const DEFAULT_INTERVAL_MS: u64 = 180_000; // 3 minutes: PR state changes slowly
 pub struct GitPrsWidget {
     align: Align,
     last_poll: Instant,
+    was_focused: bool,
     interval: Duration,
     state: Arc<Mutex<Option<PrsSummary>>>,
     is_fetching: Arc<AtomicBool>,
     pending_cwd: Option<std::path::PathBuf>,
-    /// Bumped on every cwd change; in-flight threads with a stale generation
-    /// drop their result instead of overwriting fresher state.
+    /// Changes when the active Git directory changes or disappears.
     generation: Arc<AtomicU64>,
     backoff: Arc<Mutex<FailureBackoff>>,
     /// True when the `gh` CLI is missing (not merely offline): render a
@@ -154,6 +154,7 @@ impl GitPrsWidget {
         Self {
             align,
             last_poll: Instant::now() - Duration::from_secs(120),
+            was_focused: true,
             interval: Duration::from_millis(interval_ms.unwrap_or(DEFAULT_INTERVAL_MS)),
             state: Arc::new(Mutex::new(None)),
             is_fetching: Arc::new(AtomicBool::new(false)),
@@ -189,27 +190,33 @@ impl Widget for GitPrsWidget {
         self.last_poll = t;
     }
 
+    fn update_context(&mut self, ctx: &WidgetContext) {
+        if ctx.window_focused && !self.was_focused {
+            self.last_poll = Instant::now() - self.poll_interval();
+        }
+        self.was_focused = ctx.window_focused;
+        let cwd = ctx.active_tab_cwd.filter(|_| ctx.active_tab_git.is_some());
+        if cwd != self.pending_cwd.as_deref() {
+            let mut guard = self.state.lock().unwrap();
+            self.generation.fetch_add(1, Ordering::Relaxed);
+            *guard = None;
+            self.pending_cwd = cwd.map(std::path::Path::to_path_buf);
+            self.is_fetching = Arc::new(AtomicBool::new(false));
+            self.backoff = Arc::new(Mutex::new(FailureBackoff::default()));
+            self.gh_missing = Arc::new(AtomicBool::new(false));
+            self.last_poll = Instant::now() - self.interval;
+        }
+    }
+
     fn poll(&mut self, ctx: &WidgetContext) {
+        self.update_context(ctx);
+        let cwd = ctx.active_tab_cwd.filter(|_| ctx.active_tab_git.is_some());
         if !ctx.window_focused {
             return;
         }
-        if ctx.active_tab_git.is_none() {
-            let mut guard = self.state.lock().unwrap();
-            *guard = None;
-            self.pending_cwd = None;
-            return;
-        }
 
-        if let Some(cwd) = ctx.active_tab_cwd {
+        if let Some(cwd) = cwd {
             let cwd_path = cwd.to_path_buf();
-            let is_new_cwd = Some(&cwd_path) != self.pending_cwd.as_ref();
-            if is_new_cwd {
-                self.pending_cwd = Some(cwd_path.clone());
-                self.generation.fetch_add(1, Ordering::Relaxed);
-                let mut guard = self.state.lock().unwrap();
-                *guard = None;
-            }
-
             if !self.is_fetching.load(Ordering::Relaxed) {
                 self.is_fetching.store(true, Ordering::Relaxed);
                 let state_clone = self.state.clone();
@@ -222,10 +229,8 @@ impl Widget for GitPrsWidget {
                 std::thread::spawn(move || {
                     let summary = fetch_prs_summary(&cwd_path);
 
-                    // Stale result (cwd changed mid-flight): drop it so it
-                    // can't overwrite fresher state.
+                    let mut guard = state_clone.lock().unwrap();
                     if gen != generation_clone.load(Ordering::Relaxed) {
-                        is_fetching_clone.store(false, Ordering::Relaxed);
                         return;
                     }
                     if let Ok(mut b) = backoff_clone.lock() {
@@ -238,16 +243,11 @@ impl Widget for GitPrsWidget {
                     }
                     if let Some(sum) = summary {
                         gh_missing_clone.store(false, Ordering::Relaxed);
-                        let mut guard = state_clone.lock().unwrap();
                         *guard = Some(sum);
                     }
                     is_fetching_clone.store(false, Ordering::Relaxed);
                 });
             }
-        } else {
-            let mut guard = self.state.lock().unwrap();
-            *guard = None;
-            self.pending_cwd = None;
         }
     }
 

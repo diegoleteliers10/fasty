@@ -974,6 +974,10 @@ pub enum Response {
         program_status: Vec<crate::program_status::ProgramRecord>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         process_running: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shell_pid: Option<u32>,
     },
     /// Sent once, immediately after `attached`, with the pane's current
     /// on-screen contents as ANSI/SGR bytes (see
@@ -1614,6 +1618,10 @@ mod unix_impl {
                         mode: effective_mode,
                         program_status,
                         process_running: Some(process_running),
+                        cwd: terminal
+                            .get_current_working_directory()
+                            .map(|path| path.to_string_lossy().into_owned()),
+                        shell_pid: terminal.shell_pid(),
                     },
                 );
                 send(
@@ -2771,6 +2779,8 @@ mod tests {
             mode: AttachMode::ReadOnly,
             program_status: vec![],
             process_running: None,
+            cwd: None,
+            shell_pid: None,
         };
         let json = serde_json::to_string(&res).unwrap();
         assert!(json.contains(r#""mode":"read_only""#));

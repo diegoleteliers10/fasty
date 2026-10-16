@@ -200,6 +200,7 @@ pub struct SettingsView {
     pub ai_model: Option<String>,
     pub detected_external_configs: Vec<crate::importer::DetectedConfig>,
     pub import_status_message: Option<String>,
+    config_error: Option<String>,
     pub focus_handle: gpui::FocusHandle,
     pub window_scroll_handle: ScrollHandle,
     pub system_fonts: Vec<String>,
@@ -390,6 +391,7 @@ impl SettingsView {
             ai_model,
             detected_external_configs,
             import_status_message: None,
+            config_error: crate::config::load_error(),
             config: loaded_config,
             theme,
             current_theme_name: theme_name,
@@ -661,8 +663,15 @@ impl SettingsView {
     /// scattered `save_default` calls): persists, then re-baselines so our
     /// own writes never read as external edits.
     fn save_config(&mut self) {
-        let _ = self.config.save_default();
-        self.refresh_baseline();
+        match self.config.save_default() {
+            Ok(()) => {
+                self.config_error = None;
+                self.refresh_baseline();
+            }
+            Err(error) => {
+                self.config_error = Some(format!("Cannot save settings: {error}"));
+            }
+        }
     }
 
     /// Recomputes `stale`, throttled: at most one file read+hash per second.
@@ -696,8 +705,16 @@ impl SettingsView {
     /// Reloads the on-disk config into the view (stale badge action).
     /// Unsaved in-window edits are replaced by the file content.
     fn reload_from_disk(&mut self, cx: &mut Context<Self>) {
-        let cfg = crate::config::load_lenient();
-        self.sync_from_config(&cfg, cx);
+        match crate::config::load_result() {
+            Ok(cfg) => {
+                self.config_error = None;
+                self.sync_from_config(&cfg, cx);
+            }
+            Err(error) => {
+                self.config_error = Some(format!("Cannot reload settings: {error}"));
+                cx.notify();
+            }
+        }
     }
 
     fn apply_search_filter(&mut self, cx: &mut Context<Self>) {
@@ -2367,6 +2384,20 @@ impl SettingsView {
                             }),
                     ),
             )
+            .when_some(self.config_error.as_ref(), |this, error| {
+                this.child(
+                    div()
+                        .w_full()
+                        .px(px(24.))
+                        .py(px(8.))
+                        .bg(theme.red.opacity(0.10))
+                        .border_b_1()
+                        .border_color(theme.red.opacity(0.35))
+                        .text_size(px(11.5))
+                        .text_color(theme.red)
+                        .child(error.clone()),
+                )
+            })
             // Scrollable Content
             // UX3: the config file changed outside this window (main-window
             // action or hand-edited TOML). Offer Reload before the next save

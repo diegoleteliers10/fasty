@@ -50,11 +50,16 @@ impl Widget for GitWidget {
         self.last_poll = t;
     }
 
+    fn update_context(&mut self, ctx: &WidgetContext) {
+        self.cached = ctx.active_tab_cwd.and(ctx.active_tab_git).cloned();
+        self.pending_cwd = ctx
+            .active_tab_cwd
+            .filter(|_| self.cached.is_some())
+            .map(std::path::Path::to_path_buf);
+    }
+
     fn poll(&mut self, ctx: &WidgetContext) {
-        self.cached = ctx.active_tab_git.cloned();
-        if let Some(p) = ctx.active_tab_cwd {
-            self.pending_cwd = Some(p.to_path_buf());
-        }
+        self.update_context(ctx);
     }
 
     fn render(&mut self, _ctx: &WidgetContext) -> Vec<Segment> {

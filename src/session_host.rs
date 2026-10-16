@@ -289,6 +289,8 @@ pub struct RemoteSession {
     pub snapshot: Vec<u8>,
     pub program_status: Vec<crate::program_status::ProgramRecord>,
     pub process_running: Option<bool>,
+    pub cwd: Option<String>,
+    pub shell_pid: Option<u32>,
     pub restore_legacy_mouse_modes: bool,
     pub reader: BufReader<std::os::unix::net::UnixStream>,
     pub control: std::sync::Arc<RemoteControl>,
@@ -301,6 +303,8 @@ pub struct RemoteSession {
     pub snapshot: Vec<u8>,
     pub program_status: Vec<crate::program_status::ProgramRecord>,
     pub process_running: Option<bool>,
+    pub cwd: Option<String>,
+    pub shell_pid: Option<u32>,
     pub restore_legacy_mouse_modes: bool,
     pub control: std::sync::Arc<RemoteControl>,
 }
@@ -766,12 +770,14 @@ pub fn spawn_attached(
         .map_err(|error| error.to_string())?;
         let control_stream = stream.try_clone().map_err(|error| error.to_string())?;
         let mut reader = BufReader::new(stream);
-        let (program_status, process_running) = match read_response(&mut reader)? {
+        let (program_status, process_running, cwd, shell_pid) = match read_response(&mut reader)? {
             Response::Attached {
                 program_status,
                 process_running,
+                cwd,
+                shell_pid,
                 ..
-            } => (program_status, process_running),
+            } => (program_status, process_running, cwd, shell_pid),
             Response::Error { code, message } => return Err(format!("{code}: {message}")),
             other => return Err(format!("unexpected attach response: {other:?}")),
         };
@@ -801,6 +807,8 @@ pub fn spawn_attached(
             snapshot,
             program_status,
             process_running,
+            cwd,
+            shell_pid,
             restore_legacy_mouse_modes: false,
             reader,
             control: std::sync::Arc::new(RemoteControl {
@@ -928,6 +936,12 @@ fn attach_expected(
     if let Some(expected) = &expected_host_instance {
         validate_host_connection(&mut stream, expected)?;
     }
+    write_request(&mut stream, &Request::List).map_err(|error| error.to_string())?;
+    let legacy_session = match read_response(&mut BufReader::new(&mut stream))? {
+        Response::Sessions { sessions } => sessions.into_iter().find(|session| session.id == id),
+        Response::Error { code, message } => return Err(format!("{code}: {message}")),
+        other => return Err(format!("unexpected session-list response: {other:?}")),
+    };
     write_request(
         &mut stream,
         &Request::Attach {
@@ -941,12 +955,14 @@ fn attach_expected(
     .map_err(|error| error.to_string())?;
     let control_stream = stream.try_clone().map_err(|error| error.to_string())?;
     let mut reader = BufReader::new(stream);
-    let (program_status, attached_process_running) = match read_response(&mut reader)? {
+    let (program_status, attached_process_running, cwd, shell_pid) = match read_response(&mut reader)? {
         Response::Attached {
             program_status,
             process_running,
+            cwd,
+            shell_pid,
             ..
-        } => (program_status, process_running),
+        } => (program_status, process_running, cwd, shell_pid),
         Response::Error { code, message } => return Err(format!("{code}: {message}")),
         other => return Err(format!("unexpected attach response: {other:?}")),
     };
@@ -962,15 +978,17 @@ fn attach_expected(
         .map_err(|error| error.to_string())?;
     let (restore_legacy_mouse_modes, process_running) = match attached_process_running {
         Some(process_running) => (false, Some(process_running)),
-        None => match query_session_status(id)? {
+        None => match query_session_status(id, expected_host_instance.as_ref())? {
             Response::SessionStatus {
                 process_running, ..
             } => (false, Some(process_running)),
             Response::Error { code, .. } if code == "bad_request" => {
-                let session = legacy_session_info(id)?;
+                let session = legacy_session.as_ref().ok_or_else(|| {
+                    format!("no_such_session: session ID {id} not found")
+                })?;
                 (
-                    legacy_session_needs_mouse_modes(&session),
-                    legacy_session_process_running(&session),
+                    legacy_session_needs_mouse_modes(session),
+                    legacy_session_process_running(session),
                 )
             }
             Response::Error { code, message } => return Err(format!("{code}: {message}")),
@@ -988,6 +1006,8 @@ fn attach_expected(
         snapshot,
         program_status,
         process_running,
+        cwd: cwd.or_else(|| legacy_session.and_then(|session| session.cwd)),
+        shell_pid,
         restore_legacy_mouse_modes,
         reader,
         control: std::sync::Arc::new(RemoteControl {
@@ -999,9 +1019,16 @@ fn attach_expected(
 }
 
 #[cfg(unix)]
-fn query_session_status(id: usize) -> Result<Response, String> {
+fn query_session_status(
+    id: usize,
+    expected_host_instance: Option<&crate::daemon::HostInstanceId>,
+) -> Result<Response, String> {
     let mut stream = connect_for_handshake()?;
-    validate_session_connection(&mut stream, id)?;
+    if let Some(expected) = expected_host_instance {
+        validate_host_connection(&mut stream, expected)?;
+    } else {
+        validate_session_connection(&mut stream, id)?;
+    }
     write_request(&mut stream, &Request::SessionStatus { id })
         .map_err(|error| error.to_string())?;
     read_response(&mut BufReader::new(stream))

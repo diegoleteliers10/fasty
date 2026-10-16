@@ -38,7 +38,6 @@ impl StatusBarModel {
         git: Option<GitStatus>,
     ) {
         std::thread::spawn(move || {
-            let now = std::time::Instant::now();
             let ctx = WidgetContext {
                 active_tab_cwd: cwd.as_deref(),
                 active_tab_git: git.as_ref(),
@@ -48,6 +47,8 @@ impl StatusBarModel {
             };
             let mut widgets = widgets_arc.lock();
             for w in widgets.iter_mut() {
+                w.update_context(&ctx);
+                let now = std::time::Instant::now();
                 if now.duration_since(w.last_poll()) >= w.poll_interval() {
                     w.poll(&ctx);
                     w.set_last_poll(now);
@@ -72,8 +73,9 @@ impl StatusBarModel {
         let mut right = Vec::new();
 
         let mut widgets = self.widgets.lock();
-        let now = std::time::Instant::now();
         for w in widgets.iter_mut() {
+            w.update_context(&ctx);
+            let now = std::time::Instant::now();
             if now.duration_since(w.last_poll()) >= w.poll_interval() {
                 // Permanent cheap observability (punto 4): a poll that runs
                 // on the render path must return immediately (spawn and go).
