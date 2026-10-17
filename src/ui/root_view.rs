@@ -3913,6 +3913,8 @@ impl RootView {
             view.config.keybindings.clone(),
             view.config.keybinding_preset,
         );
+        #[cfg(target_os = "macos")]
+        crate::ui::native_menu::refresh_bindings(cx);
         crate::keybindings::init_key_modes(view.config.key_modes.clone());
 
         // Daemon → GUI requests: a `spawn { open: true }` (e.g. from an MCP
@@ -6571,9 +6573,7 @@ impl RootView {
         let existing = { *crate::ui::settings_view::SETTINGS_WINDOW_HANDLE.lock() };
         if let Some(handle) = existing {
             let mut activated = false;
-            let current_config = self.config.clone();
             let _ = handle.update(cx, |view, window, cx| {
-                view.sync_from_config(&current_config, cx);
                 window.activate_window();
                 window.focus(&view.focus_handle, cx);
                 activated = true;
@@ -9645,6 +9645,8 @@ impl RootView {
             loaded_config.keybindings.clone(),
             loaded_config.keybinding_preset,
         );
+        #[cfg(target_os = "macos")]
+        crate::ui::native_menu::refresh_bindings(cx);
         crate::keybindings::init_key_modes(loaded_config.key_modes.clone());
         self.active_key_mode = None;
         self.clear_pending_key_sequence();
@@ -9991,6 +9993,478 @@ impl RootView {
         cx.stop_propagation();
     }
 
+    fn with_native_menu_actions(&self, element: Div, cx: &mut Context<Self>) -> Div {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = cx;
+            element
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use crate::ui::native_menu as menu;
+            use crate::keybindings::Action;
+            if self.native_menu_overlay_open() {
+                return element;
+            }
+            let element = element
+                .on_action(cx.listener(|this, _: &menu::NewWindow, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::NewWindow, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::NewTab, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::NewTab, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::SplitRight, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::SplitRight, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::SplitDown, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::SplitDown, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::ClosePane, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::ClosePane, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::CloseTab, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::CloseTab, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::Find, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::OpenSearch, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::ToggleAiPanel, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::ToggleAiSidebar, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::ToggleGitPanel, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::ToggleProjectSidebar, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::ToggleSidebar, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::ToggleTabSidebar, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::IncreaseFontSize, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::IncreaseFontSize, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::DecreaseFontSize, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::DecreaseFontSize, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::ResetFontSize, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::ResetFontSize, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::ToggleFullscreen, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::ToggleFullscreen, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::CommandPalette, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::CommandPalette, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::OpenSettings, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.execute_keybinding_action(Action::OpenSettings, window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::About, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.toggle_about(window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::CheckForUpdates, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        this.check_for_updates_manual(window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::Copy, _, _| {
+                    if !this.native_menu_overlay_open() {
+                        this.copy_selection(!this.ai_keys_own_input());
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::Paste, window, cx| {
+                    if !this.native_menu_overlay_open() {
+                        if this.ai_keys_own_input() {
+                            this.paste_ai_input(cx);
+                        } else {
+                            this.execute_keybinding_action(Action::Paste, window, cx);
+                        }
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &menu::SelectAll, _, cx| {
+                    if !this.native_menu_overlay_open() {
+                        if this.ai_keys_own_input() {
+                            this.ai_input_state.select_all();
+                            cx.notify();
+                        } else {
+                            this.select_all_terminal(cx);
+                        }
+                    }
+                }));
+            element
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_menu_overlay_open(&self) -> bool {
+        self.pending_close.is_some()
+            || self.pending_external_approval.is_some()
+            || self.project_panel_confirmation.is_some()
+            || self.ai_pending_confirmation.is_some()
+            || self.is_rename_tab_open
+            || self.is_command_palette_open
+            || self.is_ssh_manager_open
+            || self.is_snippet_picker_open
+            || self.is_pr_picker_open
+            || self.is_search_open
+            || self.is_worktree_picker_open
+            || self.is_project_jumper_open
+            || self.is_file_picker_open
+            || self.is_tab_overview_open
+            || self.is_global_search_open
+            || self.is_settings_open
+            || self.is_about_open
+            || self.is_update_modal_open
+            || self.is_whats_new_open
+    }
+
+    #[cfg(target_os = "macos")]
+    fn select_all_terminal(&mut self, cx: &mut Context<Self>) {
+        use alacritty_terminal::index::{Column, Line, Point};
+        let Some(tab) = self.tabs.get(self.active_tab_idx) else {
+            return;
+        };
+        let pane_id = tab.pane_tree.active_pane_id;
+        let Some(terminal) = tab.pane_tree.find_pane(pane_id)
+            .and_then(|pane| pane.terminal.as_ref())
+            .or(tab.terminal.as_ref()) else {
+            return;
+        };
+        let Some(term) = terminal.term().try_lock() else {
+            return;
+        };
+        let grid = term.grid();
+        let start = Point::new(Line(-(grid.history_size() as i32)), Column(0));
+        let end = Point::new(
+            Line(grid.screen_lines().saturating_sub(1) as i32),
+            Column(grid.columns().saturating_sub(1)),
+        );
+        drop(term);
+        self.selection = Some(Selection { pane_id, start, end });
+        self.is_selecting = false;
+        self.has_selection_dragged = false;
+        self.selection_start = None;
+        cx.notify();
+    }
+
+    fn copy_selection(&self, include_terminal: bool) {
+        if self.ai_keys_own_input() {
+            if let Some(text) = self.ai_input_state.selected_text() {
+                if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                    let _ = clip.set_text(text);
+                }
+                return;
+            }
+        }
+        if let Some((msg_idx, s, e)) = self.ai_message_selection {
+            if s < e {
+                let text = if msg_idx < self.ai_messages.len() {
+                    Some(self.ai_messages[msg_idx].text.as_str())
+                } else if msg_idx == self.ai_messages.len()
+                    && !self.ai_streaming_text.is_empty()
+                {
+                    Some(self.ai_streaming_text.as_str())
+                } else {
+                    None
+                };
+                if let Some(txt) = text {
+                    let selected: String = txt.chars().skip(s).take(e - s).collect();
+                    if !selected.is_empty() {
+                        if let Some(mut clip) =
+                            crate::event_listener::clipboard_helper()
+                        {
+                            let _ = clip.set_text(selected);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(text) = include_terminal.then(|| self.get_selected_text()).flatten() {
+            if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                let _ = clip.set_text(text);
+            }
+        }
+    }
+
+    fn paste_ai_input(&mut self, cx: &mut Context<Self>) {
+        if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+            if let Some(img_path) = crate::paste::get_clipboard_image(&mut clip) {
+                self.ai_attached_files.push(img_path);
+                cx.notify();
+                return;
+            }
+            if let Ok(text) = clip.get_text() {
+                self.ai_input_state.insert_str(&text);
+                self.ai_input_text = self.ai_input_state.text.clone();
+                self.check_ai_at_trigger();
+                cx.notify();
+            }
+        }
+    }
+
+    fn execute_keybinding_action(
+        &mut self,
+        action: crate::keybindings::Action,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use crate::keybindings::Action;
+        match action {
+            Action::CommandPalette => {
+                self.toggle_command_palette(_window, cx);
+                return true;
+            }
+            Action::NewWindow => {
+                self.execute_palette_command("new_window", _window, cx);
+                return true;
+            }
+            Action::EnterResizeMode => {
+                self.active_key_mode = Some("resize".to_string());
+                cx.notify();
+                return true;
+            }
+            Action::SshManager => {
+                self.toggle_ssh_manager(_window, cx);
+                return true;
+            }
+            Action::WorktreePicker => {
+                self.toggle_worktree_picker(_window, cx);
+                return true;
+            }
+            Action::ProjectJumper => {
+                self.toggle_project_jumper(_window, cx);
+                return true;
+            }
+            Action::InsertFilePath => {
+                self.toggle_file_picker(_window, cx);
+                return true;
+            }
+            Action::OpenSearch => {
+                self.toggle_search(_window, cx);
+                return true;
+            }
+            Action::OpenSettings => {
+                self.toggle_settings(_window, cx);
+                return true;
+            }
+            Action::ToggleFullscreen => {
+                _window.toggle_fullscreen();
+                return true;
+            }
+            Action::NewTab => {
+                self.create_tab(_window, cx);
+                return true;
+            }
+            Action::SplitRight => {
+                self.split_active_pane(Direction::Right, _window, cx);
+                return true;
+            }
+            Action::SplitDown => {
+                self.split_active_pane(Direction::Down, _window, cx);
+                return true;
+            }
+            Action::SplitLeft => {
+                self.split_active_pane(Direction::Left, _window, cx);
+                return true;
+            }
+            Action::SplitTop => {
+                self.split_active_pane(Direction::Top, _window, cx);
+                return true;
+            }
+            Action::ToggleTabSidebar => {
+                self.toggle_tab_sidebar(_window, cx);
+                return true;
+            }
+            Action::ToggleProjectSidebar => {
+                self.toggle_project_sidebar(_window, cx);
+                return true;
+            }
+            Action::ToggleAiSidebar => {
+                self.toggle_ai_sidebar(_window, cx);
+                return true;
+            }
+
+            Action::FocusLeft => {
+                self.focus_pane_in_direction(Direction::Left, cx);
+                return true;
+            }
+            Action::FocusRight => {
+                self.focus_pane_in_direction(Direction::Right, cx);
+                return true;
+            }
+            Action::FocusTop => {
+                self.focus_pane_in_direction(Direction::Top, cx);
+                return true;
+            }
+            Action::FocusDown => {
+                self.focus_pane_in_direction(Direction::Down, cx);
+                return true;
+            }
+            Action::ClosePane => {
+                self.close_active_pane(_window, cx);
+                return true;
+            }
+            Action::CloseTab => {
+                if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
+                    let id = active_tab.id;
+                    self.close_tab(id, _window, cx);
+                }
+                return true;
+            }
+            Action::NextTab => {
+                if !self.tabs.is_empty() {
+                    self.selection = None;
+                    self.is_selecting = false;
+                    self.selection_start = None;
+                    self.activate_tab_index((self.active_tab_idx + 1) % self.tabs.len());
+                    cx.notify();
+                }
+                return true;
+            }
+            Action::PrevTab => {
+                if !self.tabs.is_empty() {
+                    self.selection = None;
+                    self.is_selecting = false;
+                    self.selection_start = None;
+                    let target = if self.active_tab_idx == 0 {
+                        self.tabs.len() - 1
+                    } else {
+                        self.active_tab_idx - 1
+                    };
+                    self.activate_tab_index(target);
+                    cx.notify();
+                }
+                return true;
+            }
+            Action::SelectTab(digit) => {
+                if (1..=9).contains(&digit) {
+                    let target = (digit - 1) as usize;
+                    if target < self.tabs.len() {
+                        self.selection = None;
+                        self.is_selecting = false;
+                        self.selection_start = None;
+                        self.activate_tab_index(target);
+                        cx.notify();
+                        return true;
+                    }
+                }
+            }
+            Action::IncreaseFontSize => {
+                self.adjust_font_size(1.0, cx);
+                return true;
+            }
+            Action::DecreaseFontSize => {
+                self.adjust_font_size(-1.0, cx);
+                return true;
+            }
+            Action::ResetFontSize => {
+                if self.save_config(|config| config.font.size = 13.0) {
+                    self.palette_preview_original = None;
+                    self.font_size = self.config.font.size;
+                }
+                cx.notify();
+                return true;
+            }
+            Action::ClearScrollback => {
+                if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
+                    if let Some(ref terminal) = active_tab.terminal {
+                        terminal.scroll_to_bottom();
+                        cx.notify();
+                    }
+                }
+                return true;
+            }
+            Action::PrevPrompt => {
+                if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
+                    if let Some(ref terminal) = active_tab.terminal {
+                        terminal.scroll_to_prev_prompt();
+                        self.last_scroll_activity = std::time::Instant::now();
+                        cx.notify();
+                    }
+                }
+                return true;
+            }
+            Action::NextPrompt => {
+                if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
+                    if let Some(ref terminal) = active_tab.terminal {
+                        terminal.scroll_to_next_prompt();
+                        self.last_scroll_activity = std::time::Instant::now();
+                        cx.notify();
+                    }
+                }
+                return true;
+            }
+            Action::Copy => {
+                self.copy_selection(true);
+                return true;
+            }
+            Action::Paste => {
+                if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
+                    if let Some(ref terminal) = active_tab.terminal {
+                        if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                            if let Some(content) =
+                                crate::paste::get_clipboard_paste_content(&mut clip)
+                            {
+                                crate::paste::paste_text_to_terminal(terminal, &content);
+                                cx.notify();
+                                return true;
+                            }
+                        }
+                    }
+                }
+                return true;
+            }
+            Action::Quit => {
+                cx.quit();
+                return true;
+            }
+            Action::TabOverview => {
+                self.toggle_tab_overview(_window, cx);
+                return true;
+            }
+            Action::GlobalSearch => {
+                self.toggle_global_search(_window, cx);
+                return true;
+            }
+            Action::ReloadConfig => {
+                self.reload_config(_window, cx);
+                return true;
+            }
+        }
+        false
+    }
+
     fn process_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -10242,34 +10716,7 @@ impl RootView {
             let is_copy = (cfg!(target_os = "macos") && modifiers.platform && key_lower == "c")
                 || (!cfg!(target_os = "macos") && is_ctrl && key_lower == "c");
             if is_copy {
-                if let Some(sel_text) = self.ai_input_state.selected_text() {
-                    if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                        let _ = clip.set_text(sel_text);
-                    }
-                    return;
-                }
-                if let Some((msg_idx, s, e)) = self.ai_message_selection {
-                    if s < e {
-                        let text = if msg_idx < self.ai_messages.len() {
-                            Some(self.ai_messages[msg_idx].text.as_str())
-                        } else if msg_idx == self.ai_messages.len()
-                            && !self.ai_streaming_text.is_empty()
-                        {
-                            Some(self.ai_streaming_text.as_str())
-                        } else {
-                            None
-                        };
-                        if let Some(txt) = text {
-                            let selected: String = txt.chars().skip(s).take(e - s).collect();
-                            if !selected.is_empty() {
-                                if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                                    let _ = clip.set_text(selected);
-                                }
-                                return;
-                            }
-                        }
-                    }
-                }
+                self.copy_selection(false);
                 return;
             }
             // Cut: Cmd+X (macOS) or Ctrl+X (Linux/Windows)
@@ -10291,19 +10738,7 @@ impl RootView {
             let is_paste = (cfg!(target_os = "macos") && modifiers.platform && key_lower == "v")
                 || (!cfg!(target_os = "macos") && is_ctrl && key_lower == "v");
             if is_paste {
-                if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                    if let Some(img_path) = crate::paste::get_clipboard_image(&mut clip) {
-                        self.ai_attached_files.push(img_path);
-                        cx.notify();
-                        return;
-                    }
-                    if let Ok(text) = clip.get_text() {
-                        self.ai_input_state.insert_str(&text);
-                        self.ai_input_text = self.ai_input_state.text.clone();
-                        self.check_ai_at_trigger();
-                        cx.notify();
-                    }
-                }
+                self.paste_ai_input(cx);
                 return;
             }
             if key_lower == "enter" || key_lower == "return" || key_lower == "tab" {
@@ -11407,257 +11842,14 @@ impl RootView {
         }));
 
         if let Some(action) = action_opt {
-            use crate::keybindings::Action;
-            match action {
-                Action::CommandPalette => {
-                    self.toggle_command_palette(_window, cx);
-                    return;
-                }
-                Action::NewWindow => {
-                    self.execute_palette_command("new_window", _window, cx);
-                    return;
-                }
-                Action::EnterResizeMode => {
-                    self.active_key_mode = Some("resize".to_string());
-                    cx.notify();
-                    return;
-                }
-                Action::SshManager => {
-                    self.toggle_ssh_manager(_window, cx);
-                    return;
-                }
-                Action::WorktreePicker => {
-                    self.toggle_worktree_picker(_window, cx);
-                    return;
-                }
-                Action::ProjectJumper => {
-                    self.toggle_project_jumper(_window, cx);
-                    return;
-                }
-                Action::InsertFilePath => {
-                    self.toggle_file_picker(_window, cx);
-                    return;
-                }
-                Action::OpenSearch => {
-                    self.toggle_search(_window, cx);
-                    return;
-                }
-                Action::OpenSettings => {
-                    self.toggle_settings(_window, cx);
-                    return;
-                }
-                Action::ToggleFullscreen => {
-                    _window.toggle_fullscreen();
-                    return;
-                }
-                Action::NewTab => {
-                    self.create_tab(_window, cx);
-                    return;
-                }
-                Action::SplitRight => {
-                    self.split_active_pane(Direction::Right, _window, cx);
-                    return;
-                }
-                Action::SplitDown => {
-                    self.split_active_pane(Direction::Down, _window, cx);
-                    return;
-                }
-                Action::SplitLeft => {
-                    self.split_active_pane(Direction::Left, _window, cx);
-                    return;
-                }
-                Action::SplitTop => {
-                    self.split_active_pane(Direction::Top, _window, cx);
-                    return;
-                }
-                Action::ToggleTabSidebar => {
-                    self.toggle_tab_sidebar(_window, cx);
-                    return;
-                }
-                Action::ToggleProjectSidebar => {
-                    self.toggle_project_sidebar(_window, cx);
-                    return;
-                }
-                Action::ToggleAiSidebar => {
-                    self.toggle_ai_sidebar(_window, cx);
-                    return;
-                }
-
-                Action::FocusLeft => {
-                    self.focus_pane_in_direction(Direction::Left, cx);
-                    return;
-                }
-                Action::FocusRight => {
-                    self.focus_pane_in_direction(Direction::Right, cx);
-                    return;
-                }
-                Action::FocusTop => {
-                    self.focus_pane_in_direction(Direction::Top, cx);
-                    return;
-                }
-                Action::FocusDown => {
-                    self.focus_pane_in_direction(Direction::Down, cx);
-                    return;
-                }
-                Action::ClosePane => {
-                    self.close_active_pane(_window, cx);
-                    return;
-                }
-                Action::CloseTab => {
-                    if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
-                        let id = active_tab.id;
-                        self.close_tab(id, _window, cx);
-                    }
-                    return;
-                }
-                Action::NextTab => {
-                    if !self.tabs.is_empty() {
-                        self.selection = None;
-                        self.is_selecting = false;
-                        self.selection_start = None;
-                        self.activate_tab_index((self.active_tab_idx + 1) % self.tabs.len());
-                        cx.notify();
-                    }
-                    return;
-                }
-                Action::PrevTab => {
-                    if !self.tabs.is_empty() {
-                        self.selection = None;
-                        self.is_selecting = false;
-                        self.selection_start = None;
-                        let target = if self.active_tab_idx == 0 {
-                            self.tabs.len() - 1
-                        } else {
-                            self.active_tab_idx - 1
-                        };
-                        self.activate_tab_index(target);
-                        cx.notify();
-                    }
-                    return;
-                }
-                Action::SelectTab(digit) => {
-                    if (1..=9).contains(&digit) {
-                        let target = (digit - 1) as usize;
-                        if target < self.tabs.len() {
-                            self.selection = None;
-                            self.is_selecting = false;
-                            self.selection_start = None;
-                            self.activate_tab_index(target);
-                            cx.notify();
-                            return;
-                        }
-                    }
-                }
-                Action::IncreaseFontSize => {
-                    self.adjust_font_size(1.0, cx);
-                    return;
-                }
-                Action::DecreaseFontSize => {
-                    self.adjust_font_size(-1.0, cx);
-                    return;
-                }
-                Action::ResetFontSize => {
-                    if self.save_config(|config| config.font.size = 13.0) {
-                        self.palette_preview_original = None;
-                        self.font_size = self.config.font.size;
-                    }
-                    cx.notify();
-                    return;
-                }
-                Action::ClearScrollback => {
-                    if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
-                        if let Some(ref terminal) = active_tab.terminal {
-                            terminal.scroll_to_bottom();
-                            cx.notify();
-                        }
-                    }
-                    return;
-                }
-                Action::PrevPrompt => {
-                    if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
-                        if let Some(ref terminal) = active_tab.terminal {
-                            terminal.scroll_to_prev_prompt();
-                            self.last_scroll_activity = std::time::Instant::now();
-                            cx.notify();
-                        }
-                    }
-                    return;
-                }
-                Action::NextPrompt => {
-                    if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
-                        if let Some(ref terminal) = active_tab.terminal {
-                            terminal.scroll_to_next_prompt();
-                            self.last_scroll_activity = std::time::Instant::now();
-                            cx.notify();
-                        }
-                    }
-                    return;
-                }
-                Action::Copy => {
-                    if let Some((msg_idx, s, e)) = self.ai_message_selection {
-                        if s < e {
-                            let text = if msg_idx < self.ai_messages.len() {
-                                Some(self.ai_messages[msg_idx].text.as_str())
-                            } else if msg_idx == self.ai_messages.len()
-                                && !self.ai_streaming_text.is_empty()
-                            {
-                                Some(self.ai_streaming_text.as_str())
-                            } else {
-                                None
-                            };
-                            if let Some(txt) = text {
-                                let selected: String = txt.chars().skip(s).take(e - s).collect();
-                                if !selected.is_empty() {
-                                    if let Some(mut clip) =
-                                        crate::event_listener::clipboard_helper()
-                                    {
-                                        let _ = clip.set_text(selected);
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    if let Some(text) = self.get_selected_text() {
-                        if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                            let _ = clip.set_text(text);
-                        }
-                    }
-                    return;
-                }
-                Action::Paste => {
-                    if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
-                        if let Some(ref terminal) = active_tab.terminal {
-                            if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                                if let Some(content) =
-                                    crate::paste::get_clipboard_paste_content(&mut clip)
-                                {
-                                    crate::paste::paste_text_to_terminal(terminal, &content);
-                                    cx.notify();
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    return;
-                }
-                Action::Quit => {
-                    cx.quit();
-                    return;
-                }
-                Action::TabOverview => {
-                    self.toggle_tab_overview(_window, cx);
-                    return;
-                }
-                Action::GlobalSearch => {
-                    self.toggle_global_search(_window, cx);
-                    return;
-                }
-                Action::ReloadConfig => {
-                    self.reload_config(_window, cx);
-                    return;
-                }
+            if self.execute_keybinding_action(action, _window, cx) {
+                return;
             }
+        }
+
+        #[cfg(target_os = "macos")]
+        if crate::ui::native_menu::dispatch_system_shortcut(event, _window, cx) {
+            return;
         }
 
         let Some(active_tab) = self.tabs.get(self.active_tab_idx) else {
@@ -14393,7 +14585,7 @@ impl Render for RootView {
             div().size_full()
         };
 
-        div()
+        self.with_native_menu_actions(div(), cx)
             .flex()
             .flex_col()
             .size_full()

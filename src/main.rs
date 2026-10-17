@@ -5,10 +5,12 @@
 use fastty::cli::CliOptions;
 use fastty::ui::RootView;
 use gpui::{
-    actions, point, prelude::*, px, size, App, Bounds, KeyBinding, Menu, MenuItem, QuitMode,
+    actions, point, prelude::*, px, size, App, Bounds, QuitMode,
     TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
+#[cfg(not(target_os = "macos"))]
+use gpui::{KeyBinding, Menu, MenuItem};
 
 actions!(fastty, [Quit]);
 
@@ -629,11 +631,15 @@ fn main() {
                 std::future::ready(())
             })
             .detach();
+            #[cfg(not(target_os = "macos"))]
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("ctrl-q", Quit, None),
             ]);
+            #[cfg(not(target_os = "macos"))]
             cx.set_menus([Menu::new("Fastty").items([MenuItem::action("Quit Fastty", Quit)])]);
+            #[cfg(target_os = "macos")]
+            fastty::ui::native_menu::install(cx);
 
             if let Some(session) = saved_session.filter(|session| !session.windows.is_empty()) {
                 let active_window = session.active_window.min(session.windows.len() - 1);

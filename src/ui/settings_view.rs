@@ -865,6 +865,96 @@ impl SettingsView {
         }
     }
 
+    fn input_state_mut(&mut self, field: ActiveInputField) -> &mut crate::ui::TextInputState {
+        match field {
+            ActiveInputField::Search => &mut self.search_input,
+            ActiveInputField::AiBaseUrl => &mut self.ai_base_url_state,
+            ActiveInputField::AiApiKey => &mut self.ai_api_key_state,
+            ActiveInputField::AiModel => &mut self.ai_model_state,
+            ActiveInputField::FontSearch => &mut self.font_search_state,
+        }
+    }
+
+    fn select_all_active_input(&mut self, cx: &mut Context<Self>) {
+        if let Some(field) = self.active_input_field {
+            self.input_state_mut(field).select_all();
+            cx.notify();
+        }
+    }
+
+    fn copy_active_input(&mut self) {
+        let Some(field) = self.active_input_field else {
+            return;
+        };
+        if let Some(text) = self.input_state_mut(field).selected_text() {
+            if let Some(mut clipboard) = crate::event_listener::clipboard_helper() {
+                let _ = clipboard.set_text(text);
+            }
+        }
+    }
+
+    fn cut_active_input(&mut self, cx: &mut Context<Self>) {
+        let Some(field) = self.active_input_field else {
+            return;
+        };
+        if self.input_state_mut(field).selected_text().is_some() {
+            self.copy_active_input();
+            self.input_state_mut(field).delete_selection();
+            self.sync_active_field_text(field, cx);
+        }
+    }
+
+    fn paste_active_input(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(field) = self.active_input_field else {
+            return false;
+        };
+        let Some(mut clipboard) = crate::event_listener::clipboard_helper() else {
+            return false;
+        };
+        let Ok(text) = clipboard.get_text() else {
+            return false;
+        };
+        self.input_state_mut(field).insert_str(text.trim());
+        self.sync_active_field_text(field, cx);
+        true
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_native_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.capturing_action.is_some() {
+            self.handle_key_down(ev, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if crate::ui::native_menu::dispatch_settings_shortcut(
+            ev,
+            self.active_input_field.is_some(),
+            window,
+            cx,
+        ) {
+            cx.stop_propagation();
+            return;
+        }
+        let modifiers = &ev.keystroke.modifiers;
+        let plain_key = !modifiers.platform && !modifiers.control && !modifiers.alt;
+        let alt_gr = modifiers.control && modifiers.alt && !modifiers.platform;
+        let key = ev.keystroke.key.to_lowercase();
+        let text_key = ev.keystroke.key_char.as_deref().is_some_and(|text| {
+            !text.is_empty() && !text.chars().any(char::is_control)
+        }) || (key.chars().count() == 1 && !key.chars().any(char::is_control));
+        let edit_key = matches!(key.as_str(),
+            "backspace" | "delete" | "left" | "arrowleft" | "right" | "arrowright"
+                | "up" | "arrowup" | "down" | "arrowdown" | "home" | "end"
+                | "enter" | "return" | "escape" | "esc" | "tab" | "space"
+        );
+        let consume_input = self.active_input_field.is_some()
+            && (ev.prefer_character_input || alt_gr || (plain_key && (text_key || edit_key)));
+        self.handle_key_down(ev, window, cx);
+        if consume_input {
+            cx.stop_propagation();
+        }
+    }
+
     fn handle_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Press-to-capture binding editing: consume every key for the capture.
         if self.capturing_action.is_some() {
@@ -1022,15 +1112,7 @@ impl SettingsView {
             let is_select_all = (cfg!(target_os = "macos") && is_plat && key_lower == "a")
                 || (!cfg!(target_os = "macos") && is_ctrl && key_lower == "a");
             if is_select_all {
-                let state = match field {
-                    ActiveInputField::Search => &mut self.search_input,
-                    ActiveInputField::AiBaseUrl => &mut self.ai_base_url_state,
-                    ActiveInputField::AiApiKey => &mut self.ai_api_key_state,
-                    ActiveInputField::AiModel => &mut self.ai_model_state,
-                    ActiveInputField::FontSearch => &mut self.font_search_state,
-                };
-                state.select_all();
-                cx.notify();
+                self.select_all_active_input(cx);
                 return;
             }
 
@@ -1038,18 +1120,7 @@ impl SettingsView {
             let is_copy = (cfg!(target_os = "macos") && is_plat && key_lower == "c")
                 || (!cfg!(target_os = "macos") && is_ctrl && key_lower == "c");
             if is_copy {
-                let state = match field {
-                    ActiveInputField::Search => &self.search_input,
-                    ActiveInputField::AiBaseUrl => &self.ai_base_url_state,
-                    ActiveInputField::AiApiKey => &self.ai_api_key_state,
-                    ActiveInputField::AiModel => &self.ai_model_state,
-                    ActiveInputField::FontSearch => &self.font_search_state,
-                };
-                if let Some(sel) = state.selected_text() {
-                    if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                        let _ = clip.set_text(sel);
-                    }
-                }
+                self.copy_active_input();
                 return;
             }
 
@@ -1057,42 +1128,15 @@ impl SettingsView {
             let is_cut = (cfg!(target_os = "macos") && is_plat && key_lower == "x")
                 || (!cfg!(target_os = "macos") && is_ctrl && key_lower == "x");
             if is_cut {
-                let state = match field {
-                    ActiveInputField::Search => &mut self.search_input,
-                    ActiveInputField::AiBaseUrl => &mut self.ai_base_url_state,
-                    ActiveInputField::AiApiKey => &mut self.ai_api_key_state,
-                    ActiveInputField::AiModel => &mut self.ai_model_state,
-                    ActiveInputField::FontSearch => &mut self.font_search_state,
-                };
-                if let Some(sel) = state.selected_text() {
-                    if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                        let _ = clip.set_text(sel);
-                    }
-                    state.delete_selection();
-                    self.sync_active_field_text(field, cx);
-                }
+                self.cut_active_input(cx);
                 return;
             }
 
             // Paste: Cmd+V (macOS) or Ctrl+V (Linux/Windows)
             let is_paste = (cfg!(target_os = "macos") && is_plat && key_lower == "v")
                 || (!cfg!(target_os = "macos") && is_ctrl && key_lower == "v");
-            if is_paste {
-                if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                    if let Ok(text) = clip.get_text() {
-                        let clean = text.trim();
-                        let state = match field {
-                            ActiveInputField::Search => &mut self.search_input,
-                            ActiveInputField::AiBaseUrl => &mut self.ai_base_url_state,
-                            ActiveInputField::AiApiKey => &mut self.ai_api_key_state,
-                            ActiveInputField::AiModel => &mut self.ai_model_state,
-                            ActiveInputField::FontSearch => &mut self.font_search_state,
-                        };
-                        state.insert_str(clean);
-                        self.sync_active_field_text(field, cx);
-                        return;
-                    }
-                }
+            if is_paste && self.paste_active_input(cx) {
+                return;
             }
 
             if key_lower == "enter" || key_lower == "return" {
@@ -5163,10 +5207,41 @@ impl Render for SettingsView {
         let theme = self.theme;
         let win_ref = &*window;
         // UX3: detect on-disk edits made outside this window (throttled).
-        self.refresh_stale_state();        div()
-            .track_focus(&self.focus_handle)
-            .key_context("SettingsView")
-            .on_key_down(cx.listener(Self::handle_key_down))
+        self.refresh_stale_state();
+        let view = div().track_focus(&self.focus_handle);
+        #[cfg(target_os = "macos")]
+        let view = view
+            .on_key_down(cx.listener(Self::handle_native_key_down))
+            .on_action(cx.listener(|this, _: &crate::ui::native_menu::Find, window, cx| {
+                this.active_input_field = Some(ActiveInputField::Search);
+                this.font_combobox_open = false;
+                this.theme_dropdown_open = false;
+                window.focus(&this.focus_handle, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &crate::ui::native_menu::OpenSettings, window, cx| {
+                window.activate_window();
+                window.focus(&this.focus_handle, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::ui::native_menu::CheckForUpdates, window, cx| {
+                this.active_tab = SettingsTab::General;
+                this.check_updates_now(window, cx);
+                cx.notify();
+            }))
+            .when(self.active_input_field.is_some() && self.capturing_action.is_none(), |view| {
+                view.on_action(cx.listener(|this, _: &crate::ui::native_menu::Copy, _, _| {
+                    this.copy_active_input();
+                }))
+                .on_action(cx.listener(|this, _: &crate::ui::native_menu::Paste, _, cx| {
+                    this.paste_active_input(cx);
+                }))
+                .on_action(cx.listener(|this, _: &crate::ui::native_menu::SelectAll, _, cx| {
+                    this.select_all_active_input(cx);
+                }))
+            });
+        #[cfg(not(target_os = "macos"))]
+        let view = view.on_key_down(cx.listener(Self::handle_key_down));
+        view.key_context("SettingsView")
             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_menu_outside_click))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::handle_menu_outside_click))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))

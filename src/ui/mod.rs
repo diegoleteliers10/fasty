@@ -22,3 +22,5 @@ pub use text_input::{render_line_spans, wrap_text_into_lines, TextInputState, Wr
 pub use theme::Theme;
 
 pub mod markdown;
+#[cfg(target_os = "macos")]
+pub mod native_menu;

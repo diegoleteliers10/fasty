@@ -198,6 +198,15 @@ right_widgets = ["cwd", "duration", "exit_code"]
 
 ---
 
+## macOS menu bar
+
+The native menu bar provides Fastty, Terminal, Edit, View, Window, and Help menus.
+Terminal commands use the active window and pane. Edit commands use the active
+supported text field or terminal selection. Menu shortcuts follow your keybinding
+settings. Unavailable terminal commands are disabled in Settings and input dialogs.
+
+Quit Fastty preserves hosted sessions. Close Pane and Close Tab end their sessions.
+
 ## Keyboard Shortcuts
 
 | Action | macOS | Linux / Windows |
