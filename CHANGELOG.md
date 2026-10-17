@@ -3,6 +3,32 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.23.1 - 2026-10-16
+
+### Native macOS menus
+
+- Add Fastty, Terminal, Edit, View, Window, and Help menus to the macOS menu bar.
+- Add Settings, About, update checks, Services, Hide, and Quit commands.
+- Add window, tab, split, panel, font size, and full-screen commands.
+- Use the active terminal pane or supported text field for editing commands.
+- Preserve AI image paste and Settings text edits.
+- Show current configured shortcuts without changing key modes, key sequences, or shortcut capture.
+- Add window cycling, minimize, documentation, issue reporting, and diagnostic copy commands.
+- Keep hosted sessions alive when Fastty quits.
+
+### Terminal context menus
+
+- Open the context menu in each pane after session restore, including panes with mouse reporting.
+- Keep the menu and text selection attached to the clicked pane.
+- Use Option-right-click on macOS or Alt-right-click on Linux and Windows to send the click to a mouse-enabled terminal program.
+- Preserve terminal mouse modes and scrolling.
+- Avoid unmatched mouse release reports when Fastty handles the context menu.
+
+### Validation
+
+- Checked Rust syntax and reviewed the source changes.
+- Compilation and native app behavior have not been checked.
+
 ## 0.23.0 - 2026-10-16
 
 ### Agent status
