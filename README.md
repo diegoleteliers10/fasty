@@ -225,6 +225,10 @@ Quit Fastty preserves hosted sessions. Close Pane and Close Tab end their sessio
 | **Clear Scrollback** | `⌘K` | `Ctrl+Shift+K` |
 | **Zoom In / Out / Reset** | `⌘+` / `⌘-` / `⌘0` | `Ctrl+Plus` / `Ctrl+Minus` / `Ctrl+0` |
 
+Right-click opens the terminal menu in each pane, including restored panes.
+If a terminal program captures the mouse, hold Option on macOS or Alt on
+Linux and Windows while you right-click to send the click to that program.
+
 ---
 
 ## License

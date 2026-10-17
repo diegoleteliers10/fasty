@@ -12281,11 +12281,57 @@ impl RootView {
         let col = ((local_x / cell_w).floor() as usize) + 1;
         let row = ((local_y / line_h).floor() as usize) + 1;
 
+        let target_pane_id = clicked_pane_id.unwrap_or(active_tab.pane_tree.active_pane_id);
+        let mouse_reporting = terminal.is_mouse_mode_enabled();
+        if event.button == MouseButton::Right && (!mouse_reporting || !event.modifiers.alt) {
+            self.selection = self.selection.filter(|selection| selection.pane_id == target_pane_id);
+            if self.selection.is_none() {
+                let history_size = terminal.history_size();
+                let screen_rows = ((pane_h / line_h) as i32).max(1);
+                let screen_cols = ((pane_w / cell_w) as usize).max(1);
+                let display_offset = terminal.display_offset();
+                let grid_col =
+                    ((local_x / cell_w).floor() as usize).min(screen_cols.saturating_sub(1));
+                let grid_row = (((local_y / line_h).floor() as i32) - (display_offset as i32))
+                    .clamp(-(history_size as i32), screen_rows - 1);
+                let point = alacritty_terminal::index::Point::new(
+                    alacritty_terminal::index::Line(grid_row),
+                    alacritty_terminal::index::Column(grid_col),
+                );
+
+                if let Some(term_guard) = terminal.term().try_lock() {
+                    let grid = term_guard.grid();
+                    if let Some((_token, start_c, end_c)) =
+                        crate::selection_classifier::extract_token(grid, point, screen_cols)
+                    {
+                        let start_p = alacritty_terminal::index::Point::new(
+                            alacritty_terminal::index::Line(grid_row),
+                            alacritty_terminal::index::Column(start_c),
+                        );
+                        let end_p = alacritty_terminal::index::Point::new(
+                            alacritty_terminal::index::Line(grid_row),
+                            alacritty_terminal::index::Column(end_c.saturating_sub(1)),
+                        );
+                        self.selection = Some(Selection {
+                            pane_id: target_pane_id,
+                            start: start_p,
+                            end: end_p,
+                        });
+                    }
+                }
+            }
+            self.is_selecting = false;
+            self.has_selection_dragged = false;
+            self.selection_start = None;
+            self.open_pane_context_menu(target_pane_id, mouse_x, mouse_y, cx);
+            return;
+        }
+
         if !self.pressed_mouse_buttons.contains(&event.button) {
             self.pressed_mouse_buttons.push(event.button);
         }
 
-        if terminal.is_mouse_mode_enabled() {
+        if mouse_reporting {
             let btn = match event.button {
                 MouseButton::Left => 0,
                 MouseButton::Middle => 1,
@@ -12306,8 +12352,6 @@ impl RootView {
             );
             return;
         }
-
-        let target_pane_id = clicked_pane_id.unwrap_or(active_tab.pane_tree.active_pane_id);
 
         if event.button == MouseButton::Left {
             // URL Click check (Cmd+Click on macOS, Ctrl+Click on Linux/Windows)
@@ -12452,47 +12496,6 @@ impl RootView {
             self.selection = None;
             self.selection_mouse_pos = Some((mouse_x, mouse_y));
             cx.notify();
-        } else if event.button == MouseButton::Right {
-            // Right click: If no selection yet, select word under cursor if present, and open context menu
-            if self.selection.is_none() {
-                let history_size = terminal.history_size();
-                let screen_rows = ((pane_h / line_h) as i32).max(1);
-                let screen_cols = ((pane_w / cell_w) as usize).max(1);
-                let display_offset = terminal.display_offset();
-                let grid_col =
-                    ((local_x / cell_w).floor() as usize).min(screen_cols.saturating_sub(1));
-                let grid_row = (((local_y / line_h).floor() as i32) - (display_offset as i32))
-                    .clamp(-(history_size as i32), screen_rows - 1);
-                let point = alacritty_terminal::index::Point::new(
-                    alacritty_terminal::index::Line(grid_row),
-                    alacritty_terminal::index::Column(grid_col),
-                );
-
-                if let Some(term_guard) = terminal.term().try_lock() {
-                    let grid = term_guard.grid();
-                    if let Some((_token, start_c, end_c)) =
-                        crate::selection_classifier::extract_token(grid, point, screen_cols)
-                    {
-                        let start_p = alacritty_terminal::index::Point::new(
-                            alacritty_terminal::index::Line(grid_row),
-                            alacritty_terminal::index::Column(start_c),
-                        );
-                        let end_p = alacritty_terminal::index::Point::new(
-                            alacritty_terminal::index::Line(grid_row),
-                            alacritty_terminal::index::Column(end_c.saturating_sub(1)),
-                        );
-                        self.selection = Some(Selection {
-                            pane_id: target_pane_id,
-                            start: start_p,
-                            end: end_p,
-                        });
-                    }
-                }
-            }
-            self.is_selecting = false;
-            self.has_selection_dragged = false;
-            self.selection_start = None;
-            self.open_pane_context_menu(target_pane_id, mouse_x, mouse_y, cx);
         }
     }
 
