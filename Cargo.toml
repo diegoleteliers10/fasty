@@ -67,7 +67,7 @@ base64 = "0.22"
 semver = "1.0"
 sha2 = "0.10"
 hex = "0.4"
-sysinfo = "=0.31.4"
+sysinfo = "=0.39.6"
 
 
 [build-dependencies]
