@@ -362,7 +362,7 @@ pub fn run_capture_command(id: usize, wait_secs: Option<u64>) -> ! {
                 std::process::exit(1);
             }
         };
-        if let Err(error) = send_request(&mut stream, &Request::Hello { read_only: true }) {
+        if let Err(error) = send_request(&mut stream, &Request::Hello { read_only: true, protocol_version: Some(crate::daemon::PROTOCOL_VERSION) }) {
             eprintln!("fastty capture: {error}");
             std::process::exit(1);
         }
@@ -460,7 +460,7 @@ pub fn run_events_command(wait_secs: Option<u64>) -> ! {
                 std::process::exit(1);
             }
         };
-        if let Err(error) = send_request(&mut stream, &Request::Hello { read_only: true }) {
+        if let Err(error) = send_request(&mut stream, &Request::Hello { read_only: true, protocol_version: Some(crate::daemon::PROTOCOL_VERSION) }) {
             eprintln!("fastty events: {error}");
             std::process::exit(1);
         }
@@ -565,6 +565,7 @@ pub fn run_events_command(wait_secs: Option<u64>) -> ! {
                                 "session": session,
                             })
                         }
+                        crate::daemon::SessionEvent::Unknown => continue,
                     }
                 }
                 Response::Error { code, message } => {
@@ -1092,7 +1093,7 @@ pub fn run_write_command(id: usize, text: String, enter: bool, wait_secs: Option
                 std::process::exit(1);
             }
         };
-        if let Err(error) = send_request(&mut stream, &Request::Hello { read_only: false }) {
+        if let Err(error) = send_request(&mut stream, &Request::Hello { read_only: false, protocol_version: Some(crate::daemon::PROTOCOL_VERSION) }) {
             eprintln!("fastty write: {error}");
             std::process::exit(1);
         }
@@ -1175,7 +1176,7 @@ pub fn run_send_command(id: usize, text: String, enter: bool, wait_secs: Option<
     {
         let result = (|| {
             let mut stream = connect_with_retry(wait_secs)?;
-            send_request(&mut stream, &Request::Hello { read_only: false })?;
+            send_request(&mut stream, &Request::Hello { read_only: false, protocol_version: Some(crate::daemon::PROTOCOL_VERSION) })?;
             let mut reader = std::io::BufReader::new(stream);
             if !matches!(read_response(&mut reader)?, Response::Hello { .. }) {
                 return Err("daemon did not accept the hello request".to_string());
@@ -1244,7 +1245,7 @@ pub fn run_agent_status_command(state: String, app: String, kind: Option<String>
                 payload.push_str(&format!(":kind={kind}"));
             }
             let mut stream = connect()?;
-            send_request(&mut stream, &Request::Hello { read_only: false })?;
+            send_request(&mut stream, &Request::Hello { read_only: false, protocol_version: Some(crate::daemon::PROTOCOL_VERSION) })?;
             let mut reader = std::io::BufReader::new(stream);
             if !matches!(read_response(&mut reader)?, Response::Hello { .. }) {
                 return Err("daemon did not accept the hello request".to_string());

@@ -543,7 +543,7 @@ fn handle_websocket(mut stream: TcpStream, key: &str, read_only: bool) {
 
         // When in read_only mode, send hello with read_only flag to enforce on daemon side
         if read_only {
-            let hello_req = serde_json::to_string(&crate::daemon::Request::Hello { read_only: true })
+            let hello_req = serde_json::to_string(&crate::daemon::Request::Hello { read_only: true, protocol_version: Some(crate::daemon::PROTOCOL_VERSION) })
                 .unwrap_or_else(|_| r#"{"cmd":"hello","read_only":true}"#.to_string());
             let _ = unix_stream.write_all(format!("{}\n", hello_req).as_bytes());
             let _ = unix_stream.flush();
@@ -618,7 +618,7 @@ fn handle_websocket(mut stream: TcpStream, key: &str, read_only: bool) {
                             }
                         }
                     }
-                    let mut line = text;
+                    let mut line = announce_protocol_version(text);
                     line.push('\n');
                     if unix_write.write_all(line.as_bytes()).is_err() {
                         break;
@@ -633,6 +633,29 @@ fn handle_websocket(mut stream: TcpStream, key: &str, read_only: bool) {
         alive.store(false, Ordering::Relaxed);
         let _ = forward_to_browser.join();
     }
+}
+
+/// The gateway ships with the daemon, so a browser `hello` without a version
+/// speaks the daemon's own protocol version.
+fn announce_protocol_version(text: String) -> String {
+    // The gateway forwards every browser frame; the substring check keeps the
+    // per-message JSON parse off the typing hot path.
+    if !text.contains("\"hello\"") {
+        return text;
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return text;
+    };
+    if value.get("cmd").and_then(|cmd| cmd.as_str()) != Some("hello") {
+        return text;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return text;
+    };
+    object
+        .entry("protocol_version")
+        .or_insert_with(|| serde_json::json!(crate::daemon::PROTOCOL_VERSION));
+    serde_json::to_string(&value).unwrap_or(text)
 }
 
 pub fn send_ws_text(stream: &mut TcpStream, text: &str) -> std::io::Result<()> {
@@ -817,6 +840,24 @@ mod tests {
         assert!(!is_origin_allowed("http://localhost:3000", "localhost:8765"));
         assert!(!is_origin_allowed("null", "localhost:8765"));
         assert!(!is_origin_allowed("http://192.168.1.50:8765", "192.168.1.51:8765"));
+    }
+
+    #[test]
+    fn test_gateway_announces_its_protocol_version_on_browser_hello() {
+        let hello = announce_protocol_version(r#"{"cmd":"hello"}"#.to_string());
+        let value: serde_json::Value = serde_json::from_str(&hello).unwrap();
+        assert_eq!(
+            value["protocol_version"],
+            serde_json::json!(crate::daemon::PROTOCOL_VERSION)
+        );
+
+        let explicit =
+            announce_protocol_version(r#"{"cmd":"hello","protocol_version":1}"#.to_string());
+        let value: serde_json::Value = serde_json::from_str(&explicit).unwrap();
+        assert_eq!(value["protocol_version"], 1);
+
+        let other = announce_protocol_version(r#"{"cmd":"list"}"#.to_string());
+        assert_eq!(other, r#"{"cmd":"list"}"#);
     }
 
     #[test]

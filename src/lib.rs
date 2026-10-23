@@ -40,3 +40,4 @@ pub mod server;
 
 pub mod server_api;
 pub mod process_state;
+pub mod protocol_compat;

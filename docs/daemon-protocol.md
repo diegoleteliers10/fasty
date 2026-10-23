@@ -26,6 +26,7 @@ Un objeto JSON por línea (`\n`-terminated) en ambas direcciones.
 ```jsonc
 {"cmd": "hello"}
 {"cmd": "hello", "read_only": true}
+{"cmd": "hello", "protocol_version": 2}
 {"cmd": "set_access_scope", "scope": "observe"}
 {"cmd": "set_access_scope", "scope": "interact"}
 {"cmd": "list"}
@@ -153,6 +154,38 @@ does not store a parser that is inside an incomplete escape sequence.
 - `layout`: devuelve `{"event": "layout", "tabs": [...]}` con la estructura completa de la ventana — cada tab con sus panes (id, title, cwd, activo, tamaño). Sesiones headless sin tab no aparecen aquí; están en `list`.
 - `resize_window`: redimensiona la ventana de fastty aproximándose a `cols` x `rows` del pane activo (con splits es aproximado; para mover divisores usar `resize_pane`). Responde `done` con `cmd: "resize_window"`.
 - `binary_snapshot`: solicita un snapshot binario con cabecera `FST1` (comprimido con Deflate). `screen_only: true` excluye el scrollback. Los clientes antiguos omiten el campo y conservan el snapshot completo.
+
+## Compatibilidad entre versiones
+
+Un cliente anuncia su versión de protocolo en `hello` con el campo opcional
+`protocol_version`. Un host nuevo adapta cada respuesta a esa versión. Un host
+antiguo ignora el campo.
+
+Casos:
+
+1. Sin `hello`, el host responde con la forma nativa.
+2. Con `hello` y sin `protocol_version`, el cliente recibe la forma más antigua
+   que el host todavía soporta. Es el caso de un cliente que no conoce la
+   negociación.
+3. Con `protocol_version`, el host aplica las reglas de compatibilidad entre esa
+   versión y la suya.
+
+Cada cambio de API es una regla en `src/protocol_compat.rs`. La regla nombra la
+versión donde empezó el cambio, un JSON pointer (RFC 6901) y el tipo de cambio:
+campo agregado, campo renombrado o campo eliminado. El primer token del pointer
+es la etiqueta del mensaje (`cmd`, `event` o `type`). El token `*` recorre
+cualquier clave de objeto o cualquier elemento de arreglo.
+
+El host aplica las reglas a las respuestas que salen y a las solicitudes que
+llegan. El cliente que abre un host aplica las reglas a las solicitudes que
+salen. Los mensajes sin reglas se envían sin tocar el JSON.
+
+Un evento desconocido no rompe un cliente. El cliente lo lee como
+`Response::Unknown` y sigue leyendo la conexión. Un comando desconocido sí
+devuelve error `bad_request`, porque el host no puede ejecutarlo.
+
+Los campos nuevos se marcan con `#[serde(default)]`. Un cliente antiguo los
+ignora. Los campos eliminados o renombrados necesitan una regla.
 
 ### Responses (daemon → cliente)
 

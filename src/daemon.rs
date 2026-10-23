@@ -563,6 +563,11 @@ pub enum Request {
     Hello {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         read_only: bool,
+        /// Protocol version this client speaks. Absent means the client
+        /// predates version negotiation, so the host answers with the oldest
+        /// shape it still supports.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<u32>,
     },
     List,
     ApiList,
@@ -718,6 +723,42 @@ pub enum Request {
     },
 }
 
+impl Request {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Hello { .. } => "hello",
+            Self::List => "list",
+            Self::ApiList => "api_list",
+            Self::ApiDescribe { .. } => "api_describe",
+            Self::HostStatus => "host_status",
+            Self::RestartHost { .. } => "restart_host",
+            Self::SessionExists { .. } => "session_exists",
+            Self::SessionStatus { .. } => "session_status",
+            Self::SpawnStatus { .. } => "spawn_status",
+            Self::CloseIfIdle { .. } => "close_if_idle",
+            Self::CloseIfIdleBatch { .. } => "close_if_idle_batch",
+            Self::SubscribeSessions => "subscribe_sessions",
+            Self::SubscribeEvents { .. } => "subscribe_events",
+            Self::Capture { .. } => "capture",
+            Self::SetAccessScope { .. } => "set_access_scope",
+            Self::Attach { .. } => "attach",
+            Self::Detach { .. } => "detach",
+            Self::Write { .. } => "write",
+            Self::ExternalAction { .. } => "external_action",
+            Self::Resize { .. } => "resize",
+            Self::Spawn { .. } => "spawn",
+            Self::Close { .. } => "close",
+            Self::SplitPane { .. } => "split_pane",
+            Self::ResizePane { .. } => "resize_pane",
+            Self::FocusPane { .. } => "focus_pane",
+            Self::Layout => "layout",
+            Self::ResizeWindow { .. } => "resize_window",
+            Self::ReportProgramStatus { .. } => "report_program_status",
+            Self::BinarySnapshot { .. } => "binary_snapshot",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ExternalAction {
@@ -836,6 +877,22 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         terminal_state_changed: bool,
     },
+    /// A session event this build does not know. Never sent.
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+impl SessionEvent {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::ProcessChanged { .. } => "process_changed",
+            Self::SessionAdded { .. } => "session_added",
+            Self::SessionRemoved { .. } => "session_removed",
+            Self::SessionUpdated { .. } => "session_updated",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// One pane inside a tab, as reported by `layout`.
@@ -969,6 +1026,7 @@ pub enum Response {
         id: PaneId,
         cols: usize,
         rows: usize,
+        #[serde(default)]
         mode: AttachMode,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         program_status: Vec<crate::program_status::ProgramRecord>,
@@ -1042,6 +1100,49 @@ pub enum Response {
         code: String,
         message: String,
     },
+    /// An event this build does not know. Parsed from a newer host or client,
+    /// never sent. Callers must ignore it and keep reading.
+    #[serde(other)]
+    #[schemars(skip)]
+    Unknown,
+}
+
+impl Response {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::ApiList { .. } => "api_list",
+            Self::ApiDescribe { .. } => "api_describe",
+            Self::HostStatus { .. } => "host_status",
+            Self::HostRestarting => "host_restarting",
+            Self::Hello { .. } => "hello",
+            Self::Sessions { .. } => "sessions",
+            Self::ProcessStates { .. } => "process_states",
+            Self::EventStreamStarted { .. } => "event_stream_started",
+            Self::EventStreamGap { .. } => "event_stream_gap",
+            Self::StreamEvent { .. } => "stream_event",
+            Self::Captured { .. } => "captured",
+            Self::SessionExists { .. } => "session_exists",
+            Self::SessionStatus { .. } => "session_status",
+            Self::CloseBlocked { .. } => "close_blocked",
+            Self::CloseBatch { .. } => "close_batch",
+            Self::SessionAdded { .. } => "session_added",
+            Self::SessionRemoved { .. } => "session_removed",
+            Self::SessionUpdated { .. } => "session_updated",
+            Self::Attached { .. } => "attached",
+            Self::Snapshot { .. } => "snapshot",
+            Self::BinarySnapshot { .. } => "binary_snapshot",
+            Self::Detached { .. } => "detached",
+            Self::Closed { .. } => "closed",
+            Self::Output { .. } => "output",
+            Self::Spawned { .. } => "spawned",
+            Self::SpawnStatus { .. } => "spawn_status",
+            Self::PaneSplit { .. } => "pane_split",
+            Self::Layout { .. } => "layout",
+            Self::Done { .. } => "done",
+            Self::Error { .. } => "error",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 pub fn spawn_headless_session(
@@ -1160,7 +1261,7 @@ mod unix_impl {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::Duration;
 
     pub fn run() {
@@ -1244,11 +1345,44 @@ mod unix_impl {
     }
 
     pub(super) struct Conn {
-        pub(super) out: Arc<Mutex<UnixStream>>,
+        pub(super) out: Arc<Mutex<PeerStream>>,
         pub(super) conn_alive: Arc<AtomicBool>,
         pub(super) read_only: bool,
         pub(super) access_scope: AccessScope,
         pub(super) attachments: HashMap<PaneId, Attachment>,
+    }
+
+    /// The write half of a connection plus the protocol version its peer
+    /// announced in `hello`. Threads cloned for `attach` keep the version.
+    pub(super) struct PeerStream {
+        stream: UnixStream,
+        protocol: AtomicU32,
+    }
+
+    impl PeerStream {
+        pub(super) fn new(stream: UnixStream) -> Self {
+            Self {
+                stream,
+                protocol: AtomicU32::new(0),
+            }
+        }
+
+        /// `None` until the peer sends `hello`.
+        pub(super) fn announced(&self) -> Option<u32> {
+            match self.protocol.load(Ordering::Relaxed) {
+                0 => None,
+                version => Some(version),
+            }
+        }
+
+        fn announce(&self, version: Option<u32>) {
+            let version = version.unwrap_or(1).clamp(1, PROTOCOL_VERSION);
+            self.protocol.store(version, Ordering::Relaxed);
+        }
+
+        fn encode(&self, response: &Response) -> Option<String> {
+            crate::protocol_compat::encode_response(response, self.announced())
+        }
     }
 
     fn handle_connection(stream: UnixStream) {
@@ -1257,7 +1391,7 @@ mod unix_impl {
             Err(_) => return,
         };
         let mut conn = Conn {
-            out: Arc::new(Mutex::new(write_half)),
+            out: Arc::new(Mutex::new(PeerStream::new(write_half))),
             conn_alive: Arc::new(AtomicBool::new(true)),
             read_only: false,
             access_scope: AccessScope::Manage,
@@ -1270,7 +1404,8 @@ mod unix_impl {
             if line.trim().is_empty() {
                 continue;
             }
-            let request: Request = match serde_json::from_str(&line) {
+            let peer = conn.out.lock().announced();
+            let request = match crate::protocol_compat::parse_request(&line, peer) {
                 Ok(r) => r,
                 Err(e) => {
                     send(
@@ -1303,7 +1438,8 @@ mod unix_impl {
                 Ok(api) => send(&conn.out, &Response::ApiDescribe { api }),
                 Err(message) => send(&conn.out, &Response::Error { code: "unknown_method".into(), message }),
             }; },
-            Request::Hello { read_only } => {
+            Request::Hello { read_only, protocol_version } => {
+                conn.out.lock().announce(protocol_version);
                 if read_only {
                     conn.read_only = true;
                     conn.access_scope = AccessScope::Observe;
@@ -2322,12 +2458,13 @@ mod unix_impl {
         }
     }
 
-    fn send(out: &Arc<Mutex<UnixStream>>, response: &Response) -> bool {
-        let Ok(mut line) = serde_json::to_string(response) else {
-            return false;
+    fn send(out: &Arc<Mutex<PeerStream>>, response: &Response) -> bool {
+        let mut peer = out.lock();
+        let Some(mut line) = peer.encode(response) else {
+            return true;
         };
         line.push('\n');
-        out.lock().write_all(line.as_bytes()).is_ok()
+        peer.stream.write_all(line.as_bytes()).is_ok()
     }
 
     fn reject_access_scope(conn: &Conn, required: AccessScope) -> bool {
@@ -2488,9 +2625,9 @@ mod tests {
         use std::io::{BufRead, BufReader};
         use std::os::unix::net::UnixStream;
         use std::sync::atomic::AtomicBool;
-        use unix_impl::{handle_request, Conn};
+        use unix_impl::{handle_request, Conn, PeerStream};
         let (client, server) = UnixStream::pair().unwrap();
-        let mut conn = Conn { out: Arc::new(Mutex::new(server)), conn_alive: Arc::new(AtomicBool::new(true)), read_only: false, access_scope: AccessScope::Manage, attachments: HashMap::new() };
+        let mut conn = Conn { out: Arc::new(Mutex::new(PeerStream::new(server))), conn_alive: Arc::new(AtomicBool::new(true)), read_only: false, access_scope: AccessScope::Manage, attachments: HashMap::new() };
         handle_request(Request::Attach { id: usize::MAX, expected_host_instance: Some(HostInstanceId("previous-host".into())), mode: AttachMode::ReadWrite, binary_snapshot: false, snapshot_format: SnapshotFormat::Legacy }, &mut conn);
         let mut line = String::new();
         BufReader::new(client).read_line(&mut line).unwrap();
@@ -2529,8 +2666,8 @@ mod tests {
     #[test]
     fn test_request_serialization_roundtrip() {
         let reqs = vec![
-            Request::Hello { read_only: false },
-            Request::Hello { read_only: true },
+            Request::Hello { read_only: false, protocol_version: Some(PROTOCOL_VERSION) },
+            Request::Hello { read_only: true, protocol_version: Some(PROTOCOL_VERSION) },
             Request::List,
             Request::SessionStatus { id: 42 },
             Request::SubscribeSessions,
@@ -2610,7 +2747,7 @@ mod tests {
             let json = serde_json::to_string(&req).expect("serialize");
             let parsed: Request = serde_json::from_str(&json).expect("deserialize");
             match (&req, &parsed) {
-                (Request::Hello { read_only: a }, Request::Hello { read_only: b }) => {
+                (Request::Hello { read_only: a, .. }, Request::Hello { read_only: b, .. }) => {
                     assert_eq!(a, b);
                 }
                 (Request::List, Request::List) => {}
@@ -2815,14 +2952,14 @@ mod tests {
         let json_no_flag = r#"{"cmd":"hello"}"#;
         let req1: Request = serde_json::from_str(json_no_flag).expect("deserialize without flag");
         match req1 {
-            Request::Hello { read_only } => assert!(!read_only),
+            Request::Hello { read_only, .. } => assert!(!read_only),
             _ => panic!("wrong variant"),
         }
 
         let json_with_flag = r#"{"cmd":"hello","read_only":true}"#;
         let req2: Request = serde_json::from_str(json_with_flag).expect("deserialize with flag");
         match req2 {
-            Request::Hello { read_only } => assert!(read_only),
+            Request::Hello { read_only, .. } => assert!(read_only),
             _ => panic!("wrong variant"),
         }
     }
@@ -2833,11 +2970,11 @@ mod tests {
         use std::io::{BufRead, BufReader};
         use std::os::unix::net::UnixStream;
         use std::sync::atomic::AtomicBool;
-        use unix_impl::{handle_request, Conn};
+        use unix_impl::{handle_request, Conn, PeerStream};
 
         let (client, server) = UnixStream::pair().unwrap();
         let mut conn = Conn {
-            out: Arc::new(Mutex::new(server)),
+            out: Arc::new(Mutex::new(PeerStream::new(server))),
             conn_alive: Arc::new(AtomicBool::new(true)),
             read_only: false,
             access_scope: AccessScope::Manage,
@@ -2847,7 +2984,7 @@ mod tests {
         let mut client_reader = BufReader::new(client);
 
         // 1. Send Hello with read_only: true
-        handle_request(Request::Hello { read_only: true }, &mut conn);
+        handle_request(Request::Hello { read_only: true, protocol_version: Some(PROTOCOL_VERSION) }, &mut conn);
         assert!(conn.read_only);
 
         let mut line = String::new();
@@ -2861,7 +2998,7 @@ mod tests {
             .any(|value| value == "close_if_idle"));
 
         // 2. Try to disable read_only with Hello { read_only: false } -> should remain sticky true
-        handle_request(Request::Hello { read_only: false }, &mut conn);
+        handle_request(Request::Hello { read_only: false, protocol_version: Some(PROTOCOL_VERSION) }, &mut conn);
         assert!(conn.read_only);
         line.clear();
         client_reader.read_line(&mut line).unwrap();
@@ -2934,16 +3071,68 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn hello_response(protocol_version: Option<u32>) -> serde_json::Value {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::AtomicBool;
+        use unix_impl::{handle_request, Conn, PeerStream};
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut conn = Conn {
+            out: Arc::new(Mutex::new(PeerStream::new(server))),
+            conn_alive: Arc::new(AtomicBool::new(true)),
+            read_only: false,
+            access_scope: AccessScope::Manage,
+            attachments: HashMap::new(),
+        };
+        handle_request(
+            Request::Hello {
+                read_only: false,
+                protocol_version,
+            },
+            &mut conn,
+        );
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hello_without_a_version_receives_the_oldest_supported_shape() {
+        let hello = hello_response(None);
+        assert!(hello.get("capabilities").is_none());
+        assert!(hello.get("host_instance").is_none());
+        assert!(hello.get("version").is_some());
+        assert!(hello.get("fastty_version").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hello_with_the_native_version_receives_the_native_shape() {
+        let hello = hello_response(Some(PROTOCOL_VERSION));
+        assert!(hello["capabilities"].is_array());
+        assert!(hello.get("host_instance").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hello_with_a_future_version_is_capped_to_the_native_shape() {
+        let hello = hello_response(Some(PROTOCOL_VERSION + 5));
+        assert!(hello["capabilities"].is_array());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn test_close_gui_vs_headless_session() {
         use std::io::{BufRead, BufReader};
         use std::os::unix::net::UnixStream;
         use std::sync::atomic::AtomicBool;
-        use unix_impl::{handle_request, Conn};
+        use unix_impl::{handle_request, Conn, PeerStream};
 
         let (client, server) = UnixStream::pair().unwrap();
         let mut conn = Conn {
-            out: Arc::new(Mutex::new(server)),
+            out: Arc::new(Mutex::new(PeerStream::new(server))),
             conn_alive: Arc::new(AtomicBool::new(true)),
             read_only: false,
             access_scope: AccessScope::Manage,
@@ -3018,11 +3207,11 @@ mod tests {
         use std::io::{BufRead, BufReader};
         use std::os::unix::net::UnixStream;
         use std::sync::atomic::AtomicBool;
-        use unix_impl::{handle_request, Conn};
+        use unix_impl::{handle_request, Conn, PeerStream};
 
         let (client, server) = UnixStream::pair().unwrap();
         let mut conn = Conn {
-            out: Arc::new(Mutex::new(server)),
+            out: Arc::new(Mutex::new(PeerStream::new(server))),
             conn_alive: Arc::new(AtomicBool::new(true)),
             read_only: false,
             access_scope: AccessScope::Manage,
@@ -3188,11 +3377,11 @@ mod tests {
         use std::io::{BufRead, BufReader};
         use std::os::unix::net::UnixStream;
         use std::sync::atomic::AtomicBool;
-        use unix_impl::{handle_request, Conn};
+        use unix_impl::{handle_request, Conn, PeerStream};
 
         let (client, server) = UnixStream::pair().unwrap();
         let mut conn = Conn {
-            out: Arc::new(Mutex::new(server)),
+            out: Arc::new(Mutex::new(PeerStream::new(server))),
             conn_alive: Arc::new(AtomicBool::new(true)),
             read_only: false,
             access_scope: AccessScope::Manage,

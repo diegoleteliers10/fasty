@@ -1,6 +1,6 @@
 //! Local process host for PTY sessions.
 
-use crate::daemon::{AttachMode, BlockedSession, Request, Response, SessionInfo};
+use crate::daemon::{AttachMode, BlockedSession, Request, Response, SessionInfo, PROTOCOL_VERSION};
 use std::io::{BufRead, BufReader, Write};
 
 #[derive(Debug)]
@@ -189,7 +189,7 @@ fn probe_host_with_access(
     mut stream: std::os::unix::net::UnixStream,
     read_only: bool,
 ) -> Result<HostInfo, String> {
-    write_request(&mut stream, &Request::Hello { read_only }).map_err(|error| error.to_string())?;
+    write_request(&mut stream, &Request::Hello { read_only, protocol_version: Some(PROTOCOL_VERSION) }).map_err(|error| error.to_string())?;
     match read_response(&mut BufReader::new(stream))? {
         Response::Hello {
             version,
@@ -1159,7 +1159,8 @@ fn legacy_session_needs_mouse_modes(session: &SessionInfo) -> bool {
 
 #[cfg(unix)]
 fn write_request(stream: &mut impl Write, request: &Request) -> std::io::Result<()> {
-    let mut line = serde_json::to_string(request)
+    let peer = host_info().map(|info| info.version);
+    let mut line = crate::protocol_compat::encode_request(request, peer)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
     line.push('\n');
     stream.write_all(line.as_bytes())
@@ -1228,6 +1229,7 @@ fn validate_host_connection(
             "host_instance_changed: the saved session belongs to another host instance".into(),
         );
     }
+    remember_host_info(info);
     Ok(())
 }
 
@@ -1685,7 +1687,7 @@ mod tests {
             );
             assert!(matches!(
                 serde_json::from_str::<Request>(&line).unwrap(),
-                Request::Hello { read_only: true }
+                Request::Hello { read_only: true, protocol_version: Some(PROTOCOL_VERSION) }
             ));
             writeln!(
                 observer_server,
@@ -1890,7 +1892,7 @@ mod tests {
                 .read_line(&mut request)
                 .unwrap();
             let request: Request = serde_json::from_str(&request).unwrap();
-            assert!(matches!(request, Request::Hello { read_only: false }));
+            assert!(matches!(request, Request::Hello { read_only: false, .. }));
             server
                 .write_all(b"{\"event\":\"hello\",\"version\":1,\"fastty_version\":\"0.22.6\"}\n")
                 .unwrap();
