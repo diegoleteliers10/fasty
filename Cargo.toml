@@ -7,7 +7,7 @@ exclude = ["vendor/alacritty_terminal", "vendor/vte"]
 
 [package]
 name = "fastty"
-version = "0.24.0"
+version = "0.24.1"
 edition = "2021"
 
 [lib]
@@ -53,7 +53,6 @@ raw-window-handle = "0.6"
 rustix = { version = "1.1", features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
 arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
-notify-rust = "4"
 git2 = { version = "0.21", default-features = false }
 getrandom = "0.3.4"
 trash = "5.2.9"
@@ -80,9 +79,19 @@ libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
+# UNUserNotificationCenter replaced the deprecated NSUserNotificationCenter
+# that notify-rust still uses on macOS. objc2_06 is the objc2 generation the
+# notification bindings need; plain `objc2` stays 0.5 for macos_maximize.
+objc2-foundation = "0.3"
+objc2-user-notifications = "0.3"
+objc2_06 = { package = "objc2", version = "0.6" }
+block2 = "0.6"
 core-text = "20"
 core-foundation = "0.9"
 core-foundation-sys = "0.8"
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+notify-rust = "4"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winres = "0.1"

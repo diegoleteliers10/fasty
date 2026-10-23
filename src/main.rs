@@ -606,6 +606,8 @@ fn main() {
     application()
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(move |cx: &mut App| {
+            #[cfg(target_os = "macos")]
+            fastty::notifications::request_permission();
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.on_window_closed(|_cx, window_id| {
                 if let Err(error) = fastty::session::persist_window(window_id) {

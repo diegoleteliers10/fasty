@@ -19,6 +19,7 @@ pub mod git;
 pub mod importer;
 pub mod keybindings;
 pub mod mcp;
+pub mod notifications;
 pub mod pane_tree;
 pub mod parser;
 pub mod paste;

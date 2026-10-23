@@ -1953,63 +1953,7 @@ pub(crate) fn available_system_fonts() -> Vec<String> {
     }
 }
 
-pub fn send_system_notification(title: &str, body: &str) {
-    type NotificationSender = std::sync::mpsc::SyncSender<(String, String)>;
-    static WORKER: std::sync::OnceLock<Result<NotificationSender, String>> =
-        std::sync::OnceLock::new();
-    let worker = WORKER.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<(String, String)>(16);
-        std::thread::Builder::new()
-            .name("fastty-notifications".into())
-            .spawn(move || {
-                for (title, body) in receiver {
-                    deliver_system_notification(&title, &body);
-                }
-            })
-            .map(|_| sender)
-            .map_err(|error| error.to_string())
-    });
-    match worker {
-        Ok(sender) => {
-            if let Err(error) = sender.try_send((title.to_owned(), body.to_owned())) {
-                eprintln!("Fastty notification queue rejected a report: {error}");
-            }
-        }
-        Err(error) => eprintln!("Fastty notification worker failed: {error}"),
-    }
-}
-
-fn deliver_system_notification(title: &str, body: &str) {
-    #[cfg(target_os = "macos")]
-    {
-        static APPLICATION: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-        let application = APPLICATION.get_or_init(|| {
-            notify_rust::set_application("com.diegoleteliers10.fastty")
-                .map_err(|error| error.to_string())
-        });
-        if let Err(error) = application {
-            eprintln!("Fastty notification setup failed: {error}");
-            return;
-        }
-    }
-    let summary = if title.is_empty() { "Fastty" } else { title };
-    #[cfg(target_os = "linux")]
-    let notification_body = body
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    #[cfg(not(target_os = "linux"))]
-    let notification_body = body.to_owned();
-    let res = notify_rust::Notification::new()
-        .appname("Fastty")
-        .summary(summary)
-        .body(&notification_body)
-        .show();
-
-    if let Err(error) = res {
-        eprintln!("Fastty notification delivery failed: {error}");
-    }
-}
+use crate::notifications::send_system_notification;
 
 use super::icons::{render_app_logo, render_icon};
 use crate::universal_picker::ItemKind;
