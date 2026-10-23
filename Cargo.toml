@@ -23,12 +23,14 @@ required-features = []
 # Use the windows subsystem to hide console window
 
 [dependencies]
-gpui = { git = "https://github.com/zed-industries/zed" }
+# Pinned: unpinned CI builds float to zed main, where KeyBinding::new
+# requires a 'static keystroke and native_menu.rs no longer compiles.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "e52ab15eac51e5644da6a3c9e1fac9bb2330b000" }
 # runtime_shaders compiles GPUI's Metal shaders at app launch via
 # makeLibraryWithSource instead of at build time via `xcrun metal`. The build
 # time path needs full Xcode; the runtime path only needs Metal.framework,
 # which ships with macOS. Drop this feature once Xcode is installed.
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "e52ab15eac51e5644da6a3c9e1fac9bb2330b000", features = [
     "font-kit",
     "wayland",
     "x11",

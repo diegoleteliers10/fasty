@@ -1,5 +1,5 @@
-#Cargo lock file
-Cargo.lock
+# Cargo lock file is committed so release builds are reproducible.
+
 
 #target directory
 target/
