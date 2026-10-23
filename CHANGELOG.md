@@ -3,6 +3,17 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.24.1 - 2026-10-23
+
+### Notifications
+
+- Deliver macOS notifications through `UNUserNotificationCenter` with an authorization request at startup. The legacy `NSUserNotificationCenter` API behind `notify-rust` is deprecated and dropped reports silently on recent macOS releases.
+- Keep `notify-rust` for Linux and Windows.
+
+### Fixed
+
+- Remove an unneeded mutable binding in markdown table rendering.
+
 ## 0.24.0 - 2026-10-22
 
 ### Font size fix
