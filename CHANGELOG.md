@@ -17,6 +17,7 @@ appears in the "What's new" dialog after an update.
 - Install Antigravity hooks as a named `fastty-status` group in `~/.gemini/config/hooks.json`, or in the project's `.agents/hooks.json`.
 - Keep other hook groups untouched, and refuse to overwrite or remove a group that was edited.
 - Accept `agy` in `fastty agent-status` and `fastty agent-hook`.
+- Exit after `fastty agent-hook install` and `uninstall` instead of opening the app.
 - Document the OSC 9, OSC 99, and OSC 777 native notification sequences.
 
 ### Daemon protocol compatibility

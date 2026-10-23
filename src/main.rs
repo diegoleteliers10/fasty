@@ -274,6 +274,7 @@ fn main() {
                         if provider == "install" && agent == "hermes" {
                             println!("Enable the plugin with: hermes plugins enable fastty-status");
                         }
+                        std::process::exit(0);
                     }
                     Err(error) => {
                         eprintln!("fastty agent-hook: {error}");
