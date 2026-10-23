@@ -18,6 +18,10 @@ appears in the "What's new" dialog after an update.
 - Keep other hook groups untouched, and refuse to overwrite or remove a group that was edited.
 - Accept `agy` in `fastty agent-status` and `fastty agent-hook`.
 - Exit after `fastty agent-hook install` and `uninstall` instead of opening the app.
+
+### Notifications
+
+- Treat a program leaving `working` for `idle` as attention, so OpenCode turn completions notify like `done` reports. The notification reads "Fastty: Finished" and carries the agent's task title.
 - Document the OSC 9, OSC 99, and OSC 777 native notification sequences.
 
 ### Daemon protocol compatibility
@@ -27,7 +31,7 @@ appears in the "What's new" dialog after an update.
 
 ### Validation
 
-- `cargo test --lib`: 520 tests pass.
+- `cargo test --lib`: 524 tests pass.
 - `cargo check --all-targets` reports no errors.
 - Reviewed by Sentinel.
 

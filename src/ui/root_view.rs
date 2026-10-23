@@ -2430,6 +2430,40 @@ pub fn palette_preview_kind(cmd_id: &str) -> Option<PalettePreviewKind> {
     }
 }
 
+/// Attention-worthy changes between two program status snapshots: records
+/// that entered `Done`, `Blocked`, or `Error`, and records that left
+/// `Working` or `Blocked` for `Idle`. Agents like OpenCode report `idle`
+/// after a turn instead of `done`, so the idle landing needs to count as
+/// attention or their completion never notifies.
+fn attention_transitions(
+    previous: &[ProgramRecord],
+    records: &[ProgramRecord],
+) -> Vec<ProgramRecord> {
+    records
+        .iter()
+        .filter(|record| {
+            if matches!(
+                record.state,
+                ProgramState::Done | ProgramState::Blocked | ProgramState::Error
+            ) {
+                return !previous.iter().any(|old| {
+                    old.id == record.id
+                        && old.state == record.state
+                        && old.kind == record.kind
+                });
+            }
+            if record.state == ProgramState::Idle {
+                return previous.iter().any(|old| {
+                    old.id == record.id
+                        && matches!(old.state, ProgramState::Working | ProgramState::Blocked)
+                });
+            }
+            false
+        })
+        .cloned()
+        .collect()
+}
+
 impl RootView {
     /// Palette entries matching the current query. UX4: with an empty query
     /// the most-recently executed commands sort first (stable otherwise),
@@ -7748,32 +7782,24 @@ impl RootView {
                 .is_some_and(|tab| tab.pane_tree.active_pane_id == pane_id);
         let is_initial_status = !self.program_statuses.contains_key(&pane_id);
         let status = self.program_statuses.entry(pane_id).or_default();
-        let changed_attention: Vec<ProgramRecord> = records
-            .iter()
-            .filter(|record| {
-                !is_initial_status
-                    && matches!(
-                    record.state,
-                    ProgramState::Done | ProgramState::Blocked | ProgramState::Error
-                ) && !status.records.iter().any(|previous| {
-                    previous.id == record.id
-                        && previous.state == record.state
-                        && previous.kind == record.kind
-                })
-                })
-            .cloned()
-            .collect();
+        let attention = if is_initial_status {
+            Vec::new()
+        } else {
+            attention_transitions(&status.records, &records)
+        };
         let has_attention = records.iter().any(|record| {
             matches!(
                 record.state,
                 ProgramState::Done | ProgramState::Blocked | ProgramState::Error
             )
-        });
-        status.unread = has_attention && (status.unread || !changed_attention.is_empty());
+        }) || attention
+            .iter()
+            .any(|record| record.state == ProgramState::Idle);
+        status.unread = has_attention && (status.unread || !attention.is_empty());
         status.records = records;
         let now = std::time::Instant::now();
         if self.config.notify_on_program_status && !foreground {
-            if let Some(record) = crate::program_status::aggregate(&changed_attention) {
+            if let Some(record) = crate::program_status::aggregate(&attention) {
                 let requires_action = record.state == ProgramState::Blocked;
                 let cooldown_elapsed = status
                     .last_notification
@@ -7782,7 +7808,12 @@ impl RootView {
                     cx.notify();
                     return;
                 }
-                let title = format!("Fastty: {}", super::tab_bar::program_status_text(record));
+                let text = if record.state == ProgramState::Idle {
+                    "Finished"
+                } else {
+                    super::tab_bar::program_status_text(record)
+                };
+                let title = format!("Fastty: {text}");
                 let message = record
                     .msg
                     .as_deref()
@@ -20143,6 +20174,55 @@ mod tests {
         assert_eq!(palette_preview_kind("new_tab"), None);
         assert_eq!(palette_preview_kind("ssh"), None);
         assert_eq!(palette_preview_kind("quit"), None);
+    }
+
+    fn record(id: &str, state: ProgramState) -> ProgramRecord {
+        ProgramRecord {
+            id: id.to_string(),
+            state,
+            app: Some("opencode".to_string()),
+            title: None,
+            msg: None,
+            progress: None,
+            kind: None,
+        }
+    }
+
+    #[test]
+    fn working_to_idle_counts_as_attention() {
+        let previous = vec![record("", ProgramState::Working)];
+        let records = vec![record("", ProgramState::Idle)];
+
+        let attention = attention_transitions(&previous, &records);
+
+        assert_eq!(attention.len(), 1);
+        assert_eq!(attention[0].state, ProgramState::Idle);
+    }
+
+    #[test]
+    fn idle_without_prior_work_is_not_attention() {
+        let previous = vec![];
+        let records = vec![record("", ProgramState::Idle)];
+
+        assert!(attention_transitions(&previous, &records).is_empty());
+    }
+
+    #[test]
+    fn unchanged_attention_states_do_not_repeat() {
+        let previous = vec![record("a", ProgramState::Done)];
+        let records = vec![record("a", ProgramState::Done)];
+
+        assert!(attention_transitions(&previous, &records).is_empty());
+    }
+
+    #[test]
+    fn state_changes_and_clears_still_count() {
+        let previous = vec![record("a", ProgramState::Working)];
+        let records = vec![record("a", ProgramState::Error)];
+
+        let attention = attention_transitions(&previous, &records);
+
+        assert_eq!(attention[0].state, ProgramState::Error);
     }
 
     #[test]
