@@ -3,6 +3,33 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.24.0 - 2026-10-22
+
+### Font size fix
+
+- Stop the terminal font size from growing after command palette use.
+- Restore a previewed theme, font size, or layout whenever the command palette closes, including the right-click dismiss and workflow paths.
+- Start font previews from the configured size, and reset to the configured default of 14 instead of a hardcoded 13.
+
+### Agent notifications
+
+- Add Antigravity CLI (`agy`) status hooks: idle on session start, working while the model runs, done when the turn stops.
+- Install Antigravity hooks as a named `fastty-status` group in `~/.gemini/config/hooks.json`, or in the project's `.agents/hooks.json`.
+- Keep other hook groups untouched, and refuse to overwrite or remove a group that was edited.
+- Accept `agy` in `fastty agent-status` and `fastty agent-hook`.
+- Document the OSC 9, OSC 99, and OSC 777 native notification sequences.
+
+### Daemon protocol compatibility
+
+- Announce the protocol version in hello and serve older peers by downgrading responses and events.
+- Degrade unknown response and event variants instead of failing the connection parse.
+
+### Validation
+
+- `cargo test --lib`: 520 tests pass.
+- `cargo check --all-targets` reports no errors.
+- Reviewed by Sentinel.
+
 ## 0.23.1 - 2026-10-16
 
 ### Native macOS menus
