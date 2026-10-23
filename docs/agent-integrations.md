@@ -16,6 +16,7 @@ La API no expone mensajes libres del agente.
 | 5 | Codex CLI | Hooks de turno y sesión | Implementado. Codex puede pedir aprobación de confianza. |
 | 6 | Aider | Integración de shell y OSC | Sin hook estructurado verificado. |
 | 7 | Hermes Agent | Plugin de turnos y solicitudes al usuario | Implementado |
+| 8 | Antigravity CLI (`agy`) | Hooks de ciclo de vida | Implementado |
 
 Fuentes oficiales: [Claude Code hooks](https://code.claude.com/docs/en/hooks),
 [OpenCode plugins](https://docs.opencode.ai/docs/plugins/),
@@ -42,10 +43,10 @@ solo las entradas de Fastty. Los archivos JSON existentes se conservan y se
 respaldan antes de cada cambio. El instalador no reemplaza archivos de
 extensión que ya tengan contenido distinto.
 
-Proveedores: `claude`, `gemini`, `codex`, `opencode`, `opencode-v2`, `pi` y `hermes`. Claude, Gemini y
-Codex usan hooks JSON. OpenCode y Pi usan archivos de extensión del proyecto o
-del usuario. Codex puede pedir que confirmes la confianza del proyecto después
-de la instalación.
+Proveedores: `claude`, `gemini`, `codex`, `opencode`, `opencode-v2`, `pi`, `hermes` y `agy`.
+Claude, Gemini, Codex y Antigravity usan hooks JSON. OpenCode y Pi usan archivos
+de extensión del proyecto o del usuario. Codex puede pedir que confirmes la
+confianza del proyecto después de la instalación.
 
 ```sh
 fastty agent-hook install claude --project
@@ -53,6 +54,7 @@ fastty agent-hook install opencode --project
 fastty agent-hook install gemini --project
 fastty agent-hook install pi --project
 fastty agent-hook install codex --project
+fastty agent-hook install agy --user
 ```
 
 ## OpenCode
@@ -136,12 +138,27 @@ Fuentes: [plugins de Hermes](https://github.com/NousResearch/hermes-agent/blob/m
 [hooks de entrada del usuario](https://github.com/NousResearch/hermes-agent/blob/main/tools/human_input_hooks.py),
 [fin de turno](https://github.com/NousResearch/hermes-agent/blob/main/agent/turn_finalizer.py).
 
+## Antigravity CLI (`agy`)
+
+```sh
+fastty agent-hook install agy --user
+```
+
+El instalador escribe el grupo `fastty-status` en `~/.gemini/config/hooks.json`
+con `--user`, o en `.agents/hooks.json` del proyecto con `--project`. Conserva
+los otros grupos del archivo y no quita un grupo que el usuario editó.
+
+Fastty usa `SessionStart` para `idle`, `PreInvocation` para `working` y `Stop`
+para `done`. El hook de Antigravity no recibe el nombre del evento, así que el
+instalador lo pasa como argumento. Fastty no informa bloqueos porque los
+permisos de Antigravity no publican un evento de espera.
+
 ## Límites actuales
 
 `fastty events` publica altas, bajas y cambios de sesión. Los estados de agente
 aparecen cuando el proceso emite OSC 7501 o usa un adaptador. `fastty agent-hook`
-publica estados de Claude, Gemini y Codex. Los complementos de OpenCode y Pi
-publican estados desde sus eventos de ciclo de vida. Fastty no aprueba permisos
+publica estados de Claude, Gemini, Codex y Antigravity. Los complementos de
+OpenCode y Pi publican estados desde sus eventos de ciclo de vida. Fastty no aprueba permisos
 del agente. Los eventos de permiso solo muestran el estado bloqueado.
 
 ## Claude Code: contrato para el primer adaptador

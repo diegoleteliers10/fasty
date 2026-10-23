@@ -227,11 +227,11 @@ fn main() {
         Some("keybindings") => run_keybindings_command(subcommand_args),
         Some("agent-status") => {
             let Some(state) = subcommand_args.next() else {
-                eprintln!("Usage: fastty agent-status <idle|working|done|blocked|error|clear> <claude|opencode|gemini|pi|codex|hermes> [permission|question|auth]");
+                eprintln!("Usage: fastty agent-status <idle|working|done|blocked|error|clear> <claude|opencode|agy|gemini|pi|codex|hermes> [permission|question|auth]");
                 std::process::exit(1);
             };
             let Some(app) = subcommand_args.next() else {
-                eprintln!("Usage: fastty agent-status <idle|working|done|blocked|error|clear> <claude|opencode|gemini|pi|codex|hermes> [permission|question|auth]");
+                eprintln!("Usage: fastty agent-status <idle|working|done|blocked|error|clear> <claude|opencode|agy|gemini|pi|codex|hermes> [permission|question|auth]");
                 std::process::exit(1);
             };
             let kind = subcommand_args.next();
@@ -243,7 +243,7 @@ fn main() {
         }
         Some("agent-hook") => {
             let Some(provider) = subcommand_args.next() else {
-                eprintln!("Usage: fastty agent-hook <claude|gemini|codex> | install|uninstall <provider> --project|--user");
+                eprintln!("Usage: fastty agent-hook <claude|gemini|codex|agy> | install|uninstall <provider> --project|--user");
                 std::process::exit(1);
             };
             if matches!(provider.as_str(), "install" | "uninstall") {
@@ -281,7 +281,7 @@ fn main() {
                     }
                 }
             } else {
-                fastty::daemon_client::run_agent_hook_command(provider);
+                fastty::daemon_client::run_agent_hook_command(provider, subcommand_args.next());
             }
         }
         Some("gateway") => {

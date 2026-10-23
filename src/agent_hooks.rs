@@ -11,6 +11,10 @@ pub enum InstallScope {
 
 pub fn install(provider: &str, scope: InstallScope) -> Result<PathBuf, String> {
     let path = provider_path(provider, scope)?;
+    if provider == "agy" {
+        install_named_hooks(provider, &path)?;
+        return Ok(path);
+    }
     if matches!(provider, "opencode" | "opencode-v2" | "pi" | "hermes") {
         let files = plugin_files(provider, &path)?;
         let registration = opencode_cli_registration(provider, &path, true)?;
@@ -69,6 +73,10 @@ pub fn install(provider: &str, scope: InstallScope) -> Result<PathBuf, String> {
 
 pub fn uninstall(provider: &str, scope: InstallScope) -> Result<PathBuf, String> {
     let path = provider_path(provider, scope)?;
+    if provider == "agy" {
+        uninstall_named_hooks(provider, &path)?;
+        return Ok(path);
+    }
     if matches!(provider, "opencode" | "opencode-v2" | "pi" | "hermes") {
         let files = plugin_files(provider, &path)?;
         let registration = opencode_cli_registration(provider, &path, false)?;
@@ -131,6 +139,18 @@ pub fn uninstall(provider: &str, scope: InstallScope) -> Result<PathBuf, String>
 }
 
 fn provider_path(provider: &str, scope: InstallScope) -> Result<PathBuf, String> {
+    if provider == "agy" {
+        return Ok(match scope {
+            InstallScope::Project => std::env::current_dir()
+                .map_err(|error| error.to_string())?
+                .join(".agents/hooks.json"),
+            InstallScope::User => PathBuf::from(
+                std::env::var_os("HOME")
+                    .ok_or_else(|| "HOME is not set".to_string())?,
+            )
+            .join(".gemini/config/hooks.json"),
+        });
+    }
     if provider == "hermes" {
         if scope == InstallScope::Project {
             return Err("Hermes uses profile plugins. Use --user. Set HERMES_HOME to select a profile.".into());
@@ -212,6 +232,11 @@ fn provider_events(provider: &str) -> Result<Vec<(&'static str, Option<&'static 
             ("SessionEnd", None),
             ("PermissionRequest", None),
         ]),
+        "agy" => Ok(vec![
+            ("SessionStart", None),
+            ("PreInvocation", None),
+            ("Stop", None),
+        ]),
         _ => Err(format!("{provider} uses an extension file, not hook JSON")),
     }
 }
@@ -233,6 +258,69 @@ fn hook_entry(provider: &str, matcher: Option<&str>) -> Value {
         entry
     } else {
         json!({ "hooks": [hook] })
+    }
+}
+
+/// Name of the Fastty hook group in Antigravity's `hooks.json`.
+const AGY_HOOK_NAME: &str = "fastty-status";
+
+/// Antigravity keys hooks by name, so Fastty owns one named group and leaves
+/// every other group untouched.
+fn named_hooks_document(provider: &str) -> Result<Value, String> {
+    let mut events = Map::new();
+    for (event, _) in provider_events(provider)? {
+        events.insert(
+            event.to_string(),
+            json!([{
+                "type": "command",
+                "command": format!("fastty agent-hook {provider} {event}"),
+                "timeout": 3,
+            }]),
+        );
+    }
+    Ok(Value::Object(events))
+}
+
+fn install_named_hooks(provider: &str, path: &Path) -> Result<(), String> {
+    let mut document = read_json_object(path)?;
+    if !apply_named_hooks(&mut document, provider, true)? {
+        return Ok(());
+    }
+    write_json(path, &document)
+}
+
+fn uninstall_named_hooks(provider: &str, path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut document = read_json_object(path)?;
+    if !apply_named_hooks(&mut document, provider, false)? {
+        return Ok(());
+    }
+    write_json(path, &document)
+}
+
+/// Inserts or removes Fastty's named hook group. Returns whether the document
+/// changed. A group that the user edited is never overwritten or removed.
+fn apply_named_hooks(document: &mut Value, provider: &str, install: bool) -> Result<bool, String> {
+    let desired = named_hooks_document(provider)?;
+    let root = document
+        .as_object_mut()
+        .ok_or_else(|| "expected a JSON object".to_string())?;
+    let current = root.get(AGY_HOOK_NAME).cloned();
+    match (install, current) {
+        (true, None) => {
+            root.insert(AGY_HOOK_NAME.to_string(), desired);
+            Ok(true)
+        }
+        (true, Some(existing)) if existing == desired => Ok(false),
+        (true, Some(_)) => Err("the Fastty hook group differs. It was not changed.".to_string()),
+        (false, None) => Ok(false),
+        (false, Some(existing)) if existing == desired => {
+            root.remove(AGY_HOOK_NAME);
+            Ok(true)
+        }
+        (false, Some(_)) => Err("the Fastty hook group differs. It was not removed.".to_string()),
     }
 }
 
@@ -382,5 +470,57 @@ mod tests {
         entries.retain(|entry| entry != &owned);
         assert_eq!(doc["hooks"]["Stop"].as_array().unwrap().len(), 1);
         assert_eq!(doc["hooks"]["Stop"][0]["hooks"][0]["command"], "user-hook");
+    }
+
+    #[test]
+    fn agy_named_hook_commands_carry_their_event() {
+        let document = named_hooks_document("agy").unwrap();
+        assert_eq!(
+            document["PreInvocation"][0]["command"],
+            "fastty agent-hook agy PreInvocation"
+        );
+        assert_eq!(document["Stop"][0]["type"], "command");
+        assert!(document.get("PreToolUse").is_none());
+    }
+
+    #[test]
+    fn agy_install_keeps_other_named_hook_groups() {
+        let mut document = json!({"orca-status": {"Stop": [{"command": "orca"}]}});
+
+        assert!(apply_named_hooks(&mut document, "agy", true).unwrap());
+
+        assert_eq!(document["orca-status"]["Stop"][0]["command"], "orca");
+        assert_eq!(
+            document["fastty-status"]["SessionStart"][0]["command"],
+            "fastty agent-hook agy SessionStart"
+        );
+        assert!(!apply_named_hooks(&mut document, "agy", true).unwrap());
+    }
+
+    #[test]
+    fn agy_uninstall_removes_only_its_own_group() {
+        let mut document = json!({"orca-status": {"Stop": [{"command": "orca"}]}});
+        apply_named_hooks(&mut document, "agy", true).unwrap();
+
+        assert!(apply_named_hooks(&mut document, "agy", false).unwrap());
+
+        assert!(document.get("fastty-status").is_none());
+        assert!(document.get("orca-status").is_some());
+    }
+
+    #[test]
+    fn agy_uninstall_refuses_a_group_the_user_edited() {
+        let mut document = json!({"fastty-status": {"Stop": [{"command": "mine"}]}});
+
+        assert!(apply_named_hooks(&mut document, "agy", false).is_err());
+        assert!(document.get("fastty-status").is_some());
+    }
+
+    #[test]
+    fn agy_install_refuses_a_group_the_user_edited() {
+        let mut document = json!({"fastty-status": {"Stop": [{"command": "mine"}]}});
+
+        assert!(apply_named_hooks(&mut document, "agy", true).is_err());
+        assert_eq!(document["fastty-status"]["Stop"][0]["command"], "mine");
     }
 }

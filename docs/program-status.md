@@ -56,6 +56,19 @@ On macOS, install and open `Fastty.app` before you use notifications. Fastty use
 
 The AI panel uses provider events for its notifications. It supports ACP and HTTP providers without OSC reports.
 
+## OSC notifications
+
+A program can ask for a native notification directly. Fastty reads these sequences:
+
+| Sequence | Shape |
+| --- | --- |
+| OSC 9 | `ESC ] 9 ; MESSAGE ESC \` |
+| OSC 9 with a title | `ESC ] 9 ; TITLE ; BODY ESC \` |
+| OSC 99 | Kitty notification protocol, including `i=` fragments |
+| OSC 777 | `ESC ] 777 ; notify ; TITLE ; BODY ESC \` |
+
+Fastty sends these notifications even when **Program Status** is off. While a pane reports `working` or `blocked`, Fastty drops the OSC notifications of that pane, because the status report already covers the result.
+
 ## Background AI turns
 
 Each conversation keeps its own active turn. Switch tabs or select another conversation to leave the agent at work in the background. Return to the conversation to see its response and tool activity.

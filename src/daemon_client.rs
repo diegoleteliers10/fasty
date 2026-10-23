@@ -1234,7 +1234,7 @@ pub fn run_agent_status_command(state: String, app: String, kind: Option<String>
                 .parse::<u64>()
                 .map_err(|_| "FASTTY_SESSION_TOKEN is invalid".to_string())?;
             let valid_state = matches!(state.as_str(), "idle" | "working" | "done" | "blocked" | "error" | "clear");
-            let valid_app = matches!(app.as_str(), "claude" | "opencode" | "gemini" | "pi" | "codex" | "hermes");
+            let valid_app = matches!(app.as_str(), "claude" | "opencode" | "agy" | "gemini" | "pi" | "codex" | "hermes");
             let valid_kind = kind.as_deref().is_none_or(|value| matches!(value, "permission" | "question" | "auth"));
             if !valid_state || !valid_app || !valid_kind {
                 return Err("invalid state, agent, or blocked kind".to_string());
@@ -1292,13 +1292,16 @@ fn status_for_agent_hook(
     match (provider, event) {
         ("claude", Some("SessionStart"))
         | ("gemini", Some("SessionStart"))
-        | ("codex", Some("SessionStart")) => Some(("idle", None)),
+        | ("codex", Some("SessionStart"))
+        | ("agy", Some("SessionStart")) => Some(("idle", None)),
         ("claude", Some("UserPromptSubmit"))
         | ("gemini", Some("BeforeAgent"))
-        | ("codex", Some("UserPromptSubmit")) => Some(("working", None)),
+        | ("codex", Some("UserPromptSubmit"))
+        | ("agy", Some("PreInvocation")) => Some(("working", None)),
         ("claude", Some("Stop"))
         | ("gemini", Some("AfterAgent"))
-        | ("codex", Some("Stop")) => Some(("done", None)),
+        | ("codex", Some("Stop"))
+        | ("agy", Some("Stop")) => Some(("done", None)),
         ("claude", Some("StopFailure")) => Some(("error", None)),
         ("claude", Some("SessionEnd"))
         | ("gemini", Some("SessionEnd"))
@@ -1339,14 +1342,22 @@ mod agent_hook_tests {
             Some(("blocked", Some("permission")))
         );
         assert_eq!(status_for_agent_hook("pi", Some("agent_end"), None), None);
+        assert_eq!(
+            status_for_agent_hook("agy", Some("PreInvocation"), None),
+            Some(("working", None))
+        );
+        assert_eq!(
+            status_for_agent_hook("agy", Some("Stop"), None),
+            Some(("done", None))
+        );
     }
 }
 
-pub fn run_agent_hook_command(provider: String) -> ! {
+pub fn run_agent_hook_command(provider: String, event: Option<String>) -> ! {
     use std::io::Read;
 
-    if !matches!(provider.as_str(), "claude" | "gemini" | "codex") {
-        eprintln!("fastty agent-hook: supported providers: claude, gemini, codex");
+    if !matches!(provider.as_str(), "claude" | "gemini" | "codex" | "agy") {
+        eprintln!("fastty agent-hook: supported providers: claude, gemini, codex, agy");
         std::process::exit(2);
     }
     let emit_result = || {
@@ -1355,18 +1366,20 @@ pub fn run_agent_hook_command(provider: String) -> ! {
         }
     };
     let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
-        emit_result();
-        std::process::exit(0);
-    }
+    let _ = std::io::stdin().read_to_string(&mut input);
     let parsed = serde_json::from_str::<serde_json::Value>(&input).ok();
-    let Some(value) = parsed else {
-        emit_result();
-        std::process::exit(0);
-    };
-    let event = value.get("hook_event_name").and_then(serde_json::Value::as_str);
-    let notification = value.get("notification_type").and_then(serde_json::Value::as_str)
-        .or_else(|| value.get("type").and_then(serde_json::Value::as_str));
+    // Antigravity hooks do not name their event on stdin, so the installer
+    // passes it as an argument.
+    let event = event
+        .as_deref()
+        .or_else(|| parsed.as_ref().and_then(|value| value.get("hook_event_name"))
+            .and_then(serde_json::Value::as_str));
+    let notification = parsed.as_ref()
+        .and_then(|value| value.get("notification_type"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| parsed.as_ref()
+            .and_then(|value| value.get("type"))
+            .and_then(serde_json::Value::as_str));
     let status = status_for_agent_hook(provider.as_str(), event, notification);
     if let (Some((state, kind)), Some(executable)) =
         (status, std::env::current_exe().ok())
