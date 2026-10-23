@@ -224,6 +224,10 @@ ignora. Los campos eliminados o renombrados necesitan una regla.
   mensajes y texto libre para reducir la exposición de datos.
 - `attached.program_status` conserva el estado OSC 7501 al reconectar una
   sesión. Es opcional para clientes antiguos y omite mensajes vacíos.
+- `report_program_status` actualiza el store del daemon y además reenvía el
+  reporte como la secuencia OSC 7501 equivalente por el stream de `output`
+  de la sesión, para que los clientes conectados (la ventana GUI incluida)
+  vean la misma transición que un programa dentro del pane habría escrito.
 - Un `attach` manda **un `snapshot` inmediatamente después del `attached`**,
   con el contenido actual de la pantalla (no el scrollback completo, solo lo
   visible) como bytes ANSI/SGR ya coloreados — ver

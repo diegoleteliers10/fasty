@@ -2048,6 +2048,12 @@ impl TerminalState {
             self.source_id,
             |store| store.apply(command),
         );
+        // Mirror the report to attached clients as the OSC 7501 sequence a
+        // program inside the pane would have written, so their local stores
+        // and notification guards see the same transition this process
+        // applied through the daemon API.
+        self.output_hub
+            .publish_at_boundary(&mirror_program_status_sequence(payload));
         Ok(())
     }
 
@@ -4209,6 +4215,14 @@ fn parse_osc_framed(
     }
 }
 
+fn mirror_program_status_sequence(payload: &[u8]) -> Vec<u8> {
+    let mut sequence = Vec::with_capacity(payload.len() + 10);
+    sequence.extend_from_slice(b"\x1b]7501;");
+    sequence.extend_from_slice(payload);
+    sequence.extend_from_slice(b"\x1b\\");
+    sequence
+}
+
 fn update_program_status(
     store: &ParkingMutex<crate::program_status::ProgramStatusStore>,
     pending: &std::sync::atomic::AtomicBool,
@@ -4453,6 +4467,15 @@ fn get_foreground_process_name_other(_shell_pid: u32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn mirrored_program_status_wraps_payload_in_osc_7501() {
+        assert_eq!(
+            mirror_program_status_sequence(b"state=done:id=agent:app=opencode"),
+            b"\x1b]7501;state=done:id=agent:app=opencode\x1b\\".to_vec()
+        );
+    }
     use super::CsiEvent::{self, *};
     use super::CsiWatcher;
     use super::*;
@@ -4460,6 +4483,27 @@ mod tests {
     fn run(bytes: &[u8]) -> Vec<CsiEvent> {
         let mut w = CsiWatcher::new();
         bytes.iter().filter_map(|&b| w.feed(b)).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_program_status_mirrors_osc_7501_to_output_subscribers() {
+        let terminal = TerminalState::new_headless("/bin/sh", &[], None, 80, 24)
+            .expect("create terminal for status mirror test");
+        let output = terminal.subscribe_output();
+        terminal
+            .report_external_program_status(b"state=done:id=agent:app=opencode")
+            .expect("external status report is accepted");
+        let chunk = loop {
+            match output.recv_blocking() {
+                Ok(chunk) => break chunk,
+                Err(_) => panic!("mirrored status should reach output subscribers"),
+            }
+        };
+        assert_eq!(
+            chunk,
+            b"\x1b]7501;state=done:id=agent:app=opencode\x1b\\".to_vec()
+        );
     }
 
     #[cfg(unix)]
