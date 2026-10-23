@@ -476,7 +476,7 @@ pub struct FontConfig {
 fn default_scrollback() -> usize { 10_000 }
 fn default_theme() -> Option<String> { Some("default".to_string()) }
 fn default_font_family() -> String { "monospace".to_string() }
-fn default_font_size() -> f32 { 14.0 }
+pub(crate) fn default_font_size() -> f32 { 14.0 }
 fn default_font_weight() -> f32 { 400.0 }
 fn default_font_ligatures() -> bool { true }
 fn default_font_monospace_only() -> bool { true }

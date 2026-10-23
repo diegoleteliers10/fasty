@@ -9,6 +9,7 @@ use gpui::{
 };
 use std::sync::Arc;
 
+use super::palette_preview::{PaletteSession, PreviewState};
 use super::project_sidebar::{cached_graph_layout, GraphLayout, ProjectPanelTab, ProjectSidebar};
 use super::settings_view::SettingsView;
 use super::status_bar::{StatusBar, StatusBarModel, StatusInfo};
@@ -2403,15 +2404,6 @@ pub fn theme_name_for_palette_id(cmd_id: &str) -> Option<&'static str> {
         .map(|(name, _, _, _)| *name)
 }
 
-/// Snapshot of the visual settings a palette preview may touch.
-#[derive(Clone, Debug)]
-pub struct PalettePreviewState {
-    pub theme_name: String,
-    pub font_size: f32,
-    pub tab_layout: TabLayout,
-    pub sidebar_open: bool,
-}
-
 /// What a palette entry previews while navigating. Font deltas apply to the
 /// baseline snapshot (idempotent under repeated hovers); layout/theme swap.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3004,7 +2996,10 @@ pub struct RootView {
     pub is_pane_context_menu_open: bool,
     pub pane_context_menu_pane_id: usize,
     pub pane_context_menu_pos: (f32, f32),
-    pub is_command_palette_open: bool,
+    /// Command palette open flag plus the visual-settings preview snapshot.
+    /// Callers cannot clear the flag without going through `close`, so a
+    /// closed palette never keeps a preview in flight.
+    palette: PaletteSession,
     pub command_palette_query: String,
     pub command_palette_selected: usize,
     pub is_ssh_manager_open: bool,
@@ -3073,10 +3068,6 @@ pub struct RootView {
     pub hovered_url: Option<String>,
     pub hovered_url_range: Option<(i32, usize, usize)>,
     pub current_theme_name: String,
-    /// Snapshot of the visual settings a command-palette preview may touch.
-    /// Taken before the first preview step: `Enter` commits (saves), `Esc`
-    /// restores everything without touching the config file.
-    pub palette_preview_original: Option<PalettePreviewState>,
     /// Last config load failure (path + parse error), shown as a banner
     /// instead of failing silently to defaults. Session-dismissible.
     pub config_error: Option<String>,
@@ -3740,7 +3731,7 @@ impl RootView {
             is_pane_context_menu_open: false,
             pane_context_menu_pane_id: 0,
             pane_context_menu_pos: (0.0, 0.0),
-            is_command_palette_open: false,
+            palette: PaletteSession::default(),
             command_palette_query: String::new(),
             command_palette_selected: 0,
             is_ssh_manager_open: false,
@@ -3801,7 +3792,6 @@ impl RootView {
             hovered_url: None,
             hovered_url_range: None,
             current_theme_name: theme_name,
-            palette_preview_original: None,
             config_error: crate::config::load_error(),
             show_onboarding_hint: !crate::config::Config::get_active_config_path().exists()
                 && !crate::session::session_path().exists(),
@@ -6566,7 +6556,7 @@ impl RootView {
         self.is_settings_open = false;
         self.is_context_menu_open = false;
         self.is_about_open = false;
-        self.is_command_palette_open = false;
+        self.close_command_palette(_window, cx);
         self.is_ssh_manager_open = false;
         self.is_search_open = false;
 
@@ -6620,14 +6610,21 @@ impl RootView {
             self.is_about_open = false;
             self.is_tab_context_menu_open = false;
             self.is_pane_context_menu_open = false;
-            self.is_command_palette_open = false;
+            self.close_command_palette(_window, cx);
             self.is_ssh_manager_open = false;
             self.is_search_open = false;
         }
         cx.notify();
     }
 
-    pub fn open_tab_context_menu(&mut self, tab_id: usize, x: f32, y: f32, cx: &mut Context<Self>) {
+    pub fn open_tab_context_menu(
+        &mut self,
+        tab_id: usize,
+        x: f32,
+        y: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.is_tab_context_menu_open = true;
         self.tab_context_menu_tab_id = tab_id;
         self.tab_context_menu_pos = (x, y);
@@ -6635,7 +6632,7 @@ impl RootView {
         self.is_context_menu_open = false;
         self.is_pane_context_menu_open = false;
         self.is_about_open = false;
-        self.is_command_palette_open = false;
+        self.close_command_palette(window, cx);
         self.is_ssh_manager_open = false;
         self.is_search_open = false;
         self.is_git_menu_open = false;
@@ -6647,6 +6644,7 @@ impl RootView {
         pane_id: usize,
         x: f32,
         y: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.is_pane_context_menu_open = true;
@@ -6656,7 +6654,7 @@ impl RootView {
         self.is_context_menu_open = false;
         self.is_tab_context_menu_open = false;
         self.is_about_open = false;
-        self.is_command_palette_open = false;
+        self.close_command_palette(window, cx);
         self.is_ssh_manager_open = false;
         self.is_search_open = false;
         self.is_git_menu_open = false;
@@ -6783,7 +6781,7 @@ impl RootView {
         if self.is_about_open {
             self.is_context_menu_open = false;
             self.is_settings_open = false;
-            self.is_command_palette_open = false;
+            self.close_command_palette(_window, cx);
             self.is_ssh_manager_open = false;
             self.is_snippet_picker_open = false;
             self.is_pr_picker_open = false;
@@ -6793,12 +6791,13 @@ impl RootView {
     }
 
     pub fn toggle_command_palette(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.is_command_palette_open = !self.is_command_palette_open;
-        if self.is_command_palette_open {
+        if self.palette.is_open() {
+            // Closed without committing (toggle/Esc/backdrop): restore preview.
+            self.close_command_palette(_window, cx);
+        } else {
+            self.palette.open();
             self.command_palette_query.clear();
             self.command_palette_selected = 0;
-            // Fresh open: no preview in flight yet (set lazily on first hover).
-            self.palette_preview_original = None;
             self.is_settings_open = false;
             self.is_context_menu_open = false;
             self.is_about_open = false;
@@ -6806,9 +6805,6 @@ impl RootView {
             self.is_snippet_picker_open = false;
             self.is_pr_picker_open = false;
             self.is_search_open = false;
-        } else {
-            // Closed without committing (toggle/Esc/backdrop): drop preview.
-            self.cancel_palette_preview(_window, cx);
         }
         cx.notify();
     }
@@ -6821,7 +6817,7 @@ impl RootView {
             self.is_settings_open = false;
             self.is_context_menu_open = false;
             self.is_about_open = false;
-            self.is_command_palette_open = false;
+            self.close_command_palette(_window, cx);
             self.is_snippet_picker_open = false;
             self.is_pr_picker_open = false;
             self.is_search_open = false;
@@ -6840,7 +6836,7 @@ impl RootView {
             self.is_settings_open = false;
             self.is_context_menu_open = false;
             self.is_about_open = false;
-            self.is_command_palette_open = false;
+            self.close_command_palette(_window, cx);
             self.is_ssh_manager_open = false;
             self.is_pr_picker_open = false;
             self.is_search_open = false;
@@ -6887,7 +6883,7 @@ impl RootView {
             self.is_settings_open = false;
             self.is_context_menu_open = false;
             self.is_about_open = false;
-            self.is_command_palette_open = false;
+            self.close_command_palette(_window, cx);
             self.is_ssh_manager_open = false;
             self.is_snippet_picker_open = false;
             self.is_search_open = false;
@@ -6935,7 +6931,7 @@ impl RootView {
             self.is_settings_open = false;
             self.is_context_menu_open = false;
             self.is_about_open = false;
-            self.is_command_palette_open = false;
+            self.close_command_palette(_window, cx);
             self.is_ssh_manager_open = false;
             self.is_snippet_picker_open = false;
             self.is_pr_picker_open = false;
@@ -6953,7 +6949,7 @@ impl RootView {
             self.is_settings_open = false;
             self.is_context_menu_open = false;
             self.is_about_open = false;
-            self.is_command_palette_open = false;
+            self.close_command_palette(_window, cx);
             self.is_ssh_manager_open = false;
             self.is_snippet_picker_open = false;
             self.is_pr_picker_open = false;
@@ -6971,7 +6967,7 @@ impl RootView {
             self.is_settings_open = false;
             self.is_context_menu_open = false;
             self.is_about_open = false;
-            self.is_command_palette_open = false;
+            self.close_command_palette(_window, cx);
             self.is_ssh_manager_open = false;
             self.is_snippet_picker_open = false;
             self.is_pr_picker_open = false;
@@ -7001,7 +6997,7 @@ impl RootView {
         self.is_settings_open = false;
         self.is_context_menu_open = false;
         self.is_about_open = false;
-        self.is_command_palette_open = false;
+        self.close_command_palette(window, cx);
         self.is_ssh_manager_open = false;
         self.is_snippet_picker_open = false;
         self.is_pr_picker_open = false;
@@ -7139,7 +7135,7 @@ impl RootView {
             // frame paints or the first key press reads it.
             self.tab_overview_selected = self.active_tab_idx.min(self.tabs.len().saturating_sub(1));
             self.is_global_search_open = false;
-            self.is_command_palette_open = false;
+            self.close_command_palette(_window, cx);
             self.is_ssh_manager_open = false;
             self.is_snippet_picker_open = false;
             self.is_pr_picker_open = false;
@@ -7158,7 +7154,7 @@ impl RootView {
         self.is_global_search_open = !self.is_global_search_open;
         if self.is_global_search_open {
             self.is_tab_overview_open = false;
-            self.is_command_palette_open = false;
+            self.close_command_palette(_window, cx);
             self.is_ssh_manager_open = false;
             self.is_snippet_picker_open = false;
             self.is_pr_picker_open = false;
@@ -7453,8 +7449,12 @@ impl RootView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.is_command_palette_open = false;
         self.record_palette_recent(cmd_id);
+        // Closing restores any uncommitted preview, so a theme or layout hover
+        // cannot outlive an unrelated commit. Previewable commands then apply
+        // once from config: theme and layout are absolute, font deltas
+        // re-apply to the restored base.
+        self.close_command_palette(_window, cx);
         if let Some(workflow_id) = cmd_id.strip_prefix("workflow:") {
             let actions = self
                 .config
@@ -7467,13 +7467,6 @@ impl RootView {
             }
             self.record_palette_recent(cmd_id);
             return;
-        }
-        // Leaving the palette on a non-preview command discards any preview;
-        // previewable commands (theme, font size, layout) commit in their
-        // arms below: theme/layout are absolute (idempotent), font size
-        // persists the already-previewed value.
-        if palette_preview_kind(cmd_id).is_none() {
-            self.cancel_palette_preview(_window, cx);
         }
         match cmd_id {
             "tab_overview" => self.toggle_tab_overview(_window, cx),
@@ -7573,25 +7566,10 @@ impl RootView {
                 _window.toggle_fullscreen();
                 cx.notify();
             }
-            "zoom_in" => {
-                if self.palette_preview_original.is_none() {
-                    self.adjust_font_size(1.0, cx);
-                } else {
-                    // Already previewed while navigating: just persist.
-                    self.commit_font_size(cx);
-                }
-            }
-            "zoom_out" => {
-                if self.palette_preview_original.is_none() {
-                    self.adjust_font_size(-1.0, cx);
-                } else {
-                    self.commit_font_size(cx);
-                }
-            }
+            "zoom_in" => self.adjust_font_size(1.0, cx),
+            "zoom_out" => self.adjust_font_size(-1.0, cx),
             "zoom_reset" => {
-                if self.palette_preview_original.is_none() {
-                    self.font_size = 13.0;
-                }
+                self.font_size = config::default_font_size();
                 self.commit_font_size(cx);
             }
             "theme_default" => self.set_theme("default", cx),
@@ -9508,7 +9486,7 @@ impl RootView {
             cx.notify();
             return;
         }
-        self.palette_preview_original = None;
+        self.palette.commit();
         self.tab_layout = self.config.tab_layout;
         if self.tab_layout == TabLayout::Vertical {
             self.sidebar_open = true;
@@ -9583,7 +9561,7 @@ impl RootView {
         };
         // External reload wins over any in-flight palette preview, and
         // refreshes the config-error banner (fixing the file clears it).
-        self.palette_preview_original = None;
+        self.palette.commit();
         self.config_error = crate::config::load_error();
         let theme_name = loaded_config
             .theme
@@ -9672,7 +9650,7 @@ impl RootView {
     pub fn set_theme(&mut self, theme_name: &str, cx: &mut Context<Self>) {
         let theme = theme_name.to_string();
         if self.save_config(move |config| config.theme = Some(theme)) {
-            self.palette_preview_original = None;
+            self.palette.commit();
             self.current_theme_name = self.config.theme.clone().unwrap_or_default();
             self.theme = Theme::from_name(&self.current_theme_name).with_opacity(self.config.opacity);
             self.status_bar_model = StatusBarModel::new(&self.config, self.theme);
@@ -9683,14 +9661,12 @@ impl RootView {
     /// Snapshots the previewable visual settings before the first preview
     /// step, so cancelling restores them losslessly.
     fn ensure_palette_preview(&mut self) {
-        if self.palette_preview_original.is_none() {
-            self.palette_preview_original = Some(PalettePreviewState {
-                theme_name: self.current_theme_name.clone(),
-                font_size: self.font_size,
-                tab_layout: self.tab_layout,
-                sidebar_open: self.sidebar_open,
-            });
-        }
+        self.palette.begin(PreviewState {
+            theme_name: self.current_theme_name.clone(),
+            font_size: self.font_size,
+            tab_layout: self.tab_layout,
+            sidebar_open: self.sidebar_open,
+        });
     }
 
     /// Transient preview: swaps the UI colors without touching the config
@@ -9736,31 +9712,50 @@ impl RootView {
         cx.notify();
     }
 
-    /// Reverts an uncommitted preview. No-op when nothing is previewing.
+    /// Restores a preview snapshot. Callers get the snapshot from
+    /// `PaletteSession`, so the restore is never skipped.
+    fn restore_palette_preview(
+        &mut self,
+        original: PreviewState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        if self.current_theme_name != original.theme_name {
+            self.current_theme_name = original.theme_name;
+            self.theme =
+                Theme::from_name(&self.current_theme_name).with_opacity(self.config.opacity);
+            self.status_bar_model = StatusBarModel::new(&self.config, self.theme);
+            changed = true;
+        }
+        if (self.font_size - original.font_size).abs() > f32::EPSILON {
+            self.font_size = original.font_size;
+            changed = true;
+        }
+        if self.tab_layout != original.tab_layout || self.sidebar_open != original.sidebar_open {
+            self.tab_layout = original.tab_layout;
+            self.sidebar_open = original.sidebar_open;
+            self.trigger_sidebar_animation(window, cx);
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Reverts an uncommitted preview and keeps the palette open, so the next
+    /// row starts from the real settings. No-op when nothing is previewing.
     pub fn cancel_palette_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(original) = self.palette_preview_original.take() {
-            let mut changed = false;
-            if self.current_theme_name != original.theme_name {
-                self.current_theme_name = original.theme_name;
-                self.theme =
-                    Theme::from_name(&self.current_theme_name).with_opacity(self.config.opacity);
-                self.status_bar_model = StatusBarModel::new(&self.config, self.theme);
-                changed = true;
-            }
-            if (self.font_size - original.font_size).abs() > f32::EPSILON {
-                self.font_size = original.font_size;
-                changed = true;
-            }
-            if self.tab_layout != original.tab_layout || self.sidebar_open != original.sidebar_open
-            {
-                self.tab_layout = original.tab_layout;
-                self.sidebar_open = original.sidebar_open;
-                self.trigger_sidebar_animation(window, cx);
-                changed = true;
-            }
-            if changed {
-                cx.notify();
-            }
+        if let Some(original) = self.palette.revert() {
+            self.restore_palette_preview(original, window, cx);
+        }
+    }
+
+    /// Closes the command palette and restores an uncommitted preview. This is
+    /// the only close path: the open flag lives in `PaletteSession`.
+    pub fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(original) = self.palette.close() {
+            self.restore_palette_preview(original, window, cx);
         }
     }
 
@@ -9776,14 +9771,12 @@ impl RootView {
         match palette_preview_kind(cmd_id) {
             Some(PalettePreviewKind::Theme(name)) => self.preview_theme_transient(name, cx),
             Some(PalettePreviewKind::FontDelta(delta)) => {
-                let base = self
-                    .palette_preview_original
-                    .as_ref()
-                    .map(|s| s.font_size)
-                    .unwrap_or(self.font_size);
+                let base = self.palette.base_font_size(self.config.font.size);
                 self.preview_font_size_transient(base + delta, cx);
             }
-            Some(PalettePreviewKind::FontReset) => self.preview_font_size_transient(13.0, cx),
+            Some(PalettePreviewKind::FontReset) => {
+                self.preview_font_size_transient(config::default_font_size(), cx)
+            }
             Some(PalettePreviewKind::Layout(layout)) => {
                 self.preview_layout_transient(layout, window, cx)
             }
@@ -9793,7 +9786,7 @@ impl RootView {
 
     pub fn adjust_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         if self.save_config(|config| config.font.size = (config.font.size + delta).clamp(9.0, 36.0)) {
-            self.palette_preview_original = None;
+            self.palette.commit();
             self.font_size = self.config.font.size;
         }
         cx.notify();
@@ -9805,7 +9798,7 @@ impl RootView {
     pub fn commit_font_size(&mut self, cx: &mut Context<Self>) {
         let size = self.font_size;
         if self.save_config(move |config| config.font.size = size) {
-            self.palette_preview_original = None;
+            self.palette.commit();
             self.font_size = self.config.font.size;
         }
         cx.notify();
@@ -10132,7 +10125,7 @@ impl RootView {
             || self.project_panel_confirmation.is_some()
             || self.ai_pending_confirmation.is_some()
             || self.is_rename_tab_open
-            || self.is_command_palette_open
+            || self.palette.is_open()
             || self.is_ssh_manager_open
             || self.is_snippet_picker_open
             || self.is_pr_picker_open
@@ -10389,8 +10382,8 @@ impl RootView {
                 return true;
             }
             Action::ResetFontSize => {
-                if self.save_config(|config| config.font.size = 13.0) {
-                    self.palette_preview_original = None;
+                if self.save_config(|config| config.font.size = config::default_font_size()) {
+                    self.palette.commit();
                     self.font_size = self.config.font.size;
                 }
                 cx.notify();
@@ -11084,10 +11077,9 @@ impl RootView {
         }
 
         // 1. Command Palette Keyboard Handler
-        if self.is_command_palette_open {
+        if self.palette.is_open() {
             if key_lower == "escape" || key_lower == "esc" {
-                self.is_command_palette_open = false;
-                self.cancel_palette_preview(_window, cx);
+                self.close_command_palette(_window, cx);
                 cx.notify();
                 return;
             }
@@ -11781,7 +11773,7 @@ impl RootView {
                 || self.is_rename_tab_open
                 || self.is_tab_context_menu_open
                 || self.is_pane_context_menu_open
-                || self.is_command_palette_open
+                || self.palette.is_open()
                 || self.is_ssh_manager_open
                 || self.is_snippet_picker_open
                 || self.is_pr_picker_open
@@ -11804,7 +11796,7 @@ impl RootView {
                 self.is_git_branch_sub_open = false;
                 self.is_tab_context_menu_open = false;
                 self.is_pane_context_menu_open = false;
-                self.is_command_palette_open = false;
+                self.close_command_palette(_window, cx);
                 self.is_ssh_manager_open = false;
                 self.is_snippet_picker_open = false;
                 self.is_pr_picker_open = false;
@@ -12091,7 +12083,7 @@ impl RootView {
 
     pub(crate) fn any_input_overlay_open(&self) -> bool {
         self.is_rename_tab_open
-            || self.is_command_palette_open
+            || self.palette.is_open()
             || self.is_ssh_manager_open
             || self.is_snippet_picker_open
             || self.is_pr_picker_open
@@ -12116,7 +12108,7 @@ impl RootView {
         self.is_context_menu_open
             || self.is_tab_context_menu_open
             || self.is_pane_context_menu_open
-            || self.is_command_palette_open
+            || self.palette.is_open()
             || self.is_ssh_manager_open
             || self.is_snippet_picker_open
             || self.is_pr_picker_open
@@ -12129,11 +12121,11 @@ impl RootView {
             || self.is_git_menu_open
     }
 
-    fn close_root_menus(&mut self) {
+    fn close_root_menus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.is_context_menu_open = false;
         self.is_tab_context_menu_open = false;
         self.is_pane_context_menu_open = false;
-        self.is_command_palette_open = false;
+        self.close_command_palette(window, cx);
         self.is_ssh_manager_open = false;
         self.is_snippet_picker_open = false;
         self.is_pr_picker_open = false;
@@ -12323,7 +12315,7 @@ impl RootView {
             self.is_selecting = false;
             self.has_selection_dragged = false;
             self.selection_start = None;
-            self.open_pane_context_menu(target_pane_id, mouse_x, mouse_y, cx);
+            self.open_pane_context_menu(target_pane_id, mouse_x, mouse_y, window, cx);
             return;
         }
 
@@ -14629,7 +14621,7 @@ impl Render for RootView {
                         }
                     }))
                     .on_tab_context_menu(cx.listener(|this, &(tab_id, x, y), _window, cx| {
-                        this.open_tab_context_menu(tab_id, x, y, cx);
+                        this.open_tab_context_menu(tab_id, x, y, _window, cx);
                     }))
                     .on_new_tab(cx.listener(|this, _ev, window, cx| {
                         this.create_tab(window, cx);
@@ -14768,7 +14760,7 @@ impl Render for RootView {
                                     }
                                 }))
                                 .on_tab_context_menu(cx.listener(|this, &(tab_id, x, y), _window, cx| {
-                                    this.open_tab_context_menu(tab_id, x, y, cx);
+                                    this.open_tab_context_menu(tab_id, x, y, _window, cx);
                                 }))
                                 .on_new_tab(cx.listener(|this, _ev, window, cx| {
                                     this.create_tab(window, cx);
@@ -14993,12 +14985,12 @@ impl Render for RootView {
                         .inset_0()
                         .occlude()
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                            this.close_root_menus();
+                            this.close_root_menus(_window, cx);
                             cx.notify();
                             cx.stop_propagation();
                         }))
                         .on_mouse_down(MouseButton::Right, cx.listener(|this, _ev, _window, cx| {
-                            this.close_root_menus();
+                            this.close_root_menus(_window, cx);
                             cx.notify();
                             cx.stop_propagation();
                         })),
@@ -15968,7 +15960,7 @@ impl Render for RootView {
                 )
             })
             // Command Palette Modal
-            .when(self.is_command_palette_open, |this| {
+            .when(self.palette.is_open(), |this| {
                 let mut backdrop_bg = theme.black;
                 backdrop_bg.a = 0.65;
                 let filtered = self.filtered_palette_commands();
@@ -15985,8 +15977,7 @@ impl Render for RootView {
                         .pt(px(60.))
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                             // Backdrop click: close without committing the preview.
-                            this.is_command_palette_open = false;
-                            this.cancel_palette_preview(_window, cx);
+                            this.close_command_palette(_window, cx);
                             cx.notify();
                         }))
                         .child(
