@@ -1269,7 +1269,7 @@ fn render_table_row(
         // stops the row from renegotiating it, so every cell in a column lands on
         // the same edge. A ratio here cannot do this: each row is a separate flex
         // container and would resolve the same ratio to a different width.
-        let mut column = div().w(px(widths.get(ci).copied().unwrap_or(1.0))).flex_shrink_0();
+        let column = div().w(px(widths.get(ci).copied().unwrap_or(1.0))).flex_shrink_0();
 
         // px_1 rather than px_2: padding is charged per column against a fixed
         // panel width, so 8px a side was a meaningful slice of a 500px panel.
