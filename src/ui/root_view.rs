@@ -9827,11 +9827,8 @@ impl RootView {
 
     pub fn open_settings_file() {
         let path = crate::config::Config::get_active_config_path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if !path.exists() {
-            let _ = std::fs::write(&path, "# Fastty configuration\n");
+        if let Err(error) = crate::config::seed_config_stub(&path) {
+            eprintln!("Fastty could not seed the settings file: {error}");
         }
         open_path_or_url(&path);
     }

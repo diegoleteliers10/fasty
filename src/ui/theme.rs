@@ -308,7 +308,15 @@ impl Theme {
             "one-light" => Self::one_light(),
             "solarized-light" => Self::solarized_light(),
             "kanagawa" | "kanagawa-wave" => Self::kanagawa(),
-            _ => Self::fastty_default(),
+            _ => {
+                static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                WARNED.get_or_init(|| {
+                    eprintln!(
+                        "Fastty theme \"{name}\" is not built in and no custom theme file matches; rendering the default theme. The config file keeps the name."
+                    );
+                });
+                Self::fastty_default()
+            }
         }
     }
 

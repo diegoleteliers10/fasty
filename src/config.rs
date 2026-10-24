@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
-use toml_edit::{DocumentMut, Item, Table, value};
+use toml_edit::{DocumentMut, Item};
+#[cfg(test)]
+use toml_edit::{Table, value};
 
 pub static ACTIVE_THEME: RwLock<String> = RwLock::new(String::new());
 
@@ -661,14 +663,20 @@ fn candidate_toml_paths() -> Vec<PathBuf> {
         paths.push(home.join(".fastty.toml"));
     }
 
-    // 4. Current working directory (fastty.toml only; avoid generic config.toml)
-    paths.push(PathBuf::from("fastty.toml"));
-
-    // 5. System-wide /etc directory
+    // 4. System-wide /etc directory
     paths.push(PathBuf::from("/etc/fastty/config.toml"));
     paths.push(PathBuf::from("/etc/fastty/fastty.toml"));
 
     paths
+}
+
+/// Create a comment-only config file when it is missing, atomically, so
+/// "open settings file" never races a partial write over an existing config.
+pub fn seed_config_stub(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    atomic_write(path, b"# Fastty configuration\n")
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
@@ -711,6 +719,7 @@ fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     anyhow::bail!("Cannot create a temporary config file for {}", path.display())
 }
 
+#[cfg(test)]
 fn ensure_table(doc: &mut DocumentMut, key: &str) {
     let needs_init = !doc.contains_key(key) || !doc[key].is_table();
     if needs_init {
@@ -777,6 +786,7 @@ fn apply_config_changes(
     }
 }
 
+#[cfg(test)]
 fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
     doc["scrollback"] = value(c.scrollback as i64);
     doc["opacity"] = value(c.opacity as f64);
@@ -864,6 +874,7 @@ fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
     apply_ai_to_doc(doc, &c.ai);
 }
 
+#[cfg(test)]
 fn apply_ai_to_doc(doc: &mut DocumentMut, ai_cfg: &crate::ai::AiConfig) {
     ensure_table(doc, "ai");
     if let Some(ai) = doc["ai"].as_table_mut() {
@@ -975,6 +986,7 @@ fn apply_ai_to_doc(doc: &mut DocumentMut, ai_cfg: &crate::ai::AiConfig) {
     }
 }
 
+#[cfg(test)]
 fn config_to_toml_string(c: &Config) -> String {
     let mut doc = DocumentMut::new();
     apply_to_doc(&mut doc, c);
