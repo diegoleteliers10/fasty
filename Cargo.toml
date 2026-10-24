@@ -78,7 +78,7 @@ winres = "0.1"
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.5"
+objc2 = "0.6"
 # UNUserNotificationCenter replaced the deprecated NSUserNotificationCenter
 # that notify-rust still uses on macOS. objc2_06 is the objc2 generation the
 # notification bindings need; plain `objc2` stays 0.5 for macos_maximize.
