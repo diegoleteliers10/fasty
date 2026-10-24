@@ -1382,6 +1382,7 @@ impl TerminalState {
                             let _ = writer.flush();
                         }
                         OscCommand::ProgramStatus(command) => {
+                            eprintln!("Fastty program status OSC parsed: {command:?}");
                             update_program_status(
                                 &program_status_clone,
                                 &program_status_pending_clone,

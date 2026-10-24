@@ -7706,6 +7706,12 @@ impl RootView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        eprintln!(
+            "Fastty program status refresh: pane={pane_id} records={} notify_flag={} active_window={}",
+            records.len(),
+            self.config.notify_on_program_status,
+            window.is_window_active()
+        );
         let Some(tab) = self
             .tabs
             .iter()
