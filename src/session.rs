@@ -160,37 +160,6 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn prune_other_hosts(mut self, host: &crate::daemon::HostInstanceId) -> (Self, bool) {
-        let mut changed = false;
-        let window_count = self.windows.len();
-        (self.windows, self.active_window) =
-            retain_selected(self.windows, self.active_window, |mut window| {
-                (window.tabs, window.active_tab) =
-                    retain_selected(window.tabs, window.active_tab, |mut tab| {
-                        if let Some(tree) = tab.pane_tree.take() {
-                            let root = tree.root.prune_other_hosts(host, &mut changed)?;
-                            let active_pane_id = if root.contains_pane(tree.active_pane_id) {
-                                tree.active_pane_id
-                            } else {
-                                root.first_pane_id()
-                            };
-                            tab.pane_tree = Some(PersistedPaneTree {
-                                root,
-                                active_pane_id,
-                            });
-                        }
-                        Some(tab)
-                    });
-                (!window.tabs.is_empty()).then_some(window)
-            });
-        changed |= self.windows.len() != window_count;
-        if changed {
-            self.legacy_tabs.clear();
-            self.legacy_active_tab = 0;
-        }
-        (self, changed)
-    }
-
     pub fn migrate(self) -> Session {
         if !self.windows.is_empty() {
             return self;
@@ -211,25 +180,6 @@ impl Session {
             legacy_active_tab: self.legacy_active_tab,
         }
     }
-}
-
-fn retain_selected<T>(
-    items: Vec<T>,
-    selected: usize,
-    mut retain: impl FnMut(T) -> Option<T>,
-) -> (Vec<T>, usize) {
-    let mut retained = Vec::with_capacity(items.len());
-    let mut retained_selected = 0;
-    for (index, item) in items.into_iter().enumerate() {
-        if let Some(item) = retain(item) {
-            if index < selected {
-                retained_selected += 1;
-            }
-            retained.push(item);
-        }
-    }
-    let selected = retained_selected.min(retained.len().saturating_sub(1));
-    (retained, selected)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,63 +225,6 @@ pub enum PersistedPaneNode {
         first: Box<PersistedPaneNode>,
         second: Box<PersistedPaneNode>,
     },
-}
-
-impl PersistedPaneNode {
-    fn prune_other_hosts(
-        self,
-        host: &crate::daemon::HostInstanceId,
-        changed: &mut bool,
-    ) -> Option<Self> {
-        match self {
-            Self::Leaf(pane) => {
-                if pane
-                    .host_session_identity
-                    .as_ref()
-                    .is_some_and(|identity| &identity.host_instance != host)
-                {
-                    *changed = true;
-                    None
-                } else {
-                    Some(Self::Leaf(pane))
-                }
-            }
-            Self::Split {
-                direction,
-                ratio,
-                first,
-                second,
-            } => match (
-                first.prune_other_hosts(host, changed),
-                second.prune_other_hosts(host, changed),
-            ) {
-                (Some(first), Some(second)) => Some(Self::Split {
-                    direction,
-                    ratio,
-                    first: Box::new(first),
-                    second: Box::new(second),
-                }),
-                (Some(node), None) | (None, Some(node)) => Some(node),
-                (None, None) => None,
-            },
-        }
-    }
-
-    fn contains_pane(&self, pane_id: usize) -> bool {
-        match self {
-            Self::Leaf(pane) => pane.pane_id == pane_id,
-            Self::Split { first, second, .. } => {
-                first.contains_pane(pane_id) || second.contains_pane(pane_id)
-            }
-        }
-    }
-
-    fn first_pane_id(&self) -> usize {
-        match self {
-            Self::Leaf(pane) => pane.pane_id,
-            Self::Split { first, .. } => first.first_pane_id(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
