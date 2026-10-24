@@ -3,6 +3,13 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.24.3 - 2026-10-24
+
+### Session host
+
+- Rotate an idle session host whose build or protocol differs from the app's: after an update, the first Fastty start with no live sessions now replaces the old host in place instead of serving old daemon code forever. Hosts with live sessions still refuse to rotate.
+- Log the parsed OSC 7501 report and the notification decision inputs (records, config flag, window focus), one line per agent status transition.
+
 ## 0.24.2 - 2026-10-24
 
 ### Config persistence audit
