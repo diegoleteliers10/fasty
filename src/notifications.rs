@@ -82,9 +82,8 @@ mod macos {
     use std::ptr::NonNull;
     use objc2_foundation::{NSError, NSString};
     use objc2_user_notifications::{
-        UNAuthorizationOptions, UNAuthorizationStatus, UNMutableNotificationContent,
-        UNNotificationRequest, UNNotificationSettings, UNNotificationSound,
-        UNUserNotificationCenter,
+        UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest,
+        UNNotificationSettings, UNNotificationSound, UNUserNotificationCenter,
     };
 
     pub fn request_permission() {
