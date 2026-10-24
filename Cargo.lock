@@ -1872,7 +1872,7 @@ dependencies = [
  "criterion",
  "dirs 6.0.0",
  "fff-search",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "git2",
  "gpui",
  "gpui_platform",
