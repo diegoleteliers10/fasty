@@ -3,6 +3,15 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.24.2 - 2026-10-24
+
+### Config persistence audit
+
+- Stop deleting saved tabs from `session.json` when the host instance rotated; restore already checks each pane against the live host, so dead sessions still drop out without destroying the saved layout.
+- Remove the current-directory `fastty.toml` candidate: a project-local file could silently become the active config for the whole process.
+- Seed a missing settings file through the atomic writer instead of a bare write that could race an editor.
+- Warn once when the configured theme name matches neither a built-in nor a custom theme, instead of silently rendering the default.
+
 ## 0.24.1 - 2026-10-23
 
 ### Notifications
