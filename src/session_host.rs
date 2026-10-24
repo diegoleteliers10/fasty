@@ -292,6 +292,16 @@ pub fn ensure_running() -> Result<(), String> {
                             info.version,
                             info.capabilities
                         );
+                        // An empty host running another build would keep the
+                        // socket forever and serve old code (old protocol
+                        // behavior, no new daemon fixes). Rotate it now; the
+                        // host refuses when any session is still alive.
+                        if host_status().is_ok_and(|status| status.restart_available) {
+                            eprintln!(
+                                "Fastty restarting the idle session host to run this app's build"
+                            );
+                            return restart_host();
+                        }
                     }
                     return Ok(());
                 }
