@@ -186,7 +186,8 @@ pub enum CsiEvent {
 /// alacritty model: scrollback wipe on plain `CSI 2J`, Synchronized
 /// Output (DEC private mode 2026), the kitty clipboard probe, and the
 /// kitty keyboard protocol's push/pop/set/query sequences.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CsiWatcher {
     state: CsiState,
     /// Prefix byte of the sequence: `0`, `?`, `>`, `<`, or `=`.
@@ -197,8 +198,9 @@ pub struct CsiWatcher {
     intermediate: Option<u8>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 enum CsiState {
+    #[default]
     Ground,
     Esc,
     Params,
@@ -312,11 +314,6 @@ impl CsiWatcher {
     }
 }
 
-impl Default for CsiWatcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct ImagePlacement {
@@ -396,6 +393,7 @@ pub struct SideCheckpoint {
     apc_buf: Vec<u8>,
     #[serde(default)]
     dcs_buf: Vec<u8>,
+    #[serde(default)]
     csi_watcher: CsiWatcher,
     sync_output_active: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
