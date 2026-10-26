@@ -1,82 +1,69 @@
 # fastty — Status & Pendientes
 
-**Última actualización:** 2026-08-09
-**Plataforma objetivo:** macOS únicamente (Linux/Windows no se tocan)
+**Última actualización:** 2026-10-25
+**Render:** GPUI (Zed) — macOS primero; Linux/Windows funcionales
+
+> La versión anterior de este documento describía un renderer wgpu/winit
+> (src/renderer/pipeline.rs, src/chrome_layout.rs) que ya no existe: la app
+> compila hoy contra GPUI y el chrome se dibuja con `div()` (src/ui/). Los
+> archivos muertos se eliminaron en octubre de 2026.
 
 ---
 
-## 1. Optimización de startup ✅
+## 1. Startup
 
-| Cambio | Archivo | Impacto |
-|--------|---------|---------|
-| Fontconfig (fc-list/fc-match) solo en Linux | `src/renderer/atlas.rs` | Evita ~200ms de subprocess spam en macOS |
-| Backends específicos por plataforma (METAL en macOS) | `src/renderer/mod.rs` | Elimina enumeración innecesaria de GPUs |
-| Shell integration escrita una vez por proceso (`OnceLock`) | `src/terminal_state.rs` | Elimina reescritura de archivos en cada nueva pestaña |
+Cold start ~129ms → Warm ~79ms (verificado en M1, 2026-08):
 
-**Resultado:** Cold start ~129ms → Warm ~79ms (al primer event loop iteration).
-
----
-
-## 2. Chrome scaling en Retina (2×) ✅ parcial — pendiente bugs
-
-### Problema
-En pantallas Retina (scale_factor=2.0), el pipeline dibuja en **píxeles físicos** pero las constantes del chrome estaban en unidades lógicas de diseño. Resultado:
-- Topbar: ~15 logical px (debería ~30-40)
-- Iconos/settings: mitad de tamaño
-- Logo: mitad de tamaño
-
-### Solución aplicada
-- `chrome_layout.rs`: Factor global `set_scale(f32)` con `AtomicU32` (milli-units)
-- `pipeline.rs`: `sf = chrome_layout::scale()` → todas las constantes del chrome multiplicadas por `sf`
-- `main.rs`: Hit-testing alineado con la geometría escalada
-
-### Archivos modificados
-- `src/chrome_layout.rs` — `set_scale()`, `scale()`, `scale_f64()`, `topbar_bottom_f64()`
-- `src/renderer/pipeline.rs` — topbar, tabs, buttons, logo, scrollbar, rename input
-- `src/main.rs` — umbrales de click, context menu, cursor_outside_tab_area
+| Cambio | Archivo |
+|--------|---------|
+| Fontconfig (fc-list/fc-match) solo en Linux | `src/font_discovery_macos.rs` |
+| Backends específicos por plataforma | selección de plataforma en bootstrap |
+| Shell integration escrita una vez por proceso (`OnceLock`) | `src/terminal_state.rs` |
 
 ---
 
-## 3. Bugs conocidos / Pendientes
+## 2. Arquitectura (mapa rápido)
 
-| # | Bug | Severidad | Notas |
-|---|-----|-----------|-------|
-| 1 | **Ventana "About"**: topbar usa `40.0` hardcoded sin escalar | Baja | Ventana popup separada, no afecta la app principal |
-| 2 | **Ventana "Settings"**: topbar tiene su propio `scale = viewport_width/400` | Baja | Independiente del chrome principal, parece funcionar |
-| 3 | **Context menu**: `position.x` para el ancho del menú no escala | Baja | Afecta posición horizontal del menú contextual |
-| 4 | **Scrollbar track en second window**: `track_top = topbar_h` funciona, pero offsets internos pueden estar descaliados | Media | Revisar si el scrollbar responde correctamente en ventanas secundarias |
-| 5 | **Doble verificación de startup**: `cargo fix` dejó warnings de `is_color_font` sin usar | Baja | Preexistente, no relacionado |
-| 6 | **Necesita prueba visual**: Todos los cambios de rendering son teóricos — no se verificaron con screenshots | Alta | Abrir la app y confirmar que el topbar, logo, settings e íconos se ven correctos |
-
----
-
-## 4. Archivos clave (referencia rápida)
-
-| Archivo | Función |
-|---------|---------|
-| `src/chrome_layout.rs` | Rects de UI del chrome, factor de escala global |
-| `src/renderer/pipeline.rs` | Dibujado de todo el chrome (topbar, tabs, logo, settings, scrollbar) |
-| `src/renderer/mod.rs` | Selección de adapter/wgpu, llamada a `render()` |
-| `src/main.rs` | Hit-testing, drag tabs, context menus, control flow |
-| `src/terminal_state.rs` | PTY spawn, shell integration |
-| `src/font_discovery_macos.rs` | CoreText font resolution |
-| `src/macos_metal_layer.rs` | CAMetalLayer setup |
+| Área | Archivos |
+|------|----------|
+| UI (tabs, splits, palette, settings, status bar) | `src/ui/*.rs`, `src/pane_tree.rs` |
+| Terminal (PTY, parser OSC/CSI/DCS, imágenes, snapshot FST1) | `src/terminal_state.rs`, `src/parser/`, `src/server/` |
+| Daemon (socket, protocolo NDJSON, sesiones host) | `src/daemon.rs`, `src/session_host.rs`, `src/protocol_compat.rs` |
+| CLI (sessions/attach/spawn/write/capture/host/agent-status) | `src/main.rs`, `src/daemon_client.rs`, `src/host_service.rs` |
+| Gateway web (HTTP/WS embebido + WASM) | `src/gateway.rs`, `crates/fastty-wasm/`, `web/` |
+| MCP | `src/mcp.rs` |
+| IA (sidebar, providers, tools, auto-allow) | `src/ai/` |
 
 ---
 
-## 5. Próximos pasos (cuando se reanude)
+## 3. Pendientes / deuda conocida
 
-1. **Verificar visualmente** — abrir la app en Retina y confirmar que el topbar mide ~30-40 logical px, logo y settings se ven proporcionales
-2. **Ventana About** — aplicar `sf` al topbar de `render_about()` si se desea consistencia
-3. **Context menu X** — escalar `context_menu_x = 8.0` si es necesario
-4. **Scroll vertical en second window** — revisar offsets del scrollbar
-5. **Considerar refactor** — la lógica de tabs en `main.rs` (~2000 líneas) duplica geometría de `pipeline.rs`. Un módulo compartido `tab_layout` eliminaría esta duplicación y reduciría bugs de sincronización
+| # | Tema | Estado |
+|---|------|--------|
+| 1 | sixel: el gateway web no muestra imágenes (FST1 lleva solo celdas). Falta canal de imágenes en el snapshot o en el WS. | Abierto |
+| 2 | Windows: daemon sin named pipes (`start()` es no-op en `#[cfg(not(unix))]`). Requiere runner Windows en CI para verificarse. | Diferido |
+| 3 | Kitty keyboard: el cliente WASM (`encode_key` en `crates/fastty-wasm`) sigue con encoding legacy; el encoder nuevo (`src/kitty_keyboard.rs`) no está compartido como crate. | Abierto |
+| 4 | `src/ui/root_view.rs` (~21k líneas) necesita partición por dominio (input, overlays, render). | Abierto |
+| 5 | Dock badge con porcentaje para OSC 9;4 (hoy: solo indicador en tab). | Abierto |
+| 6 | Eventos kitty release: verificar comportamiento de `on_key_up` con IME activo y en Linux/Windows. | Abierto |
 
 ---
 
-## 6. Construcción
+## 4. Verificación
 
 ```bash
-cargo build --release    # ~54s en M1
-./target/release/fastty  # smoke test: kill después de 2s
+cargo test                # 545+ tests
+cargo build --release     # ~54s en M1
+./target/release/fastty   # smoke test
+```
+
+Pruebas manuales de protocolo:
+
+```sh
+# kitty keyboard: consultar flags (responde CSI ? flags u)
+printf '\x1b[?u'   # dentro de un pane, con una app que lo use
+# progress en tab:
+printf '\x1b]9;4;1;50\x1b\\'
+# sixel:
+chafa --format sixel imagen.png
 ```

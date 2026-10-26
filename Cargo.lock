@@ -1858,7 +1858,7 @@ dependencies = [
 
 [[package]]
 name = "fastty"
-version = "0.24.3"
+version = "0.25.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

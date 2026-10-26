@@ -11,14 +11,17 @@ Fastty is a modern, high-performance terminal emulator designed for speed, low m
 
 - **GPU-Accelerated Rendering**: Fast layout and rasterization powered by GPUI and Metal/Vulkan.
 - **TUI & CLI Compatibility**: Pixel-perfect rendering for OpenCode, Claude Code, lazygit, htop, and complex box-drawing/block ASCII art.
-- **Modern Tab System**: Underline selection styling, double-click/right-click tab renaming (`⌘⇧R` / `Ctrl+Shift+R`), duplicate tab, and dynamic process title updates.
-- **Local IPC Daemon Protocol**: Built-in multiplexer server via Unix domain socket (`fasttyd.sock`). List live sessions, attach remotely, or integrate with Neovim, Zed, and VS Code plugins.
+- **Kitty Keyboard Protocol**: Progressive enhancement (`CSI > u` / `CSI < u` / `CSI = u`), repeat and release events, alternate keys, and associated text — full modifier fidelity for agent CLIs and modern TUIs.
+- **Inline Graphics**: Kitty graphics protocol and Sixel in the same image pipeline.
+- **Modern Tab System**: Underline selection styling, double-click/right-click tab renaming (`⌘⇧R` / `Ctrl+Shift+R`), duplicate tab, dynamic process title updates, and per-tab `OSC 9;4` progress bars.
+- **Local IPC Daemon Protocol**: Built-in multiplexer server via Unix domain socket (`fasttyd.sock`). List live sessions, attach remotely (over SSH tunnels), or integrate with Neovim, Zed, and VS Code plugins.
 - **Native Web Gateway & Fastty-Wasm**: Embedded zero-dependency HTTP & WebSocket server (`fastty gateway`) and pure WebAssembly VT emulator to access your active terminals from any browser, tablet, or mobile device.
 - **Cross-Platform**: First-class support for macOS, Linux (Wayland/X11), and Windows with automatic shell detection (`zsh`, `fish`, `bash`, `powershell`, `pwsh`, `cmd`).
 - **Built-in Status Bar & Git Integration**: Branch indicator, worktree switcher (`⌘⌥W` / `Ctrl+Alt+W`), sync status, and command execution timer.
 - **Native OpenCode Agent**: Run OpenCode through ACP with tab-scoped sessions, streamed tool activity, model discovery, and permission prompts.
 - **Command Palette & SSH Manager**: Fast command navigation (`⌘P` / `Ctrl+Shift+P`) and SSH connection manager (`⌘O` / `Ctrl+Shift+O`).
 - **Config & Theming**: TOML configuration (`fastty.toml`) with live reload and 20 built-in themes — Catppuccin (Mocha/Frappé/Macchiato/Latte), Dracula, Nord, Tokyo Night, Gruvbox, Rosé Pine, One, Solarized, Kanagawa — including light variants, plus user JSON themes in `themes/`.
+- **Silence Notifications**: `notify_on_silence_seconds` fires one notification when a running command goes quiet for that long while the window is not focused.
 
 ---
 
@@ -32,17 +35,29 @@ Fastty includes a built-in session multiplexer and an embedded web server access
 # List all active tabs and splits with PID, CWD, and window title
 fastty sessions
 
+# The same, against a remote host (over an SSH tunnel)
+fastty sessions --remote user@server
+
 # Watch session changes in real time (reactive stream)
 fastty sessions --watch
 
 # Attach interactively to an existing session
 fastty attach <session-id>
 
+# Attach to a session on a remote machine
+fastty attach --remote user@server <session-id>
+
 # Attach in read-only mode (viewing logs/builds without input interference)
 fastty attach <session-id> --read-only
 
 # Wait for a session to become available before attaching
 fastty attach <session-id> --wait=30
+
+# Supervised host: starts at login, restarts after a crash,
+# and keeps sessions alive across app upgrades
+fastty host install     # macOS: launchd agent · Linux: systemd user unit
+fastty host status
+fastty host uninstall
 ```
 
 ### Web Gateway & Browser Access

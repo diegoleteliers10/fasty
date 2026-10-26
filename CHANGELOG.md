@@ -3,6 +3,49 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.25.0 - 2026-10-25
+
+### Crash fix (bare binary launches)
+
+- Never call `UNUserNotificationCenter` from a process without a main bundle identifier. A `fastty` CLI launch (installed script, agent hooks, `fastty host` from PATH) has no bundle, and `+[UNUserNotificationCenter currentNotificationCenter]` raises there, aborting the whole process ~1s after launch (crash report 5EC0FF51, SIGABRT in `-postDidFinishNotification`). `request_permission` and notification delivery now probe the bundle first and skip with a log line. Regression test runs the real call path in an unbundled test binary.
+
+### Session host diagnostics
+
+- New `host-trace.log` in the state dir: host starts (with version and protocol), host instance changes seen by the app, new host child spawns, and accept-loop exits, each with a timestamp and pid. After a lost-session incident, this answers who died, when, and which instance ran.
+
+### Kitty keyboard protocol
+
+- Full progressive enhancement: `CSI > u` push, `CSI < u` pop, `CSI = flags;mode u` set, and `CSI ? u` query (answered with the active flags). Stack bounded at 16 entries; popping an empty stack resets.
+- New pure encoder (`src/kitty_keyboard.rs`) for the CSI u forms: disambiguate escape codes, report event types (press/repeat/release via `on_key_up`), report alternate keys (shifted sub-field), report all keys, and associated text as code points. Legacy bytes stay intact when no flags are set, including the Enter/Tab/Backspace exceptions.
+- Flags survive snapshots: FST1 stores the active flags in a previously reserved byte (old snapshots read as zero, so both directions stay compatible), and restore replays `CSI = flags;1 u` so a re-attached client keeps encoding correctly.
+
+### Progress (OSC 9;4)
+
+- Parse ConEmu `OSC 9;4;state;pct` into a per-pane progress report (states: normal, error, indeterminate, paused, clear). Previously this sequence leaked into the notification path and produced junk notifications.
+- The active tab and the vertical sidebar draw a thin progress bar; indeterminate shows a short segment.
+
+### Notifications
+
+- New `notify_on_silence_seconds` config key: when a running command produces no output for that long and the window is not focused, fastty sends one notification. Armed by OSC 133 command start, disarmed by command end, so it never duplicates `notify_on_command_finish`.
+
+### Session host
+
+- New `fastty host install|uninstall|status`: a supervised host as a launchd agent (macOS) or a systemd user unit (Linux). The host starts at login, restarts after a crash, and the single-instance lock keeps it from ever fighting the app's own detached host.
+- Remote sessions over SSH tunnels: `fastty sessions --remote user@host` and `fastty attach --remote user@host <id>` forward a local Unix socket to the remote `fasttyd.sock` (auto-discovered per platform, overridable with `--remote-socket`). No protocol changes; the remote host needs its own `fastty host install`.
+
+### Gateway (web)
+
+- Session size ownership: the first browser that resizes a session owns its size; others get a `size_owned` error and a button to take control (`claim_size`). Owners release on disconnect. This replaces last-write-wins resizing when two browsers watch the same session.
+- New Resync button requests a full FST1 snapshot of the active session.
+
+### Sixel graphics
+
+- New sixel decoder (`src/parser/sixel.rs`) feeding the same image pipeline as kitty graphics: color registers (RGB and HLS), repeats, `$`/`-` movement, transparent background, 16 MB payload cap. `chafa --format sixel`, `lsix`, and older `vim` builds now draw inline images.
+
+### Cleanup
+
+- Removed dead pre-GPUI files (`src/chrome_layout.rs`, `src/secondary_window.rs`) and rewrote STATUS.md against the current architecture.
+
 ## 0.24.3 - 2026-10-24
 
 ### Session host
