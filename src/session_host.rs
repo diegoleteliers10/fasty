@@ -345,6 +345,11 @@ pub fn ensure_running() -> Result<(), String> {
     }
 
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    match recorded_host_pid_alive() {
+        Some(true) => trace("host socket dead but recorded host pid is still alive"),
+        Some(false) => trace("previous host pid is gone (process exited)"),
+        None => trace("no host.pid from a previous host"),
+    }
     trace(&format!(
         "spawning new host child from {}",
         executable.display()
@@ -404,13 +409,78 @@ pub fn trace(event: &str) {
 }
 
 pub fn run_host() {
+    install_host_signal_trace();
+    let _ = std::fs::write(
+        crate::paths::get().state_dir.join("host.pid"),
+        std::process::id().to_string(),
+    );
     trace(&format!(
-        "host started version={} protocol={}",
+        "host started version={} protocol={} pid={}",
         env!("CARGO_PKG_VERSION"),
-        PROTOCOL_VERSION
+        PROTOCOL_VERSION,
+        std::process::id()
     ));
     crate::daemon::run_host();
     trace("host accept loop exited");
+}
+
+/// Record every catchable death signal to `host-trace.log` before dying.
+///
+/// A clean `run_host` return logs `host accept loop exited`, a Rust panic
+/// logs to `panic.log`, and a memory kill produces a jetsam report. A bare
+/// `kill` or `killall fastty` produces nothing anywhere, which is exactly
+/// the unexplained-host-death case. The handler only calls `write(2)` on a
+/// descriptor opened up front, so it stays async-signal-safe; afterwards it
+/// restores the default action and re-raises.
+#[cfg(unix)]
+fn install_host_signal_trace() {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    use std::os::fd::AsRawFd;
+
+    static TRACE_FD: AtomicI32 = AtomicI32::new(-1);
+    let path = crate::paths::get().state_dir.join("host-trace.log");
+    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let raw = unsafe { libc::dup(file.as_raw_fd()) };
+        TRACE_FD.store(raw, Ordering::Relaxed);
+        std::mem::forget(file);
+    }
+
+    extern "C" fn handler(signal: libc::c_int) {
+        let fd = TRACE_FD.load(Ordering::Relaxed);
+        if fd >= 0 {
+            // Text is fixed per signal so the handler never formats.
+            let message: &[u8] = match signal {
+                libc::SIGTERM => b"host terminated by SIGTERM\n",
+                libc::SIGINT => b"host terminated by SIGINT\n",
+                libc::SIGHUP => b"host terminated by SIGHUP\n",
+                libc::SIGQUIT => b"host terminated by SIGQUIT\n",
+                _ => b"host terminated by signal\n",
+            };
+            unsafe {
+                let _ = libc::write(fd, message.as_ptr().cast(), message.len());
+                libc::signal(signal, libc::SIG_DFL);
+                libc::raise(signal);
+            }
+        }
+        std::process::exit(128 + signal as i32);
+    }
+
+    unsafe {
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+            libc::signal(signal, handler as libc::sighandler_t);
+        }
+    }
+}
+
+/// True when the recorded host process still exists. Reads `host.pid` so the
+/// caller can tell a dead host from a host whose socket vanished under it.
+#[cfg(unix)]
+fn recorded_host_pid_alive() -> Option<bool> {
+    let raw = std::fs::read_to_string(crate::paths::get().state_dir.join("host.pid")).ok()?;
+    let pid: libc::pid_t = raw.trim().parse().ok()?;
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    Some(alive)
 }
 
 #[cfg(unix)]
