@@ -481,6 +481,25 @@ fn send_http_response(stream: &mut TcpStream, content_type: &str, body: &[u8]) {
     let _ = stream.flush();
 }
 
+/// Per-session size ownership for connected browsers.
+///
+/// One gateway serves many WebSockets; without ownership, two tabs looking
+/// at the same session fight over the PTY size like an old tmux (last
+/// write wins). The first browser that resizes a session owns its size;
+/// others get a `size_owned` error and can take control explicitly with
+/// `claim_size`. Ownership dies with the owning connection.
+#[cfg(unix)]
+static SIZE_OWNERS: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<usize, u64>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(unix)]
+fn size_owners() -> &'static parking_lot::Mutex<std::collections::HashMap<usize, u64>> {
+    SIZE_OWNERS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(unix)]
+static CLIENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 fn handle_websocket(mut stream: TcpStream, key: &str, read_only: bool) {
     // 1. Handshake
     const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -552,6 +571,8 @@ fn handle_websocket(mut stream: TcpStream, key: &str, read_only: bool) {
         let _ = stream.set_read_timeout(None);
 
         let alive = Arc::new(AtomicBool::new(true));
+        #[cfg(unix)]
+        let client_id = CLIENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut ws_read = match stream.try_clone() {
             Ok(s) => s,
             Err(_) => return,
@@ -606,7 +627,7 @@ fn handle_websocket(mut stream: TcpStream, key: &str, read_only: bool) {
                     if read_only {
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
                             if let Some(cmd) = val.get("cmd").and_then(|c| c.as_str()) {
-                                if matches!(cmd, "write" | "spawn" | "close") {
+                                if matches!(cmd, "write" | "spawn" | "close" | "resize" | "claim_size") {
                                     let err_resp = serde_json::json!({
                                         "event": "error",
                                         "code": "read_only",
@@ -615,6 +636,20 @@ fn handle_websocket(mut stream: TcpStream, key: &str, read_only: bool) {
                                     let _ = send_ws_text(&mut *ws_write.lock(), &err_resp.to_string());
                                     continue;
                                 }
+                            }
+                        }
+                    }
+                    #[cfg(unix)]
+                    {
+                        match size_command(&text, client_id, &ws_write) {
+                            SizeCommand::Forward => {}
+                            SizeCommand::Handled => {
+                                let _ = unix_write.flush();
+                                continue;
+                            }
+                            SizeCommand::Rejected(message) => {
+                                let _ = send_ws_text(&mut *ws_write.lock(), &message);
+                                continue;
                             }
                         }
                     }
@@ -631,14 +666,89 @@ fn handle_websocket(mut stream: TcpStream, key: &str, read_only: bool) {
         }
 
         alive.store(false, Ordering::Relaxed);
+        #[cfg(unix)]
+        size_owners()
+            .lock()
+            .retain(|_, owner| *owner != client_id);
         let _ = forward_to_browser.join();
+    }
+}
+
+/// Outcome of inspecting a browser frame for size-ownership commands.
+#[cfg(unix)]
+enum SizeCommand {
+    /// Not a size command: forward to the daemon untouched.
+    Forward,
+    /// Answered locally; do not reach the daemon.
+    Handled,
+    /// Answered with an error; do not reach the daemon.
+    Rejected(String),
+}
+
+/// Enforce session size ownership on `resize` and answer the
+/// `claim_size` / `release_size` handshake locally.
+#[cfg(unix)]
+fn size_command(
+    text: &str,
+    client_id: u64,
+    ws_write: &parking_lot::Mutex<TcpStream>,
+) -> SizeCommand {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return SizeCommand::Forward;
+    };
+    let Some(cmd) = value.get("cmd").and_then(|c| c.as_str()) else {
+        return SizeCommand::Forward;
+    };
+    let id = value.get("id").and_then(|v| v.as_u64()).map(|v| v as usize);
+    match cmd {
+        "claim_size" | "release_size" => {
+            let Some(id) = id else {
+                return SizeCommand::Forward;
+            };
+            let owner = match cmd {
+                "claim_size" => {
+                    size_owners().lock().insert(id, client_id);
+                    Some(client_id)
+                }
+                _ => size_owners()
+                    .lock()
+                    .remove(&id)
+                    .filter(|previous| *previous == client_id)
+                    .map(|_| None)
+                    .unwrap_or_else(|| size_owners().lock().get(&id).copied()),
+            };
+            let response = serde_json::json!({ "event": "size_owner", "id": id, "client": owner });
+            let _ = send_ws_text(&mut *ws_write.lock(), &response.to_string());
+            SizeCommand::Handled
+        }
+        "resize" => {
+            let Some(id) = id else {
+                return SizeCommand::Forward;
+            };
+            let mut owners = size_owners().lock();
+            let blocked = match owners.get(&id) {
+                Some(owner) => *owner != client_id,
+                None => false,
+            };
+            if blocked {
+                let response = serde_json::json!({
+                    "event": "error",
+                    "code": "size_owned",
+                    "id": id,
+                    "message": "another browser controls this session's size. Take control to resize."
+                });
+                return SizeCommand::Rejected(response.to_string());
+            }
+            owners.insert(id, client_id);
+            SizeCommand::Forward
+        }
+        _ => SizeCommand::Forward,
     }
 }
 
 /// The gateway ships with the daemon, so a browser `hello` without a version
 /// speaks the daemon's own protocol version.
-fn announce_protocol_version(text: String) -> String {
-    // The gateway forwards every browser frame; the substring check keeps the
+fn announce_protocol_version(text: String) -> String {    // The gateway forwards every browser frame; the substring check keeps the
     // per-message JSON parse off the typing hot path.
     if !text.contains("\"hello\"") {
         return text;

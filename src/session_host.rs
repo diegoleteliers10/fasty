@@ -67,6 +67,19 @@ fn remember_host_info(info: HostInfo) -> bool {
     let cache = HOST_INFO.get_or_init(|| std::sync::Mutex::new(None));
     let mut cached = cache.lock().unwrap_or_else(|error| error.into_inner());
     let changed = cached.as_ref() != Some(&info);
+    if changed {
+        let previous = cached
+            .as_ref()
+            .and_then(|old| old.host_instance.as_ref())
+            .map(|instance| instance.0.clone())
+            .unwrap_or_else(|| "none".to_string());
+        trace(&format!(
+            "host instance changed: previous={} now={} version={}",
+            previous,
+            info.host_instance.as_ref().map(|i| i.0.as_str()).unwrap_or("none"),
+            info.fastty_version
+        ));
+    }
     *cached = Some(info);
     changed
 }
@@ -228,6 +241,22 @@ pub fn host_status() -> Result<crate::daemon::HostStatus, String> {
     }
 }
 
+/// One-line liveness report for `fastty host status`: `Some` when a live
+/// host answers the daemon socket, with its version and session count.
+#[cfg(unix)]
+pub fn probe_daemon() -> Option<String> {
+    let status = host_status().ok()?;
+    Some(format!(
+        "v{} · {} session(s)",
+        status.fastty_version, status.sessions
+    ))
+}
+
+#[cfg(not(unix))]
+pub fn probe_daemon() -> Option<String> {
+    None
+}
+
 #[cfg(unix)]
 pub fn restart_host() -> Result<(), String> {
     let mut stream = connect_for_handshake()?;
@@ -316,6 +345,10 @@ pub fn ensure_running() -> Result<(), String> {
     }
 
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    trace(&format!(
+        "spawning new host child from {}",
+        executable.display()
+    ));
     Command::new(executable)
         .arg(HOST_ARGUMENT)
         .stdin(Stdio::null())
@@ -351,8 +384,33 @@ pub fn is_host_argument(argument: Option<&str>) -> bool {
     argument == Some(HOST_ARGUMENT)
 }
 
+/// Append one timestamped line to `host-trace.log` in the state dir.
+///
+/// Best-effort diagnostics for lost hosted sessions: the log survives the
+/// host process and answers "who died, when, and which instance ran".
+/// Append mode keeps every line atomic enough for short records.
+pub fn trace(event: &str) {
+    use std::io::Write;
+    let path = crate::paths::get().state_dir.join("host-trace.log");
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let _ = writeln!(file, "{now} pid={pid} {event}");
+}
+
 pub fn run_host() {
+    trace(&format!(
+        "host started version={} protocol={}",
+        env!("CARGO_PKG_VERSION"),
+        PROTOCOL_VERSION
+    ));
     crate::daemon::run_host();
+    trace("host accept loop exited");
 }
 
 #[cfg(unix)]

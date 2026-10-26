@@ -16,13 +16,128 @@ use crate::daemon::{AttachMode, Request, Response};
 
 #[cfg(unix)]
 pub(crate) fn connect() -> Result<std::os::unix::net::UnixStream, String> {
-    let path = crate::daemon::socket_path();
+    let path = tunnel_socket().unwrap_or_else(crate::daemon::socket_path);
     std::os::unix::net::UnixStream::connect(&path).map_err(|e| {
         format!(
             "couldn't reach fastty's daemon socket at {}: {e}\n(is fastty running?)",
             path.display()
         )
     })
+}
+
+/// Socket override for `--remote`: commands talk to the local end of an
+/// SSH tunnel instead of the machine's own daemon socket.
+#[cfg(unix)]
+static TUNNEL_SOCKET: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(unix)]
+pub fn use_tunnel_socket(path: std::path::PathBuf) {
+    let _ = TUNNEL_SOCKET.set(path);
+}
+
+#[cfg(unix)]
+fn tunnel_socket() -> Option<std::path::PathBuf> {
+    TUNNEL_SOCKET.get().cloned()
+}
+
+/// FNV-1a 64: a stable, dependency-free tag for a remote host string.
+#[cfg(unix)]
+fn host_hash(value: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Open (or reuse) an SSH tunnel that forwards a local Unix socket to the
+/// remote fastty daemon socket. Returns the local socket path.
+///
+/// The ssh process is deliberately leaked: it must outlive this command so
+/// an interactive attach keeps working.
+#[cfg(unix)]
+pub fn setup_ssh_tunnel(
+    host: &str,
+    remote_socket: Option<String>,
+) -> Result<std::path::PathBuf, String> {
+    use std::time::{Duration, Instant};
+
+    let local = crate::paths::get()
+        .state_dir
+        .join(format!("remote-{:016x}.sock", host_hash(host)));
+    if std::os::unix::net::UnixStream::connect(&local).is_ok() {
+        return Ok(local);
+    }
+
+    let remote = match remote_socket {
+        Some(path) => path,
+        None => discover_remote_socket(host)?,
+    };
+
+    let _ = std::fs::remove_file(&local);
+    let forward = format!("{}:{remote}", local.display());
+    let child = std::process::Command::new("ssh")
+        .args([
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "StreamLocalBindUnlink=yes",
+            "-nNT",
+            "-L",
+            &forward,
+            host,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("could not start ssh: {error}"))?;
+    std::mem::forget(child);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::os::unix::net::UnixStream::connect(&local).is_ok() {
+            return Ok(local);
+        }
+        if Instant::now() >= deadline {
+            let _ = std::fs::remove_file(&local);
+            return Err(format!(
+                "timed out waiting for the SSH tunnel to {host}. \
+                 Is fastty installed and its daemon reachable there? \
+                 (a remote host needs its own `fastty host install`)"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// Ask the remote host where its daemon socket lives. Mirrors the
+/// platform layout of `src/paths.rs` without shipping that logic over.
+#[cfg(unix)]
+fn discover_remote_socket(host: &str) -> Result<String, String> {
+    let script = "if [ \"$(uname)\" = \"Darwin\" ]; then \
+        echo \"$HOME/Library/Application Support/fasty/fasttyd.sock\"; \
+    else \
+        echo \"${XDG_STATE_HOME:-$HOME/.local/state}/fasty/fasttyd.sock\"; \
+    fi";
+    let output = std::process::Command::new("ssh")
+        .args(["-T", host, script])
+        .output()
+        .map_err(|error| format!("could not start ssh: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ssh to {host} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return Err(format!(
+            "could not read the remote socket path from {host}; \
+             pass it explicitly with --remote-socket"
+        ));
+    }
+    Ok(path)
 }
 
 /// Like `connect`, but if `wait_secs` is set, retries every 250ms instead of

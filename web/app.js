@@ -53,6 +53,9 @@ class FasttyWebClient {
     this.scrollbarTrack = document.getElementById("scrollbar-track");
     this.scrollbarThumb = document.getElementById("scrollbar-thumb");
     this.newSessionBtn = document.getElementById("new-session-btn");
+    this.takeControlBtn = document.getElementById("take-control-btn");
+    this.resyncBtn = document.getElementById("resync-btn");
+    this.sizeControl = {};
     this.versionEl = document.getElementById("daemon-version");
     this.releaseBtn = document.getElementById("release-btn");
     this.releaseOverlay = document.getElementById("release-overlay");
@@ -136,6 +139,11 @@ class FasttyWebClient {
 
   sendResize() {
     if (!this.activeSessionId || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    if (this.sizeControl[this.activeSessionId] === "other") {
+      // The gateway rejects this anyway; keep quiet and show the control.
+      this.updateSizeControls();
+      return;
+    }
     const { cols, rows } = this.getCalculatedDimensions();
     this.ws.send(JSON.stringify({ cmd: "resize", id: this.activeSessionId, cols, rows }) + "\n");
     if (this.vt) {
@@ -197,6 +205,12 @@ class FasttyWebClient {
 
     if (this.newSessionBtn) {
       this.newSessionBtn.addEventListener("click", () => this.spawnNewSession());
+    }
+    if (this.takeControlBtn) {
+      this.takeControlBtn.addEventListener("click", () => this.claimSize());
+    }
+    if (this.resyncBtn) {
+      this.resyncBtn.addEventListener("click", () => this.requestSnapshot(this.activeSessionId));
     }
 
     this.reconnectBtn.addEventListener("click", () => {
@@ -588,6 +602,13 @@ class FasttyWebClient {
 
   handleDaemonMessage(msg) {
     switch (msg.event) {
+      case "size_owner":
+        // msg.client is null after a release; a non-null value means this
+        // browser claimed the session's size.
+        this.sizeControl[msg.id] = msg.client != null ? "mine" : null;
+        this.updateSizeControls();
+        break;
+
       case "hello":
         console.log(`⚡ Connected to fastty daemon v${msg.fastty_version} (protocol v${msg.version})`);
         if (msg.fastty_version) {
@@ -675,8 +696,42 @@ class FasttyWebClient {
 
       case "error":
         console.warn("Daemon returned error:", msg.code, msg.message);
+        if (msg.code === "size_owned" && msg.id != null) {
+          this.sizeControl[msg.id] = "other";
+          this.updateSizeControls();
+          // Fall back to the owner's current size instead of fighting it.
+          this.requestSnapshot(msg.id);
+        }
         break;
     }
+  }
+
+  updateSizeControls() {
+    const mine = this.sizeControl[this.activeSessionId] === "mine";
+    const other = this.sizeControl[this.activeSessionId] === "other";
+    if (this.takeControlBtn) {
+      this.takeControlBtn.classList.toggle("hidden", !other);
+      this.takeControlBtn.title = other
+        ? "Another browser controls this session's size. Click to take control"
+        : "Take control";
+    }
+    if (this.resyncBtn) {
+      this.resyncBtn.classList.toggle("hidden", mine);
+    }
+  }
+
+  claimSize() {
+    const id = this.activeSessionId;
+    if (!id || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ cmd: "claim_size", id }) + "\n");
+    this.sizeControl[id] = "mine";
+    this.updateSizeControls();
+    this.sendResize();
+  }
+
+  requestSnapshot(id) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ cmd: "binary_snapshot", id }) + "\n");
   }
 
   attachToSession(id) {
@@ -699,6 +754,7 @@ class FasttyWebClient {
       this.ws.send(JSON.stringify({ cmd: "binary_snapshot", id }) + "\n");
     }
 
+    this.updateSizeControls();
     this.wrapper.focus();
   }
 

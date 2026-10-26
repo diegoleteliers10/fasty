@@ -116,12 +116,14 @@ fn run_keybindings_command(args: impl Iterator<Item = String>) {
 fn main() {
     if fastty::session_host::is_host_argument(std::env::args().nth(1).as_deref()) {
         let _ = fastty::paths::init();
+        fastty::paths::install_panic_log();
         fastty::session_host::run_host();
         return;
     }
 
     fastty::updater::cleanup_old_installations();
     let _ = fastty::paths::init();
+    fastty::paths::install_panic_log();
 
     // `sessions`/`attach` are CLI-only subcommands that talk to an already
     // running fastty's daemon (see `fastty::daemon_client`) and never touch
@@ -134,13 +136,54 @@ fn main() {
             let mut watch = false;
             let mut json = false;
             let mut wait: Option<u64> = None;
-            for arg in subcommand_args {
+            let mut remote: Option<String> = None;
+            let mut remote_socket: Option<String> = None;
+            let mut args: Vec<String> = subcommand_args.collect();
+            let mut i = 0;
+            while i < args.len() {
+                let arg = args[i].clone();
+                if arg == "--remote" || arg == "--remote-socket" {
+                    let value = args.get(i + 1).cloned().filter(|v| !v.starts_with('-'));
+                    match value {
+                        Some(v) => {
+                            if arg == "--remote" {
+                                remote = Some(v)
+                            } else {
+                                remote_socket = Some(v)
+                            }
+                        }
+                        None => {
+                            eprintln!("fastty sessions: {} needs a value", arg);
+                            std::process::exit(1);
+                        }
+                    }
+                    args.drain(i..=i + 1);
+                } else if let Some(value) = arg.strip_prefix("--remote=") {
+                    remote = Some(value.to_string());
+                    args.remove(i);
+                } else if let Some(value) = arg.strip_prefix("--remote-socket=") {
+                    remote_socket = Some(value.to_string());
+                    args.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            for arg in args {
                 match parse_wait_flag(&arg) {
                     Some(w) => wait = Some(w),
                     None if arg == "--watch" => watch = true,
                     None if arg == "--json" => json = true,
                     None => {
                         eprintln!("fastty sessions: unknown flag {arg}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            if let Some(host) = remote {
+                match fastty::daemon_client::setup_ssh_tunnel(&host, remote_socket) {
+                    Ok(local_socket) => fastty::daemon_client::use_tunnel_socket(local_socket),
+                    Err(error) => {
+                        eprintln!("fastty sessions: {error}");
                         std::process::exit(1);
                     }
                 }
@@ -223,8 +266,8 @@ fn main() {
             }
             fastty::daemon_client::run_events_command(wait);
         }
-        Some("actions") => run_actions_command(subcommand_args),
-        Some("keybindings") => run_keybindings_command(subcommand_args),
+        Some("host") => fastty::host_service::run_host_service_command(subcommand_args),
+        Some("actions") => run_actions_command(subcommand_args),        Some("keybindings") => run_keybindings_command(subcommand_args),
         Some("agent-status") => {
             let Some(state) = subcommand_args.next() else {
                 eprintln!("Usage: fastty agent-status <idle|working|done|blocked|error|clear> <claude|opencode|agy|gemini|pi|codex|hermes> [permission|question|auth]");
@@ -356,21 +399,64 @@ fn main() {
             std::process::exit(0);
         }
         Some("attach") => {
-            let Some(id) = subcommand_args.next().and_then(|s| s.parse::<usize>().ok()) else {
+            let mut flags: Vec<String> = subcommand_args.collect();
+            // Remote flags can sit before or after the session id.
+            let mut remote: Option<String> = None;
+            let mut remote_socket: Option<String> = None;
+            let mut i = 0;
+            while i < flags.len() {
+                let arg = flags[i].clone();
+                if arg == "--remote" || arg == "--remote-socket" {
+                    let value = flags.get(i + 1).cloned().filter(|v| !v.starts_with('-'));
+                    match value {
+                        Some(v) => {
+                            if arg == "--remote" {
+                                remote = Some(v)
+                            } else {
+                                remote_socket = Some(v)
+                            }
+                        }
+                        None => {
+                            eprintln!("fastty attach: {} needs a value", arg);
+                            std::process::exit(1);
+                        }
+                    }
+                    flags.drain(i..=i + 1);
+                } else if let Some(value) = arg.strip_prefix("--remote=") {
+                    remote = Some(value.to_string());
+                    flags.remove(i);
+                } else if let Some(value) = arg.strip_prefix("--remote-socket=") {
+                    remote_socket = Some(value.to_string());
+                    flags.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            let mut parts = flags.into_iter();
+            let Some(id) = parts.next().and_then(|s| s.parse::<usize>().ok()) else {
                 eprintln!(
-                    "Usage: fastty attach <session-id> [--read-only] [--wait[=SECONDS]]\n\
+                    "Usage: fastty attach [--remote HOST] [--remote-socket PATH] <session-id> [--read-only] [--wait[=SECONDS]]\n\
                      Run `fastty sessions` to see available session ids."
                 );
                 std::process::exit(1);
             };
             let mut read_only = false;
             let mut wait: Option<u64> = None;
-            for arg in subcommand_args {
+            for arg in parts {
                 match parse_wait_flag(&arg) {
                     Some(w) => wait = Some(w),
                     None if arg == "--read-only" => read_only = true,
                     None => {
                         eprintln!("fastty attach: unknown flag {arg}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            if let Some(host) = remote {
+                match fastty::daemon_client::setup_ssh_tunnel(&host, remote_socket) {
+                    Ok(local_socket) => fastty::daemon_client::use_tunnel_socket(local_socket),
+                    Err(error) => {
+                        eprintln!("fastty attach: {error}");
                         std::process::exit(1);
                     }
                 }

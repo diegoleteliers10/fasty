@@ -761,3 +761,8 @@ body, html {
     max-width: 70%;
   }
 }
+
+/* Size-control buttons stay hidden until a session size conflict exists. */
+.btn-icon.hidden {
+  display: none;
+}
