@@ -34,6 +34,7 @@ pub enum AppEvent {
     ProgramStatusChanged {
         source_id: u64,
     },
+    ProgressChanged(Option<ProgressReport>),
     CommandStarted,
     CommandFinished {
         duration_ms: u128,
@@ -141,6 +142,25 @@ mod dws_regression_tests {
     }
 }
 
+/// Progress reported by a program through ConEmu's `OSC 9;4` sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressState {
+    /// State 1: the percentage is meaningful.
+    Normal,
+    /// State 2: the task failed. The percentage is kept when present.
+    Error,
+    /// State 3: the task runs without a known percentage.
+    Indeterminate,
+    /// State 4: the task paused. The percentage is kept when present.
+    Paused,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgressReport {
+    pub state: ProgressState,
+    pub percent: Option<u8>,
+}
+
 /// Events derived from raw PTY byte-stream CSI scanning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CsiEvent {
@@ -152,18 +172,25 @@ pub enum CsiEvent {
     SyncOutputEnd,
     /// `CSI ? 5522 $ p` — DECRQM probe for the kitty clipboard protocol.
     QueryKittyClipboard,
+    /// `CSI > flags u` — push keyboard flags.
+    KittyPush(u8),
+    /// `CSI < count u` — pop keyboard flags.
+    KittyPop(u32),
+    /// `CSI = flags ; mode u` — set keyboard flags.
+    KittySet(u8, u32),
+    /// `CSI ? u` — query keyboard flags.
+    KittyQuery,
 }
 
 /// Byte-level watcher for the CSI sequences fastty handles outside the
-/// alacritty model: scrollback wipe on plain `CSI 2J`, and Synchronized
-/// Output (DEC private mode 2026), which alacritty_terminal 0.24 accepts as
-/// a silent no-op. TUI frameworks (ratatui, bubbletea, Ink) wrap each frame
-/// in `?2026h`/`?2026l`, so the frontend must suppress repaints between the
-/// two to avoid painting half-built frames.
+/// alacritty model: scrollback wipe on plain `CSI 2J`, Synchronized
+/// Output (DEC private mode 2026), the kitty clipboard probe, and the
+/// kitty keyboard protocol's push/pop/set/query sequences.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CsiWatcher {
     state: CsiState,
-    private: bool,
+    /// Prefix byte of the sequence: `0`, `?`, `>`, `<`, or `=`.
+    prefix: u8,
     params: [u32; 8],
     param_count: usize,
     digit_acc: u32,
@@ -181,7 +208,7 @@ impl CsiWatcher {
     pub fn new() -> Self {
         Self {
             state: CsiState::Ground,
-            private: false,
+            prefix: 0,
             params: [0; 8],
             param_count: 0,
             digit_acc: 0,
@@ -200,7 +227,7 @@ impl CsiWatcher {
             CsiState::Esc => {
                 if byte == b'[' {
                     self.state = CsiState::Params;
-                    self.private = false;
+                    self.prefix = 0;
                     self.params = [0; 8];
                     self.param_count = 0;
                     self.digit_acc = 0;
@@ -218,8 +245,11 @@ impl CsiWatcher {
                         .saturating_mul(10)
                         .saturating_add((byte - b'0') as u32);
                     None
-                } else if byte == b'?' && self.param_count == 0 && self.digit_acc == 0 {
-                    self.private = true;
+                } else if matches!(byte, b'?' | b'>' | b'<' | b'=')
+                    && self.param_count == 0
+                    && self.digit_acc == 0
+                {
+                    self.prefix = byte;
                     None
                 } else if byte == b';' || byte == b':' {
                     self.push_param();
@@ -231,18 +261,20 @@ impl CsiWatcher {
                 } else {
                     self.push_param();
                     let params = &self.params[..self.param_count];
-                    let event = if byte == b'J' && !self.private && params.contains(&2) {
+                    let event = if self.prefix == 0 && byte == b'J' && params.contains(&2) {
                         Some(CsiEvent::ClearHistory)
-                    } else if self.private && byte == b'h' && params.contains(&2026) {
+                    } else if self.prefix == b'?' && byte == b'h' && params.contains(&2026) {
                         Some(CsiEvent::SyncOutputBegin)
-                    } else if self.private && byte == b'l' && params.contains(&2026) {
+                    } else if self.prefix == b'?' && byte == b'l' && params.contains(&2026) {
                         Some(CsiEvent::SyncOutputEnd)
-                    } else if self.private
+                    } else if self.prefix == b'?'
                         && byte == b'p'
                         && self.intermediate == Some(b'$')
                         && params.contains(&5522)
                     {
                         Some(CsiEvent::QueryKittyClipboard)
+                    } else if byte == b'u' {
+                        self.kitty_event()
                     } else {
                         None
                     };
@@ -259,6 +291,24 @@ impl CsiWatcher {
             self.param_count += 1;
         }
         self.digit_acc = 0;
+    }
+
+    /// Final byte `u` with a kitty prefix: push, pop, set, or query.
+    /// Plain `CSI u` (no prefix) stays save-cursor and returns `None`.
+    fn kitty_event(&self) -> Option<CsiEvent> {
+        // The final byte always ran `push_param`, so an empty parameter
+        // list reads as one zero param.
+        let p0 = self.params.first().copied().unwrap_or(0);
+        let p1 = self.params.get(1).copied();
+        match self.prefix {
+            b'>' => Some(CsiEvent::KittyPush(p0 as u8)),
+            b'<' => Some(CsiEvent::KittyPop(p0.max(1))),
+            b'=' => Some(CsiEvent::KittySet(p0 as u8, p1.unwrap_or(1))),
+            b'?' if self.params[..self.param_count].iter().all(|&p| p == 0) => {
+                Some(CsiEvent::KittyQuery)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -335,6 +385,8 @@ enum SequenceParseState {
     OscEsc,
     Apc,
     ApcEsc,
+    Dcs,
+    DcsEsc,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -342,6 +394,8 @@ pub struct SideCheckpoint {
     seq_state: SequenceParseState,
     osc_buf: Vec<u8>,
     apc_buf: Vec<u8>,
+    #[serde(default)]
+    dcs_buf: Vec<u8>,
     csi_watcher: CsiWatcher,
     sync_output_active: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -354,6 +408,7 @@ impl Default for SideCheckpoint {
             seq_state: SequenceParseState::Normal,
             osc_buf: Vec::new(),
             apc_buf: Vec::new(),
+            dcs_buf: Vec::new(),
             csi_watcher: CsiWatcher::new(),
             sync_output_active: false,
             cwd: None,
@@ -366,6 +421,7 @@ enum SequenceFrame {
     Reset,
     Osc { bytes: Vec<u8>, framing: usize },
     Apc(Vec<u8>),
+    Dcs(Vec<u8>),
 }
 
 impl SideCheckpoint {
@@ -385,6 +441,10 @@ impl SideCheckpoint {
                     b'_' => {
                         self.apc_buf.clear();
                         SequenceParseState::Apc
+                    }
+                    b'P' => {
+                        self.dcs_buf.clear();
+                        SequenceParseState::Dcs
                     }
                     b'c' => {
                         self.seq_state = SequenceParseState::Normal;
@@ -436,6 +496,28 @@ impl SideCheckpoint {
                     };
                 }
             }
+            SequenceParseState::Dcs | SequenceParseState::DcsEsc => {
+                // DCS framing matches APC: payload runs to ESC \ (ST). The
+                // main consumer is the sixel graphics protocol.
+                let escaped = self.seq_state == SequenceParseState::DcsEsc;
+                if (escaped && byte == b'\\') || (!escaped && byte == 0x07) {
+                    self.seq_state = SequenceParseState::Normal;
+                    return Some(SequenceFrame::Dcs(std::mem::take(&mut self.dcs_buf)));
+                }
+                if !escaped && byte == 0x1b {
+                    self.seq_state = SequenceParseState::DcsEsc;
+                } else {
+                    if escaped {
+                        self.dcs_buf.push(0x1b);
+                    }
+                    self.dcs_buf.push(byte);
+                    self.seq_state = if self.dcs_buf.len() > crate::parser::sixel::MAX_SIXEL_BYTES {
+                        SequenceParseState::Normal
+                    } else {
+                        SequenceParseState::Dcs
+                    };
+                }
+            }
         }
         None
     }
@@ -443,6 +525,7 @@ impl SideCheckpoint {
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.osc_buf.len() > 131074
             || self.apc_buf.len() > 16 * 1024 * 1024 + 2
+            || self.dcs_buf.len() > crate::parser::sixel::MAX_SIXEL_BYTES + 2
             || self.csi_watcher.param_count > self.csi_watcher.params.len()
             || self.cwd.as_ref().is_some_and(|path| !path.is_absolute())
         {
@@ -470,6 +553,16 @@ pub struct TerminalState {
     source_id: u64,
     program_status: Arc<ParkingMutex<crate::program_status::ProgramStatusStore>>,
     program_status_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// Latest `OSC 9;4` progress report from the running program. `None`
+    /// means the program cleared it or never reported one.
+    progress: Arc<ParkingMutex<Option<ProgressReport>>>,
+    /// Wall-clock milliseconds (UNIX epoch) of the last PTY output chunk.
+    /// The silence watcher compares this against its threshold.
+    last_output_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Kitty keyboard protocol state: current flags plus the push/pop stack.
+    kitty: Arc<ParkingMutex<crate::kitty_keyboard::KittyKeyboard>>,
+    /// True between `OSC 133` command-start and command-end markers.
+    command_running: Arc<std::sync::atomic::AtomicBool>,
     pub total_lines_pushed: Arc<AtomicU64>,
     pub prompt_lines: Arc<ParkingMutex<Vec<u64>>>,
     pub image_store: Arc<ParkingMutex<ImageStore>>,
@@ -1263,6 +1356,7 @@ impl TerminalState {
             &size,
             event_listener.clone(),
         )));
+        let mut restored_kitty_flags = 0u8;
         if let Some((header, cells)) = binary_snapshot.as_ref() {
             use crate::server::binary_snapshot::SNAPSHOT_FLAG_ALT_SCREEN;
             let mut term = term.lock();
@@ -1279,6 +1373,13 @@ impl TerminalState {
                 alacritty_terminal::term::TermMode::from_bits_truncate(header.terminal_modes());
             let mut mode_commands = Vec::new();
             append_restored_terminal_modes(&mut mode_commands, mode);
+            let kitty_flags = header.kitty_flags();
+            if kitty_flags != 0 {
+                // Re-arm the keyboard flags the program had at capture time,
+                // so a re-attached client keeps encoding keys correctly.
+                mode_commands.extend_from_slice(format!("\x1b[={};1u", kitty_flags).as_bytes());
+            }
+            restored_kitty_flags = kitty_flags;
             parser.advance(&mut *term, &mode_commands);
             if restored_idle_session {
                 parser.advance(&mut *term, IDLE_SESSION_MODE_RESET);
@@ -1329,6 +1430,19 @@ impl TerminalState {
         let program_status_clone = Arc::clone(&program_status);
         let program_status_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let program_status_pending_clone = Arc::clone(&program_status_pending);
+        let progress = Arc::new(ParkingMutex::new(None));
+        let progress_clone = Arc::clone(&progress);
+        let last_output_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let last_output_ms_clone = Arc::clone(&last_output_ms);
+        let command_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let command_running_clone = Arc::clone(&command_running);
+        let kitty = Arc::new(ParkingMutex::new(
+            crate::kitty_keyboard::KittyKeyboard::default(),
+        ));
+        let kitty_clone = Arc::clone(&kitty);
+        if restored_kitty_flags != 0 {
+            kitty.lock().set(restored_kitty_flags, 1);
+        }
         if !std::env::var("FASTTY_NO_READER").is_ok() {
             thread::spawn(move || {
                 use std::io::Read;
@@ -1390,6 +1504,11 @@ impl TerminalState {
                                 source_id,
                                 |store| store.apply(command),
                             );
+                        }
+                        OscCommand::Progress(report) => {
+                            *progress_clone.lock() = report;
+                            event_listener_clone
+                                .send_app_event(AppEvent::ProgressChanged(report));
                         }
                         OscCommand::PromptStarted => {
                             update_program_status(
@@ -1557,6 +1676,26 @@ impl TerminalState {
                                 &title,
                                 &body,
                                 &program_status_clone,
+                                &event_listener_clone,
+                                cursor_line,
+                                base,
+                                screen_lines,
+                            );
+                        }
+                        OscCommand::CommandStarted => {
+                            command_running_clone.store(true, Ordering::Relaxed);
+                            dispatch_osc_action(
+                                &cmd,
+                                &event_listener_clone,
+                                cursor_line,
+                                base,
+                                screen_lines,
+                            );
+                        }
+                        OscCommand::CommandFinished { .. } => {
+                            command_running_clone.store(false, Ordering::Relaxed);
+                            dispatch_osc_action(
+                                &cmd,
                                 &event_listener_clone,
                                 cursor_line,
                                 base,
@@ -1731,6 +1870,13 @@ impl TerminalState {
                         }
                         Ok(n) => {
                             let output_boundary = output_hub_clone.boundary.lock();
+                            last_output_ms_clone.store(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0),
+                                Ordering::Relaxed,
+                            );
 
                             let mut term_locked = term_clone.lock();
                             let mut ingress = ingress_clone.lock();
@@ -1830,6 +1976,53 @@ impl TerminalState {
                                             &mut parser,
                                         );
                                     }
+                                    Some(SequenceFrame::Dcs(bytes)) => {
+                                        // Sixel graphics share the image
+                                        // store with the kitty protocol.
+                                        if crate::parser::sixel::is_sixel(&bytes) {
+                                            if let Ok((render_img, img_w, img_h)) =
+                                                crate::parser::sixel::decode(&bytes)
+                                            {
+                                                let img_id = next_image_id_clone
+                                                    .fetch_add(1, Ordering::Relaxed)
+                                                    as u32;
+                                                let cursor_line = term_locked
+                                                    .grid()
+                                                    .cursor
+                                                    .point
+                                                    .line
+                                                    .0 as i32;
+                                                let cursor_col =
+                                                    term_locked.grid().cursor.point.column.0;
+                                                let base = total_lines_pushed_clone
+                                                    .load(Ordering::Relaxed)
+                                                    + local_lines;
+                                                let mut store = image_store_clone.lock();
+                                                store.add_image(img_id, render_img.clone());
+                                                let abs_line = base
+                                                    .saturating_add(cursor_line.max(0) as u64);
+                                                let cw =
+                                                    if cell_width > 0.0 { cell_width } else { 9.0 };
+                                                let ch = if cell_height > 0.0 {
+                                                    cell_height
+                                                } else {
+                                                    18.0
+                                                };
+                                                store.add_placement(ImagePlacement {
+                                                    placement_id: 0,
+                                                    image_id: img_id,
+                                                    absolute_line: abs_line,
+                                                    col: cursor_col,
+                                                    cols: ((img_w as f32) / cw).ceil().max(1.0)
+                                                        as usize,
+                                                    rows: ((img_h as f32) / ch).ceil().max(1.0)
+                                                        as usize,
+                                                    z_index: 0,
+                                                    image: render_img,
+                                                });
+                                            }
+                                        }
+                                    }
                                     None => {}
                                 }
 
@@ -1844,6 +2037,22 @@ impl TerminalState {
                                         let resp = b"\x1b[?5522;1$y";
                                         let mut w = writer_clone.lock();
                                         let _ = w.write_all(resp);
+                                        let _ = w.flush();
+                                    }
+                                    Some(CsiEvent::KittyPush(flags)) => {
+                                        kitty_clone.lock().push(flags);
+                                    }
+                                    Some(CsiEvent::KittyPop(count)) => {
+                                        kitty_clone.lock().pop(count);
+                                    }
+                                    Some(CsiEvent::KittySet(flags, mode)) => {
+                                        kitty_clone.lock().set(flags, mode);
+                                    }
+                                    Some(CsiEvent::KittyQuery) => {
+                                        // `CSI ? u` asks for the active flags.
+                                        let resp = format!("\x1b[?{}u", kitty_clone.lock().flags());
+                                        let mut w = writer_clone.lock();
+                                        let _ = w.write_all(resp.as_bytes());
                                         let _ = w.flush();
                                     }
                                     Some(CsiEvent::SyncOutputBegin) => {
@@ -2009,6 +2218,10 @@ impl TerminalState {
             source_id,
             program_status,
             program_status_pending,
+            progress,
+            last_output_ms,
+            command_running,
+            kitty,
             total_lines_pushed,
             prompt_lines,
             image_store,
@@ -2036,6 +2249,43 @@ impl TerminalState {
 
     pub fn program_status_snapshot(&self) -> Vec<crate::program_status::ProgramRecord> {
         self.program_status.lock().snapshot()
+    }
+
+    /// Latest `OSC 9;4` progress report, if the program set one.
+    pub fn progress(&self) -> Option<ProgressReport> {
+        *self.progress.lock()
+    }
+
+    /// True between `OSC 133` command-start and command-end markers.
+    pub fn is_command_running(&self) -> bool {
+        self.command_running.load(Ordering::Relaxed)
+    }
+
+    /// Active kitty keyboard protocol flags for this terminal.
+    pub fn kitty_flags(&self) -> u8 {
+        self.kitty.lock().flags()
+    }
+
+    /// Set the kitty keyboard flags (used when restoring a snapshot).
+    pub fn set_kitty_flags(&self, flags: u8) {
+        self.kitty.lock().set(flags, 1);
+    }
+
+    /// Seconds since the last PTY output while a command is running.
+    /// `None` when no command is running or nothing was ever printed.
+    pub fn silence_seconds(&self) -> Option<u64> {
+        if !self.is_command_running() {
+            return None;
+        }
+        let last = self.last_output_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return None;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Some(now.saturating_sub(last) / 1000)
     }
 
     pub fn report_external_program_status(&self, payload: &[u8]) -> Result<(), String> {
@@ -3539,6 +3789,7 @@ impl TerminalState {
         };
         header.set_history_rows(history_rows as u32);
         header.set_terminal_modes(mode.bits());
+        header.set_kitty_flags(self.kitty_flags());
 
         (header, cells)
     }
@@ -3927,7 +4178,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 enum OscCommand {
     ProgramStatus(crate::program_status::ProgramStatusCommand),
@@ -3961,6 +4212,8 @@ enum OscCommand {
         metadata: String,
         payload: Vec<u8>,
     },
+    /// ConEmu `OSC 9;4` progress. `None` clears the indicator.
+    Progress(Option<ProgressReport>),
 }
 
 /// Decodes the OSC sequences fastty acts on itself.
@@ -4002,6 +4255,9 @@ fn parse_osc_framed(
             }
         }
         b"9" => {
+            if let Some(rest) = payload.strip_prefix(b"4;") {
+                return parse_progress(rest);
+            }
             if let Ok(msg) = std::str::from_utf8(payload) {
                 let (title, body) = if let Some(idx) = msg.find(';') {
                     let t = msg[..idx].trim();
@@ -4216,6 +4472,53 @@ fn parse_osc_framed(
     }
 }
 
+/// Parse the `state[;percent]` tail of ConEmu's `OSC 9;4`.
+///
+/// States: 0 hide, 1 normal, 2 error, 3 indeterminate, 4 paused.
+/// A missing or out-of-range percentage keeps the report valid.
+fn parse_progress(payload: &[u8]) -> Option<OscCommand> {
+    let mut parts = payload.split(|byte| *byte == b';');
+    let state = parse_progress_number(parts.next()?)?;
+    let percent = match parts.next() {
+        Some(raw) if !raw.is_empty() => {
+            let value = parse_progress_number(raw)?;
+            if value > 100 {
+                return None;
+            }
+            Some(value as u8)
+        }
+        _ => None,
+    };
+    let report = match state {
+        0 => return Some(OscCommand::Progress(None)),
+        1 => ProgressReport {
+            state: ProgressState::Normal,
+            percent,
+        },
+        2 => ProgressReport {
+            state: ProgressState::Error,
+            percent,
+        },
+        3 => ProgressReport {
+            state: ProgressState::Indeterminate,
+            percent: None,
+        },
+        4 => ProgressReport {
+            state: ProgressState::Paused,
+            percent,
+        },
+        _ => return None,
+    };
+    Some(OscCommand::Progress(Some(report)))
+}
+
+fn parse_progress_number(value: &[u8]) -> Option<u32> {
+    if value.is_empty() || value.len() > 3 || !value.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(value).ok()?.parse().ok()
+}
+
 fn mirror_program_status_sequence(payload: &[u8]) -> Vec<u8> {
     let mut sequence = Vec::with_capacity(payload.len() + 10);
     sequence.extend_from_slice(b"\x1b]7501;");
@@ -4253,6 +4556,7 @@ fn dispatch_osc_action(
         // The kitty clipboard protocol is fully handled in the reader
         // thread (`handle_cmd`): it needs the PTY writer to reply.
         OscCommand::KittyClipboard { .. } | OscCommand::ProgramStatus(_) => {}
+        OscCommand::Progress(_) => {}
         OscCommand::Cwd(path) => {
             if let Some(p) = file_url_to_path(path.as_bytes()) {
                 sender.send_app_event(AppEvent::CwdChanged(p));
@@ -4486,6 +4790,95 @@ mod tests {
         bytes.iter().filter_map(|&b| w.feed(b)).collect()
     }
 
+    #[test]
+    fn kitty_keyboard_sequences_parse() {
+        use crate::kitty_keyboard::FLAG_DISAMBIGUATE;
+
+        assert_eq!(run(b"\x1b[>1u"), vec![KittyPush(FLAG_DISAMBIGUATE)]);
+        assert_eq!(run(b"\x1b[>u"), vec![KittyPush(0)]);
+        assert_eq!(run(b"\x1b[<u"), vec![KittyPop(1)]);
+        assert_eq!(run(b"\x1b[<3u"), vec![KittyPop(3)]);
+        assert_eq!(run(b"\x1b[=1;1u"), vec![KittySet(1, 1)]);
+        assert_eq!(run(b"\x1b[=;2u"), vec![KittySet(0, 2)]);
+        assert_eq!(run(b"\x1b[?u"), vec![KittyQuery]);
+
+        // Plain CSI u stays save-cursor: no kitty event.
+        assert!(run(b"\x1b[u").is_empty());
+        // Mode-set sequences with other final bytes are untouched.
+        assert!(run(b"\x1b[?1049h").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_query_replies_are_complete_and_terminate() {
+        // Mirrors the gh/termenv startup pattern: the child sends OSC 11,
+        // OSC 10, DA1, and the kitty keyboard query, then reads its stdin
+        // raw. survey then reads anything that arrives LATE and chokes on
+        // `ESC ]` (crash class: `could not prompt: unexpected escape
+        // sequence from terminal: ['\x1b' ']']`). This test pins the wire:
+        // exactly one complete reply per query, and silence afterwards.
+        let probe = r#"
+import os, sys, termios, time, select, tty
+fd = 0
+old = termios.tcgetattr(fd)
+tty.setraw(fd)
+sys.stdout.write("\x1b]11;?\x1b\\\x1b]10;?\x1b\\\x1b[c\x1b[?u")
+sys.stdout.flush()
+def drain(seconds):
+    buf = b""
+    end = time.time() + seconds
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            buf += os.read(fd, 4096)
+    return buf
+first = drain(1.5)
+late = drain(1.0)
+sys.stderr.write("REPLY:" + first.hex() + "\n")
+sys.stderr.write("LATE:" + late.hex() + "\n")
+termios.tcsetattr(fd, termios.TCSADRAIN, old)
+"#;
+        let terminal = TerminalState::new_headless(
+            "/usr/bin/python3",
+            &["-c".to_string(), probe.to_string()],
+            None,
+            80,
+            24,
+        )
+        .expect("create headless terminal for query probe");
+        let output = terminal.subscribe_output();
+        let mut reply = String::new();
+        let mut late = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && (reply.is_empty() || late.is_empty()) {
+            match output.try_recv() {
+                Ok(chunk) => {
+                    let text = String::from_utf8_lossy(&chunk).to_string();
+                    if let Some(rest) = text.strip_prefix("REPLY:") {
+                        reply = rest.trim().to_string();
+                    }
+                    if let Some(rest) = text.strip_prefix("LATE:") {
+                        late = rest.trim().to_string();
+                    }
+                }
+                Err(async_channel::TryRecvError::Empty) => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(async_channel::TryRecvError::Closed) => break,
+            }
+        }
+        eprintln!("reply={reply} late={late}");
+
+        // Exactly one complete reply per query: OSC 11, OSC 10, DA1, kitty.
+        // `reply` is the hex of the wire bytes: 1b5d = ESC ], 1b5b = ESC [.
+        assert_eq!(reply.matches("1b5d").count(), 2, "OSC replies: {reply}");
+        assert_eq!(reply.matches("1b5b").count(), 2, "CSI replies: {reply}");
+        assert!(reply.contains("7267623a"), "rgb: payload present: {reply}"); // "rgb:"
+        // Nothing may arrive after the replies: survey reads next and any
+        // stray byte is a fatal `unexpected escape sequence`.
+        assert!(late.is_empty(), "stray input after replies: {late}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn external_program_status_mirrors_osc_7501_to_output_subscribers() {
@@ -4678,7 +5071,7 @@ mod tests {
     #[test]
     fn notification_protocols_parse_to_the_filtered_command_path() {
         let mut cmd_start = None;
-        for sequence in [b"9;4;3".as_slice(), b"777;notify;4;3".as_slice()] {
+        for sequence in [b"9;hello".as_slice(), b"777;notify;4;3".as_slice()] {
             assert!(matches!(
                 parse_osc(sequence, &mut cmd_start),
                 Some(OscCommand::Notification { .. })
@@ -4688,6 +5081,60 @@ mod tests {
             parse_osc(b"99;i=job:p=body;3", &mut cmd_start),
             Some(OscCommand::NotificationFragment { .. })
         ));
+    }
+
+    #[test]
+    fn osc_94_progress_parses_by_state() {
+        let mut cmd_start = None;
+        let mut parse = |sequence: &[u8]| parse_osc(sequence, &mut cmd_start);
+
+        // State 0 clears the indicator.
+        assert_eq!(parse(b"9;4;0"), Some(OscCommand::Progress(None)));
+
+        // State 1 with and without a percentage.
+        assert_eq!(
+            parse(b"9;4;1;42"),
+            Some(OscCommand::Progress(Some(ProgressReport {
+                state: ProgressState::Normal,
+                percent: Some(42),
+            })))
+        );
+        assert_eq!(
+            parse(b"9;4;1"),
+            Some(OscCommand::Progress(Some(ProgressReport {
+                state: ProgressState::Normal,
+                percent: None,
+            })))
+        );
+
+        // State 3 is indeterminate: the percentage is dropped.
+        assert_eq!(
+            parse(b"9;4;3"),
+            Some(OscCommand::Progress(Some(ProgressReport {
+                state: ProgressState::Indeterminate,
+                percent: None,
+            })))
+        );
+        assert_eq!(
+            parse(b"9;4;2;75"),
+            Some(OscCommand::Progress(Some(ProgressReport {
+                state: ProgressState::Error,
+                percent: Some(75),
+            })))
+        );
+        assert_eq!(
+            parse(b"9;4;4;10"),
+            Some(OscCommand::Progress(Some(ProgressReport {
+                state: ProgressState::Paused,
+                percent: Some(10),
+            })))
+        );
+
+        // Out-of-range and malformed payloads are ignored, not shown as
+        // notifications.
+        assert_eq!(parse(b"9;4;1;250"), None);
+        assert_eq!(parse(b"9;4;x;5"), None);
+        assert_eq!(parse(b"9;4;7"), None);
     }
 
     #[test]

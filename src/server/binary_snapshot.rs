@@ -99,6 +99,17 @@ impl FasttyBinarySnapshotHeader {
     pub fn set_terminal_modes(&mut self, modes: u32) {
         self._reserved2[4..8].copy_from_slice(&modes.to_le_bytes());
     }
+
+    /// Kitty keyboard protocol flags at capture time. Byte 8 was reserved
+    /// in every earlier version and read as zero, so old snapshots stay
+    /// valid and new snapshots open cleanly in old readers.
+    pub fn kitty_flags(&self) -> u8 {
+        self._reserved2[8]
+    }
+
+    pub fn set_kitty_flags(&mut self, flags: u8) {
+        self._reserved2[8] = flags;
+    }
 }
 
 const _: () = assert!(size_of::<FasttyBinarySnapshotHeader>() == 32);

@@ -3,8 +3,8 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 use gpui::{
     div, prelude::*, px, size, Bounds, Context, CursorStyle, Div, FocusHandle, FontFeatures,
-    FontWeight, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Render, ScrollHandle, ScrollWheelEvent, SharedString, TitlebarOptions, Window,
+    FontWeight, Hsla, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Render, ScrollHandle, ScrollWheelEvent, SharedString, TitlebarOptions, Window,
     WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 use std::sync::Arc;
@@ -4537,6 +4537,10 @@ impl RootView {
                             this.request_git_status_refresh(cwd, cx);
                         }
                     }
+                    AppEvent::CommandStarted => {
+                        this.arm_silence_watcher(pane_id, _window, cx);
+                        cx.notify();
+                    }
                     AppEvent::PromptStarted { .. } => {
                         cx.notify();
                     }
@@ -5647,6 +5651,20 @@ impl RootView {
                         if let Some(cwd) = cwd_to_poll {
                             this.request_git_status_refresh(cwd, cx);
                         }
+                    }
+                    AppEvent::CommandStarted => {
+                        // This handler keys by tab id and host source id, so
+                        // resolve the pane the same way CwdChanged does.
+                        let watcher_pane = this.tabs.iter().find(|tab| tab.id == tab_id)
+                            .and_then(|tab| tab.pane_tree.all_panes().into_iter().find_map(|pane| {
+                                pane.terminal.as_ref()
+                                    .filter(|terminal| terminal.source_id() == source_id)
+                                    .map(|_| pane.id)
+                            }));
+                        if let Some(watcher_pane) = watcher_pane {
+                            this.arm_silence_watcher(watcher_pane, _window, cx);
+                        }
+                        cx.notify();
                     }
                     AppEvent::PromptStarted { .. } => {
                         cx.notify();
@@ -7681,6 +7699,75 @@ impl RootView {
         self.ai_last_notification = Some(now);
         let title = title.to_owned();
         send_system_notification(&title, &body);
+    }
+
+    /// Watch a running command for a silence streak.
+    ///
+    /// The loop exits when the command ends, the pane closes, or one
+    /// notification was sent. A focused window never notifies, so active
+    /// work stays silent.
+    fn arm_silence_watcher(
+        &mut self,
+        pane_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(threshold) = self.config.notify_on_silence_seconds else {
+            return;
+        };
+        if threshold == 0 {
+            return;
+        }
+        let pane_has_terminal = self
+            .tabs
+            .iter()
+            .find_map(|tab| tab.pane_tree.find_pane(pane_id))
+            .is_some_and(|pane| pane.terminal.is_some());
+        if !pane_has_terminal {
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                let finished = this
+                    .update_in(cx, |this, window, _cx| {
+                        let Some(pane) = this
+                            .tabs
+                            .iter()
+                            .find_map(|tab| tab.pane_tree.find_pane(pane_id))
+                        else {
+                            return true;
+                        };
+                        let Some(terminal) = pane.terminal.as_ref() else {
+                            return true;
+                        };
+                        if !terminal.is_command_running() {
+                            return true;
+                        }
+                        if window.is_window_active() {
+                            return false;
+                        }
+                        match terminal.silence_seconds() {
+                            Some(seconds) if seconds >= threshold => {
+                                crate::notifications::send_system_notification(
+                                    "Fastty",
+                                    &format!("{} silent for {}s", pane.title, seconds),
+                                );
+                                true
+                            }
+                            _ => false,
+                        }
+                    })
+                    .ok()
+                    .unwrap_or(true);
+                if finished {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn refresh_program_status(&mut self, source_id: u64, window: &Window, cx: &mut Context<Self>) {
@@ -9964,6 +10051,44 @@ impl RootView {
         cx.stop_propagation();
     }
 
+    /// Key releases matter only to programs that asked for event types via
+    /// the kitty keyboard protocol. Everything else falls through.
+    fn handle_key_up(
+        &mut self,
+        event: &KeyUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active_tab) = self.tabs.get(self.active_tab_idx) else {
+            return;
+        };
+        let Some(ref terminal) = active_tab.terminal else {
+            return;
+        };
+        let flags = terminal.kitty_flags();
+        if flags & crate::kitty_keyboard::FLAG_REPORT_EVENTS == 0 {
+            return;
+        }
+        let key = event.keystroke.key.to_ascii_lowercase();
+        let encoded = crate::kitty_keyboard::encode(
+            &crate::kitty_keyboard::KeyEvent {
+                key: &key,
+                text: event.keystroke.key_char.as_deref(),
+                shifted: None,
+                shift: event.keystroke.modifiers.shift,
+                alt: event.keystroke.modifiers.alt,
+                ctrl: event.keystroke.modifiers.control,
+                super_key: event.keystroke.modifiers.platform,
+                event_type: crate::kitty_keyboard::EVENT_RELEASE,
+            },
+            flags,
+        );
+        if let Some(bytes) = encoded {
+            terminal.write_to_pty(&bytes);
+            cx.stop_propagation();
+        }
+    }
+
     fn with_native_menu_actions(&self, element: Div, cx: &mut Context<Self>) -> Div {
         #[cfg(not(target_os = "macos"))]
         {
@@ -11843,7 +11968,48 @@ impl RootView {
             cx.notify();
         }
 
-        let bytes_to_send: Option<Vec<u8>> = if is_alt_gr {
+        let bytes_to_send: Option<Vec<u8>> = if !is_alt_gr && terminal.kitty_flags() != 0 {
+            // Kitty keyboard protocol: the program opted in, so keys go out
+            // in the CSI u forms it asked for. App shortcuts already ran
+            // above and consumed their keys.
+            use crate::kitty_keyboard as kk;
+            let flags = terminal.kitty_flags();
+            let event_type = if event.is_held {
+                kk::EVENT_REPEAT
+            } else {
+                kk::EVENT_PRESS
+            };
+            let shifted = if modifiers.shift {
+                event.keystroke.key_char.as_deref()
+            } else {
+                None
+            };
+            let encoded = kk::encode(
+                &kk::KeyEvent {
+                    key: &key,
+                    text: event.keystroke.key_char.as_deref(),
+                    shifted,
+                    shift: modifiers.shift,
+                    alt: modifiers.alt,
+                    ctrl: modifiers.control,
+                    super_key: modifiers.platform,
+                    event_type,
+                },
+                flags,
+            );
+            if let Some(bytes) = &encoded {
+                // Plain text that passed through still feeds the snippet
+                // trigger buffer; escape sequences do not.
+                if bytes.first() != Some(&0x1b) {
+                    if let Some(text) = std::str::from_utf8(bytes).ok() {
+                        self.typed_prompt_buf.push_str(text);
+                    }
+                } else {
+                    self.typed_prompt_buf.clear();
+                }
+            }
+            encoded
+        } else if is_alt_gr {
             if let Some(ref ch) = event.keystroke.key_char {
                 self.typed_prompt_buf.push_str(ch);
                 Some(ch.as_bytes().to_vec())
@@ -14354,6 +14520,11 @@ impl Render for RootView {
                         .filter_map(|pane| self.visible_program_record(pane.id))
                         .max_by_key(|record| record.state.priority())
                         .cloned(),
+                    progress: tab
+                        .pane_tree
+                        .active_pane()
+                        .and_then(|pane| pane.terminal.as_ref())
+                        .and_then(|terminal| terminal.progress()),
                     is_dirty: tab
                         .git_status
                         .as_ref()
@@ -14754,6 +14925,7 @@ impl Render for RootView {
                             .track_focus(&self.focus_handle)
                             .key_context("RootView")
                             .on_key_down(cx.listener(Self::handle_key_down))
+                            .on_key_up(cx.listener(Self::handle_key_up))
                             .on_scroll_wheel(cx.listener(Self::handle_scroll))
                             .on_mouse_move(cx.listener(Self::handle_mouse_move))
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))

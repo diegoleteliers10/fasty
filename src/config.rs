@@ -297,6 +297,10 @@ pub struct Config {
     pub opacity: f32,
     #[serde(default = "default_notify_on_command_finish")]
     pub notify_on_command_finish: bool,
+    /// Notify when a running command produces no output for this many
+    /// seconds and the window is not focused. `None` disables the watcher.
+    #[serde(default)]
+    pub notify_on_silence_seconds: Option<u64>,
     #[serde(default = "default_notify_on_ai_status")]
     pub notify_on_ai_status: bool,
     #[serde(default = "default_notify_on_program_status")]
@@ -511,6 +515,7 @@ impl Default for Config {
             clipboard_read: default_clipboard_read(),
             opacity: default_opacity(),
             notify_on_command_finish: default_notify_on_command_finish(),
+            notify_on_silence_seconds: None,
             notify_on_ai_status: default_notify_on_ai_status(),
             notify_on_program_status: default_notify_on_program_status(),
             bottombar: BottombarConfig::default(),
@@ -727,6 +732,47 @@ fn ensure_table(doc: &mut DocumentMut, key: &str) {
     }
 }
 
+/// Append one line to `config-changes.log` in the state dir: every config
+/// write records who wrote and which top-level keys changed, so a reported
+/// "my settings reverted" has a paper trail.
+fn trace_config_write(event: &str) {
+    use std::io::Write;
+    let path = crate::paths::get().state_dir.join("config-changes.log");
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(file, "{now} pid={} {event}", std::process::id());
+}
+
+/// Top-level keys whose serialized form differs between the two documents.
+fn changed_top_level_keys(
+    before: &toml_edit::DocumentMut,
+    after: &toml_edit::DocumentMut,
+) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for (key, item) in after.as_table().iter() {
+        let serialized = item.to_string();
+        let same = before
+            .as_table()
+            .get(key)
+            .map(|previous| previous.to_string() == serialized)
+            .unwrap_or(false);
+        if !same {
+            keys.push(key.to_string());
+        }
+    }
+    for (key, _) in before.as_table().iter() {
+        if !after.as_table().contains_key(key) {
+            keys.push(format!("-{key}"));
+        }
+    }
+    keys
+}
+
 fn lock_config_file(path: &Path) -> anyhow::Result<std::fs::File> {
     let mut lock_path = path.as_os_str().to_owned();
     lock_path.push(".lock");
@@ -796,6 +842,9 @@ fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
     doc["contrast_correction"] = value(c.contrast_correction);
     doc["clipboard_read"] = value(c.clipboard_read);
     doc["notify_on_command_finish"] = value(c.notify_on_command_finish);
+    if let Some(seconds) = c.notify_on_silence_seconds {
+        doc["notify_on_silence_seconds"] = value(seconds.min(i64::MAX as u64) as i64);
+    }
     doc["notify_on_ai_status"] = value(c.notify_on_ai_status);
     doc["notify_on_program_status"] = value(c.notify_on_program_status);
     let tab_layout_str = match c.tab_layout {
@@ -1060,6 +1109,10 @@ fn parse_lenient_from_doc(doc: &DocumentMut) -> Option<Config> {
         cfg.notify_on_command_finish = val;
         any_recognized = true;
     }
+    if let Some(val) = doc.get("notify_on_silence_seconds").and_then(|v| v.as_integer()) {
+        cfg.notify_on_silence_seconds = Some(val.max(0) as u64);
+        any_recognized = true;
+    }
     if let Some(val) = doc.get("notify_on_ai_status").and_then(|v| v.as_bool()) {
         cfg.notify_on_ai_status = val;
         any_recognized = true;
@@ -1288,7 +1341,16 @@ impl Config {
         if original.as_deref().map(str::as_bytes) != current.as_deref() {
             anyhow::bail!("Settings changed on disk. Retry the change: {}", path.display());
         }
+        let changed_keys = changed_top_level_keys(&before, &after);
         atomic_write(path, serialized.as_bytes())?;
+        trace_config_write(
+            &format!(
+                "wrote {} keys_changed=[{}] publish={}",
+                path.display(),
+                changed_keys.join(","),
+                publish
+            ),
+        );
         if publish {
             sync_runtime_statics(&committed);
             set_ai_context_window(committed.ai.context_window);
@@ -1752,6 +1814,7 @@ command = "old"
             clipboard_read: false,
             opacity: 0.95,
             notify_on_command_finish: true,
+            notify_on_silence_seconds: Some(30),
             notify_on_ai_status: true,
             notify_on_program_status: true,
             bottombar: BottombarConfig::default(),
@@ -1787,6 +1850,7 @@ command = "old"
         assert_eq!(deserialized.contrast_correction, true);
         assert_eq!(deserialized.clipboard_read, false);
         assert_eq!(deserialized.notify_on_command_finish, true);
+        assert_eq!(deserialized.notify_on_silence_seconds, Some(30));
         assert_eq!(deserialized.opacity, 0.95);
         assert_eq!(deserialized.cursor.shape, CursorShapeConfig::Beam);
         assert_eq!(deserialized.cursor.blink, true);

@@ -2,6 +2,7 @@
 
 pub mod kitty_clipboard;
 pub mod kitty_graphics;
+pub mod sixel;
 
 use alacritty_terminal::vte::{Params, Parser, Perform};
 

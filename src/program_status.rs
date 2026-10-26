@@ -50,7 +50,7 @@ pub fn aggregate(records: &[ProgramRecord]) -> Option<&ProgramRecord> {
     records.iter().max_by_key(|record| record.state.priority())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProgramStatusCommand {
     Query,
     Clear(String),

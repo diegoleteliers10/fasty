@@ -36,6 +36,43 @@ pub(crate) fn render_program_status(record: &ProgramRecord, theme: Theme, size: 
     div().flex().items_center().flex_shrink_0()
         .child(super::icons::render_icon(icon, color, size))
 }
+/// Thin progress bar drawn along the bottom edge of a tab.
+///
+/// Determinate states fill the given width by percentage. The indeterminate
+/// state shows a short fixed segment, because a tab strip has no animation
+/// clock and a static marker still reads as activity.
+pub(crate) fn render_progress(
+    report: crate::terminal_state::ProgressReport,
+    theme: Theme,
+    width: f32,
+) -> gpui::Div {
+    use crate::terminal_state::ProgressState;
+
+    let (fraction, color) = match report.state {
+        ProgressState::Normal => (report.percent.map(|p| p as f32 / 100.0), theme.accent),
+        ProgressState::Error => (
+            report.percent.map(|p| p as f32 / 100.0).or(Some(1.0)),
+            theme.red,
+        ),
+        ProgressState::Paused => (
+            report.percent.map(|p| p as f32 / 100.0),
+            theme.yellow,
+        ),
+        ProgressState::Indeterminate => (Some(0.35), theme.accent),
+    };
+    let fraction = fraction.unwrap_or(0.0).clamp(0.0, 1.0);
+    let filled = (width * fraction).max(if fraction > 0.0 { 4.0 } else { 0.0 });
+
+    div()
+        .absolute()
+        .bottom(px(0.))
+        .left(px(0.))
+        .h(px(2.))
+        .w(px(filled))
+        .rounded(px(1.))
+        .bg(color)
+}
+
 fn render_ai_response_badge(theme: Theme) -> gpui::Div {
     div()
         .absolute()
@@ -61,6 +98,7 @@ pub struct TabItem {
     pub is_dirty: bool,
     pub ai_response_unread: bool,
     pub program_status: Option<ProgramRecord>,
+    pub progress: Option<crate::terminal_state::ProgressReport>,
     pub process_name: Option<String>,
 }
 
@@ -696,6 +734,7 @@ impl RenderOnce for TabSidebar {
 
                                 div()
                                     .id(SharedString::from(format!("vert-tab-{}", tab_id)))
+                                    .relative()
                                     .flex()
                                     .flex_row()
                                     .items_center()
@@ -712,6 +751,9 @@ impl RenderOnce for TabSidebar {
                                     .font_weight(if is_active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
                                     .text_color(fg)
                                     .cursor(CursorStyle::PointingHand)
+                                    .when_some(tab.progress, |el, report| {
+                                        el.child(render_progress(report, theme, 194.0))
+                                    })
                                     .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                                         if ev.click_count >= 2 {
                                             if let Some(ref rcb) = on_rename_clone {
@@ -824,6 +866,7 @@ fn render_tab_strip(
 
             div()
                 .id(SharedString::from(format!("tab-{}", tab_id)))
+                .relative()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -842,6 +885,9 @@ fn render_tab_strip(
                 .font_weight(if is_active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
                 .text_color(fg)
                 .cursor(CursorStyle::PointingHand)
+                .when_some(tab.progress, |el, report| {
+                    el.child(render_progress(report, theme, 132.0))
+                })
                 .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                     if ev.click_count >= 2 {
                         if let Some(ref rcb) = on_rename_clone {

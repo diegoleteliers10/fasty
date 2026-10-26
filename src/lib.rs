@@ -18,6 +18,8 @@ pub mod gateway;
 pub mod git;
 pub mod importer;
 pub mod keybindings;
+pub mod kitty_keyboard;
+pub mod host_service;
 pub mod mcp;
 pub mod notifications;
 pub mod pane_tree;
