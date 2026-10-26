@@ -78,7 +78,8 @@ mod macos {
     use std::sync::OnceLock;
 
     use block2::RcBlock;
-    use objc2_06::runtime::Bool;
+    use objc2_06::msg_send;
+    use objc2_06::runtime::{AnyObject, Bool};
     use std::ptr::NonNull;
     use objc2_foundation::{NSError, NSString};
     use objc2_user_notifications::{
@@ -86,9 +87,36 @@ mod macos {
         UNNotificationSettings, UNNotificationSound, UNUserNotificationCenter,
     };
 
+    /// True only when the process carries a bundle identifier. An ObjC
+    /// exception here aborts the whole process, so this must run before any
+    /// `UNUserNotificationCenter` call.
+    fn unuser_notifications_available() -> bool {
+        // SAFETY: plain message sends to NSBundle.mainBundle; both returns
+        // are objects the caller never retains.
+        unsafe {
+            let bundle: *mut AnyObject = msg_send![objc2_06::class!(NSBundle), mainBundle];
+            if bundle.is_null() {
+                return false;
+            }
+            let identifier: *mut AnyObject = msg_send![bundle, bundleIdentifier];
+            !identifier.is_null()
+        }
+    }
+
     pub fn request_permission() {
         static REQUESTED: OnceLock<()> = OnceLock::new();
         REQUESTED.get_or_init(|| {
+            // `+[UNUserNotificationCenter currentNotificationCenter]` raises
+            // when the process has no main bundle identifier — any bare
+            // `fastty` CLI/GUI launch (crash report 5EC0FF51, 2026-10-25).
+            // Skip instead of aborting; without a bundle there is no
+            // notification identity to authorize anyway.
+            if !unuser_notifications_available() {
+                eprintln!(
+                    "Fastty notifications skipped: no bundle identity (bare binary launch)"
+                );
+                return;
+            }
             let center = UNUserNotificationCenter::currentNotificationCenter();
             let granted_block = RcBlock::new(|granted: Bool, _error: *mut NSError| {
                 if !granted.as_bool() {
@@ -109,6 +137,12 @@ mod macos {
 
     pub fn deliver(title: &str, body: &str) {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        if !unuser_notifications_available() {
+            eprintln!(
+                "Fastty notification dropped (no bundle identity): {title}"
+            );
+            return;
+        }
         request_permission();
         let center = UNUserNotificationCenter::currentNotificationCenter();
         let content = UNMutableNotificationContent::new();
@@ -131,5 +165,20 @@ mod macos {
         });
         center.addNotificationRequest_withCompletionHandler(&request, Some(&add_block));
         eprintln!("Fastty notification posted: {title}");
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod unbundled_tests {
+    /// Crash report 5EC0FF51 (2026-10-25): a bare `fastty` CLI launch has no
+    /// main bundle identifier, and `+[UNUserNotificationCenter
+    /// currentNotificationCenter]` raises there, aborting the process 1.3s
+    /// after launch. Test binaries run in the same unbundled condition, so
+    /// this test goes red (SIGABRT) exactly on that bug and stays green
+    /// once the guards hold.
+    #[test]
+    fn request_permission_and_delivery_survive_without_a_bundle() {
+        super::macos::request_permission();
+        super::macos::deliver("Fastty", "unbundled probe");
     }
 }

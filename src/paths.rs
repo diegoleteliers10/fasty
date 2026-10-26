@@ -85,6 +85,43 @@ pub fn init() -> anyhow::Result<&'static FasttyDirs> {
     Ok(FASTTY_DIRS.get_or_init(|| dirs))
 }
 
+/// Route Rust panics to `state_dir/panic.log` in addition to stderr.
+///
+/// A windowed launch from Finder/Dock has no visible stderr, so a panic
+/// that kills the app used to vanish ("it just closed"). This keeps the
+/// panic message and location on disk next to the host trace.
+pub fn install_panic_log() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let path = get().state_dir.join("panic.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            use std::io::Write;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "unknown".to_string());
+            let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "non-string panic payload".to_string()
+            };
+            let _ = writeln!(
+                file,
+                "{now} pid={} thread={:?} panic at {location}: {message}",
+                std::process::id(),
+                std::thread::current().name().unwrap_or("unnamed")
+            );
+        }
+        previous(info);
+    }));
+}
+
 pub fn get() -> &'static FasttyDirs {
     FASTTY_DIRS.get_or_init(|| FasttyDirs::new().expect("failed to initialize fastty paths"))
 }
