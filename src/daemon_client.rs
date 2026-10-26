@@ -40,6 +40,22 @@ fn tunnel_socket() -> Option<std::path::PathBuf> {
     TUNNEL_SOCKET.get().cloned()
 }
 
+/// Remote sessions forward a Unix socket, which this platform cannot open.
+/// The callers stay unconditional so `--remote` fails with a readable
+/// message instead of a compile error on a Windows build.
+#[cfg(not(unix))]
+pub fn setup_ssh_tunnel(
+    _host: &str,
+    _remote_socket: Option<String>,
+) -> Result<std::path::PathBuf, String> {
+    Err("remote sessions need a Unix socket to forward. \
+         This build cannot reach a remote fastty host."
+        .to_string())
+}
+
+#[cfg(not(unix))]
+pub fn use_tunnel_socket(_path: std::path::PathBuf) {}
+
 /// FNV-1a 64: a stable, dependency-free tag for a remote host string.
 #[cfg(unix)]
 fn host_hash(value: &str) -> u64 {
