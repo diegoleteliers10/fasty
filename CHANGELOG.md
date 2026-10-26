@@ -3,6 +3,20 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.25.2 - 2026-10-26
+
+### Session host death forensics
+
+- The host traps `SIGTERM`, `SIGINT`, `SIGHUP`, and `SIGQUIT` and records each one in `host-trace.log` before dying, so an externally killed host no longer vanishes without a trace. A clean exit keeps logging `host accept loop exited`; only `SIGKILL` stays silent by design of the OS.
+- The host writes its process id to `host.pid` in the state dir and includes the pid in every `host started` trace line.
+- When the app finds the host socket dead, it reports whether the recorded host process was still alive before spawning a replacement, separating a dead process from a host whose socket disappeared under it.
+
+## 0.25.1 - 2026-10-26
+
+### Session restore
+
+- Accept old binary snapshots whose header has no CsiWatcher prefix field instead of rejecting them.
+
 ## 0.25.0 - 2026-10-25
 
 ### Crash fix (bare binary launches)
