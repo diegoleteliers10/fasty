@@ -473,8 +473,18 @@ fn install_host_signal_trace() {
     }
 }
 
+/// Windows and other non-Unix targets have no catchable-host-forensics need;
+/// the daemon there uses named pipes and `run_host` calls this unconditionally.
+#[cfg(not(unix))]
+fn install_host_signal_trace() {}
+
 /// True when the recorded host process still exists. Reads `host.pid` so the
 /// caller can tell a dead host from a host whose socket vanished under it.
+#[cfg(not(unix))]
+fn recorded_host_pid_alive() -> Option<bool> {
+    None
+}
+
 #[cfg(unix)]
 fn recorded_host_pid_alive() -> Option<bool> {
     let raw = std::fs::read_to_string(crate::paths::get().state_dir.join("host.pid")).ok()?;
