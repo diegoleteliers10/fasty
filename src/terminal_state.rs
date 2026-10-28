@@ -1348,6 +1348,11 @@ impl TerminalState {
         let alive_clone = Arc::clone(&alive);
 
         let event_listener = EventListenerProxy::from_arc(writer_arc.clone());
+        // Daemon-attached terminals share the child's output with the session
+        // host, whose own terminal instance already answers every terminal
+        // query once. Replying again from here doubles every response (cursor
+        // position, OSC 10/11 colors) and breaks prompt libraries.
+        event_listener.set_replies_enabled(remote_control.is_none());
         event_listener.set_event_sender(sender.clone());
         let term = Arc::new(ParkingMutex::new(alacritty_terminal::term::Term::new(
             config,
