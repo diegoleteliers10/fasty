@@ -4,6 +4,7 @@
 use alacritty_terminal::event::{Event, EventListener};
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::Mutex;
 use crate::terminal_state::AppEvent;
 
@@ -67,6 +68,7 @@ impl EventSender {
 pub struct EventListenerProxy {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     app_sender: Arc<Mutex<EventSender>>,
+    replies_enabled: Arc<AtomicBool>,
 }
 
 unsafe impl Send for EventListenerProxy {}
@@ -77,7 +79,21 @@ impl EventListenerProxy {
         Self {
             writer,
             app_sender: Arc::new(Mutex::new(EventSender::None)),
+            replies_enabled: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Disable `PtyWrite` and `ColorRequest` replies for daemon-attached
+    /// terminals. The session host parses the same output stream and answers
+    /// every terminal query once; a second reply from the attached client
+    /// arrives while no reader consumes it and aborts prompt libraries
+    /// (`gh`, `survey`) with "unexpected escape sequence".
+    pub fn set_replies_enabled(&self, enabled: bool) {
+        self.replies_enabled.store(enabled, Ordering::Release);
+    }
+
+    fn replies_enabled(&self) -> bool {
+        self.replies_enabled.load(Ordering::Acquire)
     }
 
     pub fn set_event_sender(&self, sender: EventSender) {
@@ -93,6 +109,9 @@ impl EventListener for EventListenerProxy {
     fn send_event(&self, event: Event) {
         match event {
             Event::PtyWrite(response) => {
+                if !self.replies_enabled() {
+                    return;
+                }
                 let mut w = self.writer.lock();
                 if w.write_all(response.as_bytes()).is_ok() {
                     let _ = w.flush();
@@ -131,6 +150,9 @@ impl EventListener for EventListenerProxy {
                 self.app_sender.lock().send(AppEvent::TitleChanged(title));
             }
             Event::ColorRequest(index, format) => {
+                if !self.replies_enabled() {
+                    return;
+                }
                 let theme_name = crate::config::ACTIVE_THEME.read().clone();
                 let theme = crate::ui::theme::Theme::from_name(&theme_name);
                 let hsla = match index {
@@ -168,5 +190,49 @@ impl EventListener for EventListenerProxy {
             }
             _ => {}
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::vte::ansi::Rgb;
+
+    #[derive(Default)]
+    struct Sink(parking_lot::Mutex<Vec<u8>>);
+
+    struct SinkHandle(Arc<Sink>);
+
+    impl Write for SinkHandle {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 .0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reply_suppression_drops_query_replies_for_attached_terminals() {
+        let sink = Arc::new(Sink::default());
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(SinkHandle(Arc::clone(&sink)))));
+        let proxy = EventListenerProxy::from_arc(writer);
+        proxy.set_replies_enabled(false);
+
+        proxy.send_event(Event::PtyWrite("\x1b[31;56R".to_string()));
+        let format_color = Arc::new(|rgb: Rgb| {
+            format!("\x1b]11;rgb:{:02x}{:02x}{:02x}\x1b\\", rgb.r, rgb.g, rgb.b)
+        });
+        proxy.send_event(Event::ColorRequest(257, format_color));
+
+        assert!(
+            sink.0.lock().is_empty(),
+            "attached terminals must not answer terminal queries"
+        );
+
+        proxy.set_replies_enabled(true);
+        proxy.send_event(Event::PtyWrite("\x1b[31;56R".to_string()));
+        assert_eq!(sink.0.lock().as_slice(), b"\x1b[31;56R");
     }
 }
