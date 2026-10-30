@@ -40,3 +40,14 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag "${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Trigger release build
+        # A tag pushed with the default GITHUB_TOKEN does not fire other
+        # workflows (GitHub blocks recursive events), so dispatch the Release
+        # workflow explicitly. release.yml resolves the version from the tag.
+        if: steps.version.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh workflow run release.yml --ref "${{ steps.version.outputs.tag }}"

@@ -260,7 +260,7 @@ static DOCKER_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 pub fn docker_containers() -> Vec<DockerContainer> {
     let cache = DOCKER_CACHE.get_or_init(|| Mutex::new(None));
     let fresh = {
-        let guard = cache.lock().unwrap();
+        let guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match guard.as_ref() {
             Some(snap) if snap.fetched_at.elapsed() < DOCKER_TTL => {
                 Some(snap.containers.clone())
@@ -288,7 +288,7 @@ fn spawn_docker_refresh() {
     std::thread::spawn(|| {
         let containers = list_docker_containers_blocking();
         let cache = DOCKER_CACHE.get_or_init(|| Mutex::new(None));
-        *cache.lock().unwrap() = Some(DockerSnapshot {
+        *cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(DockerSnapshot {
             fetched_at: Instant::now(),
             containers,
         });

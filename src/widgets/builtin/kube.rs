@@ -108,7 +108,7 @@ impl Widget for KubeWidget {
     }
 
     fn render(&mut self, _ctx: &WidgetContext) -> Vec<Segment> {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match &*guard {
             KubeState::Ok(ctx) => {
                 vec![

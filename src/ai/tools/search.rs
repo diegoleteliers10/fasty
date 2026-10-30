@@ -193,7 +193,11 @@ impl Tool for SearchTool {
         }
 
         // Case 4: Grep query in files
-        let query = parsed.query.as_ref().unwrap();
+        let Some(query) = parsed.query.as_ref() else {
+            return Ok(ToolOutput::success(
+                "No query provided; nothing to search.".to_string(),
+            ));
+        };
         let query_lower = query.to_lowercase();
         let mut results = Vec::new();
 

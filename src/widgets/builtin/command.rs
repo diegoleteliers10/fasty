@@ -123,7 +123,7 @@ impl Widget for CommandWidget {
     }
 
     fn render(&mut self, _ctx: &WidgetContext) -> Vec<Segment> {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match &*guard {
             CommandState::Ok(s) => {
                 vec![
@@ -142,7 +142,7 @@ impl Widget for CommandWidget {
     }
 
     fn on_click(&mut self, _ctx: &WidgetContext) -> ClickAction {
-        let payload = match &*self.state.lock().unwrap() {
+        let payload = match &*self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
             CommandState::Ok(s) => s.clone(),
             _ => return ClickAction::None,
         };
