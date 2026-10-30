@@ -168,6 +168,14 @@ cargo build --target wasm32-unknown-unknown -p fastty-wasm --release
 
 ---
 
+## Releasing
+
+A release starts from a pull request merge into `main`. The automation tags the
+merge commit, builds every platform, and publishes the GitHub Release. See
+[docs/releasing.md](docs/releasing.md) for the full process.
+
+---
+
 ## Configuration
 
 Fastty uses the first existing file in this order:
