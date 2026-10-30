@@ -1,7 +1,6 @@
 //! Auto-detect and import configurations from other terminal emulators and muxers.
 
 use std::path::{Path, PathBuf};
-#[cfg(test)]
 use crate::config::Config;
 
 use crate::keybindings::KeybindingPreset;
