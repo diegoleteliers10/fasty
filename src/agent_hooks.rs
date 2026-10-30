@@ -129,7 +129,9 @@ pub fn uninstall(provider: &str, scope: InstallScope) -> Result<PathBuf, String>
         }
     }
     if hooks.is_empty() {
-        document.as_object_mut().unwrap().remove("hooks");
+        if let Some(object) = document.as_object_mut() {
+            object.remove("hooks");
+        }
     }
     if document == original {
         return Ok(path);
@@ -371,7 +373,10 @@ fn opencode_cli_registration(
     let plugin = plugin.to_str()
         .ok_or_else(|| "The OpenCode plugin path must use UTF-8".to_string())?;
     if install {
-        let entries = document.as_object_mut().unwrap()
+        let Some(entries) = document.as_object_mut() else {
+            return Err("The OpenCode config is not a JSON object".into());
+        };
+        let entries = entries
             .entry("plugins").or_insert_with(|| json!([]))
             .as_array_mut().ok_or_else(|| "OpenCode cli.json: plugins must be an array".to_string())?;
         if !entries.iter().any(|entry| entry.as_str() == Some(plugin)) {
@@ -382,7 +387,9 @@ fn opencode_cli_registration(
             .ok_or_else(|| "OpenCode cli.json: plugins must be an array".to_string())?;
         entries.retain(|entry| entry.as_str() != Some(plugin));
         if entries.is_empty() {
-            document.as_object_mut().unwrap().remove("plugins");
+            if let Some(object) = document.as_object_mut() {
+                object.remove("plugins");
+            }
         }
     }
     Ok((document != original).then_some((path, document)))

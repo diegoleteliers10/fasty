@@ -81,7 +81,11 @@ fn find_exact(content: &str, query: &str) -> Result<MatchRange, String> {
     let count = content.matches(query).count();
     match count {
         1 => {
-            let start = content.find(query).expect("one match");
+            // count == 1 guarantees the find; fall back to no-match instead
+            // of panicking if the invariant is ever broken.
+            let Some(start) = content.find(query) else {
+                return Err("match vanished while locating".into());
+            };
             Ok(MatchRange {
                 start,
                 end: start + query.len(),
@@ -375,7 +379,11 @@ fn find_fuzzy(content: &str, query: &str) -> Result<(MatchRange, (i32, i32)), Fu
         return Err(FuzzyError::NoMatch);
     }
 
-    let best_cost = candidates.iter().map(|c| c.cost).min().expect("non-empty");
+    let best_cost = candidates
+        .iter()
+        .map(|c| c.cost)
+        .min()
+        .ok_or(FuzzyError::NoMatch)?;
     let mut best: Option<&FuzzyMatch> = None;
     let mut tie_lines: Vec<usize> = Vec::new();
     for candidate in &candidates {
