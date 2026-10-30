@@ -7,47 +7,81 @@ on:
 
 permissions:
   contents: write
+  actions: write
+
+concurrency:
+  group: tag-release-main
+  cancel-in-progress: false
 
 jobs:
   tag:
     name: Tag merged release version
-    if: github.event.pull_request.merged == true
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout main
+      - name: Checkout merged commit
         uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.event.pull_request.merge_commit_sha || 'main' }}
           fetch-depth: 0
+          fetch-tags: true
 
-      - name: Resolve version
+      - name: Resolve version and tag state
         id: version
-        run: |
-          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
-          TAG="v${VERSION}"
-          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Tag ${TAG} already exists; skipping."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Push release tag
-        if: steps.version.outputs.exists == 'false'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "${{ steps.version.outputs.tag }}"
-          git push origin "${{ steps.version.outputs.tag }}"
-
-      - name: Trigger release build
-        # A tag pushed with the default GITHUB_TOKEN does not fire other
-        # workflows (GitHub blocks recursive events), so dispatch the Release
-        # workflow explicitly. release.yml resolves the version from the tag.
-        if: steps.version.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh workflow run release.yml --ref "${{ steps.version.outputs.tag }}"
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          TAG="v${VERSION}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TAG} already exists."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TAG} does not exist yet."
+          fi
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${TAG} already published."
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${TAG} not published yet."
+          fi
+
+      - name: Push release tag
+        if: steps.version.outputs.exists == 'false'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "refs/tags/$TAG"
+
+      # A tag pushed with the default GITHUB_TOKEN does not fire other
+      # workflows: GitHub blocks events created by the token to stop recursive
+      # runs. Dispatch the Release workflow on the tag ref instead. This also
+      # covers the recovery case where the tag exists but the release does not.
+      - name: Dispatch release build
+        if: steps.version.outputs.exists == 'false' || steps.version.outputs.released == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run release.yml --ref "$TAG"; then
+              echo "Dispatched Release for ${TAG}."
+              exit 0
+            fi
+            echo "Dispatch attempt ${attempt} failed; retrying in 5s."
+            sleep 5
+          done
+          echo "::error::Could not dispatch the Release workflow for ${TAG}."
+          exit 1
