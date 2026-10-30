@@ -1220,7 +1220,7 @@ mod tests {
         assert_eq!(older_page.commits.len(), 3);
         let older_commit_id = older_page.commits[0].id.clone();
         {
-            let mut cache = git_info_cache().lock().unwrap();
+            let mut cache = git_info_cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let info = cache.get_mut(&path).unwrap().info.as_mut().unwrap();
             info.project_panel.commits.extend(older_page.commits);
             info.project_panel.history_has_more = older_page.has_more;
@@ -1335,7 +1335,7 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
         let old_generation = current_git_info_generation(&path);
         {
-            let mut in_flight = git_refreshes_in_flight().lock().unwrap();
+            let mut in_flight = git_refreshes_in_flight().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             in_flight.insert(path.clone(), old_generation);
         }
         invalidate_git_info_cache(&path);

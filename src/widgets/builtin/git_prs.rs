@@ -197,7 +197,7 @@ impl Widget for GitPrsWidget {
         self.was_focused = ctx.window_focused;
         let cwd = ctx.active_tab_cwd.filter(|_| ctx.active_tab_git.is_some());
         if cwd != self.pending_cwd.as_deref() {
-            let mut guard = self.state.lock().unwrap();
+            let mut guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             self.generation.fetch_add(1, Ordering::Relaxed);
             *guard = None;
             self.pending_cwd = cwd.map(std::path::Path::to_path_buf);
@@ -229,7 +229,7 @@ impl Widget for GitPrsWidget {
                 std::thread::spawn(move || {
                     let summary = fetch_prs_summary(&cwd_path);
 
-                    let mut guard = state_clone.lock().unwrap();
+                    let mut guard = state_clone.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     if gen != generation_clone.load(Ordering::Relaxed) {
                         return;
                     }
@@ -252,7 +252,7 @@ impl Widget for GitPrsWidget {
     }
 
     fn render(&mut self, _ctx: &WidgetContext) -> Vec<Segment> {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(summary) = guard.as_ref() else {
             // UX2: subtle one-glance hint instead of silence when `gh` is
             // missing; the tooltip carries the explanation.
@@ -322,7 +322,7 @@ impl Widget for GitPrsWidget {
     }
 
     fn get_context_menu_items(&self) -> Option<Vec<ContextMenuItem>> {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let summary = guard.as_ref()?;
 
         let mut items = Vec::new();
@@ -424,7 +424,7 @@ mod tests {
 
     fn widget_with(summary: PrsSummary) -> GitPrsWidget {
         let widget = GitPrsWidget::new(Align::Left, None);
-        *widget.state.lock().unwrap() = Some(summary);
+        *widget.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(summary);
         widget
     }
 

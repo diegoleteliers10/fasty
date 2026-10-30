@@ -274,7 +274,10 @@ impl OpencodeRuntime {
             .map_err(|error| anyhow::anyhow!("Cannot start ACP command '{}': {error}", command.to_string_lossy()))?;
         let mut child = ChildGuard(Some(child));
 
-        let process = child.0.as_mut().expect("new child guard has a process");
+        let process = child
+            .0
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("ACP child process vanished before handshake"))?;
         let stdin = process
             .stdin
             .take()
@@ -365,7 +368,10 @@ impl OpencodeRuntime {
             mode: session.get("mode").cloned().unwrap_or(Value::Null),
             ..info
         };
-        let child = child.0.take().expect("child guard has a process");
+        let child = child
+            .0
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("ACP child process vanished before handshake"))?;
         Ok(Self {
             command: command.to_os_string(),
             args: args.to_vec(),
@@ -542,13 +548,13 @@ impl OpencodeRuntime {
     pub fn recv_event(&self) -> anyhow::Result<OpencodeEvent> {
         self.events
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .recv()
             .map_err(|_| anyhow::anyhow!("OpenCode ACP connection closed"))
     }
 
     pub fn recv_event_timeout(&self, timeout: Duration) -> anyhow::Result<Option<OpencodeEvent>> {
-        match self.events.lock().unwrap().recv_timeout(timeout) {
+        match self.events.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).recv_timeout(timeout) {
             Ok(event) => Ok(Some(event)),
             Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -618,7 +624,7 @@ impl OpencodeManager {
     ) -> anyhow::Result<Arc<OpencodeRuntime>> {
         let tab_id = tab_id.into();
         let cwd = absolute_directory(cwd.as_ref())?;
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(runtime) = sessions.get(&tab_id) {
             if runtime.cwd() == cwd && runtime.command() == command.as_ref() && runtime.args == args {
                 let session_matches = saved_session_id
@@ -671,7 +677,7 @@ impl OpencodeManager {
 
     pub fn remove(&self, tab_id: &str) {
         let prefix = format!("{tab_id}::");
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let keys = sessions.keys()
             .filter(|key| key.as_str() == tab_id || key.starts_with(&prefix))
             .cloned()
@@ -737,12 +743,12 @@ fn request_inner(
 ) -> anyhow::Result<Value> {
     let id = transport.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::channel();
-    transport.pending.lock().unwrap().insert(id, tx);
+    transport.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(id, tx);
     if let Err(error) = write_message(
         transport,
         json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
     ) {
-        transport.pending.lock().unwrap().remove(&id);
+        transport.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&id);
         return Err(error);
     }
     let response = match timeout {
@@ -760,14 +766,14 @@ fn request_inner(
         Ok(Ok(result)) => Ok(result),
         Ok(Err(error)) => Err(anyhow::anyhow!("ACP {method} failed: {error}")),
         Err(error) => {
-            transport.pending.lock().unwrap().remove(&id);
+            transport.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&id);
             Err(error)
         }
     }
 }
 
 fn write_message(transport: &Transport, message: Value) -> anyhow::Result<()> {
-    let mut stdin = transport.stdin.lock().unwrap();
+    let mut stdin = transport.stdin.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     serde_json::to_writer(&mut *stdin, &message)?;
     stdin.write_all(b"\n")?;
     stdin.flush()?;
@@ -796,7 +802,7 @@ fn spawn_reader(
                     }
                 }
             }
-            for (_, sender) in transport.pending.lock().unwrap().drain() {
+            for (_, sender) in transport.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).drain() {
                 let _ = sender.send(Err("ACP process exited".into()));
             }
             let _ = transport
@@ -855,7 +861,7 @@ fn dispatch_message(transport: &Transport, message: Value) {
     let Some(id) = message.get("id").and_then(Value::as_u64) else {
         return;
     };
-    if let Some(sender) = transport.pending.lock().unwrap().remove(&id) {
+    if let Some(sender) = transport.pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&id) {
         let result = if let Some(error) = message.get("error") {
             Err(error
                 .get("message")

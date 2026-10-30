@@ -11376,7 +11376,7 @@ impl RootView {
             let rows: Vec<PrPickerRow> = match self.pr_picker_mode.clone() {
                 PrPickerMode::Browse => {
                     let query = self.pr_picker_query.to_lowercase();
-                    let guard = self.pr_snapshot.lock().unwrap();
+                    let guard = self.pr_snapshot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     guard
                         .as_ref()
                         .map(pr_picker_rows)
@@ -16488,7 +16488,7 @@ impl Render for RootView {
                 let mode = self.pr_picker_mode.clone();
                 let query = self.pr_picker_query.to_lowercase();
                 let has_cwd = self.pr_picker_cwd.is_some();
-                let snapshot = self.pr_snapshot.lock().unwrap().clone();
+                let snapshot = self.pr_snapshot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
                 let rows: Vec<PrPickerRow> = snapshot
                     .as_ref()
                     .map(pr_picker_rows)

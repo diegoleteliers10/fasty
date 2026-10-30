@@ -1053,7 +1053,13 @@ fn install_linux(archive_path: &Path) -> Result<(), UpdateError> {
         }
     }
 
-    let target_name = target_path.file_name().unwrap().to_string_lossy();
+    let Some(target_name) = target_path.file_name() else {
+        return Err(UpdateError::InvalidVersion(format!(
+            "Update target path has no file name: {}",
+            target_path.display()
+        )));
+    };
+    let target_name = target_name.to_string_lossy();
     let staged_file = parent.join(format!("{target_name}.new"));
     let _ = fs::remove_file(&staged_file);
 

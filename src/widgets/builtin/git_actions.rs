@@ -137,7 +137,7 @@ impl Widget for GitActionsWidget {
         self.was_focused = ctx.window_focused;
         let cwd = ctx.active_tab_cwd.filter(|_| ctx.active_tab_git.is_some());
         if cwd != self.pending_cwd.as_deref() {
-            let mut guard = self.state.lock().unwrap();
+            let mut guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             self.generation.fetch_add(1, Ordering::Relaxed);
             *guard = None;
             self.pending_cwd = cwd.map(std::path::Path::to_path_buf);
@@ -261,7 +261,7 @@ impl Widget for GitActionsWidget {
                         })
                     })();
 
-                    let mut guard = state_clone.lock().unwrap();
+                    let mut guard = state_clone.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     if gen != generation_clone.load(Ordering::Relaxed) {
                         return;
                     }
@@ -282,7 +282,7 @@ impl Widget for GitActionsWidget {
     }
 
     fn render(&mut self, _ctx: &WidgetContext) -> Vec<Segment> {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(summary) = guard.as_ref() else {
             if self.is_fetching.load(Ordering::Relaxed) {
                 return vec![Segment::parts(
@@ -362,7 +362,7 @@ impl Widget for GitActionsWidget {
     }
 
     fn tooltip(&self) -> Option<String> {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(summary) = guard.as_ref() {
             let mut lines = Vec::new();
             lines.push("GitHub Actions Summary:".to_string());
@@ -380,7 +380,7 @@ impl Widget for GitActionsWidget {
     }
 
     fn get_context_menu_items(&self) -> Option<Vec<ContextMenuItem>> {
-        let guard = self.state.lock().unwrap();
+        let guard = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let summary = guard.as_ref()?;
 
         let mut items = Vec::new();
@@ -460,7 +460,7 @@ mod tests {
 
     fn widget_with(summary: ActionsSummary) -> GitActionsWidget {
         let widget = GitActionsWidget::new(Align::Left, None);
-        *widget.state.lock().unwrap() = Some(summary);
+        *widget.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(summary);
         widget
     }
 
