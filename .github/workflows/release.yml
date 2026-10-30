@@ -5,30 +5,56 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build (for example v0.25.5). Defaults to the dispatched tag ref, or to the Cargo.toml version.
+        required: false
+        type: string
 
 permissions:
   contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   prepare:
     name: Resolve Version
     runs-on: ubuntu-latest
     outputs:
+      tag: ${{ steps.get_version.outputs.tag }}
       version: ${{ steps.get_version.outputs.version }}
+      checkout_ref: ${{ steps.get_version.outputs.checkout_ref }}
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v7
 
       - name: Resolve Version
         id: get_version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/v}"
+          if [[ -n "$INPUT_TAG" ]]; then
+            TAG="$INPUT_TAG"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
           else
-            VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+            TAG="v$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
           fi
-          echo "Resolved version: $VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "::error::Release tag must look like vX.Y.Z, got '${TAG}'. Dispatch this workflow on a tag ref or pass the tag input."
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            CHECKOUT_REF="$TAG"
+          else
+            CHECKOUT_REF="${GITHUB_REF}"
+          fi
+          echo "Resolved tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=$CHECKOUT_REF" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build - ${{ matrix.target }}
@@ -61,6 +87,8 @@ jobs:
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
 
       - name: Install System Dependencies (Linux)
         if: runner.os == 'Linux'
@@ -360,13 +388,15 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
 
       - name: Download All Build Artifacts
         uses: actions/download-artifact@v8
@@ -392,6 +422,7 @@ jobs:
       - name: Create GitHub Release and Upload Assets
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
           files: release-assets/*
           body_path: release_notes.md
           fail_on_unmatched_files: true
@@ -403,7 +434,7 @@ jobs:
   update-cask:
     name: Update Homebrew Cask
     needs: [prepare, release]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: needs.release.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
