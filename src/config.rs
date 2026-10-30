@@ -315,6 +315,10 @@ pub struct Config {
     pub update_channel: String,
     #[serde(default)]
     pub keybinding_preset: Option<crate::keybindings::KeybindingPreset>,
+    /// Recently executed command-palette command ids (most recent first),
+    /// persisted so the palette ordering survives restarts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub palette_recent: Vec<String>,
     /// Treat the Option key as Alt (send `ESC` + key) instead of letting
     /// macOS compose the layout character. Mirrors zed's `option_as_meta`
     /// and ghostty's `macos-option-as-alt`; default is false so Option
@@ -509,6 +513,7 @@ impl Default for Config {
             key_modes: std::collections::HashMap::new(),
             workflows: std::collections::HashMap::new(),
             keybinding_preset: None,
+            palette_recent: Vec::new(),
             session_restore: default_session_restore(),
             copy_on_select: false,
             contrast_correction: default_contrast_correction(),
@@ -853,6 +858,13 @@ fn apply_to_doc(doc: &mut DocumentMut, c: &Config) {
     };
     doc["tab_layout"] = value(tab_layout_str);
     doc["update_channel"] = value(c.update_channel.as_str());
+    if !c.palette_recent.is_empty() {
+        let mut arr = toml_edit::Array::new();
+        for id in &c.palette_recent {
+            arr.push(id.as_str());
+        }
+        doc["palette_recent"] = value(arr);
+    }
     if let Some(ref preset) = c.keybinding_preset {
         doc["keybinding_preset"] = value(preset.to_string());
     } else {
@@ -1136,6 +1148,16 @@ fn parse_lenient_from_doc(doc: &DocumentMut) -> Option<Config> {
     if let Some(val) = doc.get("keybinding_preset").and_then(|v| v.as_str()) {
         if let Ok(preset) = val.parse::<crate::keybindings::KeybindingPreset>() {
             cfg.keybinding_preset = Some(preset);
+            any_recognized = true;
+        }
+    }
+    if let Some(recent) = doc.get("palette_recent").and_then(|v| v.as_array()) {
+        let ids: Vec<String> = recent
+            .iter()
+            .filter_map(|item| item.as_str().map(|s| s.to_string()))
+            .collect();
+        if !ids.is_empty() {
+            cfg.palette_recent = ids;
             any_recognized = true;
         }
     }
@@ -1827,6 +1849,7 @@ command = "old"
             tab_layout: TabLayout::Horizontal,
             update_channel: "stable".to_string(),
             keybinding_preset: Some(crate::keybindings::KeybindingPreset::Ghostty),
+            palette_recent: vec!["toggle_sidebar".to_string(), "new_tab".to_string()],
             option_as_meta: true,
             ai: crate::ai::AiConfig::default(),
         };
@@ -1859,6 +1882,8 @@ command = "old"
         assert_eq!(deserialized.tab_layout, TabLayout::Horizontal);
         assert_eq!(deserialized.keybinding_preset, Some(crate::keybindings::KeybindingPreset::Ghostty));
         assert_eq!(deserialized.option_as_meta, true);
+        assert_eq!(deserialized.palette_recent, vec!["toggle_sidebar".to_string(), "new_tab".to_string()]);
+        assert_eq!(lenient_deserialized.palette_recent, deserialized.palette_recent);
         assert_eq!(deserialized.keybindings.get("ctrl-shift-t").map(|s| s.as_str()), Some("new_tab"));
         assert_eq!(deserialized.keybindings.get("ctrl-shift-w").map(|s| s.as_str()), Some("close_tab"));
     }
