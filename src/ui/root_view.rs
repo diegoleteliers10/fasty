@@ -2447,13 +2447,16 @@ impl RootView {
         cmds
     }
 
-    /// Records a palette execution for recent-first ordering (max 5).
+    /// Records a palette execution for recent-first ordering (max 5) and
+    /// persists the list so ordering survives restarts.
     pub fn record_palette_recent(&mut self, cmd_id: &str) {
         if let Some(pos) = self.palette_recent.iter().position(|r| r == cmd_id) {
             self.palette_recent.remove(pos);
         }
         self.palette_recent.insert(0, cmd_id.to_string());
         self.palette_recent.truncate(5);
+        let recent = self.palette_recent.clone();
+        let _ = crate::config::Config::update_default(|c| c.palette_recent = recent);
     }
 }
 
@@ -3670,7 +3673,7 @@ impl RootView {
         crate::whats_new::mark_version_seen();
 
         let mut view = Self {
-            config: loaded_config,
+            config: loaded_config.clone(),
             window_id: _window.window_handle().window_id(),
             terminal_render_retry_pending: Arc::new(parking_lot::Mutex::new(
                 std::collections::HashSet::new(),
@@ -3773,7 +3776,7 @@ impl RootView {
             config_error: crate::config::load_error(),
             show_onboarding_hint: !crate::config::Config::get_active_config_path().exists()
                 && !crate::session::session_path().exists(),
-            palette_recent: Vec::new(),
+            palette_recent: loaded_config.palette_recent.clone(),
             cursor_blink_visible: true,
             last_cursor_activity: std::time::Instant::now(),
             last_scroll_activity: std::time::Instant::now() - std::time::Duration::from_secs(10),
@@ -9669,6 +9672,7 @@ impl RootView {
                 }
             };
         self.font_family = new_family;
+        self.palette_recent = loaded_config.palette_recent.clone();
         self.status_bar_model = StatusBarModel::new(&loaded_config, self.theme);
         if self.tab_layout != loaded_config.tab_layout {
             self.tab_layout = loaded_config.tab_layout;

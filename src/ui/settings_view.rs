@@ -1988,34 +1988,28 @@ impl SettingsView {
     }
 
     pub fn import_external(&mut self, app: crate::importer::ExternalApp, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        let snapshot = self.config.clone();
         match crate::importer::import_external_config(app, &path, &mut self.config) {
             Ok(msg) => {
-                self.import_status_message = Some(msg);
-                self.scrollback = self.config.scrollback;
-                self.font_size = self.config.font.size;
-                self.font_family = self.config.font.family.clone();
-                self.opacity = self.config.opacity;
-                if let Some(ref t) = self.config.theme {
-                    self.current_theme_name = t.clone();
-                    self.theme = Theme::from_name(t).with_opacity(self.config.opacity);
+                let imported = std::mem::replace(&mut self.config, snapshot);
+                if self.save_config(move |latest| *latest = imported) {
+                    self.import_status_message = Some(msg);
+                    crate::keybindings::init_resolver(
+                        self.config.keybindings.clone(),
+                        self.config.keybinding_preset,
+                    );
+                    crate::keybindings::init_key_modes(self.config.key_modes.clone());
+                    // "Software should be fun": the migration moment gets its
+                    // celebration, a nod to the config-import confetti that
+                    // made the rounds in September.
+                    self.start_celebration();
+                } else {
+                    self.import_status_message = self.config_error.clone();
                 }
-                if let Some(p) = self.config.keybinding_preset {
-                    self.keybinding_preset = p;
-                }
-                self.config_error = None;
-                self.refresh_baseline();
-                crate::keybindings::init_resolver(
-                    self.config.keybindings.clone(),
-                    self.config.keybinding_preset,
-                );
-                crate::keybindings::init_key_modes(self.config.key_modes.clone());
-                // "Software should be fun": the migration moment gets its
-                // celebration, a nod to the config-import confetti that
-                // made the rounds in September.
-                self.start_celebration();
                 cx.notify();
             }
             Err(e) => {
+                self.config = snapshot;
                 self.config_error = Some(format!("Cannot import settings: {e}"));
                 self.import_status_message = self.config_error.clone();
                 cx.notify();
