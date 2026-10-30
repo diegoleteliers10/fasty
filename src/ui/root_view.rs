@@ -12419,7 +12419,11 @@ impl RootView {
 
         let target_pane_id = clicked_pane_id.unwrap_or(active_tab.pane_tree.active_pane_id);
         let mouse_reporting = terminal.is_mouse_mode_enabled();
-        if event.button == MouseButton::Right && (!mouse_reporting || !event.modifiers.alt) {
+        // Apps with mouse reporting own right-click like any other button;
+        // Alt+right-click stays as the escape hatch for fastty's own menu.
+        if event.button == MouseButton::Right
+            && (!mouse_reporting || event.modifiers.alt)
+        {
             self.selection = self.selection.filter(|selection| selection.pane_id == target_pane_id);
             if self.selection.is_none() {
                 let history_size = terminal.history_size();
