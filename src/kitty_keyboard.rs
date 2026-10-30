@@ -178,7 +178,13 @@ pub fn encode(event: &KeyEvent, flags: u8) -> Option<Vec<u8>> {
     };
 
     if !as_csi {
-        // Legacy bytes. Repeat is indistinguishable from press.
+        // Legacy bytes cannot express release or repeat as distinct events;
+        // emitting one would arrive as a phantom press of the same key.
+        // Drop the event instead (kitty spec: hosts encode releases as CSI u
+        // or not at all). Repeat is indistinguishable from press.
+        if release {
+            return None;
+        }
         return legacy_bytes(event, form);
     }
 
@@ -498,6 +504,22 @@ mod tests {
 
         // Releases without the flag are swallowed.
         assert_eq!(encode(&release, FLAG_DISAMBIGUATE), None);
+    }
+
+    #[test]
+    fn release_never_falls_back_to_legacy_bytes() {
+        // herdr-style flag set (disambiguate | events | alternate, no
+        // report_all): a plain key stays legacy on press, but a release
+        // emitted as legacy bytes arrives as a phantom press ("a" -> "aa").
+        let flags = FLAG_DISAMBIGUATE | FLAG_REPORT_EVENTS | FLAG_REPORT_ALTERNATE;
+        let mut release = press("a");
+        release.event_type = EVENT_RELEASE;
+        assert_eq!(encode(&release, flags), None);
+        // Press still takes the legacy path.
+        assert_eq!(
+            encode(&text_event("a", "a", "A", false), flags).as_deref(),
+            Some(b"a".as_slice())
+        );
     }
 
     #[test]

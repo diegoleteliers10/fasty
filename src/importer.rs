@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use crate::config::Config;
+
 use crate::keybindings::KeybindingPreset;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +137,9 @@ pub fn import_external_config(app: ExternalApp, path: &Path, cfg: &mut Config) -
     let content = std::fs::read_to_string(path)?;
     let mut imported_items = Vec::new();
 
-    let committed = Config::update_default(|cfg| match app {
+    // Parse and merge into `cfg` only. The caller owns persistence; writing
+    // the user config from here made test runs touch the real config file.
+    match app {
         ExternalApp::Ghostty => {
             cfg.keybinding_preset = Some(KeybindingPreset::Ghostty);
             imported_items.push("Preset: Ghostty keybindings".to_string());
@@ -298,8 +301,7 @@ pub fn import_external_config(app: ExternalApp, path: &Path, cfg: &mut Config) -
                 }
             }
         }
-    })?;
-    *cfg = committed;
+    }
 
     if imported_items.is_empty() {
         Ok(format!("Imported default preset for {app}"))
