@@ -35,13 +35,13 @@ static BG_CACHE: Mutex<Option<HashMap<u32, u32>>> = Mutex::new(None);
 const CACHE_CLEAR_AT: usize = 8192;
 
 fn cache_get(cache: &Mutex<Option<HashMap<u32, u32>>>, key: u32) -> Option<Rgb> {
-    let guard = cache.lock().unwrap();
+    let guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let packed = guard.as_ref()?.get(&key)?;
     Some(unpack_rgb(*packed))
 }
 
 fn cache_put(cache: &Mutex<Option<HashMap<u32, u32>>>, key: u32, value: Rgb) {
-    let mut guard = cache.lock().unwrap();
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
     if map.len() >= CACHE_CLEAR_AT {
         map.clear();
