@@ -28,7 +28,7 @@ jobs:
       checkout_ref: ${{ steps.get_version.outputs.checkout_ref }}
     steps:
       - name: Checkout Source Code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Resolve Version
         id: get_version
@@ -86,7 +86,7 @@ jobs:
 
     steps:
       - name: Checkout Source Code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
 
@@ -97,12 +97,12 @@ jobs:
           sudo apt-get install -y pkg-config libssl-dev libvulkan-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev libfreetype6-dev libxfixes-dev
 
       - name: Set up Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable branch
         with:
           targets: ${{ matrix.target }}
 
       - name: Install wasm-pack
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
           tool: wasm-pack
 
@@ -144,7 +144,8 @@ jobs:
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
-          sudo apt-get install -y libfuse2 imagemagick || sudo apt-get install -y libfuse2t64 imagemagick || true
+          sudo apt-get install -y libfuse2 imagemagick || sudo apt-get install -y libfuse2t64 imagemagick
+          command -v convert >/dev/null || { echo "::error::ImageMagick 'convert' is required to build the AppImage icon."; exit 1; }
 
           curl -fsSL -o linuxdeploy "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage"
           curl -fsSL -o linuxdeploy-plugin-appimage "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage"
@@ -348,7 +349,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "light.exe failed with exit code $LASTEXITCODE" }
 
       - name: Upload Build Artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ matrix.target }}
           path: ${{ matrix.artifact_name }}
@@ -356,7 +357,7 @@ jobs:
 
       - name: Upload DMG Artifact
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ matrix.target }}-dmg
           path: ${{ matrix.dmg_name }}
@@ -364,7 +365,7 @@ jobs:
 
       - name: Upload MSI Artifact
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ matrix.target }}-msi
           path: ${{ matrix.msi_name }}
@@ -372,7 +373,7 @@ jobs:
 
       - name: Upload DEB Artifact
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ matrix.target }}-deb
           path: ${{ matrix.deb_name }}
@@ -380,7 +381,7 @@ jobs:
 
       - name: Upload AppImage Artifact
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ matrix.target }}-appimage
           path: ${{ matrix.appimage_name }}
@@ -394,12 +395,12 @@ jobs:
       contents: write
     steps:
       - name: Checkout Source Code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
 
       - name: Download All Build Artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: artifacts
 
@@ -420,7 +421,7 @@ jobs:
           cat release_notes.md
 
       - name: Create GitHub Release and Upload Assets
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           files: release-assets/*
@@ -443,12 +444,12 @@ jobs:
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
       - name: Checkout main
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: main
 
       - name: Download macOS DMG Artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: '*-apple-darwin-dmg'
           path: dmgs
