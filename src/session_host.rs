@@ -354,11 +354,14 @@ pub fn ensure_running() -> Result<(), String> {
         "spawning new host child from {}",
         executable.display()
     ));
-    Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg(HOST_ARGUMENT)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    configure_host_process_group(&mut command);
+    command
         .spawn()
         .map_err(|error| format!("could not start Fastty session host: {error}"))?;
 
@@ -424,6 +427,32 @@ pub fn run_host() {
     trace("host accept loop exited");
 }
 
+/// Put the host in its own process group so terminal noise aimed at the
+/// launching app (SIGINT from Ctrl+C, SIGHUP from closing the terminal that
+/// started fasty) never reaches it. Surviving sessions is the whole point of
+/// the host; dying with the app's process group defeats it. `process_group(0)`
+/// gives the child pgid == its own pid without a full setsid, which is enough
+/// because the host has no controlling terminal of its own.
+#[cfg(unix)]
+fn configure_host_process_group(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_host_process_group(_command: &mut std::process::Command) {}
+
+/// Whether the host must SURVIVE the given catchable signal. Surviving
+/// sessions depend on it: SIGHUP (closing the terminal that launched fasty)
+/// and SIGINT (a stray Ctrl+C aimed at the app) are terminal noise, never a
+/// request to kill live sessions. SIGTERM and SIGQUIT keep the trace-and-die
+/// behavior: they are explicit kills (`kill <host.pid>`, `killall`) and a
+/// restart expects them to work.
+#[cfg(unix)]
+fn host_signal_survives(signal: libc::c_int) -> bool {
+    matches!(signal, libc::SIGHUP | libc::SIGINT)
+}
+
 /// Record every catchable death signal to `host-trace.log` before dying.
 ///
 /// A clean `run_host` return logs `host accept loop exited`, a Rust panic
@@ -431,7 +460,8 @@ pub fn run_host() {
 /// `kill` or `killall fastty` produces nothing anywhere, which is exactly
 /// the unexplained-host-death case. The handler only calls `write(2)` on a
 /// descriptor opened up front, so it stays async-signal-safe; afterwards it
-/// restores the default action and re-raises.
+/// restores the default action and re-raises. Signals in the survive set
+/// (`host_signal_survives`) are logged and ignored instead.
 #[cfg(unix)]
 fn install_host_signal_trace() {
     use std::sync::atomic::{AtomicI32, Ordering};
@@ -447,6 +477,20 @@ fn install_host_signal_trace() {
     }
 
     extern "C" fn handler(signal: libc::c_int) {
+        if host_signal_survives(signal) {
+            let fd = TRACE_FD.load(Ordering::Relaxed);
+            if fd >= 0 {
+                let message: &[u8] = match signal {
+                    libc::SIGINT => b"host survived SIGINT (sessions kept)\n",
+                    libc::SIGHUP => b"host survived SIGHUP (sessions kept)\n",
+                    _ => b"host survived signal\n",
+                };
+                unsafe {
+                    let _ = libc::write(fd, message.as_ptr().cast(), message.len());
+                }
+            }
+            return;
+        }
         let fd = TRACE_FD.load(Ordering::Relaxed);
         if fd >= 0 {
             // Text is fixed per signal so the handler never formats.
@@ -2340,12 +2384,53 @@ mod tests {
         assert!(!is_host_argument(None));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn host_survives_terminal_noise_and_keeps_explicit_kills_fatal() {
+        for noise in [libc::SIGHUP, libc::SIGINT] {
+            assert!(
+                super::host_signal_survives(noise),
+                "signal {noise} must not kill the host"
+            );
+        }
+        for explicit in [libc::SIGTERM, libc::SIGQUIT] {
+            assert!(
+                !super::host_signal_survives(explicit),
+                "signal {explicit} must stay fatal so restart_host works"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_child_gets_its_own_process_group() {
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("5");
+        super::configure_host_process_group(&mut command);
+        let mut child = command.spawn().expect("spawn disposable child");
+        let child_pid = child.id() as libc::pid_t;
+        let parent_pgid = unsafe { libc::getpgid(std::process::id() as libc::pid_t) };
+        let child_pgid = unsafe { libc::getpgid(child_pid) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            child_pgid, child_pid,
+            "the host must lead its own process group"
+        );
+        assert_ne!(
+            child_pgid, parent_pgid,
+            "the host must not share the launching app's process group"
+        );
+    }
+
     #[test]
     fn host_survives_gui_projection_drop_and_reattach() {
         match std::env::var("FASTTY_TEST_SESSION_HOST_ROLE").as_deref() {
             Ok("server") => {
                 crate::paths::init().expect("initialize isolated server paths");
-                crate::daemon::run_host();
+                // Use the production entrypoint so the signal policy under
+                // test is the one the real host installs.
+                super::run_host();
             }
             Ok("driver") => run_isolated_gui_driver(),
             Ok("parent") => run_isolated_lifecycle_parent(),
@@ -2575,6 +2660,20 @@ mod tests {
             duplicate_status.success(),
             "duplicate host contender failed"
         );
+
+        for signal in ["-HUP", "-INT"] {
+            let status = Command::new("/bin/kill")
+                .arg(signal)
+                .arg(host_pid.to_string())
+                .status()
+                .expect("signal the isolated host");
+            assert!(status.success(), "could not send {signal} to the host");
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                host_pid_exists(&host_pid.to_string()),
+                "the host must survive {signal} and keep its sessions"
+            );
+        }
 
         std::thread::sleep(Duration::from_millis(1_500));
         let sessions = list_sessions().expect("list host sessions after GUI driver exit");
