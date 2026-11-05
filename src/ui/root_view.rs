@@ -109,10 +109,123 @@ impl RightPanel {
 #[cfg(test)]
 mod project_panel_state_tests {
     use super::{
-        project_graph_scroll_target_changed, project_panel_width_after_drag,
-        ProjectGraphScrollTarget, ProjectPanelFeedback, RightPanel,
+        group_palette_commands, palette_shortcut_keys, project_graph_scroll_target_changed,
+        project_panel_width_after_drag, PaletteCommand, ProjectGraphScrollTarget,
+        ProjectPanelFeedback, RightPanel,
     };
+    use ::icons::common::IconType;
     use std::path::PathBuf;
+
+    fn palette_command(id: &str, category: &str) -> PaletteCommand {
+        PaletteCommand {
+            id: id.to_string(),
+            icon: IconType::Plus,
+            title: id.to_string(),
+            category: category.to_string(),
+            shortcut: None,
+        }
+    }
+
+    #[test]
+    fn release_date_parses_iso_dates() {
+        assert_eq!(
+            super::format_release_date("2026-11-03T12:00:00Z").as_deref(),
+            Some("Nov 3, 2026")
+        );
+        assert_eq!(
+            super::format_release_date("2026-11-03").as_deref(),
+            Some("Nov 3, 2026")
+        );
+        assert_eq!(super::format_release_date(""), None);
+        assert_eq!(super::format_release_date("garbage"), None);
+        assert_eq!(super::format_release_date("2026-13-01"), None);
+        assert_eq!(super::format_release_date("2026-11-00"), None);
+        assert_eq!(super::format_release_date("2026-11-99"), None);
+    }
+
+    #[test]
+    fn changelog_lines_lose_inline_markdown() {
+        assert_eq!(super::strip_inline_markdown("**Bold** fix"), "Bold fix");
+        assert_eq!(
+            super::strip_inline_markdown("[link](https://x) text"),
+            "link text"
+        );
+        assert_eq!(super::strip_inline_markdown("`code` here"), "code here");
+    }
+
+    #[test]
+    fn palette_groups_recents_first_then_categories() {
+        let commands = vec![
+            palette_command("a", "Navigation"),
+            palette_command("b", "Terminal"),
+            palette_command("c", "Navigation"),
+        ];
+        let recent = vec!["c".to_string()];
+        let groups = group_palette_commands(commands, &recent, true);
+        assert_eq!(groups[0].0, "Recent");
+        assert_eq!(groups[0].1[0].id, "c");
+        assert_eq!(groups[1].0, "Navigation");
+        assert_eq!(groups[1].1.len(), 1);
+        assert_eq!(groups[1].1[0].id, "a");
+        assert_eq!(groups[2].0, "Terminal");
+    }
+
+    #[test]
+    fn palette_groups_skip_recent_when_searching() {
+        let commands = vec![
+            palette_command("a", "Navigation"),
+            palette_command("b", "Terminal"),
+        ];
+        let recent = vec!["a".to_string()];
+        let groups = group_palette_commands(commands, &recent, false);
+        assert_eq!(groups[0].0, "Navigation");
+        assert_eq!(groups[0].1[0].id, "a");
+    }
+
+    #[test]
+    fn search_highlights_cover_literal_matches() {
+        let accent = gpui::hsla(0.7, 0.5, 0.6, 1.0);
+        let foreground = gpui::hsla(0.0, 0.0, 0.0, 1.0);
+        let ranges =
+            super::search_match_highlights("foo Foo food", "foo", false, accent, foreground);
+        assert_eq!(ranges.len(), 3);
+        let exact = super::search_match_highlights("foo Foo", "Foo", true, accent, foreground);
+        assert_eq!(exact.len(), 1);
+        assert!(
+            super::search_match_highlights("abc", "", false, accent, foreground).is_empty()
+        );
+    }
+
+    #[test]
+    fn visual_index_counts_headers_for_any_group_list() {
+        assert_eq!(super::visual_index_with_headers(&[2, 1], 0), 1);
+        assert_eq!(super::visual_index_with_headers(&[2, 1], 1), 2);
+        assert_eq!(super::visual_index_with_headers(&[2, 1], 2), 4);
+    }
+
+    #[test]
+    fn palette_visual_index_counts_headers() {
+        let groups = vec![
+            (
+                "Recent".to_string(),
+                vec![palette_command("a", "Navigation"), palette_command("b", "Terminal")],
+            ),
+            ("Navigation".to_string(), vec![palette_command("c", "Navigation")]),
+        ];
+        assert_eq!(super::palette_visual_index(&groups, 0), 1);
+        assert_eq!(super::palette_visual_index(&groups, 1), 2);
+        assert_eq!(super::palette_visual_index(&groups, 2), 4);
+    }
+
+    #[test]
+    fn palette_shortcut_splits_symbols_and_words() {
+        assert_eq!(palette_shortcut_keys("⌘⇧O"), vec!["⌘", "⇧", "O"]);
+        assert_eq!(
+            palette_shortcut_keys("Ctrl+Shift+F"),
+            vec!["Ctrl", "Shift", "F"]
+        );
+        assert_eq!(palette_shortcut_keys("F5"), vec!["F5"]);
+    }
 
     #[test]
     fn project_and_ai_panels_replace_or_close_each_other() {
@@ -2117,6 +2230,199 @@ pub struct PaletteCommand {
     pub shortcut: Option<&'static str>,
 }
 
+/// Split a shortcut into one chip per key. Handles `⌘⇧O` and `Ctrl+Shift+F`.
+pub fn palette_shortcut_keys(shortcut: &str) -> Vec<String> {
+    if shortcut.contains('+') {
+        return shortcut
+            .split('+')
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect();
+    }
+    let mut keys = Vec::new();
+    let mut rest = shortcut;
+    while let Some(ch) = rest.chars().next() {
+        if matches!(ch, '⌘' | '⇧' | '⌥' | '⌃') {
+            keys.push(ch.to_string());
+            rest = &rest[ch.len_utf8()..];
+        } else {
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        keys.push(rest.to_string());
+    }
+    if keys.is_empty() {
+        keys.push(shortcut.to_string());
+    }
+    keys
+}
+
+/// Child index of a flat row inside the palette list, counting the section
+/// headers that the list draws before it.
+pub fn palette_visual_index(
+    groups: &[(String, Vec<PaletteCommand>)],
+    index: usize,
+) -> usize {
+    let sizes: Vec<usize> = groups.iter().map(|(_, commands)| commands.len()).collect();
+    visual_index_with_headers(&sizes, index)
+}
+
+/// Child index of a row inside a list that draws one header per group.
+pub fn visual_index_with_headers(group_sizes: &[usize], index: usize) -> usize {
+    let mut visual = index;
+    let mut seen = 0usize;
+    for &len in group_sizes {
+        visual += 1;
+        if index < seen + len {
+            break;
+        }
+        seen += len;
+    }
+    visual
+}
+
+/// Highlight ranges for every literal occurrence of `query` in `text`.
+fn search_match_highlights(
+    text: &str,
+    query: &str,
+    case_sensitive: bool,
+    accent: Hsla,
+    foreground: Hsla,
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let (haystack, needle) = if case_sensitive {
+        (text.to_string(), query.to_string())
+    } else {
+        (text.to_lowercase(), query.to_lowercase())
+    };
+    if haystack.len() != text.len() {
+        // Case folding changed the byte offsets; skip the highlight instead of
+        // slicing the original text at wrong boundaries.
+        return Vec::new();
+    }
+    let style = HighlightStyle {
+        color: Some(foreground),
+        background_color: Some(accent),
+        ..Default::default()
+    };
+    haystack
+        .match_indices(&needle)
+        .map(|(start, matched)| (start..start + matched.len(), style.clone()))
+        .collect()
+}
+
+/// Shortcut currently bound to `action`, falling back to a platform default.
+fn shortcut_label_for(action: crate::keybindings::Action, fallback: &str) -> String {
+    let combos = crate::keybindings::RESOLVER
+        .get_or_init(|| {
+            parking_lot::RwLock::new(crate::keybindings::KeyBindingResolver::with_defaults())
+        })
+        .read()
+        .combos_for(action);
+    combos
+        .first()
+        .map(|combo| crate::keybindings::format_combo(combo))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn push_palette_group(
+    groups: &mut Vec<(String, Vec<PaletteCommand>)>,
+    label: &str,
+    command: PaletteCommand,
+) {
+    if let Some(group) = groups.iter_mut().find(|(name, _)| name == label) {
+        group.1.push(command);
+    } else {
+        groups.push((label.to_string(), vec![command]));
+    }
+}
+
+/// Group commands into the sections the palette draws, recent first.
+pub fn group_palette_commands(
+    commands: Vec<PaletteCommand>,
+    recent: &[String],
+    include_recent: bool,
+) -> Vec<(String, Vec<PaletteCommand>)> {
+    let mut groups: Vec<(String, Vec<PaletteCommand>)> = Vec::new();
+    if include_recent && !recent.is_empty() {
+        for id in recent.iter().take(5) {
+            let already_listed = groups
+                .first()
+                .is_some_and(|(_, listed)| listed.iter().any(|command| &command.id == id));
+            if already_listed {
+                continue;
+            }
+            if let Some(command) = commands.iter().find(|command| &command.id == id) {
+                push_palette_group(&mut groups, "Recent", command.clone());
+            }
+        }
+    }
+    for command in commands {
+        if include_recent && recent.iter().take(5).any(|recent_id| recent_id == &command.id) {
+            continue;
+        }
+        let label = command.category.clone();
+        push_palette_group(&mut groups, &label, command);
+    }
+    groups
+}
+
+/// Format a GitHub ISO timestamp as `Nov 3, 2026`.
+fn format_release_date(iso: &str) -> Option<String> {
+    let date = iso.get(0..10)?;
+    let mut parts = date.split('-');
+    let year = parts.next()?;
+    let month: usize = parts.next()?.parse().ok()?;
+    let day: u32 = parts.next()?.parse().ok()?;
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month = MONTHS.get(month.checked_sub(1)?)?;
+    if !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(format!("{month} {day}, {year}"))
+}
+
+fn format_release_size(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+}
+
+/// Drop the common inline markdown markers from a changelog line.
+fn strip_inline_markdown(line: &str) -> String {
+    let mut text = line
+        .replace("**", "")
+        .replace("__", "")
+        .replace('`', "");
+    while let Some(start) = text.find('[') {
+        let Some(mid) = text[start..].find("](") else {
+            break;
+        };
+        let Some(end) = text[start + mid + 2..].find(')') else {
+            break;
+        };
+        let label = text[start + 1..start + mid].to_string();
+        text.replace_range(start..start + mid + 2 + end + 1, &label);
+    }
+    text.trim().to_string()
+}
+
+/// Shortcut currently bound to the command palette.
+pub fn palette_shortcut_label() -> String {
+    shortcut_label_for(
+        crate::keybindings::Action::CommandPalette,
+        if cfg!(target_os = "macos") {
+            "⌘P"
+        } else {
+            "Ctrl+Shift+P"
+        },
+    )
+}
+
 pub fn fuzzy_match_str(pattern: &str, target: &str) -> bool {
     if pattern.is_empty() {
         return true;
@@ -2583,9 +2889,8 @@ fn attention_transitions(
 }
 
 impl RootView {
-    /// Palette entries matching the current query. UX4: with an empty query
-    /// the most-recently executed commands sort first (stable otherwise),
-    /// so repeat actions are one `Enter` away.
+    /// Palette entries matching the current query. The `# Recent` group
+    /// carries recency; the rest keeps its declared order.
     pub fn filtered_palette_commands(&self) -> Vec<PaletteCommand> {
         let query = self.command_palette_query.to_lowercase();
         let mut commands = get_all_palette_commands();
@@ -2602,7 +2907,7 @@ impl RootView {
                 }
             })
         }));
-        let mut cmds: Vec<PaletteCommand> = commands
+        let cmds: Vec<PaletteCommand> = commands
             .into_iter()
             .filter(|c| {
                 query.is_empty()
@@ -2610,15 +2915,29 @@ impl RootView {
                     || fuzzy_match_str(&query, &c.category)
             })
             .collect();
-        if query.is_empty() && !self.palette_recent.is_empty() {
-            cmds.sort_by_key(|c| {
-                self.palette_recent
-                    .iter()
-                    .position(|r| r == &c.id)
-                    .unwrap_or(usize::MAX)
-            });
-        }
         cmds
+    }
+
+    /// Commands grouped into the palette sections, in draw order.
+    pub fn grouped_palette_commands(&self) -> Vec<(String, Vec<PaletteCommand>)> {
+        group_palette_commands(
+            self.filtered_palette_commands(),
+            &self.palette_recent,
+            self.command_palette_query.is_empty(),
+        )
+    }
+
+    /// Commands flattened in draw order, so selection indices match rows.
+    pub fn ordered_palette_commands(&self) -> Vec<PaletteCommand> {
+        self.grouped_palette_commands()
+            .into_iter()
+            .flat_map(|(_, commands)| commands)
+            .collect()
+    }
+
+    /// Child index of a row inside the palette list, counting section headers.
+    pub fn palette_visual_index(&self, index: usize) -> usize {
+        palette_visual_index(&self.grouped_palette_commands(), index)
     }
 
     /// Records a palette execution for recent-first ordering (max 5) and
@@ -3201,9 +3520,15 @@ pub struct RootView {
         Arc<std::sync::Mutex<Option<crate::widgets::builtin::git_prs::PrsSummary>>>,
     pub is_search_open: bool,
     pub search_query: String,
+    pub search_case_sensitive: bool,
+    pub search_regex: bool,
+    pub search_invalid_pattern: bool,
     pub search_match_idx: usize,
     pub search_matches: Vec<usize>,
     pub is_worktree_picker_open: bool,
+    /// Change count per worktree, captured in the background when the picker opens.
+    pub worktree_picker_changes: Vec<(std::path::PathBuf, Option<usize>)>,
+    pub worktree_picker_changes_generation: u64,
     pub worktree_picker_query: String,
     pub worktree_picker_selected: usize,
     pub is_project_jumper_open: bool,
@@ -3228,8 +3553,18 @@ pub struct RootView {
     pub global_search_query: String,
     pub global_search_results: Vec<GlobalSearchResult>,
     pub global_search_selected: usize,
+    pub global_search_case_sensitive: bool,
+    pub global_search_regex: bool,
+    pub global_search_invalid_pattern: bool,
+    /// Content line count per pane, captured when the modal opens.
+    pub global_search_pane_lines: Vec<(usize, usize, usize)>,
     pub global_search_scroll_handle: ScrollHandle,
     pub is_git_menu_open: bool,
+    /// Local branch count, read once when the git menu opens so the row does
+    /// not run git on every frame.
+    pub git_branch_count: Option<usize>,
+    /// Local branches for the submenu, refreshed with the count.
+    pub git_branches: Vec<String>,
     pub is_git_branch_sub_open: bool,
     pub git_menu_pos: Option<(f32, f32)>,
     pub command_palette_scroll_handle: ScrollHandle,
@@ -3281,8 +3616,13 @@ pub struct RootView {
     pub update_available: Option<crate::updater::ReleaseInfo>,
     pub is_updating: bool,
     pub is_update_ready: bool,
+    /// True once an update check returned a result, so the logo menu can tell
+    /// "up to date" from "not checked yet".
+    pub update_checked: bool,
+    pub update_check_failed: bool,
     pub update_status: Option<String>,
     pub is_update_modal_open: bool,
+    pub update_details_open: bool,
     pub is_whats_new_open: bool,
     pub whats_new_notes: Option<String>,
     pub pending_close: Option<PendingClose>,
@@ -4037,9 +4377,14 @@ impl RootView {
             pr_snapshot: Arc::new(std::sync::Mutex::new(None)),
             is_search_open: false,
             search_query: String::new(),
+            search_case_sensitive: false,
+            search_regex: false,
+            search_invalid_pattern: false,
             search_match_idx: 0,
             search_matches: Vec::new(),
             is_worktree_picker_open: false,
+            worktree_picker_changes: Vec::new(),
+            worktree_picker_changes_generation: 0,
             worktree_picker_query: String::new(),
             worktree_picker_selected: 0,
             is_project_jumper_open: false,
@@ -4059,8 +4404,14 @@ impl RootView {
             global_search_query: String::new(),
             global_search_results: Vec::new(),
             global_search_selected: 0,
+            global_search_case_sensitive: false,
+            global_search_regex: false,
+            global_search_invalid_pattern: false,
+            global_search_pane_lines: Vec::new(),
             global_search_scroll_handle: ScrollHandle::new(),
             is_git_menu_open: false,
+            git_branch_count: None,
+            git_branches: Vec::new(),
             is_git_branch_sub_open: false,
             git_menu_pos: None,
             command_palette_scroll_handle: ScrollHandle::new(),
@@ -4103,9 +4454,12 @@ impl RootView {
             scrollbar_drag_start_offset: 0,
             update_available: None,
             is_updating: false,
+            update_checked: false,
+            update_check_failed: false,
             update_status: None,
             is_update_ready: false,
             is_update_modal_open: false,
+            update_details_open: false,
             is_whats_new_open: show_whats_new,
             whats_new_notes: crate::whats_new::notes_for(env!("CARGO_PKG_VERSION")),
             pending_close: None,
@@ -4295,6 +4649,8 @@ impl RootView {
             Ready(crate::updater::ReleaseInfo),
             Blocked(crate::updater::ReleaseInfo, String),
             Available(crate::updater::ReleaseInfo),
+            UpToDate,
+            CheckFailed,
         }
         let (update_tx, update_rx) = async_channel::unbounded::<UpdateStatus>();
         let update_channel = crate::updater::UpdateChannel::parse(&view.config.update_channel);
@@ -4319,7 +4675,12 @@ impl RootView {
                         let _ = update_tx.send_blocking(UpdateStatus::Blocked(release, reason));
                     }
                 }
-                Ok(None) | Err(_) => {}
+                Ok(None) => {
+                    let _ = update_tx.send_blocking(UpdateStatus::UpToDate);
+                }
+                Err(_) => {
+                    let _ = update_tx.send_blocking(UpdateStatus::CheckFailed);
+                }
             }
         });
 
@@ -4347,6 +4708,14 @@ impl RootView {
                             this.update_available = Some(release);
                             this.update_status = None;
                             this.is_update_modal_open = true;
+                        }
+                        UpdateStatus::UpToDate => {
+                            this.update_checked = true;
+                            this.update_check_failed = false;
+                        }
+                        UpdateStatus::CheckFailed => {
+                            this.update_checked = true;
+                            this.update_check_failed = true;
                         }
                     }
                     cx.notify();
@@ -6076,6 +6445,26 @@ impl RootView {
         self.create_tab_with_cmd_and_cwd(cmd, args, None, title_override, window, cx);
     }
 
+    /// Open a tab for an SSH host and pin its title, so the picker can mark it
+    /// as active even after the remote sets an OSC title.
+    fn open_ssh_host_tab(
+        &mut self,
+        host: &crate::ssh::SshHost,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = format!("ssh: {}", host.name);
+        let (shell, args) = host.resilient_shell_command();
+        let tabs_before = self.tabs.len();
+        self.create_tab_with_cmd(&shell, &args, Some(title.clone()), window, cx);
+        if self.tabs.len() > tabs_before {
+            if let Some(tab) = self.tabs.last_mut() {
+                tab.custom_title = Some(title);
+            }
+            self.persist_session();
+        }
+    }
+
     pub fn create_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let shell = self
             .config
@@ -6794,6 +7183,7 @@ impl RootView {
     }
 
     pub fn trigger_apply_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_details_open = false;
         if self.is_updating {
             self.is_update_modal_open = true;
             cx.notify();
@@ -6862,6 +7252,7 @@ impl RootView {
     /// with "up to date" on no release, or with the error text on failure, so
     /// the user never faces a dead button.
     pub fn check_for_updates_manual(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_details_open = false;
         if self.is_updating
             || self.is_update_ready
             || self.update_status.as_deref() == Some("Checking for updates...")
@@ -6889,12 +7280,16 @@ impl RootView {
                 let _ = this.update_in(cx, |this, _window, cx| {
                     match res {
                         Ok(Some(release)) => {
+                            this.update_checked = true;
+                            this.update_check_failed = false;
                             this.is_update_ready = false;
                             this.update_available = Some(release);
                             this.update_status = None;
                             this.is_update_modal_open = true;
                         }
                         Ok(None) => {
+                            this.update_checked = true;
+                            this.update_check_failed = false;
                             this.update_available = None;
                             this.is_update_ready = false;
                             this.update_status = Some(format!(
@@ -6904,6 +7299,8 @@ impl RootView {
                             this.is_update_modal_open = true;
                         }
                         Err(e) => {
+                            this.update_checked = true;
+                            this.update_check_failed = true;
                             this.update_available = None;
                             this.is_update_ready = false;
                             this.update_status = Some(format!("Update check failed:\n{e}"));
@@ -6926,6 +7323,7 @@ impl RootView {
         }
         self.update_available = None;
         self.is_update_ready = false;
+        self.update_checked = true;
         self.update_status = None;
         self.is_update_modal_open = false;
         cx.notify();
@@ -7304,9 +7702,11 @@ impl RootView {
     pub fn toggle_search(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.is_search_open = !self.is_search_open;
         if self.is_search_open {
+            self.ai_input_focused = false;
             self.search_query.clear();
             self.search_match_idx = 0;
             self.search_matches.clear();
+            self.search_invalid_pattern = false;
             self.is_settings_open = false;
             self.is_context_menu_open = false;
             self.is_about_open = false;
@@ -7320,11 +7720,106 @@ impl RootView {
         cx.notify();
     }
 
+    /// Scroll so the hit is not hidden under the floating search bar. Hits on
+    /// the live screen (offset 0) are already visible, so they do not move.
+    fn scroll_buffer_search_to(&mut self, offset: usize, window: &Window) {
+        let (_, line_h) = self.measure_cell_metrics(window);
+        let line_h = if line_h > 0.0 { line_h } else { 18.0 };
+        let hidden_rows =
+            (((BUFFER_BAR_INSET + BUFFER_BAR_HEIGHT) / line_h).ceil()) as usize;
+        let target = if offset == 0 {
+            0
+        } else {
+            offset.saturating_add(hidden_rows)
+        };
+        let terminal = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|tab| tab.terminal.clone());
+        if let Some(terminal) = terminal {
+            terminal.scroll_to_offset(target);
+            self.last_scroll_activity = std::time::Instant::now();
+        }
+    }
+
+    /// Re-run the buffer search with the current options and scroll to the
+    /// first hit.
+    fn refresh_buffer_search(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.search_invalid_pattern = false;
+        self.search_matches.clear();
+        self.search_match_idx = 0;
+        let query = self.search_query.trim().to_string();
+        if query.is_empty() {
+            cx.notify();
+            return;
+        }
+        if self.search_regex
+            && regex::RegexBuilder::new(&query)
+                .case_insensitive(!self.search_case_sensitive)
+                .build()
+                .is_err()
+        {
+            self.search_invalid_pattern = true;
+            cx.notify();
+            return;
+        }
+        let terminal = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|tab| tab.terminal.clone());
+        let Some(terminal) = terminal else {
+            cx.notify();
+            return;
+        };
+        self.search_matches = terminal.search_matches_with(
+            &query,
+            self.search_case_sensitive,
+            self.search_regex,
+        );
+        if let Some(&offset) = self.search_matches.first() {
+            self.scroll_buffer_search_to(offset, window);
+        }
+        cx.notify();
+    }
+
     pub fn toggle_worktree_picker(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.is_worktree_picker_open = !self.is_worktree_picker_open;
         if self.is_worktree_picker_open {
             self.worktree_picker_query.clear();
             self.worktree_picker_selected = 0;
+            self.worktree_picker_changes.clear();
+            self.worktree_picker_changes_generation =
+                self.worktree_picker_changes_generation.wrapping_add(1);
+            let generation = self.worktree_picker_changes_generation;
+            if let Some(cwd) = self.tabs.get(self.active_tab_idx).and_then(|tab| tab.cwd.clone())
+            {
+                let paths: Vec<std::path::PathBuf> = crate::git::list_worktrees(&cwd)
+                    .into_iter()
+                    .map(|worktree| worktree.path)
+                    .collect();
+                let (tx, rx) = async_channel::bounded(1);
+                std::thread::spawn(move || {
+                    let counts = paths
+                        .into_iter()
+                        .map(|path| {
+                            let count = crate::git::worktree_change_count(&path);
+                            (path, count)
+                        })
+                        .collect::<Vec<_>>();
+                    let _ = tx.send_blocking(counts);
+                });
+                cx.spawn(async move |this, cx| {
+                    if let Ok(counts) = rx.recv().await {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.worktree_picker_changes_generation == generation {
+                                this.worktree_picker_changes = counts;
+                                cx.notify();
+                            }
+                        });
+                    }
+                })
+                .detach();
+            }
             self.is_settings_open = false;
             self.is_context_menu_open = false;
             self.is_about_open = false;
@@ -7543,69 +8038,133 @@ impl RootView {
             self.is_project_jumper_open = false;
             self.is_settings_open = false;
             self.is_about_open = false;
+            self.ai_input_focused = false;
             self.global_search_query.clear();
             self.global_search_results.clear();
             self.global_search_selected = 0;
             self.global_search_scroll_handle.scroll_to_item(0);
+            self.global_search_pane_lines.clear();
+            for tab in &self.tabs {
+                for pane in tab.pane_tree.all_panes() {
+                    if let Some(terminal) = pane.terminal.as_ref() {
+                        self.global_search_pane_lines.push((
+                            tab.id,
+                            pane.id,
+                            terminal.non_empty_line_count(),
+                        ));
+                    }
+                }
+            }
         }
         cx.notify();
+    }
+
+    /// Child index of a result row, counting the pane headers above it.
+    pub fn global_search_visual_index(&self, index: usize) -> usize {
+        let mut sizes: Vec<usize> = Vec::new();
+        let mut current: Option<(usize, usize)> = None;
+        for result in &self.global_search_results {
+            let key = (result.tab_id, result.pane_id);
+            if current != Some(key) {
+                sizes.push(0);
+                current = Some(key);
+            }
+            if let Some(size) = sizes.last_mut() {
+                *size += 1;
+            }
+        }
+        visual_index_with_headers(&sizes, index)
+    }
+
+    /// Focus the tab and pane of a search hit, then scroll to it.
+    fn jump_to_global_search_result(
+        &mut self,
+        tab_id: usize,
+        pane_id: usize,
+        offset: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_tab(tab_id, cx);
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            if pane_id > 0 && tab.pane_tree.find_pane(pane_id).is_some() {
+                tab.pane_tree.active_pane_id = pane_id;
+            }
+            if let Some(pane) = tab.pane_tree.active_pane() {
+                tab.terminal = pane.terminal.clone();
+                tab.cwd = pane.cwd.clone();
+                tab.git_status = pane.git_status.clone();
+            }
+            if let Some(terminal) = tab.terminal.clone() {
+                match offset {
+                    Some(offset) => terminal.scroll_to_offset(offset),
+                    None => terminal.scroll_to_bottom(),
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn global_search_pane_cwd(&self, tab_id: usize, pane_id: usize) -> Option<String> {
+        let tab = self.tabs.iter().find(|tab| tab.id == tab_id)?;
+        let path = if pane_id > 0 {
+            tab.pane_tree
+                .find_pane(pane_id)
+                .and_then(|pane| pane.cwd.clone())
+        } else {
+            tab.cwd.clone()
+        };
+        path.map(|path| Self::short_home_path(&path))
     }
 
     pub fn update_global_search(&mut self, cx: &mut Context<Self>) {
         self.global_search_results.clear();
         self.global_search_selected = 0;
         let q = self.global_search_query.trim();
+        self.global_search_invalid_pattern = false;
         if q.is_empty() {
+            cx.notify();
+            return;
+        }
+        if self.global_search_regex
+            && regex::RegexBuilder::new(q)
+                .case_insensitive(!self.global_search_case_sensitive)
+                .build()
+                .is_err()
+        {
+            self.global_search_invalid_pattern = true;
             cx.notify();
             return;
         }
 
         for (tab_idx, tab) in self.tabs.iter().enumerate() {
-            let proc = tab
-                .terminal
-                .as_ref()
-                .and_then(|t| t.get_foreground_process_name());
-            let tab_title = tab
-                .custom_title
-                .clone()
-                .unwrap_or_else(|| tab.title.clone());
-
-            // Check main terminal
-            if let Some(ref term) = tab.terminal {
-                let snippets = term.search_snippets(q, 10);
+            // `all_panes` includes the active pane, and `tab.terminal` mirrors it,
+            // so searching both would duplicate every active pane.
+            for pane in tab.pane_tree.all_panes() {
+                let Some(term) = pane.terminal.as_ref() else {
+                    continue;
+                };
+                let history = term.history_size() as i64;
+                let snippets = term.search_snippets_with(
+                    q,
+                    40,
+                    self.global_search_case_sensitive,
+                    self.global_search_regex,
+                );
                 for snip in snippets {
                     self.global_search_results.push(GlobalSearchResult {
                         tab_idx,
                         tab_id: tab.id,
-                        tab_title: tab_title.clone(),
-                        process_name: proc.clone(),
-                        pane_id: 0,
+                        tab_title: pane
+                            .custom_title
+                            .clone()
+                            .unwrap_or_else(|| pane.title.clone()),
+                        process_name: term.get_foreground_process_name(),
+                        pane_id: pane.id,
                         offset: snip.offset,
                         line_index: snip.line_index,
+                        line_number: (history + snip.line_index as i64).max(0) as usize + 1,
                         line_content: snip.text,
                     });
-                }
-            }
-
-            // Check split panes if any
-            for pane in tab.pane_tree.all_panes() {
-                if let Some(ref term) = pane.terminal {
-                    let snippets = term.search_snippets(q, 10);
-                    for snip in snippets {
-                        self.global_search_results.push(GlobalSearchResult {
-                            tab_idx,
-                            tab_id: tab.id,
-                            tab_title: pane
-                                .custom_title
-                                .clone()
-                                .unwrap_or_else(|| pane.title.clone()),
-                            process_name: term.get_foreground_process_name(),
-                            pane_id: pane.id,
-                            offset: snip.offset,
-                            line_index: snip.line_index,
-                            line_content: snip.text,
-                        });
-                    }
                 }
             }
         }
@@ -12475,38 +13034,42 @@ impl RootView {
         // Global Multi-Tab Search Keyboard Handler
         if self.is_global_search_open {
             if key_lower == "escape" || key_lower == "esc" {
-                self.is_global_search_open = false;
-                cx.notify();
+                if !self.global_search_query.trim().is_empty() {
+                    self.global_search_query.clear();
+                    self.update_global_search(cx);
+                } else {
+                    self.is_global_search_open = false;
+                    cx.notify();
+                }
                 return;
             }
             let count = self.global_search_results.len();
+            if modifiers.alt && key_lower == "c" {
+                self.global_search_case_sensitive = !self.global_search_case_sensitive;
+                self.update_global_search(cx);
+                return;
+            }
+            if modifiers.alt && key_lower == "r" {
+                self.global_search_regex = !self.global_search_regex;
+                self.update_global_search(cx);
+                return;
+            }
             if key_lower == "enter" || key_lower == "return" {
                 if let Some(res) = self.global_search_results.get(self.global_search_selected) {
                     let tab_id = res.tab_id;
-                    let offset = res.offset;
                     let pane_id = res.pane_id;
+                    let offset = res.offset;
                     self.is_global_search_open = false;
-                    self.select_tab(tab_id, cx);
-                    if let Some(active_tab) = self.tabs.iter().find(|t| t.id == tab_id) {
-                        if pane_id > 0 {
-                            if let Some(pane) = active_tab.pane_tree.find_pane(pane_id) {
-                                if let Some(ref t) = pane.terminal {
-                                    t.scroll_to_offset(offset);
-                                }
-                            }
-                        } else if let Some(ref t) = active_tab.terminal {
-                            t.scroll_to_offset(offset);
-                        }
-                    }
-                    cx.notify();
+                    self.jump_to_global_search_result(tab_id, pane_id, Some(offset), cx);
                 }
                 return;
             }
             if key_lower == "down" || key_lower == "arrowdown" || key_lower == "tab" {
                 if count > 0 {
                     self.global_search_selected = (self.global_search_selected + 1) % count;
-                    self.global_search_scroll_handle
-                        .scroll_to_item(self.global_search_selected);
+                    self.global_search_scroll_handle.scroll_to_item(
+                        self.global_search_visual_index(self.global_search_selected),
+                    );
                     cx.notify();
                 }
                 return;
@@ -12518,8 +13081,9 @@ impl RootView {
                     } else {
                         self.global_search_selected - 1
                     };
-                    self.global_search_scroll_handle
-                        .scroll_to_item(self.global_search_selected);
+                    self.global_search_scroll_handle.scroll_to_item(
+                        self.global_search_visual_index(self.global_search_selected),
+                    );
                     cx.notify();
                 }
                 return;
@@ -12564,7 +13128,7 @@ impl RootView {
                 if count > 0 {
                     self.command_palette_selected = (self.command_palette_selected + 1) % count;
                     self.command_palette_scroll_handle
-                        .scroll_to_item(self.command_palette_selected);
+                        .scroll_to_item(self.palette_visual_index(self.command_palette_selected));
                     let selected_id = filtered
                         .get(self.command_palette_selected)
                         .map(|c| c.id.clone());
@@ -12583,7 +13147,7 @@ impl RootView {
                         self.command_palette_selected - 1
                     };
                     self.command_palette_scroll_handle
-                        .scroll_to_item(self.command_palette_selected);
+                        .scroll_to_item(self.palette_visual_index(self.command_palette_selected));
                     let selected_id = filtered
                         .get(self.command_palette_selected)
                         .map(|c| c.id.clone());
@@ -12600,7 +13164,7 @@ impl RootView {
                 self.command_palette_scroll_handle.scroll_to_item(0);
                 // Re-filter after the edit so the row under the cursor previews.
                 let selected_id = self
-                    .filtered_palette_commands()
+                    .ordered_palette_commands()
                     .into_iter()
                     .next()
                     .map(|c| c.id.clone());
@@ -12616,7 +13180,7 @@ impl RootView {
                     self.command_palette_selected = 0;
                     self.command_palette_scroll_handle.scroll_to_item(0);
                     let selected_id = self
-                        .filtered_palette_commands()
+                        .ordered_palette_commands()
                         .into_iter()
                         .next()
                         .map(|c| c.id.clone());
@@ -12631,7 +13195,7 @@ impl RootView {
                 self.command_palette_selected = 0;
                 self.command_palette_scroll_handle.scroll_to_item(0);
                 let selected_id = self
-                    .filtered_palette_commands()
+                    .ordered_palette_commands()
                     .into_iter()
                     .next()
                     .map(|c| c.id.clone());
@@ -12864,9 +13428,7 @@ impl RootView {
                 if let Some(host) = filtered.get(self.ssh_manager_selected) {
                     let host_clone = (*host).clone();
                     self.is_ssh_manager_open = false;
-                    let title = format!("ssh: {}", host_clone.name);
-                    let (shell, args) = host_clone.resilient_shell_command();
-                    self.create_tab_with_cmd(&shell, &args, Some(title), _window, cx);
+                    self.open_ssh_host_tab(&host_clone, _window, cx);
                 } else {
                     // UX5: no match (or no hosts at all): open ~/.ssh/config
                     // so the user can add their first `Host` entry.
@@ -12931,58 +13493,51 @@ impl RootView {
                 cx.notify();
                 return;
             }
-            if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
-                if let Some(ref term) = active_tab.terminal {
-                    if key_lower == "enter" || key_lower == "return" {
-                        if !self.search_matches.is_empty() {
-                            if modifiers.shift {
-                                self.search_match_idx = if self.search_match_idx == 0 {
-                                    self.search_matches.len() - 1
-                                } else {
-                                    self.search_match_idx - 1
-                                };
-                            } else {
-                                self.search_match_idx =
-                                    (self.search_match_idx + 1) % self.search_matches.len();
-                            }
-                            let offset = self.search_matches[self.search_match_idx];
-                            term.scroll_to_offset(offset);
-                            self.last_scroll_activity = std::time::Instant::now();
-                            cx.notify();
-                        }
-                        return;
+            if modifiers.alt && key_lower == "c" {
+                self.search_case_sensitive = !self.search_case_sensitive;
+                self.refresh_buffer_search(_window, cx);
+                return;
+            }
+            if modifiers.alt && key_lower == "r" {
+                self.search_regex = !self.search_regex;
+                self.refresh_buffer_search(_window, cx);
+                return;
+            }
+            if key_lower == "enter" || key_lower == "return" {
+                if !self.search_matches.is_empty() {
+                    if modifiers.shift {
+                        self.search_match_idx = if self.search_match_idx == 0 {
+                            self.search_matches.len() - 1
+                        } else {
+                            self.search_match_idx - 1
+                        };
+                    } else {
+                        self.search_match_idx =
+                            (self.search_match_idx + 1) % self.search_matches.len();
                     }
-                    if key_lower == "backspace" {
-                        self.search_query.pop();
-                        self.search_matches = term.search_matches(&self.search_query);
-                        self.search_match_idx = 0;
-                        if let Some(&offset) = self.search_matches.first() {
-                            term.scroll_to_offset(offset);
-                            self.last_scroll_activity = std::time::Instant::now();
-                        }
-                        cx.notify();
-                        return;
-                    }
-                    let mut char_to_add = None;
-                    if let Some(ref ch) = event.keystroke.key_char {
-                        if !modifiers.platform && !is_ctrl {
-                            char_to_add = Some(ch.clone());
-                        }
-                    } else if key.len() == 1 && !modifiers.platform && !is_ctrl {
-                        char_to_add = Some(key.clone());
-                    }
-                    if let Some(ch) = char_to_add {
-                        self.search_query.push_str(&ch);
-                        self.search_matches = term.search_matches(&self.search_query);
-                        self.search_match_idx = 0;
-                        if let Some(&offset) = self.search_matches.first() {
-                            term.scroll_to_offset(offset);
-                            self.last_scroll_activity = std::time::Instant::now();
-                        }
-                        cx.notify();
-                        return;
-                    }
+                    let offset = self.search_matches[self.search_match_idx];
+                    self.scroll_buffer_search_to(offset, _window);
+                    cx.notify();
                 }
+                return;
+            }
+            if key_lower == "backspace" {
+                self.search_query.pop();
+                self.refresh_buffer_search(_window, cx);
+                return;
+            }
+            let mut char_to_add = None;
+            if let Some(ref ch) = event.keystroke.key_char {
+                if !modifiers.platform && !is_ctrl {
+                    char_to_add = Some(ch.clone());
+                }
+            } else if key.len() == 1 && !modifiers.platform && !is_ctrl {
+                char_to_add = Some(key.clone());
+            }
+            if let Some(ch) = char_to_add {
+                self.search_query.push_str(&ch);
+                self.refresh_buffer_search(_window, cx);
+                return;
             }
             return;
         }
@@ -15360,9 +15915,19 @@ impl RootView {
                         drop(store);
 
                         let selection_range = if is_active { self.selection } else { None };
-                        let search_open =
-                            is_active && self.is_search_open && !self.search_query.is_empty();
-                        let search_query_str = self.search_query.to_lowercase();
+                        let search_open = is_active
+                            && self.is_search_open
+                            && !self.search_query.trim().is_empty();
+                        let search_query_str = self.search_query.trim().to_string();
+                        let search_regex = (search_open && self.search_regex)
+                            .then(|| {
+                                regex::RegexBuilder::new(&search_query_str)
+                                    .case_insensitive(!self.search_case_sensitive)
+                                    .build()
+                                    .ok()
+                            })
+                            .flatten();
+                        let search_case_sensitive = self.search_case_sensitive;
                         let active_search_offset =
                             self.search_matches.get(self.search_match_idx).copied();
                         let num_lines = lines.len();
@@ -15388,17 +15953,45 @@ impl RootView {
                                     }
                                 }
 
-                                let line_lower = full_line.to_lowercase();
-                                let mut start_b = 0;
-                                while let Some(found_b) =
-                                    line_lower[start_b..].find(&search_query_str)
-                                {
-                                    let match_start_b = start_b + found_b;
-                                    let match_end_b = match_start_b + search_query_str.len();
-                                    let match_start_char =
-                                        line_lower[..match_start_b].chars().count();
-                                    let match_end_char = line_lower[..match_end_b].chars().count();
+                                // Match with the same options the counter uses.
+                                let char_matches: Vec<(usize, usize)> =
+                                    if let Some(pattern) = search_regex.as_ref() {
+                                        pattern
+                                            .find_iter(&full_line)
+                                            .map(|matched| {
+                                                (
+                                                    full_line[..matched.start()].chars().count(),
+                                                    full_line[..matched.end()].chars().count(),
+                                                )
+                                            })
+                                            .collect()
+                                    } else {
+                                        let (haystack, needle) = if search_case_sensitive {
+                                            (full_line.clone(), search_query_str.clone())
+                                        } else {
+                                            (
+                                                full_line.to_lowercase(),
+                                                search_query_str.to_lowercase(),
+                                            )
+                                        };
+                                        if haystack.len() == full_line.len() {
+                                            haystack
+                                                .match_indices(&needle)
+                                                .map(|(start, matched)| {
+                                                    (
+                                                        haystack[..start].chars().count(),
+                                                        haystack[..start + matched.len()]
+                                                            .chars()
+                                                            .count(),
+                                                    )
+                                                })
+                                                .collect()
+                                        } else {
+                                            Vec::new()
+                                        }
+                                    };
 
+                                for (match_start_char, match_end_char) in char_matches {
                                     if match_start_char < char_to_col.len() && match_end_char > 0 {
                                         let col_start = char_to_col[match_start_char];
                                         let last_char_idx =
@@ -15412,10 +16005,6 @@ impl RootView {
                                                     + (num_lines.saturating_sub(1 + row_idx)))
                                             });
                                         row_highlights.push((col_start, col_len, is_active_match));
-                                    }
-                                    start_b = match_end_b;
-                                    if search_query_str.is_empty() {
-                                        break;
                                     }
                                 }
                                 all_search_highlights.push(row_highlights);
@@ -16785,170 +17374,26 @@ impl Render for RootView {
                 )
                 .child(
                     div()
-                        .id("logo-context-menu-popup")
+                        .id("logo-menu-anchor")
                         .absolute()
                         .top(px(34.))
                         .when(cfg!(target_os = "macos"), |d| d.right(px(6.)))
                         .when(!cfg!(target_os = "macos"), |d| d.left(px(6.)))
-                        .w(px(220.))
-                        .p(px(4.))
-                        .rounded(px(8.))
-                        .bg({
-                            let mut bg = theme.surface;
-                            bg.a = 1.0;
-                            bg
-                        })
-                        .border_1()
-                        .border_color(theme.border)
-                        .shadow_xl()
-                        .occlude()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
-                            cx.stop_propagation();
-                        })
-                        .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
-                            cx.stop_propagation();
-                        })
-                        .on_mouse_move(|_ev, _window, cx| {
-                            cx.stop_propagation();
-                        })
-                        .on_scroll_wheel(|_ev, _window, cx| {
-                            cx.stop_propagation();
-                        })
-                        .child(render_context_menu_item(
-                            IconType::Zap,
-                            "About Fastty",
-                            None,
-                            cx.listener(|this, _ev, window, cx| {
-                                this.toggle_about(window, cx);
-                            }),
-                            theme,
-                        ))
-                        .child(render_context_menu_item(
-                            IconType::RotateCcw,
-                            "Check for Updates",
-                            None,
-                            cx.listener(|this, _ev, window, cx| {
-                                this.is_context_menu_open = false;
-                                this.check_for_updates_manual(window, cx);
-                            }),
-                            theme,
-                        ))
-                        .child(render_context_menu_item(
-                            IconType::Settings,
-                            "Settings...",
-                            Some(sc_settings),
-                            cx.listener(|this, _ev, window, cx| {
-                                this.is_context_menu_open = false;
-                                this.open_settings_window(window, cx);
-                            }),
-                            theme,
-                        ))
-                        .child(render_context_menu_divider(theme))
-                        .child(render_context_menu_item(
-                            IconType::Command,
-                            "Command Palette",
-                            Some(sc_palette),
-                            cx.listener(|this, _ev, window, cx| {
-                                this.is_context_menu_open = false;
-                                this.toggle_command_palette(window, cx);
-                            }),
-                            theme,
-                        ))
-                        .child(render_context_menu_item(
-                            IconType::Sparkles,
-                            "Fastty AI",
-                            Some(sc_ai),
-                            cx.listener(|this, _ev, window, cx| {
-                                this.is_context_menu_open = false;
-                                this.toggle_ai_sidebar(window, cx);
-                            }),
-                            theme,
-                        ))
-                        .child(render_context_menu_item(
-                            IconType::Server,
-                            "SSH Manager",
-                            Some(sc_ssh),
-                            cx.listener(|this, _ev, window, cx| {
-                                this.is_context_menu_open = false;
-                                this.toggle_ssh_manager(window, cx);
-                            }),
-                            theme,
-                        ))
-                        .child(render_context_menu_item(
-                            IconType::Search,
-                            "Find in Buffer",
-                            Some(sc_search),
-                            cx.listener(|this, _ev, window, cx| {
-                                this.is_context_menu_open = false;
-                                this.toggle_search(window, cx);
-                            }),
-                            theme,
-                        ))
-                        .child(render_context_menu_divider(theme))
-                        .child(render_context_menu_item(
-                            IconType::Plus,
-                            "New Tab",
-                            Some(sc_new_tab),
-                            cx.listener(|this, _ev, window, cx| {
-                                this.is_context_menu_open = false;
-                                this.create_tab(window, cx);
-                            }),
-                            theme,
-                        ))
-                        .child(render_context_menu_item(
-                            IconType::Trash2,
-                            "Clear Scrollback",
-                            Some(sc_clear),
-                            cx.listener(|this, _ev, _window, cx| {
-                                if let Some(tab) = this.tabs.get(this.active_tab_idx) {
-                                    if let Some(ref term) = tab.terminal {
-                                        term.scroll_to_bottom();
-                                    }
-                                }
-                                this.is_context_menu_open = false;
-                                cx.notify();
-                            }),
-                            theme,
-                        ))
-                        .child(render_context_menu_item(
-                            IconType::Folder,
-                            "Open Config Folder",
-                            None,
-                            cx.listener(|this, _ev, _window, cx| {
-                                let config_dir = dirs::home_dir().map(|h| h.join(".config/fastty")).unwrap_or_default();
-                                let _ = std::fs::create_dir_all(&config_dir);
-                                if let Some(path_str) = config_dir.to_str() {
-                                    open_path_or_url(path_str);
-                                }
-                                this.is_context_menu_open = false;
-                                cx.notify();
-                            }),
-                            theme,
-                        ))
-                        .child(render_context_menu_item(
-                            IconType::Maximize2,
-                            "Toggle Fullscreen",
-                            Some(sc_fullscreen),
-                            cx.listener(|this, _ev, window, cx| {
-                                window.toggle_fullscreen();
-                                this.is_context_menu_open = false;
-                                cx.notify();
-                            }),
-                            theme,
-                        ))
-                        .child(render_context_menu_divider(theme))
-                        .child(render_context_menu_item(
-                            IconType::LogOut,
-                            "Quit Fastty",
-                            Some(sc_quit),
-                            cx.listener(|_this, _ev, _window, cx| {
-                                cx.quit();
-                            }),
-                            theme,
-                        )),
+                        .child(
+                            AppMenu::new(
+                                theme,
+                                env!("CARGO_PKG_VERSION"),
+                                status,
+                                menu_max_height,
+                            )
+                            .on_action(
+                                cx.listener(
+                                    |this, action: &AppMenuAction, window, cx| {
+                                        this.handle_app_menu_action(*action, window, cx);
+                                    },
+                                ),
+                            ),
+                        ),
                 )
             })
             // Tab Right-Click Context Menu Overlay
@@ -17710,8 +18155,113 @@ impl Render for RootView {
             .when(self.palette.is_open(), |this| {
                 let mut backdrop_bg = theme.black;
                 backdrop_bg.a = 0.65;
-                let filtered = self.filtered_palette_commands();
+                let groups = self.grouped_palette_commands();
                 let selected_idx = self.command_palette_selected;
+                let mut rows: Vec<gpui::AnyElement> = Vec::new();
+                let mut row_index = 0usize;
+                for (label, commands) in groups {
+                    rows.push(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(5.))
+                            .px(px(10.))
+                            .pt(px(12.))
+                            .pb(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted)
+                                    .child("#"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(theme.muted_strong)
+                                    .child(SharedString::from(label)),
+                            )
+                            .into_any_element(),
+                    );
+                    for cmd in commands {
+                        let is_selected = row_index == selected_idx;
+                        let preview_cmd_id = cmd.id.clone();
+                        let execute_cmd_id = cmd.id.clone();
+                        let shortcut = cmd.shortcut;
+                        let mut row = div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .h(px(38.))
+                            .px(px(10.))
+                            .rounded(px(8.))
+                            .when(is_selected, |row| row.bg(theme.selected))
+                            .when(!is_selected, |row| {
+                                row.hover(move |style| style.bg(theme.hover))
+                            })
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                if this.command_palette_selected != row_index {
+                                    this.command_palette_selected = row_index;
+                                    // Hover previews live, like keyboard nav.
+                                    this.preview_palette_command(&preview_cmd_id, _window, cx);
+                                    cx.notify();
+                                }
+                            }))
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
+                                this.execute_palette_command(&execute_cmd_id, window, cx);
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .min_w(px(0.))
+                                    .child(render_icon(
+                                        cmd.icon,
+                                        if is_selected { theme.accent } else { theme.muted_strong },
+                                        15.0,
+                                    ))
+                                    .child(
+                                        div()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .text_size(px(13.))
+                                            .text_color(theme.foreground)
+                                            .child(cmd.title),
+                                    ),
+                            );
+                        if let Some(shortcut) = shortcut {
+                            let mut keys = div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.))
+                                .flex_shrink_0();
+                            for key in palette_shortcut_keys(shortcut) {
+                                keys = keys.child(
+                                    div()
+                                        .min_w(px(20.))
+                                        .h(px(20.))
+                                        .px(px(4.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(5.))
+                                        .bg(theme.surface_raised)
+                                        .text_size(px(10.5))
+                                        .text_color(theme.muted_strong)
+                                        .child(SharedString::from(key)),
+                                );
+                            }
+                            row = row.child(keys);
+                        }
+                        rows.push(row.into_any_element());
+                        row_index += 1;
+                    }
+                }
 
                 this.child(
                     div()
@@ -17745,139 +18295,75 @@ impl Render for RootView {
                                 .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
                                     cx.stop_propagation();
                                 })
-                                // Input Box Header
+                                // Query row
                                 .child(
                                     div()
                                         .flex()
                                         .flex_row()
                                         .items_center()
-                                        .gap_2()
-                                        .px(px(12.))
-                                        .py(px(10.))
-                                        .border_b_1()
-                                        .border_color(theme.border)
-                                        .child(render_icon(IconType::Search, theme.accent, 14.0))
+                                        .gap(px(14.))
+                                        .px(px(16.))
+                                        .pt(px(12.))
+                                        .pb(px(8.))
+                                        .child(render_icon(IconType::ChevronRight, theme.accent, 16.0))
                                         .child(
                                             div()
                                                 .flex_1()
-                                                .text_size(px(13.))
+                                                .text_size(px(15.))
                                                 .text_color(if self.command_palette_query.is_empty() {
                                                     theme.muted
                                                 } else {
                                                     theme.foreground
                                                 })
                                                 .child(if self.command_palette_query.is_empty() {
-                                                    "Type a command... (↑↓ to navigate, Enter to run)".to_string()
+                                                    "Run a command...".to_string()
                                                 } else {
                                                     format!("{}|", self.command_palette_query)
                                                 }),
-                                        )
-                                        .child(
-                                            div()
-                                                .px(px(5.))
-                                                .py(px(2.))
-                                                .rounded(px(3.))
-                                                .bg(theme.surface_raised)
-                                                .text_size(px(10.))
-                                                .text_color(theme.muted)
-                                                .child("ESC"),
                                         ),
                                 )
-                                // Filtered Commands List
+                                // Grouped command list
                                 .child(
                                     div()
                                         .id("palette-commands-list")
                                         .track_scroll(&self.command_palette_scroll_handle)
                                         .flex()
                                         .flex_col()
-                                        .max_h(px(280.))
+                                        .max_h(px(320.))
                                         .overflow_y_scroll()
-                                        .p(px(4.))
-                                        .gap_1()
-                                        .children(
-                                            if filtered.is_empty() {
-                                                vec![
-                                                    div()
-                                                        .p(px(12.))
-                                                        .text_size(px(12.))
-                                                        .text_color(theme.muted)
-                                                        .child("No matching commands found."),
-                                                ]
-                                            } else {
-                                                filtered
-                                                    .into_iter()
-                                                    .enumerate()
-                                                    .map(|(idx, cmd)| {
-                                                        let is_selected = idx == selected_idx;
-                                                        let preview_cmd_id = cmd.id.clone();
-                                                        let execute_cmd_id = cmd.id.clone();
-                                                        div()
-                                                            .flex()
-                                                            .flex_row()
-                                                            .items_center()
-                                                            .justify_between()
-                                                            .px(px(10.))
-                                                            .py(px(6.))
-                                                            .rounded(px(6.))
-                                                            .bg(if is_selected { theme.accent } else { theme.surface })
-                                                            .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
-                                                            .cursor(CursorStyle::PointingHand)
-                                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
-                                                                if this.command_palette_selected != idx {
-                                                                    this.command_palette_selected = idx;
-                                                                    // Hover previews live, like keyboard nav.
-                                                                    this.preview_palette_command(&preview_cmd_id, _window, cx);
-                                                                    cx.notify();
-                                                                }
-                                                            }))
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
-                                                                this.execute_palette_command(&execute_cmd_id, window, cx);
-                                                            }))
-                                                            .child(
-                                                                div()
-                                                                    .flex()
-                                                                    .flex_row()
-                                                                    .items_center()
-                                                                    .gap_2p5()
-                                                                    .child(render_icon(cmd.icon, if is_selected { theme.black } else { theme.accent }, 13.0))
-                                                                    .child(
-                                                                        div()
-                                                                            .text_size(px(12.))
-                                                                            .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::NORMAL })
-                                                                            .text_color(if is_selected { theme.black } else { theme.foreground })
-                                                                            .child(cmd.title),
-                                                                    ),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .flex()
-                                                                    .flex_row()
-                                                                    .items_center()
-                                                                    .gap_2()
-                                                                    .child(
-                                                                        div()
-                                                                            .text_size(px(10.))
-                                                                            .text_color(if is_selected { theme.black.opacity(0.85) } else { theme.muted })
-                                                                            .child(cmd.category),
-                                                                    )
-                                                                    .when_some(cmd.shortcut, |this, sc| {
-                                                                        this.child(
-                                                                            div()
-                                                                                .px(px(4.))
-                                                                                .py(px(1.))
-                                                                                .rounded(px(3.))
-                                                                                .bg(if is_selected { theme.black } else { theme.surface_raised })
-                                                                                .text_size(px(10.))
-                                                                                .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                                                                                .text_color(if is_selected { theme.accent } else { theme.muted })
-                                                                                .child(sc),
-                                                                        )
-                                                                    }),
-                                                            )
-                                                    })
-                                                    .collect()
-                                            }
-                                        ),
+                                        .px(px(10.))
+                                        .pb(px(8.))
+                                        .gap(px(4.))
+                                        .children(if rows.is_empty() {
+                                            vec![
+                                                div()
+                                                    .px(px(12.))
+                                                    .py(px(14.))
+                                                    .text_size(px(13.))
+                                                    .text_color(theme.muted)
+                                                    .child("No matching commands found.")
+                                                    .into_any_element(),
+                                            ]
+                                        } else {
+                                            rows
+                                        }),
+                                )
+                                // Footer hints
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .px(px(16.))
+                                        .py(px(9.))
+                                        .text_size(px(11.))
+                                        .text_color(theme.muted)
+                                        .child(div().child("↑↓ navigate   ↵ run   esc close"))
+                                        .child(div().child(format!(
+                                            "{} palette",
+                                            palette_shortcut_label()
+                                        ))),
                                 ),
                         ),
                 )
@@ -17885,7 +18371,7 @@ impl Render for RootView {
             // Snippet Picker Modal (F4)
             .when(self.is_snippet_picker_open, |this| {
                 let mut backdrop_bg = theme.black;
-                backdrop_bg.a = 0.65;
+                backdrop_bg.a = 0.55;
                 let all_snips = crate::snippets::all();
                 let query = self.snippet_query.to_lowercase();
                 let filtered: Vec<(String, String)> = all_snips
@@ -17897,6 +18383,122 @@ impl Render for RootView {
                     })
                     .collect();
                 let selected_idx = self.snippet_selected;
+                let total = filtered.len();
+                let font_family = self.font_family.clone();
+
+                let mut rows: Vec<gpui::AnyElement> = Vec::new();
+                if filtered.is_empty() {
+                    rows.push(
+                        div()
+                            .px(px(16.))
+                            .py(px(18.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.foreground)
+                                    .child("No snippets found"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted)
+                                    .child("Add [snippet.NAME] entries to your snippets.toml to grow this list."),
+                            )
+                            .into_any_element(),
+                    );
+                } else {
+                    for (idx, (trigger, body)) in filtered.into_iter().enumerate() {
+                        let is_selected = idx == selected_idx;
+                        let (expanded, _) = crate::snippets::expand(&body);
+                        let preview: String = expanded
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(120)
+                            .collect();
+                        let body_for_click = body.clone();
+                        rows.push(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .h(px(44.))
+                                .px(px(10.))
+                                .rounded(px(8.))
+                                .when(is_selected, |row| row.bg(theme.surface_raised))
+                                .when(!is_selected, |row| {
+                                    row.hover(move |style| style.bg(theme.hover))
+                                })
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                    if this.snippet_selected != idx {
+                                        this.snippet_selected = idx;
+                                        cx.notify();
+                                    }
+                                }))
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                    this.insert_snippet_body(&body_for_click, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(12.))
+                                        .min_w(px(0.))
+                                        .child(
+                                            div()
+                                                .w(px(110.))
+                                                .flex_shrink_0()
+                                                .truncate()
+                                                .text_size(px(13.))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(if is_selected {
+                                                    theme.accent
+                                                } else {
+                                                    theme.foreground
+                                                })
+                                                .child(SharedString::from(trigger)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_size(px(12.))
+                                                .text_color(theme.muted)
+                                                .child("→"),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .font_family(font_family.clone())
+                                                .text_size(px(12.5))
+                                                .text_color(if is_selected {
+                                                    theme.foreground
+                                                } else {
+                                                    theme.muted_strong
+                                                })
+                                                .child(SharedString::from(preview)),
+                                        ),
+                                )
+                                .when(is_selected, |row| {
+                                    row.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(px(10.5))
+                                            .text_color(theme.muted)
+                                            .child("insert ↵"),
+                                    )
+                                })
+                                .into_any_element(),
+                        );
+                    }
+                }
 
                 this.child(
                     div()
@@ -17906,15 +18508,19 @@ impl Render for RootView {
                         .flex()
                         .flex_col()
                         .items_center()
-                        .pt(px(60.))
+                        .px(px(16.))
+                        .pt(px(52.))
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                             this.is_snippet_picker_open = false;
                             cx.notify();
                         }))
                         .child(
                             div()
-                                .w(px(560.))
-                                .rounded(px(10.))
+                                .occlude()
+                                .w_full()
+                                .max_w(px(560.))
+                                .max_h(gpui::relative(0.88))
+                                .rounded(px(12.))
                                 .bg(theme.surface)
                                 .border_1()
                                 .border_color(theme.border)
@@ -17928,145 +18534,70 @@ impl Render for RootView {
                                 .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
                                     cx.stop_propagation();
                                 })
-                                // Input Box Header
                                 .child(
                                     div()
                                         .flex()
                                         .flex_row()
                                         .items_center()
-                                        .gap_2()
-                                        .px(px(12.))
-                                        .py(px(10.))
-                                        .border_b_1()
-                                        .border_color(theme.border)
-                                        .child(render_icon(IconType::Terminal, theme.accent, 14.0))
+                                        .gap(px(14.))
+                                        .px(px(16.))
+                                        .pt(px(12.))
+                                        .pb(px(8.))
+                                        .child(render_icon(IconType::SquareTerminal, theme.accent, 16.0))
                                         .child(
                                             div()
                                                 .flex_1()
-                                                .text_size(px(13.))
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_size(px(15.))
                                                 .text_color(if self.snippet_query.is_empty() {
                                                     theme.muted
                                                 } else {
                                                     theme.foreground
                                                 })
                                                 .child(if self.snippet_query.is_empty() {
-                                                    "Type to filter snippets... (↑↓ to navigate, Enter to insert)".to_string()
+                                                    "Filter snippets...".to_string()
                                                 } else {
                                                     format!("{}|", self.snippet_query)
                                                 }),
                                         )
                                         .child(
                                             div()
-                                                .px(px(5.))
-                                                .py(px(2.))
-                                                .rounded(px(3.))
-                                                .bg(theme.surface_raised)
-                                                .text_size(px(10.))
+                                                .text_size(px(11.5))
                                                 .text_color(theme.muted)
-                                                .child("ESC"),
+                                                .child(SharedString::from(if total == 1 {
+                                                    "1 snippet".to_string()
+                                                } else {
+                                                    format!("{total} snippets")
+                                                })),
                                         ),
                                 )
-                                // Filtered Snippets List
                                 .child(
                                     div()
                                         .id("snippet-picker-list")
                                         .track_scroll(&self.snippet_scroll_handle)
                                         .flex()
                                         .flex_col()
-                                        .max_h(px(300.))
+                                        .max_h(px(320.))
+                                        .min_h(px(0.))
+                                        .flex_shrink(1.)
                                         .overflow_y_scroll()
-                                        .p(px(4.))
-                                        .gap_1()
-                                        .children(
-                                            if filtered.is_empty() {
-                                                vec![
-                                                    div()
-                                                        .p(px(12.))
-                                                        .flex()
-                                                        .flex_col()
-                                                        .gap_1()
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(12.))
-                                                                .text_color(theme.foreground)
-                                                                .child("No snippets found"),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(11.))
-                                                                .text_color(theme.muted)
-                                                                .child("Add [snippet.NAME] entries to your snippets.toml to grow this list."),
-                                                        ),
-                                                ]
-                                            } else {
-                                                filtered
-                                                    .into_iter()
-                                                    .enumerate()
-                                                    .map(|(idx, (trigger, body))| {
-                                                        let is_selected = idx == selected_idx;
-                                                        // Placeholder-stripped preview, one line.
-                                                        let (expanded, _) = crate::snippets::expand(&body);
-                                                        let preview: String = expanded
-                                                            .lines()
-                                                            .next()
-                                                            .unwrap_or("")
-                                                            .chars()
-                                                            .take(72)
-                                                            .collect();
-                                                        div()
-                                                            .flex()
-                                                            .flex_col()
-                                                            .gap_0p5()
-                                                            .px(px(10.))
-                                                            .py(px(6.))
-                                                            .rounded(px(6.))
-                                                            .bg(if is_selected { theme.accent } else { theme.surface })
-                                                            .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
-                                                            .cursor(CursorStyle::PointingHand)
-                                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
-                                                                if this.snippet_selected != idx {
-                                                                    this.snippet_selected = idx;
-                                                                    cx.notify();
-                                                                }
-                                                            }))
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                                                this.insert_snippet_body(&body, cx);
-                                                            }))
-                                                            .child(
-                                                                div()
-                                                                    .flex()
-                                                                    .flex_row()
-                                                                    .items_center()
-                                                                    .gap_2()
-                                                                    .child(
-                                                                        div()
-                                                                            .text_size(px(12.))
-                                                                            .font_weight(FontWeight::BOLD)
-                                                                            .text_color(if is_selected { theme.black } else { theme.accent })
-                                                                            .child(trigger),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .px(px(4.))
-                                                                            .py(px(1.))
-                                                                            .rounded(px(3.))
-                                                                            .bg(if is_selected { theme.black } else { theme.surface_raised })
-                                                                            .text_size(px(10.))
-                                                                            .text_color(if is_selected { theme.accent } else { theme.muted })
-                                                                            .child("snip"),
-                                                                    ),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(11.))
-                                                                    .text_color(if is_selected { theme.black.opacity(0.85) } else { theme.muted_strong })
-                                                                    .overflow_hidden()
-                                                                    .child(preview),
-                                                            )
-                                                    })
-                                                    .collect()
-                                            }
-                                        ),
+                                        .px(px(10.))
+                                        .pb(px(8.))
+                                        .gap(px(4.))
+                                        .children(rows),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .px(px(16.))
+                                        .py(px(9.))
+                                        .text_size(px(11.))
+                                        .text_color(theme.muted)
+                                        .child("↑↓ navigate   ↵ insert   esc close"),
                                 ),
                         ),
                 )
@@ -18357,14 +18888,128 @@ impl Render for RootView {
             // SSH Host Manager Modal
             .when(self.is_ssh_manager_open, |this| {
                 let mut backdrop_bg = theme.black;
-                backdrop_bg.a = 0.65;
+                backdrop_bg.a = 0.55;
                 let hosts = crate::ssh::parse_ssh_config();
                 let query = self.ssh_manager_query.to_lowercase();
                 let filtered: Vec<crate::ssh::SshHost> = hosts
                     .into_iter()
-                    .filter(|h| query.is_empty() || fuzzy_match_str(&query, &h.name) || fuzzy_match_str(&query, &h.hostname) || fuzzy_match_str(&query, &h.user) || fuzzy_match_str(&query, &h.tag))
+                    .filter(|host| {
+                        query.is_empty()
+                            || fuzzy_match_str(&query, &host.name)
+                            || fuzzy_match_str(&query, &host.hostname)
+                            || fuzzy_match_str(&query, &host.user)
+                            || fuzzy_match_str(&query, &host.tag)
+                    })
                     .collect();
                 let selected_idx = self.ssh_manager_selected;
+                let total = filtered.len();
+
+                let mut rows: Vec<gpui::AnyElement> = Vec::new();
+                if filtered.is_empty() {
+                    rows.push(
+                        div()
+                            .px(px(16.))
+                            .py(px(18.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.foreground)
+                                    .child("No SSH hosts found"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted)
+                                    .child("Add 'Host <name>' entries to ~/.ssh/config, or press Enter to open it."),
+                            )
+                            .into_any_element(),
+                    );
+                } else {
+                    for (idx, host) in filtered.into_iter().enumerate() {
+                        let is_selected = idx == selected_idx;
+                        let host_clone = host.clone();
+                        let expected_title = format!("ssh: {}", host.name);
+                        let is_already_connected = self.tabs.iter().any(|tab| {
+                            tab.custom_title.as_deref() == Some(expected_title.as_str())
+                        });
+                        let tag = host.tag.clone();
+                        rows.push(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .h(px(44.))
+                                .px(px(10.))
+                                .rounded(px(8.))
+                                .when(is_selected, |row| row.bg(theme.surface_raised))
+                                .when(!is_selected, |row| {
+                                    row.hover(move |style| style.bg(theme.hover))
+                                })
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                    if this.ssh_manager_selected != idx {
+                                        this.ssh_manager_selected = idx;
+                                        cx.notify();
+                                    }
+                                }))
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
+                                    this.is_ssh_manager_open = false;
+                                    this.open_ssh_host_tab(&host_clone, window, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(20.))
+                                        .min_w(px(0.))
+                                        .child(
+                                            div()
+                                                .w(px(170.))
+                                                .flex_shrink_0()
+                                                .truncate()
+                                                .text_size(px(13.5))
+                                                .text_color(theme.foreground)
+                                                .child(SharedString::from(host.name.clone())),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_size(px(12.5))
+                                                .text_color(theme.muted)
+                                                .child(SharedString::from(host.display())),
+                                        )
+                                        .when(is_already_connected, |row| {
+                                            row.child(
+                                                div()
+                                                    .px(px(7.))
+                                                    .py(px(2.))
+                                                    .rounded(px(5.))
+                                                    .bg(theme.green.opacity(0.15))
+                                                    .text_size(px(10.5))
+                                                    .text_color(theme.green)
+                                                    .child("active"),
+                                            )
+                                        }),
+                                )
+                                .when(!tag.is_empty(), |row| {
+                                    row.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(px(11.5))
+                                            .text_color(theme.muted)
+                                            .child(SharedString::from(format!("via {tag}"))),
+                                    )
+                                })
+                                .into_any_element(),
+                        );
+                    }
+                }
 
                 this.child(
                     div()
@@ -18374,15 +19019,19 @@ impl Render for RootView {
                         .flex()
                         .flex_col()
                         .items_center()
-                        .pt(px(60.))
+                        .px(px(16.))
+                        .pt(px(52.))
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                             this.is_ssh_manager_open = false;
                             cx.notify();
                         }))
                         .child(
                             div()
-                                .w(px(480.))
-                                .rounded(px(10.))
+                                .occlude()
+                                .w_full()
+                                .max_w(px(560.))
+                                .max_h(gpui::relative(0.88))
+                                .rounded(px(12.))
                                 .bg(theme.surface)
                                 .border_1()
                                 .border_color(theme.border)
@@ -18396,182 +19045,72 @@ impl Render for RootView {
                                 .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
                                     cx.stop_propagation();
                                 })
-                                // Input Box Header
                                 .child(
                                     div()
                                         .flex()
                                         .flex_row()
                                         .items_center()
-                                        .gap_2()
-                                        .px(px(12.))
-                                        .py(px(10.))
-                                        .border_b_1()
-                                        .border_color(theme.border)
-                                        .child(render_icon(IconType::Server, theme.accent, 14.0))
+                                        .gap(px(14.))
+                                        .px(px(16.))
+                                        .pt(px(12.))
+                                        .pb(px(8.))
+                                        .child(render_icon(IconType::Server, theme.accent, 16.0))
                                         .child(
                                             div()
                                                 .flex_1()
-                                                .text_size(px(13.))
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_size(px(15.))
                                                 .text_color(if self.ssh_manager_query.is_empty() {
                                                     theme.muted
                                                 } else {
                                                     theme.foreground
                                                 })
                                                 .child(if self.ssh_manager_query.is_empty() {
-                                                    "Search SSH hosts from ~/.ssh/config...".to_string()
+                                                    "Connect to host...".to_string()
                                                 } else {
                                                     format!("{}|", self.ssh_manager_query)
                                                 }),
                                         )
                                         .child(
                                             div()
-                                                .px(px(5.))
-                                                .py(px(2.))
-                                                .rounded(px(3.))
-                                                .bg(theme.surface_raised)
-                                                .text_size(px(10.))
+                                                .text_size(px(11.5))
                                                 .text_color(theme.muted)
-                                                .child("ESC"),
+                                                .child(if total == 0 {
+                                                    "~/.ssh/config".to_string()
+                                                } else if total == 1 {
+                                                    "1 host".to_string()
+                                                } else {
+                                                    format!("{total} hosts")
+                                                }),
                                         ),
                                 )
-                                // Hosts List
                                 .child(
                                     div()
                                         .id("ssh-hosts-list")
                                         .track_scroll(&self.ssh_manager_scroll_handle)
                                         .flex()
                                         .flex_col()
-                                        .max_h(px(280.))
+                                        .max_h(px(320.))
+                                        .min_h(px(0.))
+                                        .flex_shrink(1.)
                                         .overflow_y_scroll()
-                                        .p(px(4.))
-                                        .gap_1()
-                                        .children(
-                                            if filtered.is_empty() {
-                                                vec![
-                                                    div()
-                                                        .p(px(16.))
-                                                        .flex()
-                                                        .flex_col()
-                                                        .gap_1()
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(12.))
-                                                                .text_color(theme.foreground)
-                                                                .child("No SSH hosts found"),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(11.))
-                                                                .text_color(theme.muted)
-                                                                .child("Add 'Host <name>' entries to ~/.ssh/config — or press Enter to open it."),
-                                                        ),
-                                                ]
-                                            } else {
-                                                filtered
-                                                    .into_iter()
-                                                    .enumerate()
-                                                    .map(|(idx, host)| {
-                                                        let is_selected = idx == selected_idx;
-                                                        let host_clone = host.clone();
-                                                        let is_already_connected = self.tabs.iter().any(|t| {
-                                                            let title = t.custom_title.as_deref().unwrap_or(&t.title);
-                                                            title.contains(&host.name)
-                                                        });
-
-                                                        div()
-                                                            .flex()
-                                                            .flex_row()
-                                                            .items_center()
-                                                            .justify_between()
-                                                            .px(px(10.))
-                                                            .py(px(6.))
-                                                            .rounded(px(6.))
-                                                            .bg(if is_selected { theme.accent } else { theme.surface })
-                                                            .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
-                                                            .cursor(CursorStyle::PointingHand)
-                                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
-                                                                if this.ssh_manager_selected != idx {
-                                                                    this.ssh_manager_selected = idx;
-                                                                    cx.notify();
-                                                                }
-                                                            }))
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
-                                                                this.is_ssh_manager_open = false;
-                                                                let title = format!("ssh: {}", host_clone.name);
-                                                                let (shell, args) = host_clone.resilient_shell_command();
-                                                                this.create_tab_with_cmd(&shell, &args, Some(title), window, cx);
-                                                            }))
-                                                            .child(
-                                                                div()
-                                                                    .flex()
-                                                                    .flex_col()
-                                                                    .child(
-                                                                        div()
-                                                                            .flex()
-                                                                            .flex_row()
-                                                                            .items_center()
-                                                                            .gap_2()
-                                                                            .child(
-                                                                                div()
-                                                                                    .text_size(px(12.))
-                                                                                    .font_weight(FontWeight::BOLD)
-                                                                                    .text_color(if is_selected { theme.black } else { theme.foreground })
-                                                                                    .child(host.name.clone()),
-                                                                            )
-                                                                            .when(is_already_connected, |el| {
-                                                                                el.child(
-                                                                                    div()
-                                                                                        .px(px(4.))
-                                                                                        .py(px(1.))
-                                                                                        .rounded(px(3.))
-                                                                                        .bg(theme.green.opacity(0.2))
-                                                                                        .text_size(px(9.))
-                                                                                        .font_weight(FontWeight::BOLD)
-                                                                                        .text_color(theme.green)
-                                                                                        .child("● Active"),
-                                                                                )
-                                                                            }),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .text_size(px(10.5))
-                                                                            .text_color(if is_selected { theme.black.opacity(0.85) } else { theme.muted })
-                                                                            .child(format!("{}@{}", host.user, host.hostname)),
-                                                                    ),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .flex()
-                                                                    .flex_row()
-                                                                    .items_center()
-                                                                    .gap_1()
-                                                                    .child(
-                                                                        div()
-                                                                            .px(px(5.))
-                                                                            .py(px(1.5))
-                                                                            .rounded(px(3.))
-                                                                            .bg(if is_selected { theme.black } else { theme.surface_raised })
-                                                                            .text_size(px(9.5))
-                                                                            .font_weight(FontWeight::MEDIUM)
-                                                                            .text_color(if is_selected { theme.accent } else { theme.muted_strong })
-                                                                            .child(format!("#{}", host.tag)),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .px(px(5.))
-                                                                            .py(px(1.5))
-                                                                            .rounded(px(3.))
-                                                                            .bg(if is_selected { theme.black } else { theme.surface_raised })
-                                                                            .text_size(px(9.5))
-                                                                            .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                                                                            .text_color(if is_selected { theme.black.opacity(0.7) } else { theme.muted })
-                                                                            .child(format!(":{}", host.port)),
-                                                                    ),
-                                                            )
-                                                    })
-                                                    .collect()
-                                            }
-                                        ),
+                                        .px(px(10.))
+                                        .pb(px(8.))
+                                        .gap(px(4.))
+                                        .children(rows),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .px(px(16.))
+                                        .py(px(9.))
+                                        .text_size(px(11.))
+                                        .text_color(theme.muted)
+                                        .child("↑↓ navigate   ↵ connect in new tab   esc close"),
                                 ),
                         ),
                 )
@@ -18579,20 +19118,45 @@ impl Render for RootView {
             // In-Terminal Search Bar Overlay
             .when(self.is_search_open, |this| {
                 let match_count = self.search_matches.len();
-                let current_match_display = if match_count == 0 {
+                let counter = if self.search_invalid_pattern {
+                    "invalid pattern".to_string()
+                } else if match_count == 0 {
                     "0/0".to_string()
                 } else {
                     format!("{}/{}", self.search_match_idx + 1, match_count)
                 };
+                let has_query = !self.search_query.trim().is_empty();
+
+                let active_bounds = self
+                    .tabs
+                    .get(self.active_tab_idx)
+                    .and_then(|tab| tab.pane_tree.active_pane())
+                    .and_then(|pane| pane.last_bounds);
+                let viewport_width = _window.viewport_size().width.to_f64() as f32;
+                let (bar_top, bar_right, bar_width) = match active_bounds {
+                    Some(bounds) => {
+                        let pane_right = bounds.origin.x.to_f64() as f32
+                            + bounds.size.width.to_f64() as f32;
+                        (
+                            bounds.origin.y.to_f64() as f32 + BUFFER_BAR_INSET,
+                            (viewport_width - pane_right + BUFFER_BAR_INSET).max(8.0),
+                            ((bounds.size.width.to_f64() as f32 - 16.0).clamp(200.0, 360.0)),
+                        )
+                    }
+                    None => (40.0, 12.0, 360.0),
+                };
+                let compact_bar = bar_width < 300.0;
 
                 this.child(
                     div()
                         .absolute()
-                        .top(px(36.))
-                        .right(px(12.))
-                        .w(px(310.))
-                        .p(px(6.))
-                        .rounded(px(8.))
+                        .top(px(bar_top))
+                        .right(px(bar_right))
+                        .occlude()
+                        .w(px(bar_width))
+                        .h(px(BUFFER_BAR_HEIGHT))
+                        .px(px(12.))
+                        .rounded(px(9.))
                         .bg(theme.surface)
                         .border_1()
                         .border_color(theme.border)
@@ -18600,40 +19164,118 @@ impl Render for RootView {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap_2()
-                        .child(render_icon(IconType::Search, theme.accent, 13.0))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(12.))
-                                .text_color(if self.search_query.is_empty() { theme.muted } else { theme.foreground })
-                                .child(if self.search_query.is_empty() {
-                                    "Find in terminal...".to_string()
-                                } else {
-                                    format!("{}|", self.search_query)
-                                }),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(10.5))
-                                .text_color(theme.muted)
-                                .child(current_match_display),
-                        )
-                        // Prev match button
-                        .child(
-                            div()
-                                .cursor(CursorStyle::PointingHand)
-                                .w(px(18.))
-                                .h(px(18.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(3.))
-                                .bg(theme.surface_raised)
-                                .hover(|s| s.bg(theme.hover))
-                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                    if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
-                                        if let Some(ref term) = active_tab.terminal {
+                        .gap(px(8.))
+                        .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(render_icon(IconType::Search, theme.accent, 14.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .overflow_hidden()
+                                        .truncate()
+                                        .text_size(px(13.))
+                                        .text_color(if has_query {
+                                            theme.foreground
+                                        } else {
+                                            theme.muted
+                                        })
+                                        .child(if has_query {
+                                            format!("{}|", self.search_query)
+                                        } else {
+                                            "Find in buffer".to_string()
+                                        }),
+                                )
+                                .when(has_query && !compact_bar, |row| {
+                                    row.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(px(10.5))
+                                            .text_color(if self.search_invalid_pattern {
+                                                theme.red
+                                            } else {
+                                                theme.muted
+                                            })
+                                            .child(SharedString::from(counter)),
+                                    )
+                                })
+                                .when(!compact_bar, |row| {
+                                    row.child(
+                                        div()
+                                            .id("buffer-search-case")
+                                            .flex_shrink_0()
+                                            .px(px(6.))
+                                        .py(px(2.))
+                                        .rounded(px(6.))
+                                        .when(self.search_case_sensitive, |toggle| {
+                                            toggle.bg(theme.surface_raised)
+                                        })
+                                        .text_size(px(11.5))
+                                        .text_color(if self.search_case_sensitive {
+                                            theme.accent
+                                        } else {
+                                            theme.muted
+                                        })
+                                        .cursor(CursorStyle::PointingHand)
+                                        .hover(move |style| style.text_color(theme.foreground))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                            this.search_case_sensitive = !this.search_case_sensitive;
+                                            this.refresh_buffer_search(_window, cx);
+                                        }))
+                                            .child("Aa"),
+                                    )
+                                })
+                                .when(!compact_bar, |row| {
+                                    row.child(
+                                        div()
+                                            .id("buffer-search-regex")
+                                            .flex_shrink_0()
+                                            .px(px(6.))
+                                        .py(px(2.))
+                                        .rounded(px(6.))
+                                        .when(self.search_regex, |toggle| {
+                                            toggle.bg(theme.surface_raised)
+                                        })
+                                        .text_size(px(11.5))
+                                        .text_color(if self.search_regex {
+                                            theme.accent
+                                        } else {
+                                            theme.muted
+                                        })
+                                        .cursor(CursorStyle::PointingHand)
+                                        .hover(move |style| style.text_color(theme.foreground))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                            this.search_regex = !this.search_regex;
+                                            this.refresh_buffer_search(_window, cx);
+                                        }))
+                                            .child(".*"),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .w(px(1.))
+                                        .h(px(14.))
+                                        .bg(theme.border)
+                                        .flex_shrink_0(),
+                                )
+                                .child(
+                                    div()
+                                        .id("buffer-search-prev")
+                                        .flex_shrink_0()
+                                        .w(px(22.))
+                                        .h(px(22.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(5.))
+                                        .cursor(CursorStyle::PointingHand)
+                                        .hover(move |style| style.bg(theme.hover))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                                             if !this.search_matches.is_empty() {
                                                 this.search_match_idx = if this.search_match_idx == 0 {
                                                     this.search_matches.len() - 1
@@ -18641,249 +19283,360 @@ impl Render for RootView {
                                                     this.search_match_idx - 1
                                                 };
                                                 let offset = this.search_matches[this.search_match_idx];
-                                                term.scroll_to_offset(offset);
-                                                this.last_scroll_activity = std::time::Instant::now();
+                                                this.scroll_buffer_search_to(offset, _window);
                                                 cx.notify();
                                             }
-                                        }
-                                    }
-                                }))
-                                .child(render_icon(IconType::ChevronUp, theme.accent, 11.0)),
-                        )
-                        // Next match button
-                        .child(
-                            div()
-                                .cursor(CursorStyle::PointingHand)
-                                .w(px(18.))
-                                .h(px(18.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(3.))
-                                .bg(theme.surface_raised)
-                                .hover(|s| s.bg(theme.hover))
-                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                    if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
-                                        if let Some(ref term) = active_tab.terminal {
+                                        }))
+                                        .child(render_icon(IconType::ChevronUp, theme.muted_strong, 12.0)),
+                                )
+                                .child(
+                                    div()
+                                        .id("buffer-search-next")
+                                        .flex_shrink_0()
+                                        .w(px(22.))
+                                        .h(px(22.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(5.))
+                                        .cursor(CursorStyle::PointingHand)
+                                        .hover(move |style| style.bg(theme.hover))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                                             if !this.search_matches.is_empty() {
-                                                this.search_match_idx = (this.search_match_idx + 1) % this.search_matches.len();
+                                                this.search_match_idx =
+                                                    (this.search_match_idx + 1) % this.search_matches.len();
                                                 let offset = this.search_matches[this.search_match_idx];
-                                                term.scroll_to_offset(offset);
-                                                this.last_scroll_activity = std::time::Instant::now();
+                                                this.scroll_buffer_search_to(offset, _window);
                                                 cx.notify();
                                             }
-                                        }
-                                    }
-                                }))
-                                .child(render_icon(IconType::ChevronDown, theme.accent, 11.0)),
-                        )
-                        // Close button
-                        .child(
-                            div()
-                                .cursor(CursorStyle::PointingHand)
-                                .w(px(18.))
-                                .h(px(18.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(3.))
-                                .bg(theme.surface_raised)
-                                .hover(|s| s.bg(theme.hover))
-                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                    this.is_search_open = false;
-                                    cx.notify();
-                                }))
-                                .child(render_icon(IconType::X, theme.accent, 11.0)),
-                        ),
+                                        }))
+                                        .child(render_icon(IconType::ChevronDown, theme.muted_strong, 12.0)),
+                                )
+                                .child(
+                                    div()
+                                        .id("buffer-search-close")
+                                        .flex_shrink_0()
+                                        .w(px(22.))
+                                        .h(px(22.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(5.))
+                                        .cursor(CursorStyle::PointingHand)
+                                        .hover(move |style| style.bg(theme.hover))
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                            this.is_search_open = false;
+                                            cx.notify();
+                                        }))
+                                        .child(render_icon(IconType::X, theme.muted_strong, 12.0)),
+                                ),
                 )
             })
             // Git Worktree Picker Modal
             .when(self.is_worktree_picker_open, |this| {
-                let active_cwd = self.tabs.get(self.active_tab_idx).and_then(|t| t.cwd.as_deref());
-                let is_git = active_cwd.is_some_and(crate::git::is_git_repo);
-                let worktrees = active_cwd.map(crate::git::list_worktrees).unwrap_or_default();
+                let active_cwd = self.tabs.get(self.active_tab_idx).and_then(|tab| tab.cwd.clone());
+                let is_git = active_cwd.as_deref().is_some_and(crate::git::is_git_repo);
+                let worktrees = active_cwd
+                    .as_deref()
+                    .map(crate::git::list_worktrees)
+                    .unwrap_or_default();
+                let canonical_worktrees: Vec<(std::path::PathBuf, std::path::PathBuf)> = worktrees
+                    .iter()
+                    .map(|worktree| {
+                        let canonical = worktree
+                            .path
+                            .canonicalize()
+                            .unwrap_or_else(|_| worktree.path.clone());
+                        (worktree.path.clone(), canonical)
+                    })
+                    .collect();
+                let current_worktree = active_cwd.as_deref().and_then(|cwd| {
+                    let cwd = cwd
+                        .canonicalize()
+                        .unwrap_or_else(|_| cwd.to_path_buf());
+                    canonical_worktrees
+                        .iter()
+                        .filter(|(_, canonical)| cwd.starts_with(canonical))
+                        .max_by_key(|(_, canonical)| canonical.as_os_str().len())
+                        .map(|(raw, _)| raw.clone())
+                });
                 let query = self.worktree_picker_query.to_lowercase();
                 let filtered: Vec<crate::git::Worktree> = worktrees
                     .into_iter()
-                    .filter(|w| query.is_empty() || w.short_branch().to_lowercase().contains(&query) || w.path.to_string_lossy().to_lowercase().contains(&query))
+                    .filter(|worktree| {
+                        query.is_empty()
+                            || worktree.short_branch().to_lowercase().contains(&query)
+                            || worktree
+                                .path
+                                .to_string_lossy()
+                                .to_lowercase()
+                                .contains(&query)
+                    })
                     .collect();
                 let selected_idx = self.worktree_picker_selected;
+                let total = filtered.len();
+                let changes = self.worktree_picker_changes.clone();
+                let font_family = self.font_family.clone();
+
+                let mut rows: Vec<gpui::AnyElement> = Vec::new();
+                if !is_git {
+                    rows.push(
+                        div()
+                            .px(px(16.))
+                            .py(px(18.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.foreground)
+                                    .child("Not a Git repository"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted)
+                                    .child("Current tab directory is not within a Git worktree."),
+                            )
+                            .into_any_element(),
+                    );
+                } else if filtered.is_empty() {
+                    rows.push(
+                        div()
+                            .px(px(16.))
+                            .py(px(18.))
+                            .text_size(px(12.))
+                            .text_color(theme.muted)
+                            .child("No worktrees match your filter")
+                            .into_any_element(),
+                    );
+                } else {
+                    for (idx, worktree) in filtered.into_iter().enumerate() {
+                        let is_selected = idx == selected_idx;
+                        let is_current =
+                            current_worktree.as_deref() == Some(worktree.path.as_path());
+                        let changed = changes
+                            .iter()
+                            .find(|(path, _)| path == &worktree.path)
+                            .map(|(_, count)| *count);
+                        let (status_text, status_color) = match changed {
+                            None => (String::new(), theme.muted),
+                            Some(None) => ("unavailable".to_string(), theme.muted),
+                            Some(Some(0)) => ("clean".to_string(), theme.muted),
+                            Some(Some(count)) => (format!("{count} changed"), theme.yellow),
+                        };
+                        let worktree_clone = worktree.clone();
+                        rows.push(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .h(px(52.))
+                                .px(px(10.))
+                                .rounded(px(8.))
+                                .when(is_selected, |row| row.bg(theme.surface_raised))
+                                .when(!is_selected, |row| {
+                                    row.hover(move |style| style.bg(theme.hover))
+                                })
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                    if this.worktree_picker_selected != idx {
+                                        this.worktree_picker_selected = idx;
+                                        cx.notify();
+                                    }
+                                }))
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
+                                    let shell = this
+                                        .config
+                                        .shell
+                                        .clone()
+                                        .or_else(|| std::env::var("SHELL").ok())
+                                        .unwrap_or_else(crate::paths::default_system_shell);
+                                    let title = worktree_clone.short_branch().to_string();
+                                    let path = worktree_clone.path.clone();
+                                    this.is_worktree_picker_open = false;
+                                    this.create_tab_with_cmd_and_cwd(
+                                        &shell,
+                                        &[],
+                                        Some(&path),
+                                        Some(title),
+                                        window,
+                                        cx,
+                                    );
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.))
+                                        .min_w(px(0.))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(10.))
+                                                .child(
+                                                    div()
+                                                        .min_w(px(0.))
+                                                        .truncate()
+                                                        .text_size(px(14.))
+                                                        .text_color(theme.foreground)
+                                                        .child(SharedString::from(
+                                                            worktree.short_branch().to_string(),
+                                                        )),
+                                                )
+                                                .when(is_current, |row| {
+                                                    row.child(
+                                                        div()
+                                                            .px(px(6.))
+                                                            .py(px(2.))
+                                                            .rounded(px(4.))
+                                                            .bg(theme.green.opacity(0.15))
+                                                            .text_size(px(10.5))
+                                                            .text_color(theme.green)
+                                                            .child("current"),
+                                                    )
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(px(11.5))
+                                                .text_color(theme.muted)
+                                                .child(SharedString::from(Self::short_home_path(
+                                                    &worktree.path,
+                                                ))),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .items_end()
+                                        .gap(px(4.))
+                                        .flex_shrink_0()
+                                        .child(
+                                            div()
+                                                .font_family(font_family.clone())
+                                                .text_size(px(11.5))
+                                                .text_color(theme.muted)
+                                                .child(SharedString::from(
+                                                    worktree.short_commit().to_string(),
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .text_color(status_color)
+                                                .child(SharedString::from(status_text)),
+                                        ),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                }
 
                 this.child(
                     div()
                         .absolute()
                         .inset_0()
-                        .bg(rgb_to_hsla(0, 0, 0).opacity(0.45))
+                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.55))
                         .flex()
-                        .items_start()
-                        .justify_center()
-                        .pt(px(70.))
+                        .flex_col()
+                        .items_center()
+                        .px(px(16.))
+                        .pt(px(52.))
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                             this.is_worktree_picker_open = false;
                             cx.notify();
                         }))
                         .child(
                             div()
-                                .w(px(520.))
-                                .rounded(px(10.))
+                                .occlude()
+                                .w_full()
+                                .max_w(px(560.))
+                                .max_h(gpui::relative(0.88))
+                                .rounded(px(12.))
                                 .bg(theme.surface)
                                 .border_1()
                                 .border_color(theme.border)
                                 .shadow_xl()
-                                .p(px(8.))
                                 .flex()
                                 .flex_col()
-                                .gap_2()
+                                .overflow_hidden()
                                 .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
                                     cx.stop_propagation();
                                 })
                                 .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
                                     cx.stop_propagation();
                                 })
-                                // Header & Search Input
                                 .child(
                                     div()
                                         .flex()
                                         .flex_row()
                                         .items_center()
-                                        .gap_2()
-                                        .px(px(8.))
-                                        .py(px(6.))
-                                        .rounded(px(6.))
-                                        .bg(theme.surface_raised)
-                                        .child(render_icon(IconType::GitPullRequest, theme.accent, 14.0))
+                                        .gap(px(14.))
+                                        .px(px(16.))
+                                        .pt(px(12.))
+                                        .pb(px(8.))
+                                        .child(render_icon(IconType::GitBranch, theme.accent, 16.0))
                                         .child(
                                             div()
                                                 .flex_1()
-                                                .text_size(px(13.))
-                                                .text_color(if self.worktree_picker_query.is_empty() { theme.muted } else { theme.foreground })
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_size(px(15.))
+                                                .text_color(if self.worktree_picker_query.is_empty() {
+                                                    theme.muted
+                                                } else {
+                                                    theme.foreground
+                                                })
                                                 .child(if self.worktree_picker_query.is_empty() {
-                                                    "Filter Git worktrees...".to_string()
+                                                    "Filter worktrees...".to_string()
                                                 } else {
                                                     format!("{}|", self.worktree_picker_query)
                                                 }),
                                         )
                                         .child(
                                             div()
-                                                .px(px(6.))
-                                                .py(px(2.))
-                                                .rounded(px(4.))
-                                                .bg(theme.surface)
-                                                .text_size(px(10.))
+                                                .text_size(px(11.5))
                                                 .text_color(theme.muted)
-                                                .child("ESC to close"),
+                                                .child(SharedString::from(if total == 1 {
+                                                    "1 worktree".to_string()
+                                                } else {
+                                                    format!("{total} worktrees")
+                                                })),
                                         ),
                                 )
-                                // Worktree List
                                 .child(
                                     div()
                                         .id("worktrees-list")
                                         .track_scroll(&self.worktree_picker_scroll_handle)
                                         .flex()
                                         .flex_col()
-                                        .max_h(px(280.))
+                                        .max_h(px(320.))
+                                        .min_h(px(0.))
+                                        .flex_shrink(1.)
                                         .overflow_y_scroll()
-                                        .p(px(4.))
-                                        .gap_1()
-                                        .children(
-                                            if !is_git {
-                                                vec![
-                                                    div()
-                                                        .p(px(16.))
-                                                        .flex()
-                                                        .flex_col()
-                                                        .gap_1()
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(12.))
-                                                                .text_color(theme.foreground)
-                                                                .child("Not a Git repository"),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(11.))
-                                                                .text_color(theme.muted)
-                                                                .child("Current tab directory is not within a Git worktree."),
-                                                        ),
-                                                ]
-                                            } else if filtered.is_empty() {
-                                                vec![
-                                                    div()
-                                                        .p(px(16.))
-                                                        .flex()
-                                                        .flex_col()
-                                                        .gap_1()
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(12.))
-                                                                .text_color(theme.foreground)
-                                                                .child("No worktrees match your filter"),
-                                                        ),
-                                                ]
-                                            } else {
-                                                filtered
-                                                    .into_iter()
-                                                    .enumerate()
-                                                    .map(|(idx, wt)| {
-                                                        let is_selected = idx == selected_idx;
-                                                        let wt_clone = wt.clone();
-                                                        div()
-                                                            .flex()
-                                                            .flex_row()
-                                                            .items_center()
-                                                            .justify_between()
-                                                            .px(px(10.))
-                                                            .py(px(6.))
-                                                            .rounded(px(6.))
-                                                            .bg(if is_selected { theme.accent } else { theme.surface })
-                                                            .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
-                                                            .cursor(CursorStyle::PointingHand)
-                                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
-                                                                if this.worktree_picker_selected != idx {
-                                                                    this.worktree_picker_selected = idx;
-                                                                    cx.notify();
-                                                                }
-                                                            }))
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
-                                                                let shell = this.config.shell.clone().or_else(|| std::env::var("SHELL").ok()).unwrap_or_else(crate::paths::default_system_shell);
-                                                                let title = wt_clone.short_branch().to_string();
-                                                                let path = wt_clone.path.clone();
-                                                                this.is_worktree_picker_open = false;
-                                                                this.create_tab_with_cmd_and_cwd(&shell, &[], Some(&path), Some(title), window, cx);
-                                                            }))
-                                                            .child(
-                                                                div()
-                                                                    .flex()
-                                                                    .flex_col()
-                                                                    .child(
-                                                                        div()
-                                                                            .text_size(px(12.))
-                                                                            .font_weight(FontWeight::BOLD)
-                                                                            .text_color(if is_selected { theme.black } else { theme.foreground })
-                                                                            .child(format!("branch: {}", wt.short_branch())),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .text_size(px(10.5))
-                                                                            .text_color(if is_selected { theme.black.opacity(0.85) } else { theme.muted })
-                                                                            .child(wt.path.to_string_lossy().to_string()),
-                                                                    ),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .px(px(6.))
-                                                                    .py(px(2.))
-                                                                    .rounded(px(3.))
-                                                                    .bg(if is_selected { theme.black } else { theme.surface_raised })
-                                                                    .text_size(px(10.))
-                                                                    .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                                                                    .text_color(if is_selected { theme.accent } else { theme.muted })
-                                                                    .child(wt.short_commit().to_string()),
-                                                            )
-                                                    })
-                                                    .collect()
-                                            }
-                                        ),
+                                        .px(px(10.))
+                                        .pb(px(8.))
+                                        .gap(px(4.))
+                                        .children(rows),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .px(px(16.))
+                                        .py(px(9.))
+                                        .text_size(px(11.))
+                                        .text_color(theme.muted)
+                                        .child("↑↓ navigate   ↵ open in new tab   esc close"),
                                 ),
                         ),
                 )
@@ -20273,7 +21026,339 @@ impl Render for RootView {
             .when(self.is_global_search_open, |this| {
                 let backdrop = gpui::hsla(0.0, 0.0, 0.0, 0.65);
                 let selected_idx = self.global_search_selected;
-                let results_count = self.global_search_results.len();
+                let query = self.global_search_query.clone();
+                let has_query = !query.trim().is_empty();
+                let total_matches = self.global_search_results.len();
+                let mut matched_tabs: Vec<usize> = self
+                    .global_search_results
+                    .iter()
+                    .map(|result| result.tab_id)
+                    .collect();
+                matched_tabs.sort_unstable();
+                matched_tabs.dedup();
+                let search_all = shortcut_label_for(
+                    crate::keybindings::Action::GlobalSearch,
+                    if cfg!(target_os = "macos") { "⌘⇧F" } else { "Ctrl+Shift+F" },
+                );
+                let alt_case = if cfg!(target_os = "macos") { "⌥C" } else { "Alt+C" };
+                let alt_regex = if cfg!(target_os = "macos") { "⌥R" } else { "Alt+R" };
+                let font_family = self.font_family.clone();
+
+                let mut rows: Vec<gpui::AnyElement> = Vec::new();
+                if !has_query {
+                    rows.push(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.))
+                            .px(px(14.))
+                            .pt(px(14.))
+                            .pb(px(6.))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(theme.muted)
+                                    .child("#"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.5))
+                                    .text_color(theme.muted_strong)
+                                    .child(SharedString::from(format!(
+                                        "searching {} tabs",
+                                        self.tabs.len()
+                                    ))),
+                            )
+                            .into_any_element(),
+                    );
+                    for (tab_id, pane_id, lines) in self.global_search_pane_lines.clone() {
+                        let tab = self.tabs.iter().find(|tab| tab.id == tab_id);
+                        let pane = tab.and_then(|tab| {
+                            if pane_id > 0 {
+                                tab.pane_tree.find_pane(pane_id)
+                            } else {
+                                tab.pane_tree.active_pane()
+                            }
+                        });
+                        let title = pane
+                            .map(|pane| {
+                                pane.custom_title
+                                    .clone()
+                                    .unwrap_or_else(|| pane.title.clone())
+                            })
+                            .or_else(|| tab.map(|tab| tab.title.clone()))
+                            .unwrap_or_else(|| "terminal".to_string());
+                        let process = pane
+                            .and_then(|pane| pane.terminal.as_ref())
+                            .and_then(|terminal| terminal.get_foreground_process_name())
+                            .unwrap_or_else(|| "sh".to_string());
+                        let (icon, _) = super::icons::get_deck_process_icon(&process);
+                        let cwd = self.global_search_pane_cwd(tab_id, pane_id);
+                        rows.push(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .h(px(44.))
+                                .px(px(10.))
+                                .rounded(px(8.))
+                                .hover(move |style| style.bg(theme.hover))
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                    this.is_global_search_open = false;
+                                    this.jump_to_global_search_result(tab_id, pane_id, None, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(10.))
+                                        .min_w(px(0.))
+                                        .child(render_icon(icon, theme.muted_strong, 15.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(13.))
+                                                .text_color(theme.foreground)
+                                                .child(SharedString::from(title)),
+                                        )
+                                        .when_some(cwd, |row, cwd| {
+                                            row.child(
+                                                div()
+                                                    .text_size(px(11.5))
+                                                    .text_color(theme.muted)
+                                                    .child(SharedString::from(cwd)),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.muted)
+                                        .child(SharedString::from(if lines == 1 {
+                                            "1 line".to_string()
+                                        } else {
+                                            format!("{lines} lines")
+                                        })),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                    rows.push(
+                        div()
+                            .px(px(10.))
+                            .pt(px(10.))
+                            .pb(px(4.))
+                            .text_size(px(12.))
+                            .text_color(theme.muted)
+                            .child(format!(
+                                "Searches the scrollback of every open tab and split. Use {alt_case} for match case and {alt_regex} for regex."
+                            ))
+                            .into_any_element(),
+                    );
+                } else if self.global_search_invalid_pattern {
+                    rows.push(
+                        div()
+                            .px(px(14.))
+                            .py(px(18.))
+                            .text_size(px(13.))
+                            .text_color(theme.red)
+                            .child("Invalid regular expression")
+                            .into_any_element(),
+                    );
+                } else if self.global_search_results.is_empty() {
+                    rows.push(
+                        div()
+                            .px(px(14.))
+                            .py(px(18.))
+                            .text_size(px(13.))
+                            .text_color(theme.muted)
+                            .child("No matches found across active tabs")
+                            .into_any_element(),
+                    );
+                } else {
+                    let results = self.global_search_results.clone();
+                    let regex_highlighter = if self.global_search_regex {
+                        regex::RegexBuilder::new(query.trim())
+                            .case_insensitive(!self.global_search_case_sensitive)
+                            .build()
+                            .ok()
+                    } else {
+                        None
+                    };
+                    let mut current: Option<(usize, usize)> = None;
+                    for (idx, result) in results.iter().enumerate() {
+                        let key = (result.tab_id, result.pane_id);
+                        if current != Some(key) {
+                            current = Some(key);
+                            let group_len = results
+                                .iter()
+                                .filter(|other| {
+                                    other.tab_id == result.tab_id
+                                        && other.pane_id == result.pane_id
+                                })
+                                .count();
+                            let process = result
+                                .process_name
+                                .clone()
+                                .unwrap_or_else(|| "sh".to_string());
+                            let (icon, _) = super::icons::get_deck_process_icon(&process);
+                            let cwd = self.global_search_pane_cwd(result.tab_id, result.pane_id);
+                            rows.push(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .px(px(10.))
+                                    .pt(px(12.))
+                                    .pb(px(2.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(10.))
+                                            .min_w(px(0.))
+                                            .child(render_icon(icon, theme.muted_strong, 15.0))
+                                            .child(
+                                                div()
+                                                    .text_size(px(13.))
+                                                    .text_color(theme.foreground)
+                                                    .child(SharedString::from(
+                                                        result.tab_title.clone(),
+                                                    )),
+                                            )
+                                            .when_some(cwd, |row, cwd| {
+                                                row.child(
+                                                    div()
+                                                        .text_size(px(11.5))
+                                                        .text_color(theme.muted)
+                                                        .child(SharedString::from(cwd)),
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(theme.muted)
+                                            .child(SharedString::from(group_len.to_string())),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                        let is_selected = idx == selected_idx;
+                        let tab_id = result.tab_id;
+                        let pane_id = result.pane_id;
+                        let offset = result.offset;
+                        let line_number = result.line_number;
+                        let highlights = if let Some(pattern) = regex_highlighter.as_ref() {
+                            let style = HighlightStyle {
+                                color: Some(theme.black),
+                                background_color: Some(theme.accent),
+                                ..Default::default()
+                            };
+                            pattern
+                                .find_iter(&result.line_content)
+                                .map(|matched| (matched.start()..matched.end(), style.clone()))
+                                .collect()
+                        } else {
+                            search_match_highlights(
+                                &result.line_content,
+                                &query,
+                                self.global_search_case_sensitive,
+                                theme.accent,
+                                theme.black,
+                            )
+                        };
+                        rows.push(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .h(px(44.))
+                                .px(px(12.))
+                                .rounded(px(8.))
+                                .when(is_selected, |row| row.bg(theme.surface_raised))
+                                .when(!is_selected, |row| {
+                                    row.hover(move |style| style.bg(theme.hover))
+                                })
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                    if this.global_search_selected != idx {
+                                        this.global_search_selected = idx;
+                                        cx.notify();
+                                    }
+                                }))
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                    this.is_global_search_open = false;
+                                    this.jump_to_global_search_result(
+                                        tab_id,
+                                        pane_id,
+                                        Some(offset),
+                                        cx,
+                                    );
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(12.))
+                                        .min_w(px(0.))
+                                        .child(
+                                            div()
+                                                .w(px(36.))
+                                                .flex_shrink_0()
+                                                .text_size(px(11.5))
+                                                .text_color(theme.muted)
+                                                .text_right()
+                                                .child(SharedString::from(line_number.to_string())),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .font_family(font_family.clone())
+                                                .text_size(px(12.5))
+                                                .text_color(theme.foreground)
+                                                .child(
+                                                    StyledText::new(SharedString::from(
+                                                        result.line_content.clone(),
+                                                    ))
+                                                    .with_highlights(highlights),
+                                                ),
+                                        ),
+                                )
+                                .when(is_selected, |row| {
+                                    row.child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(5.))
+                                            .flex_shrink_0()
+                                            .text_size(px(11.))
+                                            .text_color(theme.muted)
+                                            .child("open tab")
+                                            .child(
+                                                div()
+                                                    .px(px(6.))
+                                                    .py(px(2.))
+                                                    .rounded(px(5.))
+                                                    .bg(theme.surface)
+                                                    .text_color(theme.muted_strong)
+                                                    .child("↵"),
+                                            ),
+                                    )
+                                })
+                                .into_any_element(),
+                        );
+                    }
+                }
 
                 this.child(
                     div()
@@ -20283,15 +21368,17 @@ impl Render for RootView {
                         .flex()
                         .flex_col()
                         .items_center()
-                        .pt(px(60.))
+                        .px(px(16.))
+                        .pt(px(52.))
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                             this.is_global_search_open = false;
                             cx.notify();
                         }))
                         .child(
                             div()
-                                .w(px(580.))
-                                .rounded(px(10.))
+                                .w_full()
+                                .max_w(px(620.))
+                                .rounded(px(12.))
                                 .bg(theme.surface)
                                 .border_1()
                                 .border_color(theme.border)
@@ -20305,56 +21392,96 @@ impl Render for RootView {
                                 .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
                                     cx.stop_propagation();
                                 })
-                                // Input Box Header
+                                // Query row
                                 .child(
                                     div()
                                         .flex()
                                         .flex_row()
                                         .items_center()
-                                        .gap_2()
-                                        .px(px(12.))
-                                        .py(px(10.))
-                                        .border_b_1()
-                                        .border_color(theme.border)
-                                        .child(render_icon(IconType::Search, theme.accent, 14.0))
+                                        .gap(px(14.))
+                                        .px(px(16.))
+                                        .pt(px(12.))
+                                        .pb(px(8.))
+                                        .child(render_icon(IconType::Search, theme.accent, 16.0))
                                         .child(
                                             div()
                                                 .flex_1()
-                                                .text_size(px(13.))
-                                                .text_color(if self.global_search_query.is_empty() {
-                                                    theme.muted
-                                                } else {
+                                                .min_w(px(0.))
+                                                .overflow_hidden()
+                                                .truncate()
+                                                .text_size(px(15.))
+                                                .text_color(if has_query {
                                                     theme.foreground
-                                                })
-                                                .child(if self.global_search_query.is_empty() {
-                                                    "Search in all open tabs and splits (⌘⇧F)...".to_string()
                                                 } else {
+                                                    theme.muted
+                                                })
+                                                .child(if has_query {
                                                     format!("{}|", self.global_search_query)
+                                                } else {
+                                                    "Search every tab and pane...".to_string()
                                                 }),
                                         )
+                                        .when(has_query && total_matches > 0, |row| {
+                                            row.child(
+                                                div()
+                                                    .text_size(px(11.5))
+                                                    .text_color(theme.muted)
+                                                    .child(SharedString::from(format!(
+                                                        "{} matches · {} tabs",
+                                                        total_matches,
+                                                        matched_tabs.len()
+                                                    ))),
+                                            )
+                                        })
                                         .child(
                                             div()
+                                                .id("global-search-case")
                                                 .px(px(6.))
                                                 .py(px(2.))
-                                                .rounded(px(3.))
-                                                .bg(theme.surface_raised)
-                                                .text_size(px(10.))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(if results_count > 0 { theme.accent } else { theme.muted })
-                                                .child(format!("{results_count} results")),
+                                                .rounded(px(5.))
+                                                .when(self.global_search_case_sensitive, |toggle| {
+                                                    toggle.bg(theme.surface_raised)
+                                                })
+                                                .text_size(px(12.))
+                                                .text_color(if self.global_search_case_sensitive {
+                                                    theme.accent
+                                                } else {
+                                                    theme.muted
+                                                })
+                                                .cursor(CursorStyle::PointingHand)
+                                                .hover(move |style| style.text_color(theme.foreground))
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                    this.global_search_case_sensitive =
+                                                        !this.global_search_case_sensitive;
+                                                    this.update_global_search(cx);
+                                                }))
+                                                .child("Aa"),
                                         )
                                         .child(
                                             div()
-                                                .px(px(5.))
+                                                .id("global-search-regex")
+                                                .px(px(6.))
                                                 .py(px(2.))
-                                                .rounded(px(3.))
-                                                .bg(theme.surface_raised)
-                                                .text_size(px(10.))
-                                                .text_color(theme.muted)
-                                                .child("ESC"),
+                                                .rounded(px(5.))
+                                                .when(self.global_search_regex, |toggle| {
+                                                    toggle.bg(theme.surface_raised)
+                                                })
+                                                .text_size(px(12.))
+                                                .text_color(if self.global_search_regex {
+                                                    theme.accent
+                                                } else {
+                                                    theme.muted
+                                                })
+                                                .cursor(CursorStyle::PointingHand)
+                                                .hover(move |style| style.text_color(theme.foreground))
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                    this.global_search_regex = !this.global_search_regex;
+                                                    this.update_global_search(cx);
+                                                }))
+                                                .child(".*"),
                                         ),
                                 )
-                                // Results List
+                                // Grouped results
                                 .child(
                                     div()
                                         .id("global-search-results-list")
@@ -20362,131 +21489,31 @@ impl Render for RootView {
                                         .flex()
                                         .flex_col()
                                         .max_h(px(340.))
+                                        .min_h(px(0.))
+                                        .flex_shrink(1.)
                                         .overflow_y_scroll()
-                                        .p(px(4.))
-                                        .gap_1()
-                                        .children(
-                                            if self.global_search_query.trim().is_empty() {
-                                                vec![
-                                                    div()
-                                                        .p(px(20.))
-                                                        .flex()
-                                                        .flex_col()
-                                                        .items_center()
-                                                        .gap_1()
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(12.))
-                                                                .text_color(theme.foreground)
-                                                                .child("Find text across all tabs"),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(11.))
-                                                                .text_color(theme.muted)
-                                                                .child("Type any query to search the full scrollback of every active terminal."),
-                                                        ),
-                                                ]
-                                            } else if self.global_search_results.is_empty() {
-                                                vec![
-                                                    div()
-                                                        .p(px(16.))
-                                                        .flex()
-                                                        .flex_col()
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(12.))
-                                                                .text_color(theme.muted)
-                                                                .child("No matches found across active tabs"),
-                                                        ),
-                                                ]
-                                            } else {
-                                                self.global_search_results
-                                                    .iter()
-                                                    .enumerate()
-                                                    .map(|(idx, res)| {
-                                                        let is_selected = idx == selected_idx;
-                                                        let tab_id = res.tab_id;
-                                                        let offset = res.offset;
-                                                        let pane_id = res.pane_id;
-                                                        let proc_name = res.process_name.clone().unwrap_or_else(|| "sh".to_string());
-                                                        let (icon_type, _) = super::icons::get_deck_process_icon(&proc_name);
-
-                                                        div()
-                                                            .flex()
-                                                            .flex_col()
-                                                            .px(px(10.))
-                                                            .py(px(6.))
-                                                            .rounded(px(6.))
-                                                            .bg(if is_selected { theme.accent } else { theme.surface })
-                                                            .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
-                                                            .cursor(CursorStyle::PointingHand)
-                                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
-                                                                if this.global_search_selected != idx {
-                                                                    this.global_search_selected = idx;
-                                                                    cx.notify();
-                                                                }
-                                                            }))
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                                                this.is_global_search_open = false;
-                                                                this.select_tab(tab_id, cx);
-                                                                if let Some(active_tab) = this.tabs.iter().find(|t| t.id == tab_id) {
-                                                                    if pane_id > 0 {
-                                                                        if let Some(pane) = active_tab.pane_tree.find_pane(pane_id) {
-                                                                            if let Some(ref t) = pane.terminal {
-                                                                                t.scroll_to_offset(offset);
-                                                                            }
-                                                                        }
-                                                                    } else if let Some(ref t) = active_tab.terminal {
-                                                                        t.scroll_to_offset(offset);
-                                                                    }
-                                                                }
-                                                                cx.notify();
-                                                            }))
-                                                            .child(
-                                                                div()
-                                                                    .flex()
-                                                                    .flex_row()
-                                                                    .items_center()
-                                                                    .justify_between()
-                                                                    .child(
-                                                                        div()
-                                                                            .flex()
-                                                                            .flex_row()
-                                                                            .items_center()
-                                                                            .gap_1()
-                                                                            .child(render_icon(icon_type, if is_selected { theme.black } else { theme.accent }, 12.0))
-                                                                            .child(
-                                                                                div()
-                                                                                    .text_size(px(11.5))
-                                                                                    .font_weight(FontWeight::BOLD)
-                                                                                    .text_color(if is_selected { theme.black } else { theme.foreground })
-                                                                                    .child(format!("Tab #{}: {}", res.tab_idx + 1, res.tab_title)),
-                                                                            ),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .px(px(4.))
-                                                                            .py(px(1.))
-                                                                            .rounded(px(3.))
-                                                                            .bg(if is_selected { theme.black } else { theme.surface_raised })
-                                                                            .text_size(px(9.5))
-                                                                            .text_color(if is_selected { theme.accent } else { theme.muted })
-                                                                            .child(format!("Line {}", res.line_index)),
-                                                                    ),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .pt(px(2.))
-                                                                    .text_size(px(11.))
-                                                                    .font_family(self.font_family.clone())
-                                                                    .text_color(if is_selected { theme.black.opacity(0.9) } else { theme.muted })
-                                                                    .child(res.line_content.clone()),
-                                                            )
-                                                    })
-                                                    .collect()
-                                            }
-                                        ),
+                                        .px(px(8.))
+                                        .pb(px(6.))
+                                        .gap(px(4.))
+                                        .children(rows),
+                                )
+                                // Footer hints
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .px(px(16.))
+                                        .py(px(9.))
+                                        .text_size(px(11.))
+                                        .text_color(theme.muted)
+                                        .child(div().child(if has_query {
+                                            "↑↓ navigate   ↵ jump   esc clear"
+                                        } else {
+                                            "↑↓ navigate   ↵ jump   esc close"
+                                        }))
+                                        .child(div().child(format!("{search_all} search all"))),
                                 ),
                         ),
                 )
@@ -20494,52 +21521,408 @@ impl Render for RootView {
             .when(self.is_update_modal_open, |this| {
                 let release_opt = self.update_available.clone();
                 let has_release = release_opt.is_some();
+                let current_version = env!("CARGO_PKG_VERSION");
                 let version = release_opt
                     .as_ref()
-                    .map(|r| r.version.clone())
-                    .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+                    .map(|release| release.version.clone())
+                    .unwrap_or_else(|| current_version.to_string());
                 let release_url = release_opt
                     .as_ref()
-                    .map(|r| r.release_url.clone())
-                    .unwrap_or_else(|| "https://github.com/diegoleteliers10/fasty/releases".to_string());
+                    .map(|release| release.release_url.clone())
+                    .unwrap_or_else(|| {
+                        "https://github.com/diegoleteliers10/fasty/releases".to_string()
+                    });
                 let notes = release_opt
                     .as_ref()
-                    .and_then(|r| {
-                        let trimmed = r.release_notes.trim();
-                        if !trimmed.is_empty() {
-                            Some(trimmed.to_string())
-                        } else {
-                            None
-                        }
+                    .and_then(|release| {
+                        let trimmed = release.release_notes.trim();
+                        (!trimmed.is_empty()).then(|| trimmed.to_string())
                     })
                     .or_else(|| crate::whats_new::notes_for(&version))
                     .unwrap_or_else(|| "Bug fixes and performance improvements.".to_string());
+                let checking = self.update_status.as_deref() == Some("Checking for updates...");
+                let check_error = self.update_status.as_deref().and_then(|status| {
+                    status
+                        .strip_prefix("Update check failed:")
+                        .map(|rest| rest.trim().to_string())
+                });
+                let download_error = self.update_status.as_deref().and_then(|status| {
+                    status
+                        .strip_prefix("Update failed:")
+                        .map(|rest| rest.trim().to_string())
+                });
+                let is_download_failure = download_error.is_some();
+                let failed_error = download_error.clone().or_else(|| check_error.clone());
+                let failed = failed_error.is_some();
 
-                let title = if self.is_update_ready {
-                    format!("Fastty v{} is ready to install", version)
-                } else if self.is_updating {
-                    format!("Downloading Fastty v{}...", version)
-                } else if has_release {
-                    format!("Fastty v{} is available", version)
-                } else if self.update_status.as_deref() == Some("Checking for updates...") {
-                    "Checking for updates...".to_string()
-                } else if self.update_status.as_deref().is_some_and(|status| status.starts_with("Update check failed:")) {
+                let title = if is_download_failure {
+                    "Update download failed".to_string()
+                } else if check_error.is_some() {
                     "Update check failed".to_string()
+                } else if self.is_update_ready {
+                    format!("Fastty v{version} is ready to install")
+                } else if self.is_updating {
+                    format!("Downloading Fastty v{version}...")
+                } else if has_release {
+                    format!("Fastty v{version} is available")
+                } else if checking {
+                    "Checking for updates".to_string()
                 } else {
                     "Fastty is up to date".to_string()
                 };
-
-                let subtitle = if self.is_update_ready {
-                    "Update downloaded and verified. Restart Fastty to switch to the new version."
-                } else if self.is_updating {
-                    "Downloading update in the background..."
-                } else if let Some(ref status) = self.update_status {
-                    status.as_str()
-                } else if has_release {
-                    "A new update is available."
+                let (state_icon, state_color) = if failed {
+                    (IconType::CloudOff, theme.red)
+                } else if has_release || self.is_update_ready || self.is_updating {
+                    (IconType::Download, theme.accent)
+                } else if checking {
+                    (IconType::RotateCw, theme.accent)
                 } else {
-                    "Fastty is up to date."
+                    (IconType::CircleCheck, theme.green)
                 };
+
+                // Version line: `v0.25.4 · stable channel`, or the full release
+                // line `v0.25.4 → v0.26.0 · Nov 3, 2026 · 18.4 MB`.
+                let mut meta = div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(7.))
+                    .text_size(px(11.5))
+                    .text_color(theme.muted)
+                    .child(div().child(format!("v{current_version}")));
+                if has_release && !failed {
+                    meta = meta
+                        .child(div().child("→"))
+                        .child(
+                            div()
+                                .text_color(theme.green)
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(format!("v{version}")),
+                        );
+                } else {
+                    meta = meta
+                        .child(div().child("·"))
+                        .child(div().child("stable channel"));
+                }
+                if let Some(error) = failed_error.as_ref() {
+                    let summary = error.lines().next().unwrap_or(error).to_string();
+                    meta = meta
+                        .child(div().child("·"))
+                        .child(div().text_color(theme.red).child(SharedString::from(summary)));
+                }
+                if has_release {
+                    if let Some(date) = release_opt
+                        .as_ref()
+                        .and_then(|release| format_release_date(&release.published_at))
+                    {
+                        meta = meta.child(div().child("·")).child(div().child(date));
+                    }
+                    if let Some(size) = release_opt
+                        .as_ref()
+                        .map(|release| release.download_size)
+                        .filter(|size| *size > 0)
+                    {
+                        meta = meta
+                            .child(div().child("·"))
+                            .child(div().child(format_release_size(size)));
+                    }
+                }
+
+                let bullets: Vec<String> = notes
+                    .lines()
+                    .map(|line| line.trim())
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(|line| {
+                        strip_inline_markdown(line.trim_start_matches(['-', '*', '+']).trim())
+                    })
+                    .filter(|line| !line.is_empty())
+                    .collect();
+
+                let mut body = div().flex().flex_col().gap(px(14.)).pt(px(6.));
+                if failed {
+                    let error = failed_error.clone().unwrap_or_default();
+                    let (lead, hint) = if is_download_failure {
+                        (
+                            "Fastty could not download and verify the update. The version you have keeps working normally.",
+                            "Check the details below, then try again.",
+                        )
+                    } else {
+                        (
+                            "Fastty couldn't reach GitHub to look for a new release. The version you have keeps working normally.",
+                            "Check your connection, then try again.",
+                        )
+                    };
+                    body = body
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(theme.foreground)
+                                .child(lead),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .text_color(theme.muted_strong)
+                                .child(hint),
+                        )
+                        .child(
+                            div()
+                                .id("update-modal-details-toggle")
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.))
+                                .text_size(px(11.5))
+                                .text_color(theme.muted)
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(move |style| style.text_color(theme.foreground))
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                    this.update_details_open = !this.update_details_open;
+                                    cx.notify();
+                                }))
+                                .child(if self.update_details_open { "⌄" } else { "›" })
+                                .child("# details"),
+                        )
+                        .when(self.update_details_open, |details| {
+                            details.child(
+                                div()
+                                    .id("update-modal-details")
+                                    .p(px(12.))
+                                    .rounded(px(7.))
+                                    .bg(theme.surface_raised)
+                                    .max_h(px(120.))
+                                    .overflow_y_scroll()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted_strong)
+                                    .child(SharedString::from(if error.is_empty() {
+                                        "No error detail was reported.".to_string()
+                                    } else {
+                                        error
+                                    })),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id("update-modal-retry")
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.))
+                                .px(px(11.))
+                                .py(px(6.))
+                                .rounded(px(7.))
+                                .bg(theme.surface_raised)
+                                .border_1()
+                                .border_color(theme.border)
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.foreground)
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(move |style| style.bg(theme.hover))
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
+                                    if is_download_failure {
+                                        this.trigger_apply_update(window, cx);
+                                    } else {
+                                        this.check_for_updates_manual(window, cx);
+                                    }
+                                }))
+                                .child(render_icon(IconType::RotateCw, theme.foreground, 12.0))
+                                .child("Try again"),
+                        );
+                } else if self.is_updating {
+                    body = body.child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(theme.foreground)
+                            .child("Downloading the update in the background. You can keep working."),
+                    );
+                } else if has_release && !self.is_update_ready {
+                    if let Some(reason) = release_opt
+                        .as_ref()
+                        .and_then(|release| release.self_update_blocked_reason.clone())
+                    {
+                        body = body.child(
+                            div()
+                                .text_size(px(12.5))
+                                .text_color(theme.muted_strong)
+                                .child(SharedString::from(reason)),
+                        );
+                    }
+                    body = body.child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(theme.muted)
+                            .child("# what's new"),
+                    );
+                    let mut card = div()
+                        .id("update-modal-whats-new")
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .p(px(12.))
+                        .rounded(px(10.))
+                        .bg(theme.surface_raised)
+                        .max_h(px(200.))
+                        .overflow_y_scroll();
+                    if bullets.is_empty() {
+                        card = card.child(
+                            div()
+                                .text_size(px(12.5))
+                                .text_color(theme.muted_strong)
+                                .child("Bug fixes and performance improvements."),
+                        );
+                    }
+                    for bullet in bullets {
+                        card = card.child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_start()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .text_color(theme.accent)
+                                        .child("+"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .text_color(theme.muted_strong)
+                                        .child(SharedString::from(bullet)),
+                                ),
+                        );
+                    }
+                    body = body.child(card);
+                } else if self.is_update_ready {
+                    body = body.child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(theme.foreground)
+                            .child("The update is downloaded and verified. Restart Fastty to switch to the new version."),
+                    );
+                } else if checking {
+                    body = body.child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(theme.muted_strong)
+                            .child("Looking for a newer release on GitHub..."),
+                    );
+                } else {
+                    body = body.child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(theme.muted_strong)
+                            .child("You are running the newest release."),
+                    );
+                }
+
+                let is_blocked = release_opt
+                    .as_ref()
+                    .and_then(|release| release.self_update_blocked_reason.as_ref())
+                    .is_some();
+                let mut actions = div().flex().flex_row().items_center().gap(px(14.)).pt(px(4.));
+                if self.is_update_ready {
+                    actions = actions
+                        .child(
+                            div()
+                                .px(px(12.))
+                                .py(px(7.))
+                                .rounded(px(7.))
+                                .bg(theme.accent)
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.black)
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, _cx| {
+                                    this.persist_session();
+                                    crate::updater::relaunch_fastty();
+                                }))
+                                .child("Restart now"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme.muted_strong)
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(move |style| style.text_color(theme.foreground))
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                    this.is_update_modal_open = false;
+                                    cx.notify();
+                                }))
+                                .child("Later"),
+                        );
+                } else if self.is_updating {
+                    actions = actions.child(
+                        div()
+                            .px(px(12.))
+                            .py(px(7.))
+                            .rounded(px(7.))
+                            .bg(theme.surface_raised)
+                            .text_size(px(12.))
+                            .text_color(theme.foreground)
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                this.is_update_modal_open = false;
+                                cx.notify();
+                            }))
+                            .child("Hide"),
+                    );
+                } else if has_release && is_blocked {
+                    let blocked_url = release_url.clone();
+                    actions = actions.child(
+                        div()
+                            .px(px(12.))
+                            .py(px(7.))
+                            .rounded(px(7.))
+                            .bg(theme.accent)
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.black)
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(MouseButton::Left, move |_ev, _window, _cx| {
+                                open_path_or_url(&blocked_url);
+                            })
+                            .child("Open download page"),
+                    );
+                } else if has_release {
+                    actions = actions
+                        .child(
+                            div()
+                                .id("update-modal-download")
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.))
+                                .px(px(12.))
+                                .py(px(7.))
+                                .rounded(px(7.))
+                                .bg(theme.accent)
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.black)
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(move |style| style.opacity(0.9))
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, window, cx| {
+                                    this.trigger_apply_update(window, cx);
+                                }))
+                                .child(render_icon(IconType::Download, theme.black, 12.0))
+                                .child("Download update"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme.muted_strong)
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(move |style| style.text_color(theme.foreground))
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                    this.is_update_modal_open = false;
+                                    cx.notify();
+                                }))
+                                .child("Later"),
+                        );
+                }
 
                 this.child(
                     div()
@@ -20549,22 +21932,27 @@ impl Render for RootView {
                         .flex()
                         .items_center()
                         .justify_center()
+                        .px(px(12.))
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                             this.is_update_modal_open = false;
                             cx.notify();
                         }))
                         .child(
                             div()
-                                .w(px(500.))
-                                .p(px(16.))
-                                .rounded(px(10.))
+                                .id("update-modal-panel")
+                                .w_full()
+                                .max_w(px(440.))
+                                .max_h(gpui::relative(0.88))
+                                .overflow_y_scroll()
+                                .p(px(20.))
+                                .rounded(px(12.))
                                 .bg(theme.surface)
                                 .border_1()
                                 .border_color(theme.border)
                                 .shadow_xl()
                                 .flex()
                                 .flex_col()
-                                .gap_3()
+                                .gap(px(6.))
                                 .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
                                     cx.stop_propagation();
                                 })
@@ -20574,203 +21962,80 @@ impl Render for RootView {
                                         .flex_row()
                                         .items_center()
                                         .justify_between()
-                                        .pb(px(6.))
-                                        .border_b_1()
-                                        .border_color(theme.border)
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .text_size(px(13.))
-                                                        .font_weight(FontWeight::BOLD)
-                                                        .text_color(theme.foreground)
-                                                        .child(title),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_size(px(11.))
-                                                        .text_color(theme.muted)
-                                                        .child(subtitle.to_string()),
-                                                ),
-                                        )
+                                        .child(render_icon(state_icon, state_color, 18.0))
                                         .child(
                                             div()
                                                 .cursor(CursorStyle::PointingHand)
+                                                .rounded(px(4.))
+                                                .p(px(3.))
+                                                .hover(move |style| style.bg(theme.hover))
                                                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                                                     this.is_update_modal_open = false;
                                                     cx.notify();
                                                 }))
-                                                .child(render_icon(IconType::X, theme.accent, 12.0)),
+                                                .child(render_icon(IconType::X, theme.muted, 14.0)),
                                         ),
                                 )
-                                .when(has_release, |el| el.child(
+                                .child(
                                     div()
-                                        .id("update-modal-changelog")
-                                        .max_h(px(320.))
-                                        .p(px(12.))
-                                        .rounded(px(6.))
-                                        .bg(theme.surface_raised)
-                                        .border_1()
-                                        .border_color(theme.border)
-                                        .overflow_y_scroll()
-                                        .child(crate::ui::markdown::render_markdown(&notes, &theme, false)),
-                                ))
+                                        .text_size(px(19.))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(theme.foreground)
+                                        .child(SharedString::from(title)),
+                                )
+                                .child(meta)
+                                .child(body)
+                                .when(
+                                    !failed && (self.is_update_ready || self.is_updating || has_release),
+                                    |modal| modal.child(actions),
+                                )
                                 .child(
                                     div()
                                         .flex()
                                         .flex_row()
                                         .items_center()
                                         .justify_between()
-                                        .pt(px(2.))
-                                        .when(has_release, |el| el.child(
-                                            div()
-                                                .text_size(px(11.))
-                                                .text_color(theme.accent)
-                                                .cursor(CursorStyle::PointingHand)
-                                                .on_mouse_down(MouseButton::Left, move |_ev, _window, _cx| {
-                                                    open_path_or_url(&release_url);
-                                                })
-                                                .child("View full changelog"),
-                                        ))
+                                        .pt(px(8.))
                                         .child(
                                             div()
                                                 .flex()
                                                 .flex_row()
-                                                .gap_2()
-                                                .when(self.is_update_ready, |el| {
-                                                    el.child(
-                                                        div()
-                                                            .px(px(12.))
-                                                            .py(px(5.))
-                                                            .rounded(px(5.))
-                                                            .bg(theme.surface_raised)
-                                                            .text_color(theme.foreground)
-                                                            .font_weight(FontWeight::NORMAL)
-                                                            .text_size(px(11.))
-                                                            .cursor(CursorStyle::PointingHand)
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                                this.is_update_modal_open = false;
-                                                                cx.notify();
-                                                            }))
-                                                            .child("Later"),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .px(px(12.))
-                                                            .py(px(5.))
-                                                            .rounded(px(5.))
-                                                            .bg(theme.accent)
-                                                            .text_color(theme.black)
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .text_size(px(11.))
-                                                            .cursor(CursorStyle::PointingHand)
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, _cx| {
-                                                                this.persist_session();
-                                                                crate::updater::relaunch_fastty();
-                                                            }))
-                                                            .child("Restart Now"),
-                                                    )
+                                                .items_center()
+                                                .gap(px(6.))
+                                                .text_size(px(11.5))
+                                                .text_color(theme.muted)
+                                                .cursor(CursorStyle::PointingHand)
+                                                .hover(move |style| style.text_color(theme.foreground))
+                                                .on_mouse_down(MouseButton::Left, move |_ev, _window, _cx| {
+                                                    open_path_or_url(
+                                                        "https://github.com/diegoleteliers10/fasty/releases",
+                                                    );
                                                 })
-                                                .when(self.is_updating, |el| {
-                                                    el.child(
-                                                        div()
-                                                            .px(px(12.))
-                                                            .py(px(5.))
-                                                            .rounded(px(5.))
-                                                            .bg(theme.accent)
-                                                            .text_color(theme.black)
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .text_size(px(11.))
-                                                            .cursor(CursorStyle::PointingHand)
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                                this.is_update_modal_open = false;
-                                                                cx.notify();
-                                                            }))
-                                                            .child("Hide"),
-                                                    )
-                                                })
-                                                .when(!self.is_update_ready && !self.is_updating, |el| {
-                                                    let is_blocked = self
-                                                        .update_available
-                                                        .as_ref()
-                                                        .and_then(|r| r.self_update_blocked_reason.as_ref())
-                                                        .is_some();
-                                                    let release_url = self
-                                                        .update_available
-                                                        .as_ref()
-                                                        .map(|r| r.release_url.clone())
-                                                        .unwrap_or_else(|| "https://github.com/diegoleteliers10/fasty/releases".to_string());
-                                                    el.child(
-                                                        div()
-                                                            .px(px(12.))
-                                                            .py(px(5.))
-                                                            .rounded(px(5.))
-                                                            .bg(theme.surface_raised)
-                                                            .text_color(theme.foreground)
-                                                            .font_weight(FontWeight::NORMAL)
-                                                            .text_size(px(11.))
-                                                            .cursor(CursorStyle::PointingHand)
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                                this.is_update_modal_open = false;
-                                                                cx.notify();
-                                                            }))
-                                                            .child(if has_release { "Later" } else { "Close" }),
-                                                    )
-                                                    .when(has_release, |btn| {
-                                                        btn.child(
-                                                            div()
-                                                                .px(px(12.))
-                                                                .py(px(5.))
-                                                                .rounded(px(5.))
-                                                                .bg(theme.surface_raised)
-                                                                .text_color(theme.foreground)
-                                                                .font_weight(FontWeight::NORMAL)
-                                                                .text_size(px(11.))
-                                                                .cursor(CursorStyle::PointingHand)
-                                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                                    this.skip_update_version(cx);
-                                                                }))
-                                                                .child("Skip this version"),
-                                                        )
-                                                    })
-                                                    .when(is_blocked, |btn| {
-                                                        btn.child(
-                                                            div()
-                                                                .px(px(12.))
-                                                                .py(px(5.))
-                                                                .rounded(px(5.))
-                                                                .bg(theme.accent)
-                                                                .text_color(theme.black)
-                                                                .font_weight(FontWeight::SEMIBOLD)
-                                                                .text_size(px(11.))
-                                                                .cursor(CursorStyle::PointingHand)
-                                                                .on_mouse_down(MouseButton::Left, move |_ev, _window, _cx| {
-                                                                    open_path_or_url(&release_url);
-                                                                })
-                                                                .child("Open download page"),
-                                                        )
-                                                    })
-                                                    .when(has_release && !is_blocked, |btn| {
-                                                        btn.child(
-                                                            div()
-                                                                .px(px(12.))
-                                                                .py(px(5.))
-                                                                .rounded(px(5.))
-                                                                .bg(theme.accent)
-                                                                .text_color(theme.black)
-                                                                .font_weight(FontWeight::SEMIBOLD)
-                                                                .text_size(px(11.))
-                                                                .cursor(CursorStyle::PointingHand)
-                                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, window, cx| {
-                                                                    this.trigger_apply_update(window, cx);
-                                                                }))
-                                                                .child("Update Now"),
-                                                        )
-                                                    })
-                                                }),
+                                                .child("All releases")
+                                                .child(render_icon(IconType::ArrowUpRight, theme.muted, 11.0)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(6.))
+                                                .child(
+                                                    div()
+                                                        .px(px(6.))
+                                                        .py(px(2.))
+                                                        .rounded(px(4.))
+                                                        .bg(theme.surface_raised)
+                                                        .text_size(px(10.5))
+                                                        .text_color(theme.muted_strong)
+                                                        .child("esc"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(11.5))
+                                                        .text_color(theme.muted)
+                                                        .child("to close"),
+                                                ),
                                         ),
                                 ),
                         ),
@@ -21534,6 +22799,36 @@ fn render_about_spec_row(label: &'static str, value: &str, theme: Theme) -> Div 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn acp_tool_diff_reads_a_content_block() {
+        let update = serde_json::json!({
+            "content": [{
+                "type": "diff",
+                "path": "src/parser.rs",
+                "oldText": "let a = 1;\n",
+                "newText": "let a = 2;\n"
+            }]
+        });
+        let diff = super::acp_tool_diff(&update, "").expect("diff");
+        assert_eq!(diff.path, "src/parser.rs");
+        assert_eq!(diff.added, 1);
+        assert_eq!(diff.removed, 1);
+    }
+
+    #[test]
+    fn acp_tool_diff_reads_camel_case_arguments() {
+        let args = serde_json::json!({
+            "filePath": "STATUS.md",
+            "oldString": "**Render:** GPU (wgpu/winit)\n",
+            "newString": "**Render:** GPU (Zed)\n"
+        })
+        .to_string();
+        let diff = super::acp_tool_diff(&serde_json::Value::Null, &args).expect("diff");
+        assert_eq!(diff.path, "STATUS.md");
+        assert_eq!(diff.added, 1);
+        assert_eq!(diff.removed, 1);
+    }
+
     use super::*;
 
     #[test]

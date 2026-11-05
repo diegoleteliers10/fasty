@@ -49,6 +49,7 @@ notify-debouncer-mini = "0.7"
 seahash = "4"
 anyhow = "1"
 parking_lot = "0.12"
+regex = "1"
 raw-window-handle = "0.6"
 rustix = { version = "1.1", features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }

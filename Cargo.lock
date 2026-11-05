@@ -1890,6 +1890,7 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "raw-window-handle",
+ "regex",
  "rustix",
  "schemars 0.8.22",
  "seahash",
