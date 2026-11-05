@@ -601,13 +601,37 @@ impl PaneTree {
         self.root.set_split_ratio_by_path(path, new_ratio)
     }
 
-    pub fn update_layout_bounds(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        self.root.update_bounds(x, y, w, h);
+    /// Store each pane slot rect. `gap` and `divider` must match the values the
+    /// pane view uses, or mouse routing drifts from the rendered panes.
+    pub fn update_layout_bounds(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        gap: f32,
+        divider: f32,
+    ) {
+        self.root.update_bounds(x, y, w, h, gap, divider);
     }
 }
 
 impl PaneNode {
-    pub fn update_bounds(&mut self, x: f32, y: f32, w: f32, h: f32) {
+    /// Extent of one pane across a split axis. The pane view and the bounds
+    /// pass share it so mouse routing stays on the drawn pane.
+    pub fn split_pane_extent(len: f32, ratio: f32, gap: f32, divider: f32) -> f32 {
+        (len * ratio - gap - divider / 2.0).max(40.0)
+    }
+
+    pub fn update_bounds(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        gap: f32,
+        divider: f32,
+    ) {
         match self {
             PaneNode::Leaf(pane) => {
                 pane.last_bounds = Some(Bounds {
@@ -617,16 +641,16 @@ impl PaneNode {
             }
             PaneNode::Split { direction, ratio, first, second } => match direction {
                 SplitDirection::Horizontal => {
-                    let w1 = w * *ratio;
-                    let w2 = w * (1.0 - *ratio);
-                    first.update_bounds(x, y, w1, h);
-                    second.update_bounds(x + w1, y, w2, h);
+                    let w1 = Self::split_pane_extent(w, *ratio, gap, divider);
+                    let w2 = Self::split_pane_extent(w, 1.0 - *ratio, gap, divider);
+                    first.update_bounds(x, y, w1, h, gap, divider);
+                    second.update_bounds(x + w1 + gap * 2.0 + divider, y, w2, h, gap, divider);
                 }
                 SplitDirection::Vertical => {
-                    let h1 = h * *ratio;
-                    let h2 = h * (1.0 - *ratio);
-                    first.update_bounds(x, y, w, h1);
-                    second.update_bounds(x, y + h1, w, h2);
+                    let h1 = Self::split_pane_extent(h, *ratio, gap, divider);
+                    let h2 = Self::split_pane_extent(h, 1.0 - *ratio, gap, divider);
+                    first.update_bounds(x, y, w, h1, gap, divider);
+                    second.update_bounds(x, y + h1 + gap * 2.0 + divider, w, h2, gap, divider);
                 }
             },
         }
@@ -656,6 +680,29 @@ mod tests {
             last_exit_code: None,
             last_bounds: None,
         }
+    }
+
+    #[test]
+    fn test_layout_bounds_follow_the_rendered_gap_and_divider() {
+        let mut tree = PaneTree::new(dummy_pane(1));
+        assert!(tree.split_pane_at(1, dummy_pane(2), Direction::Right));
+        assert!(tree.split_pane_at(2, dummy_pane(3), Direction::Down));
+        let (gap, divider) = (2.0_f32, 9.0_f32);
+        tree.update_layout_bounds(8.0, 40.0, 1000.0, 600.0, gap, divider);
+
+        let first = tree.find_pane(1).and_then(|pane| pane.last_bounds).unwrap();
+        let second = tree.find_pane(2).and_then(|pane| pane.last_bounds).unwrap();
+        let third = tree.find_pane(3).and_then(|pane| pane.last_bounds).unwrap();
+
+        let first_w = 1000.0_f32 * 0.5 - gap - divider / 2.0;
+        assert!((first.size.width.to_f64() as f32 - first_w).abs() < 0.01);
+        let second_x = 8.0 + first_w + gap * 2.0 + divider;
+        assert!((second.origin.x.to_f64() as f32 - second_x).abs() < 0.01);
+
+        let second_h = 600.0_f32 * 0.5 - gap - divider / 2.0;
+        assert!((second.size.height.to_f64() as f32 - second_h).abs() < 0.01);
+        let third_y = 40.0 + second_h + gap * 2.0 + divider;
+        assert!((third.origin.y.to_f64() as f32 - third_y).abs() < 0.01);
     }
 
     #[test]
