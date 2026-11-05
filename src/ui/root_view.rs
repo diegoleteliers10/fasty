@@ -18280,8 +18280,9 @@ impl Render for RootView {
                         }))
                         .child(
                             div()
-                                .w(px(500.))
-                                .rounded(px(10.))
+                                .w_full()
+                                .max_w(px(560.))
+                                .rounded(px(12.))
                                 .bg(theme.surface)
                                 .border_1()
                                 .border_color(theme.border)
