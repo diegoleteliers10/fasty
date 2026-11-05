@@ -124,6 +124,39 @@ fn split_source_lines(text: &str) -> Vec<SrcLine> {
 
 /// Parses the full text into a sequence of MarkdownBlocks annotated with
 /// source char offsets.
+/// Parse memoization for the AI panel. Scrolling re-renders every message, and
+/// re-parsing unchanged prose each frame is the expensive part. The cache is
+/// per thread (rendering happens on one), bounded, and skipped while text is
+/// still streaming.
+pub fn parse_markdown_cached(text: &str) -> Vec<MarkdownBlock> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<Vec<(u64, String, Vec<MarkdownBlock>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    const MAX_ENTRIES: usize = 64;
+    let key = seahash::hash(text.as_bytes());
+    let hit = CACHE.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(hash, source, _)| *hash == key && source == text)
+            .map(|(_, _, blocks)| blocks.clone())
+    });
+    if let Some(blocks) = hit {
+        return blocks;
+    }
+    let blocks = parse_markdown(text);
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= MAX_ENTRIES {
+            cache.remove(0);
+        }
+        cache.push((key, text.to_string(), blocks.clone()));
+    });
+    blocks
+}
+
 pub fn parse_markdown(text: &str) -> Vec<MarkdownBlock> {
     let segments: Vec<(String, usize)> = split_source_lines(text)
         .into_iter()
@@ -784,7 +817,11 @@ pub fn render_markdown_selectable(
     // has no agent tables and falls back to intrinsic sizing.
     available_width: f32,
 ) -> Div {
-    let blocks = parse_markdown(text);
+    let blocks = if is_streaming {
+        parse_markdown(text)
+    } else {
+        parse_markdown_cached(text)
+    };
     let mut container = div().flex().flex_col().gap_3().w_full().min_w(px(0.));
 
     if blocks.is_empty() {
