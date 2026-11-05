@@ -98,6 +98,9 @@ pub struct TabItem {
     pub is_dirty: bool,
     pub ai_response_unread: bool,
     pub program_status: Option<ProgramRecord>,
+    /// The `OSC 7501` app name, independent of the attention filter. The tab
+    /// keeps the brand mark of a program that already finished.
+    pub program_app: Option<String>,
     pub progress: Option<crate::terminal_state::ProgressReport>,
     pub process_name: Option<String>,
 }
@@ -729,8 +732,13 @@ impl RenderOnce for TabSidebar {
                                     (gpui::transparent_black(), theme.muted_strong)
                                 };
 
-                                let (deck_icon, _) = tab.process_name.as_deref().map(super::icons::get_deck_process_icon).unwrap_or((icons::common::IconType::Terminal, "term"));
-                                let icon_color = if is_active { theme.accent } else { theme.muted_strong };
+                                let working = super::tab_icons::is_working(
+                                    tab.program_status.as_ref().map(|record| record.state),
+                                );
+                                let glyph = super::tab_icons::tab_glyph(
+                                    tab.program_app.as_deref(),
+                                    tab.process_name.as_deref(),
+                                );
 
                                 div()
                                     .id(SharedString::from(format!("vert-tab-{}", tab_id)))
@@ -778,10 +786,20 @@ impl RenderOnce for TabSidebar {
                                             .gap_2()
                                             .overflow_hidden()
                                             .flex_1()
-                                            .child(super::icons::render_icon(deck_icon, icon_color, 12.0))
-                                            .when_some(tab.program_status.clone(), |row, record| {
-                                                row.child(render_program_status(&record, theme, 12.0))
-                                            })
+                                            .child(super::tab_icons::render_tab_glyph(
+                                                glyph,
+                                                theme,
+                                                is_active,
+                                                13.0,
+                                            ))
+                                            .when_some(
+                                                tab.program_status
+                                                    .clone()
+                                                    .filter(|record| record.state != ProgramState::Working),
+                                                |row, record| {
+                                                    row.child(render_program_status(&record, theme, 12.0))
+                                                },
+                                            )
                                             .when(tab.ai_response_unread, |row| {
                                                 row.child(div().w(px(6.)).h(px(6.)).flex_shrink_0().rounded_full().bg(theme.accent))
                                             })
@@ -794,6 +812,13 @@ impl RenderOnce for TabSidebar {
                                                     .child(SharedString::from(tab.title)),
                                             ),
                                     )
+                                    .when(working, |element| {
+                                        element.child(super::tab_icons::render_working_dots(
+                                            theme.muted_strong,
+                                            3.0,
+                                            SharedString::from(format!("vert-tab-dots-{tab_id}")),
+                                        ))
+                                    })
                                     .child(
                                         div()
                                             .id(SharedString::from(format!("vert-tab-close-{}", tab_id)))
@@ -861,8 +886,13 @@ fn render_tab_strip(
                 (theme.tab_inactive_bg, theme.muted_strong, gpui::transparent_black())
             };
 
-            let (deck_icon, _) = tab.process_name.as_deref().map(super::icons::get_deck_process_icon).unwrap_or((icons::common::IconType::Terminal, "term"));
-            let icon_color = if is_active { theme.accent } else { theme.muted };
+            let working = super::tab_icons::is_working(
+                tab.program_status.as_ref().map(|record| record.state),
+            );
+            let glyph = super::tab_icons::tab_glyph(
+                tab.program_app.as_deref(),
+                tab.process_name.as_deref(),
+            );
 
             div()
                 .id(SharedString::from(format!("tab-{}", tab_id)))
@@ -912,10 +942,18 @@ fn render_tab_strip(
                         .gap_1p5()
                         .overflow_hidden()
                         .flex_1()
-                        .child(super::icons::render_icon(deck_icon, icon_color, 11.0))
-                        .when_some(tab.program_status.clone(), |row, record| {
-                            row.child(render_program_status(&record, theme, 11.0))
-                        })
+                        .child(super::tab_icons::render_tab_glyph(
+                            glyph,
+                            theme,
+                            is_active,
+                            11.0,
+                        ))
+                        .when_some(
+                            tab.program_status
+                                .clone()
+                                .filter(|record| record.state != ProgramState::Working),
+                            |row, record| row.child(render_program_status(&record, theme, 11.0)),
+                        )
                         .when(tab.ai_response_unread, |row| {
                             row.child(div().w(px(6.)).h(px(6.)).flex_shrink_0().rounded_full().bg(theme.accent))
                         })
@@ -928,6 +966,13 @@ fn render_tab_strip(
                                 .child(SharedString::from(tab.title)),
                         ),
                 )
+                .when(working, |element| {
+                    element.child(super::tab_icons::render_working_dots(
+                        theme.muted_strong,
+                        2.5,
+                        SharedString::from(format!("tab-dots-{tab_id}")),
+                    ))
+                })
                 .child(
                     div()
                         .id(SharedString::from(format!("tab-close-{}", tab_id)))
