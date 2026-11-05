@@ -45,6 +45,19 @@ enum RightPanel {
 }
 
 const PROJECT_PANEL_WIDTH: f32 = 300.0;
+/// Space between the terminal area edge and the outer pane border.
+const PANE_AREA_PADDING: f32 = 8.0;
+/// Space between a pane border and its terminal grid.
+const PANE_INSET: f32 = 7.0;
+/// Extra space between two panes, on each side of the split divider.
+const PANE_GAP: f32 = 2.0;
+/// Width of the draggable split divider.
+const PANE_DIVIDER: f32 = 9.0;
+/// Distance from a pane slot edge to its first terminal cell (border plus inset).
+const PANE_CONTENT_OFFSET: f32 = PANE_INSET + 1.0;
+/// Floating buffer search bar geometry, shared with the scroll adjustment.
+const BUFFER_BAR_INSET: f32 = 8.0;
+const BUFFER_BAR_HEIGHT: f32 = 38.0;
 
 #[derive(Clone, Copy)]
 enum WheelAccumulator {
@@ -2090,6 +2103,8 @@ pub struct GlobalSearchResult {
     pub pane_id: usize,
     pub offset: usize,
     pub line_index: i32,
+    /// One-based line number from the oldest line still in scrollback.
+    pub line_number: usize,
     pub line_content: String,
 }
 
@@ -3130,6 +3145,10 @@ pub struct RootView {
     host_attach_retry_generation: u64,
     host_missing_sessions: std::collections::HashSet<PaneId>,
     close_check_generation: u64,
+    /// Foreground program name per pane at the last tick. The tab mark
+    /// follows that name, so a program that starts or exits swaps the mark
+    /// without waiting for its own output.
+    foreground_names: std::collections::HashMap<PaneId, Option<String>>,
     theme: Theme,
     tabs: Vec<TabData>,
     active_tab_idx: usize,
@@ -3230,6 +3249,12 @@ pub struct RootView {
     pub cursor_window_pos: Option<(f32, f32)>,
     pub hovered_url: Option<String>,
     pub hovered_url_range: Option<(i32, usize, usize)>,
+    /// Pane under the pointer, so only its hover toolbar shows.
+    pub pane_toolbar_hover: Option<PaneId>,
+    /// Scrollbar proximity tier (0 away, 1 band, 2 near). Only tier changes repaint.
+    pub scrollbar_zone: u8,
+    /// Window rect of the visible pane toolbar, so link hover can skip it.
+    pub pane_toolbar_rect: std::cell::Cell<Option<(f32, f32, f32, f32)>>,
     pub current_theme_name: String,
     /// Last config load failure (path + parse error), shown as a banner
     /// instead of failing silently to defaults. Session-dismissible.
@@ -3868,6 +3893,28 @@ impl RootView {
                         needs_notify = true;
                     }
 
+                    // The tab mark follows the foreground program. A program
+                    // that starts or exits changes the name the tab reads, so
+                    // watching that name swaps the mark on the next tick
+                    // instead of waiting for the program to write output.
+                    process_counter = (process_counter + 1) % 2;
+                    if process_counter == 0 {
+                        let names: std::collections::HashMap<PaneId, Option<String>> = this
+                            .tabs
+                            .iter()
+                            .flat_map(|tab| tab.pane_tree.all_panes())
+                            .filter_map(|pane| {
+                                pane.terminal.as_ref().map(|terminal| {
+                                    (pane.id, terminal.get_foreground_process_name())
+                                })
+                            })
+                            .collect();
+                        if names != this.foreground_names {
+                            this.foreground_names = names;
+                            cx.notify();
+                        }
+                    }
+
                     // Progressive AI stream reveal (smooth word-by-word / token-by-token effect)
                     let text_len = this.ai_pending_text.len();
                     if text_len > 0 {
@@ -4033,6 +4080,9 @@ impl RootView {
             cursor_window_pos: None,
             hovered_url: None,
             hovered_url_range: None,
+            pane_toolbar_hover: None,
+            scrollbar_zone: 0,
+            pane_toolbar_rect: std::cell::Cell::new(None),
             current_theme_name: theme_name,
             config_error: crate::config::load_error(),
             show_onboarding_hint: !crate::config::Config::get_active_config_path().exists()
@@ -4553,6 +4603,7 @@ impl RootView {
         self.ai_input_focused = true;
         let panel_was_open = self.right_panel == RightPanel::Ai;
         self.right_panel = RightPanel::Ai;
+        self.project_commit_focused = false;
         window.focus(&self.focus_handle, cx);
         if !panel_was_open {
             self.persist_session();
@@ -5936,6 +5987,31 @@ impl RootView {
                         if let Some(cwd) = cwd_to_poll {
                             this.request_git_status_refresh(cwd, cx);
                         }
+
+                        let finished_pane = this
+                            .tabs
+                            .iter()
+                            .find(|tab| tab.id == tab_id)
+                            .and_then(|tab| {
+                                tab.pane_tree.all_panes().into_iter().find_map(|pane| {
+                                    pane.terminal
+                                        .as_ref()
+                                        .filter(|terminal| terminal.source_id() == source_id)
+                                        .map(|_| pane.id)
+                                })
+                            });
+                        if let Some(pane_id) = finished_pane {
+                            this.notify_command_finished(
+                                pane_id,
+                                duration_ms,
+                                exit_code,
+                                _window,
+                                cx,
+                            );
+                        }
+                        // The shell owns the terminal again, so the mark goes
+                        // back to the shell without waiting for the prompt.
+                        crate::process_state::request_foreground_child_name_refresh();
                     }
                     AppEvent::CommandStarted => {
                         // This handler keys by tab id and host source id, so
@@ -7343,8 +7419,9 @@ impl RootView {
         let (cur_line, cur_col) = terminal.cursor_screen_pos();
         let row = (cur_line as f32 + terminal.display_offset() as f32)
             .min(((pane_h / line_h) as f32).floor());
-        let x = pane_x + cur_col as f32 * cell_w;
-        let y = pane_y + row * line_h;
+        let inset = self.pane_content_offset();
+        let x = pane_x + inset + cur_col as f32 * cell_w;
+        let y = pane_y + inset + row * line_h;
         Some((x, y))
     }
 
@@ -7940,6 +8017,9 @@ impl RootView {
 
     pub fn toggle_ai_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.right_panel = self.right_panel.toggle(RightPanel::Ai);
+        if self.right_panel != RightPanel::Project {
+            self.project_commit_focused = false;
+        }
         if self.right_panel == RightPanel::Ai {
             self.ai_input_focused = true;
             window.focus(&self.focus_handle, cx);
@@ -7953,6 +8033,9 @@ impl RootView {
 
     pub fn toggle_project_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.right_panel = self.right_panel.toggle(RightPanel::Project);
+        if self.right_panel != RightPanel::Project {
+            self.project_commit_focused = false;
+        }
         self.persist_session();
         self.trigger_ai_sidebar_animation(window, cx);
         cx.notify();
@@ -11777,8 +11860,14 @@ impl RootView {
             }
             Action::ClearScrollback => {
                 if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
-                    if let Some(ref terminal) = active_tab.terminal {
+                    if let Some(terminal) = active_tab
+                        .pane_tree
+                        .active_pane()
+                        .and_then(|pane| pane.terminal.as_ref())
+                        .or(active_tab.terminal.as_ref())
+                    {
                         terminal.scroll_to_bottom();
+                        terminal.write_to_pty(b"\x0c");
                         cx.notify();
                     }
                 }
@@ -13615,6 +13704,16 @@ impl RootView {
             return;
         };
 
+        // Clicking outside the project panel drops the commit box focus.
+        if self.right_panel == RightPanel::Project && self.project_commit_focused {
+            let win_w = window.viewport_size().width.to_f64() as f32;
+            let panel_left = win_w - self.current_project_panel_width();
+            if (event.position.x.to_f64() as f32) < panel_left {
+                self.project_commit_focused = false;
+                cx.notify();
+            }
+        }
+
         // Click in terminal area unfocuses the AI input so keystrokes go to the terminal.
         if self.right_panel == RightPanel::Ai && self.ai_input_focused {
             let win_w = window.viewport_size().width.to_f64() as f32;
@@ -13696,8 +13795,9 @@ impl RootView {
                 )
             };
 
-        let local_x = (mouse_x - pane_origin_x).max(0.0);
-        let local_y = (mouse_y - pane_origin_y).max(0.0);
+        let pane_inset = self.pane_content_offset();
+        let local_x = (mouse_x - pane_origin_x - pane_inset).max(0.0);
+        let local_y = (mouse_y - pane_origin_y - pane_inset).max(0.0);
         let col = ((local_x / cell_w).floor() as usize) + 1;
         let row = ((local_y / line_h).floor() as usize) + 1;
 
@@ -13931,46 +14031,22 @@ impl RootView {
     ) {
         let cur_x = event.position.x.to_f64() as f32;
         let cur_y = event.position.y.to_f64() as f32;
-        let prev_pos = self.cursor_window_pos;
         self.cursor_window_pos = Some((cur_x, cur_y));
 
-        // Repaint when mouse enters, moves within, or leaves scrollbar proximity (within 48px inside right edge)
+        // The scrollbar has three proximity tiers, not a per-pixel fade. Repaint
+        // only when the tier changes, so moving over the pane toolbar does not
+        // rebuild the terminal grid on every mouse event.
+        let mut zone = 0u8;
         if let Some(tab) = self.tabs.get(self.active_tab_idx) {
-            let in_prox = tab.pane_tree.all_panes().iter().any(|p| {
-                if let Some(b) = p.last_bounds {
-                    let bx = b.origin.x.to_f64() as f32;
-                    let by = b.origin.y.to_f64() as f32;
-                    let bw = b.size.width.to_f64() as f32;
-                    let bh = b.size.height.to_f64() as f32;
-                    let right_edge = bx + bw;
-                    cur_y >= (by - 4.0)
-                        && cur_y <= (by + bh + 4.0)
-                        && cur_x >= (right_edge - 48.0)
-                        && cur_x <= (right_edge + 8.0)
-                } else {
-                    false
+            for pane in tab.pane_tree.all_panes() {
+                if let Some(bounds) = pane.last_bounds {
+                    zone = zone.max(Self::scrollbar_tier(bounds, cur_x, cur_y));
                 }
-            });
-            let was_in_prox = prev_pos.is_some_and(|(px, py)| {
-                tab.pane_tree.all_panes().iter().any(|p| {
-                    if let Some(b) = p.last_bounds {
-                        let bx = b.origin.x.to_f64() as f32;
-                        let by = b.origin.y.to_f64() as f32;
-                        let bw = b.size.width.to_f64() as f32;
-                        let bh = b.size.height.to_f64() as f32;
-                        let right_edge = bx + bw;
-                        py >= (by - 4.0)
-                            && py <= (by + bh + 4.0)
-                            && px >= (right_edge - 48.0)
-                            && px <= (right_edge + 8.0)
-                    } else {
-                        false
-                    }
-                })
-            });
-            if in_prox || was_in_prox {
-                cx.notify();
             }
+        }
+        if zone != self.scrollbar_zone {
+            self.scrollbar_zone = zone;
+            cx.notify();
         }
 
         if self.is_dragging_ai_input {
@@ -14020,6 +14096,8 @@ impl RootView {
 
         if self.is_dragging_pane_split {
             let (bx, by, bw, bh) = self.dragging_split_bounds;
+            // The gap and divider are split evenly around the divider center,
+            // so the cursor maps straight to the ratio.
             let new_ratio = match self.dragging_split_direction {
                 SplitDirection::Horizontal => {
                     if bw > 20.0 {
@@ -14101,6 +14179,13 @@ impl RootView {
             }
         });
 
+        let hovered_pane_id = hovered_pane.map(|pane| pane.id);
+        if self.pane_toolbar_hover != hovered_pane_id {
+            self.pane_toolbar_hover = hovered_pane_id;
+            self.pane_toolbar_rect.set(None);
+            cx.notify();
+        }
+
         let (cell_w, line_h) = self.measure_cell_metrics(_window);
 
         // Terminal mouse motion reporting (for active pane if dragging, or hovered pane if moving)
@@ -14120,8 +14205,9 @@ impl RootView {
                     } else {
                         (self.current_sidebar_width() + 1.0, 32.0)
                     };
-                    let local_x = (cur_x - pane_x).max(0.0);
-                    let local_y = (cur_y - pane_y).max(0.0);
+                    let pane_inset = self.pane_content_offset();
+                    let local_x = (cur_x - pane_x - pane_inset).max(0.0);
+                    let local_y = (cur_y - pane_y - pane_inset).max(0.0);
                     let left = self.pressed_mouse_buttons.contains(&MouseButton::Left)
                         && self.reported_mouse_buttons.contains(&MouseButton::Left);
                     let middle = self.pressed_mouse_buttons.contains(&MouseButton::Middle)
@@ -14218,8 +14304,26 @@ impl RootView {
             return;
         }
 
-        let local_x = (cur_x - bx).max(0.0);
-        let local_y = (cur_y - by).max(0.0);
+        // The pane toolbar floats over the top-right corner. Ignore links under
+        // it so moving across the buttons cannot churn hover state and repaints.
+        let over_pane_toolbar = self.pane_chrome()
+            && self.pane_toolbar_hover == Some(link_pane.id)
+            && !self.is_selecting
+            && self.pane_toolbar_rect.get().is_some_and(|(x, y, w, h)| {
+                cur_x >= x && cur_x <= x + w && cur_y >= y && cur_y <= y + h
+            });
+        if over_pane_toolbar {
+            if self.hovered_url.is_some() {
+                self.hovered_url = None;
+                self.hovered_url_range = None;
+                cx.notify();
+            }
+            return;
+        }
+
+        let pane_inset = self.pane_content_offset();
+        let local_x = (cur_x - bx - pane_inset).max(0.0);
+        let local_y = (cur_y - by - pane_inset).max(0.0);
         let history_size = terminal.history_size();
         let screen_rows = ((bh / line_h) as i32).max(1);
         let display_offset = terminal.display_offset();
@@ -14295,7 +14399,10 @@ impl RootView {
             .retain(|button| *button != event.button);
         self.is_dragging_scrollbar = false;
         self.dragging_scrollbar_pane_id = None;
-        self.is_dragging_pane_split = false;
+        if self.is_dragging_pane_split {
+            self.is_dragging_pane_split = false;
+            cx.notify();
+        }
         self.is_dragging_ai_sidebar = false;
         self.is_dragging_project_panel = false;
         if self.is_dragging_ai_input {
@@ -14338,8 +14445,15 @@ impl RootView {
                         } else {
                             (self.current_sidebar_width() + 1.0, 32.0)
                         };
-                        let local_x = (event.position.x.to_f64() as f32 - pane_x).max(0.0);
-                        let local_y = (event.position.y.to_f64() as f32 - pane_y).max(0.0);
+                        let pane_inset = self.pane_content_offset();
+                        let local_x = (event.position.x.to_f64() as f32
+                            - pane_x
+                            - pane_inset)
+                            .max(0.0);
+                        let local_y = (event.position.y.to_f64() as f32
+                            - pane_y
+                            - pane_inset)
+                            .max(0.0);
                         let col = ((local_x / cell_w).floor() as usize) + 1;
                         let row = ((local_y / line_h).floor() as usize) + 1;
                         let btn = match event.button {
@@ -14405,11 +14519,16 @@ impl RootView {
                 )
             };
 
-        let top_edge = pane_y;
-        let bottom_edge = pane_y + pane_h;
+        let pane_inset = self.pane_content_offset();
+        let content_x = pane_x + pane_inset;
+        let content_y = pane_y + pane_inset;
+        let content_w = (pane_w - pane_inset * 2.0).max(1.0);
+        let content_h = (pane_h - pane_inset * 2.0).max(1.0);
+        let top_edge = content_y;
+        let bottom_edge = content_y + content_h;
 
-        let screen_rows = ((pane_h / px_per_line) as i32).max(1);
-        let screen_cols = ((pane_w / cell_width) as usize).max(1);
+        let screen_rows = ((content_h / px_per_line) as i32).max(1);
+        let screen_cols = ((content_w / cell_width) as usize).max(1);
         let history_size = terminal.history_size();
         let display_offset = terminal.display_offset();
 
@@ -14418,14 +14537,14 @@ impl RootView {
         } else if raw_y > bottom_edge {
             (screen_rows - 1) - (display_offset as i32)
         } else {
-            let rel_y = (raw_y - top_edge).clamp(0.0, pane_h - 1.0);
+            let rel_y = (raw_y - top_edge).clamp(0.0, content_h - 1.0);
             let row_in_screen = (rel_y / px_per_line).floor() as i32;
             row_in_screen - (display_offset as i32)
         }
         .clamp(-(history_size as i32), screen_rows - 1);
 
-        let local_x = (raw_x - pane_x).max(0.0);
-        let updated_col = if raw_y < top_edge && raw_x < pane_x + 5.0 {
+        let local_x = (raw_x - content_x).max(0.0);
+        let updated_col = if raw_y < top_edge && raw_x < content_x + 5.0 {
             0
         } else {
             ((local_x / cell_width).floor() as usize).min(screen_cols.saturating_sub(1))
@@ -14539,6 +14658,22 @@ impl RootView {
         let mouse_x = event.position.x.to_f64() as f32;
         let mouse_y = event.position.y.to_f64() as f32;
 
+        // The side panels scroll themselves. Without this the wheel over the
+        // AI panel also scrolled the terminal behind it and forced a full
+        // window re-render on every tick, which made the panel stutter.
+        let viewport_w = _window.viewport_size().width.to_f64() as f32;
+        let right_w = match self.right_panel {
+            RightPanel::Closed => 0.0,
+            RightPanel::Project => self.current_project_panel_width(),
+            RightPanel::Ai => self.current_ai_sidebar_width(),
+        };
+        if right_w > 0.0 && mouse_x >= viewport_w - right_w {
+            return;
+        }
+        if mouse_x < self.current_sidebar_width() {
+            return;
+        }
+
         let target_pane = active_tab
             .pane_tree
             .all_panes()
@@ -14617,8 +14752,9 @@ impl RootView {
                     let sidebar_w = self.current_sidebar_width();
                     (sidebar_w + 1.0, 32.0)
                 };
-                let local_x = (mouse_x - pane_x).max(0.0);
-                let local_y = (mouse_y - pane_y).max(0.0);
+                let pane_inset = self.pane_content_offset();
+                let local_x = (mouse_x - pane_x - pane_inset).max(0.0);
+                let local_y = (mouse_y - pane_y - pane_inset).max(0.0);
                 let col = ((local_x / cell_w).floor() as usize) + 1;
                 let row = ((local_y / px_per_line).floor() as usize) + 1;
                 let btn = if steps > 0 { 64 } else { 65 };
@@ -14715,6 +14851,187 @@ impl RootView {
         .detach();
     }
 
+    /// Floating toolbar shown on the pane under the pointer.
+    fn render_pane_toolbar(
+        &self,
+        pane: &TerminalPane,
+        pane_id: PaneId,
+        is_zoomed: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = self.theme;
+        let shell = pane
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.get_foreground_process_name())
+            .unwrap_or_else(|| "shell".to_string());
+        let cwd = pane
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.get_current_working_directory())
+            .or_else(|| pane.cwd.clone())
+            .map(|path| Self::short_home_path(&path))
+            .unwrap_or_default();
+        let label = if cwd.is_empty() {
+            shell
+        } else {
+            format!("{shell} · {cwd}")
+        };
+        // Estimated pill rect: link hover must ignore exactly the drawn area.
+        let label_w = (label.chars().count() as f32 * 6.2).min(190.0);
+        let pill_w = 2.0 + 10.0 + label_w + 4.0 + 4.0 * 24.0 + 4.0 * 2.0 + 5.0;
+        self.pane_toolbar_rect.set(pane.last_bounds.map(|bounds| {
+            let right = bounds.origin.x.to_f64() as f32
+                + bounds.size.width.to_f64() as f32
+                - 6.0;
+            let top = bounds.origin.y.to_f64() as f32 + 5.0;
+            (right - pill_w, top, pill_w, 28.0)
+        }));
+        div()
+            .occlude()
+            .absolute()
+            .top(px(5.))
+            .right(px(6.))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.))
+            .h(px(28.))
+            .pl(px(10.))
+            .pr(px(5.))
+            .rounded(px(9.))
+            .bg(theme.surface_raised)
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .max_w(px(190.))
+                    .truncate()
+                    .pr(px(4.))
+                    .text_size(px(11.))
+                    .text_color(theme.muted_strong)
+                    .child(SharedString::from(label)),
+            )
+            .child(
+                Self::pane_toolbar_button(
+                    theme,
+                    IconType::Columns2,
+                    cx,
+                    move |this, _event, window, cx| {
+                        this.focus_pane_for_action(pane_id);
+                        this.split_active_pane(Direction::Right, window, cx);
+                    },
+                ),
+            )
+            .child(
+                Self::pane_toolbar_button(
+                    theme,
+                    IconType::Rows2,
+                    cx,
+                    move |this, _event, window, cx| {
+                        this.focus_pane_for_action(pane_id);
+                        this.split_active_pane(Direction::Down, window, cx);
+                    },
+                ),
+            )
+            .child(
+                Self::pane_toolbar_button(
+                    theme,
+                    if is_zoomed {
+                        IconType::Minimize2
+                    } else {
+                        IconType::Maximize2
+                    },
+                    cx,
+                    move |this, _event, _window, cx| {
+                        this.focus_pane_for_action(pane_id);
+                        this.toggle_pane_zoom(cx);
+                    },
+                ),
+            )
+            .child(
+                Self::pane_toolbar_button(
+                    theme,
+                    IconType::X,
+                    cx,
+                    move |this, _event, window, cx| {
+                        this.close_pane_by_id(pane_id, window, cx);
+                    },
+                ),
+            )
+    }
+
+    fn pane_toolbar_button(
+        theme: Theme,
+        icon: IconType,
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut Self, &MouseDownEvent, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(24.))
+            .h(px(24.))
+            .rounded(px(6.))
+            .cursor(CursorStyle::PointingHand)
+            .hover(move |style| style.bg(theme.selected))
+            .on_mouse_down(MouseButton::Left, cx.listener(handler))
+            .child(super::icons::render_icon(icon, theme.muted_strong, 13.0))
+    }
+
+    /// Scrollbar proximity tier for one pane: 0 away, 1 in the band, 2 near.
+    fn scrollbar_tier(bounds: Bounds<gpui::Pixels>, x: f32, y: f32) -> u8 {
+        let bx = bounds.origin.x.to_f64() as f32;
+        let by = bounds.origin.y.to_f64() as f32;
+        let bw = bounds.size.width.to_f64() as f32;
+        let bh = bounds.size.height.to_f64() as f32;
+        let right_edge = bx + bw;
+        if y < (by - 4.0)
+            || y > (by + bh + 4.0)
+            || x < (right_edge - 48.0)
+            || x > (right_edge + 8.0)
+        {
+            return 0;
+        }
+        if (right_edge - x).max(0.0) <= 14.0 {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// True when the tab draws pane borders, gaps and the hover toolbar.
+    fn pane_chrome(&self) -> bool {
+        self.tabs
+            .get(self.active_tab_idx)
+            .is_some_and(|tab| tab.pane_tree.pane_count() > 1)
+    }
+
+    /// Distance from the pane slot edge to the first cell, zero for one pane.
+    fn pane_content_offset(&self) -> f32 {
+        if self.pane_chrome() {
+            PANE_CONTENT_OFFSET
+        } else {
+            0.0
+        }
+    }
+
+    /// Home-relative path for the pane toolbar label.
+    fn short_home_path(path: &std::path::Path) -> String {
+        if let Some(home) = dirs::home_dir() {
+            if let Ok(rest) = path.strip_prefix(&home) {
+                let rest = rest.to_string_lossy();
+                return if rest.is_empty() {
+                    "~".to_string()
+                } else {
+                    format!("~/{rest}")
+                };
+            }
+        }
+        path.to_string_lossy().into_owned()
+    }
+
     fn render_pane_tree_node(
         &self,
         node: &PaneNode,
@@ -14726,7 +15043,7 @@ impl RootView {
         cell_w: f32,
         line_h: f32,
         active_pane_id: usize,
-        pane_count: usize,
+        pane_chrome: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -14742,8 +15059,11 @@ impl RootView {
             PaneNode::Leaf(pane) => {
                 let is_active = pane.id == active_pane_id;
                 let pane_id = pane.id;
-                let target_cols = ((avail_w / cell_w) as usize).max(20);
-                let target_rows = ((avail_h / line_h) as usize).max(5);
+                let pane_inset = if pane_chrome { PANE_CONTENT_OFFSET } else { 0.0 };
+                let content_w = (avail_w - pane_inset * 2.0).max(cell_w);
+                let content_h = (avail_h - pane_inset * 2.0).max(line_h);
+                let target_cols = ((content_w / cell_w) as usize).max(20);
+                let target_rows = ((content_h / line_h) as usize).max(5);
 
                 let grid_el = if let Some(ref terminal) = pane.terminal {
                     if !terminal.try_resize_with_pixels(
@@ -15147,33 +15467,18 @@ impl RootView {
                         || (self.last_scrolled_pane_id.is_none() && is_active))
                         && elapsed_ms < 1500;
 
-                    // Proximity check against this pane's right edge
-                    let right_edge = container_x + avail_w;
-                    let bottom_edge = container_y + avail_h;
-                    let (is_in_proximity, dist_from_right) =
-                        if let Some((mx, my)) = self.cursor_window_pos {
-                            if my >= (container_y - 4.0)
-                                && my <= (bottom_edge + 4.0)
-                                && mx >= (right_edge - 48.0)
-                                && mx <= (right_edge + 8.0)
-                            {
-                                let dist = (right_edge - mx).max(0.0);
-                                (true, dist)
-                            } else {
-                                (false, 999.0)
-                            }
-                        } else {
-                            (false, 999.0)
-                        };
-
-                    if is_this_dragging || is_this_scrolling || is_in_proximity {
+                    let tier = pane
+                        .last_bounds
+                        .zip(self.cursor_window_pos)
+                        .map(|(bounds, (mx, my))| Self::scrollbar_tier(bounds, mx, my))
+                        .unwrap_or(0);
+                    if is_this_dragging || is_this_scrolling || tier > 0 {
                         let (alpha_mult, visual_w) = if is_this_dragging {
                             (1.0, 8.0)
-                        } else if dist_from_right <= 14.0 {
+                        } else if tier == 2 {
                             (0.90, 8.0)
-                        } else if is_in_proximity {
-                            let t = ((48.0 - dist_from_right) / 34.0).clamp(0.0, 1.0);
-                            (0.30 + 0.60 * t, 6.0)
+                        } else if tier == 1 {
+                            (0.55, 6.0)
                         } else if elapsed_ms < 700 {
                             (1.0, 5.0)
                         } else {
@@ -15241,59 +15546,6 @@ impl RootView {
                 } else {
                     None
                 };
-
-                let program_badge = self.visible_program_record(pane_id).map(|record| {
-                    let mut label = format!(
-                        "{}: {}",
-                        record
-                            .app
-                            .as_deref()
-                            .or(record.title.as_deref())
-                            .unwrap_or("Program"),
-                        super::tab_bar::program_status_text(record)
-                    );
-                    if let Some(progress) = record.progress {
-                        label.push_str(&format!(" {progress}%"));
-                    }
-                    if let Some(message) =
-                        record.msg.as_deref().filter(|message| !message.is_empty())
-                    {
-                        label.push_str(&format!(" · {message}"));
-                    }
-                    div()
-                        .id(("program-status", pane_id))
-                        .absolute()
-                        .bottom(px(4.))
-                        .right(px(20.))
-                        .flex()
-                        .items_center()
-                        .gap(px(5.))
-                        .max_w(px(260.))
-                        .px(px(7.))
-                        .py(px(4.))
-                        .rounded(px(5.))
-                        .bg(theme.surface_raised)
-                        .border_1()
-                        .border_color(theme.border)
-                        .text_size(px(11.))
-                        .text_color(theme.foreground)
-                        .overflow_hidden()
-                        .child(super::tab_bar::render_program_status(record, theme, 12.0))
-                        .child(
-                            div()
-                                .min_w(px(0.))
-                                .truncate()
-                                .child(SharedString::from(label)),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _ev, _window, cx| {
-                            this.acknowledge_program_status(pane_id);
-                            cx.stop_propagation();
-                            cx.notify();
-                            }),
-                        )
-                });
 
                 let retry_panel = pane
                     .host_session_id
@@ -15478,15 +15730,27 @@ impl RootView {
                         )
                 });
 
+                let is_zoomed = self
+                    .tabs
+                    .get(self.active_tab_idx)
+                    .is_some_and(|tab| tab.zoomed_pane == Some(pane_id));
+                let hovered = pane_chrome && self.pane_toolbar_hover == Some(pane_id);
                 div()
                     .size_full()
                     .relative()
                     .overflow_hidden()
-                    .when(pane_count > 1 && is_active, |d| {
-                        d.border_1().border_color(theme.accent)
-                    })
-                    .when(pane_count > 1 && !is_active, |d| {
-                        d.border_1().border_color(theme.border)
+                    .when(pane_chrome, |d| {
+                        d.rounded(px(10.))
+                            .border_1()
+                            .border_color(if is_active {
+                                theme.accent
+                            } else if hovered {
+                                theme.muted.opacity(0.55)
+                            } else {
+                                theme.border
+                            })
+                            .bg(theme.background)
+                            .p(px(PANE_INSET))
                     })
                     .on_mouse_down(
                         MouseButton::Left,
@@ -15536,7 +15800,9 @@ impl RootView {
                     .when_some(terminal_error_panel, |d, panel| d.child(panel))
                     .when_some(render_retry_panel, |d, panel| d.child(panel))
                     .when_some(pane_scrollbar_thumb, |d, thumb| d.child(thumb))
-                    .when_some(program_badge, |d, badge| d.child(badge))
+                    .when(hovered && !self.is_selecting, |d| {
+                        d.child(self.render_pane_toolbar(pane, pane_id, is_zoomed, cx))
+                    })
             }
             PaneNode::Split {
                 direction,
@@ -15544,7 +15810,7 @@ impl RootView {
                 first,
                 second,
             } => {
-                let mut container = div().size_full().flex();
+                let mut container = div().size_full().flex().gap(px(PANE_GAP));
                 container = match direction {
                     SplitDirection::Horizontal => container.flex_row(),
                     SplitDirection::Vertical => container.flex_col(),
@@ -15552,8 +15818,15 @@ impl RootView {
 
                 let (w1, h1, w2, h2, first_x, first_y, second_x, second_y) = match direction {
                     SplitDirection::Horizontal => {
-                        let w1 = avail_w * *ratio;
-                        let w2 = avail_w * (1.0 - *ratio);
+                        let w1 = PaneNode::split_pane_extent(
+                            avail_w, *ratio, PANE_GAP, PANE_DIVIDER,
+                        );
+                        let w2 = PaneNode::split_pane_extent(
+                            avail_w,
+                            1.0 - *ratio,
+                            PANE_GAP,
+                            PANE_DIVIDER,
+                        );
                         (
                             w1,
                             avail_h,
@@ -15561,13 +15834,20 @@ impl RootView {
                             avail_h,
                             container_x,
                             container_y,
-                            container_x + w1,
+                            container_x + w1 + PANE_GAP * 2.0 + PANE_DIVIDER,
                             container_y,
                         )
                     }
                     SplitDirection::Vertical => {
-                        let h1 = avail_h * *ratio;
-                        let h2 = avail_h * (1.0 - *ratio);
+                        let h1 = PaneNode::split_pane_extent(
+                            avail_h, *ratio, PANE_GAP, PANE_DIVIDER,
+                        );
+                        let h2 = PaneNode::split_pane_extent(
+                            avail_h,
+                            1.0 - *ratio,
+                            PANE_GAP,
+                            PANE_DIVIDER,
+                        );
                         (
                             avail_w,
                             h1,
@@ -15576,33 +15856,36 @@ impl RootView {
                             container_x,
                             container_y,
                             container_x,
-                            container_y + h1,
+                            container_y + h1 + PANE_GAP * 2.0 + PANE_DIVIDER,
                         )
                     }
                 };
 
                 let is_dragging_this =
                     self.is_dragging_pane_split && self.dragging_split_path == path;
+                // Nothing is drawn between panes at rest. A short handle appears
+                // only while the pointer is on the divider or it is dragged.
+                let divider_group = SharedString::from(format!("pane-divider-{:?}", path));
                 let divider_line_color = if is_dragging_this {
                     theme.accent
                 } else {
-                    theme.border
+                    theme.muted_strong
                 };
+                let divider_line_opacity = if is_dragging_this { 1.0 } else { 0.0 };
                 let split_path_clone = path.clone();
                 let dir_val = *direction;
 
                 let divider = match direction {
                     SplitDirection::Horizontal => div()
                         .id(SharedString::from(format!("h-split-divider-{:?}", path)))
+                        .group(divider_group.clone())
                         .relative()
-                        .w(px(7.))
+                        .w(px(PANE_DIVIDER))
                         .h_full()
-                        .mx(px(-3.))
                         .cursor(CursorStyle::ResizeColumn)
                         .flex()
                         .items_center()
                         .justify_center()
-                        .hover(move |s| s.bg(gpui::transparent_black()))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
@@ -15614,18 +15897,25 @@ impl RootView {
                                 cx.notify();
                             }),
                         )
-                        .child(div().w(px(1.)).h_full().bg(divider_line_color)),
+                        .child(
+                            div()
+                                .w(px(2.))
+                                .h(px(64.))
+                                .rounded(px(2.))
+                                .bg(divider_line_color)
+                                .opacity(divider_line_opacity)
+                                .group_hover(divider_group.clone(), |style| style.opacity(1.0)),
+                        ),
                     SplitDirection::Vertical => div()
                         .id(SharedString::from(format!("v-split-divider-{:?}", path)))
+                        .group(divider_group.clone())
                         .relative()
-                        .h(px(7.))
+                        .h(px(PANE_DIVIDER))
                         .w_full()
-                        .my(px(-3.))
                         .cursor(CursorStyle::ResizeRow)
                         .flex()
                         .items_center()
                         .justify_center()
-                        .hover(move |s| s.bg(gpui::transparent_black()))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
@@ -15653,11 +15943,18 @@ impl RootView {
                 let mut path_second = path;
                 path_second.push(1);
 
+                let (first_box, second_box) = match direction {
+                    SplitDirection::Horizontal => {
+                        (div().w(px(w1)).h_full(), div().w(px(w2)).h_full())
+                    }
+                    SplitDirection::Vertical => {
+                        (div().w_full().h(px(h1)), div().w_full().h(px(h2)))
+                    }
+                };
                 container
                     .child(
-                        div()
-                            .flex_basis(gpui::relative(*ratio))
-                            .size_full()
+                        first_box
+                            .flex_shrink_0()
                             .overflow_hidden()
                             .child(self.render_pane_tree_node(
                                 first,
@@ -15669,16 +15966,15 @@ impl RootView {
                                 cell_w,
                                 line_h,
                                 active_pane_id,
-                                pane_count,
+                                pane_chrome,
                                 window,
                                 cx,
                             )),
                     )
                     .child(divider)
                     .child(
-                        div()
-                            .flex_basis(gpui::relative(1.0 - *ratio))
-                            .size_full()
+                        second_box
+                            .flex_shrink_0()
                             .overflow_hidden()
                             .child(self.render_pane_tree_node(
                                 second,
@@ -15690,7 +15986,7 @@ impl RootView {
                                 cell_w,
                                 line_h,
                                 active_pane_id,
-                                pane_count,
+                                pane_chrome,
                                 window,
                                 cx,
                             )),
@@ -15733,6 +16029,8 @@ impl Render for RootView {
         }
         self.project_graph_scroll_target = graph_scroll_target;
         let theme = self.theme;
+        let menu_max_height =
+            (_window.viewport_size().height.to_f64() as f32 - 44.0).max(200.0);
         let mut live_panes = std::collections::HashSet::new();
         for tab in &self.tabs {
             for pane in tab.pane_tree.all_panes() {
@@ -15760,6 +16058,40 @@ impl Render for RootView {
         }
         self.program_statuses
             .retain(|id, _| live_panes.contains(id));
+        let pending_permission = self.ai_pending_confirmation.is_some();
+        let tabs = &self.tabs;
+        self.notifications.retain(|card| {
+            if card.key.starts_with("ai-perm:") && !pending_permission {
+                return false;
+            }
+            match card.pane_id {
+                Some(id) => live_panes.contains(&id),
+                None => card
+                    .tab_id
+                    .is_none_or(|id| tabs.iter().any(|tab| tab.id == id)),
+            }
+        });
+        self.start_notification_ticker(_window, cx);
+        self.start_notification_exit_timer(_window, cx);
+        // A working card for the pane on screen would cover the terminal it
+        // describes. Filter it out of this frame instead of the queue, so it
+        // returns when the user looks away again.
+        let active_pane = self
+            .tabs
+            .get(self.active_tab_idx)
+            .map(|tab| tab.pane_tree.active_pane_id);
+        let window_active = _window.is_window_active();
+        let notification_cards: Vec<_> = self
+            .notifications
+            .cards()
+            .iter()
+            .filter(|card| {
+                !(card.tone == NotificationTone::Working
+                    && window_active
+                    && card.pane_id == active_pane)
+            })
+            .cloned()
+            .collect();
         self.terminal_render_retry_state
             .lock()
             .retain(|id, _| live_panes.contains(id));
@@ -15791,10 +16123,14 @@ impl Render for RootView {
             .iter()
             .enumerate()
             .map(|(idx, tab)| {
+                // The active pane owns the foreground process. `tab.terminal`
+                // is only a mirror and goes stale after a split or a close.
                 let process_name = tab
-                    .terminal
-                    .as_ref()
-                    .and_then(|t| t.get_foreground_process_name());
+                    .pane_tree
+                    .active_pane()
+                    .and_then(|pane| pane.terminal.as_ref())
+                    .or(tab.terminal.as_ref())
+                    .and_then(|terminal| terminal.get_foreground_process_name());
                 // F2: zoomed tabs carry a marker so the state is visible.
                 let mut title = tab
                     .custom_title
@@ -15816,6 +16152,10 @@ impl Render for RootView {
                         .filter_map(|pane| self.visible_program_record(pane.id))
                         .max_by_key(|record| record.state.priority())
                         .cloned(),
+                    program_app: tab
+                        .pane_tree
+                        .active_pane()
+                        .and_then(|pane| self.pane_program_app(pane.id)),
                     progress: tab
                         .pane_tree
                         .active_pane()
@@ -15829,30 +16169,6 @@ impl Render for RootView {
                 }
             })
             .collect();
-
-        let mut background_program_statuses = Vec::new();
-        for (tab_idx, tab) in self.tabs.iter().enumerate() {
-            if tab_idx == self.active_tab_idx {
-                continue;
-            }
-            let title = tab
-                .custom_title
-                .as_deref()
-                .unwrap_or(&tab.title)
-                .to_string();
-            for pane in tab.pane_tree.all_panes() {
-                if let Some(record) = self.visible_program_record(pane.id).cloned() {
-                    background_program_statuses.push((tab_idx, pane.id, title.clone(), record));
-                }
-            }
-        }
-        background_program_statuses.sort_by_key(|(tab_idx, pane_id, _, record)| {
-            (
-                std::cmp::Reverse(record.state.priority()),
-                *tab_idx,
-                *pane_id,
-            )
-        });
 
         let (active_cwd, active_git, fallback_info) =
             if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
@@ -15939,6 +16255,12 @@ impl Render for RootView {
         let font_family = self.font_family.clone();
         let font_ligatures = self.config.font.ligatures;
         let font_size = self.font_size;
+        let pane_chrome = self.pane_chrome();
+        let pane_padding = if pane_chrome { PANE_AREA_PADDING } else { 0.0 };
+        let pane_origin_x = sidebar_w + pane_padding;
+        let pane_origin_y = top_offset + pane_padding;
+        let avail_w = (avail_w - pane_padding * 2.0).max(100.0);
+        let avail_h = (avail_h - pane_padding * 2.0).max(100.0);
 
         // F2: a zoomed pane renders alone over the whole area. The temp leaf
         // is a clone, so real-tree state is untouched; hidden panes lose
@@ -15960,8 +16282,8 @@ impl Render for RootView {
             if zoomed_leaf.is_some() {
                 let full = gpui::Bounds {
                     origin: gpui::Point {
-                        x: px(sidebar_w),
-                        y: px(top_offset),
+                        x: px(pane_origin_x),
+                        y: px(pane_origin_y),
                     },
                     size: gpui::Size {
                         width: px(avail_w),
@@ -15978,9 +16300,14 @@ impl Render for RootView {
             } else {
                 // No zoom (or a stale zoom target): normal tree layout.
                 active_tab.zoomed_pane = None;
-                active_tab
-                    .pane_tree
-                    .update_layout_bounds(sidebar_w, top_offset, avail_w, avail_h);
+                active_tab.pane_tree.update_layout_bounds(
+                    pane_origin_x,
+                    pane_origin_y,
+                    avail_w,
+                    avail_h,
+                    PANE_GAP,
+                    PANE_DIVIDER,
+                );
             }
         }
 
@@ -15993,37 +16320,41 @@ impl Render for RootView {
             self.render_pane_tree_node(
                 leaf,
                 Vec::new(),
-                sidebar_w,
-                top_offset,
+                pane_origin_x,
+                pane_origin_y,
                 avail_w,
                 avail_h,
                 cell_w,
                 line_h,
                 active_pane_id,
-                1,
+                pane_chrome,
                 _window,
                 cx,
             )
         } else if let Some(active_tab) = self.tabs.get(self.active_tab_idx) {
             let active_pane_id = active_tab.pane_tree.active_pane_id;
-            let pane_count = active_tab.pane_tree.pane_count();
             self.render_pane_tree_node(
                 &active_tab.pane_tree.root,
                 Vec::new(),
-                sidebar_w,
-                top_offset,
+                pane_origin_x,
+                pane_origin_y,
                 avail_w,
                 avail_h,
                 cell_w,
                 line_h,
                 active_pane_id,
-                pane_count,
+                pane_chrome,
                 _window,
                 cx,
             )
         } else {
             div().size_full()
         };
+
+        let terminal_area = div()
+            .size_full()
+            .when(pane_chrome, |d| d.p(px(PANE_AREA_PADDING)))
+            .child(terminal_area);
 
         self.with_native_menu_actions(div(), cx)
             .flex()
@@ -16224,6 +16555,11 @@ impl Render for RootView {
                             .on_key_up(cx.listener(Self::handle_key_up))
                             .on_scroll_wheel(cx.listener(Self::handle_scroll))
                             .on_mouse_move(cx.listener(Self::handle_mouse_move))
+                            .on_mouse_exit(cx.listener(|this, _ev, _window, cx| {
+                                if this.pane_toolbar_hover.take().is_some() {
+                                    cx.notify();
+                                }
+                            }))
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
                             .on_mouse_down(MouseButton::Right, cx.listener(Self::handle_mouse_down))
                             .on_mouse_down(MouseButton::Middle, cx.listener(Self::handle_mouse_down))
@@ -16244,66 +16580,7 @@ impl Render for RootView {
                             .font_features(terminal_ligatures(font_ligatures))
                             .overflow_hidden()
                             .child(super::ime::registration(cx.entity(), self.focus_handle.clone()))
-                            .child(terminal_area)
-                            .when(!background_program_statuses.is_empty(), |pane| {
-                                pane.child(
-                                    div()
-                                        .id("background-program-statuses")
-                                        .absolute()
-                                        .bottom(px(4.))
-                                        .right(px(20.))
-                                        .flex()
-                                        .flex_col()
-                                        .items_end()
-                                        .gap(px(4.))
-                                        .children(background_program_statuses.iter().map(
-                                            |(tab_idx, pane_id, tab_title, record)| {
-                                                let label = format!(
-                                                    "{} | {}: {}",
-                                                    tab_title,
-                                                    record
-                                                        .app
-                                                        .as_deref()
-                                                        .or(record.title.as_deref())
-                                                        .unwrap_or("Program"),
-                                                    super::tab_bar::program_status_text(record),
-                                                );
-                                                let pane_id = *pane_id;
-                                                let tab_idx = *tab_idx;
-                                                div()
-                                                    .id(("background-program-status", pane_id))
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(5.))
-                                                    .max_w(px(360.))
-                                                    .px(px(7.))
-                                                    .py(px(4.))
-                                                    .rounded(px(5.))
-                                                    .bg(theme.surface_raised)
-                                                    .border_1()
-                                                    .border_color(theme.border)
-                                                    .text_size(px(11.))
-                                                    .text_color(theme.foreground)
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |this, _ev, _window, cx| {
-                                                            this.activate_tab_index(tab_idx);
-                                                            cx.notify();
-                                                        }),
-                                                    )
-                                                    .child(super::tab_bar::render_program_status(
-                                                        record, theme, 12.0,
-                                                    ))
-                                                    .child(
-                                                        div()
-                                                            .min_w(px(0.))
-                                                            .truncate()
-                                                            .child(SharedString::from(label)),
-                                                    )
-                                            },
-                                        )),
-                                )
-                            }),
+                            .child(terminal_area),
                     )
                     .when(
                         self.ai_opencode_variants_open
@@ -16835,10 +17112,7 @@ impl Render for RootView {
             .when(self.is_pane_context_menu_open, |this| {
                 let (menu_x, menu_y) = self.pane_context_menu_pos;
                 let target_pane_id = self.pane_context_menu_pane_id;
-                let sc_copy = if cfg!(target_os = "macos") { "⌘C" } else { "Ctrl+Shift+C" };
-                let sc_paste = if cfg!(target_os = "macos") { "⌘V" } else { "Ctrl+Shift+V" };
-                let sc_split_right = if cfg!(target_os = "macos") { "⌘D" } else { "Ctrl+Shift+E" };
-                let sc_split_down = if cfg!(target_os = "macos") { "⌘⇧D" } else { "Ctrl+Shift+O" };
+                let sc_ai = if cfg!(target_os = "macos") { "⌘L" } else { "Ctrl+Shift+L" };
                 let sc_close_pane = if cfg!(target_os = "macos") { "⌘W" } else { "Ctrl+Shift+W" };
                 let sc_close_tab = if cfg!(target_os = "macos") { "⌘⇧W" } else { "Ctrl+Shift+Q" };
                 let sc_rename = if cfg!(target_os = "macos") { "⌘⇧R" } else { "Ctrl+Shift+R" };
@@ -16879,9 +17153,6 @@ impl Render for RootView {
                 } else {
                     menu_y.max(36.0)
                 };
-
-                let mut menu_bg = theme.surface;
-                menu_bg.a = 1.0;
 
                 this.child(
                     div()
@@ -16929,207 +17200,205 @@ impl Render for RootView {
                         .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
                             cx.stop_propagation();
                         })
-                        .when(has_selection, |d| {
-                            d.child(render_context_menu_item(
-                                IconType::ClipboardCopy,
-                                "Copy",
-                                Some(sc_copy),
-                                cx.listener(|this, _ev, _window, cx| {
-                                    this.is_pane_context_menu_open = false;
-                                    if let Some(text) = this.get_selected_text() {
-                                        if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                                            let _ = clip.set_text(text);
-                                        }
-                                    }
-                                    cx.notify();
-                                }),
-                                theme,
-                            ))
-                            .when(can_attach_to_ai_panel, |menu| menu.child(render_context_menu_item(
-                                IconType::Sparkles,
-                                "Adjuntar al panel de IA",
-                                None,
-                                cx.listener(move |this, _ev, window, cx| {
-                                    this.attach_selection_to_agent(target_pane_id, window, cx);
-                                }),
-                                theme,
-                            )))
-                        })
-                        .child(render_context_menu_item(
-                            IconType::ClipboardPaste,
-                            "Paste",
-                            Some(sc_paste),
-                            cx.listener(move |this, _ev, _window, cx| {
-                                this.is_pane_context_menu_open = false;
-                                if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
-                                    let pane = active_tab.pane_tree.find_pane(target_pane_id).or_else(|| active_tab.pane_tree.active_pane());
-                                    if let Some(terminal) = pane.and_then(|p| p.terminal.as_ref()).or(active_tab.terminal.as_ref()) {
-                                        if let Some(mut clip) = crate::event_listener::clipboard_helper() {
-                                            if let Some(content) = crate::paste::get_clipboard_paste_content(&mut clip) {
-                                                crate::paste::paste_text_to_terminal(terminal, &content);
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(4.))
+                                .child(pane_quick_action(
+                                    IconType::ClipboardCopy,
+                                    "Copy",
+                                    None,
+                                    has_selection,
+                                    theme,
+                                    cx.listener(move |this, _ev, _window, cx| {
+                                        this.is_pane_context_menu_open = false;
+                                        if let Some(text) =
+                                            this.get_selected_text_for_pane(target_pane_id)
+                                        {
+                                            if let Some(mut clip) =
+                                                crate::event_listener::clipboard_helper()
+                                            {
+                                                let _ = clip.set_text(text);
                                             }
                                         }
-                                    }
-                                }
-                                cx.notify();
-                            }),
-                            theme,
-                        ))
-                        .child(render_context_menu_divider(theme))
-                        .child(render_context_menu_item(
-                            IconType::PanelRight,
-                            "Split Pane Right",
-                            Some(sc_split_right),
-                            cx.listener(move |this, _ev, window, cx| {
-                                this.is_pane_context_menu_open = false;
-                                if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
-                                    tab.pane_tree.active_pane_id = target_pane_id;
-                                    if let Some(p) = tab.pane_tree.active_pane() {
-                                        tab.terminal = p.terminal.clone();
-                                        tab.cwd = p.cwd.clone();
-                                        tab.git_status = p.git_status.clone();
-                                    }
-                                }
-                                this.split_active_pane(Direction::Right, window, cx);
-                            }),
-                            theme,
-                        ))
-                        .child(render_context_menu_item(
-                            IconType::PanelBottom,
-                            "Split Pane Down",
-                            Some(sc_split_down),
-                            cx.listener(move |this, _ev, window, cx| {
-                                this.is_pane_context_menu_open = false;
-                                if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
-                                    tab.pane_tree.active_pane_id = target_pane_id;
-                                    if let Some(p) = tab.pane_tree.active_pane() {
-                                        tab.terminal = p.terminal.clone();
-                                        tab.cwd = p.cwd.clone();
-                                        tab.git_status = p.git_status.clone();
-                                    }
-                                }
-                                this.split_active_pane(Direction::Down, window, cx);
-                            }),
-                            theme,
-                        ))
-                        .child(render_context_menu_item(
-                            IconType::PanelLeft,
-                            "Split Pane Left",
-                            None,
-                            cx.listener(move |this, _ev, window, cx| {
-                                this.is_pane_context_menu_open = false;
-                                if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
-                                    tab.pane_tree.active_pane_id = target_pane_id;
-                                    if let Some(p) = tab.pane_tree.active_pane() {
-                                        tab.terminal = p.terminal.clone();
-                                        tab.cwd = p.cwd.clone();
-                                        tab.git_status = p.git_status.clone();
-                                    }
-                                }
-                                this.split_active_pane(Direction::Left, window, cx);
-                            }),
-                            theme,
-                        ))
-                        .child(render_context_menu_item(
-                            IconType::PanelTop,
-                            "Split Pane Top",
-                            None,
-                            cx.listener(move |this, _ev, window, cx| {
-                                this.is_pane_context_menu_open = false;
-                                if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
-                                    tab.pane_tree.active_pane_id = target_pane_id;
-                                    if let Some(p) = tab.pane_tree.active_pane() {
-                                        tab.terminal = p.terminal.clone();
-                                        tab.cwd = p.cwd.clone();
-                                        tab.git_status = p.git_status.clone();
-                                    }
-                                }
-                                this.split_active_pane(Direction::Top, window, cx);
-                            }),
-                            theme,
-                        ))
-                        .when(can_zoom, |d| {
-                            d.child(render_context_menu_item(
-                                IconType::Maximize2,
-                                if is_zoomed { "Unzoom Pane" } else { "Zoom Pane" },
-                                None,
-                                cx.listener(move |this, _ev, _window, cx| {
-                                    this.is_pane_context_menu_open = false;
-                                    if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
-                                        tab.pane_tree.active_pane_id = target_pane_id;
-                                        if let Some(p) = tab.pane_tree.active_pane() {
-                                            tab.terminal = p.terminal.clone();
-                                            tab.cwd = p.cwd.clone();
-                                            tab.git_status = p.git_status.clone();
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(pane_quick_action(
+                                    IconType::ClipboardPaste,
+                                    "Paste",
+                                    None,
+                                    true,
+                                    theme,
+                                    cx.listener(move |this, _ev, _window, cx| {
+                                        this.is_pane_context_menu_open = false;
+                                        if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
+                                            let pane = active_tab
+                                                .pane_tree
+                                                .find_pane(target_pane_id)
+                                                .or_else(|| active_tab.pane_tree.active_pane());
+                                            if let Some(terminal) = pane
+                                                .and_then(|pane| pane.terminal.as_ref())
+                                                .or(active_tab.terminal.as_ref())
+                                            {
+                                                if let Some(mut clip) =
+                                                    crate::event_listener::clipboard_helper()
+                                                {
+                                                    if let Some(content) =
+                                                        crate::paste::get_clipboard_paste_content(
+                                                            &mut clip,
+                                                        )
+                                                    {
+                                                        crate::paste::paste_text_to_terminal(
+                                                            terminal, &content,
+                                                        );
+                                                    }
+                                                }
+                                            }
                                         }
-                                    }
-                                    this.toggle_pane_zoom(cx);
-                                }),
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(pane_quick_action(
+                                    IconType::SquareDashed,
+                                    "Select All",
+                                    None,
+                                    true,
+                                    theme,
+                                    cx.listener(move |this, _ev, _window, cx| {
+                                        this.is_pane_context_menu_open = false;
+                                        this.focus_pane_for_action(target_pane_id);
+                                        this.select_all_terminal(cx);
+                                    }),
+                                )),
+                        )
+                        .child(pane_menu_section("split pane", "← pick", theme))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .px(px(7.))
+                                .pb(px(5.))
+                                .children(
+                                    [
+                                        Direction::Left,
+                                        Direction::Right,
+                                        Direction::Top,
+                                        Direction::Down,
+                                    ]
+                                    .into_iter()
+                                    .map(|direction| {
+                                        pane_split_button(
+                                            direction,
+                                            theme,
+                                            cx.listener(move |this, _ev, window, cx| {
+                                                this.is_pane_context_menu_open = false;
+                                                this.focus_pane_for_action(target_pane_id);
+                                                this.split_active_pane(direction, window, cx);
+                                            }),
+                                        )
+                                    }),
+                                ),
+                        )
+                        .when(can_attach_to_ai_panel, |menu| {
+                            menu.child(super::app_menu::menu_row(
+                                IconType::Sparkles,
+                                "Ask Fastty AI about output",
+                                sc_ai,
+                                true,
                                 theme,
+                                cx.listener(move |this, _ev, window, cx| {
+                                    this.is_pane_context_menu_open = false;
+                                    this.attach_selection_to_agent(target_pane_id, window, cx);
+                                }),
                             ))
                         })
-                        .child(render_context_menu_divider(theme))
-                        .child(render_context_menu_item(
+                        .child(super::app_menu::menu_row(
                             IconType::Pencil,
-                            "Change Tab Name...",
-                            Some(sc_rename),
+                            "Rename Tab...",
+                            sc_rename,
+                            false,
+                            theme,
                             cx.listener(|this, _ev, _window, cx| {
                                 this.is_pane_context_menu_open = false;
                                 let idx = this.active_tab_idx;
                                 this.open_rename_tab(idx, cx);
                             }),
-                            theme,
                         ))
-                        .child(render_context_menu_item(
+                        .child(super::app_menu::menu_row(
                             IconType::Search,
                             "Find in Buffer...",
-                            Some(sc_search),
+                            sc_search,
+                            false,
+                            theme,
                             cx.listener(move |this, _ev, window, cx| {
                                 this.is_pane_context_menu_open = false;
-                                if let Some(tab) = this.tabs.get_mut(this.active_tab_idx) {
-                                    tab.pane_tree.active_pane_id = target_pane_id;
-                                    if let Some(p) = tab.pane_tree.active_pane() {
-                                        tab.terminal = p.terminal.clone();
-                                        tab.cwd = p.cwd.clone();
-                                        tab.git_status = p.git_status.clone();
-                                    }
-                                }
+                                this.focus_pane_for_action(target_pane_id);
                                 this.toggle_search(window, cx);
                             }),
-                            theme,
                         ))
-                        .child(render_context_menu_item(
-                            IconType::Trash2,
-                            "Clear / Reset Terminal",
-                            Some(sc_clear),
+                        .child(super::app_menu::menu_row(
+                            IconType::Eraser,
+                            "Clear Scrollback",
+                            sc_clear,
+                            false,
+                            theme,
                             cx.listener(move |this, _ev, _window, cx| {
                                 this.is_pane_context_menu_open = false;
                                 if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
-                                    let pane = active_tab.pane_tree.find_pane(target_pane_id).or_else(|| active_tab.pane_tree.active_pane());
-                                    if let Some(ref term) = pane.and_then(|p| p.terminal.as_ref()).or(active_tab.terminal.as_ref()) {
-                                        term.scroll_to_bottom();
-                                        term.write_to_pty(b"\x0c");
+                                    let pane = active_tab
+                                        .pane_tree
+                                        .find_pane(target_pane_id)
+                                        .or_else(|| active_tab.pane_tree.active_pane());
+                                    if let Some(terminal) = pane
+                                        .and_then(|pane| pane.terminal.as_ref())
+                                        .or(active_tab.terminal.as_ref())
+                                    {
+                                        terminal.scroll_to_bottom();
+                                        terminal.write_to_pty(b"\x0c");
                                     }
                                 }
                                 cx.notify();
                             }),
-                            theme,
                         ))
-                        .child(render_context_menu_divider(theme))
-                        .child(render_context_menu_item(
+                        .when(can_zoom, |menu| {
+                            menu.child(super::app_menu::menu_row(
+                                if is_zoomed {
+                                    IconType::Minimize
+                                } else {
+                                    IconType::Maximize2
+                                },
+                                if is_zoomed { "Unzoom Pane" } else { "Zoom Pane" },
+                                "",
+                                false,
+                                theme,
+                                cx.listener(move |this, _ev, _window, cx| {
+                                    this.is_pane_context_menu_open = false;
+                                    this.focus_pane_for_action(target_pane_id);
+                                    this.toggle_pane_zoom(cx);
+                                }),
+                            ))
+                        })
+                        .child(super::app_menu::menu_row(
                             IconType::X,
                             "Close Pane",
-                            Some(sc_close_pane),
+                            sc_close_pane,
+                            false,
+                            theme,
                             cx.listener(move |this, _ev, window, cx| {
                                 this.is_pane_context_menu_open = false;
                                 this.close_pane_by_id(target_pane_id, window, cx);
                             }),
-                            theme,
                         ))
-                        .child(render_context_menu_item(
+                        .child(super::app_menu::menu_row(
                             IconType::Trash2,
                             "Close Tab",
-                            Some(sc_close_tab),
+                            sc_close_tab,
+                            false,
+                            theme,
                             cx.listener(|this, _ev, window, cx| {
                                 this.is_pane_context_menu_open = false;
                                 if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
@@ -21056,6 +21325,141 @@ fn redact_process_command(command: &str) -> String {
     } else {
         command.to_string()
     }
+}
+
+/// Big icon-over-label button at the top of the terminal context menu.
+fn pane_quick_action(
+    icon: IconType,
+    label: &'static str,
+    suffix: Option<String>,
+    enabled: bool,
+    theme: Theme,
+    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<Div> {
+    let icon_color = if enabled {
+        theme.muted_strong
+    } else {
+        theme.muted.opacity(0.5)
+    };
+    let label_color = if enabled {
+        theme.foreground
+    } else {
+        theme.muted
+    };
+    div()
+        .id(SharedString::from(format!("pane-quick-{label}")))
+        .flex_1()
+        .h(px(46.))
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(3.))
+        .rounded(px(8.))
+        .bg(theme.hover)
+        .when(enabled, |button| button.cursor(CursorStyle::PointingHand))
+        .when(enabled, move |button| {
+            button
+                .hover(move |style| style.bg(theme.selected))
+                .active(move |style| style.bg(theme.hover))
+        })
+        .child(render_icon(icon, icon_color, 15.0))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(3.))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(label_color)
+                        .truncate()
+                        .child(label),
+                )
+                .when_some(suffix, |row, suffix| {
+                    row.child(
+                        div()
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.accent)
+                            .child(SharedString::from(suffix)),
+                    )
+                }),
+        )
+        .when(enabled, |button| {
+            button.on_mouse_down(MouseButton::Left, on_click)
+        })
+}
+
+fn pane_menu_section(title: &'static str, hint: &'static str, theme: Theme) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px(px(7.))
+        .pt(px(8.))
+        .pb(px(4.))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(5.))
+                .text_size(px(11.))
+                .text_color(theme.muted)
+                .child("#")
+                .child(title),
+        )
+        .child(
+            div()
+                .text_size(px(10.5))
+                .text_color(theme.muted)
+                .child(hint),
+        )
+}
+
+/// A small diagram of the split, with the new pane drawn in the accent color.
+fn pane_split_button(
+    direction: Direction,
+    theme: Theme,
+    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<Div> {
+    let active = theme.accent.opacity(0.85);
+    let idle = theme.muted.opacity(0.38);
+    let cell = |color: gpui::Hsla| div().flex_1().rounded(px(2.)).bg(color);
+    let (first, second, vertical) = match direction {
+        Direction::Left => (active, idle, false),
+        Direction::Right => (idle, active, false),
+        Direction::Top => (active, idle, true),
+        Direction::Down => (idle, active, true),
+    };
+    let plot = div()
+        .flex()
+        .flex_1()
+        .gap(px(2.))
+        .when(vertical, |plot| plot.flex_col())
+        .when(!vertical, |plot| plot.flex_row())
+        .child(cell(first))
+        .child(cell(second));
+    div()
+        .id(SharedString::from(format!("pane-split-{direction:?}")))
+        .w(px(42.))
+        .h(px(26.))
+        .flex()
+        .flex_shrink_0()
+        .p(px(2.))
+        .rounded(px(5.))
+        .bg(theme.hover)
+        .border_1()
+        .border_color(theme.border)
+        .cursor(CursorStyle::PointingHand)
+        .hover(move |style| style.bg(theme.selected))
+        .child(plot)
+        .on_mouse_down(MouseButton::Left, on_click)
 }
 
 fn render_context_menu_item(
