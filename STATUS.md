@@ -1,6 +1,6 @@
 # fastty — Status & Pendientes
 
-**Última actualización:** 2026-10-25
+**Última actualización:** 2026-11-04 (revisión de estado)
 **Render:** GPUI (Zed) — macOS primero; Linux/Windows funcionales
 
 > La versión anterior de este documento describía un renderer wgpu/winit
@@ -33,6 +33,7 @@ Cold start ~129ms → Warm ~79ms (verificado en M1, 2026-08):
 | Gateway web (HTTP/WS embebido + WASM) | `src/gateway.rs`, `crates/fastty-wasm/`, `web/` |
 | MCP | `src/mcp.rs` |
 | IA (sidebar, providers, tools, auto-allow) | `src/ai/` |
+| Assets de marca (iconos de tab, logo) | `src/ui/brand_assets.rs`, `src/ui/tab_icons.rs`, `assets/brands/` |
 
 ---
 
