@@ -3,13 +3,19 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 use gpui::{
     div, prelude::*, px, size, Bounds, Context, CursorStyle, Div, FocusHandle, FontFeatures,
-    FontWeight, Hsla, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Render, ScrollHandle, ScrollWheelEvent, SharedString, TitlebarOptions, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions,
+    FontWeight, HighlightStyle, Hsla, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Render, ScrollHandle, ScrollWheelEvent, SharedString, StyledText,
+    TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 use std::sync::Arc;
 
+use super::app_menu::{AppMenu, AppMenuAction, AppMenuStatus};
+use super::notification_stack::{
+    summarize_detail, InternalNotification, NotificationAction, NotificationQueue,
+    NotificationStack, NotificationTone,
+};
 use super::palette_preview::{PaletteSession, PreviewState};
+use super::tab_icons::{tab_glyph, TabGlyph};
 use super::project_sidebar::{cached_graph_layout, GraphLayout, ProjectPanelTab, ProjectSidebar};
 use super::settings_view::SettingsView;
 use super::status_bar::{StatusBar, StatusBarModel, StatusInfo};
@@ -15196,16 +15202,19 @@ impl Render for RootView {
                 )
             })
             .when(self.is_context_menu_open, |this| {
-                let sc_palette = if cfg!(target_os = "macos") { "⌘P" } else { "Ctrl+Shift+P" };
-                let sc_ai = if cfg!(target_os = "macos") { "⌘L" } else { "Ctrl+Shift+L" };
-                let sc_ssh = if cfg!(target_os = "macos") { "⌘O" } else { "Ctrl+Shift+O" };
-                let sc_search = if cfg!(target_os = "macos") { "⌘F" } else { "Ctrl+Shift+F" };
-                let sc_settings = if cfg!(target_os = "macos") { "⌘," } else { "Ctrl+," };
-                let sc_new_tab = if cfg!(target_os = "macos") { "⌘T" } else { "Ctrl+Shift+T" };
-                let sc_clear = if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl+Shift+K" };
-                let sc_fullscreen = if cfg!(target_os = "macos") { "⌃⌘F" } else { "F11" };
-                let sc_quit = if cfg!(target_os = "macos") { "⌘Q" } else { "Alt+F4" };
-
+                let status = if self.is_update_ready {
+                    AppMenuStatus::Ready
+                } else if self.is_updating {
+                    AppMenuStatus::Updating
+                } else if let Some(release) = &self.update_available {
+                    AppMenuStatus::Available(release.version.clone())
+                } else if self.update_check_failed {
+                    AppMenuStatus::CheckFailed
+                } else if self.update_checked {
+                    AppMenuStatus::UpToDate
+                } else {
+                    AppMenuStatus::Unknown
+                };
                 this.child(
                     div()
                         .id("logo-menu-backdrop")
