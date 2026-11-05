@@ -142,6 +142,11 @@ pub struct AiSidebar {
     pub turn_completed: bool,
     pub is_focused: bool,
     pub pending_confirmation: Option<AiUiPendingConfirmation>,
+    pub pending_question: Option<crate::ai::opencode::ElicitationRequestData>,
+    pub question_selection: std::collections::HashMap<String, Vec<String>>,
+    pub on_question_toggle: Option<Box<dyn Fn(&(String, String), &mut Window, &mut App) + 'static>>,
+    pub on_question_submit: Option<MouseDownCallback>,
+    pub on_question_cancel: Option<MouseDownCallback>,
     pub input_text: String,
     pub cursor_pos: usize,
     pub selection: Option<(usize, usize)>,
@@ -180,6 +185,8 @@ pub struct AiSidebar {
     pub at_menu_open: bool,
     pub at_is_skill_menu: bool,
     pub at_matches: Vec<String>,
+    /// Git status letter per relative path, for the mention list.
+    pub at_file_status: std::collections::HashMap<String, char>,
     /// Row the arrow keys point at. Separate from hover: the pointer and the
     /// keyboard move it independently, so the highlight has to read without a
     /// mouse over the list.
@@ -200,6 +207,7 @@ pub struct AiSidebar {
     pub on_copied: Option<MouseDownCallback>,
     pub context_used_tokens: u64,
     pub context_max_tokens: u64,
+    pub context_breakdown: ContextBreakdown,
     pub ai_last_usage: Option<(u64, u64)>,
     pub context_hovercard_open: bool,
     pub on_hover_context: Option<Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>>,
@@ -231,6 +239,11 @@ impl AiSidebar {
             turn_completed: false,
             is_focused: true,
             pending_confirmation: None,
+            pending_question: None,
+            question_selection: std::collections::HashMap::new(),
+            on_question_toggle: None,
+            on_question_submit: None,
+            on_question_cancel: None,
             input_text: String::new(),
             cursor_pos: 0,
             selection: None,
@@ -269,6 +282,7 @@ impl AiSidebar {
             at_selected: 0,
             at_scroll_handle: ScrollHandle::new(),
             at_matches: Vec::new(),
+            at_file_status: std::collections::HashMap::new(),
             on_select_at_match: None,
             composer_bounds: None,
             message_selection: None,
@@ -279,6 +293,7 @@ impl AiSidebar {
             on_copied: None,
             context_used_tokens: 0,
             context_max_tokens: 128_000,
+            context_breakdown: ContextBreakdown::default(),
             ai_last_usage: None,
             context_hovercard_open: false,
             on_hover_context: None,
@@ -289,6 +304,11 @@ impl AiSidebar {
         self.context_used_tokens = used;
         self.context_max_tokens = max;
         self.ai_last_usage = last_usage;
+        self
+    }
+
+    pub fn context_breakdown(mut self, breakdown: ContextBreakdown) -> Self {
+        self.context_breakdown = breakdown;
         self
     }
 
@@ -381,6 +401,46 @@ impl AiSidebar {
 
     pub fn pending_confirmation(mut self, conf: Option<AiUiPendingConfirmation>) -> Self {
         self.pending_confirmation = conf;
+        self
+    }
+
+    pub fn pending_question(
+        mut self,
+        question: Option<crate::ai::opencode::ElicitationRequestData>,
+    ) -> Self {
+        self.pending_question = question;
+        self
+    }
+
+    pub fn question_selection(
+        mut self,
+        selection: std::collections::HashMap<String, Vec<String>>,
+    ) -> Self {
+        self.question_selection = selection;
+        self
+    }
+
+    pub fn on_question_toggle(
+        mut self,
+        handler: impl Fn(&(String, String), &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_question_toggle = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_question_submit(
+        mut self,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_question_submit = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_question_cancel(
+        mut self,
+        handler: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_question_cancel = Some(Box::new(handler));
         self
     }
 
@@ -621,6 +681,11 @@ impl AiSidebar {
         self
     }
 
+    pub fn at_file_status(mut self, status: std::collections::HashMap<String, char>) -> Self {
+        self.at_file_status = status;
+        self
+    }
+
     pub fn at_matches(mut self, matches: Vec<String>) -> Self {
         self.at_matches = matches;
         self
@@ -735,10 +800,11 @@ fn format_cwd_display(cwd: &str) -> String {
 }
 
 pub fn current_time_str() -> String {
-    let secs = std::time::SystemTime::now()
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_secs() as i64;
+    let secs = (now + local_utc_offset_secs() as i64).max(0) as u64;
     let hours = (secs / 3600 % 24) as u32;
     let mins = (secs / 60 % 60) as u32;
     let (h12, ampm) = if hours == 0 {
@@ -751,6 +817,22 @@ pub fn current_time_str() -> String {
         (hours - 12, "PM")
     };
     format!("{}:{:02} {}", h12, mins, ampm)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn local_utc_offset_secs() -> i32 {
+    unsafe {
+        let mut t: libc::time_t = 0;
+        libc::time(&mut t);
+        let mut tm = std::mem::zeroed::<libc::tm>();
+        libc::localtime_r(&t, &mut tm);
+        tm.tm_gmtoff as i32
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn local_utc_offset_secs() -> i32 {
+    0
 }
 
 pub(crate) struct ParsedToolRow {
@@ -1248,8 +1330,20 @@ const DIFF_MAX_ROWS: usize = 200;
 struct ContextUsage {
     used_tokens: u64,
     max_tokens: u64,
-    last_usage: Option<(u64, u64)>,
     pct: f32,
+    provider: String,
+    breakdown: ContextBreakdown,
+}
+
+/// Rough split of the context window. The values come from counting the
+/// rendered conversation; they are estimates, not provider counters, and are
+/// scaled to the reported total before drawing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ContextBreakdown {
+    pub system: u64,
+    pub tools: u64,
+    pub files: u64,
+    pub conversation: u64,
 }
 
 /// Callbacks a tool diff card needs. Grouped because eight positional
@@ -1264,22 +1358,16 @@ fn render_tool_diff_card(
     theme: &Theme,
     diff: &crate::ai::diff::FileDiff,
     pending: bool,
+    pending_confirmation: Option<&AiUiPendingConfirmation>,
     running: bool,
     card_idx: usize,
     callbacks: ToolCardCallbacks,
 ) -> Div {
-    let file_name = diff
-        .path
-        .rsplit('/')
-        .next()
-        .unwrap_or(&diff.path)
-        .to_string();
-
     let mut card = div()
         .flex()
         .flex_col()
         .w_full()
-        .rounded(px(6.))
+        .rounded(px(8.))
         .border_1()
         .border_color(if pending { theme.accent } else { theme.border })
         .bg(theme.main_bg)
@@ -1290,38 +1378,38 @@ fn render_tool_diff_card(
                 .flex_row()
                 .items_center()
                 .justify_between()
-                .px(px(8.))
-                .py(px(4.))
+                .px(px(10.))
+                .py(px(7.))
                 .bg(theme.surface)
                 .child(
                     div()
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap_1()
+                        .gap(px(6.))
                         .min_w(px(0.))
                         .overflow_hidden()
+                        .child(crate::ui::icons::render_icon(
+                            IconType::FileCode,
+                            if pending { theme.accent } else { theme.muted },
+                            12.0,
+                        ))
                         .child(
                             div()
-                                .text_size(px(10.5))
-                                .text_color(if pending { theme.accent } else { theme.muted })
-                                .flex_shrink_0()
-                                .child(if running {
-                                    "Editing"
-                                } else if pending {
-                                    "Edit — review"
-                                } else {
-                                    "Edited"
-                                }),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.foreground)
-                                .overflow_hidden()
-                                .child(SharedString::from(file_name)),
-                        ),
+                                .truncate()
+                                .child(SharedString::from(diff.path.clone())),
+                        )
+                        .when(running, |row| {
+                            row.child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(theme.muted)
+                                    .child("editing"),
+                            )
+                        }),
                 )
                 .child(
                     div()
@@ -1446,6 +1534,22 @@ fn render_tool_diff_card(
     // allowlist so later edits to the same file apply without asking.
     if pending {
         if let Some(on_confirm) = callbacks.on_confirm.as_ref() {
+            // ACP agents choose their own option ids; map them by kind so the
+            // buttons send an id the agent accepts.
+            let option_id = |kind: &str, fallback: &str| {
+                pending_confirmation
+                    .and_then(|confirmation| {
+                        confirmation
+                            .options
+                            .iter()
+                            .find(|option| option.kind.as_deref() == Some(kind))
+                            .map(|option| option.option_id.clone())
+                    })
+                    .unwrap_or_else(|| fallback.to_string())
+            };
+            let allow_id = option_id("allow_once", "allow_once");
+            let always_id = option_id("allow_always", "allow_always");
+            let reject_id = option_id("reject_once", "reject_once");
             let on_confirm_allow = on_confirm.clone();
             let on_confirm_always = on_confirm.clone();
             let on_confirm_decline = on_confirm;
@@ -1467,35 +1571,35 @@ fn render_tool_diff_card(
                             .items_center()
                             .gap_2()
                             .child(render_confirm_button(
-                                "Accept".to_string(),
+                                "Apply".to_string(),
                                 theme,
                                 true,
                                 false,
-                                "allow_once".to_string(),
+                                allow_id,
                                 &on_confirm_allow,
                             ))
                             .child(render_confirm_button(
-                                "Allow Always".to_string(),
+                                "Discard".to_string(),
                                 theme,
                                 false,
                                 false,
-                                "allow_always".to_string(),
-                                &on_confirm_always,
+                                reject_id,
+                                on_confirm_decline,
                             ))
                             .child(render_confirm_button(
-                                "Reject".to_string(),
+                                "Allow always".to_string(),
                                 theme,
                                 false,
-                                true,
-                                "reject_once".to_string(),
-                                on_confirm_decline,
+                                false,
+                                always_id,
+                                &on_confirm_always,
                             )),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(10.5))
                             .text_color(theme.muted)
-                            .child("⌘↵ Accept"),
+                            .child("⌘↵ apply"),
                     ),
             );
         }
@@ -1879,13 +1983,22 @@ fn render_confirmation_section(
 }
 
 fn parse_diff_confirmation(tool_name: &str, summary: &str) -> Option<ParsedDiffCard> {
-    if tool_name != "edit_file" {
+    // `edit_file` is Fastty's own tool; ACP agents send "Edit", "Write" or
+    // "Patch" with camelCase keys.
+    if !matches!(tool_name, "edit_file" | "Edit" | "Write" | "write_file" | "Patch") {
         return None;
     }
     let val: serde_json::Value = serde_json::from_str(summary).ok()?;
-    let path = val.get("path")?.as_str()?.to_string();
-    let old_s = val.get("old_string").and_then(|v| v.as_str());
-    let new_s = val.get("new_string").and_then(|v| v.as_str());
+    let path = ["path", "filePath", "file_path"]
+        .iter()
+        .find_map(|key| val.get(*key).and_then(|value| value.as_str()))?
+        .to_string();
+    let old_s = ["old_string", "oldString", "oldText"]
+        .iter()
+        .find_map(|key| val.get(*key).and_then(|value| value.as_str()));
+    let new_s = ["new_string", "newString", "newText"]
+        .iter()
+        .find_map(|key| val.get(*key).and_then(|value| value.as_str()));
     let content = val.get("content").and_then(|v| v.as_str());
 
     let mut rows: Vec<DiffRow> = Vec::new();
@@ -2044,38 +2157,136 @@ fn format_number(n: u64) -> String {
     out
 }
 
-fn render_context_hovercard(
-    usage: ContextUsage,
-    theme: &Theme,
-    on_file_drop: Option<std::rc::Rc<FileDropCallback>>,
-) -> impl IntoElement {
+/// `6.3k`, `27k`, `948`. Used by the context legend and the note.
+fn format_k(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    let rounded = (n as f64 / 100.0).round() / 10.0;
+    if (rounded * 10.0).fract() == 0.0 {
+        format!("{rounded:.0}k")
+    } else {
+        format!("{rounded:.1}k")
+    }
+}
+
+fn render_context_hovercard(usage: ContextUsage, theme: &Theme, max_width: f32) -> impl IntoElement {
+    let card_w = (max_width - 20.0).clamp(200.0, 316.0);
     let ContextUsage {
         used_tokens,
         max_tokens,
-        last_usage,
         pct,
+        provider,
+        breakdown,
     } = usage;
     let progress = pct.clamp(0.0, 1.0);
-    let pct_label = if last_usage.is_some() {
-        format!("{:.1}%", progress * 100.0)
+    let remaining_tokens = max_tokens.saturating_sub(used_tokens);
+    let pct_label = if used_tokens > 0 {
+        format!("{:.0}", progress * 100.0)
     } else {
         "—".to_string()
     };
-    let remaining_tokens = max_tokens.saturating_sub(used_tokens);
-    let bar_color = if progress > 0.8 {
-        theme.bright_red
+
+    // Scale the estimates to the reported total. The residual goes to the
+    // system slice so the used part of the bar always sums to the percentage.
+    let raw = [
+        breakdown.system,
+        breakdown.tools,
+        breakdown.files,
+        breakdown.conversation,
+    ];
+    let raw_total: u64 = raw.iter().sum();
+    let scale = if raw_total > used_tokens && raw_total > 0 {
+        used_tokens as f32 / raw_total as f32
     } else {
-        theme.accent
+        1.0
+    };
+    let scaled: Vec<u64> = raw.iter().map(|value| (*value as f32 * scale) as u64).collect();
+    let scaled_total: u64 = scaled.iter().sum();
+    let mut categories = scaled.clone();
+    if let Some(system) = categories.first_mut() {
+        *system = system.saturating_add(used_tokens.saturating_sub(scaled_total));
+    }
+    let free = max_tokens.saturating_sub(used_tokens);
+
+    let track_w: f32 = card_w - 28.0;
+    let segments: [(u64, gpui::Hsla); 5] = [
+        (categories[0], theme.blue),
+        (categories[1], theme.bright_yellow),
+        (categories[2], theme.cyan),
+        (categories[3], theme.accent),
+        (free, theme.muted.opacity(0.35)),
+    ];
+    let total: u64 = segments.iter().map(|(tokens, _)| *tokens).sum::<u64>().max(1);
+    let bars = div()
+        .relative()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(2.))
+        .h(px(7.))
+        .w_full()
+        .children(segments.into_iter().filter_map(|(tokens, color)| {
+            if tokens == 0 {
+                return None;
+            }
+            let width = (track_w * tokens as f32 / total as f32).max(2.0);
+            Some(
+                div()
+                    .h(px(7.))
+                    .w(px(width))
+                    .rounded(px(3.))
+                    .bg(color)
+                    .flex_shrink_0(),
+            )
+        }))
+        .child(
+            div()
+                .absolute()
+                .top(px(-2.))
+                .left(px(track_w * 0.9))
+                .h(px(11.))
+                .w(px(1.))
+                .bg(theme.muted_strong),
+        );
+
+    let legend_row = |color: gpui::Hsla, label: &'static str, tokens: u64| {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .h(px(22.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(7.))
+                    .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(color))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(theme.muted_strong)
+                            .child(label),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme.muted)
+                    .child(SharedString::from(format_k(tokens))),
+            )
     };
 
-    let mut card = div()
+    div()
         .id("ai-context-hovercard")
         .absolute()
-        .top(px(38.))
+        .top(px(46.))
         .right(px(10.))
-        .w(px(250.))
-        .p(px(12.))
-        .rounded(px(8.))
+        .w(px(card_w))
+        .p(px(14.))
+        .rounded(px(10.))
         .bg({
             let mut bg = theme.surface_raised;
             bg.a = 1.0;
@@ -2087,7 +2298,7 @@ fn render_context_hovercard(
         .occlude()
         .flex()
         .flex_col()
-        .gap(px(8.))
+        .gap(px(10.))
         .on_mouse_down(MouseButton::Left, |_, _, cx| {
             cx.stop_propagation();
         })
@@ -2100,145 +2311,116 @@ fn render_context_hovercard(
         .on_scroll_wheel(|_, _, cx| {
             cx.stop_propagation();
         })
-        // Card Header
         .child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_start()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.muted)
+                        .child("# context window"),
+                )
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_size(px(11.))
+                        .text_color(theme.muted)
+                        .child(SharedString::from(provider)),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_end()
+                .justify_between()
                 .child(
                     div()
                         .flex()
                         .flex_row()
-                        .items_center()
-                        .gap(px(5.))
-                        .child(crate::ui::icons::render_icon(
-                            IconType::Sparkles,
-                            theme.accent,
-                            12.0,
-                        ))
+                        .items_end()
+                        .gap(px(2.))
                         .child(
                             div()
-                                .text_size(px(11.5))
-                                .font_weight(FontWeight::BOLD)
+                                .text_size(px(30.))
+                                .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme.foreground)
-                                .child("Context Window"),
+                                .child(SharedString::from(pct_label.clone())),
+                        )
+                        .when(pct_label != "—", |row| {
+                            row.child(
+                                div()
+                                    .pb(px(4.))
+                                    .text_size(px(13.))
+                                    .text_color(theme.muted)
+                                    .child("%"),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_end()
+                        .gap(px(1.))
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .text_color(theme.foreground)
+                                .child(SharedString::from(format_number(used_tokens))),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.muted)
+                                .child(SharedString::from(format!(
+                                    "of {}",
+                                    format_number(max_tokens)
+                                ))),
                         ),
                 ),
         )
-        // Progress Bar & Percentage
+        .child(bars)
         .child(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(3.))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .text_size(px(10.5))
-                        .child(div().text_color(theme.muted_strong).child("Capacity"))
-                        .child(
-                            div()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(if progress > 0.8 {
-                                    theme.bright_red
-                                } else {
-                                    theme.accent
-                                })
-                                .child(pct_label),
-                        ),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .h(px(4.))
-                        .rounded(px(2.))
-                        .bg(theme.border)
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .h_full()
-                                .w(gpui::DefiniteLength::Fraction(progress))
-                                .rounded(px(2.))
-                                .bg(bar_color),
-                        ),
-                ),
+                .child(legend_row(theme.blue, "System & rules", categories[0]))
+                .child(legend_row(theme.bright_yellow, "Tool results", categories[1]))
+                .child(legend_row(theme.cyan, "Files read", categories[2]))
+                .child(legend_row(theme.accent, "Conversation", categories[3])),
         )
-        // Token Stats Breakdown
         .child(
             div()
                 .flex()
-                .flex_col()
-                .gap(px(3.))
-                .pt(px(2.))
-                .border_t_1()
-                .border_color(theme.border)
+                .flex_row()
+                .items_start()
+                .gap(px(5.))
+                .p(px(10.))
+                .rounded(px(8.))
+                .bg(theme.surface)
                 .child(
                     div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .text_size(px(10.5))
-                        .child(div().text_color(theme.muted).child("Used Tokens"))
-                        .child(
-                            div()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.foreground)
-                                .child(if last_usage.is_some() {
-                                    format!("{} / {}", format_number(used_tokens), format_number(max_tokens))
-                                } else {
-                                    format!("— / {}", format_number(max_tokens))
-                                }),
-                        ),
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.yellow)
+                        .child(SharedString::from(format_k(remaining_tokens))),
                 )
-                .when_some(last_usage, |rows, (input, output)| {
-                    rows.child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .text_size(px(10.))
-                            .child(div().text_color(theme.muted).child("Prompt / Completion"))
-                            .child(div().text_color(theme.muted_strong).child(format!(
-                                "{} / {}",
-                                format_number(input),
-                                format_number(output)
-                            ))),
-                    )
-                })
-                .when_some(last_usage, |rows, _| rows.child(
+                .child(
                     div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .text_size(px(10.))
-                        .child(div().text_color(theme.muted).child("Remaining"))
-                        .child(
-                            div()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(if remaining_tokens < 2_000 {
-                                    theme.bright_red
-                                } else {
-                                    theme.muted_strong
-                                })
-                                .child(format_number(remaining_tokens)),
-                        ),
-                )),
-        );
-    if let Some(on_drop) = on_file_drop {
-        card = card.on_drop(move |paths: &gpui::ExternalPaths, window, cx| {
-            on_drop(paths.paths(), window, cx);
-        });
-    }
-    card
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_size(px(11.5))
+                        .text_color(theme.muted)
+                        .child("tokens left in the context window. Keep the chat short when the bar passes 90%."),
+                ),
+        )
 }
+
 
 fn render_thinking_indicator(theme: &Theme) -> Div {
     div()
@@ -2266,7 +2448,7 @@ fn render_thinking_indicator(theme: &Theme) -> Div {
             div()
                 .text_size(px(11.5))
                 .text_color(theme.muted)
-                .child("Thinking")
+                .child("Thought")
                 .with_animation(
                     "ai-thinking-pulse",
                     Animation::new(Duration::from_millis(1600))
@@ -2322,6 +2504,11 @@ impl RenderOnce for AiSidebar {
         let on_submit = self.on_submit.map(std::rc::Rc::new);
         let on_confirm = self.on_confirm.map(std::rc::Rc::new);
         let pending_confirmation = self.pending_confirmation.clone();
+        let pending_question = self.pending_question.clone();
+        let question_selection = self.question_selection.clone();
+        let on_question_toggle = self.on_question_toggle.map(std::rc::Rc::new);
+        let on_question_submit = self.on_question_submit.map(std::rc::Rc::new);
+        let on_question_cancel = self.on_question_cancel.map(std::rc::Rc::new);
         let on_copied = self.on_copied.map(std::rc::Rc::new);
         let copy_feedback = self.copy_feedback;
         // Selectable text rows are registered fresh on every render pass.
@@ -2361,7 +2548,6 @@ impl RenderOnce for AiSidebar {
 
         let input_val = self.input_text.clone();
         let display_cwd = format_cwd_display(&self.cwd);
-        let active_branch = self.git_branch.clone();
         let context_pct = self.context_pct;
         let active_mode = self.agent_mode.clone();
         let context_used_tokens = self.context_used_tokens;
@@ -2409,75 +2595,82 @@ impl RenderOnce for AiSidebar {
                 }
             })
             .child(
-                // 1. Header: Sleek, compact single toolbar (h: 36px) matching Fastty's design system
+                // 1. Header: identity on the left, status and actions on the right.
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .justify_between()
-                     .h(px(36.))
-                     .w_full()
-                     .px(px(12.))
-                     // No visible divider under the header: section edges are imaginary.
-                     // Left: Git branch
-                    .child({
-                        let has_branch = active_branch.is_some();
+                    .w_full()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(6.))
-                            .min_w(px(0.))
+                            .gap(px(9.))
                             .flex_1()
+                            .min_w(px(0.))
                             .overflow_hidden()
-                            .when_some(active_branch, |this, branch| {
-                                this.child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(4.))
-                                        .min_w(px(0.))
-                                        .overflow_hidden()
-                                        .child(crate::ui::icons::render_icon(
-                                            IconType::GitBranch,
-                                            theme.muted_strong,
-                                            12.0,
-                                        ))
-                                        .child(
-                                            div()
-                                                .text_size(px(12.))
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(theme.foreground)
-                                                .truncate()
-                                                .child(SharedString::from(branch)),
-                                        ),
-                                )
-                            })
-                            .when(!has_branch, |this| {
-                                this.child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(4.))
-                                        .min_w(px(0.))
-                                        .overflow_hidden()
-                                        .child(crate::ui::icons::render_icon(
-                                            IconType::Folder,
-                                            theme.muted,
-                                            11.0,
-                                        ))
-                                        .child(
-                                            div()
-                                                .text_size(px(12.))
-                                                .text_color(theme.muted_strong)
-                                                .truncate()
-                                                .child(SharedString::from(display_cwd)),
-                                        ),
-                                )
-                            })
-                    })
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(30.))
+                                    .h(px(30.))
+                                    .rounded(px(8.))
+                                    .flex_shrink_0()
+                                    .bg(theme.accent.opacity(0.18))
+                                    .child(crate::ui::icons::render_icon(
+                                        IconType::Sparkles,
+                                        theme.accent,
+                                        16.0,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.))
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme.foreground)
+                                            .child("Fastty AI"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(4.))
+                                            .min_w(px(0.))
+                                            .text_size(px(10.5))
+                                            .text_color(theme.muted)
+                                            .child(
+                                                div()
+                                                    .min_w(px(0.))
+                                                    .truncate()
+                                                    .child(SharedString::from(
+                                                        self.provider_name.clone(),
+                                                    )),
+                                            )
+                                            .child(div().child("·"))
+                                            .child(
+                                                div()
+                                                    .min_w(px(0.))
+                                                    .truncate()
+                                                    .child(SharedString::from(display_cwd)),
+                                            ),
+                                    ),
+                            ),
+                    )
                     // Right: Context indicator + Actions
                     .child(
                         div()
@@ -2718,7 +2911,7 @@ impl RenderOnce for AiSidebar {
                         let tool_on_confirm = on_confirm.clone();
                         let on_drag_msg = on_drag_message_char.clone();
                         let registry = row_registry.clone();
-                        self.messages.clone().into_iter().enumerate().map(move |(msg_idx, msg)| {
+                        self.messages.iter().enumerate().map(move |(msg_idx, msg)| {
                             if msg.is_user {
                                 div()
                                     .w_full()
@@ -2888,6 +3081,33 @@ impl RenderOnce for AiSidebar {
                                     .px(px(4.))
                                     .my(px(3.))
                                     .gap_3()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .child(crate::ui::icons::render_icon(
+                                            IconType::Sparkles,
+                                            theme.accent,
+                                            12.0,
+                                        ))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(theme.muted_strong)
+                                                .child("Fastty"),
+                                        )
+                                        .when_some(msg.timestamp.clone(), |row, stamp| {
+                                            row.child(
+                                                div()
+                                                    .text_size(px(10.5))
+                                                    .text_color(theme.muted)
+                                                    .child(SharedString::from(stamp)),
+                                            )
+                                        }),
+                                )
                                 // Collapsible reasoning line
                                 .when_some(msg.thinking.clone(), |this, thinking| {
                                     let is_thinking_expanded = expanded_thinkings.contains(&msg_idx);
@@ -2928,7 +3148,11 @@ impl RenderOnce for AiSidebar {
                                                             .gap_1()
                                                             .min_w(px(0.))
                                                             .child(crate::ui::icons::render_icon(
-                                                                IconType::Lightbulb,
+                                                                if is_thinking_expanded {
+                                                                    IconType::ChevronDown
+                                                                } else {
+                                                                    IconType::ChevronRight
+                                                                },
                                                                 theme.muted,
                                                                 12.0,
                                                             ))
@@ -2936,20 +3160,34 @@ impl RenderOnce for AiSidebar {
                                                                 div()
                                                                     .text_size(px(11.5))
                                                                     .text_color(theme.muted)
-                                                                    .child("Thinking"),
-                                                            ),
-                                                    )
-                                                    // justify_between pushes this to the far
-                                                    // edge rather than trailing the label.
-                                                    .child(crate::ui::icons::render_icon(
-                                                        if is_thinking_expanded {
-                                                            IconType::ChevronDown
-                                                        } else {
-                                                            IconType::ChevronUp
-                                                        },
-                                                        theme.muted,
-                                                        12.0,
-                                                    )),
+                                                                    .flex_shrink_0()
+                                                                    .child("Thought"),
+                                                            )
+                                                            .when(!is_thinking_expanded, |row| {
+                                                                row
+                                                                    .child(
+                                                                        div()
+                                                                            .text_size(px(11.5))
+                                                                            .text_color(theme.muted)
+                                                                            .child("·"),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .flex_1()
+                                                                            .min_w(px(0.))
+                                                                            .truncate()
+                                                                            .text_size(px(11.5))
+                                                                            .text_color(theme.muted_strong)
+                                                                            .child(SharedString::from(
+                                                                                thinking
+                                                                                    .lines()
+                                                                                    .next()
+                                                                                    .unwrap_or("")
+                                                                                    .to_string(),
+                                                                            )),
+                                                                    )
+                                                            }),
+                                                    ),
                                             )
                                             .when(is_thinking_expanded, |d| {
                                                 d.child(
@@ -2972,11 +3210,19 @@ impl RenderOnce for AiSidebar {
                                             .flex()
                                             .flex_col()
                                             .w_full()
-                                            .gap_2()
+                                            .p(px(2.))
+                                            .rounded(px(8.))
+                                            .bg(theme.surface)
+                                            .border_1()
+                                            .border_color(theme.border)
+                                            .overflow_hidden()
                                             .my(px(2.))
-                                              .children(msg.tool_calls.into_iter().enumerate().map(|(tc_idx, tc)| {
+                                              .children(msg.tool_calls.iter().enumerate().map(|(tc_idx, tc)| {
                                                  let info = parse_tool_row(&tc);
-                                                 let is_edit = tc.name == "edit_file";
+                                                 let parsed_edit =
+                                                     parse_diff_confirmation(&tc.name, &tc.args);
+                                                 let is_edit =
+                                                     parsed_edit.is_some() || tc.name == "edit_file";
                                                  let awaiting = tool_pending_conf
                                                      .as_ref()
                                                      .filter(|p| p.tool_id == tc.id)
@@ -2989,7 +3235,7 @@ impl RenderOnce for AiSidebar {
                                                      if let Some(diff) = tc.diff.clone() {
                                                          (diff, false)
                                                      } else if is_edit {
-                                                         match parse_diff_confirmation("edit_file", &tc.args) {
+                                                         match parsed_edit {
                                                              Some(p) => (
                                                                  crate::ai::diff::FileDiff {
                                                                      path: p.file_path,
@@ -3062,12 +3308,9 @@ let show_card = is_edit || tc.diff.is_some();
                                                       .flex_row()
                                                       .items_center()
                                                       .justify_between()
-                                                      .px(px(10.))
-                                                      .py(px(6.))
+                                                      .h(px(30.))
+                                                      .px(px(9.))
                                                       .rounded(px(6.))
-                                                      .bg(theme.surface)
-                                                      .border_1()
-                                                      .border_color(theme.border)
                                                       .cursor(CursorStyle::PointingHand)
                                                       .hover(move |s| s.bg(theme.hover))
                                                       .on_mouse_down(MouseButton::Left, {
@@ -3157,6 +3400,7 @@ let show_card = is_edit || tc.diff.is_some();
                                                              &theme,
                                                              &card_diff,
                                                              awaiting.is_some(),
+                                                             awaiting.as_ref(),
                                                              card_running,
                                                              tc_idx,
                                                              ToolCardCallbacks {
@@ -3377,9 +3621,25 @@ let show_card = is_edit || tc.diff.is_some();
                                 }),
                         )
                     })
-                    // 4. Pending Permission Confirmation (Diff Card or Command Prompt)
+                    // 4. Pending Permission Confirmation. An edit already shows
+                    // Apply/Discard on its diff card, so do not ask twice.
                     .when_some(self.pending_confirmation.clone(), |this, conf| {
-                        this.child(render_confirmation_section(&theme, &conf, on_confirm.clone()))
+                        let shown_in_diff_card = self.messages.iter().any(|message| {
+                            message.tool_calls.iter().any(|call| {
+                                call.id == conf.tool_id
+                                    && (call.diff.is_some()
+                                        || parse_diff_confirmation(&call.name, &call.args).is_some())
+                            })
+                        });
+                        if shown_in_diff_card {
+                            this
+                        } else {
+                            this.child(render_confirmation_section(
+                                &theme,
+                                &conf,
+                                on_confirm.clone(),
+                            ))
+                        }
                     }),
             )
             .child(
@@ -3404,6 +3664,522 @@ let show_card = is_edit || tc.diff.is_some();
                                 .child("Turn complete"),
                         )
                     })
+                    .when_some(pending_question, |composer, question| {
+                        let selection = question_selection.clone();
+                        let toggle = on_question_toggle.clone();
+                        let submit = on_question_submit.clone();
+                        let cancel = on_question_cancel.clone();
+                        composer.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.))
+                                .mb(px(6.))
+                                .p(px(10.))
+                                .rounded(px(10.))
+                                .bg(theme.surface_raised)
+                                .border_1()
+                                .border_color(theme.border)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .child(crate::ui::icons::render_icon(
+                                            IconType::MessageCircleQuestion,
+                                            theme.accent,
+                                            13.0,
+                                        ))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.))
+                                                .text_color(theme.muted)
+                                                .child("Question"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_size(px(12.))
+                                                .text_color(theme.foreground)
+                                                .child(SharedString::from(question.message.clone())),
+                                        ),
+                                )
+                                .children(question.fields.iter().map(|field| {
+                                    let field_key = field.key.clone();
+                                    let chosen = selection.get(&field.key).cloned().unwrap_or_default();
+                                    let toggle = toggle.clone();
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.))
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(theme.foreground)
+                                                .child(SharedString::from(field.title.clone())),
+                                        )
+                                        .when(!field.description.is_empty(), |column| {
+                                            column.child(
+                                                div()
+                                                    .text_size(px(10.5))
+                                                    .text_color(theme.muted)
+                                                    .child(SharedString::from(field.description.clone())),
+                                            )
+                                        })
+                                        .children(field.options.iter().map(|option| {
+                                            let is_selected = chosen.iter().any(|value| value == &option.value);
+                                            let toggle = toggle.clone();
+                                            let key = field_key.clone();
+                                            let value = option.value.clone();
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "ai-question-{}-{}",
+                                                    field_key, option.value
+                                                )))
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(7.))
+                                                .px(px(8.))
+                                                .py(px(5.))
+                                                .rounded(px(6.))
+                                                .bg(if is_selected {
+                                                    theme.accent.opacity(0.16)
+                                                } else {
+                                                    theme.surface
+                                                })
+                                                .border_1()
+                                                .border_color(if is_selected {
+                                                    theme.accent
+                                                } else {
+                                                    theme.border
+                                                })
+                                                .cursor(CursorStyle::PointingHand)
+                                                .hover(move |style| style.bg(theme.hover))
+                                                .child(
+                                                    div()
+                                                        .w(px(8.))
+                                                        .h(px(8.))
+                                                        .rounded_full()
+                                                        .flex_shrink_0()
+                                                        .border_1()
+                                                        .border_color(if is_selected {
+                                                            theme.accent
+                                                        } else {
+                                                            theme.muted
+                                                        })
+                                                        .when(is_selected, |dot| {
+                                                            dot.bg(theme.accent)
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(11.5))
+                                                        .text_color(theme.foreground)
+                                                        .child(SharedString::from(option.label.clone())),
+                                                )
+                                                .when(!option.description.is_empty(), |row| {
+                                                    row.child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w(px(0.))
+                                                            .truncate()
+                                                            .text_size(px(10.5))
+                                                            .text_color(theme.muted)
+                                                            .child(SharedString::from(option.description.clone())),
+                                                    )
+                                                })
+                                                .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
+                                                    cx.stop_propagation();
+                                                    if let Some(ref callback) = toggle {
+                                                        callback(&(key.clone(), value.clone()), window, cx);
+                                                    }
+                                                })
+                                        }))
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .pt(px(2.))
+                                        .child(
+                                            div()
+                                                .id("ai-question-cancel")
+                                                .px(px(8.))
+                                                .py(px(4.))
+                                                .rounded(px(6.))
+                                                .cursor(CursorStyle::PointingHand)
+                                                .text_size(px(11.5))
+                                                .text_color(theme.muted)
+                                                .hover(move |style| {
+                                                    style.bg(theme.hover).text_color(theme.foreground)
+                                                })
+                                                .child("Cancel")
+                                                .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                                                    if let Some(ref callback) = cancel {
+                                                        callback(ev, window, cx);
+                                                    }
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("ai-question-submit")
+                                                .px(px(10.))
+                                                .py(px(4.))
+                                                .rounded(px(6.))
+                                                .bg(theme.accent)
+                                                .cursor(CursorStyle::PointingHand)
+                                                .text_size(px(11.5))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(theme.black)
+                                                .hover(move |style| style.opacity(0.85))
+                                                .child("Answer")
+                                                .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
+                                                    if let Some(ref callback) = submit {
+                                                        callback(ev, window, cx);
+                                                    }
+                                                }),
+                                        ),
+                                ),
+                        )
+                    })
+                    .when(self.at_menu_open && !self.at_matches.is_empty(), |composer| {
+                        let on_select_at_match = on_select_at_match.clone();
+                        let status_map = self.at_file_status.clone();
+                        composer.child(
+                            gpui::deferred(
+                                div()
+                                    .id("ai-at-mention-popup")
+                                    .w_full()
+                                    .max_h(px(236.))
+                                    .mb(px(6.))
+                                    .rounded(px(10.))
+                                    .bg(theme.surface_raised)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .shadow_xl()
+                                    .overflow_hidden()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .justify_between()
+                                            .px(px(10.))
+                                            .pt(px(6.))
+                                            .pb(px(5.))
+                                            .flex_shrink_0()
+                                            .text_size(px(11.))
+                                            .text_color(theme.muted)
+                                            .child(if at_is_skill_menu {
+                                                "# skills"
+                                            } else {
+                                                "# recent & changed"
+                                            })
+                                            .child(SharedString::from(format!(
+                                                "{} match{}",
+                                                self.at_matches.len(),
+                                                if self.at_matches.len() == 1 { "" } else { "es" }
+                                            ))),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("ai-at-mention-rows")
+                                            .flex()
+                                            .flex_1()
+                                            .flex_col()
+                                            .min_h(px(0.))
+                                            .overflow_y_scroll()
+                                            .track_scroll(&self.at_scroll_handle)
+                                            .px(px(6.))
+                                            .children(
+                                                self.at_matches
+                                                    .iter()
+                                                    .take(AI_AT_MENU_MAX_ROWS)
+                                                    .enumerate()
+                                                    .map(|(idx, file_path)| {
+                                                        let fp = file_path.clone();
+                                                        let on_select = on_select_at_match.clone();
+                                                        let is_selected = idx == self.at_selected;
+                                                        let row_bg = if is_selected {
+                                                            theme.selected
+                                                        } else {
+                                                            gpui::transparent_black()
+                                                        };
+                                                        let name_color = theme.foreground;
+                                                        let icon_color = if is_selected {
+                                                            theme.accent
+                                                        } else {
+                                                            theme.muted_strong
+                                                        };
+                                                        let mut row = div()
+                                                            .id(SharedString::from(format!(
+                                                                "ai-at-row-{}",
+                                                                idx
+                                                            )))
+                                                            .flex()
+                                                            .flex_row()
+                                                            .items_center()
+                                                            .gap(px(7.))
+                                                            .px(px(6.))
+                                                            .py(px(4.))
+                                                            .flex_shrink_0()
+                                                            .rounded(px(6.))
+                                                            .min_w(px(0.))
+                                                            .overflow_hidden()
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .bg(row_bg)
+                                                            .when(!is_selected, |row| {
+                                                                row.hover(move |style| {
+                                                                    style.bg(theme.hover)
+                                                                })
+                                                            })
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                move |_ev, window, cx| {
+                                                                    cx.stop_propagation();
+                                                                    if let Some(ref cb) = on_select {
+                                                                        cb(&fp, window, cx);
+                                                                    }
+                                                                },
+                                                            );
+
+                                                        if at_is_skill_menu {
+                                                            let (display_name, scope, description) =
+                                                                if let Some(rest) =
+                                                                    file_path.strip_prefix("skill::")
+                                                                {
+                                                                    let mut parts =
+                                                                        rest.splitn(4, "::");
+                                                                    let _name =
+                                                                        parts.next().unwrap_or(rest);
+                                                                    let scope =
+                                                                        parts.next().unwrap_or("");
+                                                                    let description =
+                                                                        parts.next().unwrap_or("");
+                                                                    let folder =
+                                                                        parts.next().unwrap_or("");
+                                                                    (
+                                                                        if folder.is_empty() {
+                                                                            _name.to_string()
+                                                                        } else {
+                                                                            folder.to_string()
+                                                                        },
+                                                                        scope,
+                                                                        description,
+                                                                    )
+                                                                } else if let Some(rest) =
+                                                                    file_path.strip_prefix("acp::")
+                                                                {
+                                                                    (format!("/{rest}"), "", "")
+                                                                } else {
+                                                                    (file_path.to_string(), "", "")
+                                                                };
+                                                            row = row
+                                                                .child(
+                                                                    div()
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .justify_center()
+                                                                        .w(px(22.))
+                                                                        .h(px(22.))
+                                                                        .rounded(px(5.))
+                                                                        .flex_shrink_0()
+                                                                        .bg(if is_selected {
+                                                                            theme.accent.opacity(0.18)
+                                                                        } else {
+                                                                            theme.surface
+                                                                        })
+                                                                        .child(crate::ui::icons::render_icon(
+                                                                            IconType::Slash,
+                                                                            icon_color,
+                                                                            12.0,
+                                                                        )),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .flex()
+                                                                        .flex_col()
+                                                                        .gap(px(1.))
+                                                                        .flex_1()
+                                                                        .min_w(px(0.))
+                                                                        .child(
+                                                                            div()
+                                                                                .truncate()
+                                                                                .text_size(px(12.5))
+                                                                                .text_color(name_color)
+                                                                                .child(SharedString::from(
+                                                                                    display_name.clone(),
+                                                                                )),
+                                                                        )
+                                                                        .when(!description.is_empty(), |col| {
+                                                                            col.child(
+                                                                                div()
+                                                                                    .truncate()
+                                                                                    .text_size(px(10.5))
+                                                                                    .text_color(theme.muted)
+                                                                                    .child(SharedString::from(
+                                                                                        description.to_string(),
+                                                                                    )),
+                                                                            )
+                                                                        }),
+                                                                )
+                                                                .when(!scope.is_empty(), |row| {
+                                                                    row.child(
+                                                                        div()
+                                                                            .flex_shrink_0()
+                                                                            .px(px(5.))
+                                                                            .py(px(1.))
+                                                                            .rounded(px(4.))
+                                                                            .bg(if scope == "project" {
+                                                                                theme.accent.opacity(0.14)
+                                                                            } else {
+                                                                                theme.surface
+                                                                            })
+                                                                            .text_size(px(9.5))
+                                                                            .text_color(if scope == "project" {
+                                                                                theme.accent
+                                                                            } else {
+                                                                                theme.muted
+                                                                            })
+                                                                            .child(SharedString::from(
+                                                                                scope.to_string(),
+                                                                            )),
+                                                                    )
+                                                                });
+                                                        } else {
+                                                            let is_folder =
+                                                                file_path.ends_with('/');
+                                                            let trimmed =
+                                                                file_path.trim_end_matches('/');
+                                                            let (dir, base) =
+                                                                match trimmed.rfind('/') {
+                                                                    Some(pos) => (
+                                                                        &trimmed[..pos + 1],
+                                                                        &trimmed[pos + 1..],
+                                                                    ),
+                                                                    None => ("", trimmed),
+                                                                };
+                                                            let status = status_map
+                                                                .get(trimmed)
+                                                                .copied();
+                                                            row = row
+                                                                .child(
+                                                                    div()
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .justify_center()
+                                                                        .w(px(22.))
+                                                                        .h(px(22.))
+                                                                        .rounded(px(5.))
+                                                                        .flex_shrink_0()
+                                                                        .bg(if is_selected {
+                                                                            theme.accent.opacity(0.18)
+                                                                        } else {
+                                                                            theme.surface
+                                                                        })
+                                                                        .child(crate::ui::icons::render_icon(
+                                                                            if is_folder {
+                                                                                IconType::Folder
+                                                                            } else {
+                                                                                IconType::FileCode
+                                                                            },
+                                                                            icon_color,
+                                                                            12.0,
+                                                                        )),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .flex()
+                                                                        .flex_row()
+                                                                        .flex_1()
+                                                                        .min_w(px(0.))
+                                                                        .text_size(px(12.))
+                                                                        .when(!dir.is_empty(), |row| {
+                                                                            row.child(
+                                                                                div()
+                                                                                    .min_w(px(0.))
+                                                                                    .flex_shrink_1()
+                                                                                    .truncate()
+                                                                                    .text_color(theme.muted)
+                                                                                    .child(SharedString::from(
+                                                                                        dir.to_string(),
+                                                                                    )),
+                                                                            )
+                                                                        })
+                                                                        .child(
+                                                                            div()
+                                                                                .flex_shrink_0()
+                                                                                .max_w(px(200.))
+                                                                                .truncate()
+                                                                                .text_color(name_color)
+                                                                                .child(SharedString::from(
+                                                                                    if is_folder {
+                                                                                        format!("{base}/")
+                                                                                    } else {
+                                                                                        base.to_string()
+                                                                                    },
+                                                                                )),
+                                                                        ),
+                                                                )
+                                                                .when_some(status, |row, status| {
+                                                                    row.child(
+                                                                        div()
+                                                                            .flex_shrink_0()
+                                                                            .text_size(px(11.))
+                                                                            .font_weight(FontWeight::MEDIUM)
+                                                                            .text_color(match status {
+                                                                                'A' | '?' => theme.green,
+                                                                                'D' => theme.red,
+                                                                                'R' => theme.cyan,
+                                                                                _ => theme.yellow,
+                                                                            })
+                                                                            .child(SharedString::from(
+                                                                                status.to_string(),
+                                                                            )),
+                                                                    )
+                                                                })
+                                                                .when(is_folder, |row| {
+                                                                    row.child(
+                                                                        crate::ui::icons::render_icon(
+                                                                            IconType::ChevronRight,
+                                                                            theme.muted,
+                                                                            12.0,
+                                                                        ),
+                                                                    )
+                                                                });
+                                                        }
+                                                        row
+                                                    }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .justify_between()
+                                            .px(px(10.))
+                                            .pt(px(5.))
+                                            .pb(px(6.))
+                                            .flex_shrink_0()
+                                            .text_size(px(10.))
+                                            .text_color(theme.muted)
+                                            .child("↑↓ move   ⏎ insert")
+                                            .child("esc dismiss"),
+                                    ),
+                            )
+                            .with_priority(100),
+                        )
+                    })
                     .child(
                         // Composer Inset Box
                         div()
@@ -3411,9 +4187,9 @@ let show_card = is_edit || tc.diff.is_some();
                             .flex()
                             .flex_col()
                             .p(px(10.))
-                            .rounded(px(10.))
+                            .rounded(px(12.))
                             .border_1()
-                            .border_color(if is_focused { theme.accent } else { theme.border })
+                            .border_color(theme.border)
                             .bg(surface_raised)
                             .cursor(CursorStyle::IBeam)
                             .on_mouse_down(MouseButton::Left, {
@@ -3423,107 +4199,6 @@ let show_card = is_edit || tc.diff.is_some();
                                         cb(ev, window, cx);
                                     }
                                 }
-                            })
-                            // @ Mention Popup
-                            .when(self.at_menu_open && !self.at_matches.is_empty(), |d| {
-                                let on_select_at_match = on_select_at_match.clone();
-                                d.child(gpui::deferred(
-                                    div()
-                                        .id("ai-at-mention-popup")
-                                        .w_full()
-                                        .max_h(px(160.))
-                                        .overflow_y_scroll()
-                                        .track_scroll(&self.at_scroll_handle)
-                                        .rounded(px(6.))
-                                        .bg(theme.surface)
-                                        .border_1()
-                                        .border_color(theme.border)
-                                        .mb(px(8.))
-                                        .p(px(4.))
-                                        .when(at_is_skill_menu, |menu| menu.child(
-                                            div().px(px(8.)).py(px(4.)).text_size(px(10.))
-                                                .font_weight(FontWeight::BOLD).text_color(theme.muted_strong)
-                                                .child("Skills and commands")
-                                        ))
-                                        .children(
-                                            self.at_matches
-                                                .iter()
-                                                .take(AI_AT_MENU_MAX_ROWS)
-                                                .enumerate()
-                                                .map(|(idx, file_path)| {
-                                                    let fp = file_path.clone();
-                                                    let display_name = if let Some(rest) = file_path.strip_prefix("skill::") {
-                                                        let mut parts = rest.splitn(2, "::");
-                                                        format!("/{} · {}", parts.next().unwrap_or("skill"), parts.next().unwrap_or("project"))
-                                                    } else if let Some(name) = file_path.strip_prefix("acp::") {
-                                                        format!("/{}", name)
-                                                    } else {
-                                                        file_path.clone()
-                                                    };
-                                                    let on_select = on_select_at_match.clone();
-                                                    // The keyboard selection paints on its
-                                                    // own: without a pointer over the list,
-                                                    // hover paints nothing.
-                                                    let is_selected = idx == self.at_selected;
-                                                    let row_bg = if is_selected {
-                                                        theme.accent
-                                                    } else {
-                                                        theme.surface
-                                                    };
-                                                    let row_fg = if is_selected {
-                                                        theme.black
-                                                    } else {
-                                                        theme.foreground
-                                                    };
-                                                    let row_icon = if is_selected {
-                                                        theme.black
-                                                    } else {
-                                                        theme.muted
-                                                    };
-                                                    div()
-                                                        .id(SharedString::from(format!("ai-at-row-{}", idx)))
-                                                        .flex()
-                                                        .flex_row()
-                                                        .items_center()
-                                                        .gap_2()
-                                                        .px(px(8.))
-                                                        .py(px(4.))
-                                                        .rounded(px(4.))
-                                                        .min_w(px(0.))
-                                                        .overflow_hidden()
-                                                        .cursor(CursorStyle::PointingHand)
-                                                        .bg(row_bg)
-                                                        // Hover on the selected row would
-                                                        // hide the selection exactly when
-                                                        // the reader looks at it.
-                                                        .when(!is_selected, |row| {
-                                                            row.hover(move |s| s.bg(theme.hover))
-                                                        })
-                                                        .on_mouse_down(MouseButton::Left, move |_ev, window, cx| {
-                                                            if let Some(ref cb) = on_select {
-                                                                cb(&fp, window, cx);
-                                                            }
-                                                        })
-                                                        .child(crate::ui::icons::render_icon(
-                                                            IconType::FileCode,
-                                                            row_icon,
-                                                            12.0,
-                                                        ))
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(12.))
-                                                                .font_weight(if is_selected {
-                                                                    FontWeight::BOLD
-                                                                } else {
-                                                                    FontWeight::NORMAL
-                                                                })
-                                                                .text_color(row_fg)
-                                                                .overflow_hidden()
-                                                                .child(SharedString::from(display_name)),
-                                                        )
-                                                }),
-                                        ),
-                                ).with_priority(100))
                             })
                             // Attached Files Chip Badges
                             .when(!self.attached_files.is_empty(), |d| {
@@ -3629,9 +4304,9 @@ let show_card = is_edit || tc.diff.is_some();
                                                     .text_size(px(12.5))
                                                     .text_color(theme.muted)
                                                     .child(if active_mode == "Ask" {
-                                                        "Ask a question about the code..."
+                                                        "Ask about the code..."
                                                     } else {
-                                                        "Describe the task, or type @ to reference a file"
+                                                        "Describe a task — @ for files, / for skills"
                                                     }),
                                             )
                                     } else {
@@ -3882,42 +4557,43 @@ let show_card = is_edit || tc.diff.is_some();
                                             let submit = div()
                                                 .id("ai-submit-btn")
                                                 .flex()
-                                                .flex_row()
                                                 .items_center()
-                                                .gap_1()
-                                                .px(px(10.))
-                                                .py(px(4.))
-                                                .rounded(px(6.))
+                                                .justify_center()
+                                                .w(px(30.))
+                                                .h(px(30.))
+                                                .rounded(px(8.))
                                                 .bg(if is_empty {
                                                     sidebar_bg
                                                 } else {
-                                                    surface_raised
+                                                    theme.accent
                                                 })
                                                 .border_1()
-                                                .border_color(theme.border)
+                                                .border_color(if is_empty {
+                                                    theme.border
+                                                } else {
+                                                    theme.accent
+                                                })
                                                 .cursor(if is_empty {
                                                     CursorStyle::Arrow
                                                 } else {
                                                     CursorStyle::PointingHand
                                                 })
-                                                .hover(move |s| {
+                                                .hover(move |style| {
                                                     if !is_empty {
-                                                        s.bg(theme.hover).border_color(theme.accent)
+                                                        style.opacity(0.85)
                                                     } else {
-                                                        s
+                                                        style
                                                     }
                                                 })
-                                                .child(
-                                                    div()
-                                                        .text_size(px(11.5))
-                                                        .font_weight(FontWeight::MEDIUM)
-                                                        .text_color(if is_empty {
-                                                            theme.muted
-                                                        } else {
-                                                            theme.foreground
-                                                        })
-                                                        .child("Send ↑"),
-                                                )
+                                                .child(crate::ui::icons::render_icon(
+                                                    IconType::ArrowUp,
+                                                    if is_empty {
+                                                        theme.muted
+                                                    } else {
+                                                        theme.black
+                                                    },
+                                                    16.0,
+                                                ))
                                                 .on_mouse_down(MouseButton::Left, {
                                                     let on_submit = on_submit.clone();
                                                     move |ev, window, cx| {
@@ -3960,6 +4636,22 @@ let show_card = is_edit || tc.diff.is_some();
                                         },
                                     ),
                             ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(5.))
+                            .pt(px(6.))
+                            .pb(px(2.))
+                            .text_size(px(10.5))
+                            .text_color(theme.muted)
+                            .child(SharedString::from(if cfg!(target_os = "macos") {
+                                "⌘⏎ send · @ files · / skills · esc close"
+                            } else {
+                                "Ctrl+Enter send · @ files · / skills · esc close"
+                            })),
                     )
                     .when(self.opencode_variants_open && !self.opencode_variants.is_empty(), |composer| {
                         let selected = self.opencode_variant.clone();
@@ -4010,7 +4702,7 @@ let show_card = is_edit || tc.diff.is_some();
                                         .id(SharedString::from(format!("ai-opencode-effort-{variant}")))
                                         .flex().items_center().justify_between()
                                         .px(px(8.)).py(px(6.)).rounded(px(5.))
-                                        .bg(if is_selected { theme.surface_raised } else { theme.surface })
+                                        .bg(if is_selected { theme.selected } else { theme.surface })
                                         .hover(move |style| style.bg(theme.hover))
                                         .cursor(CursorStyle::PointingHand)
                                         .text_size(px(11.5)).text_color(theme.foreground)
@@ -4024,17 +4716,45 @@ let show_card = is_edit || tc.diff.is_some();
                     })
             )
             .when(context_hovercard_open, |container| {
-                let on_file_drop = self.on_file_drop.clone();
-                container.child(render_context_hovercard(
-                    ContextUsage {
-                        used_tokens: context_used_tokens,
-                        max_tokens: context_max_tokens,
-                        last_usage: ai_last_usage,
-                        pct: context_pct,
-                    },
-                    &theme,
-on_file_drop.clone(),
+                container.child(
+                    gpui::deferred(render_context_hovercard(
+                        ContextUsage {
+                            used_tokens: context_used_tokens,
+                            max_tokens: context_max_tokens,
+                            pct: context_pct,
+                            provider: self.provider_name.clone(),
+                            breakdown: self.context_breakdown,
+                        },
+                        &theme,
+                        self.width,
                     ))
+                    .with_priority(1000),
+                )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_diff_confirmation;
+
+    #[test]
+    fn parses_an_acp_edit_with_camel_case_keys() {
+        let args = serde_json::json!({
+            "filePath": "src/main.rs",
+            "oldString": "let a = 1;\n",
+            "newString": "let a = 2;\n"
+        })
+        .to_string();
+        let card = parse_diff_confirmation("Edit", &args).expect("diff card");
+        assert_eq!(card.file_path, "src/main.rs");
+        assert_eq!(card.add_count, 1);
+        assert_eq!(card.del_count, 1);
+    }
+
+    #[test]
+    fn a_read_tool_never_gets_a_diff_card() {
+        let args = serde_json::json!({ "filePath": "src/main.rs", "content": "x" }).to_string();
+        assert!(parse_diff_confirmation("Read", &args).is_none());
     }
 }

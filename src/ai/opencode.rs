@@ -39,11 +39,39 @@ pub enum OpencodeEvent {
         tool_call: Value,
         options: Vec<PermissionOption>,
     },
+    /// The agent asked the user a structured question through ACP elicitation.
+    ElicitationRequest {
+        request_id: Value,
+        data: ElicitationRequestData,
+    },
     UsageUpdate { used: u64, size: u64 },
     AvailableCommands(Vec<crate::ai::conversations::AvailableCommand>),
     OtherUpdate(Value),
     PromptFinished(Value),
     Error(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ElicitationOption {
+    pub value: String,
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ElicitationField {
+    pub key: String,
+    pub title: String,
+    pub description: String,
+    pub multiselect: bool,
+    pub required: bool,
+    pub options: Vec<ElicitationOption>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ElicitationRequestData {
+    pub message: String,
+    pub fields: Vec<ElicitationField>,
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +292,29 @@ impl OpencodeRuntime {
         let cwd = absolute_directory(cwd.as_ref())?;
         let preparation_started = std::time::Instant::now();
         let mut launch = super::acp_launcher::prepare(command, args, &cwd)?;
+        // OpenCode allows edits by default. Fastty's permission mode decides
+        // whether an edit should ask first, so bring that policy into the ACP
+        // session unless the user already set an inline OpenCode config.
+        if command
+            .to_string_lossy()
+            .to_lowercase()
+            .contains("opencode")
+            && std::env::var_os("OPENCODE_CONFIG_CONTENT").is_none()
+        {
+            let mode = crate::config::load_lenient().ai.permission_mode;
+            let policy = match mode {
+                crate::ai::config::PermissionMode::ConfirmWrites => {
+                    Some(r#"{"permission":{"edit":"ask"}}"#)
+                }
+                crate::ai::config::PermissionMode::ConfirmAll => Some(
+                    r#"{"permission":{"edit":"ask","bash":"ask","webfetch":"ask"}}"#,
+                ),
+                crate::ai::config::PermissionMode::Yolo => None,
+            };
+            if let Some(policy) = policy {
+                launch.env("OPENCODE_CONFIG_CONTENT", policy);
+            }
+        }
         let deadline = deadline.map(|value| value + preparation_started.elapsed());
         let child = launch
             .current_dir(&cwd)
@@ -312,7 +363,10 @@ impl OpencodeRuntime {
                 "clientInfo": { "name": "fastty", "version": env!("CARGO_PKG_VERSION") },
                 "clientCapabilities": {
                     "fs": { "readTextFile": false, "writeTextFile": false },
-                    "terminal": false
+                    "terminal": false,
+                    // Lets the agent render its `question` tool through ACP
+                    // elicitation instead of cancelling it.
+                    "elicitation": { "form": {} }
                 }
             });
         let init = match deadline {
@@ -523,6 +577,21 @@ impl OpencodeRuntime {
 
     /// Reply with an offered ACP option ID. The UI must display the offered
     /// choices and pass the chosen ID unchanged.
+    pub fn resolve_elicitation(
+        &self,
+        request_id: &Value,
+        content: Option<Value>,
+    ) -> anyhow::Result<()> {
+        let result = match content {
+            Some(content) => json!({ "action": "accept", "content": content }),
+            None => json!({ "action": "cancel" }),
+        };
+        write_message(
+            &self.transport,
+            json!({ "jsonrpc": "2.0", "id": request_id, "result": result }),
+        )
+    }
+
     pub fn resolve_permission(
         &self,
         request_id: &Value,
@@ -843,6 +912,27 @@ fn dispatch_message(transport: &Transport, message: Value) {
                     tool_call: params.get("toolCall").cloned().unwrap_or(Value::Null),
                     options,
                 });
+            } else if matches!(
+                method,
+                "elicitation/create" | "unstable_createElicitation" | "unstable/elicitation/create"
+            ) {
+                let params = message.get("params").cloned().unwrap_or(Value::Null);
+                match parse_elicitation(&params) {
+                    Some(data) => {
+                        let _ = transport.events.send(OpencodeEvent::ElicitationRequest {
+                            request_id: id.clone(),
+                            data,
+                        });
+                    }
+                    None => {
+                        // A form this client cannot draw: decline so the model
+                        // continues instead of hanging.
+                        let _ = write_message(
+                            transport,
+                            json!({ "jsonrpc": "2.0", "id": id, "result": { "action": "cancel" } }),
+                        );
+                    }
+                }
             } else {
                 let _ = write_message(
                     transport,
@@ -873,6 +963,109 @@ fn dispatch_message(transport: &Transport, message: Value) {
         };
         let _ = sender.send(result);
     }
+}
+
+/// Read the ACP form schema into the few shapes the panel can draw: fields
+/// with a fixed list of options. Anything else is declined.
+fn parse_elicitation(params: &Value) -> Option<ElicitationRequestData> {
+    let message = params
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Question")
+        .to_string();
+    let schema = params.get("requestedSchema")?;
+    let properties = schema.get("properties")?.as_object()?;
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    let mut fields = Vec::new();
+    for (key, property) in properties {
+        let title = property
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(key)
+            .to_string();
+        let description = property
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let multiselect = property.get("type").and_then(Value::as_str) == Some("array");
+        let options_value = if multiselect {
+            property
+                .get("items")
+                .and_then(|items| items.get("anyOf").or_else(|| items.get("oneOf")))
+        } else {
+            property.get("oneOf")
+        };
+        let options: Vec<ElicitationOption> = if let Some(values) =
+            property.get("enum").and_then(Value::as_array)
+        {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|value| ElicitationOption {
+                    value: value.to_string(),
+                    label: value.to_string(),
+                    description: String::new(),
+                })
+                .collect()
+        } else if let Some(options_value) = options_value.and_then(Value::as_array) {
+            options_value
+                .iter()
+                .filter_map(|option| {
+                    let value = option
+                        .get("const")
+                        .or_else(|| option.get("value"))
+                        .and_then(Value::as_str)?
+                        .to_string();
+                    let label = option
+                        .get("title")
+                        .or_else(|| option.get("const"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(&value)
+                        .to_string();
+                    let description = option
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    Some(ElicitationOption {
+                        value,
+                        label,
+                        description,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if options.is_empty() {
+            // OpenCode sends a free-text `<key>_custom` sibling for every
+            // question; it is optional and the model treats a missing answer
+            // as "no custom text". A required field without options cannot be
+            // drawn, so decline that form.
+            if required.contains(&key.as_str()) {
+                return None;
+            }
+            continue;
+        }
+        fields.push(ElicitationField {
+            key: key.clone(),
+            title,
+            description,
+            multiselect,
+            required: required.contains(&key.as_str()),
+            options,
+        });
+    }
+    if fields.is_empty() {
+        return None;
+    }
+    Some(ElicitationRequestData { message, fields })
 }
 
 fn dispatch_update(transport: &Transport, update: Value) {
@@ -979,5 +1172,108 @@ mod permission_response_tests {
             let result = result_for(Some(id));
             assert_eq!(result["outcome"]["optionId"], id);
         }
+    }
+}
+
+#[cfg(test)]
+mod elicitation_tests {
+    use super::parse_elicitation;
+    use serde_json::json;
+
+    #[test]
+    fn reads_a_single_select_question() {
+        let params = json!({
+            "message": "Delete hello.rs?",
+            "requestedSchema": {
+                "type": "object",
+                "required": ["confirm"],
+                "properties": {
+                    "confirm": {
+                        "type": "string",
+                        "title": "Borrar hello.rs",
+                        "description": "Not tracked by git.",
+                        "oneOf": [
+                            { "const": "yes", "title": "Sí, bórralo", "description": "Elimina el archivo" },
+                            { "const": "no", "title": "No" }
+                        ]
+                    }
+                }
+            }
+        });
+        let data = parse_elicitation(&params).expect("form");
+        assert_eq!(data.message, "Delete hello.rs?");
+        assert_eq!(data.fields.len(), 1);
+        let field = &data.fields[0];
+        assert_eq!(field.key, "confirm");
+        assert!(field.required);
+        assert!(!field.multiselect);
+        assert_eq!(field.options.len(), 2);
+        assert_eq!(field.options[0].value, "yes");
+        assert_eq!(field.options[0].label, "Sí, bórralo");
+    }
+
+    #[test]
+    fn skips_the_optional_custom_answer_field() {
+        let params = json!({
+            "message": "Delete hello.rs?",
+            "requestedSchema": {
+                "type": "object",
+                "required": [],
+                "properties": {
+                    "q0": {
+                        "type": "string",
+                        "title": "Borrar hello.rs",
+                        "oneOf": [
+                            { "const": "Sí, bórralo", "title": "Sí, bórralo" },
+                            { "const": "No", "title": "No" }
+                        ]
+                    },
+                    "q0_custom": {
+                        "type": "string",
+                        "title": "Borrar hello.rs (other)",
+                        "description": "Type your own answer"
+                    }
+                }
+            }
+        });
+        let data = parse_elicitation(&params).expect("form");
+        assert_eq!(data.fields.len(), 1);
+        assert_eq!(data.fields[0].key, "q0");
+    }
+
+    #[test]
+    fn declines_a_required_free_text_form() {
+        let params = json!({
+            "message": "Name?",
+            "requestedSchema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": { "name": { "type": "string", "title": "Name" } }
+            }
+        });
+        assert!(parse_elicitation(&params).is_none());
+    }
+
+    #[test]
+    fn reads_a_multiselect_question() {
+        let params = json!({
+            "message": "Pick files",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "title": "Files",
+                        "items": { "anyOf": [
+                            { "const": "a.rs", "title": "a.rs" },
+                            { "const": "b.rs", "title": "b.rs" }
+                        ] }
+                    }
+                }
+            }
+        });
+        let data = parse_elicitation(&params).expect("form");
+        assert!(data.fields[0].multiselect);
+        assert_eq!(data.fields[0].options.len(), 2);
     }
 }

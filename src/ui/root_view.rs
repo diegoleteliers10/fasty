@@ -972,7 +972,123 @@ pub fn decode_box_drawing(ch: char) -> Option<(u8, u8, u8, u8, u8)> {
     })
 }
 
-#[allow(dead_code)]
+/// A command card takes the mark of the tool the pane title names. A name with
+/// no mark of its own reads as the shell, the same as a tab.
+fn command_glyph(source: &str) -> TabGlyph {
+    tab_glyph(None, Some(source))
+}
+
+/// An AI card uses the provider's mark, and the generic agent mark when the
+/// provider has no bundled one.
+fn agent_glyph(provider: &str) -> TabGlyph {
+    match tab_glyph(Some(provider), None) {
+        TabGlyph::Deck(_) | TabGlyph::Shell => TabGlyph::Agent,
+        glyph => glyph,
+    }
+}
+
+/// Quote one value for a POSIX shell. Branch names come from the repository
+/// and may contain `$()`, backticks, or quotes.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Estimate how the context is spent. Characters are counted as four per
+/// token; the provider reports the real total, so the hovercard scales these
+/// slices to it.
+fn ai_context_breakdown(
+    messages: &[crate::ui::ai_sidebar::AiUiMessage],
+) -> crate::ui::ai_sidebar::ContextBreakdown {
+    let mut conversation = 0u64;
+    let mut tools = 0u64;
+    let mut files = 0u64;
+    for message in messages {
+        conversation += (message.text.chars().count() as u64) / 4
+            + message
+                .thinking
+                .as_deref()
+                .map(|thinking| thinking.chars().count() as u64 / 4)
+                .unwrap_or(0);
+        for call in &message.tool_calls {
+            let tokens = call
+                .output
+                .as_deref()
+                .map(|output| output.chars().count() as u64 / 4)
+                .unwrap_or(0);
+            let name = call.name.to_lowercase();
+            if name == "read" || name.starts_with("read ") {
+                files += tokens;
+            } else {
+                tools += tokens;
+            }
+        }
+    }
+    crate::ui::ai_sidebar::ContextBreakdown {
+        system: 0,
+        tools,
+        files,
+        conversation,
+    }
+}
+
+/// Command durations read in the same units as the status bar: milliseconds
+/// under a second, seconds above it.
+/// Build the review diff for an ACP edit call from its `content` block, or
+/// from the camelCase arguments when the block is missing.
+fn acp_tool_diff(
+    update: &serde_json::Value,
+    args: &str,
+) -> Option<crate::ai::diff::FileDiff> {
+    if let Some(blocks) = update.get("content").and_then(|value| value.as_array()) {
+        for block in blocks {
+            if block.get("type").and_then(|value| value.as_str()) != Some("diff") {
+                continue;
+            }
+            let path = ["path", "filePath"]
+                .iter()
+                .find_map(|key| block.get(*key).and_then(|value| value.as_str()))?;
+            let old = ["oldText", "old_string", "oldString"]
+                .iter()
+                .find_map(|key| block.get(*key).and_then(|value| value.as_str()))
+                .unwrap_or("");
+            let new = ["newText", "new_string", "newString"]
+                .iter()
+                .find_map(|key| block.get(*key).and_then(|value| value.as_str()))
+                .unwrap_or("");
+            if old.is_empty() && new.is_empty() {
+                continue;
+            }
+            return Some(crate::ai::diff::diff_contents(path, old, new));
+        }
+    }
+    let value: serde_json::Value = serde_json::from_str(args).ok()?;
+    let path = ["filePath", "file_path", "path"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(|value| value.as_str()))?;
+    let old = ["oldString", "old_string", "oldText"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(|value| value.as_str()))
+        .unwrap_or("");
+    let new = ["newString", "new_string", "newText", "content"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(|value| value.as_str()))
+        .unwrap_or("");
+    if old.is_empty() && new.is_empty() {
+        return None;
+    }
+    Some(crate::ai::diff::diff_contents(path, old, new))
+}
+
+/// Command durations read in the same units as the status bar: milliseconds
+/// under a second, seconds above it.
+fn format_command_duration(duration_ms: u128) -> String {
+    if duration_ms < 1000 {
+        format!("{duration_ms}ms")
+    } else {
+        format!("{:.1}s", duration_ms as f64 / 1000.0)
+    }
+}
+
 fn render_quadrant(width: f32, line_h: f32, tl: Hsla, tr: Hsla, bl: Hsla, br: Hsla) -> Div {
     let half_w = (width / 2.0).floor().max(1.0);
     let rem_w = (width - half_w).max(1.0);
@@ -2523,6 +2639,10 @@ fn run_opencode_turn(
         Vec<crate::ai::opencode::PermissionOption>,
         async_channel::Sender<Option<String>>,
     )>,
+    question_tx: async_channel::Sender<(
+        crate::ai::opencode::ElicitationRequestData,
+        async_channel::Sender<Option<serde_json::Value>>,
+    )>,
     event_tx: async_channel::Sender<crate::ai::AgentEvent>,
 ) -> anyhow::Result<()> {
     if cancel.is_cancelled() {
@@ -2602,6 +2722,12 @@ fn run_opencode_turn(
                         ..
                     })) => {
                         let _ = runtime.resolve_permission(&request_id, None);
+                    }
+                    Ok(Some(crate::ai::opencode::OpencodeEvent::ElicitationRequest {
+                        request_id,
+                        ..
+                    })) => {
+                        let _ = runtime.resolve_elicitation(&request_id, None);
                     }
                     Ok(Some(_)) | Ok(None) => {}
                 }
@@ -2708,12 +2834,13 @@ fn run_opencode_turn(
                         .get("content")
                         .map(|value| value.to_string())
                         .unwrap_or_default();
+                    let diff = acp_tool_diff(&update, &args);
                     let _ = event_tx.send_blocking(crate::ai::AgentEvent::ToolEnd {
                         id: id.clone(),
                         name,
                         output,
                         is_error: status == "failed",
-                        diff: None,
+                        diff,
                         args: (!args.is_empty()).then_some(args),
                     });
                     active_tools.remove(&id);
@@ -2754,6 +2881,15 @@ fn run_opencode_turn(
                 }
                 let choice = reply_rx.recv_blocking().unwrap_or(None);
                 runtime.resolve_permission(&request_id, choice.as_deref())?;
+            }
+            crate::ai::opencode::OpencodeEvent::ElicitationRequest { request_id, data } => {
+                let (reply_tx, reply_rx) = async_channel::bounded(1);
+                if question_tx.send_blocking((data, reply_tx)).is_err() {
+                    let _ = runtime.resolve_elicitation(&request_id, None);
+                    continue;
+                }
+                let content = reply_rx.recv_blocking().unwrap_or(None);
+                runtime.resolve_elicitation(&request_id, content)?;
             }
             crate::ai::opencode::OpencodeEvent::PromptFinished(response) => {
                 if let Some(usage) = response.get("usage") {
@@ -2959,6 +3095,9 @@ struct AiConversationRuntime {
     pending_confirmation: Option<crate::ui::ai_sidebar::AiUiPendingConfirmation>,
     confirm_reply_tx: Option<async_channel::Sender<crate::ai::PermissionDecision>>,
     opencode_confirm_reply_tx: Option<async_channel::Sender<Option<String>>>,
+    pending_question: Option<crate::ai::opencode::ElicitationRequestData>,
+    question_reply_tx: Option<async_channel::Sender<Option<serde_json::Value>>>,
+    question_selection: std::collections::HashMap<String, Vec<String>>,
     pending_text: String,
     pending_thinking: String,
     turn_provider: String,
@@ -3174,6 +3313,11 @@ pub struct RootView {
     pub ai_is_streaming: bool,
     pub ai_turn_completions: std::collections::HashMap<String, AiTurnCompletion>,
     pub program_statuses: std::collections::HashMap<PaneId, ProgramPaneStatus>,
+    /// Floating cards shown over the terminal. One live card per key, and a
+    /// memory of the states the user dismissed.
+    pub notifications: NotificationQueue,
+    notification_ticker_active: bool,
+    notification_exit_timer_active: bool,
     pub ai_last_notification: Option<std::time::Instant>,
     pub ai_last_usage: Option<(u64, u64)>,
     pub ai_current_turn_usage: (u64, u64),
@@ -3181,6 +3325,9 @@ pub struct RootView {
     pub ai_cancel_token: Option<crate::ai::CancelToken>,
     pub ai_stream_generation: u64,
     pub ai_pending_confirmation: Option<crate::ui::ai_sidebar::AiUiPendingConfirmation>,
+    pub ai_pending_question: Option<crate::ai::opencode::ElicitationRequestData>,
+    pub ai_question_reply_tx: Option<async_channel::Sender<Option<serde_json::Value>>>,
+    pub ai_question_selection: std::collections::HashMap<String, Vec<String>>,
     pub ai_confirm_reply_tx: Option<async_channel::Sender<crate::ai::PermissionDecision>>,
     pub ai_opencode_confirm_reply_tx: Option<async_channel::Sender<Option<String>>>,
     pub ai_opencode_manager: Arc<crate::ai::opencode::OpencodeManager>,
@@ -3194,6 +3341,10 @@ pub struct RootView {
     pub ai_at_menu_open: bool,
     pub ai_at_is_skill_menu: bool,
     pub ai_at_matches: Vec<String>,
+    /// Git status letter per relative path, shown in the mention list.
+    pub ai_at_file_status: std::collections::HashMap<String, char>,
+    /// Cwd the status map was built for, so typing does not re-open the repo.
+    pub ai_at_status_cwd: Option<String>,
     /// Row the arrow keys point at in the `@` mention menu. Clamped to the
     /// drawn row count, which is `AI_AT_MENU_MAX_ROWS`, not the whole match list.
     pub ai_at_selected: usize,
@@ -3891,6 +4042,9 @@ impl RootView {
             ai_is_streaming: false,
             ai_turn_completions: std::collections::HashMap::new(),
             program_statuses: std::collections::HashMap::new(),
+            notifications: NotificationQueue::default(),
+            notification_ticker_active: false,
+            notification_exit_timer_active: false,
             ai_last_notification: None,
             ai_last_usage: None,
             ai_current_turn_usage: (0, 0),
@@ -3898,6 +4052,9 @@ impl RootView {
             ai_cancel_token: None,
             ai_stream_generation: 0,
             ai_pending_confirmation: None,
+            ai_pending_question: None,
+            ai_question_reply_tx: None,
+            ai_question_selection: std::collections::HashMap::new(),
             ai_confirm_reply_tx: None,
             ai_opencode_confirm_reply_tx: None,
             ai_opencode_manager: Arc::new(crate::ai::opencode::OpencodeManager::default()),
@@ -3916,6 +4073,8 @@ impl RootView {
             ai_file_drag_hover: false,
             ai_at_scroll_handle: ScrollHandle::new(),
             ai_at_matches: Vec::new(),
+            ai_at_file_status: std::collections::HashMap::new(),
+            ai_at_status_cwd: None,
             ai_pending_text: String::new(),
             ai_pending_thinking: String::new(),
             ai_composer_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -5920,6 +6079,18 @@ impl RootView {
         );
         std::mem::swap(&mut self.ai_confirm_reply_tx, &mut runtime.confirm_reply_tx);
         std::mem::swap(
+            &mut self.ai_pending_question,
+            &mut runtime.pending_question,
+        );
+        std::mem::swap(
+            &mut self.ai_question_reply_tx,
+            &mut runtime.question_reply_tx,
+        );
+        std::mem::swap(
+            &mut self.ai_question_selection,
+            &mut runtime.question_selection,
+        );
+        std::mem::swap(
             &mut self.ai_opencode_confirm_reply_tx,
             &mut runtime.opencode_confirm_reply_tx,
         );
@@ -7811,6 +7982,483 @@ impl RootView {
         .detach();
     }
 
+    /// Resolve a stable tab id to its current position.
+    fn tab_position(&self, tab_id: usize) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == tab_id)
+    }
+
+    fn remove_notification(&mut self, key: &str) {
+        self.notifications.remove(key);
+    }
+
+    fn remove_notifications_with_prefix(&mut self, prefix: &str) {
+        self.notifications.remove_with_prefix(prefix);
+    }
+
+    /// Pin the right-clicked pane and its tab mirrors before a pane-scoped
+    /// action, so every handler reads the same pane.
+    fn focus_pane_for_action(&mut self, pane_id: PaneId) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab_idx) {
+            tab.pane_tree.active_pane_id = pane_id;
+            if let Some(pane) = tab.pane_tree.active_pane() {
+                tab.terminal = pane.terminal.clone();
+                tab.cwd = pane.cwd.clone();
+                tab.git_status = pane.git_status.clone();
+            }
+        }
+    }
+
+    /// Send a command to the active pane's shell.
+    fn write_git_command(&mut self, command: &[u8]) {
+        let Some(terminal) = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|tab| tab.pane_tree.active_pane())
+            .and_then(|pane| pane.terminal.as_ref())
+        else {
+            return;
+        };
+        terminal.write_to_pty(command);
+    }
+
+    /// Read the local branches once, when the git menu or its submenu opens.
+    fn refresh_git_branches(&mut self) {
+        let cwd = self
+            .tabs
+            .get(self.active_tab_idx)
+            .and_then(|tab| tab.cwd.clone());
+        self.git_branches = cwd
+            .as_deref()
+            .map(crate::git::list_local_branches)
+            .unwrap_or_default();
+        self.git_branch_count = Some(self.git_branches.len());
+    }
+
+    /// Run one entry of the logo menu and close it.
+    fn handle_app_menu_action(
+        &mut self,
+        action: AppMenuAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.is_context_menu_open = false;
+        match action {
+            AppMenuAction::About => self.toggle_about(window, cx),
+            AppMenuAction::CheckForUpdates => self.check_for_updates_manual(window, cx),
+            AppMenuAction::Settings => self.open_settings_window(window, cx),
+            AppMenuAction::CommandPalette => self.toggle_command_palette(window, cx),
+            AppMenuAction::FasttyAi => self.toggle_ai_sidebar(window, cx),
+            AppMenuAction::SshManager => self.toggle_ssh_manager(window, cx),
+            AppMenuAction::FindInBuffer => self.toggle_search(window, cx),
+            AppMenuAction::NewTab => self.create_tab(window, cx),
+            AppMenuAction::ClearScrollback => {
+                if let Some(tab) = self.tabs.get(self.active_tab_idx) {
+                    if let Some(terminal) = tab
+                        .pane_tree
+                        .active_pane()
+                        .and_then(|pane| pane.terminal.as_ref())
+                        .or(tab.terminal.as_ref())
+                    {
+                        terminal.scroll_to_bottom();
+                        terminal.write_to_pty(b"\x0c");
+                    }
+                }
+            }
+            AppMenuAction::OpenConfigFolder => {
+                let config_path = crate::config::Config::get_active_config_path();
+                if let Some(dir) = config_path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                    if let Some(dir) = dir.to_str() {
+                        open_path_or_url(dir);
+                    }
+                }
+            }
+            AppMenuAction::ToggleFullscreen => window.toggle_fullscreen(),
+            AppMenuAction::Quit => cx.quit(),
+        }
+        cx.notify();
+    }
+
+    /// Actions carry the card key, not its position: the stack can shift
+    /// between the frame that painted the button and the click.
+    fn handle_notification_action(
+        &mut self,
+        key: &str,
+        action: NotificationAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.notifications.position(key) else {
+            return;
+        };
+        let card = self.notifications.cards()[index].clone();
+        match action {
+            NotificationAction::OpenTab => {
+                if let Some(tab_idx) = card.tab_id.and_then(|id| self.tab_position(id)) {
+                    self.activate_tab_index(tab_idx);
+                }
+                if let Some(pane_id) = card.pane_id {
+                    self.acknowledge_program_status(pane_id);
+                }
+                self.notifications.dismiss_key(key);
+            }
+            NotificationAction::Review => {
+                if let Some(tab_idx) = card.tab_id.and_then(|id| self.tab_position(id)) {
+                    self.activate_tab_index(tab_idx);
+                }
+                self.notifications.dismiss_key(key);
+                if self.right_panel != RightPanel::Ai {
+                    self.toggle_ai_sidebar(window, cx);
+                }
+            }
+            NotificationAction::Allow => match self.ai_allow_option_id() {
+                Some(option_id) => self.confirm_ai_permission(&option_id, cx),
+                None => self.allow_ai_permission(cx),
+            },
+            NotificationAction::Dismiss => {
+                if let Some(pane_id) = card.pane_id {
+                    self.acknowledge_program_status(pane_id);
+                }
+                self.notifications.dismiss_key(key);
+            }
+        }
+        cx.notify();
+    }
+
+    /// The provider owns the permission options. Prefer `allow_once`, then the
+    /// first option that is not a reject. The keyboard shortcut uses the same
+    /// rule, so a card click and Cmd+Enter grant the same permission.
+    fn ai_allow_option_id(&self) -> Option<String> {
+        let pending = self.ai_pending_confirmation.as_ref()?;
+        pending
+            .options
+            .iter()
+            .find(|option| option.kind.as_deref() == Some("allow_once"))
+            .or_else(|| {
+                pending.options.iter().find(|option| {
+                    !option.kind.as_deref().unwrap_or("").starts_with("reject")
+                })
+            })
+            .map(|option| option.option_id.clone())
+    }
+
+    /// Allow a request that lists no options. The keyboard shortcut does the
+    /// same: an opencode request with no options carries no option id.
+    fn allow_ai_permission(&mut self, cx: &mut Context<Self>) {
+        if let Some(ref pending) = self.ai_pending_confirmation {
+            let _ = crate::ai::learned_allow::record_approval(
+                &pending.tool_name,
+                &pending.input_summary,
+            );
+        }
+        if let Some(tx) = self.ai_opencode_confirm_reply_tx.take() {
+            let _ = tx.send_blocking(None);
+        } else if let Some(tx) = self.ai_confirm_reply_tx.take() {
+            let _ = tx.send_blocking(crate::ai::PermissionDecision::Allow);
+        }
+        self.ai_pending_confirmation = None;
+        self.remove_notifications_with_prefix("ai-perm:");
+        cx.notify();
+    }
+
+    fn toggle_ai_question_option(&mut self, key: &str, value: &str) {
+        let multiselect = self
+            .ai_pending_question
+            .as_ref()
+            .and_then(|question| question.fields.iter().find(|field| field.key == key))
+            .is_some_and(|field| field.multiselect);
+        let selected = self
+            .ai_question_selection
+            .entry(key.to_string())
+            .or_default();
+        if multiselect {
+            if let Some(position) = selected.iter().position(|item| item == value) {
+                selected.remove(position);
+            } else {
+                selected.push(value.to_string());
+            }
+        } else {
+            *selected = vec![value.to_string()];
+        }
+    }
+
+    fn submit_ai_question(&mut self, cx: &mut Context<Self>) {
+        let Some(question) = self.ai_pending_question.clone() else {
+            return;
+        };
+        let mut content = serde_json::Map::new();
+        for field in &question.fields {
+            let selected = self
+                .ai_question_selection
+                .get(&field.key)
+                .cloned()
+                .unwrap_or_default();
+            if selected.is_empty() {
+                if field.required {
+                    // Keep the card open until every required field has an answer.
+                    return;
+                }
+                continue;
+            }
+            if field.multiselect {
+                content.insert(field.key.clone(), serde_json::json!(selected));
+            } else {
+                content.insert(field.key.clone(), serde_json::json!(selected[0]));
+            }
+        }
+        if let Some(reply) = self.ai_question_reply_tx.take() {
+            let _ = reply.send_blocking(Some(serde_json::Value::Object(content)));
+        }
+        self.ai_pending_question = None;
+        self.ai_question_selection.clear();
+        self.remove_notification(&format!(
+            "ai-question:{}",
+            self.ai_loaded_conversation_id
+        ));
+        cx.notify();
+    }
+
+    fn cancel_ai_question(&mut self, cx: &mut Context<Self>) {
+        if let Some(reply) = self.ai_question_reply_tx.take() {
+            let _ = reply.send_blocking(None);
+        }
+        self.ai_pending_question = None;
+        self.ai_question_selection.clear();
+        self.remove_notification(&format!(
+            "ai-question:{}",
+            self.ai_loaded_conversation_id
+        ));
+        cx.notify();
+    }
+
+    fn confirm_ai_permission(&mut self, option_id: &str, cx: &mut Context<Self>) {
+        let is_always = option_id == "allow_always";
+        let is_allow = !option_id.starts_with("reject");
+        if is_always && is_allow {
+            if let Some(ref pending) = self.ai_pending_confirmation {
+                self.ai_permission_checker
+                    .allow_always_tool(&pending.tool_name, &pending.input_summary);
+            }
+        }
+        if is_allow {
+            // Learned auto-allow: count the manual approval toward its command
+            // family; the sidebar offers the rule once the family crosses the
+            // threshold.
+            if let Some(ref pending) = self.ai_pending_confirmation {
+                let _ = crate::ai::learned_allow::record_approval(
+                    &pending.tool_name,
+                    &pending.input_summary,
+                );
+            }
+        }
+        if let Some(tx) = self.ai_opencode_confirm_reply_tx.take() {
+            let _ = tx.send_blocking(Some(option_id.to_string()));
+        } else if let Some(tx) = self.ai_confirm_reply_tx.take() {
+            let decision = if is_allow {
+                crate::ai::PermissionDecision::Allow
+            } else {
+                crate::ai::PermissionDecision::Deny
+            };
+            let _ = tx.send_blocking(decision);
+        }
+        self.ai_pending_confirmation = None;
+        self.remove_notifications_with_prefix("ai-perm:");
+        cx.notify();
+    }
+
+    fn pane_is_foreground(&self, pane_id: PaneId, window: &Window) -> bool {
+        window.is_window_active()
+            && !self.any_input_overlay_open()
+            && self
+                .tabs
+                .get(self.active_tab_idx)
+                .is_some_and(|tab| tab.pane_tree.active_pane_id == pane_id)
+    }
+
+    /// A finished command gets a card only when it lasted long enough to be
+    /// worth reporting, or when it failed. A quick `ls` stays silent.
+    fn notify_command_finished(
+        &mut self,
+        pane_id: PaneId,
+        duration_ms: u128,
+        exit_code: Option<i32>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.config.notify_on_command_finish {
+            return;
+        }
+        let failed = exit_code.is_some_and(|code| code != 0);
+        if !failed && duration_ms < 2_000 {
+            return;
+        }
+        if self.pane_is_foreground(pane_id, window) {
+            return;
+        }
+        let Some(tab_idx) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.pane_tree.find_pane(pane_id).is_some())
+        else {
+            return;
+        };
+        let source = {
+            let tab = &self.tabs[tab_idx];
+            let tab_title = tab
+                .custom_title
+                .clone()
+                .unwrap_or_else(|| tab.title.clone());
+            tab.pane_tree
+                .find_pane(pane_id)
+                .map(|pane| pane.title.clone())
+                .filter(|title| !title.is_empty())
+                .unwrap_or(tab_title)
+        };
+        let duration = format_command_duration(duration_ms);
+        let detail = match exit_code {
+            Some(code) => format!("exit {code} · {duration}"),
+            None => duration,
+        };
+        let tone = if failed {
+            NotificationTone::Failed
+        } else {
+            NotificationTone::Done
+        };
+        let glyph = command_glyph(&source);
+        let actions = if failed {
+            vec![NotificationAction::OpenTab, NotificationAction::Dismiss]
+        } else {
+            Vec::new()
+        };
+        self.push_notification(
+            InternalNotification {
+                key: format!("command:{pane_id}"),
+                fingerprint: detail.clone(),
+                source,
+                glyph,
+                tone,
+                detail,
+                created_at: std::time::Instant::now(),
+                progress: None,
+                actions,
+                tab_id: Some(self.tabs[tab_idx].id),
+                pane_id: Some(pane_id),
+                always_new: true,
+                departing: None,
+            },
+            cx,
+        );
+    }
+
+    fn notify_ai_status(&mut self, window: &Window, title: &str, urgency: AiNotificationUrgency) {
+        if !self.config.notify_on_ai_status || self.ai_response_is_visible(window) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if urgency == AiNotificationUrgency::Routine
+            && self
+                .ai_last_notification
+                .is_some_and(|last| now.duration_since(last).as_secs() < 5)
+        {
+            return;
+        }
+        let tab = self
+            .ai_event_source
+            .as_ref()
+            .and_then(|(id, _)| self.tabs.iter().find(|tab| tab.id == *id))
+            .or_else(|| self.tabs.get(self.active_tab_idx));
+        let Some(tab) = tab else { return };
+        let conversation_id = self
+            .ai_event_source
+            .as_ref()
+            .map(|(_, id)| id.as_str())
+            .unwrap_or(tab.ai_conversation_id.as_str());
+        let conversation_title = self
+            .ai_chat_records
+            .iter()
+            .find(|record| record.id == conversation_id)
+            .map(|record| record.title.as_str())
+            .unwrap_or("AI chat");
+        let body = format!(
+            "{} / {}: {}",
+            tab.custom_title.as_deref().unwrap_or(&tab.title),
+            conversation_title,
+            self.ai_turn_provider
+        );
+        self.ai_last_notification = Some(now);
+        let title = title.to_owned();
+        send_system_notification(&title, &body);
+    }
+
+    /// Watch a running command for a silence streak.
+    ///
+    /// The loop exits when the command ends, the pane closes, or one
+    /// notification was sent. A focused window never notifies, so active
+    /// work stays silent.
+    fn arm_silence_watcher(
+        &mut self,
+        pane_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(threshold) = self.config.notify_on_silence_seconds else {
+            return;
+        };
+        if threshold == 0 {
+            return;
+        }
+        let pane_has_terminal = self
+            .tabs
+            .iter()
+            .find_map(|tab| tab.pane_tree.find_pane(pane_id))
+            .is_some_and(|pane| pane.terminal.is_some());
+        if !pane_has_terminal {
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                let finished = this
+                    .update_in(cx, |this, window, _cx| {
+                        let Some(pane) = this
+                            .tabs
+                            .iter()
+                            .find_map(|tab| tab.pane_tree.find_pane(pane_id))
+                        else {
+                            return true;
+                        };
+                        let Some(terminal) = pane.terminal.as_ref() else {
+                            return true;
+                        };
+                        if !terminal.is_command_running() {
+                            return true;
+                        }
+                        if window.is_window_active() {
+                            return false;
+                        }
+                        match terminal.silence_seconds() {
+                            Some(seconds) if seconds >= threshold => {
+                                crate::notifications::send_system_notification(
+                                    "Fastty",
+                                    &format!("{} silent for {}s", pane.title, seconds),
+                                );
+                                true
+                            }
+                            _ => false,
+                        }
+                    })
+                    .ok()
+                    .unwrap_or(true);
+                if finished {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     fn refresh_program_status(&mut self, source_id: u64, window: &Window, cx: &mut Context<Self>) {
         let source = self
             .tabs
@@ -7834,12 +8482,6 @@ impl RootView {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        eprintln!(
-            "Fastty program status refresh: pane={pane_id} records={} notify_flag={} active_window={}",
-            records.len(),
-            self.config.notify_on_program_status,
-            window.is_window_active()
-        );
         let Some(tab) = self
             .tabs
             .iter()
@@ -7852,6 +8494,21 @@ impl RootView {
             tab.custom_title.as_deref().unwrap_or(&tab.title),
             pane_id
         );
+        let tab_idx = self
+            .tabs
+            .iter()
+            .position(|candidate| candidate.id == tab.id);
+        let tab_id = tab.id;
+        let tab_title = tab
+            .custom_title
+            .as_deref()
+            .unwrap_or(&tab.title)
+            .to_string();
+        let pane_title = tab
+            .pane_tree
+            .find_pane(pane_id)
+            .map(|pane| pane.title.clone())
+            .unwrap_or_default();
         let foreground = window.is_window_active()
             && !self.any_input_overlay_open()
             && self
@@ -7876,38 +8533,156 @@ impl RootView {
         status.unread = has_attention && (status.unread || !attention.is_empty());
         status.records = records;
         let now = std::time::Instant::now();
+        let aggregate = crate::program_status::aggregate(&status.records).cloned();
         if self.config.notify_on_program_status && !foreground {
             if let Some(record) = crate::program_status::aggregate(&attention) {
                 let requires_action = record.state == ProgramState::Blocked;
                 let cooldown_elapsed = status
                     .last_notification
                     .is_none_or(|last| now.duration_since(last).as_secs() >= 5);
-                if !requires_action && !cooldown_elapsed {
-                    cx.notify();
-                    return;
+                if requires_action || cooldown_elapsed {
+                    let text = if record.state == ProgramState::Idle {
+                        "Finished"
+                    } else {
+                        super::tab_bar::program_status_text(record)
+                    };
+                    let title = format!("Fastty: {text}");
+                    let message = record
+                        .msg
+                        .as_deref()
+                        .or(record.title.as_deref())
+                        .unwrap_or("");
+                    let body = format!(
+                        "{}: {} {}",
+                        source,
+                        record.app.as_deref().unwrap_or("Program"),
+                        message
+                    );
+                    status.last_notification = Some(now);
+                    send_system_notification(&title, &body);
                 }
-                let text = if record.state == ProgramState::Idle {
-                    "Finished"
-                } else {
-                    super::tab_bar::program_status_text(record)
+            }
+        }
+        // The native notification above is throttled. The floating card is
+        // not: it only replaces itself while the state stays the same.
+        let card_action =
+            program_card_action(aggregate.as_ref(), &attention, self.config.notify_on_program_status);
+        match card_action {
+            ProgramCardAction::Show(record) => {
+                let tone = match record.state {
+                    ProgramState::Working => NotificationTone::Working,
+                    ProgramState::Done => NotificationTone::Done,
+                    ProgramState::Blocked => NotificationTone::NeedsYou,
+                    ProgramState::Error => NotificationTone::Failed,
+                    ProgramState::Idle => NotificationTone::Done,
                 };
-                let title = format!("Fastty: {text}");
                 let message = record
                     .msg
-                    .as_deref()
-                    .or(record.title.as_deref())
-                    .unwrap_or("");
-                let body = format!(
-                    "{}: {} {}",
-                    source,
-                    record.app.as_deref().unwrap_or("Program"),
+                    .clone()
+                    .filter(|message| !message.is_empty())
+                    .or_else(|| record.title.clone())
+                    .unwrap_or_else(|| match tone {
+                        NotificationTone::Working => "Working".to_string(),
+                        NotificationTone::Done => "Finished".to_string(),
+                        _ => String::new(),
+                    });
+                let detail = if tab_idx.is_some_and(|idx| idx != self.active_tab_idx) {
+                    format!("{tab_title} · {message}")
+                } else {
                     message
+                };
+                let source = record
+                    .app
+                    .clone()
+                    .or_else(|| record.title.clone())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| pane_title.clone());
+                let actions = match record.state {
+                    // A running or finished run only reports: it is not a
+                    // request, so it offers no button.
+                    ProgramState::Working | ProgramState::Done | ProgramState::Idle => Vec::new(),
+                    _ => vec![NotificationAction::OpenTab, NotificationAction::Dismiss],
+                };
+                let glyph = match record.app.as_deref() {
+                    // An app with no bundled mark still reads as an agent.
+                    Some(app) => agent_glyph(app),
+                    None => tab_glyph(None, record.title.as_deref()),
+                };
+                // The card stays in the queue even while its pane is on
+                // screen. The renderer hides it there, so it appears again when
+                // the user looks away without waiting for a new report.
+                self.push_notification(
+                    InternalNotification {
+                        key: format!("pane:{pane_id}"),
+                        fingerprint: format!("{:?}|{}", record.state, record.id),
+                        source: if source.is_empty() {
+                            tab_title.clone()
+                        } else {
+                            source
+                        },
+                        glyph,
+                        tone,
+                        detail,
+                        created_at: now,
+                        progress: record.progress,
+                        actions,
+                        tab_id: Some(tab_id),
+                        pane_id: Some(pane_id),
+                        // A repeated error is a new event: retrying must show
+                        // it again even after a dismissal.
+                        always_new: record.state == ProgramState::Error,
+                        departing: None,
+                    },
+                    cx,
                 );
-                status.last_notification = Some(now);
-                send_system_notification(&title, &body);
+            }
+            ProgramCardAction::Remove => {
+                self.remove_notification(&format!("pane:{pane_id}"));
+            }
+            ProgramCardAction::Keep => {
+                // The card may belong to a record that no longer drives the
+                // pane, for example a `working` card left after a `done` child
+                // kept the aggregate alive.
+                let expected = aggregate
+                    .as_ref()
+                    .map(|record| format!("{:?}|{}", record.state, record.id));
+                let key = format!("pane:{pane_id}");
+                let stale = self
+                    .notifications
+                    .cards()
+                    .iter()
+                    .find(|card| card.key == key)
+                    .is_some_and(|card| {
+                        card.tone == NotificationTone::Working
+                            && expected.as_deref() != Some(card.fingerprint.as_str())
+                    });
+                if stale {
+                    self.remove_notification(&key);
+                }
             }
         }
         cx.notify();
+    }
+
+    /// The app name of the live work in a pane. A finished record keeps its
+    /// app, but it no longer owns the tab: the foreground process does.
+    fn pane_program_app(&self, pane_id: PaneId) -> Option<String> {
+        self.program_statuses.get(&pane_id).and_then(|status| {
+            status
+                .records
+                .iter()
+                // A finished app keeps its record. Only the live ones own the
+                // tab: otherwise `claude` would hide `cargo` in the same pane.
+                .filter(|record| {
+                    record.app.is_some()
+                        && matches!(
+                            record.state,
+                            ProgramState::Working | ProgramState::Blocked
+                        )
+                })
+                .max_by_key(|record| record.state.priority())
+                .and_then(|record| record.app.clone())
+        })
     }
 
     fn visible_program_record(&self, pane_id: PaneId) -> Option<&ProgramRecord> {
@@ -7985,6 +8760,16 @@ impl RootView {
             let _ = tx.send_blocking(None);
         }
         self.ai_pending_confirmation = None;
+        // Decline a pending question so the agent thread unblocks too.
+        if let Some(tx) = self.ai_question_reply_tx.take() {
+            let _ = tx.send_blocking(None);
+        }
+        self.ai_pending_question = None;
+        self.ai_question_selection.clear();
+        let conversation = format!("ai-question:{}", self.ai_loaded_conversation_id);
+        self.remove_notification(&conversation);
+        let permission = format!("ai-perm:{}", self.ai_loaded_conversation_id);
+        self.remove_notification(&permission);
         if !self.ai_pending_text.is_empty() {
             self.ai_streaming_text.push_str(&self.ai_pending_text);
             self.ai_pending_text.clear();
@@ -8009,13 +8794,68 @@ impl RootView {
             .and_then(|t| t.cwd.as_ref().map(|p| p.to_string_lossy().to_string()))
             .unwrap_or_else(|| "~".to_string());
 
+        if self.ai_at_status_cwd.as_deref() != Some(active_cwd.as_str()) {
+            let cwd_path = std::path::PathBuf::from(&active_cwd);
+            let repo_root = git2::Repository::discover(&cwd_path)
+                .ok()
+                .and_then(|repo| repo.workdir().map(std::path::PathBuf::from));
+            let git_snapshot = self
+                .tabs
+                .get(self.active_tab_idx)
+                .and_then(|tab| tab.git_status.as_ref());
+            if let Some(git) = git_snapshot {
+                self.ai_at_file_status = {
+                    git.project_panel
+                        .changes
+                        .iter()
+                        .filter_map(|change| {
+                            let letter = match change
+                                .worktree
+                                .as_ref()
+                                .or(change.index.as_ref())
+                                .map(|side| &side.status)
+                            {
+                                Some(crate::git::GitFileStatus::Added) => 'A',
+                                Some(crate::git::GitFileStatus::Untracked) => '?',
+                                Some(crate::git::GitFileStatus::Deleted) => 'D',
+                                Some(crate::git::GitFileStatus::Renamed) => 'R',
+                                Some(crate::git::GitFileStatus::Conflicted) => '!',
+                                Some(crate::git::GitFileStatus::Modified) => 'M',
+                                None => return None,
+                            };
+                            // Git paths are repo-relative; the picker lists paths
+                            // relative to the terminal cwd.
+                            let relative = repo_root
+                                .as_ref()
+                                .map(|root| root.join(change.path.replace('\\', "/")))
+                                .and_then(|full| {
+                                    full.strip_prefix(&cwd_path)
+                                        .ok()
+                                        .map(|path| path.to_string_lossy().replace('\\', "/"))
+                                })
+                                .unwrap_or_else(|| change.path.replace('\\', "/"));
+                            Some((relative, letter))
+                        })
+                        .collect()
+                };
+                // Only cache once a snapshot exists: an early open would
+                // otherwise lock in an empty map.
+                self.ai_at_status_cwd = Some(active_cwd.clone());
+            }
+        }
         self.ai_at_matches = crate::file_search::search_from_root(
             std::path::Path::new(&active_cwd),
             query,
             crate::ui::ai_sidebar::AI_AT_MENU_MAX_ROWS,
         )
         .into_iter()
-        .map(|entry| entry.rel_path)
+        .map(|entry| {
+            if entry.is_dir {
+                format!("{}/", entry.rel_path.trim_end_matches('/'))
+            } else {
+                entry.rel_path
+            }
+        })
         .collect();
         // The list just changed under the selection. Typing filters it, so an
         // index from before can point past the end.
@@ -8035,8 +8875,27 @@ impl RootView {
         let needle = query.to_lowercase();
         let mut matches: Vec<String> = crate::ai::conversations::discover_skills(&cwd)
             .into_iter()
-            .filter(|skill| needle.is_empty() || skill.name.to_lowercase().contains(&needle))
-            .map(|skill| format!("skill::{}::{}", skill.name, skill.scope))
+            .filter_map(|skill| {
+                let folder = skill
+                    .path
+                    .parent()
+                    .and_then(|dir| dir.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| skill.name.clone());
+                if !needle.is_empty()
+                    && !skill.name.to_lowercase().contains(&needle)
+                    && !folder.to_lowercase().contains(&needle)
+                {
+                    return None;
+                }
+                Some(format!(
+                    "skill::{}::{}::{}::{}",
+                    skill.name.replace("::", " "),
+                    skill.scope.replace("::", " "),
+                    skill.description.replace("::", " "),
+                    folder.replace("::", " ")
+                ))
+            })
             .collect();
         let conversation_id = self
             .tabs
@@ -8129,18 +8988,29 @@ impl RootView {
         let before_cursor: String = chars[..cursor_clamped].iter().collect();
         let after_cursor: String = chars[cursor_clamped..].iter().collect();
 
+        let is_folder = path.ends_with('/');
+        let trailing = if is_folder { "" } else { " " };
         if let Some(at_idx) = before_cursor.rfind('@') {
             let before_at = &before_cursor[..at_idx];
-            let new_text = format!("{}@{} {}", before_at, path, after_cursor);
-            let new_cursor = before_at.chars().count() + 1 + path.chars().count() + 1;
+            let new_text = format!("{}@{}{}{}", before_at, path, trailing, after_cursor);
+            let new_cursor =
+                before_at.chars().count() + 1 + path.chars().count() + trailing.len();
             self.ai_input_state
                 .set_text_with_cursor(new_text, new_cursor);
         } else {
-            let insertion = format!("@{} ", path);
+            let insertion = format!("@{}{}", path, trailing);
             self.ai_input_state.insert_str(&insertion);
         }
         self.ai_input_text = self.ai_input_state.text.clone();
-        self.ai_at_menu_open = false;
+        if is_folder {
+            // Stay open on the folder's children instead of inserting a path
+            // that resolves to nothing.
+            self.ai_at_menu_open = true;
+            self.update_ai_at_matches(path);
+            self.ai_at_selected = 0;
+        } else {
+            self.ai_at_menu_open = false;
+        }
     }
 
     pub fn check_ai_at_trigger(&mut self) {
@@ -8357,6 +9227,10 @@ impl RootView {
             String,
             Vec<crate::ai::opencode::PermissionOption>,
             async_channel::Sender<Option<String>>,
+        )>();
+        let (question_tx, question_rx) = async_channel::unbounded::<(
+            crate::ai::opencode::ElicitationRequestData,
+            async_channel::Sender<Option<serde_json::Value>>,
         )>();
         let (event_tx, event_rx) = async_channel::unbounded::<crate::ai::AgentEvent>();
 
@@ -8625,6 +9499,7 @@ impl RootView {
                         opencode_prompt,
                         cancel_tok.clone(),
                         opencode_ask_tx,
+                        question_tx,
                         tx.clone(),
                     )
                 };
@@ -8647,6 +9522,14 @@ impl RootView {
                         &permission_conversation_id,
                         stream_generation,
                         |this| {
+                        let notification_detail = format!(
+                            "Wants to run {}",
+                            if input_summary.is_empty() {
+                                tool_name.clone()
+                            } else {
+                                input_summary.clone()
+                            }
+                        );
                         this.ai_pending_confirmation =
                             Some(crate::ui::ai_sidebar::AiUiPendingConfirmation {
                                 tool_id,
@@ -8660,6 +9543,35 @@ impl RootView {
                         "Fastty AI: Permission required",
                         AiNotificationUrgency::RequiresAction,
                     );
+                    if this.config.notify_on_ai_status {
+                        let source = if this.ai_turn_provider.is_empty() {
+                            "Fastty AI".to_string()
+                        } else {
+                            this.ai_turn_provider.clone()
+                        };
+                        let glyph = agent_glyph(&source);
+                        this.push_notification(
+                            InternalNotification {
+                                key: format!("ai-perm:{permission_conversation_id}"),
+                                fingerprint: format!("needs-you|{notification_detail}"),
+                                source,
+                                glyph,
+                                tone: NotificationTone::NeedsYou,
+                                detail: notification_detail,
+                                created_at: std::time::Instant::now(),
+                                progress: None,
+                                actions: vec![
+                                    NotificationAction::Allow,
+                                    NotificationAction::Review,
+                                ],
+                                tab_id: Some(event_tab_id),
+                                pane_id: None,
+                                always_new: true,
+                                departing: None,
+                            },
+                            cx,
+                        );
+                    }
                     this.ai_opencode_confirm_reply_tx = None;
                     // The confirmation card renders at the end of the message
                     // list; bring it into view so the user sees the diff.
@@ -8689,6 +9601,14 @@ impl RootView {
                         &opencode_permission_conversation_id,
                         stream_generation,
                         |this| {
+                            let notification_detail = format!(
+                                "Wants to run {}",
+                                if input_summary.is_empty() {
+                                    tool_name.clone()
+                                } else {
+                                    input_summary.clone()
+                                }
+                            );
                             this.ai_pending_confirmation =
                                 Some(crate::ui::ai_sidebar::AiUiPendingConfirmation {
                             tool_id,
@@ -8710,6 +9630,35 @@ impl RootView {
                         "Fastty AI: Permission required",
                         AiNotificationUrgency::RequiresAction,
                     );
+                    if this.config.notify_on_ai_status {
+                        let source = if this.ai_turn_provider.is_empty() {
+                            "Fastty AI".to_string()
+                        } else {
+                            this.ai_turn_provider.clone()
+                        };
+                        let glyph = agent_glyph(&source);
+                        this.push_notification(
+                            InternalNotification {
+                                key: format!("ai-perm:{opencode_permission_conversation_id}"),
+                                fingerprint: format!("needs-you|{notification_detail}"),
+                                source,
+                                glyph,
+                                tone: NotificationTone::NeedsYou,
+                                detail: notification_detail,
+                                created_at: std::time::Instant::now(),
+                                progress: None,
+                                actions: vec![
+                                    NotificationAction::Allow,
+                                    NotificationAction::Review,
+                                ],
+                                tab_id: Some(event_tab_id),
+                                pane_id: None,
+                                always_new: true,
+                                departing: None,
+                            },
+                            cx,
+                        );
+                    }
                             if this.ai_event_source.is_none() {
                                 this.ai_scroll_handle.scroll_to_bottom();
                             }
@@ -8718,6 +9667,71 @@ impl RootView {
                     );
                     if accepted.is_none() {
                         let _ = rejected_reply.send_blocking(None);
+                    }
+                });
+            }
+        })
+        .detach();
+
+        let question_conversation_id = event_conversation_id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok((data, reply_tx)) = question_rx.recv().await {
+                let _ = this.update_in(cx, |this, _window, cx| {
+                    let rejected = reply_tx.clone();
+                    let accepted = this.with_ai_turn(
+                        event_tab_id,
+                        &question_conversation_id,
+                        stream_generation,
+                        |this| {
+                            let detail = summarize_detail(&data.message, 80);
+                            this.ai_pending_question = Some(data);
+                            this.ai_question_reply_tx = Some(reply_tx);
+                            this.ai_question_selection.clear();
+                            this.notify_ai_status(
+                                _window,
+                                "Fastty AI: Question",
+                                AiNotificationUrgency::RequiresAction,
+                            );
+                            if this.config.notify_on_ai_status {
+                                let source = if this.ai_turn_provider.is_empty() {
+                                    "Fastty AI".to_string()
+                                } else {
+                                    this.ai_turn_provider.clone()
+                                };
+                                let glyph = agent_glyph(&source);
+                                this.push_notification(
+                                    InternalNotification {
+                                        key: format!(
+                                            "ai-question:{question_conversation_id}"
+                                        ),
+                                        fingerprint: format!("question|{detail}"),
+                                        source,
+                                        glyph,
+                                        tone: NotificationTone::NeedsYou,
+                                        detail: if detail.is_empty() {
+                                            "Wants an answer".to_string()
+                                        } else {
+                                            detail
+                                        },
+                                        created_at: std::time::Instant::now(),
+                                        progress: None,
+                                        actions: vec![
+                                            NotificationAction::OpenTab,
+                                            NotificationAction::Review,
+                                        ],
+                                        tab_id: Some(event_tab_id),
+                                        pane_id: None,
+                                        always_new: true,
+                                        departing: None,
+                                    },
+                                    cx,
+                                );
+                            }
+                            cx.notify();
+                        },
+                    );
+                    if accepted.is_none() {
+                        let _ = rejected.send_blocking(None);
                     }
                 });
             }
@@ -8934,6 +9948,7 @@ impl RootView {
                             }
 
                             let text = std::mem::take(&mut this.ai_streaming_text);
+                            let turn_summary = summarize_detail(&text, 96);
                             let thinking = if this.ai_streaming_thinking.is_empty() {
                                 None
                             } else {
@@ -8987,6 +10002,39 @@ impl RootView {
                                 "Fastty AI: Turn complete",
                                 AiNotificationUrgency::Routine,
                             );
+                            if this.config.notify_on_ai_status
+                                && !this.ai_response_is_visible(_window)
+                            {
+                                let source = if this.ai_turn_provider.is_empty() {
+                                    "Fastty AI".to_string()
+                                } else {
+                                    this.ai_turn_provider.clone()
+                                };
+                                let glyph = agent_glyph(&source);
+                                this.push_notification(
+                                    InternalNotification {
+                                        key: format!("ai-turn:{stream_conversation_id}"),
+                                        fingerprint: format!("done|{turn_summary}"),
+                                        source,
+                                        glyph,
+                                        tone: NotificationTone::Done,
+                                        detail: if turn_summary.is_empty() {
+                                            "Turn complete".to_string()
+                                        } else {
+                                            turn_summary.clone()
+                                        },
+                                        created_at: std::time::Instant::now(),
+                                        progress: None,
+                                        actions: Vec::new(),
+                                        tab_id: Some(event_tab_id),
+                                        pane_id: None,
+                                        always_new: true,
+                                        departing: None,
+                                    },
+                                    cx,
+                                );
+                                this.remove_notifications_with_prefix("ai-perm:");
+                            }
                             this.save_active_ai_conversation();
                         }
                         crate::ai::AgentEvent::Usage { input, output } => {
@@ -9049,6 +10097,43 @@ impl RootView {
                                 "Fastty AI: Turn failed",
                                 AiNotificationUrgency::Routine,
                             );
+                            if this.config.notify_on_ai_status
+                                && !this.ai_response_is_visible(_window)
+                            {
+                                let source = if this.ai_turn_provider.is_empty() {
+                                    "Fastty AI".to_string()
+                                } else {
+                                    this.ai_turn_provider.clone()
+                                };
+                                let glyph = agent_glyph(&source);
+                                let detail = summarize_detail(&err, 96);
+                                this.push_notification(
+                                    InternalNotification {
+                                        key: format!("ai-turn:{stream_conversation_id}"),
+                                        fingerprint: format!("failed|{detail}"),
+                                        source,
+                                        glyph,
+                                        tone: NotificationTone::Failed,
+                                        detail: if detail.is_empty() {
+                                            "Turn failed".to_string()
+                                        } else {
+                                            detail.clone()
+                                        },
+                                        created_at: std::time::Instant::now(),
+                                        progress: None,
+                                        actions: vec![
+                                            NotificationAction::OpenTab,
+                                            NotificationAction::Dismiss,
+                                        ],
+                                        tab_id: Some(event_tab_id),
+                                        pane_id: None,
+                                        always_new: true,
+                                        departing: None,
+                                    },
+                                    cx,
+                                );
+                                this.remove_notifications_with_prefix("ai-perm:");
+                            }
                             this.ai_is_streaming = false;
                             this.ai_cancel_token = None;
                             this.save_active_ai_conversation();
@@ -9203,6 +10288,7 @@ impl RootView {
         .git_branch(active_branch)
         .context_pct(context_pct)
         .context_tokens(used_tokens_u64, max_context_u64, effective_usage)
+        .context_breakdown(ai_context_breakdown(&self.ai_messages))
         .context_hovercard_open(self.ai_context_hovercard_open)
         .on_hover_context(cx.listener(|this, is_hovered: &bool, _window, cx| {
             this.ai_context_hovercard_open = *is_hovered;
@@ -9219,6 +10305,20 @@ impl RootView {
             self.ai_streaming_thinking.clone(),
         )
         .pending_confirmation(self.ai_pending_confirmation.clone())
+        .pending_question(self.ai_pending_question.clone())
+        .question_selection(self.ai_question_selection.clone())
+        .on_question_toggle(cx.listener(
+            |this, pair: &(String, String), _window, cx| {
+                this.toggle_ai_question_option(&pair.0, &pair.1);
+                cx.notify();
+            },
+        ))
+        .on_question_submit(cx.listener(|this, _ev, _window, cx| {
+            this.submit_ai_question(cx);
+        }))
+        .on_question_cancel(cx.listener(|this, _ev, _window, cx| {
+            this.cancel_ai_question(cx);
+        }))
         .input_text(self.ai_input_state.text.clone())
         .cursor_pos(self.ai_input_state.cursor)
         .selection(self.ai_input_state.selection)
@@ -9279,6 +10379,7 @@ impl RootView {
         .at_menu_open(self.ai_at_menu_open)
         .at_is_skill_menu(self.ai_at_is_skill_menu)
         .at_matches(self.ai_at_matches.clone())
+        .at_file_status(self.ai_at_file_status.clone())
         .at_selected(
             self.ai_at_selected
                 .min(self.ai_at_row_count().saturating_sub(1)),
@@ -9286,12 +10387,18 @@ impl RootView {
         .at_scroll_handle(self.ai_at_scroll_handle.clone())
         .on_select_at_match(cx.listener(|this, path: &String, _window, cx| {
             this.insert_ai_at_path(path);
-            this.ai_at_menu_open = false;
+            // A folder keeps the menu open on its children; insert_ai_at_path
+            // already decided which case this is.
+            if !path.ends_with('/') {
+                this.ai_at_menu_open = false;
+            }
             cx.notify();
         }))
         .on_at_click(cx.listener(|this, _ev, _window, cx| {
             this.ai_at_menu_open = !this.ai_at_menu_open;
             if this.ai_at_menu_open {
+                // Refresh the git letters once per open, not per keystroke.
+                this.ai_at_status_cwd = None;
                 this.update_ai_at_matches("");
             }
             cx.notify();
@@ -9487,37 +10594,7 @@ impl RootView {
             this.submit_ai_prompt(window, cx);
         }))
         .on_confirm(cx.listener(|this, option_id: &String, _window, cx| {
-                let is_always = option_id == "allow_always";
-                let is_allow = !option_id.starts_with("reject");
-                if is_always && is_allow {
-                    if let Some(ref pending) = this.ai_pending_confirmation {
-                        this.ai_permission_checker
-                            .allow_always_tool(&pending.tool_name, &pending.input_summary);
-                    }
-                }
-                if is_allow {
-                    // Learned auto-allow: count the manual approval toward
-                    // its command family; the sidebar offers the rule once
-                    // the family crosses the threshold.
-                    if let Some(ref pending) = this.ai_pending_confirmation {
-                        let _ = crate::ai::learned_allow::record_approval(
-                            &pending.tool_name,
-                            &pending.input_summary,
-                        );
-                    }
-                }
-                if let Some(tx) = this.ai_opencode_confirm_reply_tx.take() {
-                    let _ = tx.send_blocking(Some(option_id.clone()));
-                } else if let Some(tx) = this.ai_confirm_reply_tx.take() {
-                    let dec = if is_allow {
-                        crate::ai::PermissionDecision::Allow
-                    } else {
-                        crate::ai::PermissionDecision::Deny
-                    };
-                    let _ = tx.send_blocking(dec);
-                }
-                this.ai_pending_confirmation = None;
-                cx.notify();
+            this.confirm_ai_permission(option_id, cx);
         }));
 
         div()
@@ -10101,6 +11178,13 @@ impl RootView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.project_commit_focused && self.right_panel == RightPanel::Project {
+            cx.stop_propagation();
+            return;
+        }
+        if self.any_input_overlay_open() || self.ai_keys_own_input() {
+            return;
+        }
         let Some(active_tab) = self.tabs.get(self.active_tab_idx) else {
             return;
         };
@@ -10752,6 +11836,8 @@ impl RootView {
                 } else if let Some(tx) = self.ai_confirm_reply_tx.take() {
                     let _ = tx.send_blocking(crate::ai::PermissionDecision::Deny);
                     self.ai_pending_confirmation = None;
+                } else if self.ai_pending_question.is_some() {
+                    self.cancel_ai_question(cx);
                 } else if self.ai_is_streaming {
                     self.cancel_ai_stream();
                 } else {
@@ -10806,7 +11892,7 @@ impl RootView {
                     self.ai_at_selected = 0;
                     Some(0)
                 } else if key_lower == "end" {
-                    self.ai_at_selected = self.ai_at_row_count() - 1;
+                    self.ai_at_selected = self.ai_at_row_count().saturating_sub(1);
                     Some(0)
                 } else {
                     None
@@ -10897,29 +11983,19 @@ impl RootView {
                     self.ai_input_text = self.ai_input_state.text.clone();
                     self.check_ai_at_trigger();
                 } else if self.ai_pending_confirmation.is_some() && modifiers.platform {
+                    if let Some(ref pending) = self.ai_pending_confirmation {
+                        let _ = crate::ai::learned_allow::record_approval(
+                            &pending.tool_name,
+                            &pending.input_summary,
+                        );
+                    }
                     if let Some(tx) = self.ai_opencode_confirm_reply_tx.take() {
-                        let selected = self
-                            .ai_pending_confirmation
-                            .as_ref()
-                            .and_then(|pending| {
-                                pending
-                                    .options
-                                    .iter()
-                                    .find(|option| option.kind.as_deref() == Some("allow_once"))
-                            })
-                            .or_else(|| {
-                                self.ai_pending_confirmation.as_ref().and_then(|pending| {
-                                    pending.options.iter().find(|option| {
-                                        !option.kind.as_deref().unwrap_or("").starts_with("reject")
-                                    })
-                                })
-                            })
-                            .map(|option| option.option_id.clone());
-                        let _ = tx.send_blocking(selected);
+                        let _ = tx.send_blocking(self.ai_allow_option_id());
                     } else if let Some(tx) = self.ai_confirm_reply_tx.take() {
                         let _ = tx.send_blocking(crate::ai::PermissionDecision::Allow);
                     }
                     self.ai_pending_confirmation = None;
+                    self.remove_notifications_with_prefix("ai-perm:");
                 } else {
                     self.submit_ai_prompt(_window, cx);
                 }
