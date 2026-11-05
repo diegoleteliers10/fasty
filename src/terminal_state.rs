@@ -3139,11 +3139,36 @@ impl TerminalState {
     }
 
     pub fn search_matches(&self, query: &str) -> Vec<usize> {
+        self.search_matches_with(query, false, false)
+    }
+
+    /// Scroll offsets of the lines that match, with optional case sensitivity
+    /// and regular expressions.
+    pub fn search_matches_with(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        regex: bool,
+    ) -> Vec<usize> {
         if query.trim().is_empty() {
             return Vec::new();
         }
         use alacritty_terminal::index::Line;
-        let query_lower = query.to_lowercase();
+        let matcher: Box<dyn Fn(&str) -> bool> = if regex {
+            let Ok(pattern) = regex::RegexBuilder::new(query)
+                .case_insensitive(!case_sensitive)
+                .build()
+            else {
+                return Vec::new();
+            };
+            Box::new(move |line| pattern.is_match(line))
+        } else if case_sensitive {
+            let needle = query.to_string();
+            Box::new(move |line| line.contains(&needle))
+        } else {
+            let needle = query.to_lowercase();
+            Box::new(move |line| line.to_lowercase().contains(&needle))
+        };
         let term = self.term.lock();
         let grid = term.grid();
         let history = grid.history_size();
@@ -3172,11 +3197,39 @@ impl TerminalState {
     }
 
     pub fn search_snippets(&self, query: &str, max_results: usize) -> Vec<SearchSnippet> {
+        self.search_snippets_with(query, max_results, false, false)
+    }
+
+    /// Search the scrollback with optional case sensitivity and regular
+    /// expressions. An invalid pattern yields no matches instead of an error.
+    pub fn search_snippets_with(
+        &self,
+        query: &str,
+        max_results: usize,
+        case_sensitive: bool,
+        regex: bool,
+    ) -> Vec<SearchSnippet> {
         if query.trim().is_empty() {
             return Vec::new();
         }
         use alacritty_terminal::index::Line;
         let query_lower = query.to_lowercase();
+        let matcher: Box<dyn Fn(&str) -> bool> = if regex {
+            let Ok(pattern) = regex::RegexBuilder::new(query)
+                .case_insensitive(!case_sensitive)
+                .build()
+            else {
+                return Vec::new();
+            };
+            Box::new(move |line| pattern.is_match(line))
+        } else if case_sensitive {
+            let needle = query.to_string();
+            Box::new(move |line| line.contains(&needle))
+        } else {
+            let needle = query.to_lowercase();
+            Box::new(move |line| line.to_lowercase().contains(&needle))
+        };
+        let fuzzy_allowed = !regex && !case_sensitive;
         let term = self.term.lock();
         let grid = term.grid();
         let history = grid.history_size();
@@ -5773,6 +5826,33 @@ termios.tcsetattr(fd, termios.TCSADRAIN, old)
                 alacritty_terminal::vte::ansi::NamedColor::Background,
             ),
         );
+    }
+
+    #[test]
+    fn search_options_respect_case_and_regex() {
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let terminal = TerminalState::new_headless("/bin/cat", &[], None, 40, 10)
+            .expect("create headless terminal");
+        let mut parser: Processor<StdSyncHandler> = Processor::new();
+        parser.advance(
+            &mut *terminal.term.lock(),
+            b"Alpha beta\r\nalpha BETA\r\nGamma\r\n",
+        );
+
+        let insensitive = terminal.search_snippets_with("alpha", 10, false, false);
+        assert_eq!(insensitive.len(), 2);
+        let sensitive = terminal.search_snippets_with("alpha", 10, true, false);
+        assert_eq!(sensitive.len(), 1);
+        let regex = terminal.search_snippets_with("^A.*a$", 10, true, true);
+        assert_eq!(regex.len(), 1);
+        assert!(terminal
+            .search_snippets_with("(", 10, true, true)
+            .is_empty());
+        assert_eq!(terminal.non_empty_line_count(), 3);
+        assert_eq!(terminal.search_matches_with("Alpha", true, false).len(), 1);
+        assert_eq!(terminal.search_matches_with("^A", true, true).len(), 1);
+        assert!(terminal.search_matches_with("(", true, true).is_empty());
     }
 
     #[test]
