@@ -56,6 +56,25 @@ On macOS, install and open `Fastty.app` before you use notifications. Fastty use
 
 The AI panel uses provider events for its notifications. It supports ACP and HTTP providers without OSC reports.
 
+## Floating cards
+
+Fastty shows the same events as cards in the window, in the bottom right of the terminal area. A card shows the program mark, the source name, the state, the time, the message, and the actions you can take.
+
+| Card | Actions | Time | Bar |
+| --- | --- | --- | --- |
+| Done | None | Countdown | Yes |
+| Failed | **Open tab**, **Dismiss** | Countdown | No |
+| Needs you | **Allow**, **Review** | Elapsed | No |
+| Working | None | Elapsed | No |
+
+A done card only reports a result. It has no actions, it shows the time left, and a bar counts down until it clears. A working card only reports that the source is busy, so it has no action and no bar. The other cards wait for the source or for you, so they show the elapsed time and no bar. The actions depend on the source: a permission request offers **Allow** and **Review**, and a blocked program offers **Open tab** and **Dismiss**.
+
+**Open tab** selects the tab of the event. **Review** opens the AI panel with the request. **Dismiss** removes the card. Fastty hides a working card while its pane is on screen, because the card would cover the terminal it describes.
+
+A dismissed result does not return for the same state. A new state for the same source shows a new card. A retried failure and a finished command are new events each time, so they always show a card.
+
+Fastty keeps at most three cards, and a card that needs you is never removed to make room for a result. A done card clears itself three seconds after the work ends. A failed card counts down from 60 seconds, but its actions stay available until it clears. A card that reports work or a request for input stays until the source changes state or you act on it. The cards follow the **AI Status** and **Program Status** settings. A command card also needs `notify_on_command_finish = true` and a duration of two seconds or more, unless the command fails.
+
 ## OSC notifications
 
 A program can ask for a native notification directly. Fastty reads these sequences:
@@ -76,6 +95,21 @@ Each conversation keeps its own active turn. Switch tabs or select another conve
 If an agent needs permission, its conversation keeps the request pending. Open that conversation to approve or deny the request. With **AI Status** enabled, Fastty can notify you when a background conversation needs permission or finishes its turn.
 
 Use **Stop** to cancel the visible conversation's turn. Clear or delete a conversation to cancel its turn. Close a tab to cancel its conversations. Closing Fastty cancels all active turns.
+
+## Tab identity
+
+Each tab shows the mark of the program that owns the pane. When the foreground process is a shell, the tab shows the green terminal mark. Otherwise Fastty reads the `app` field of the live pane records first, then the process name. A record that finished no longer owns the tab, so the next program in that pane sets the mark.
+
+- A shell shows the green terminal mark.
+- A known agent shows its brand mark: Claude, OpenCode, Codex, Gemini, GitHub Copilot, Cursor, Amp, Qwen, Cline, Windsurf, Mistral, Kimi, LM Studio, Pi, Antigravity, or Hermes.
+- An agent without a bundled mark shows the generic agent mark.
+- A language or runtime shows its mark: Node.js, Bun, Deno, npm, pnpm, Yarn, Python, Rust, Go, Ruby, PHP, Java, Kotlin, Swift, .NET, Lua, Elixir, Zig, Dart, Flutter, Haskell, Clojure, or R.
+- A tool shows its mark: Docker, Terraform, Kubernetes, Git, Neovim, Vim, tmux, Redis, SQLite, PostgreSQL, MongoDB, CMake, Gradle, Ollama, or Hugging Face.
+- Any other program shows the mark of its tool group.
+
+When a report names a program in the family of a bundled mark, the tab uses that mark, so `claude-code` shows the Claude mark and `/usr/local/bin/opencode` shows the OpenCode mark. When the pane goes back to a shell prompt, the tab shows the terminal mark again.
+
+While a record reports `working`, the tab shows a three-dot loader beside the title. The loader stops when the record leaves `working`. A finished or failed record shows a small status mark until you open the tab, and a blocked record shows one until the program continues.
 
 ## Record lifetime
 
