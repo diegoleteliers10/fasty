@@ -2379,6 +2379,43 @@ pub fn palette_preview_kind(cmd_id: &str) -> Option<PalettePreviewKind> {
 /// `Working` or `Blocked` for `Idle`. Agents like OpenCode report `idle`
 /// after a turn instead of `done`, so the idle landing needs to count as
 /// attention or their completion never notifies.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ProgramCardAction<'a> {
+    Show(&'a ProgramRecord),
+    Remove,
+    Keep,
+}
+
+/// Decide what a program-status report does to the floating card.
+///
+/// `attention` holds the records that changed in this report. A finished or
+/// idle record only reports once: a later read of the same record keeps the
+/// existing card so its clock does not restart.
+fn program_card_action<'a>(
+    aggregate: Option<&'a ProgramRecord>,
+    attention: &'a [ProgramRecord],
+    enabled: bool,
+) -> ProgramCardAction<'a> {
+    if !enabled {
+        return ProgramCardAction::Remove;
+    }
+    // A transition is the event to report, even when another record outranks
+    // it: `idle` has the lowest priority, and a leftover `done` child would
+    // otherwise hide the completion of the parent run.
+    if let Some(changed) = crate::program_status::aggregate(attention) {
+        return ProgramCardAction::Show(changed);
+    }
+    match aggregate {
+        None => ProgramCardAction::Remove,
+        // Work in progress keeps updating its card with new progress.
+        Some(record) if matches!(record.state, ProgramState::Working | ProgramState::Blocked) => {
+            ProgramCardAction::Show(record)
+        }
+        // A finished record read again keeps its existing card and clock.
+        Some(_) => ProgramCardAction::Keep,
+    }
+}
+
 fn attention_transitions(
     previous: &[ProgramRecord],
     records: &[ProgramRecord],
@@ -3544,6 +3581,7 @@ impl RootView {
         // Scrollbar fade and cursor ticker (interval: 35ms for smooth 30-60fps fade out)
         cx.spawn_in(_window, async move |this, cx| {
             let mut blink_counter = 0u32;
+            let mut process_counter = 0u32;
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(35))
@@ -4132,7 +4170,7 @@ impl RootView {
                 cwd: t.cwd.clone(),
                 ai_tab_key: Some(t.ai_tab_key.clone()),
                 ai_conversation_id: Some(t.ai_conversation_id.clone()),
-                custom_name: None,
+                custom_name: t.custom_title.clone(),
                 title_override: Some(t.title.clone()),
                 pane_tree: Some(crate::session::PersistedPaneTree {
                     root: persist_pane_node(&t.pane_tree.root),
@@ -5971,6 +6009,10 @@ impl RootView {
         if idx >= self.tabs.len() {
             return;
         }
+        if idx != self.active_tab_idx {
+            self.project_commit_message.clear();
+            self.project_commit_focused = false;
+        }
         self.acknowledge_program_status(self.tabs[idx].pane_tree.active_pane_id);
         if idx == self.active_tab_idx {
             let id = self.tabs[idx].ai_conversation_id.clone();
@@ -7664,108 +7706,81 @@ impl RootView {
             && !self.is_tab_overview_open
     }
 
-    fn notify_ai_status(&mut self, window: &Window, title: &str, urgency: AiNotificationUrgency) {
-        if !self.config.notify_on_ai_status || self.ai_response_is_visible(window) {
+    fn push_notification(&mut self, card: InternalNotification, cx: &mut Context<Self>) {
+        if self.notifications.push(card) {
+            cx.notify();
+        }
+    }
+
+    /// Prune exit animations quickly instead of waiting for the one-second tick.
+    fn start_notification_exit_timer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.notification_exit_timer_active || !self.notifications.has_departing() {
             return;
         }
-        let now = std::time::Instant::now();
-        if urgency == AiNotificationUrgency::Routine
-            && self
-                .ai_last_notification
-                .is_some_and(|last| now.duration_since(last).as_secs() < 5)
+        self.notification_exit_timer_active = true;
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(
+                    crate::ui::notification_stack::EXIT_DURATION
+                        + std::time::Duration::from_millis(20),
+                )
+                .await;
+            let _ = this.update_in(cx, |this, _window, cx| {
+                this.notification_exit_timer_active = false;
+                this.notifications.prune_departed(std::time::Instant::now());
+                if this.notifications.is_empty() {
+                    this.notification_ticker_active = false;
+                }
+                cx.notify();
+            });
+            // If the view is gone the flag dies with it; nothing to reset.
+        })
+        .detach();
+    }
+
+    fn start_notification_ticker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.notification_ticker_active || self.notifications.is_empty() {
+            return;
+        }
+        // Only a countdown needs a per-second repaint. A waiting card would
+        // otherwise rebuild the whole window every second while it sits there.
+        if !self
+            .notifications
+            .cards()
+            .iter()
+            .any(|card| card.tone.expires())
         {
             return;
         }
-        let tab = self
-            .ai_event_source
-            .as_ref()
-            .and_then(|(id, _)| self.tabs.iter().find(|tab| tab.id == *id))
-            .or_else(|| self.tabs.get(self.active_tab_idx));
-        let Some(tab) = tab else { return };
-        let conversation_id = self
-            .ai_event_source
-            .as_ref()
-            .map(|(_, id)| id.as_str())
-            .unwrap_or(tab.ai_conversation_id.as_str());
-        let conversation_title = self
-            .ai_chat_records
-            .iter()
-            .find(|record| record.id == conversation_id)
-            .map(|record| record.title.as_str())
-            .unwrap_or("AI chat");
-        let body = format!(
-            "{} / {}: {}",
-            tab.custom_title.as_deref().unwrap_or(&tab.title),
-            conversation_title,
-            self.ai_turn_provider
-        );
-        self.ai_last_notification = Some(now);
-        let title = title.to_owned();
-        send_system_notification(&title, &body);
-    }
-
-    /// Watch a running command for a silence streak.
-    ///
-    /// The loop exits when the command ends, the pane closes, or one
-    /// notification was sent. A focused window never notifies, so active
-    /// work stays silent.
-    fn arm_silence_watcher(
-        &mut self,
-        pane_id: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(threshold) = self.config.notify_on_silence_seconds else {
-            return;
-        };
-        if threshold == 0 {
-            return;
-        }
-        let pane_has_terminal = self
-            .tabs
-            .iter()
-            .find_map(|tab| tab.pane_tree.find_pane(pane_id))
-            .is_some_and(|pane| pane.terminal.is_some());
-        if !pane_has_terminal {
-            return;
-        }
+        self.notification_ticker_active = true;
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(1))
                     .await;
-                let finished = this
-                    .update_in(cx, |this, window, _cx| {
-                        let Some(pane) = this
-                            .tabs
-                            .iter()
-                            .find_map(|tab| tab.pane_tree.find_pane(pane_id))
-                        else {
-                            return true;
-                        };
-                        let Some(terminal) = pane.terminal.as_ref() else {
-                            return true;
-                        };
-                        if !terminal.is_command_running() {
-                            return true;
-                        }
-                        if window.is_window_active() {
+                let keep_ticking = this
+                    .update_in(cx, |this, _window, cx| {
+                        let now = std::time::Instant::now();
+                        this.notifications.prune_departed(now);
+                        if !this.notifications.expire(now) {
+                            this.notification_ticker_active = false;
                             return false;
                         }
-                        match terminal.silence_seconds() {
-                            Some(seconds) if seconds >= threshold => {
-                                crate::notifications::send_system_notification(
-                                    "Fastty",
-                                    &format!("{} silent for {}s", pane.title, seconds),
-                                );
-                                true
-                            }
-                            _ => false,
+                        // Nothing left to count down: stop the 1 Hz repaint.
+                        if !this
+                            .notifications
+                            .cards()
+                            .iter()
+                            .any(|card| card.tone.expires() || card.is_departing())
+                        {
+                            this.notification_ticker_active = false;
+                            return false;
                         }
+                        cx.notify();
+                        true
                     })
-                    .ok()
-                    .unwrap_or(true);
-                if finished {
+                    .unwrap_or(false);
+                if !keep_ticking {
                     break;
                 }
             }
@@ -10231,6 +10246,7 @@ impl RootView {
             || self.pending_external_approval.is_some()
             || self.project_panel_confirmation.is_some()
             || self.ai_pending_confirmation.is_some()
+            || self.ai_pending_question.is_some()
             || self.is_rename_tab_open
             || self.palette.is_open()
             || self.is_ssh_manager_open
@@ -11190,7 +11206,7 @@ impl RootView {
                 cx.notify();
                 return;
             }
-            let filtered = self.filtered_palette_commands();
+            let filtered = self.ordered_palette_commands();
             let count = filtered.len();
 
             if key_lower == "enter" || key_lower == "return" {
@@ -14357,7 +14373,15 @@ impl RootView {
                                 cx.notify();
                             }),
                         )
-                        .child(div().h(px(1.)).w_full().bg(divider_line_color)),
+                        .child(
+                            div()
+                                .h(px(2.))
+                                .w(px(64.))
+                                .rounded(px(2.))
+                                .bg(divider_line_color)
+                                .opacity(divider_line_opacity)
+                                .group_hover(divider_group.clone(), |style| style.opacity(1.0)),
+                        ),
                 };
 
                 let mut path_first = path.clone();
@@ -15544,8 +15568,8 @@ impl Render for RootView {
                         )
                     })
                     .unwrap_or((false, false));
-                let menu_w: f32 = 220.0;
-                let menu_h: f32 = if has_selection { 456.0 } else { 390.0 };
+                let menu_w: f32 = 288.0;
+                let menu_h: f32 = if can_attach_to_ai_panel || can_zoom { 306.0 } else { 272.0 };
                 let vp = _window.viewport_size();
                 let vp_w = vp.width.to_f64() as f32;
                 let vp_h = vp.height.to_f64() as f32;
@@ -15585,17 +15609,18 @@ impl Render for RootView {
                         .absolute()
                         .top(px(popup_y))
                         .left(px(popup_x))
-                        .w(px(220.))
-                        .p(px(4.))
-                        .rounded(px(8.))
-                        .bg(menu_bg)
+                        .w(px(menu_w))
+                        .p(px(5.))
+                        .max_h(px((vp_h - 44.0).max(200.)))
+                        .overflow_y_scroll()
+                        .rounded(px(11.))
+                        .bg(theme.surface_raised)
                         .border_1()
                         .border_color(theme.border)
                         .shadow_xl()
                         .occlude()
                         .flex()
                         .flex_col()
-                        .gap_1()
                         .on_mouse_move(|_ev, _window, cx| {
                             cx.stop_propagation();
                         })
@@ -15816,7 +15841,6 @@ impl Render for RootView {
                                     this.close_tab(tab_id, window, cx);
                                 }
                             }),
-                            theme,
                         )),
                 )
             })
@@ -16132,7 +16156,8 @@ impl Render for RootView {
                         .flex()
                         .flex_col()
                         .items_center()
-                        .pt(px(60.))
+                        .px(px(16.))
+                        .pt(px(52.))
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                             // Backdrop click: close without committing the preview.
                             this.close_command_palette(_window, cx);
@@ -17524,7 +17549,7 @@ impl Render for RootView {
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "No working directory".to_string());
 
-                let menu_w: f32 = 300.0;
+                let menu_w: f32 = 220.0;
                 let menu_h: f32 = 340.0;
                 let vp = _window.viewport_size();
                 let vp_w = vp.width.to_f64() as f32;
@@ -18083,10 +18108,8 @@ impl Render for RootView {
                                     })
                                     .child(
                                         div()
-                                            .px(px(8.))
+                                            .px(px(7.))
                                             .py(px(4.))
-                                            .border_b_1()
-                                            .border_color(theme.border)
                                             .text_size(px(10.))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(theme.muted)
@@ -18176,7 +18199,7 @@ impl Render for RootView {
                                                         .into_any_element()
                                                 })
                                                 .collect()
-                                        }
+                                        },
                                     ),
                             )
                         }),
