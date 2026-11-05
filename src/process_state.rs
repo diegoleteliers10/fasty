@@ -67,7 +67,6 @@ impl ProcessTable {
             records: BTreeMap::new(),
         }
     }
-
     pub(crate) fn refresh(&mut self) {
         self.system
             .refresh_processes_specifics(ProcessesToUpdate::All, ProcessRefreshKind::new());
@@ -294,5 +293,168 @@ mod tests {
         let json = serde_json::to_string(&second).unwrap();
         assert!(!json.contains("argv"));
         assert!(!json.contains("command"));
+    }
+}
+
+/// Name of the newest direct child of each shell. The UI reads this on every
+/// paint, so a background thread keeps the table warm and the render path only
+/// takes the lock for a map lookup.
+///
+/// A full process scan costs milliseconds, so it runs once a second. A shell
+/// that reports a command start or end calls
+/// [`request_foreground_child_name_refresh`] to get the new name at once.
+pub fn foreground_child_name(shell_pid: u32) -> Option<String> {
+    static SNAPSHOT: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u32, String>>,
+    > = std::sync::OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let snapshot: &'static std::sync::Mutex<std::collections::HashMap<u32, String>> =
+        SNAPSHOT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    STARTED.call_once(|| {
+        std::thread::Builder::new()
+            .name("fastty-process-names".into())
+            .spawn(move || {
+                let mut system = System::new();
+                let mut last_refresh: Option<std::time::Instant> = None;
+                loop {
+                    let demanded = REFRESH_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed);
+                    let due = last_refresh.is_none_or(|last: std::time::Instant| {
+                        last.elapsed() >= std::time::Duration::from_secs(1)
+                    });
+                    if demanded {
+                        // The shell has just started a command: the child may
+                        // not exist yet, so read once now and once more after
+                        // it has had time to exec.
+                        publish_foreground_child_names(&mut system, snapshot);
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        publish_foreground_child_names(&mut system, snapshot);
+                        last_refresh = Some(std::time::Instant::now());
+                        continue;
+                    }
+                    if due {
+                        publish_foreground_child_names(&mut system, snapshot);
+                        last_refresh = Some(std::time::Instant::now());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            })
+            .map(|_| ())
+            .unwrap_or_else(|error| {
+                eprintln!("Fastty process-name sampler did not start: {error}");
+            });
+    });
+    snapshot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&shell_pid)
+        .cloned()
+}
+
+/// Ask the sampler to read the child names now instead of at its next pass.
+pub fn request_foreground_child_name_refresh() {
+    REFRESH_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+static REFRESH_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A running process seen as a possible child of another one.
+struct ChildProcess {
+    parent_pid: u32,
+    pid: u32,
+    start_time_secs: u64,
+    name: String,
+}
+
+/// The newest direct child of each parent, by start time and then by pid. A
+/// newer pid reads as the more recent process when both start in the same
+/// second, which a pipeline often does.
+fn newest_child_per_parent(
+    children: Vec<ChildProcess>,
+) -> std::collections::HashMap<u32, String> {
+    let mut newest: std::collections::HashMap<u32, ChildProcess> =
+        std::collections::HashMap::new();
+    for child in children {
+        if child.name.is_empty() {
+            continue;
+        }
+        let replaces = newest.get(&child.parent_pid).is_none_or(|current| {
+            (child.start_time_secs, child.pid) > (current.start_time_secs, current.pid)
+        });
+        if replaces {
+            newest.insert(child.parent_pid, child);
+        }
+    }
+    newest
+        .into_iter()
+        .map(|(parent, child)| (parent, child.name))
+        .collect()
+}
+
+fn publish_foreground_child_names(
+    system: &mut System,
+    snapshot: &std::sync::Mutex<std::collections::HashMap<u32, String>>,
+) {
+    system.refresh_processes_specifics(ProcessesToUpdate::All, ProcessRefreshKind::new());
+    let children: Vec<ChildProcess> = system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            let parent = process.parent()?;
+            Some(ChildProcess {
+                parent_pid: parent.as_u32(),
+                pid: pid.as_u32(),
+                start_time_secs: process.start_time(),
+                name: process.name().to_string_lossy().into_owned(),
+            })
+        })
+        .collect();
+    let names = newest_child_per_parent(children);
+    // Swap the finished map in under the lock, so a paint never waits for a
+    // rebuild.
+    *snapshot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = names;
+}
+
+#[cfg(test)]
+mod child_name_tests {
+    use super::{newest_child_per_parent, ChildProcess};
+    use std::collections::HashMap;
+
+    fn child(parent_pid: u32, pid: u32, start_time_secs: u64, name: &str) -> ChildProcess {
+        ChildProcess {
+            parent_pid,
+            pid,
+            start_time_secs,
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_newest_child_of_each_parent_wins() {
+        let names = newest_child_per_parent(vec![
+            child(10, 20, 100, "zsh"),
+            child(10, 21, 200, "cargo"),
+            child(30, 40, 150, "nvim"),
+        ]);
+        assert_eq!(names.get(&10).map(String::as_str), Some("cargo"));
+        assert_eq!(names.get(&30).map(String::as_str), Some("nvim"));
+    }
+
+    #[test]
+    fn a_newer_pid_breaks_a_start_time_tie() {
+        let names = newest_child_per_parent(vec![
+            child(10, 22, 100, "second"),
+            child(10, 21, 100, "first"),
+        ]);
+        assert_eq!(names.get(&10).map(String::as_str), Some("second"));
+    }
+
+    #[test]
+    fn a_nameless_child_is_skipped() {
+        let names = newest_child_per_parent(vec![
+            child(10, 20, 100, "zsh"),
+            child(10, 21, 200, ""),
+            child(30, 40, 100, ""),
+        ]);
+        assert_eq!(names, HashMap::from([(10u32, "zsh".to_string())]));
     }
 }

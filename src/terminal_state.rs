@@ -561,6 +561,9 @@ pub struct TerminalState {
     kitty: Arc<ParkingMutex<crate::kitty_keyboard::KittyKeyboard>>,
     /// True between `OSC 133` command-start and command-end markers.
     command_running: Arc<std::sync::atomic::AtomicBool>,
+    /// True once the shell emitted any `OSC 133` marker, so a prompt without a
+    /// command is known to be a prompt and not a program that never reports.
+    shell_integration_seen: Arc<std::sync::atomic::AtomicBool>,
     pub total_lines_pushed: Arc<AtomicU64>,
     pub prompt_lines: Arc<ParkingMutex<Vec<u64>>>,
     pub image_store: Arc<ParkingMutex<ImageStore>>,
@@ -1439,6 +1442,8 @@ impl TerminalState {
         let last_output_ms_clone = Arc::clone(&last_output_ms);
         let command_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let command_running_clone = Arc::clone(&command_running);
+        let shell_integration_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shell_integration_seen_clone = Arc::clone(&shell_integration_seen);
         let kitty = Arc::new(ParkingMutex::new(
             crate::kitty_keyboard::KittyKeyboard::default(),
         ));
@@ -1499,7 +1504,6 @@ impl TerminalState {
                             let _ = writer.flush();
                         }
                         OscCommand::ProgramStatus(command) => {
-                            eprintln!("Fastty program status OSC parsed: {command:?}");
                             update_program_status(
                                 &program_status_clone,
                                 &program_status_pending_clone,
@@ -1514,6 +1518,7 @@ impl TerminalState {
                                 .send_app_event(AppEvent::ProgressChanged(report));
                         }
                         OscCommand::PromptStarted => {
+                            shell_integration_seen_clone.store(true, Ordering::Relaxed);
                             update_program_status(
                                 &program_status_clone,
                                 &program_status_pending_clone,
@@ -1687,6 +1692,7 @@ impl TerminalState {
                         }
                         OscCommand::CommandStarted => {
                             command_running_clone.store(true, Ordering::Relaxed);
+                            shell_integration_seen_clone.store(true, Ordering::Relaxed);
                             dispatch_osc_action(
                                 &cmd,
                                 &event_listener_clone,
@@ -1697,6 +1703,7 @@ impl TerminalState {
                         }
                         OscCommand::CommandFinished { .. } => {
                             command_running_clone.store(false, Ordering::Relaxed);
+                            shell_integration_seen_clone.store(true, Ordering::Relaxed);
                             dispatch_osc_action(
                                 &cmd,
                                 &event_listener_clone,
@@ -2224,6 +2231,7 @@ impl TerminalState {
             progress,
             last_output_ms,
             command_running,
+            shell_integration_seen,
             kitty,
             total_lines_pushed,
             prompt_lines,
@@ -2513,25 +2521,52 @@ impl TerminalState {
         if self.remote_session_id.is_some() {
             return (None, None);
         }
+        (self.shell_pid, self.foreground_process_group())
+    }
+
+    /// The process group that owns the terminal right now, or `None` when the
+    /// terminal runs in a session host, which owns the real PTY. One cheap
+    /// call per pane.
+    pub fn foreground_process_group(&self) -> Option<u32> {
+        if self.remote_session_id.is_some() {
+            return None;
+        }
         #[cfg(unix)]
-        let foreground = self.master.lock().as_raw_fd().and_then(|fd| {
+        {
+            let master = self.master.lock();
+            let fd = master.as_raw_fd()?;
             let group = unsafe { libc::tcgetpgrp(fd) };
             (group > 0).then_some(group as u32)
-        });
+        }
         #[cfg(not(unix))]
-        let foreground = None;
-        (self.shell_pid, foreground)
+        {
+            None
+        }
     }
 
     pub fn get_foreground_process_name(&self) -> Option<String> {
-        let _shell_pid = self.shell_pid?;
         #[cfg(unix)]
-        let pid = {
-            let master = self.master.lock();
-            let fd = master.as_raw_fd()?;
-            let pid = unsafe { libc::tcgetpgrp(fd) };
-            (pid > 0).then_some(pid as u32)?
-        };
+        if let Some(name) = self.local_foreground_process_name() {
+            return Some(name);
+        }
+        // A hosted pane has no local PTY: ask the process table for the newest
+        // child of the shell instead.
+        let shell_pid = self
+            .shell_pid
+            .or(self.remote_shell_pid.filter(|_| self.is_alive()))?;
+        // An integrated shell at its prompt reports no command, so a
+        // background job must not hold the tab mark. A pane that never
+        // reports markers is running a program directly: keep its name.
+        if self.shell_integration_seen.load(Ordering::Relaxed) && !self.is_command_running() {
+            return None;
+        }
+        crate::process_state::foreground_child_name(shell_pid)
+    }
+
+    #[cfg(unix)]
+    fn local_foreground_process_name(&self) -> Option<String> {
+        self.shell_pid?;
+        let pid = self.foreground_process_group()?;
         #[cfg(target_os = "macos")]
         {
             get_process_name_macos(pid)
@@ -2545,7 +2580,7 @@ impl TerminalState {
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            get_foreground_process_name_other(_shell_pid)
+            get_foreground_process_name_other(pid)
         }
     }
 
@@ -3127,7 +3162,7 @@ impl TerminalState {
                     line_str.push(c);
                 }
             }
-            if line_str.to_lowercase().contains(&query_lower) {
+            if matcher(&line_str) {
                 let offset = if line_i < 0 { (-line_i) as usize } else { 0 };
                 matches.push(offset);
             }
@@ -3165,9 +3200,9 @@ impl TerminalState {
                 continue;
             }
             let trimmed_lower = trimmed.to_lowercase();
-            let is_match = if trimmed_lower.contains(&query_lower) {
+            let is_match = if matcher(trimmed) {
                 true
-            } else if query_lower.len() >= 3 {
+            } else if fuzzy_allowed && query_lower.len() >= 3 {
                 let mut p_idx = 0;
                 let q_chars: Vec<char> = query_lower.chars().collect();
                 for ch in trimmed_lower.chars() {
@@ -3193,6 +3228,26 @@ impl TerminalState {
             }
         }
         snippets
+    }
+
+    /// Lines in the scrollback plus screen that contain visible text.
+    pub fn non_empty_line_count(&self) -> usize {
+        use alacritty_terminal::index::Line;
+        let term = self.term.lock();
+        let grid = term.grid();
+        let history = grid.history_size();
+        let screen_lines = grid.screen_lines();
+        let mut count = 0usize;
+        for line_i in -(history as i32)..(screen_lines as i32) {
+            let row = &grid[Line(line_i)];
+            let has_text = row
+                .into_iter()
+                .any(|cell| cell.c != '\0' && !cell.c.is_whitespace());
+            if has_text {
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Rows the terminal shows. A preview cannot have more lines than this, so a
@@ -4768,7 +4823,7 @@ fn get_process_cwd(_pid: u32) -> Option<std::path::PathBuf> {
     None
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn get_foreground_process_name_other(_shell_pid: u32) -> Option<String> {
     None
 }

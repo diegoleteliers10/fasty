@@ -3723,6 +3723,7 @@ impl RootView {
             host_attach_retry_generation: 0,
             host_missing_sessions: std::collections::HashSet::new(),
             close_check_generation: 0,
+            foreground_names: std::collections::HashMap::new(),
             theme,
             tabs: Vec::new(),
             active_tab_idx: 0,
@@ -4577,12 +4578,22 @@ impl RootView {
                         if let Some(cwd) = cwd_to_poll {
                             this.request_git_status_refresh(cwd, cx);
                         }
+                        this.notify_command_finished(pane_id, duration_ms, exit_code, _window, cx);
+                        // The shell owns the terminal again, so the mark goes
+                        // back to the shell without waiting for the prompt.
+                        crate::process_state::request_foreground_child_name_refresh();
                     }
                     AppEvent::CommandStarted => {
                         this.arm_silence_watcher(pane_id, _window, cx);
+                        // The tab mark follows the new foreground command.
+                        crate::process_state::request_foreground_child_name_refresh();
                         cx.notify();
                     }
                     AppEvent::PromptStarted { .. } => {
+                        // The prompt ends the working and blocked records. Read
+                        // them again so a stale card clears with the prompt.
+                        this.refresh_program_status(terminal_source_id, _window, cx);
+                        crate::process_state::request_foreground_child_name_refresh();
                         cx.notify();
                     }
                     AppEvent::ProgramStatusChanged { source_id } => {
@@ -5705,9 +5716,15 @@ impl RootView {
                         if let Some(watcher_pane) = watcher_pane {
                             this.arm_silence_watcher(watcher_pane, _window, cx);
                         }
+                        // The tab mark follows the new foreground command.
+                        crate::process_state::request_foreground_child_name_refresh();
                         cx.notify();
                     }
                     AppEvent::PromptStarted { .. } => {
+                        // The prompt ends the working and blocked records. Read
+                        // them again so a stale card clears with the prompt.
+                        this.refresh_program_status(source_id, _window, cx);
+                        crate::process_state::request_foreground_child_name_refresh();
                         cx.notify();
                     }
                     AppEvent::ProgramStatusChanged { source_id } => {
@@ -18179,14 +18196,22 @@ impl Render for RootView {
                                                                         .flex_1()
                                                                         .overflow_hidden()
                                                                         .text_ellipsis()
-                                                                        .text_size(px(12.))
-                                                                        .font_weight(if is_current { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                                                                        .text_color(if is_current { theme.green } else { theme.foreground })
-                                                                        .child(SharedString::from(target_branch)),
+                                                                        .text_size(px(11.5))
+                                                                        .font_weight(if is_current {
+                                                                            FontWeight::BOLD
+                                                                        } else {
+                                                                            FontWeight::MEDIUM
+                                                                        })
+                                                                        .text_color(if is_current {
+                                                                            theme.green
+                                                                        } else {
+                                                                            theme.foreground
+                                                                        })
+                                                                        .child(SharedString::from(branch)),
                                                                 ),
                                                         )
-                                                        .when(is_current, |el| {
-                                                            el.child(
+                                                        .when(is_current, |row| {
+                                                            row.child(
                                                                 div()
                                                                     .flex_shrink_0()
                                                                     .pl(px(4.))
@@ -19620,6 +19645,35 @@ impl Render for RootView {
                         ),
                 )
             })
+            .when(!notification_cards.is_empty(), |root| {
+                let viewport_w = _window.viewport_size().width.to_f64() as f32;
+                root.child(
+                    gpui::deferred(
+                        div()
+                            .id("notification-overlay")
+                            .absolute()
+                            .bottom(px(28.))
+                            .right(px(14.))
+                            .child(
+                                NotificationStack::new(
+                                    notification_cards.clone(),
+                                    theme,
+                                    std::time::Instant::now(),
+                                    viewport_w - 32.0,
+                                )
+                                .on_action(cx.listener(
+                                    |this,
+                                     &(ref key, action): &(String, NotificationAction),
+                                     window,
+                                     cx| {
+                                        this.handle_notification_action(key, action, window, cx);
+                                    },
+                                )),
+                            ),
+                    )
+                    .with_priority(1200),
+                )
+            })
     }
 }
 
@@ -20339,6 +20393,14 @@ mod tests {
     }
 
     #[test]
+    fn shell_quote_neutralizes_repository_branch_names() {
+        assert_eq!(shell_quote("main"), "'main'");
+        assert_eq!(shell_quote("feat/x"), "'feat/x'");
+        assert_eq!(shell_quote("$(rm -rf /)"), "'$(rm -rf /)'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
     fn working_to_idle_counts_as_attention() {
         let previous = vec![record("", ProgramState::Working)];
         let records = vec![record("", ProgramState::Idle)];
@@ -20347,6 +20409,64 @@ mod tests {
 
         assert_eq!(attention.len(), 1);
         assert_eq!(attention[0].state, ProgramState::Idle);
+    }
+
+    #[test]
+    fn a_finished_card_reports_once_and_then_keeps_its_clock() {
+        let done = record("", ProgramState::Done);
+        let attention = vec![done.clone()];
+
+        assert_eq!(
+            program_card_action(Some(&done), &attention, true),
+            ProgramCardAction::Show(&done)
+        );
+        // The next report reads the same record: keep the card alive.
+        assert_eq!(
+            program_card_action(Some(&done), &[], true),
+            ProgramCardAction::Keep
+        );
+    }
+
+    #[test]
+    fn working_to_idle_reports_a_completion_card() {
+        let idle = record("", ProgramState::Idle);
+        let attention = vec![idle.clone()];
+
+        assert_eq!(
+            program_card_action(Some(&idle), &attention, true),
+            ProgramCardAction::Show(&idle)
+        );
+        // A later idle read does not restart the countdown.
+        assert_eq!(
+            program_card_action(Some(&idle), &[], true),
+            ProgramCardAction::Keep
+        );
+    }
+
+    #[test]
+    fn a_child_result_does_not_hide_the_parent_completion() {
+        let child = record("build", ProgramState::Done);
+        let idle = record("", ProgramState::Idle);
+        let attention = vec![idle.clone()];
+
+        assert_eq!(
+            program_card_action(Some(&child), &attention, true),
+            ProgramCardAction::Show(&idle)
+        );
+    }
+
+    #[test]
+    fn a_cleared_pane_removes_its_card_and_a_disabled_setting_never_shows_one() {
+        let working = record("", ProgramState::Working);
+        assert_eq!(program_card_action(None, &[], true), ProgramCardAction::Remove);
+        assert_eq!(
+            program_card_action(Some(&working), &[], false),
+            ProgramCardAction::Remove
+        );
+        assert_eq!(
+            program_card_action(Some(&working), &[], true),
+            ProgramCardAction::Show(&working)
+        );
     }
 
     #[test]
