@@ -95,6 +95,8 @@ pub enum ProjectGitAction {
     ViewStash,
     DiscardTrackedChanges,
     TrashUntrackedFiles,
+    /// Commit the staged changes with this message.
+    Commit(String),
 }
 
 impl ProjectGitAction {
@@ -127,6 +129,7 @@ impl ProjectGitAction {
             Self::StashTracked => "Stash Tracked",
             Self::StashPop => "Stash Pop",
             Self::ViewStash => "View Stash",
+            Self::Commit(_) => "Commit",
             Self::DiscardTrackedChanges => "Discard Tracked Changes",
             Self::TrashUntrackedFiles => "Trash Untracked Files",
         }
@@ -172,6 +175,9 @@ pub fn run_project_git_action(cwd: &Path, action: &ProjectGitAction) -> Result<S
         Action::StashTracked => { command.args(["stash", "push", "-m", "Fastty project panel", "--", "."]); }
         Action::StashPop => { command.args(["stash", "pop"]); }
         Action::ViewStash => { command.args(["stash", "list", "--max-count=20", "--format=%gd %s (%cr)"]); }
+        Action::Commit(message) => {
+            command.args(["commit", "-m"]).arg(message);
+        }
         Action::DiscardTrackedChanges => { command.args(["restore", "--worktree", "--", "."]); }
         Action::TrashUntrackedFiles => return Err("OS Trash handling did not run".to_string()),
     }
@@ -345,6 +351,17 @@ pub fn list_worktrees(cwd: &Path) -> Vec<Worktree> {
         Some(s) => parse_worktree_list(&s),
         None => Vec::new(),
     }
+}
+
+/// Number of changed entries in a worktree, used by the worktree picker.
+/// `None` means the directory is missing or is not a repository.
+pub fn worktree_change_count(path: &Path) -> Option<usize> {
+    let repo = git2::Repository::open(path).ok()?;
+    let mut options = git2::StatusOptions::new();
+    options.include_untracked(true).recurse_untracked_dirs(false);
+    repo.statuses(Some(&mut options))
+        .ok()
+        .map(|statuses| statuses.len())
 }
 
 pub fn list_local_branches(cwd: &Path) -> Vec<String> {
@@ -1062,6 +1079,25 @@ mod tests {
         let tree = repo.find_tree(tree_id).unwrap();
         let signature = git2::Signature::now("Fastty Test", "fastty@example.test").unwrap();
         repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &[]).unwrap();
+    }
+
+    #[test]
+    fn worktree_change_count_reports_clean_and_dirty() {
+        let (path, repo) = temporary_repo("worktree-count");
+        commit_file(&repo, "a.txt", "one\n", "initial");
+        assert_eq!(worktree_change_count(&path), Some(0));
+
+        std::fs::write(path.join("a.txt"), "two\n").unwrap();
+        assert_eq!(worktree_change_count(&path), Some(1));
+
+        std::fs::write(path.join("b.txt"), "new\n").unwrap();
+        assert_eq!(worktree_change_count(&path), Some(2));
+
+        assert_eq!(
+            worktree_change_count(&path.join("missing")),
+            None
+        );
+        std::fs::remove_dir_all(&path).ok();
     }
 
     #[test]

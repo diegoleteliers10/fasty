@@ -1,7 +1,7 @@
 use crate::git::{GitCommit, GitFileChange, GitFileSide, GitFileStatus, GitPanelAvailability, GitPanelSnapshot, ProjectGitAction};
 use gpui::{
-    div, prelude::*, px, App, CursorStyle, FontWeight, IntoElement, MouseButton, MouseDownEvent,
-    RenderOnce, ScrollHandle, ScrollWheelEvent, SharedString, Window,
+    div, prelude::*, px, App, CursorStyle, FontWeight, HighlightStyle, IntoElement, MouseButton,
+    MouseDownEvent, RenderOnce, ScrollHandle, ScrollWheelEvent, SharedString, StyledText, Window,
 };
 use std::ops::Range;
 
@@ -48,6 +48,14 @@ pub struct ProjectSidebar {
     graph_rendered_range: std::rc::Rc<std::cell::Cell<(usize, usize)>>,
     graph_layout: Option<std::sync::Arc<GraphLayout>>,
     on_load_more: Option<LoadMoreCallback>,
+    branch: Option<String>,
+    ahead: usize,
+    behind: usize,
+    upstream: Option<String>,
+    commit_message: String,
+    commit_focused: bool,
+    commit_scroll_handle: ScrollHandle,
+    on_focus_commit: Option<SimpleCallback>,
 }
 
 impl ProjectSidebar {
@@ -57,7 +65,7 @@ impl ProjectSidebar {
         snapshot: GitPanelSnapshot,
         active_tab: ProjectPanelTab,
     ) -> Self {
-        Self { theme, width, snapshot, active_tab, on_close: None, on_select_changes: None, on_select_graph: None, menu_open: false, pending_confirmation: None, feedback: None, on_action: None, on_confirm_action: None, on_toggle_menu: None, on_cancel_confirmation: None, graph_scroll_handle: ScrollHandle::new(), graph_rendered_range: std::rc::Rc::new(std::cell::Cell::new((0, 0))), graph_layout: None, on_load_more: None }
+        Self { theme, width, snapshot, active_tab, on_close: None, on_select_changes: None, on_select_graph: None, menu_open: false, pending_confirmation: None, feedback: None, on_action: None, on_confirm_action: None, on_toggle_menu: None, on_cancel_confirmation: None, graph_scroll_handle: ScrollHandle::new(), graph_rendered_range: std::rc::Rc::new(std::cell::Cell::new((0, 0))), graph_layout: None, on_load_more: None, branch: None, ahead: 0, behind: 0, upstream: None, commit_message: String::new(), commit_focused: false, commit_scroll_handle: ScrollHandle::new(), on_focus_commit: None }
     }
 
     pub fn on_close(
@@ -116,6 +124,34 @@ impl ProjectSidebar {
         self
     }
 
+    pub fn branch_summary(
+        mut self,
+        branch: Option<String>,
+        ahead: usize,
+        behind: usize,
+        upstream: Option<String>,
+    ) -> Self {
+        self.branch = branch;
+        self.ahead = ahead;
+        self.behind = behind;
+        self.upstream = upstream;
+        self
+    }
+
+    pub fn commit_input(
+        mut self,
+        message: String,
+        focused: bool,
+        scroll_handle: ScrollHandle,
+        on_focus: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.commit_message = message;
+        self.commit_focused = focused;
+        self.commit_scroll_handle = scroll_handle;
+        self.on_focus_commit = Some(std::sync::Arc::new(on_focus));
+        self
+    }
+
     pub fn graph_layout(mut self, layout: std::sync::Arc<GraphLayout>) -> Self {
         self.graph_layout = Some(layout);
         self
@@ -140,6 +176,20 @@ impl RenderOnce for ProjectSidebar {
         let graph_rendered_range = self.graph_rendered_range;
         let graph_layout = self.graph_layout;
         let load_more_callback = self.on_load_more;
+        let branch = self.branch;
+        let ahead = self.ahead;
+        let behind = self.behind;
+        let upstream = self.upstream;
+        let commit_message = self.commit_message;
+        let commit_focused = self.commit_focused;
+        let commit_scroll_handle = self.commit_scroll_handle.clone();
+        let on_focus_commit = self.on_focus_commit;
+        let changes_count = snapshot
+            .changes
+            .iter()
+            .map(|change| change.index.is_some() as usize + change.worktree.is_some() as usize)
+            .sum::<usize>();
+        let graph_count = snapshot.commits.len();
 
         div()
             .id("project-context-sidebar")
@@ -155,39 +205,133 @@ impl RenderOnce for ProjectSidebar {
             .child(
                 div()
                     .flex()
+                    .flex_row()
                     .items_center()
                     .justify_between()
-                    .h(px(42.))
-                    .px(px(14.))
+                    .w_full()
+                    .px(px(10.))
+                    .pt(px(10.))
+                    .pb(px(6.))
                     .child(
                         div()
                             .flex()
+                            .flex_row()
                             .items_center()
-                            .gap(px(14.))
-                            .child(tab_button(theme, "Changes", ProjectPanelTab::Changes, self.active_tab, changes_callback.as_ref()))
-                            .child(tab_button(theme, "Graph", ProjectPanelTab::Graph, self.active_tab, graph_callback.as_ref())),
+                            .gap(px(2.))
+                            .p(px(2.))
+                            .rounded(px(8.))
+                            .bg(theme.surface)
+                            .child(tab_button(
+                                theme,
+                                "Changes",
+                                changes_count,
+                                ProjectPanelTab::Changes,
+                                self.active_tab,
+                                changes_callback.as_ref(),
+                            ))
+                            .child(tab_button(
+                                theme,
+                                "Graph",
+                                graph_count,
+                                ProjectPanelTab::Graph,
+                                self.active_tab,
+                                graph_callback.as_ref(),
+                            )),
                     )
                     .child(
                         div()
-                            .id("project-context-close")
                             .flex()
+                            .flex_row()
                             .items_center()
-                            .justify_center()
-                            .w(px(24.))
-                            .h(px(24.))
-                            .rounded(px(4.))
-                            .hover(|style| style.bg(theme.hover))
-                            .cursor(CursorStyle::PointingHand)
-                            .when_some(close, |button, on_close| {
-                                button.on_mouse_down(MouseButton::Left, move |event, window, cx| {
-                                    on_close(event, window, cx);
-                                })
+                            .gap(px(2.))
+                            .when(self.active_tab == ProjectPanelTab::Changes, |actions| {
+                                actions.child(simple_button(theme, "···", toggle_menu_callback.as_ref()))
                             })
-                            .child(icons::render_icon(IconType::X, theme.muted_strong, 12.0)),
+                            .child(
+                                div()
+                                    .id("project-context-close")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(22.))
+                                    .h(px(22.))
+                                    .rounded(px(4.))
+                                    .hover(|style| style.bg(theme.hover))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .when_some(close, |button, on_close| {
+                                        button.on_mouse_down(
+                                            MouseButton::Left,
+                                            move |event, window, cx| {
+                                                on_close(event, window, cx);
+                                            },
+                                        )
+                                    })
+                                    .child(icons::render_icon(IconType::X, theme.muted_strong, 12.0)),
+                            ),
                     ),
             )
+            .when_some(branch, |panel, branch| {
+                panel.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(5.))
+                        .px(px(14.))
+                        .pb(px(8.))
+                        .min_w(px(0.))
+                        .child(icons::render_icon(IconType::GitBranch, theme.green, 12.0))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.foreground)
+                                .child(SharedString::from(branch)),
+                        )
+                        .when(upstream.is_some(), |row| {
+                            row.child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted)
+                                    .child(SharedString::from(format!("↑{ahead}"))),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted)
+                                    .child(SharedString::from(format!("↓{behind}"))),
+                            )
+                        })
+                        .when_some(upstream, |row, upstream| {
+                            row.child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted)
+                                    .child("·"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted)
+                                    .child(SharedString::from(upstream)),
+                            )
+                        }),
+                )
+            })
             .when(self.active_tab == ProjectPanelTab::Changes, |panel| {
-                panel.child(render_changes(theme, &snapshot, feedback, action_callback.as_ref(), toggle_menu_callback.as_ref()))
+                panel.child(render_changes(
+                    theme,
+                    &snapshot,
+                    feedback,
+                    action_callback.as_ref(),
+                    &commit_message,
+                    commit_focused,
+                    &commit_scroll_handle,
+                    on_focus_commit.as_ref(),
+                ))
             })
             .when(self.active_tab == ProjectPanelTab::Graph, |panel| {
                 panel.child(render_graph(theme, &snapshot, graph_scroll_handle.clone(), graph_rendered_range.clone(), graph_layout.as_deref(), load_more_callback.as_ref()))
@@ -205,21 +349,39 @@ impl RenderOnce for ProjectSidebar {
 fn tab_button(
     theme: Theme,
     label: &'static str,
+    count: usize,
     tab: ProjectPanelTab,
     active: ProjectPanelTab,
     callback: Option<&TabCallback>,
 ) -> impl IntoElement {
     let is_active = active == tab;
     div()
-        .id(match tab { ProjectPanelTab::Changes => "project-panel-changes-tab", ProjectPanelTab::Graph => "project-panel-graph-tab" })
+        .id(match tab {
+            ProjectPanelTab::Changes => "project-panel-changes-tab",
+            ProjectPanelTab::Graph => "project-panel-graph-tab",
+        })
         .flex()
+        .flex_row()
         .items_center()
-        .h_full()
-        .border_b_2()
-        .border_color(if is_active { theme.accent } else { theme.sidebar_bg })
+        .gap(px(6.))
+        .px(px(10.))
+        .py(px(4.))
+        .rounded(px(6.))
+        .when(is_active, |button| button.bg(theme.selected))
+        .when(!is_active, |button| {
+            button.hover(move |style| style.bg(theme.hover))
+        })
         .text_size(px(12.))
-        .font_weight(if is_active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
-        .text_color(if is_active { theme.foreground } else { theme.muted_strong })
+        .font_weight(if is_active {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::MEDIUM
+        })
+        .text_color(if is_active {
+            theme.foreground
+        } else {
+            theme.muted_strong
+        })
         .cursor(CursorStyle::PointingHand)
         .when_some(callback.map(std::sync::Arc::clone), |button, callback| {
             button.on_mouse_down(MouseButton::Left, move |event, window, cx| {
@@ -227,6 +389,16 @@ fn tab_button(
             })
         })
         .child(label)
+        .child(
+            div()
+                .text_size(px(10.5))
+                .text_color(if is_active {
+                    theme.muted_strong
+                } else {
+                    theme.muted
+                })
+                .child(SharedString::from(count.to_string())),
+        )
 }
 
 fn render_changes(
@@ -234,44 +406,312 @@ fn render_changes(
     snapshot: &GitPanelSnapshot,
     feedback: Option<String>,
     action_callback: Option<&ActionCallback>,
-    toggle_menu_callback: Option<&SimpleCallback>,
+    commit_message: &str,
+    commit_focused: bool,
+    commit_scroll_handle: &ScrollHandle,
+    on_focus_commit: Option<&SimpleCallback>,
 ) -> impl IntoElement {
-    let mut content = div().id("project-panel-changes-content").flex().flex_col().flex_1().overflow_y_scroll().w_full().px(px(12.)).pt(px(12.)).gap(px(12.));
-    content = content.child(
-        div().flex().items_center().justify_between()
-            .child(action_button(theme, "Stage All", ProjectGitAction::StageAll, action_callback, true))
-                .child(simple_button(theme, "···", toggle_menu_callback)),
-    );
-    if let Some(feedback) = feedback {
-        content = content.child(div().text_size(px(10.)).text_color(theme.muted_strong).child(SharedString::from(feedback)));
+    let mut content = div()
+        .id("project-panel-changes-content")
+        .flex()
+        .flex_col()
+        .flex_1()
+        .overflow_y_scroll()
+        .w_full()
+        .px(px(14.))
+        .pb(px(16.))
+        .gap(px(12.));
+
+    let staged: Vec<_> = snapshot
+        .changes
+        .iter()
+        .filter_map(|item| item.index.as_ref().map(|side| (item, side)))
+        .collect();
+    let changes: Vec<_> = snapshot
+        .changes
+        .iter()
+        .filter_map(|item| {
+            item.worktree
+                .as_ref()
+                .filter(|side| side.status != GitFileStatus::Untracked)
+                .map(|side| (item, side))
+        })
+        .collect();
+    let untracked: Vec<_> = snapshot
+        .changes
+        .iter()
+        .filter_map(|item| {
+            item.worktree
+                .as_ref()
+                .filter(|side| side.status == GitFileStatus::Untracked)
+                .map(|side| (item, side))
+        })
+        .collect();
+
+    // Show the commit card while the tree has changes, or while a draft exists.
+    if !snapshot.changes.is_empty() || !commit_message.is_empty() {
+        let can_commit = !commit_message.trim().is_empty() && !staged.is_empty();
+        let staged_files = staged.len();
+        let commit_action = ProjectGitAction::Commit(commit_message.trim().to_string());
+        content = content.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .p(px(10.))
+                .rounded(px(10.))
+                .bg(theme.surface_raised)
+                .border_1()
+                .border_color(theme.border)
+                .cursor(CursorStyle::IBeam)
+                .when_some(on_focus_commit.cloned(), |card, on_focus| {
+                    card.on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                        on_focus(event, window, cx);
+                    })
+                })
+                .child(
+                    div()
+                        .id("project-commit-scroll")
+                        .w_full()
+                        .h(px(72.))
+                        .overflow_y_scroll()
+                        .track_scroll(commit_scroll_handle)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_end()
+                                .w_full()
+                                .text_size(px(12.5))
+                                .line_height(px(17.))
+                                .child(if commit_message.is_empty() {
+                                    div()
+                                        .text_color(theme.muted)
+                                        .child("Commit message")
+                                        .into_any_element()
+                                } else {
+                                    // The caret is a text run, so it stays after the
+                                    // last character when the draft wraps.
+                                    let mut draft = commit_message.to_string();
+                                    let mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> =
+                                        Vec::new();
+                                    if commit_focused {
+                                        let start = draft.len();
+                                        draft.push('|');
+                                        highlights.push((
+                                            start..draft.len(),
+                                            HighlightStyle {
+                                                color: Some(theme.accent),
+                                                ..Default::default()
+                                            },
+                                        ));
+                                    }
+                                    div()
+                                        .min_w(px(0.))
+                                        .flex_shrink(1.)
+                                        .text_color(theme.foreground)
+                                        .child(
+                                            StyledText::new(draft).with_highlights(highlights),
+                                        )
+                                        .into_any_element()
+                                })
+                                .when(commit_focused && commit_message.is_empty(), |row| {
+                                    row.child(
+                                        div()
+                                            .mb(px(1.))
+                                            .w(px(2.))
+                                            .h(px(15.))
+                                            .rounded(px(1.))
+                                            .bg(theme.accent)
+                                            .flex_shrink_0(),
+                                    )
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(theme.muted)
+                                .child(if cfg!(target_os = "macos") {
+                                    "⌘↵"
+                                } else {
+                                    "Ctrl+Enter"
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("project-commit-btn")
+                                .px(px(10.))
+                                .py(px(4.))
+                                .rounded(px(6.))
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .bg(if can_commit {
+                                    theme.accent
+                                } else {
+                                    theme.surface
+                                })
+                                .text_color(if can_commit {
+                                    theme.black
+                                } else {
+                                    theme.muted
+                                })
+                                .cursor(if can_commit {
+                                    CursorStyle::PointingHand
+                                } else {
+                                    CursorStyle::Arrow
+                                })
+                                .hover(move |style| {
+                                    if can_commit {
+                                        style.opacity(0.88)
+                                    } else {
+                                        style
+                                    }
+                                })
+                                .child(SharedString::from(if staged_files == 1 {
+                                    "Commit 1 file".to_string()
+                                } else {
+                                    format!("Commit {staged_files} files")
+                                }))
+                                .when_some(
+                                    action_callback.cloned().filter(|_| can_commit),
+                                    |button, callback| {
+                                        button.on_mouse_down(
+                                            MouseButton::Left,
+                                            move |event, window, cx| {
+                                                callback(&commit_action, event, window, cx);
+                                            },
+                                        )
+                                    },
+                                ),
+                        ),
+                ),
+        );
     }
+
+    if let Some(feedback) = feedback {
+        content = content.child(
+            div()
+                .text_size(px(10.5))
+                .text_color(theme.muted_strong)
+                .child(SharedString::from(feedback)),
+        );
+    }
+
     if snapshot.changes.is_empty() {
         let message = empty_changes_message(snapshot);
         return content.child(
-            div().py(px(28.)).text_size(px(12.)).text_color(theme.muted_strong).text_center().child(message),
+            div()
+                .py(px(28.))
+                .text_size(px(12.))
+                .text_color(theme.muted_strong)
+                .text_center()
+                .child(message),
         );
     }
     if snapshot.changes_truncated {
         content = content.child(
-            div().text_size(px(10.)).text_color(theme.muted_strong).child(SharedString::from(format!("Change list incomplete · {} rows shown", snapshot.changes.len()))),
+            div()
+                .text_size(px(10.))
+                .text_color(theme.muted_strong)
+                .child(SharedString::from(format!(
+                    "Change list incomplete · {} rows shown",
+                    snapshot.changes.len()
+                ))),
         );
     }
-    let staged: Vec<_> = snapshot.changes.iter().filter_map(|item| item.index.as_ref().map(|side| (item, side))).collect();
-    let changes: Vec<_> = snapshot.changes.iter().filter_map(|item| item.worktree.as_ref().filter(|side| side.status != GitFileStatus::Untracked).map(|side| (item, side))).collect();
-    let untracked: Vec<_> = snapshot.changes.iter().filter_map(|item| item.worktree.as_ref().filter(|side| side.status == GitFileStatus::Untracked).map(|side| (item, side))).collect();
-    for (label, items) in [("STAGED", staged), ("CHANGES", changes), ("UNTRACKED", untracked)] {
-        if items.is_empty() { continue; }
+
+    let sections: [(
+        &'static str,
+        bool,
+        &[(&GitFileChange, &GitFileSide)],
+        Option<(&'static str, ProjectGitAction)>,
+    ); 3] = [
+        (
+            "Staged",
+            true,
+            &staged,
+            Some(("Unstage all", ProjectGitAction::UnstageAll)),
+        ),
+        (
+            "Changes",
+            false,
+            &changes,
+            Some(("Stage all", ProjectGitAction::StageAll)),
+        ),
+        ("Untracked", false, &untracked, None),
+    ];
+    for (label, is_staged, items, action) in sections {
+        if items.is_empty() {
+            continue;
+        }
+        let mut header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .pt(px(2.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.muted)
+                            .child("#"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.muted_strong)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(theme.muted)
+                            .child(SharedString::from(items.len().to_string())),
+                    ),
+            );
+        if let Some((action_label, action)) = action {
+            if let Some(callback) = action_callback {
+                let callback = callback.clone();
+                header = header.child(
+                    div()
+                        .id(SharedString::from(format!("project-section-{label}")))
+                        .text_size(px(10.5))
+                        .text_color(theme.muted)
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(move |style| style.text_color(theme.foreground))
+                        .child(action_label)
+                        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                            callback(&action, event, window, cx);
+                        }),
+                );
+            }
+        }
         content = content.child(
-            div().flex().flex_col().gap(px(3.))
-                .child(div().flex().justify_between().px(px(2.)).pb(px(3.))
-                    .child(div().text_size(px(10.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.muted).child(label))
-                    .child(div().text_size(px(10.)).text_color(theme.muted).child(items.len().to_string())))
-                .children(items.into_iter().enumerate().map(|(index, (item, side))| {
-                    let staged = side.status != GitFileStatus::Untracked && label == "STAGED";
-                    change_row(theme, item, side, index, staged, action_callback)
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .child(header)
+                .children(items.iter().enumerate().map(|(index, (item, side))| {
+                    change_row(theme, item, side, index, is_staged, action_callback)
                 })),
         );
     }
+
     content
 }
 
@@ -397,8 +837,15 @@ mod tests {
     }
 }
 
-fn change_row(theme: Theme, item: &GitFileChange, side: &GitFileSide, index: usize, staged: bool, callback: Option<&ActionCallback>) -> impl IntoElement {
-    let (icon, color) = match side.status {
+fn change_row(
+    theme: Theme,
+    item: &GitFileChange,
+    side: &GitFileSide,
+    index: usize,
+    staged: bool,
+    callback: Option<&ActionCallback>,
+) -> impl IntoElement {
+    let (letter, color) = match side.status {
         GitFileStatus::Added => ("A", theme.green),
         GitFileStatus::Modified => ("M", theme.yellow),
         GitFileStatus::Untracked => ("?", theme.green),
@@ -408,19 +855,88 @@ fn change_row(theme: Theme, item: &GitFileChange, side: &GitFileSide, index: usi
     };
     let name = item.path.rsplit('/').next().unwrap_or(&item.path);
     let parent = item.path.rsplit_once('/').map(|(parent, _)| parent);
-    div()
-        .id(SharedString::from(format!("project-change-{:?}-{index}-{}", side.status, item.path)))
+    let action = stage_toggle_action(&item.path, staged);
+    let mut row = div()
+        .id(SharedString::from(format!(
+            "project-change-{}-{:?}-{index}-{}",
+            if staged { "staged" } else { "worktree" },
+            side.status,
+            item.path
+        )))
         .flex()
+        .flex_row()
         .items_center()
         .gap(px(8.))
-        .py(px(4.))
-        .child(div().w(px(14.)).text_size(px(10.)).font_weight(FontWeight::BOLD).text_color(color).child(icon))
-        .child(div().flex().flex_col().flex_grow(1.).min_w(px(0.)).child(div().text_size(px(12.)).text_color(theme.foreground).truncate().child(SharedString::from(name.to_string()))).when_some(parent, |row, parent| row.child(div().text_size(px(10.)).text_color(theme.muted).truncate().child(SharedString::from(parent.to_string())))))
-        .child(div().flex().gap(px(4.)).text_size(px(10.))
-            .when(side.added > 0, |counts| counts.child(div().text_color(theme.green).child(SharedString::from(format!("+{}", side.added)))))
-            .when(side.removed > 0, |counts| counts.child(div().text_color(theme.red).child(SharedString::from(format!("-{}", side.removed))))),
+        .h(px(30.))
+        .px(px(2.))
+        .rounded(px(5.))
+        .cursor(CursorStyle::PointingHand)
+        .hover(move |style| style.bg(theme.hover))
+        .child(
+            div()
+                .w(px(12.))
+                .text_size(px(10.5))
+                .font_weight(FontWeight::BOLD)
+                .text_color(color)
+                .child(letter),
         )
-        .child(action_button(theme, if staged { "☑" } else { "□" }, stage_toggle_action(&item.path, staged), callback, false))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_baseline()
+                .gap(px(7.))
+                .flex_1()
+                .min_w(px(0.))
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(theme.foreground)
+                        .truncate()
+                        .child(SharedString::from(name.to_string())),
+                )
+                .when_some(parent, |row, parent| {
+                    row.child(
+                        div()
+                            .flex_shrink(1.)
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(10.5))
+                            .text_color(theme.muted)
+                            .child(SharedString::from(parent.to_string())),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(5.))
+                .flex_shrink_0()
+                .text_size(px(10.5))
+                .when(side.added > 0, |counts| {
+                    counts.child(
+                        div()
+                            .text_color(theme.green)
+                            .child(SharedString::from(format!("+{}", side.added))),
+                    )
+                })
+                .when(side.removed > 0, |counts| {
+                    counts.child(
+                        div()
+                            .text_color(theme.red)
+                            .child(SharedString::from(format!("-{}", side.removed))),
+                    )
+                }),
+        );
+    if let Some(callback) = callback {
+        let callback = callback.clone();
+        row = row.on_mouse_down(MouseButton::Left, move |event, window, cx| {
+            callback(&action, event, window, cx);
+        });
+    }
+    row
 }
 
 fn stage_toggle_action(path: &str, staged: bool) -> ProjectGitAction {
@@ -733,36 +1249,124 @@ fn lane_color(colors: &[gpui::Hsla], lane: usize) -> gpui::Hsla {
     colors[lane_color_slot(lane, colors.len())]
 }
 
-fn commit_row(theme: Theme, commit: &GitCommit, row: &GraphRowLayout, lane_count: usize, colors: &[gpui::Hsla]) -> gpui::Div {
-    let graph = div().relative().flex_shrink_0().w(px(lane_count as f32 * GRAPH_LANE_WIDTH)).h(px(52.))
-        .children(row.top_lanes.iter().map(|lane| graph_vertical(*lane, true, false, lane_color(colors, *lane))))
-        .children(row.bottom_lanes.iter().map(|lane| graph_vertical(*lane, false, true, lane_color(colors, *lane))))
-        .children(row.full_lanes.iter().map(|lane| graph_vertical(*lane, true, true, lane_color(colors, *lane))))
+fn commit_row(
+    theme: Theme,
+    commit: &GitCommit,
+    row: &GraphRowLayout,
+    lane_count: usize,
+    colors: &[gpui::Hsla],
+) -> gpui::Div {
+    let graph = div()
+        .relative()
+        .flex_shrink_0()
+        .w(px(lane_count as f32 * GRAPH_LANE_WIDTH))
+        .h(px(GRAPH_ROW_HEIGHT))
+        .children(
+            row.top_lanes
+                .iter()
+                .map(|lane| graph_vertical(*lane, true, false, lane_color(colors, *lane))),
+        )
+        .children(
+            row.bottom_lanes
+                .iter()
+                .map(|lane| graph_vertical(*lane, false, true, lane_color(colors, *lane))),
+        )
+        .children(
+            row.full_lanes
+                .iter()
+                .map(|lane| graph_vertical(*lane, true, true, lane_color(colors, *lane))),
+        )
         .children(row.connections.iter().filter_map(|(from, to)| {
             let left = from.min(to);
             let width = from.abs_diff(*to) as f32 * GRAPH_LANE_WIDTH;
-            (width > 0.0).then(|| div().absolute().left(px(*left as f32 * GRAPH_LANE_WIDTH + GRAPH_LANE_WIDTH / 2.0)).top(px(25.5)).w(px(width)).h(px(1.)).bg(lane_color(colors, *from)))
+            (width > 0.0).then(|| {
+                div()
+                    .absolute()
+                    .left(px(*left as f32 * GRAPH_LANE_WIDTH + GRAPH_LANE_WIDTH / 2.0))
+                    .top(px(25.5))
+                    .w(px(width))
+                    .h(px(1.))
+                    .bg(lane_color(colors, *from))
+            })
         }))
-        .child(div().absolute().left(px(row.node_lane as f32 * GRAPH_LANE_WIDTH + 3.5)).top(px(22.5)).w(px(7.)).h(px(7.)).rounded(px(4.)).bg(lane_color(colors, row.node_lane)));
-    let refs = commit.refs.iter().map(|name| div().px(px(4.)).rounded(px(3.)).bg(theme.selected).text_size(px(9.)).text_color(theme.accent).child(SharedString::from(name.clone())));
-    let details = format!("{} · {}", commit.author, commit.date);
-    let text = div()
+        .child(
+            div()
+                .absolute()
+                .left(px(row.node_lane as f32 * GRAPH_LANE_WIDTH + 3.5))
+                .top(px(22.5))
+                .w(px(7.))
+                .h(px(7.))
+                .rounded(px(4.))
+                .bg(lane_color(colors, row.node_lane)),
+        );
+
+    let refs = commit.refs.iter().map(|name| {
+        div()
+            .max_w(px(96.))
+            .truncate()
+            .px(px(5.))
+            .rounded(px(4.))
+            .bg(theme.selected)
+            .text_size(px(9.5))
+            .text_color(if name.contains("tag:") {
+                theme.yellow
+            } else {
+                theme.accent
+            })
+            .child(SharedString::from(name.clone()))
+    });
+
+    div()
         .flex()
-        .flex_col()
-        .flex_grow(1.)
-        .min_w(px(0.))
-        .gap(px(2.))
+        .flex_row()
+        .gap(px(8.))
+        .h(px(GRAPH_ROW_HEIGHT))
+        .flex_shrink_0()
+        .child(graph)
         .child(
             div()
                 .flex()
-                .items_center()
-                .gap(px(5.))
-                .children(refs)
-                .child(div().text_size(px(10.)).text_color(theme.muted).child(SharedString::from(commit.hash.clone()))),
+                .flex_col()
+                .justify_center()
+                .gap(px(3.))
+                .flex_1()
+                .min_w(px(0.))
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(theme.foreground)
+                        .truncate()
+                        .child(SharedString::from(commit.subject.clone())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(5.))
+                        .min_w(px(0.))
+                        .text_size(px(10.5))
+                        .child(
+                            div()
+                                .flex_shrink(1.)
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_color(theme.muted)
+                                .child(SharedString::from(format!(
+                                    "{} · {}",
+                                    commit.author, commit.date
+                                ))),
+                        )
+                        .children(refs)
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(theme.muted)
+                                .child(SharedString::from(commit.hash.clone())),
+                        ),
+                ),
         )
-        .child(div().text_size(px(12.)).text_color(theme.foreground).truncate().child(SharedString::from(commit.subject.clone())))
-        .child(div().text_size(px(10.)).text_color(theme.muted_strong).truncate().child(SharedString::from(details)));
-    div().flex().gap(px(6.)).h(px(GRAPH_ROW_HEIGHT)).flex_shrink_0().child(graph).child(text)
 }
 
 fn graph_vertical(lane: usize, top: bool, bottom: bool, color: gpui::Hsla) -> gpui::Div {

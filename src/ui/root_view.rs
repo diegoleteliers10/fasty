@@ -3281,6 +3281,9 @@ pub struct RootView {
     project_panel_menu_open: bool,
     project_panel_confirmation: Option<crate::git::ProjectGitConfirmation>,
     project_panel_feedback: Option<ProjectPanelFeedback>,
+    project_commit_message: String,
+    project_commit_focused: bool,
+    project_commit_scroll_handle: ScrollHandle,
     project_panel_action_generation: u64,
     pub project_panel_width: f32,
     pub is_dragging_project_panel: bool,
@@ -3507,6 +3510,57 @@ impl RootView {
         .detach();
     }
 
+    /// Keep the caret in view inside the fixed-height commit box.
+    fn commit_draft_changed(&mut self, cx: &mut Context<Self>) {
+        self.project_commit_scroll_handle.scroll_to_bottom();
+        cx.notify();
+    }
+
+    /// Append the clipboard text to the commit draft, with control characters
+    /// flattened so a pasted ticket title cannot inject shell input.
+    fn paste_into_project_commit(&mut self, cx: &mut Context<Self>) {
+        let Some(mut clip) = crate::event_listener::clipboard_helper() else {
+            return;
+        };
+        let Some(content) = clip.get_text().ok().filter(|text| !text.is_empty()) else {
+            return;
+        };
+        let cleaned: String = content
+            .chars()
+            .map(|ch| if ch == '\n' || ch == '\t' { ch } else if ch.is_control() { ' ' } else { ch })
+            .collect();
+        self.project_commit_message.push_str(&cleaned);
+        self.commit_draft_changed(cx);
+    }
+
+    fn commit_project_message(&mut self, cx: &mut Context<Self>) {
+        let message = self.project_commit_message.trim().to_string();
+        if message.is_empty() {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active_tab_idx) else {
+            return;
+        };
+        let Some(cwd) = tab.cwd.clone() else {
+            return;
+        };
+        let tab_id = tab.id;
+        let snapshot = crate::git::cached_project_panel_snapshot(Some(cwd.as_path()));
+        if !snapshot.changes.iter().any(|change| change.index.is_some()) {
+            self.project_panel_feedback = Some(ProjectPanelFeedback {
+                tab_id,
+                cwd: Some(cwd),
+                message: "Stage a file before you commit".to_string(),
+                action_id: None,
+            });
+            cx.notify();
+            return;
+        }
+        self.project_commit_focused = false;
+        self.handle_project_git_action(crate::git::ProjectGitAction::Commit(message), cx);
+        cx.notify();
+    }
+
     fn handle_project_git_action(
         &mut self,
         action: crate::git::ProjectGitAction,
@@ -3593,6 +3647,10 @@ impl RootView {
             message: format!("Running {}…", action.label()),
             action_id: Some(action_id),
         });
+        let sent_commit_message = match &action {
+            crate::git::ProjectGitAction::Commit(message) => Some(message.clone()),
+            _ => None,
+        };
         let (tx, rx) = async_channel::bounded(1);
         let worker_cwd = cwd.clone();
         std::thread::spawn(move || {
@@ -3603,6 +3661,13 @@ impl RootView {
             if let Ok(result) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
                     crate::git::invalidate_git_info_cache(&cwd);
+                    if result.is_ok()
+                        && sent_commit_message
+                            .as_ref()
+                            .is_some_and(|sent| this.project_commit_message.trim() == sent.trim())
+                    {
+                        this.project_commit_message.clear();
+                    }
                     if this
                         .project_panel_feedback
                         .as_ref()
@@ -4013,6 +4078,9 @@ impl RootView {
             project_panel_menu_open: false,
             project_panel_confirmation: None,
             project_panel_feedback: None,
+            project_commit_message: String::new(),
+            project_commit_focused: false,
+            project_commit_scroll_handle: ScrollHandle::new(),
             project_panel_action_generation: 0,
             project_panel_width: PROJECT_PANEL_WIDTH,
             is_dragging_project_panel: false,
@@ -11161,11 +11229,99 @@ impl RootView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.project_commit_focused
+            && self.right_panel == RightPanel::Project
+            && !self.any_input_overlay_open()
+            && !self.ai_keys_own_input()
+        {
+            let key = event.keystroke.key.to_lowercase();
+            let modifiers = event.keystroke.modifiers;
+            let is_alt_gr = modifiers.control && !modifiers.platform && modifiers.alt;
+            let is_ctrl = modifiers.control && !is_alt_gr;
+            let handled = if key == "escape" {
+                self.project_commit_focused = false;
+                cx.notify();
+                true
+            } else if key == "enter" || key == "return" {
+                if modifiers.platform || is_ctrl {
+                    self.commit_project_message(cx);
+                } else {
+                    self.project_commit_message.push('\n');
+                    self.commit_draft_changed(cx);
+                }
+                true
+            } else if key == "backspace" {
+                self.project_commit_message.pop();
+                self.commit_draft_changed(cx);
+                true
+            } else if key == "space" {
+                self.project_commit_message.push(' ');
+                self.commit_draft_changed(cx);
+                true
+            } else if (modifiers.platform || is_ctrl) && key == "v" {
+                self.paste_into_project_commit(cx);
+                true
+            } else if (modifiers.platform || is_ctrl) && matches!(key.as_str(), "c" | "x" | "a") {
+                // Terminal copy, cut and select-all must not run behind the box.
+                true
+            } else if key
+                .strip_prefix('f')
+                .is_some_and(|suffix| suffix.parse::<u8>().is_ok_and(|n| (1..=24).contains(&n)))
+            {
+                // Function keys would send escape sequences to the shell.
+                true
+            } else if matches!(
+                key.as_str(),
+                "up" | "down" | "left" | "right" | "delete" | "tab" | "home" | "end" | "pageup"
+                    | "pagedown"
+            ) || is_ctrl
+            {
+                // Swallow navigation and control chords instead of leaking them
+                // to the shell behind the panel.
+                true
+            } else if !modifiers.platform && !is_ctrl {
+                match event.keystroke.key_char.as_deref() {
+                    Some(text) if !text.chars().any(char::is_control) => {
+                        self.project_commit_message.push_str(text);
+                        self.commit_draft_changed(cx);
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                let combo = crate::keybindings::combo_from_key(
+                    &event.keystroke.key,
+                    is_ctrl,
+                    modifiers.shift,
+                    modifiers.alt && !is_alt_gr,
+                    modifiers.platform,
+                );
+                let bound = combo.is_some_and(|combo| {
+                    crate::keybindings::RESOLVER
+                        .get_or_init(|| {
+                            parking_lot::RwLock::new(
+                                crate::keybindings::KeyBindingResolver::with_defaults(),
+                            )
+                        })
+                        .read()
+                        .resolve(&combo)
+                        .is_some()
+                });
+                // Bound platform chords run. Unbound ones stay with the box.
+                !bound
+            };
+            if handled {
+                cx.stop_propagation();
+                return;
+            }
+            // App shortcuts still work while the commit box is focused.
+        }
         if !self.any_input_overlay_open()
             && super::ime::defers_to_ime(event, self.config.option_as_meta)
         {
             return;
         }
+
         self.process_key_down(event, _window, cx);
         cx.stop_propagation();
     }
@@ -13406,6 +13562,15 @@ impl RootView {
         self.ime_marked_text = None;
         if self.any_input_overlay_open() {
             cx.notify();
+            return;
+        }
+        if self.project_commit_focused && self.right_panel == RightPanel::Project {
+            let cleaned: String = text
+                .chars()
+                .map(|ch| if ch == '\n' || ch == '\t' { ch } else if ch.is_control() { ' ' } else { ch })
+                .collect();
+            self.project_commit_message.push_str(&cleaned);
+            self.commit_draft_changed(cx);
             return;
         }
         let terminal = self
@@ -16188,18 +16353,45 @@ impl Render for RootView {
                         let cancel_entity = project_entity.clone();
                         let graph_entity = project_entity.clone();
                         let project_width = self.current_project_panel_width();
+                        let git_summary = active_tab
+                            .and_then(|tab| tab.git_status.as_ref());
+                        let (branch, ahead, behind, upstream) = git_summary
+                            .map(|git| {
+                                (
+                                    Some(git.branch.clone()),
+                                    git.ahead,
+                                    git.behind,
+                                    git.remote_url
+                                        .as_ref()
+                                        .map(|_| format!("origin/{}", git.branch)),
+                                )
+                            })
+                            .unwrap_or((None, 0, 0, None));
                         this.child(
                             div().relative().w(px(project_width)).h_full().flex_shrink_0()
                                 .child(ProjectSidebar::new(theme, project_width, snapshot, self.project_panel_tab)
+                                .branch_summary(branch, ahead, behind, upstream)
+                                .commit_input(
+                                    self.project_commit_message.clone(),
+                                    self.project_commit_focused,
+                                    self.project_commit_scroll_handle.clone(),
+                                    cx.listener(|this, _ev, _window, cx| {
+                                        this.project_commit_focused = true;
+                                        this.project_commit_scroll_handle.scroll_to_bottom();
+                                        cx.notify();
+                                    }),
+                                )
                                 .on_close(cx.listener(|this, _ev, window, cx| {
                                     this.toggle_project_sidebar(window, cx);
                                 }))
                                 .on_select_changes(cx.listener(|this, _ev, _window, cx| {
                                     this.project_panel_tab = ProjectPanelTab::Changes;
+                                    this.project_commit_focused = false;
                                     cx.notify();
                                 }))
                                 .on_select_graph(cx.listener(|this, _ev, _window, cx| {
                                     this.project_panel_tab = ProjectPanelTab::Graph;
+                                    this.project_commit_focused = false;
                                     cx.notify();
                                 }))
                                 .actions(
@@ -16249,6 +16441,8 @@ impl Render for RootView {
                         if let Some(active_tab) = this.tabs.get(this.active_tab_idx) {
                             if active_tab.git_status.is_some() {
                                 this.is_git_menu_open = true;
+                                this.is_git_branch_sub_open = false;
+                                this.refresh_git_branches();
                                 this.git_menu_pos = Some((ev.position.x.to_f64() as f32, ev.position.y.to_f64() as f32));
                                 cx.notify();
                             }
@@ -18882,6 +19076,21 @@ impl Render for RootView {
                 let branch_name = git_info.branch.clone();
                 let remote_url = git_info.remote_url.clone();
                 let has_remote = remote_url.is_some();
+                let changes = git_info.staged + git_info.unstaged + git_info.untracked;
+                let upstream = if git_info.is_detached {
+                    "detached HEAD".to_string()
+                } else if has_remote {
+                    format!("origin/{branch_name}")
+                } else {
+                    "no remote".to_string()
+                };
+                let change_label = if changes == 1 {
+                    "1 change".to_string()
+                } else {
+                    format!("{changes} changes")
+                };
+                let branch_count = self.git_branch_count;
+                let menu_w: f32 = 282.0;
 
                 this.child(
                     div()
@@ -18889,10 +19098,12 @@ impl Render for RootView {
                         .inset_0()
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                             this.is_git_menu_open = false;
+                            this.is_git_branch_sub_open = false;
                             cx.notify();
                         }))
                         .on_mouse_down(MouseButton::Right, cx.listener(|this, _ev, _window, cx| {
                             this.is_git_menu_open = false;
+                            this.is_git_branch_sub_open = false;
                             cx.notify();
                         }))
                         .child(
@@ -18901,69 +19112,146 @@ impl Render for RootView {
                                 .absolute()
                                 .bottom(px(32.))
                                 .left(px(12.))
-                                .w(px(240.))
-                                .p(px(6.))
-                                .rounded(px(8.))
-                                .bg(theme.surface)
+                                .w(px(menu_w))
+                                .p(px(5.))
+                                .rounded(px(11.))
+                                .bg(theme.surface_raised)
                                 .border_1()
                                 .border_color(theme.border)
                                 .shadow_xl()
+                                .occlude()
                                 .flex()
                                 .flex_col()
-                                .gap_1()
                                 .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
                                     cx.stop_propagation();
                                 })
                                 .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
                                     cx.stop_propagation();
                                 })
+                                .on_mouse_move(|_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_scroll_wheel(|_ev, _window, cx| {
+                                    cx.stop_propagation();
+                                })
                                 .child(
                                     div()
-                                        .px(px(8.))
-                                        .py(px(4.))
-                                        .border_b_1()
-                                        .border_color(theme.border)
                                         .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .justify_between()
+                                        .flex_col()
+                                        .gap(px(3.))
+                                        .px(px(7.))
+                                        .pt(px(8.))
+                                        .pb(px(6.))
                                         .child(
                                             div()
                                                 .flex()
                                                 .flex_row()
                                                 .items_center()
-                                                .gap_1()
-                                                .child(render_icon(IconType::GitBranch, theme.foreground, 11.0))
+                                                .gap(px(7.))
+                                                .child(render_icon(
+                                                    IconType::GitBranch,
+                                                    theme.green,
+                                                    14.0,
+                                                ))
                                                 .child(
                                                     div()
-                                                        .text_size(px(11.))
-                                                        .font_weight(FontWeight::BOLD)
+                                                        .flex_1()
+                                                        .min_w(px(0.))
+                                                        .text_size(px(14.))
+                                                        .font_weight(FontWeight::SEMIBOLD)
                                                         .text_color(theme.foreground)
-                                                        .child(branch_name.clone()),
+                                                        .truncate()
+                                                        .child(SharedString::from(branch_name.clone())),
                                                 ),
                                         )
                                         .child(
                                             div()
-                                                .text_size(px(10.))
-                                                .text_color(theme.muted)
-                                                .child("Git Actions"),
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(5.))
+                                                .pl(px(21.))
+                                                .text_size(px(11.))
+                                                .child(
+                                                    div()
+                                                        .min_w(px(0.))
+                                                        .flex_shrink_1()
+                                                        .truncate()
+                                                        .text_color(theme.muted_strong)
+                                                        .child(SharedString::from(upstream)),
+                                                )
+                                                .child(div().text_color(theme.muted).child("·"))
+                                                .child(
+                                                    div()
+                                                        .text_color(if changes > 0 {
+                                                            theme.yellow
+                                                        } else {
+                                                            theme.muted
+                                                        })
+                                                        .child(SharedString::from(change_label)),
+                                                ),
                                         ),
                                 )
                                 .child(
-                                    render_context_menu_item(
-                                        IconType::GitPullRequest,
-                                        "Git Status",
-                                        None,
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .gap(px(4.))
+                                        .child(pane_quick_action(
+                                            IconType::ArrowDown,
+                                            "Pull",
+                                            None,
+                                            true,
+                                            theme,
+                                            cx.listener(|this, _ev, _window, cx| {
+                                                this.is_git_menu_open = false;
+                                                this.is_git_branch_sub_open = false;
+                                                this.write_git_command(b"git pull\r");
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(pane_quick_action(
+                                            IconType::RefreshCw,
+                                            "Fetch",
+                                            None,
+                                            true,
+                                            theme,
+                                            cx.listener(|this, _ev, _window, cx| {
+                                                this.is_git_menu_open = false;
+                                                this.is_git_branch_sub_open = false;
+                                                this.write_git_command(b"git fetch --all --prune\r");
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(pane_quick_action(
+                                            IconType::ArrowUp,
+                                            "Push",
+                                            (git_info.ahead > 0)
+                                                .then(|| format!("↑{}", git_info.ahead)),
+                                            true,
+                                            theme,
+                                            cx.listener(|this, _ev, _window, cx| {
+                                                this.is_git_menu_open = false;
+                                                this.is_git_branch_sub_open = false;
+                                                this.write_git_command(b"git push\r");
+                                                cx.notify();
+                                            }),
+                                        )),
+                                )
+                                .child(div().h(px(6.)))
+                                .child(
+                                    super::app_menu::menu_row(
+                                        IconType::ListChecks,
+                                        "Status",
+                                        "",
+                                        false,
+                                        theme,
                                         cx.listener(|this, _ev, _window, cx| {
                                             this.is_git_menu_open = false;
-                                            if let Some(tab) = this.tabs.get(this.active_tab_idx) {
-                                                if let Some(ref term) = tab.terminal {
-                                                    term.write_to_pty(b"git status\r");
-                                                }
-                                            }
+                                            this.is_git_branch_sub_open = false;
+                                            this.write_git_command(b"git status\r");
                                             cx.notify();
                                         }),
-                                        theme,
                                     )
                                     .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                                         if *hovered && this.is_git_branch_sub_open {
@@ -18973,89 +19261,18 @@ impl Render for RootView {
                                     })),
                                 )
                                 .child(
-                                    render_context_menu_item(
-                                        IconType::ArrowDown,
-                                        "Git Pull",
-                                        None,
-                                        cx.listener(|this, _ev, _window, cx| {
-                                            this.is_git_menu_open = false;
-                                            if let Some(tab) = this.tabs.get(this.active_tab_idx) {
-                                                if let Some(ref term) = tab.terminal {
-                                                    term.write_to_pty(b"git pull\r");
-                                                }
-                                            }
-                                            cx.notify();
-                                        }),
-                                        theme,
-                                    )
-                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
-                                        if *hovered && this.is_git_branch_sub_open {
-                                            this.is_git_branch_sub_open = false;
-                                            cx.notify();
-                                        }
-                                    })),
-                                )
-                                .child(
-                                    render_context_menu_item(
-                                        IconType::ArrowUp,
-                                        "Git Push",
-                                        None,
-                                        cx.listener(|this, _ev, _window, cx| {
-                                            this.is_git_menu_open = false;
-                                            if let Some(tab) = this.tabs.get(this.active_tab_idx) {
-                                                if let Some(ref term) = tab.terminal {
-                                                    term.write_to_pty(b"git push\r");
-                                                }
-                                            }
-                                            cx.notify();
-                                        }),
-                                        theme,
-                                    )
-                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
-                                        if *hovered && this.is_git_branch_sub_open {
-                                            this.is_git_branch_sub_open = false;
-                                            cx.notify();
-                                        }
-                                    })),
-                                )
-                                .child(
-                                    render_context_menu_item(
-                                        IconType::GitGraph,
-                                        "Git Log Graph",
-                                        None,
-                                        cx.listener(|this, _ev, _window, cx| {
-                                            this.is_git_menu_open = false;
-                                            if let Some(tab) = this.tabs.get(this.active_tab_idx) {
-                                                if let Some(ref term) = tab.terminal {
-                                                    term.write_to_pty(b"git log --oneline --graph --all -n 25\r");
-                                                }
-                                            }
-                                            cx.notify();
-                                        }),
-                                        theme,
-                                    )
-                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
-                                        if *hovered && this.is_git_branch_sub_open {
-                                            this.is_git_branch_sub_open = false;
-                                            cx.notify();
-                                        }
-                                    })),
-                                )
-                                .child(
-                                    render_context_menu_item(
+                                    super::app_menu::menu_row(
                                         IconType::FileDiff,
-                                        "Git Diff",
-                                        None,
+                                        "Diff",
+                                        "",
+                                        true,
+                                        theme,
                                         cx.listener(|this, _ev, _window, cx| {
                                             this.is_git_menu_open = false;
-                                            if let Some(tab) = this.tabs.get(this.active_tab_idx) {
-                                                if let Some(ref term) = tab.terminal {
-                                                    term.write_to_pty(b"git diff\r");
-                                                }
-                                            }
+                                            this.is_git_branch_sub_open = false;
+                                            this.write_git_command(b"git diff\r");
                                             cx.notify();
                                         }),
-                                        theme,
                                     )
                                     .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                                         if *hovered && this.is_git_branch_sub_open {
@@ -19065,20 +19282,20 @@ impl Render for RootView {
                                     })),
                                 )
                                 .child(
-                                    render_context_menu_item(
-                                        IconType::RefreshCw,
-                                        "Git Fetch All",
-                                        None,
+                                    super::app_menu::menu_row(
+                                        IconType::GitGraph,
+                                        "Log Graph",
+                                        "",
+                                        false,
+                                        theme,
                                         cx.listener(|this, _ev, _window, cx| {
                                             this.is_git_menu_open = false;
-                                            if let Some(tab) = this.tabs.get(this.active_tab_idx) {
-                                                if let Some(ref term) = tab.terminal {
-                                                    term.write_to_pty(b"git fetch --all --prune\r");
-                                                }
-                                            }
+                                            this.is_git_branch_sub_open = false;
+                                            this.write_git_command(
+                                                b"git log --oneline --graph --all -n 25\r",
+                                            );
                                             cx.notify();
                                         }),
-                                        theme,
                                     )
                                     .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                                         if *hovered && this.is_git_branch_sub_open {
@@ -19088,34 +19305,46 @@ impl Render for RootView {
                                     })),
                                 )
                                 .child(
-                                    render_context_menu_item(
+                                    super::app_menu::menu_row_trailing(
                                         IconType::GitBranch,
-                                        "Change Branch",
-                                        Some("▶"),
+                                        "Switch Branch",
+                                        "",
+                                        branch_count.map(|count| format!("{count} ›")),
+                                        false,
+                                        theme,
                                         cx.listener(|this, _ev, _window, cx| {
-                                            this.is_git_branch_sub_open = !this.is_git_branch_sub_open;
+                                            this.is_git_branch_sub_open =
+                                                !this.is_git_branch_sub_open;
+                                            if this.is_git_branch_sub_open {
+                                                this.refresh_git_branches();
+                                            }
                                             cx.notify();
                                         }),
-                                        theme,
                                     )
                                     .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                                         if *hovered && !this.is_git_branch_sub_open {
                                             this.is_git_branch_sub_open = true;
+                                            this.refresh_git_branches();
                                             cx.notify();
                                         }
                                     })),
                                 )
                                 .child(
-                                    render_context_menu_item(
-                                        IconType::GitBranch,
-                                        "Git Worktree Picker",
-                                        Some(if cfg!(target_os = "macos") { "⌘⌥W" } else { "Ctrl+Alt+W" }),
+                                    super::app_menu::menu_row(
+                                        IconType::Workflow,
+                                        "Worktree Picker",
+                                        if cfg!(target_os = "macos") {
+                                            "⌘⌥W"
+                                        } else {
+                                            "Ctrl+Alt+W"
+                                        },
+                                        false,
+                                        theme,
                                         cx.listener(|this, _ev, window, cx| {
                                             this.is_git_menu_open = false;
                                             this.is_git_branch_sub_open = false;
                                             this.toggle_worktree_picker(window, cx);
                                         }),
-                                        theme,
                                     )
                                     .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                                         if *hovered && this.is_git_branch_sub_open {
@@ -19125,22 +19354,25 @@ impl Render for RootView {
                                     })),
                                 )
                                 .child(
-                                    render_context_menu_item(
+                                    super::app_menu::menu_row(
                                         IconType::Clipboard,
                                         "Copy Branch Name",
-                                        None,
+                                        "",
+                                        false,
+                                        theme,
                                         {
                                             let b_name = branch_name.clone();
                                             cx.listener(move |this, _ev, _window, cx| {
                                                 this.is_git_menu_open = false;
                                                 this.is_git_branch_sub_open = false;
-                                                if let Some(mut clip) = crate::event_listener::clipboard_helper() {
+                                                if let Some(mut clip) =
+                                                    crate::event_listener::clipboard_helper()
+                                                {
                                                     let _ = clip.set_text(b_name.clone());
                                                 }
                                                 cx.notify();
                                             })
                                         },
-                                        theme,
                                     )
                                     .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                                         if *hovered && this.is_git_branch_sub_open {
@@ -19149,19 +19381,20 @@ impl Render for RootView {
                                         }
                                     })),
                                 )
-                                .when_some(remote_url, |this, url| {
-                                    this.child(
-                                        render_context_menu_item(
+                                .when_some(remote_url, |menu, url| {
+                                    menu.child(
+                                        super::app_menu::menu_row(
                                             IconType::Globe,
                                             "Open Remote in Browser",
-                                            None,
+                                            "",
+                                            false,
+                                            theme,
                                             cx.listener(move |this, _ev, _window, cx| {
                                                 this.is_git_menu_open = false;
                                                 this.is_git_branch_sub_open = false;
                                                 open_path_or_url(&url);
                                                 cx.notify();
                                             }),
-                                            theme,
                                         )
                                         .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                                             if *hovered && this.is_git_branch_sub_open {
@@ -19173,35 +19406,27 @@ impl Render for RootView {
                                 }),
                         )
                         .when(self.is_git_branch_sub_open, |parent| {
-                            let active_cwd = self.tabs.get(self.active_tab_idx).and_then(|t| t.cwd.as_deref());
-                            let branches = active_cwd.map(crate::git::list_local_branches).unwrap_or_default();
+                            let branches = self.git_branches.clone();
                             let current_branch = branch_name.clone();
-
-                            let items_below = if has_remote { 3.0 } else { 2.0 };
-                            let change_branch_bottom = 32.0 + 6.0 + items_below * 31.0;
-                            let change_branch_top = change_branch_bottom + 27.0;
-                            let branch_count = branches.len().max(1) as f32;
-                            let submenu_h = (39.0 + branch_count * 31.0 - 4.0).min(320.0);
-                            let submenu_bottom = (change_branch_top - submenu_h).max(32.0);
 
                             parent.child(
                                 div()
                                     .id("git-branch-submenu-popup")
                                     .absolute()
-                                    .bottom(px(submenu_bottom))
-                                    .left(px(256.))
+                                    .bottom(px(32.))
+                                    .left(px(12. + menu_w + 6.))
                                     .w(px(210.))
                                     .max_h(px(320.))
                                     .overflow_y_scroll()
-                                    .p(px(6.))
-                                    .rounded(px(8.))
-                                    .bg(theme.surface)
+                                    .p(px(5.))
+                                    .rounded(px(9.))
+                                    .bg(theme.surface_raised)
                                     .border_1()
                                     .border_color(theme.border)
                                     .shadow_xl()
+                                    .occlude()
                                     .flex()
                                     .flex_col()
-                                    .gap_1()
                                     .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
                                         cx.stop_propagation();
                                     })
@@ -19219,61 +19444,72 @@ impl Render for RootView {
                                     )
                                     .children(
                                         if branches.is_empty() {
-                                            vec![
-                                                div()
-                                                    .px(px(8.))
-                                                    .py(px(6.))
-                                                    .text_size(px(11.))
-                                                    .text_color(theme.muted)
-                                                    .child("No branches found")
-                                                    .into_any_element()
-                                            ]
+                                            vec![div()
+                                                .px(px(7.))
+                                                .py(px(6.))
+                                                .text_size(px(11.))
+                                                .text_color(theme.muted)
+                                                .child("No branches found")
+                                                .into_any_element()]
                                         } else {
                                             branches
                                                 .into_iter()
-                                                .map(|b| {
-                                                    let is_current = b == current_branch;
-                                                    let target_branch = b.clone();
-                                                    let target_branch_cb = b.clone();
+                                                .map(|branch| {
+                                                    let is_current = branch == current_branch;
+                                                    let target = branch.clone();
                                                     let hover_bg = theme.hover;
-                                                    let active_bg = theme.surface_raised;
+                                                    let active_bg = theme.selected;
 
                                                     div()
-                                                        .id(SharedString::from(format!("branch-item-{}", target_branch)))
+                                                        .id(SharedString::from(format!(
+                                                            "branch-item-{branch}"
+                                                        )))
                                                         .flex()
                                                         .flex_row()
                                                         .items_center()
                                                         .justify_between()
                                                         .w_full()
-                                                        .px(px(8.))
-                                                        .py(px(5.5))
+                                                        .h(px(26.))
+                                                        .px(px(7.))
                                                         .rounded(px(6.))
                                                         .cursor(CursorStyle::PointingHand)
-                                                        .hover(move |s| s.bg(hover_bg))
-                                                        .active(move |s| s.bg(active_bg))
-                                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                                            this.is_git_menu_open = false;
-                                                            this.is_git_branch_sub_open = false;
-                                                            if !is_current {
-                                                                if let Some(tab) = this.tabs.get(this.active_tab_idx) {
-                                                                    if let Some(ref term) = tab.terminal {
-                                                                        term.write_to_pty(format!("git checkout {}\r", target_branch_cb).as_bytes());
-                                                                    }
+                                                        .hover(move |style| style.bg(hover_bg))
+                                                        .active(move |style| style.bg(active_bg))
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            cx.listener(move |this, _ev, _window, cx| {
+                                                                this.is_git_menu_open = false;
+                                                                this.is_git_branch_sub_open = false;
+                                                                if !is_current {
+                                                                    // The name comes from the
+                                                                    // repository, so quote it before
+                                                                    // it reaches the shell.
+                                                                    this.write_git_command(
+                                                                        format!(
+                                                                            "git checkout {}\r",
+                                                                            shell_quote(&target)
+                                                                        )
+                                                                        .as_bytes(),
+                                                                    );
                                                                 }
-                                                            }
-                                                            cx.notify();
-                                                        }))
+                                                                cx.notify();
+                                                            }),
+                                                        )
                                                         .child(
                                                             div()
                                                                 .flex()
                                                                 .flex_row()
                                                                 .items_center()
-                                                                .gap_2()
+                                                                .gap(px(6.))
                                                                 .flex_1()
                                                                 .overflow_hidden()
                                                                 .child(render_icon(
                                                                     IconType::GitBranch,
-                                                                    if is_current { theme.green } else { theme.accent },
+                                                                    if is_current {
+                                                                        theme.green
+                                                                    } else {
+                                                                        theme.muted
+                                                                    },
                                                                     12.0,
                                                                 ))
                                                                 .child(
