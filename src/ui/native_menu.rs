@@ -1,9 +1,9 @@
 use crate::keybindings::{Action as TerminalAction, KeyBindingResolver, KeyCombo, NamedKey};
 use crate::ui::{RootView, SettingsView};
 use gpui::{
-    actions, div, prelude::*, px, size, App, Bounds, Context, Global, KeyBinding, KeyDownEvent,
-    Menu, MenuItem, OsAction, SystemMenuType, TitlebarOptions, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowOptions,
+    actions, div, prelude::*, px, size, App, Bounds, Context, Global, KeyBinding,
+    KeyBindingContextPredicate, KeyDownEvent, Menu, MenuItem, OsAction, SystemMenuType,
+    TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions,
 };
 
 actions!(
@@ -146,16 +146,28 @@ pub fn refresh_bindings(cx: &mut App) {
     let resolver = resolver.read();
     let mut bindings = Vec::new();
     let mut signature = Vec::new();
+    // Dynamic keystrokes cannot feed `KeyBinding::new`, which now takes a
+    // static string, so they load through the parsing entry point.
+    let menu_context = Some(std::rc::Rc::new(
+        KeyBindingContextPredicate::parse("FasttyMenuLabel && !FasttyMenuLabel")
+            .expect("the static menu predicate parses"),
+    ));
     macro_rules! bind {
         ($terminal:ident, $menu:ident) => {
             for combo in resolver.combos_for(TerminalAction::$terminal) {
                 let key = gpui_keystroke(combo);
                 signature.push((stringify!($menu).to_string(), key.clone()));
-                bindings.push(KeyBinding::new(
-                    &key,
-                    $menu,
-                    Some("FasttyMenuLabel && !FasttyMenuLabel"),
-                ));
+                bindings.push(
+                    KeyBinding::load(
+                        &key,
+                        Box::new($menu),
+                        menu_context.clone(),
+                        false,
+                        None,
+                        cx,
+                    )
+                    .expect("the resolver only produces valid keystrokes"),
+                );
             }
         };
     }
