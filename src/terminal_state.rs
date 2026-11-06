@@ -3138,18 +3138,18 @@ impl TerminalState {
         term.history_size()
     }
 
-    pub fn search_matches(&self, query: &str) -> Vec<usize> {
+    pub fn search_matches(&self, query: &str) -> Vec<i32> {
         self.search_matches_with(query, false, false)
     }
 
-    /// Scroll offsets of the lines that match, with optional case sensitivity
-    /// and regular expressions.
+    /// Terminal line indices that match, with optional case sensitivity and
+    /// regular expressions. Screen lines are >= 0, scrollback lines are < 0.
     pub fn search_matches_with(
         &self,
         query: &str,
         case_sensitive: bool,
         regex: bool,
-    ) -> Vec<usize> {
+    ) -> Vec<i32> {
         if query.trim().is_empty() {
             return Vec::new();
         }
@@ -3188,11 +3188,9 @@ impl TerminalState {
                 }
             }
             if matcher(&line_str) {
-                let offset = if line_i < 0 { (-line_i) as usize } else { 0 };
-                matches.push(offset);
+                matches.push(line_i);
             }
         }
-        matches.dedup();
         matches
     }
 
@@ -5851,6 +5849,7 @@ termios.tcsetattr(fd, termios.TCSADRAIN, old)
             .is_empty());
         assert_eq!(terminal.non_empty_line_count(), 3);
         assert_eq!(terminal.search_matches_with("Alpha", true, false).len(), 1);
+        assert_eq!(terminal.search_matches_with("a", false, false).len(), 3);
         assert_eq!(terminal.search_matches_with("^A", true, true).len(), 1);
         assert!(terminal.search_matches_with("(", true, true).is_empty());
     }

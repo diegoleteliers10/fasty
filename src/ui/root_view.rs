@@ -3519,7 +3519,7 @@ pub struct RootView {
     pub search_regex: bool,
     pub search_invalid_pattern: bool,
     pub search_match_idx: usize,
-    pub search_matches: Vec<usize>,
+    pub search_matches: Vec<i32>,
     pub is_worktree_picker_open: bool,
     /// Change count per worktree, captured in the background when the picker opens.
     pub worktree_picker_changes: Vec<(std::path::PathBuf, Option<usize>)>,
@@ -7718,23 +7718,25 @@ impl RootView {
         cx.notify();
     }
 
-    /// Scroll so the hit is not hidden under the floating search bar. Hits on
-    /// the live screen (offset 0) are already visible, so they do not move.
-    fn scroll_buffer_search_to(&mut self, offset: usize, window: &Window) {
+    /// Scroll a matching terminal line below the floating search bar. Screen
+    /// lines near the top move the viewport just enough to clear the bar.
+    fn scroll_buffer_search_to_line(&mut self, line: i32, window: &Window) {
         let (_, line_h) = self.measure_cell_metrics(window);
         let line_h = if line_h > 0.0 { line_h } else { 18.0 };
         let hidden_rows =
-            (((BUFFER_BAR_INSET + BUFFER_BAR_HEIGHT) / line_h).ceil()) as usize;
-        let target = if offset == 0 {
-            0
+            (((BUFFER_BAR_INSET + BUFFER_BAR_HEIGHT) / line_h).ceil()) as i32;
+        let target = if line < 0 {
+            ((-line) + hidden_rows).max(0) as usize
         } else {
-            offset.saturating_add(hidden_rows)
+            (hidden_rows - line).max(0) as usize
         };
         let terminal = self
             .tabs
             .get(self.active_tab_idx)
             .and_then(|tab| tab.terminal.clone());
         if let Some(terminal) = terminal {
+            // Offset 0 is still a scroll: it returns the viewport to the live
+            // screen, where a screen match is visible.
             terminal.scroll_to_offset(target);
             self.last_scroll_activity = std::time::Instant::now();
         }
@@ -7774,8 +7776,8 @@ impl RootView {
             self.search_case_sensitive,
             self.search_regex,
         );
-        if let Some(&offset) = self.search_matches.first() {
-            self.scroll_buffer_search_to(offset, window);
+        if let Some(&line) = self.search_matches.first() {
+            self.scroll_buffer_search_to_line(line, window);
         }
         cx.notify();
     }
@@ -13567,8 +13569,8 @@ impl RootView {
                         self.search_match_idx =
                             (self.search_match_idx + 1) % self.search_matches.len();
                     }
-                    let offset = self.search_matches[self.search_match_idx];
-                    self.scroll_buffer_search_to(offset, _window);
+                    let line = self.search_matches[self.search_match_idx];
+                    self.scroll_buffer_search_to_line(line, _window);
                     cx.notify();
                 }
                 return;
@@ -15980,7 +15982,7 @@ impl RootView {
                             })
                             .flatten();
                         let search_case_sensitive = self.search_case_sensitive;
-                        let active_search_offset =
+                        let active_search_line =
                             self.search_matches.get(self.search_match_idx).copied();
                         let num_lines = lines.len();
                         let row_width = (target_cols as f32 * cell_w).round();
@@ -16051,11 +16053,10 @@ impl RootView {
                                         let col_end = char_to_end_col[last_char_idx];
                                         let col_len = col_end.saturating_sub(col_start).max(1);
 
+                                        let row_line =
+                                            row_idx as i32 - display_offset as i32;
                                         let is_active_match =
-                                            active_search_offset.is_some_and(|off| {
-                                                off == (display_offset
-                                                    + (num_lines.saturating_sub(1 + row_idx)))
-                                            });
+                                            active_search_line == Some(row_line);
                                         row_highlights.push((col_start, col_len, is_active_match));
                                     }
                                 }
@@ -19339,8 +19340,8 @@ impl Render for RootView {
                                                 } else {
                                                     this.search_match_idx - 1
                                                 };
-                                                let offset = this.search_matches[this.search_match_idx];
-                                                this.scroll_buffer_search_to(offset, _window);
+                                                let line = this.search_matches[this.search_match_idx];
+                                                this.scroll_buffer_search_to_line(line, _window);
                                                 cx.notify();
                                             }
                                         }))
@@ -19362,8 +19363,8 @@ impl Render for RootView {
                                             if !this.search_matches.is_empty() {
                                                 this.search_match_idx =
                                                     (this.search_match_idx + 1) % this.search_matches.len();
-                                                let offset = this.search_matches[this.search_match_idx];
-                                                this.scroll_buffer_search_to(offset, _window);
+                                                let line = this.search_matches[this.search_match_idx];
+                                                this.scroll_buffer_search_to_line(line, _window);
                                                 cx.notify();
                                             }
                                         }))
