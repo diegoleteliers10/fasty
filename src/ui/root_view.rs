@@ -18219,8 +18219,8 @@ impl Render for RootView {
                             .items_center()
                             .gap(px(5.))
                             .px(px(10.))
-                            .pt(px(12.))
-                            .pb(px(2.))
+                            .pt(px(14.))
+                            .pb(px(4.))
                             .child(
                                 div()
                                     .text_size(px(11.))
@@ -18245,8 +18245,8 @@ impl Render for RootView {
                             .flex_row()
                             .items_center()
                             .justify_between()
-                            .h(px(38.))
-                            .px(px(10.))
+                            .h(px(46.))
+                            .px(px(12.))
                             .rounded(px(8.))
                             .when(is_selected, |row| row.bg(theme.selected))
                             .when(!is_selected, |row| {
@@ -18280,7 +18280,7 @@ impl Render for RootView {
                                         div()
                                             .min_w(px(0.))
                                             .truncate()
-                                            .text_size(px(13.))
+                                            .text_size(px(13.5))
                                             .text_color(theme.foreground)
                                             .child(cmd.title),
                                     ),
@@ -18295,15 +18295,15 @@ impl Render for RootView {
                             for key in palette_shortcut_keys(shortcut) {
                                 keys = keys.child(
                                     div()
-                                        .min_w(px(20.))
-                                        .h(px(20.))
-                                        .px(px(4.))
+                                        .min_w(px(22.))
+                                        .h(px(22.))
+                                        .px(px(5.))
                                         .flex()
                                         .items_center()
                                         .justify_center()
                                         .rounded(px(5.))
                                         .bg(theme.surface_raised)
-                                        .text_size(px(10.5))
+                                        .text_size(px(11.))
                                         .text_color(theme.muted_strong)
                                         .child(SharedString::from(key)),
                                 );
@@ -18386,7 +18386,7 @@ impl Render for RootView {
                                         .overflow_y_scroll()
                                         .px(px(10.))
                                         .pb(px(8.))
-                                        .gap(px(4.))
+                                        .gap(px(2.))
                                         .children(if rows.is_empty() {
                                             vec![
                                                 div()
