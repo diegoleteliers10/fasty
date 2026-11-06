@@ -3692,7 +3692,11 @@ impl SettingsView {
             .pb(px(24.))
             .gap(px(24.))
             .child(title)
-            .child(list(self.keyboard_list_state.clone(), render).flex_1())
+            .child(
+                list(self.keyboard_list_state.clone(), render)
+                    .w_full()
+                    .flex_1(),
+            )
     }
 
     fn keyboard_rows(&self) -> Vec<KeyboardRow> {
@@ -3736,6 +3740,7 @@ impl SettingsView {
             KeyboardRow::CustomHeader => {
                 let has_custom = !self.config.keybindings.is_empty();
                 div()
+                    .w_full()
                     .flex()
                     .flex_col()
                     .gap(px(6.))
@@ -3782,6 +3787,7 @@ impl SettingsView {
                     .into_any_element()
             }
             KeyboardRow::Category(category) => div()
+                .w_full()
                 .pt(px(18.))
                 .pb(px(4.))
                 .text_size(px(13.))
@@ -3805,6 +3811,7 @@ impl SettingsView {
         let is_active = self.keybinding_preset == preset;
         div()
             .id(SharedString::from(format!("preset-row-{}", preset)))
+            .w_full()
             .flex()
             .flex_row()
             .items_center()
@@ -4014,6 +4021,7 @@ impl SettingsView {
             false,
             theme,
         )
+        .w_full()
         .into_any_element()
     }
 
@@ -4032,6 +4040,7 @@ impl SettingsView {
         let owner_name = conflict.owner.display_name();
         let combo_label = crate::keybindings::format_combo(&conflict.combo);
         div()
+            .w_full()
             .flex()
             .flex_row()
             .items_center()
