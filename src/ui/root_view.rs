@@ -20724,7 +20724,9 @@ impl Render for RootView {
             })
             // Mission Control / Tab Peek Grid View Overlay
             .when(self.is_tab_overview_open, |this| {
-                let backdrop = gpui::hsla(0.0, 0.0, 0.0, 0.75);
+                // Nearly opaque, so terminal text behind cannot compete with
+                // the title and the card labels.
+                let backdrop = theme.background.opacity(0.97);
                 let selected_idx = self.tab_overview_selected;
                 let font_fam = self.font_family.clone();
                 let viewport = _window.viewport_size();
@@ -20909,7 +20911,7 @@ impl Render for RootView {
                                             .w(px(cell_w))
                                             .h(px(cell_h))
                                             .rounded(px(10.))
-                                            .bg(theme.surface)
+                                            .bg(theme.surface_raised)
                                             .border_2()
                                             .border_color(if is_selected { theme.accent } else if is_active_tab { theme.accent.opacity(0.5) } else { theme.border })
                                             .shadow_xl()
@@ -21174,7 +21176,7 @@ impl Render for RootView {
                                         .w(px(cell_w))
                                         .h(px(cell_h))
                                         .rounded(px(10.))
-                                        .bg(theme.surface.opacity(0.4))
+                                        .bg(theme.surface)
                                         .border_1()
                                         .border_color(theme.border)
                                         .cursor(CursorStyle::PointingHand)
