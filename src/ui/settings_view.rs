@@ -3689,7 +3689,7 @@ impl SettingsView {
                             .flex_row()
                             .items_center()
                             .justify_between()
-                            .px(px(0.))
+                            .px(px(14.))
                             .py(px(14.))
                             .rounded(px(8.))
                             .when(is_active, |row| row.bg(theme.surface_raised))
