@@ -111,6 +111,7 @@ pub struct ThemeCardInfo {
     pub acc_color: gpui::Hsla,
     pub fg_color: gpui::Hsla,
     pub muted_color: gpui::Hsla,
+    pub ansi: [gpui::Hsla; 8],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -381,6 +382,9 @@ impl SettingsView {
                     acc_color: t.accent,
                     fg_color: t.foreground,
                     muted_color: t.muted_strong,
+                    ansi: [
+                        t.black, t.red, t.green, t.yellow, t.blue, t.magenta, t.cyan, t.white,
+                    ],
                 }
             })
             .collect();
@@ -2988,7 +2992,7 @@ impl SettingsView {
                         }))
                         .child(
                             div()
-                                .h(px(118.))
+                                .h(px(156.))
                                 .p(px(14.))
                                 .flex()
                                 .flex_col()
@@ -3024,10 +3028,33 @@ impl SettingsView {
                                 )
                                 .child(
                                     div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(4.))
                                         .font_family(font_family.clone())
                                         .text_size(px(12.5))
                                         .text_color(card.acc_color)
-                                        .child("~ > "),
+                                        .child("~ >")
+                                        .child(
+                                            div()
+                                                .w(px(6.))
+                                                .h(px(13.))
+                                                .bg(card.fg_color),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .mt_auto()
+                                        .w_full()
+                                        .h(px(22.))
+                                        .rounded(px(4.))
+                                        .overflow_hidden()
+                                        .flex()
+                                        .flex_row()
+                                        .children(card.ansi.into_iter().map(|color| {
+                                            div().flex_1().h_full().bg(color)
+                                        })),
                                 ),
                         )
                         .child(
