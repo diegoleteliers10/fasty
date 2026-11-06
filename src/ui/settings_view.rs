@@ -1,8 +1,9 @@
 use gpui::{
-    canvas, Context, CursorStyle, FontWeight, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Render, ScrollHandle, ScrollStrategy, SharedString,
-    UniformListScrollHandle, Window, WindowControlArea, WindowHandle, div, list, ListAlignment,
-    ListState, prelude::*, px, uniform_list, Animation, AnimationExt, DefiniteLength,
+    App, WeakEntity, canvas, Context, CursorStyle, FontWeight, Hsla, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle, ScrollStrategy,
+    SharedString, UniformListScrollHandle, Window, WindowControlArea, WindowHandle, div, list,
+    ListAlignment, ListState, prelude::*, px, uniform_list, Animation, AnimationExt,
+    DefiniteLength,
 };
 use std::time::Duration;
 use icons::common::IconType;
@@ -274,6 +275,7 @@ pub struct SettingsView {
     settings_scroll_target: f32,
     settings_scroll_offset: f32,
     settings_scroll_animating: bool,
+    settings_scroll_last_frame: Option<std::time::Instant>,
     theme_carousel_scroll: ScrollHandle,
     binding_render_cache: Option<std::rc::Rc<BindingRenderData>>,
     pub font_scroll_handle: UniformListScrollHandle,
@@ -473,6 +475,7 @@ impl SettingsView {
             settings_scroll_target: 0.0,
             settings_scroll_offset: 0.0,
             settings_scroll_animating: false,
+            settings_scroll_last_frame: None,
             theme_carousel_scroll: ScrollHandle::new(),
             binding_render_cache: None,
             font_scroll_handle: UniformListScrollHandle::new(),
@@ -5352,12 +5355,15 @@ impl SettingsView {
     fn handle_settings_scroll(
         &mut self,
         event: &gpui::ScrollWheelEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let delta = match event.delta {
-            gpui::ScrollDelta::Pixels(delta) => delta.y.as_f32(),
-            gpui::ScrollDelta::Lines(delta) => delta.y * 48.0,
+        // Precise deltas (trackpad and its momentum) already carry the
+        // system's easing, so they follow the finger 1:1. A notched wheel
+        // reports lines and gets the frame-locked glide below.
+        let (delta, precise) = match event.delta {
+            gpui::ScrollDelta::Pixels(delta) => (delta.y.as_f32(), true),
+            gpui::ScrollDelta::Lines(delta) => (delta.y * 48.0, false),
         };
         if !delta.is_finite() || delta == 0.0 {
             self.sync_settings_scroll_target();
@@ -5368,45 +5374,59 @@ impl SettingsView {
         if !limit.is_finite() {
             return;
         }
-        // Undo any delta the built-in scroll already applied, then animate from
-        // the last painted offset to the new target.
+        // Undo any delta the built-in scroll already applied, then move the
+        // authoritative offset by exactly this event's delta.
         self.window_scroll_handle
             .set_offset(gpui::point(px(0.), px(self.settings_scroll_offset)));
         self.settings_scroll_target = (self.settings_scroll_target + delta).clamp(-limit, 0.0);
-        if !self.settings_scroll_animating {
+        if precise {
+            self.settings_scroll_offset = self.settings_scroll_target;
+            self.window_scroll_handle
+                .set_offset(gpui::point(px(0.), px(self.settings_scroll_target)));
+        } else if !self.settings_scroll_animating {
             self.settings_scroll_animating = true;
-            cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(8))
-                        .await;
-                    let mut done = false;
-                    let result = this.update(cx, |this, cx| {
-                        let current = this.settings_scroll_offset;
-                        let target = this.settings_scroll_target;
-                        let next = current + (target - current) * 0.5;
-                        if (target - next).abs() <= 0.5 {
-                            this.settings_scroll_offset = target;
-                            this.window_scroll_handle
-                                .set_offset(gpui::point(px(0.), px(target)));
-                            this.settings_scroll_animating = false;
-                            done = true;
-                        } else {
-                            this.settings_scroll_offset = next;
-                            this.window_scroll_handle
-                                .set_offset(gpui::point(px(0.), px(next)));
-                        }
-                        cx.notify();
-                    });
-                    if result.is_err() || done {
-                        break;
-                    }
-                }
-            })
-            .detach();
+            self.settings_scroll_last_frame = None;
+            let entity = cx.weak_entity();
+            window.on_next_frame(move |window, app| {
+                Self::step_settings_scroll(entity, window, app)
+            });
         }
         cx.stop_propagation();
         cx.notify();
+    }
+
+    /// Advance one vsync frame of the notched-wheel glide and reschedule while
+    /// the offset has not reached its target.
+    fn step_settings_scroll(entity: WeakEntity<Self>, window: &mut Window, app: &mut App) {
+        let continuing = entity
+            .update(app, |this, cx| {
+                let now = std::time::Instant::now();
+                let dt = this
+                    .settings_scroll_last_frame
+                    .replace(now)
+                    .map(|last| now.duration_since(last).as_secs_f32())
+                    .unwrap_or(0.016)
+                    .min(0.05);
+                // Exponential approach: 50 ms covers ~63% of the distance.
+                const TIME_CONSTANT: f32 = 0.05;
+                let blend = 1.0 - (-dt / TIME_CONSTANT).exp();
+                let target = this.settings_scroll_target;
+                let next =
+                    this.settings_scroll_offset + (target - this.settings_scroll_offset) * blend;
+                let settled = (target - next).abs() <= 0.25;
+                this.settings_scroll_offset = if settled { target } else { next };
+                this.window_scroll_handle
+                    .set_offset(gpui::point(px(0.), px(this.settings_scroll_offset)));
+                this.settings_scroll_animating = !settled;
+                cx.notify();
+                !settled
+            })
+            .unwrap_or(false);
+        if continuing {
+            window.on_next_frame(move |window, app| {
+                Self::step_settings_scroll(entity, window, app)
+            });
+        }
     }
 
     fn handle_menu_outside_click(
