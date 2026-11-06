@@ -3245,7 +3245,9 @@ impl SettingsView {
                             )
                             .child(self.render_font_combobox(theme, window, cx)),
                     )
-                    .child(
+                    .child({
+                        let preview_font = SharedString::from(self.font_family.clone());
+                        let preview_size = self.font_size.clamp(10.0, 24.0);
                         div()
                             .flex()
                             .flex_row()
@@ -3255,15 +3257,21 @@ impl SettingsView {
                             .py(px(10.))
                             .rounded(px(8.))
                             .bg(theme.surface_raised)
-                            .font_family(font_family)
-                            .text_size(px(12.5))
-                            .child(div().text_color(theme.accent).child("~ >"))
                             .child(
                                 div()
+                                    .font_family(preview_font.clone())
+                                    .text_size(px(preview_size))
+                                    .text_color(theme.accent)
+                                    .child("~ >"),
+                            )
+                            .child(
+                                div()
+                                    .font_family(preview_font)
+                                    .text_size(px(preview_size))
                                     .text_color(theme.muted_strong)
                                     .child("echo \"fast ⇒ fastty\" ≠ slow"),
-                            ),
-                    ),
+                            )
+                    }),
             )
     }
 
@@ -3542,12 +3550,13 @@ impl SettingsView {
                                                             items.push(
                                                                 div()
                                                                     .id(pos)
-                                                                    .h(px(28.))
+                                                                    .w_full()
+                                                                    .h(px(32.))
                                                                     .flex()
                                                                     .flex_row()
                                                                     .items_center()
                                                                     .justify_between()
-                                                                    .px(px(8.))
+                                                                    .px(px(10.))
                                                                     .py(px(4.))
                                                                     .rounded(px(5.))
                                                                     .bg(if is_selected {
