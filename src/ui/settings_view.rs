@@ -184,6 +184,11 @@ pub struct BindingConflict {
     pub owner: crate::keybindings::Action,
 }
 
+struct BindingRenderData {
+    combos: std::collections::HashMap<crate::keybindings::Action, Vec<Vec<String>>>,
+    customized: std::collections::HashSet<crate::keybindings::Action>,
+}
+
 pub struct SettingsView {
     pub config: Config,
     pub theme: Theme,
@@ -228,6 +233,7 @@ pub struct SettingsView {
     pub font_search_query: String,
     pub font_search_state: crate::ui::TextInputState,
     pub font_highlighted_index: usize,
+    binding_render_cache: Option<std::rc::Rc<BindingRenderData>>,
     pub font_scroll_handle: UniformListScrollHandle,
     pub font_trigger_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     pub font_search_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
@@ -415,6 +421,7 @@ impl SettingsView {
             font_search_query: String::new(),
             font_search_state: crate::ui::TextInputState::default(),
             font_highlighted_index: 0,
+            binding_render_cache: None,
             font_scroll_handle: UniformListScrollHandle::new(),
             font_trigger_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             font_search_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -581,6 +588,7 @@ impl SettingsView {
     }
 
     pub fn sync_from_config(&mut self, cfg: &Config, cx: &mut Context<Self>) {
+        self.binding_render_cache = None;
         self.config = cfg.clone();        self.ai_test_status = AiTestStatus::Idle;
         self.opacity = cfg.opacity;
         self.scrollback = cfg.scrollback;
@@ -1534,6 +1542,7 @@ impl SettingsView {
     }
 
     fn persist_bindings(&mut self, edit: impl FnOnce(&mut Config), cx: &mut Context<Self>) {
+        self.binding_render_cache = None;
         if self.save_config(edit) {
             self.keybinding_preset = self.config.keybinding_preset.unwrap_or_default();
             crate::keybindings::init_resolver(
@@ -1545,8 +1554,28 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn effective_bindings(&self) -> crate::keybindings::KeyBindingResolver {
-        crate::keybindings::effective_resolver(self.keybinding_preset, &self.config.keybindings)
+    fn binding_render_data(&mut self) -> std::rc::Rc<BindingRenderData> {
+        if let Some(cache) = &self.binding_render_cache {
+            return cache.clone();
+        }
+        let effective = crate::keybindings::effective_resolver(
+            self.keybinding_preset,
+            &self.config.keybindings,
+        );
+        let customized =
+            crate::keybindings::customized_actions(&self.config.keybindings, self.keybinding_preset);
+        let mut combos = std::collections::HashMap::new();
+        for action in crate::keybindings::Action::all() {
+            let keycaps = effective
+                .combos_for(action)
+                .iter()
+                .map(crate::keybindings::combo_keycaps)
+                .collect();
+            combos.insert(action, keycaps);
+        }
+        let data = std::rc::Rc::new(BindingRenderData { combos, customized });
+        self.binding_render_cache = Some(data.clone());
+        data
     }
 
     pub fn start_binding_capture(
@@ -2289,7 +2318,7 @@ impl SettingsView {
             )
     }
 
-    fn render_content_pane(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_content_pane(&mut self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("settings-content-pane")
             .flex_1()
@@ -3606,7 +3635,7 @@ impl SettingsView {
             )
     }
 
-    fn render_tab_keyboard(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_tab_keyboard(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let presets = [
             (crate::keybindings::KeybindingPreset::Default, "Default (Fastty)", "Standard modern shortcuts (⌘T, ⌘W, ⌘D, ⌘⌥Arrows)"),
             (crate::keybindings::KeybindingPreset::Ghostty, "Ghostty", "Ghostty-compatible splits, tabs & nav"),
@@ -3614,7 +3643,8 @@ impl SettingsView {
             (crate::keybindings::KeybindingPreset::ITerm2, "iTerm2", "macOS iTerm2 muscle memory shortcuts"),
         ];
 
-        let effective = self.effective_bindings();
+        let binding_data = self.binding_render_data();
+        let all_actions = crate::keybindings::Action::all();
         let has_custom = !self.config.keybindings.is_empty();
         let capturing = self.capturing_action;
         let conflict = self.binding_conflict;
@@ -3729,8 +3759,9 @@ impl SettingsView {
             );
 
         for category in crate::keybindings::Action::categories() {
-            let actions: Vec<crate::keybindings::Action> = crate::keybindings::Action::all()
-                .into_iter()
+            let actions: Vec<crate::keybindings::Action> = all_actions
+                .iter()
+                .copied()
                 .filter(|a| a.category() == category)
                 .collect();
             if actions.is_empty() {
@@ -3738,13 +3769,13 @@ impl SettingsView {
             }
             let mut card = div().flex().flex_col();
             for (row_idx, action) in actions.iter().enumerate() {
-                let combos = effective.combos_for(*action);
+                let combos = binding_data
+                    .combos
+                    .get(action)
+                    .cloned()
+                    .unwrap_or_default();
                 let is_capturing = capturing == Some(*action);
-                let customized = crate::keybindings::is_action_customized(
-                    &self.config.keybindings,
-                    self.keybinding_preset,
-                    *action,
-                );
+                let customized = binding_data.customized.contains(action);
                 let is_last = row_idx == actions.len() - 1
                     && conflict.is_none_or(|c| c.target != *action);
 
@@ -3778,7 +3809,7 @@ impl SettingsView {
                     for (i, combo) in combos.iter().enumerate() {
                         let act = *action;
                         let is_recording = is_capturing && i == 0;
-                        let keycaps = crate::keybindings::combo_keycaps(combo);
+                        let keycaps = combo.clone();
                         badges = badges.child(
                             div()
                                 .id(SharedString::from(format!(
