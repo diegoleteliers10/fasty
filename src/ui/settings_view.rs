@@ -142,8 +142,8 @@ impl SettingsTab {
             Self::Appearance => "Theme, transparency and the type your shell is set in.",
             Self::Keyboard => "Pick a preset, then make any shortcut your own.",
             Self::Ai => "Choose who powers Fastty AI and what it is allowed to do.",
-            Self::Migration => "Import settings from other terminals.",
-            Self::Advanced => "Deeper configuration and diagnostics.",
+            Self::Migration => "Bring your setup over from another terminal in one click.",
+            Self::Advanced => "Raw configuration and build details.",
         }
     }
 
@@ -2003,71 +2003,9 @@ fn render_section_header(title: impl Into<SharedString>, theme: &Theme) -> gpui:
         .child(format!("# {}", title.into()))
 }
 
-fn render_group_card(theme: &Theme) -> gpui::Div {
-    div()
-        .bg(theme.surface)
-        .border_1()
-        .border_color(theme.border)
-        .rounded(px(10.))
-        .overflow_hidden()
-        .flex()
-        .flex_col()
-}
-
 /// Plain group used by the General page: rows sit on the page background.
 fn render_plain_group() -> gpui::Div {
     div().flex().flex_col()
-}
-
-fn render_card_row(
-    title: impl Into<SharedString>,
-    subtitle: Option<impl Into<SharedString>>,
-    control: impl IntoElement,
-    _is_last: bool,
-    theme: &Theme,
-) -> gpui::Div {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .px(px(16.))
-        .py(px(12.))
-        .when(!_is_last, |this| this.border_b_1().border_color(theme.border))
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .mr(px(12.))
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .child(
-                    div()
-                        .text_size(px(12.5))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.foreground)
-                        .child(title.into()),
-                )
-                .when_some(subtitle, |this, sub| {
-                    this.child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(theme.muted)
-                            .child(sub.into()),
-                    )
-                }),
-        )
-        .child(
-            div()
-                .flex_shrink_0()
-                // Let a control that is wider than the row wrap inside itself
-                // rather than overflow the card. A row of keycaps with long
-                // modifier names is the case that reaches this.
-                .max_w_full()
-                .min_w_0()
-                .child(control),
-        )
 }
 
 fn render_plain_row(
@@ -4879,33 +4817,33 @@ impl SettingsView {
                     .flex_col()
                     .child(render_section_header("Migrate from Other Terminals", theme))
                     .child(
-                        render_group_card(theme)
+                        div().flex().flex_col()
                             .when(!self.detected_external_configs.is_empty(), |this| {
                                 this.children(self.detected_external_configs.iter().enumerate().map(|(idx, detected)| {
                                     let app = detected.app;
                                     let path = detected.path.clone();
                                     let label = detected.label.clone();
                                     let details = detected.details.clone();
-                                    let is_last = idx == self.detected_external_configs.len() - 1 && self.import_status_message.is_none();
+                                    let _is_last = idx == self.detected_external_configs.len() - 1 && self.import_status_message.is_none();
 
-                                    render_card_row(
+                                    render_plain_row_inset(
                                         label,
                                         Some(details),
                                         div()
-                                            .px(px(10.))
-                                            .py(px(5.))
-                                            .rounded(px(5.))
-                                            .bg(theme.accent)
-                                            .hover(|s| s.opacity(0.9))
-                                            .text_size(px(11.))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(theme.black)
+                                            .px(px(14.))
+                                            .py(px(8.))
+                                            .rounded(px(8.))
+                                            .bg(theme.surface_raised)
+                                            .hover(|s| s.bg(theme.hover))
+                                            .text_size(px(13.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme.foreground)
                                             .cursor(CursorStyle::PointingHand)
                                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
                                                 this.import_external(app, path.clone(), cx);
                                             }))
                                             .child("Import & Adopt"),
-                                        is_last,
+                                        _is_last,
                                         theme,
                                     )
                                 }))
@@ -4913,21 +4851,21 @@ impl SettingsView {
                             .when(self.detected_external_configs.is_empty(), |this| {
                                 this.child(
                                     div()
-                                        .p(px(20.))
+                                        .px(px(14.))
+                                        .py(px(18.))
                                         .flex()
                                         .flex_col()
-                                        .items_center()
-                                        .gap_2()
+                                        .gap(px(4.))
                                         .child(
                                             div()
-                                                .text_size(px(12.5))
-                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_size(px(14.5))
+                                                .font_weight(FontWeight::MEDIUM)
                                                 .text_color(theme.foreground)
                                                 .child("No external terminal configurations detected"),
                                         )
                                         .child(
                                             div()
-                                                .text_size(px(11.))
+                                                .text_size(px(13.))
                                                 .text_color(theme.muted)
                                                 .child("Configurations for Ghostty, Warp, Alacritty, iTerm2, and WezTerm are checked automatically."),
                                         ),
@@ -4936,12 +4874,10 @@ impl SettingsView {
                             .when_some(self.import_status_message.as_ref(), |this, msg| {
                                 this.child(
                                     div()
-                                        .p(px(12.))
-                                        .border_t_1()
-                                        .border_color(theme.border)
-                                        .bg(theme.accent.opacity(0.12))
-                                        .text_size(px(11.5))
-                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .px(px(14.))
+                                        .py(px(10.))
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::MEDIUM)
                                         .text_color(theme.accent)
                                         .child(msg.clone()),
                                 )
@@ -4962,21 +4898,19 @@ impl SettingsView {
                     .flex_col()
                     .child(render_section_header("Configuration Files", theme))
                     .child(
-                        render_group_card(theme)
-                            .child(render_card_row(
+                        div().flex().flex_col()
+                            .child(render_plain_row_inset(
                                 "Configuration Directory",
                                 Some("~/.config/fastty"),
                                 div()
-                                    .px(px(10.))
-                                    .py(px(5.))
-                                    .rounded(px(6.))
+                                    .px(px(14.))
+                                    .py(px(8.))
+                                    .rounded(px(8.))
                                     .bg(theme.surface_raised)
-                                    .border_1()
-                                    .border_color(theme.border)
                                     .hover(|s| s.bg(theme.hover))
                                     .cursor(CursorStyle::PointingHand)
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::BOLD)
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme.foreground)
                                     .on_mouse_down(MouseButton::Left, |_ev, _window, _cx| {
                                         Self::open_config_folder();
@@ -4985,20 +4919,18 @@ impl SettingsView {
                                 false,
                                 theme,
                             ))
-                            .child(render_card_row(
+                            .child(render_plain_row_inset(
                                 "fastty.toml",
                                 Some("Directly edit raw configuration file"),
                                 div()
-                                    .px(px(10.))
-                                    .py(px(5.))
-                                    .rounded(px(6.))
+                                    .px(px(14.))
+                                    .py(px(8.))
+                                    .rounded(px(8.))
                                     .bg(theme.surface_raised)
-                                    .border_1()
-                                    .border_color(theme.border)
                                     .hover(|s| s.bg(theme.hover))
                                     .cursor(CursorStyle::PointingHand)
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::BOLD)
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme.foreground)
                                     .on_mouse_down(MouseButton::Left, |_ev, _window, _cx| {
                                         Self::open_settings_file();
@@ -5016,39 +4948,39 @@ impl SettingsView {
                     .flex_col()
                     .child(render_section_header("Application Information", theme))
                     .child(
-                        render_group_card(theme)
-                            .child(render_card_row(
+                        div().flex().flex_col()
+                            .child(render_plain_row_inset(
                                 "Version",
                                 None::<&str>,
                                 div()
-                                    .px(px(7.))
-                                    .py(px(2.))
-                                    .rounded(px(4.))
+                                    .px(px(9.))
+                                    .py(px(4.))
+                                    .rounded(px(6.))
                                     .bg(theme.surface_raised)
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::BOLD)
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::MEDIUM)
                                     .text_color(theme.muted_strong)
                                     .child(concat!("v", env!("CARGO_PKG_VERSION"))),
                                 false,
                                 theme,
                             ))
-                            .child(render_card_row(
+                            .child(render_plain_row_inset(
                                 "Rendering Engine",
                                 None::<&str>,
                                 div()
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::NORMAL)
                                     .text_color(theme.muted_strong)
-                                    .child("GPUI Metal / DirectX hardware-accelerated"),
+                                    .child("GPUI (Metal / DirectX)"),
                                 false,
                                 theme,
                             ))
-                            .child(render_card_row(
+                            .child(render_plain_row_inset(
                                 "Platform Target",
                                 None::<&str>,
                                 div()
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::NORMAL)
                                     .text_color(theme.muted_strong)
                                     .child(format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)),
                                 true,
