@@ -18248,7 +18248,7 @@ impl Render for RootView {
                             .flex_row()
                             .items_center()
                             .justify_between()
-                            .h(px(40.))
+                            .h(px(34.))
                             .flex_shrink_0()
                             .px(px(12.))
                             .rounded(px(8.))
@@ -18278,13 +18278,13 @@ impl Render for RootView {
                                     .child(render_icon(
                                         cmd.icon,
                                         if is_selected { theme.accent } else { theme.muted_strong },
-                                        15.0,
+                                        14.0,
                                     ))
                                     .child(
                                         div()
                                             .min_w(px(0.))
                                             .truncate()
-                                            .text_size(px(14.))
+                                            .text_size(px(13.))
                                             .text_color(theme.foreground)
                                             .child(cmd.title),
                                     ),
@@ -18299,15 +18299,15 @@ impl Render for RootView {
                             for key in palette_shortcut_keys(shortcut) {
                                 keys = keys.child(
                                     div()
-                                        .min_w(px(22.))
-                                        .h(px(22.))
-                                        .px(px(5.))
+                                        .min_w(px(20.))
+                                        .h(px(20.))
+                                        .px(px(4.))
                                         .flex()
                                         .items_center()
                                         .justify_center()
                                         .rounded(px(5.))
                                         .bg(theme.surface_raised)
-                                        .text_size(px(11.5))
+                                        .text_size(px(10.5))
                                         .text_color(theme.muted_strong)
                                         .child(SharedString::from(key)),
                                 );
