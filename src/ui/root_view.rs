@@ -19,6 +19,7 @@ use super::tab_icons::{tab_glyph, TabGlyph};
 use super::project_sidebar::{cached_graph_layout, GraphLayout, ProjectPanelTab, ProjectSidebar};
 use super::settings_view::SettingsView;
 use super::status_bar::{StatusBar, StatusBarModel, StatusInfo};
+use crate::terminal_state::SearchMatch;
 use super::tab_bar::{TabBar, TabItem, TabSidebar};
 use super::theme::{rgb_to_hsla, Theme};
 use crate::config::{self, Config, TabLayout};
@@ -3519,7 +3520,7 @@ pub struct RootView {
     pub search_regex: bool,
     pub search_invalid_pattern: bool,
     pub search_match_idx: usize,
-    pub search_matches: Vec<i32>,
+    pub search_matches: Vec<SearchMatch>,
     pub is_worktree_picker_open: bool,
     /// Change count per worktree, captured in the background when the picker opens.
     pub worktree_picker_changes: Vec<(std::path::PathBuf, Option<usize>)>,
@@ -7776,8 +7777,8 @@ impl RootView {
             self.search_case_sensitive,
             self.search_regex,
         );
-        if let Some(&line) = self.search_matches.first() {
-            self.scroll_buffer_search_to_line(line, window);
+        if let Some(first) = self.search_matches.first().copied() {
+            self.scroll_buffer_search_to_line(first.line, window);
         }
         cx.notify();
     }
@@ -13569,7 +13570,7 @@ impl RootView {
                         self.search_match_idx =
                             (self.search_match_idx + 1) % self.search_matches.len();
                     }
-                    let line = self.search_matches[self.search_match_idx];
+                    let line = self.search_matches[self.search_match_idx].line;
                     self.scroll_buffer_search_to_line(line, _window);
                     cx.notify();
                 }
@@ -15982,7 +15983,7 @@ impl RootView {
                             })
                             .flatten();
                         let search_case_sensitive = self.search_case_sensitive;
-                        let active_search_line =
+                        let active_search_match =
                             self.search_matches.get(self.search_match_idx).copied();
                         let num_lines = lines.len();
                         let row_width = (target_cols as f32 * cell_w).round();
@@ -16012,6 +16013,9 @@ impl RootView {
                                     if let Some(pattern) = search_regex.as_ref() {
                                         pattern
                                             .find_iter(&full_line)
+                                            .filter(|matched| {
+                                                matched.start() != matched.end()
+                                            })
                                             .map(|matched| {
                                                 (
                                                     full_line[..matched.start()].chars().count(),
@@ -16020,29 +16024,11 @@ impl RootView {
                                             })
                                             .collect()
                                     } else {
-                                        let (haystack, needle) = if search_case_sensitive {
-                                            (full_line.clone(), search_query_str.clone())
-                                        } else {
-                                            (
-                                                full_line.to_lowercase(),
-                                                search_query_str.to_lowercase(),
-                                            )
-                                        };
-                                        if haystack.len() == full_line.len() {
-                                            haystack
-                                                .match_indices(&needle)
-                                                .map(|(start, matched)| {
-                                                    (
-                                                        haystack[..start].chars().count(),
-                                                        haystack[..start + matched.len()]
-                                                            .chars()
-                                                            .count(),
-                                                    )
-                                                })
-                                                .collect()
-                                        } else {
-                                            Vec::new()
-                                        }
+                                        crate::terminal_state::find_literal_ranges(
+                                            &full_line,
+                                            &search_query_str,
+                                            search_case_sensitive,
+                                        )
                                     };
 
                                 for (match_start_char, match_end_char) in char_matches {
@@ -16055,8 +16041,12 @@ impl RootView {
 
                                         let row_line =
                                             row_idx as i32 - display_offset as i32;
-                                        let is_active_match =
-                                            active_search_line == Some(row_line);
+                                        let is_active_match = active_search_match.is_some_and(
+                                            |active| {
+                                                active.line == row_line
+                                                    && active.column == match_start_char
+                                            },
+                                        );
                                         row_highlights.push((col_start, col_len, is_active_match));
                                     }
                                 }
@@ -19340,7 +19330,8 @@ impl Render for RootView {
                                                 } else {
                                                     this.search_match_idx - 1
                                                 };
-                                                let line = this.search_matches[this.search_match_idx];
+                                                let line =
+                                                    this.search_matches[this.search_match_idx].line;
                                                 this.scroll_buffer_search_to_line(line, _window);
                                                 cx.notify();
                                             }
@@ -19363,7 +19354,8 @@ impl Render for RootView {
                                             if !this.search_matches.is_empty() {
                                                 this.search_match_idx =
                                                     (this.search_match_idx + 1) % this.search_matches.len();
-                                                let line = this.search_matches[this.search_match_idx];
+                                                let line =
+                                                    this.search_matches[this.search_match_idx].line;
                                                 this.scroll_buffer_search_to_line(line, _window);
                                                 cx.notify();
                                             }

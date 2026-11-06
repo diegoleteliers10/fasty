@@ -3138,36 +3138,53 @@ impl TerminalState {
         term.history_size()
     }
 
-    pub fn search_matches(&self, query: &str) -> Vec<i32> {
+    pub fn search_matches(&self, query: &str) -> Vec<SearchMatch> {
         self.search_matches_with(query, false, false)
     }
 
-    /// Terminal line indices that match, with optional case sensitivity and
-    /// regular expressions. Screen lines are >= 0, scrollback lines are < 0.
+    /// Every match in the buffer, one entry per occurrence. Screen lines are
+    /// >= 0, scrollback lines are < 0, and `column` is the character offset of
+    /// the match within the line.
     pub fn search_matches_with(
         &self,
         query: &str,
         case_sensitive: bool,
         regex: bool,
-    ) -> Vec<i32> {
+    ) -> Vec<SearchMatch> {
         if query.trim().is_empty() {
             return Vec::new();
         }
         use alacritty_terminal::index::Line;
-        let matcher: Box<dyn Fn(&str) -> bool> = if regex {
+        let finder: Box<dyn Fn(&str) -> Vec<usize>> = if regex {
             let Ok(pattern) = regex::RegexBuilder::new(query)
                 .case_insensitive(!case_sensitive)
                 .build()
             else {
                 return Vec::new();
             };
-            Box::new(move |line| pattern.is_match(line))
+            Box::new(move |line| {
+                pattern
+                    .find_iter(line)
+                    .filter(|matched| matched.start() != matched.end())
+                    .map(|matched| line[..matched.start()].chars().count())
+                    .collect()
+            })
         } else if case_sensitive {
             let needle = query.to_string();
-            Box::new(move |line| line.contains(&needle))
+            Box::new(move |line| {
+                find_literal_ranges(line, &needle, true)
+                    .into_iter()
+                    .map(|(start, _)| start)
+                    .collect()
+            })
         } else {
-            let needle = query.to_lowercase();
-            Box::new(move |line| line.to_lowercase().contains(&needle))
+            let needle = query.to_string();
+            Box::new(move |line| {
+                find_literal_ranges(line, &needle, false)
+                    .into_iter()
+                    .map(|(start, _)| start)
+                    .collect()
+            })
         };
         let term = self.term.lock();
         let grid = term.grid();
@@ -3182,13 +3199,28 @@ impl TerminalState {
             let row = &grid[Line(line_i)];
             let mut line_str = String::new();
             for cell in row.into_iter() {
-                let c = cell.c;
-                if c != '\0' {
-                    line_str.push(c);
+                if cell
+                    .flags
+                    .contains(alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                line_str.push(if matches!(cell.c, '\t' | '\0') {
+                    ' '
+                } else {
+                    cell.c
+                });
+                if let Some(characters) = cell.zerowidth() {
+                    for character in characters {
+                        line_str.push(*character);
+                    }
                 }
             }
-            if matcher(&line_str) {
-                matches.push(line_i);
+            for column in finder(&line_str) {
+                matches.push(SearchMatch {
+                    line: line_i,
+                    column,
+                });
             }
         }
         matches
@@ -4052,11 +4084,64 @@ impl TerminalState {
     }
 }
 
+/// Character ranges of every literal occurrence of `query` in `line`.
+pub fn find_literal_ranges(line: &str, query: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    if case_sensitive {
+        return line
+            .match_indices(query)
+            .map(|(start, matched)| {
+                (
+                    line[..start].chars().count(),
+                    line[..start + matched.len()].chars().count(),
+                )
+            })
+            .collect();
+    }
+    let needle = query.to_lowercase();
+    let (lower, source_char_at) = lowercase_with_map(line);
+    lower
+        .match_indices(&needle)
+        .filter_map(|(start, matched)| {
+            let first = *source_char_at.get(start)?;
+            let last = *source_char_at.get(start + matched.len() - 1)?;
+            Some((first, last + 1))
+        })
+        .collect()
+}
+
+/// Lowercase `line` while remembering the source character index of every
+/// byte in the lowered string. Lowercasing can change byte length, so slicing
+/// the original by a lowered offset can panic.
+fn lowercase_with_map(line: &str) -> (String, Vec<usize>) {
+    let mut lower = String::with_capacity(line.len());
+    let mut source_char_at: Vec<usize> = Vec::with_capacity(line.len());
+    let mut buffer = [0u8; 4];
+    for (char_index, character) in line.chars().enumerate() {
+        for lowered in character.to_lowercase() {
+            let encoded = lowered.encode_utf8(&mut buffer);
+            for _ in 0..encoded.len() {
+                source_char_at.push(char_index);
+            }
+            lower.push(lowered);
+        }
+    }
+    (lower, source_char_at)
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchSnippet {
     pub offset: usize,
     pub line_index: i32,
     pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub line: i32,
+    pub column: usize,
 }
 
 /// Replays a decoded FST1 snapshot into an alacritty `Term`: resets the
@@ -5827,6 +5912,32 @@ termios.tcsetattr(fd, termios.TCSADRAIN, old)
     }
 
     #[test]
+    fn search_counts_adjacent_occurrences_and_survives_case_folding() {
+        use alacritty_terminal::vte::ansi::Processor;
+
+        let terminal = TerminalState::new_headless("/bin/cat", &[], None, 60, 10)
+            .expect("create headless terminal");
+        let mut parser: Processor<StdSyncHandler> = Processor::new();
+        parser.advance(
+            &mut *terminal.term.lock(),
+            "signal(signal\r\nΩİ signal\r\n".as_bytes(),
+        );
+
+        let adjacent = terminal.search_matches_with("signal", true, false);
+        assert_eq!(adjacent.len(), 3);
+        assert_eq!(adjacent[0].column, 0);
+        assert_eq!(adjacent[1].column, 7);
+
+        // Lowercasing changes byte length here; the matcher must not panic or
+        // drop the ASCII hit on the same line.
+        let folded = terminal.search_matches_with("i̇", false, false);
+        assert!(folded.len() <= 1);
+        assert!(!terminal
+            .search_matches_with("signal", false, false)
+            .is_empty());
+    }
+
+    #[test]
     fn search_options_respect_case_and_regex() {
         use alacritty_terminal::vte::ansi::Processor;
 
@@ -5849,7 +5960,7 @@ termios.tcsetattr(fd, termios.TCSADRAIN, old)
             .is_empty());
         assert_eq!(terminal.non_empty_line_count(), 3);
         assert_eq!(terminal.search_matches_with("Alpha", true, false).len(), 1);
-        assert_eq!(terminal.search_matches_with("a", false, false).len(), 3);
+        assert_eq!(terminal.search_matches_with("a", false, false).len(), 8);
         assert_eq!(terminal.search_matches_with("^A", true, true).len(), 1);
         assert!(terminal.search_matches_with("(", true, true).is_empty());
     }
