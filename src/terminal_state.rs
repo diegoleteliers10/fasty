@@ -5061,7 +5061,6 @@ termios.tcsetattr(fd, termios.TCSADRAIN, old)
                 Err(async_channel::TryRecvError::Closed) => break,
             }
         }
-        eprintln!("reply={reply} late={late}");
 
         // Exactly one complete reply per query: OSC 11, OSC 10, DA1, kitty.
         // `reply` is the hex of the wire bytes: 1b5d = ESC ], 1b5b = ESC [.

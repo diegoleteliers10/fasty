@@ -5038,7 +5038,6 @@ impl RootView {
             .unwrap_or("fastty");
         let pane_title = title_override.unwrap_or_else(|| default_shell_name.to_string());
 
-        let session_start = std::time::Instant::now();
         let attach = if let Some(remote) = pre_attached_remote {
             #[cfg(unix)]
             {
@@ -5163,10 +5162,6 @@ impl RootView {
         let terminal_arc = Arc::new(terminal);
         let terminal_host_session_id = terminal_arc.remote_session_id();
         let terminal_source_id = terminal_arc.source_id();
-        eprintln!(
-            "Fastty pane session ready: pane_id={pane_id}, host_session_id={terminal_host_session_id:?}, elapsed_ms={}",
-            session_start.elapsed().as_millis()
-        );
         // The session host owns this PTY. The local TerminalState is only the
         // renderer projection fed by the host's attach stream.
         cx.spawn_in(window, async move |this, cx| {
@@ -15421,16 +15416,12 @@ impl RootView {
         if !self.terminal_render_retry_pending.lock().insert(pane_id) {
             return;
         }
-        let (delay, retry_count) = {
+        let delay = {
             let mut state = self.terminal_render_retry_state.lock();
             let retry_count = state.entry(pane_id).or_default();
             *retry_count = retry_count.saturating_add(1);
-            (terminal_render_retry_delay(*retry_count), *retry_count)
+            terminal_render_retry_delay(*retry_count)
         };
-        eprintln!(
-            "Fastty terminal render deferred: pane_id={pane_id}, retry={retry_count}, delay_ms={}",
-            delay.as_millis()
-        );
 
         let pending = Arc::clone(&self.terminal_render_retry_pending);
         cx.spawn_in(window, async move |this, cx| {

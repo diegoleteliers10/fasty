@@ -983,7 +983,6 @@ pub fn spawn_attached(
     rows: usize,
 ) -> Result<RemoteSession, SpawnAttachError> {
     ensure_running().map_err(SpawnAttachError::from)?;
-    let spawn_started = std::time::Instant::now();
     let request_id = next_spawn_request_id();
     let mut stream = connect_for_handshake()?;
     let info = probe_host_with_access(
@@ -1020,12 +1019,7 @@ pub fn spawn_attached(
                 .map_err(|_| SpawnAttachError::ambiguous(error))?,
         },
     };
-    eprintln!(
-        "Fastty session host spawn complete: session_id={id}, elapsed_ms={}",
-        spawn_started.elapsed().as_millis()
-    );
 
-    let attach_started = std::time::Instant::now();
     let attached = (|| -> Result<RemoteSession, String> {
         let mut stream = connect_for_handshake()?;
         validate_session_connection(&mut stream, id)?;
@@ -1059,11 +1053,6 @@ pub fn spawn_attached(
             Response::Error { code, message } => return Err(format!("{code}: {message}")),
             other => return Err(format!("unexpected snapshot response: {other:?}")),
         };
-        eprintln!(
-            "Fastty session host attach complete: session_id={id}, snapshot_bytes={}, elapsed_ms={}",
-            snapshot.len(),
-            attach_started.elapsed().as_millis()
-        );
         reader
             .get_mut()
             .set_read_timeout(None)

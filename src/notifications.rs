@@ -12,7 +12,6 @@ const QUEUE_DEPTH: usize = 16;
 
 /// Queue a native notification for delivery on the worker thread.
 pub fn send_system_notification(title: &str, body: &str) {
-    eprintln!("Fastty notification queued: {title}");
     static WORKER: OnceLock<Result<SyncSender<(String, String)>, String>> = OnceLock::new();
     let worker = WORKER.get_or_init(|| {
         let (sender, receiver) = sync_channel::<(String, String)>(QUEUE_DEPTH);
@@ -80,11 +79,10 @@ mod macos {
     use block2::RcBlock;
     use objc2_06::msg_send;
     use objc2_06::runtime::{AnyObject, Bool};
-    use std::ptr::NonNull;
     use objc2_foundation::{NSError, NSString};
     use objc2_user_notifications::{
         UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest,
-        UNNotificationSettings, UNNotificationSound, UNUserNotificationCenter,
+        UNNotificationSound, UNUserNotificationCenter,
     };
 
     /// True only when the process carries a bundle identifier. An ObjC
@@ -127,11 +125,6 @@ mod macos {
                 UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
                 &granted_block,
             );
-            let settings_block = RcBlock::new(|settings: NonNull<UNNotificationSettings>| unsafe {
-                let status = settings.as_ref().authorizationStatus();
-                eprintln!("Fastty notification authorization status: {status:?}");
-            });
-            center.getNotificationSettingsWithCompletionHandler(&settings_block);
         });
     }
 
@@ -164,7 +157,6 @@ mod macos {
             }
         });
         center.addNotificationRequest_withCompletionHandler(&request, Some(&add_block));
-        eprintln!("Fastty notification posted: {title}");
     }
 }
 
