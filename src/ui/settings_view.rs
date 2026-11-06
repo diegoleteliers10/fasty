@@ -272,7 +272,9 @@ pub struct SettingsView {
     keyboard_list_state: ListState,
     keyboard_row_count: usize,
     settings_scroll_target: f32,
+    settings_scroll_offset: f32,
     settings_scroll_animating: bool,
+    theme_carousel_scroll: ScrollHandle,
     binding_render_cache: Option<std::rc::Rc<BindingRenderData>>,
     pub font_scroll_handle: UniformListScrollHandle,
     pub font_trigger_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
@@ -469,7 +471,9 @@ impl SettingsView {
             keyboard_list_state: ListState::new(0, ListAlignment::Top, px(240.)),
             keyboard_row_count: 0,
             settings_scroll_target: 0.0,
+            settings_scroll_offset: 0.0,
             settings_scroll_animating: false,
+            theme_carousel_scroll: ScrollHandle::new(),
             binding_render_cache: None,
             font_scroll_handle: UniformListScrollHandle::new(),
             font_trigger_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -2985,137 +2989,151 @@ impl SettingsView {
     fn render_tab_appearance(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let font_family = SharedString::from(self.font_family.clone());
 
-        // Theme grid: two cards per row, each with a live preview and a footer.
-        let mut theme_rows: Vec<gpui::AnyElement> = Vec::new();
-        for chunk in self.theme_cards.chunks(2) {
-            let mut row = div().flex().flex_row().items_stretch().gap(px(20.)).w_full();
-            for card in chunk {
-                let is_active = self.current_theme_name == card.name;
-                let name = card.name.clone();
-                row = row.child(
-                    div()
-                        .id(SharedString::from(format!("theme-card-{}", card.name)))
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .rounded(px(10.))
-                        .border_1()
-                        .border_color(if is_active { theme.accent } else { theme.border })
-                        .bg(theme.surface)
-                        .overflow_hidden()
-                        .cursor(CursorStyle::PointingHand)
-                        .hover(move |style| style.border_color(theme.muted_strong))
-                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                            this.set_theme(&name, cx);
-                        }))
-                        .child(
-                            div()
-                                .h(px(156.))
-                                .p(px(14.))
-                                .flex()
-                                .flex_col()
-                                .gap(px(7.))
-                                .bg(card.bg_color)
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .gap(px(4.))
-                                        .pb(px(4.))
-                                        .children((0..3).map(|_| {
-                                            div()
-                                                .w(px(6.))
-                                                .h(px(6.))
-                                                .rounded_full()
-                                                .bg(card.surf_color)
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .font_family(font_family.clone())
-                                        .text_size(px(12.5))
-                                        .text_color(card.fg_color)
-                                        .child("~ > fastty --version"),
-                                )
-                                .child(
-                                    div()
-                                        .font_family(font_family.clone())
-                                        .text_size(px(12.5))
-                                        .text_color(card.muted_color)
-                                        .child(format!("fastty {}", env!("CARGO_PKG_VERSION"))),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(4.))
-                                        .font_family(font_family.clone())
-                                        .text_size(px(12.5))
-                                        .text_color(card.acc_color)
-                                        .child("~ >")
-                                        .child(
-                                            div()
-                                                .w(px(6.))
-                                                .h(px(13.))
-                                                .bg(card.fg_color),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .mt_auto()
-                                        .w_full()
-                                        .h(px(22.))
-                                        .rounded(px(4.))
-                                        .overflow_hidden()
-                                        .flex()
-                                        .flex_row()
-                                        .children(card.ansi.into_iter().map(|color| {
-                                            div().flex_1().h_full().bg(color)
-                                        })),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .h(px(42.))
-                                .px(px(14.))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .justify_between()
-                                .bg(theme.surface_raised)
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(9.))
-                                        .child(
-                                            div()
-                                                .w(px(10.))
-                                                .h(px(10.))
-                                                .rounded_full()
-                                                .bg(card.acc_color),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(13.5))
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(theme.foreground)
-                                                .child(SharedString::from(card.label.clone())),
-                                        ),
-                                )
-                                .when(is_active, |row| {
-                                    row.child(render_icon(IconType::Check, theme.accent, 14.0))
-                                }),
-                        ),
-                );
-            }
-            if chunk.len() == 1 {
-                row = row.child(div().flex_1());
-            }
-            theme_rows.push(row.into_any_element());
+        // Theme carousel: fixed-width cards scrolled horizontally.
+        let mut theme_cards = div()
+            .id("theme-carousel")
+            .track_scroll(&self.theme_carousel_scroll)
+            .flex()
+            .flex_row()
+            .gap(px(20.))
+            .overflow_x_scroll()
+            .restrict_scroll_to_axis()
+            .w_full();
+        for card in &self.theme_cards {
+            let is_active = self.current_theme_name == card.name;
+            let name = card.name.clone();
+            theme_cards = theme_cards.child(
+                div()
+                    .id(SharedString::from(format!("theme-card-{}", card.name)))
+                    .w(px(300.))
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(if is_active { theme.accent } else { theme.border })
+                    .bg(theme.surface)
+                    .overflow_hidden()
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(move |style| style.border_color(theme.muted_strong))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                        this.set_theme(&name, cx);
+                    }))
+                    .child(
+                        div()
+                            .h(px(156.))
+                            .p(px(14.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(7.))
+                            .bg(card.bg_color)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(4.))
+                                    .pb(px(4.))
+                                    .children((0..3).map(|_| {
+                                        div()
+                                            .w(px(6.))
+                                            .h(px(6.))
+                                            .rounded_full()
+                                            .bg(card.surf_color)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .font_family(font_family.clone())
+                                    .text_size(px(12.5))
+                                    .text_color(card.fg_color)
+                                    .child("~ > fastty --version"),
+                            )
+                            .child(
+                                div()
+                                    .font_family(font_family.clone())
+                                    .text_size(px(12.5))
+                                    .text_color(card.muted_color)
+                                    .child(format!("fastty {}", env!("CARGO_PKG_VERSION"))),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .font_family(font_family.clone())
+                                    .text_size(px(12.5))
+                                    .text_color(card.acc_color)
+                                    .child("~ >")
+                                    .child(
+                                        div()
+                                            .w(px(6.))
+                                            .h(px(13.))
+                                            .bg(card.fg_color),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .mt_auto()
+                                    .w_full()
+                                    .h(px(22.))
+                                    .rounded(px(4.))
+                                    .overflow_hidden()
+                                    .flex()
+                                    .flex_row()
+                                    .children(card.ansi.into_iter().map(|color| {
+                                        div().flex_1().h_full().bg(color)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h(px(42.))
+                            .px(px(14.))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .bg(theme.surface_raised)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(9.))
+                                    .child(
+                                        div()
+                                            .w(px(10.))
+                                            .h(px(10.))
+                                            .rounded_full()
+                                            .bg(card.acc_color),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.foreground)
+                                            .child(SharedString::from(card.label.clone())),
+                                    ),
+                            )
+                            .when(is_active, |row| {
+                                row.child(render_icon(IconType::Check, theme.accent, 14.0))
+                            }),
+                    ),
+            );
         }
+
+        let theme_count = self.theme_cards.len();
+        let current_theme_index = (((self
+            .theme_carousel_scroll
+            .offset()
+            .x
+            .as_f32()
+            .abs()
+            / 320.0)
+            .round() as usize)
+            + 1)
+            .min(theme_count.max(1));
 
         let opacity_pills = [1.0, 0.95, 0.90, 0.85, 0.80, 0.75];
 
@@ -3139,7 +3157,65 @@ impl SettingsView {
                                 self.current_theme_name
                             ))),
                     )
-                    .children(theme_rows),
+                    .child(theme_cards)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .pt(px(4.))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(theme.muted)
+                                    .child(SharedString::from(format!(
+                                        "{current_theme_index} / {theme_count} themes"
+                                    ))),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .id("theme-prev")
+                                            .w(px(34.))
+                                            .h(px(34.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(px(8.))
+                                            .bg(theme.surface_raised)
+                                            .cursor(CursorStyle::PointingHand)
+                                            .hover(move |style| style.bg(theme.hover))
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                this.scroll_theme_carousel(1.0);
+                                                cx.notify();
+                                            }))
+                                            .child(render_icon(IconType::ChevronLeft, theme.muted_strong, 15.0)),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("theme-next")
+                                            .w(px(34.))
+                                            .h(px(34.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(px(8.))
+                                            .bg(theme.surface_raised)
+                                            .cursor(CursorStyle::PointingHand)
+                                            .hover(move |style| style.bg(theme.hover))
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                this.scroll_theme_carousel(-1.0);
+                                                cx.notify();
+                                            }))
+                                            .child(render_icon(IconType::ChevronRight, theme.muted_strong, 15.0)),
+                                    ),
+                            ),
+                    ),
             )
             // Window
             .child(
@@ -5239,8 +5315,18 @@ impl SettingsView {
         }
     }
 
+    fn scroll_theme_carousel(&mut self, direction: f32) {
+        const STEP: f32 = 320.0;
+        let max = self.theme_carousel_scroll.max_offset().x.as_f32().abs();
+        let current = self.theme_carousel_scroll.offset().x.as_f32();
+        self.theme_carousel_scroll
+            .set_offset(gpui::point(px((current + direction * STEP).clamp(-max, 0.0)), px(0.)));
+    }
+
     fn sync_settings_scroll_target(&mut self) {
-        self.settings_scroll_target = self.window_scroll_handle.offset().y.as_f32();
+        let offset = self.window_scroll_handle.offset().y.as_f32();
+        self.settings_scroll_target = offset;
+        self.settings_scroll_offset = offset;
     }
 
     fn handle_settings_scroll(
@@ -5254,6 +5340,7 @@ impl SettingsView {
             gpui::ScrollDelta::Lines(delta) => delta.y * 48.0,
         };
         if !delta.is_finite() || delta == 0.0 {
+            self.sync_settings_scroll_target();
             return;
         }
         // `max_offset` is positive; offsets are negative (0 at the top).
@@ -5261,8 +5348,10 @@ impl SettingsView {
         if !limit.is_finite() {
             return;
         }
-        // The target is authoritative: the built-in scroll may apply the same
-        // delta before this handler, but the animation sets an absolute offset.
+        // Undo any delta the built-in scroll already applied, then animate from
+        // the last painted offset to the new target.
+        self.window_scroll_handle
+            .set_offset(gpui::point(px(0.), px(self.settings_scroll_offset)));
         self.settings_scroll_target = (self.settings_scroll_target + delta).clamp(-limit, 0.0);
         if !self.settings_scroll_animating {
             self.settings_scroll_animating = true;
@@ -5273,15 +5362,17 @@ impl SettingsView {
                         .await;
                     let mut done = false;
                     let result = this.update(cx, |this, cx| {
-                        let current = this.window_scroll_handle.offset().y.as_f32();
+                        let current = this.settings_scroll_offset;
                         let target = this.settings_scroll_target;
                         let next = current + (target - current) * 0.5;
                         if (target - next).abs() <= 0.5 {
+                            this.settings_scroll_offset = target;
                             this.window_scroll_handle
                                 .set_offset(gpui::point(px(0.), px(target)));
                             this.settings_scroll_animating = false;
                             done = true;
                         } else {
+                            this.settings_scroll_offset = next;
                             this.window_scroll_handle
                                 .set_offset(gpui::point(px(0.), px(next)));
                         }
