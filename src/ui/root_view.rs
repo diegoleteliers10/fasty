@@ -17888,7 +17888,7 @@ impl Render for RootView {
             })
             .when(self.is_about_open, |this| {
                 let mut backdrop_bg = theme.black;
-                backdrop_bg.a = 0.65;
+                backdrop_bg.a = 0.55;
 
                 let pkg_ver = env!("CARGO_PKG_VERSION");
                 let platform_desc = if cfg!(target_os = "macos") {
@@ -18059,7 +18059,7 @@ impl Render for RootView {
             // Rename Tab Modal
             .when(self.is_rename_tab_open, |this| {
                 let mut backdrop_bg = theme.black;
-                backdrop_bg.a = 0.65;
+                backdrop_bg.a = 0.55;
                 this.child(
                     div()
                         .absolute()
@@ -18186,7 +18186,7 @@ impl Render for RootView {
             // Command Palette Modal
             .when(self.palette.is_open(), |this| {
                 let mut backdrop_bg = theme.black;
-                backdrop_bg.a = 0.65;
+                backdrop_bg.a = 0.55;
                 let groups = self.grouped_palette_commands();
                 let selected_idx = self.command_palette_selected;
                 let list_height = (_window.viewport_size().height.to_f64() as f32 - 260.0)
@@ -18642,7 +18642,7 @@ impl Render for RootView {
             // PR Picker Modal (F5)
             .when(self.is_pr_picker_open, |this| {
                 let mut backdrop_bg = theme.black;
-                backdrop_bg.a = 0.65;
+                backdrop_bg.a = 0.55;
                 let mode = self.pr_picker_mode.clone();
                 let query = self.pr_picker_query.to_lowercase();
                 let has_cwd = self.pr_picker_cwd.is_some();
@@ -21172,7 +21172,7 @@ impl Render for RootView {
             })
             // Global Multi-Tab Search Overlay
             .when(self.is_global_search_open, |this| {
-                let backdrop = gpui::hsla(0.0, 0.0, 0.0, 0.5);
+                let backdrop = gpui::hsla(0.0, 0.0, 0.0, 0.55);
                 let selected_idx = self.global_search_selected;
                 let list_height = (_window.viewport_size().height.to_f64() as f32 - 260.0)
                     .clamp(96.0, 300.0);
@@ -22083,7 +22083,7 @@ impl Render for RootView {
                     div()
                         .absolute()
                         .inset_0()
-                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
+                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.55))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -22205,7 +22205,7 @@ impl Render for RootView {
                     div()
                         .absolute()
                         .inset_0()
-                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
+                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.55))
                         .flex()
                         .items_center()
                         .justify_center()
