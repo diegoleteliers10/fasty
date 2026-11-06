@@ -19652,12 +19652,13 @@ impl Render for RootView {
             })
             // Project / Tab Jumper Modal
             .when(self.is_project_jumper_open, |this| {
+                let mut backdrop_bg = theme.black;
+                backdrop_bg.a = 0.55;
                 let query = self.project_jumper_query.to_lowercase();
-                let filtered_tabs: Vec<(usize, usize, String, Option<String>, Option<String>)> = self
+                let filtered_tabs: Vec<(usize, String, Option<String>, Option<String>)> = self
                     .tabs
                     .iter()
-                    .enumerate()
-                    .filter_map(|(idx, t)| {
+                    .filter_map(|t| {
                         let cwd_str = t.cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
                         let branch_str = t.git_status.as_ref().map(|g| g.branch.clone());
                         let matches = query.is_empty()
@@ -19665,62 +19666,174 @@ impl Render for RootView {
                             || cwd_str.as_ref().is_some_and(|c| c.to_lowercase().contains(&query))
                             || branch_str.as_ref().is_some_and(|b| b.to_lowercase().contains(&query));
                         if matches {
-                            Some((idx, t.id, t.title.clone(), cwd_str, branch_str))
+                            Some((t.id, t.title.clone(), cwd_str, branch_str))
                         } else {
                             None
                         }
                     })
                     .collect();
                 let selected_idx = self.project_jumper_selected;
+                let total = filtered_tabs.len();
+
+                let mut rows: Vec<gpui::AnyElement> = Vec::new();
+                if filtered_tabs.is_empty() {
+                    rows.push(
+                        div()
+                            .px(px(16.))
+                            .py(px(18.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme.foreground)
+                                    .child("No open tabs matching search"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted)
+                                    .child("Open a tab, or clear the search to see every tab."),
+                            )
+                            .into_any_element(),
+                    );
+                } else {
+                    for (idx, (tab_id, title, cwd_str, branch_str)) in
+                        filtered_tabs.into_iter().enumerate()
+                    {
+                        let is_selected = idx == selected_idx;
+                        rows.push(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .h(px(44.))
+                                .px(px(10.))
+                                .rounded(px(8.))
+                                .when(is_selected, |row| row.bg(theme.surface_raised))
+                                .when(!is_selected, |row| {
+                                    row.hover(move |style| style.bg(theme.hover))
+                                })
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                    if this.project_jumper_selected != idx {
+                                        this.project_jumper_selected = idx;
+                                        cx.notify();
+                                    }
+                                }))
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                    this.is_project_jumper_open = false;
+                                    this.select_tab(tab_id, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(20.))
+                                        .min_w(px(0.))
+                                        .child(
+                                            div()
+                                                .w(px(190.))
+                                                .flex_shrink_0()
+                                                .truncate()
+                                                .text_size(px(13.5))
+                                                .text_color(theme.foreground)
+                                                .child(SharedString::from(title)),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_size(px(12.5))
+                                                .text_color(theme.muted)
+                                                .child(SharedString::from(
+                                                    cwd_str.unwrap_or_else(|| "~".to_string()),
+                                                )),
+                                        ),
+                                )
+                                .when(branch_str.is_some(), |row| {
+                                    row.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(5.))
+                                            .text_size(px(11.5))
+                                            .text_color(theme.muted)
+                                            .child(render_icon(
+                                                IconType::GitBranch,
+                                                theme.muted,
+                                                11.0,
+                                            ))
+                                            .child(SharedString::from(
+                                                branch_str.unwrap_or_default(),
+                                            )),
+                                    )
+                                })
+                                .into_any_element(),
+                        );
+                    }
+                }
 
                 this.child(
                     div()
                         .absolute()
                         .inset_0()
-                        .bg(rgb_to_hsla(0, 0, 0).opacity(0.45))
+                        .bg(backdrop_bg)
                         .flex()
-                        .items_start()
-                        .justify_center()
-                        .pt(px(70.))
+                        .flex_col()
+                        .items_center()
+                        .px(px(16.))
+                        .pt(px(52.))
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                             this.is_project_jumper_open = false;
                             cx.notify();
                         }))
                         .child(
                             div()
-                                .w(px(520.))
-                                .rounded(px(10.))
+                                .occlude()
+                                .w_full()
+                                .max_w(px(560.))
+                                .max_h(gpui::relative(0.88))
+                                .rounded(px(12.))
                                 .bg(theme.surface)
                                 .border_1()
                                 .border_color(theme.border)
                                 .shadow_xl()
-                                .p(px(8.))
                                 .flex()
                                 .flex_col()
-                                .gap_2()
+                                .overflow_hidden()
                                 .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
                                     cx.stop_propagation();
                                 })
                                 .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
                                     cx.stop_propagation();
                                 })
-                                // Header & Search Input
                                 .child(
                                     div()
                                         .flex()
                                         .flex_row()
                                         .items_center()
-                                        .gap_2()
-                                        .px(px(8.))
-                                        .py(px(6.))
-                                        .rounded(px(6.))
-                                        .bg(theme.surface_raised)
-                                        .child(render_icon(IconType::Folder, theme.accent, 14.0))
+                                        .gap(px(14.))
+                                        .px(px(16.))
+                                        .pt(px(12.))
+                                        .pb(px(8.))
+                                        .child(render_icon(IconType::Folder, theme.accent, 16.0))
                                         .child(
                                             div()
                                                 .flex_1()
-                                                .text_size(px(13.))
-                                                .text_color(if self.project_jumper_query.is_empty() { theme.muted } else { theme.foreground })
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_size(px(15.))
+                                                .text_color(if self.project_jumper_query.is_empty() {
+                                                    theme.muted
+                                                } else {
+                                                    theme.foreground
+                                                })
                                                 .child(if self.project_jumper_query.is_empty() {
                                                     "Switch tab or project...".to_string()
                                                 } else {
@@ -19729,134 +19842,41 @@ impl Render for RootView {
                                         )
                                         .child(
                                             div()
-                                                .px(px(6.))
-                                                .py(px(2.))
-                                                .rounded(px(4.))
-                                                .bg(theme.surface)
-                                                .text_size(px(10.))
+                                                .text_size(px(11.5))
                                                 .text_color(theme.muted)
-                                                .child("ESC to close"),
+                                                .child(match total {
+                                                    0 => "no tabs".to_string(),
+                                                    1 => "1 tab".to_string(),
+                                                    n => format!("{n} tabs"),
+                                                }),
                                         ),
                                 )
-                                // Tab Jumper List
                                 .child(
                                     div()
                                         .id("project-jumper-list")
                                         .track_scroll(&self.project_jumper_scroll_handle)
                                         .flex()
                                         .flex_col()
-                                        .max_h(px(280.))
+                                        .max_h(px(320.))
+                                        .min_h(px(0.))
+                                        .flex_shrink(1.)
                                         .overflow_y_scroll()
-                                        .p(px(4.))
-                                        .gap_1()
-                                        .children(
-                                            if filtered_tabs.is_empty() {
-                                                vec![
-                                                    div()
-                                                        .p(px(16.))
-                                                        .flex()
-                                                        .flex_col()
-                                                        .gap_1()
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(12.))
-                                                                .text_color(theme.foreground)
-                                                                .child("No open tabs matching search"),
-                                                        ),
-                                                ]
-                                            } else {
-                                                filtered_tabs
-                                                    .into_iter()
-                                                    .enumerate()
-                                                    .map(|(idx, (_, tab_id, title, cwd_str, branch_str))| {
-                                                        let is_selected = idx == selected_idx;
-                                                        div()
-                                                            .flex()
-                                                            .flex_row()
-                                                            .items_center()
-                                                            .justify_between()
-                                                            .px(px(10.))
-                                                            .py(px(6.))
-                                                            .rounded(px(6.))
-                                                            .bg(if is_selected { theme.accent } else { theme.surface })
-                                                            .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
-                                                            .cursor(CursorStyle::PointingHand)
-                                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
-                                                                if this.project_jumper_selected != idx {
-                                                                    this.project_jumper_selected = idx;
-                                                                    cx.notify();
-                                                                }
-                                                            }))
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                                                this.is_project_jumper_open = false;
-                                                                this.select_tab(tab_id, cx);
-                                                            }))
-                                                            .child(
-                                                                div()
-                                                                    .flex()
-                                                                    .flex_col()
-                                                                    .min_w_0()
-                                                                    .flex_1()
-                                                                    .child(
-                                                                        div()
-                                                                            .text_size(px(12.))
-                                                                            .font_weight(FontWeight::BOLD)
-                                                                            .text_color(if is_selected { theme.black } else { theme.foreground })
-                                                                            .whitespace_nowrap()
-                                                                            .text_ellipsis()
-                                                                            .overflow_hidden()
-                                                                            .child(title),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .flex()
-                                                                            .flex_row()
-                                                                            .items_center()
-                                                                            .gap_1()
-                                                                            .min_w_0()
-                                                                            .text_size(px(10.5))
-                                                                            .text_color(if is_selected { theme.black.opacity(0.85) } else { theme.muted })
-                                                                            .child(render_icon(
-                                                                                IconType::Folder,
-                                                                                if is_selected { theme.black.opacity(0.85) } else { theme.muted },
-                                                                                10.0,
-                                                                            ))
-                                                                            .child(
-                                                                                div()
-                                                                                    .min_w_0()
-                                                                                    .whitespace_nowrap()
-                                                                                    .text_ellipsis()
-                                                                                    .overflow_hidden()
-                                                                                    .child(cwd_str.unwrap_or_else(|| "~".to_string())),
-                                                                            ),
-                                                                    ),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .px(px(6.))
-                                                                    .py(px(2.))
-                                                                    .rounded(px(3.))
-                                                                    .flex()
-                                                                    .flex_row()
-                                                                    .items_center()
-                                                                    .gap_1()
-                                                                    .bg(if is_selected { theme.black } else { theme.surface_raised })
-                                                                    .text_size(px(10.))
-                                                                    .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                                                                    .text_color(if is_selected { theme.accent } else { theme.muted })
-                                                                    .when(branch_str.is_some(), |el| {
-                                                                        el.child(render_icon(
-                                                                            IconType::GitBranch,
-                                                                            if is_selected { theme.accent } else { theme.muted },
-                                                                            10.0,
-                                                                        ))
-                                                                    })
-                                                                    .child(branch_str.unwrap_or_else(|| "Tab".to_string())),
-                                                            )
-                                                    })
-                                                    .collect()
-                                            }
-                                        ),
+                                        .px(px(10.))
+                                        .pb(px(8.))
+                                        .gap(px(4.))
+                                        .children(rows),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .px(px(16.))
+                                        .py(px(9.))
+                                        .text_size(px(11.))
+                                        .text_color(theme.muted)
+                                        .child("↑↓ navigate   ↵ switch tab   esc close"),
                                 ),
                         ),
                 )
