@@ -134,6 +134,17 @@ impl SettingsTab {
         }
     }
 
+    pub fn subtitle(&self) -> &'static str {
+        match self {
+            Self::General => "Layout, terminal behavior, notifications and updates.",
+            Self::Appearance => "Theme, fonts, and colors.",
+            Self::Keyboard => "Keybindings and modes.",
+            Self::Ai => "Providers, models, and assistant behavior.",
+            Self::Migration => "Import settings from other terminals.",
+            Self::Advanced => "Deeper configuration and diagnostics.",
+        }
+    }
+
     pub fn icon(&self) -> IconType {
         match self {
             Self::General => IconType::Settings,
@@ -2039,31 +2050,28 @@ fn render_toggle_switch(is_on: bool, theme: &Theme) -> gpui::Stateful<gpui::Div>
         .id(if is_on { "toggle-on" } else { "toggle-off" })
         .flex()
         .items_center()
-        .w(px(38.))
-        .h(px(22.))
+        .w(px(46.))
+        .h(px(26.))
         .rounded_full()
         .bg(if is_on { theme.accent } else { theme.surface_raised })
-        .border_1()
-        .border_color(if is_on { theme.accent } else { theme.border })
-        .p(px(2.))
+        .p(px(3.))
         .cursor(CursorStyle::PointingHand)
         .child(
             div()
-                .w(px(16.))
-                .h(px(16.))
+                .w(px(20.))
+                .h(px(20.))
                 .rounded_full()
-                .bg(if is_on { theme.white } else { theme.bright_black })
-                .when(is_on, |this| this.ml(px(16.))),
+                .bg(if is_on { theme.white } else { theme.muted_strong })
+                .when(is_on, |this| this.ml(px(20.))),
         )
 }
 
 fn render_section_header(title: impl Into<SharedString>, theme: &Theme) -> gpui::Div {
     div()
-        .text_size(px(12.))
-        .font_weight(FontWeight::BOLD)
-        .text_color(theme.muted_strong)
-        .mb(px(8.))
-        .child(title.into())
+        .text_size(px(13.))
+        .text_color(theme.muted)
+        .mb(px(10.))
+        .child(format!("# {}", title.into()))
 }
 
 fn render_group_card(theme: &Theme) -> gpui::Div {
@@ -2077,11 +2085,16 @@ fn render_group_card(theme: &Theme) -> gpui::Div {
         .flex_col()
 }
 
+/// Plain group used by the General page: rows sit on the page background.
+fn render_plain_group() -> gpui::Div {
+    div().flex().flex_col()
+}
+
 fn render_card_row(
     title: impl Into<SharedString>,
     subtitle: Option<impl Into<SharedString>>,
     control: impl IntoElement,
-    is_last: bool,
+    _is_last: bool,
     theme: &Theme,
 ) -> gpui::Div {
     div()
@@ -2091,7 +2104,7 @@ fn render_card_row(
         .justify_between()
         .px(px(16.))
         .py(px(12.))
-        .when(!is_last, |this| this.border_b_1().border_color(theme.border))
+        .when(!_is_last, |this| this.border_b_1().border_color(theme.border))
         .child(
             div()
                 .flex_1()
@@ -2128,6 +2141,53 @@ fn render_card_row(
         )
 }
 
+fn render_plain_row(
+    title: impl Into<SharedString>,
+    subtitle: Option<impl Into<SharedString>>,
+    control: impl IntoElement,
+    _is_last: bool,
+    theme: &Theme,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px(px(0.))
+        .py(px(16.))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .mr(px(12.))
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .child(
+                    div()
+                        .text_size(px(14.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                        .child(title.into()),
+                )
+                .when_some(subtitle, |this, sub| {
+                    this.child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(theme.muted)
+                            .child(sub.into()),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .max_w_full()
+                .min_w_0()
+                .child(control),
+        )
+}
+
 impl SettingsView {
     fn render_sidebar(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tabs = [
@@ -2148,13 +2208,11 @@ impl SettingsView {
 
         div()
             .id("settings-sidebar")
-            .w(px(230.))
-            .min_w(px(210.))
-            .max_w(px(250.))
+            .w(px(250.))
+            .min_w(px(230.))
+            .max_w(px(270.))
             .h_full()
-            .bg(theme.sidebar_bg)
-            .border_r_1()
-            .border_color(theme.border)
+            .bg(theme.main_bg)
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -2172,20 +2230,44 @@ impl SettingsView {
                         }
                     }),
             )
+            // Brand
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(16.))
+                    .mb(px(18.))
+                    .child(render_app_logo(20.0))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme.foreground)
+                            .child("Fastty"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.muted)
+                            .child(concat!("v", env!("CARGO_PKG_VERSION"))),
+                    ),
+            )
             // Search box
             .child({
                 let is_search_active = self.active_input_field == Some(ActiveInputField::Search);
                 let query = self.search_query.clone();
                 div()
                     .id("settings-search-bar")
-                    .mx(px(12.))
-                    .mb(px(10.))
-                    .h(px(32.))
+                    .mx(px(16.))
+                    .mb(px(18.))
+                    .h(px(36.))
                     .rounded(px(8.))
-                    .bg(theme.surface)
+                    .bg(theme.surface_raised)
                     .border_1()
                     .border_color(if is_search_active { theme.accent } else { theme.border })
-                    .px(px(10.))
+                    .px(px(12.))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -2194,12 +2276,12 @@ impl SettingsView {
                     .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                         this.active_input_field = Some(ActiveInputField::Search);
                         this.search_input.last_bounds = this.search_input_bounds.get();
-                        let col = this.search_input.index_for_position(ev.position, 11.5, 0.0, window);
+                        let col = this.search_input.index_for_position(ev.position, 12.5, 0.0, window);
                         this.search_input.start_drag(col);
                         this.is_dragging_input = true;
                         cx.notify();
                     }))
-                    .child(render_icon(IconType::Search, if is_search_active { theme.accent } else { theme.muted }, 12.0))
+                    .child(render_icon(IconType::Search, if is_search_active { theme.accent } else { theme.muted }, 14.0))
                     .child(
                         div()
                             .relative()
@@ -2233,9 +2315,9 @@ impl SettingsView {
                                     })
                                     .child(
                                         div()
-                                            .text_size(px(11.5))
+                                            .text_size(px(12.5))
                                             .text_color(theme.muted)
-                                            .child("Search settings..."),
+                                            .child("Search settings"),
                                     )
                             } else {
                                 crate::ui::text_input::render_line_spans(
@@ -2243,46 +2325,20 @@ impl SettingsView {
                                     0,
                                     if is_search_active { Some(self.search_input.cursor) } else { None },
                                     self.search_input.selection,
-                                    11.5,
+                                    12.5,
                                     theme,
                                     Some(window),
                                 )
                             })
                     )
             })
-            // App Branding / Profile Card
             .child(
                 div()
-                    .mx(px(10.))
-                    .mb(px(12.))
-                    .p(px(8.))
-                    .rounded(px(8.))
-                    .bg(theme.surface_raised.opacity(0.6))
-                    .border_1()
-                    .border_color(theme.border)
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2p5()
-                    .child(render_app_logo(22.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(theme.foreground)
-                                    .child("Fastty Terminal"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.5))
-                                    .text_color(theme.muted)
-                                    .child(concat!("v", env!("CARGO_PKG_VERSION"), " • Preferences")),
-                            ),
-                    ),
+                    .px(px(16.))
+                    .pb(px(10.))
+                    .text_size(px(10.5))
+                    .text_color(theme.muted)
+                    .child("PREFERENCES"),
             )
             // Tab list
             .child(
@@ -2293,7 +2349,7 @@ impl SettingsView {
                     .px(px(8.))
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap(px(4.))
                     .children(tabs.into_iter().map(|(tab, badge)| {
                         let is_active = self.active_tab == tab;
                         div()
@@ -2302,12 +2358,10 @@ impl SettingsView {
                             .flex_row()
                             .items_center()
                             .justify_between()
-                            .px(px(10.))
-                            .py(px(7.))
-                            .rounded(px(7.))
-                            .bg(if is_active { theme.surface_raised } else { theme.sidebar_bg })
-                            .border_1()
-                            .border_color(if is_active { theme.border } else { theme.sidebar_bg })
+                            .h(px(38.))
+                            .px(px(8.))
+                            .rounded(px(8.))
+                            .bg(if is_active { theme.surface_raised } else { theme.main_bg })
                             .hover(move |s| if !is_active { s.bg(theme.hover) } else { s })
                             .cursor(CursorStyle::PointingHand)
                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
@@ -2323,28 +2377,36 @@ impl SettingsView {
                                     .child(render_icon(
                                         tab.icon(),
                                         if is_active { theme.accent } else { theme.muted_strong },
-                                        13.0,
+                                        15.0,
                                     ))
                                     .child(
                                         div()
-                                            .text_size(px(12.5))
-                                            .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                            .text_size(px(13.5))
+                                            .font_weight(if is_active { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
                                             .text_color(if is_active { theme.foreground } else { theme.muted_strong })
                                             .child(tab.label()),
                                     ),
                             )
                             .when_some(badge, |this, badge_text| {
-                                this.child(
-                                    div()
-                                        .px(px(5.))
-                                        .py(px(1.))
-                                        .rounded(px(4.))
-                                        .bg(if is_active { theme.selected } else { theme.surface })
-                                        .text_size(px(10.))
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(if is_active { theme.accent } else { theme.muted })
-                                        .child(badge_text),
-                                )
+                                if tab == SettingsTab::Ai {
+                                    this.child(render_icon(
+                                        IconType::Sparkles,
+                                        theme.accent,
+                                        13.0,
+                                    ))
+                                } else {
+                                    this.child(
+                                        div()
+                                            .px(px(5.))
+                                            .py(px(1.))
+                                            .rounded(px(4.))
+                                            .bg(if is_active { theme.selected } else { theme.surface })
+                                            .text_size(px(10.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(if is_active { theme.accent } else { theme.muted })
+                                            .child(badge_text),
+                                    )
+                                }
                             })
                     })),
             )
@@ -2359,36 +2421,16 @@ impl SettingsView {
             .flex_col()
             .bg(theme.main_bg)
             .overflow_hidden()
-            // Header
+            // Top bar: drag region and the Esc hint
             .child(
                 div()
-                    .id("settings-header")
-                    .h(px(44.))
+                    .id("settings-top-bar")
+                    .h(px(42.))
                     .w_full()
-                    .bg(theme.main_bg)
-                    .border_b_1()
-                    .border_color(theme.border)
                     .flex()
                     .flex_row()
                     .items_center()
-                    .justify_between()
-                    .px(px(24.))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .child(render_icon(self.active_tab.icon(), theme.accent, 14.0))
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(theme.foreground)
-                                    .child(self.active_tab.label()),
-                            ),
-                    )
-                    // Drag region to move window
+                    .px(px(20.))
                     .child(
                         div()
                             .flex_1()
@@ -2407,12 +2449,22 @@ impl SettingsView {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap_2()
+                            .gap(px(6.))
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .px(px(6.))
+                                    .py(px(2.))
+                                    .rounded(px(4.))
+                                    .bg(theme.surface_raised)
+                                    .text_size(px(10.5))
+                                    .text_color(theme.muted_strong)
+                                    .child("esc"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
                                     .text_color(theme.muted)
-                                    .child("Press Esc to close"),
+                                    .child("to close"),
                             )
                             .when(!cfg!(target_os = "macos"), |this| {
                                 this.child(
@@ -2421,7 +2473,7 @@ impl SettingsView {
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        .w(px(26.))
+                                        .w(px(24.))
                                         .h(px(22.))
                                         .rounded(px(4.))
                                         .when(cfg!(target_os = "windows"), |this| {
@@ -2442,7 +2494,7 @@ impl SettingsView {
                 this.child(
                     div()
                         .w_full()
-                        .px(px(24.))
+                        .px(px(56.))
                         .py(px(8.))
                         .bg(theme.red.opacity(0.10))
                         .border_b_1()
@@ -2464,7 +2516,7 @@ impl SettingsView {
                         .items_center()
                         .gap_2()
                         .w_full()
-                        .px(px(24.))
+                        .px(px(56.))
                         .py(px(8.))
                         .bg(theme.accent.opacity(0.10))
                         .border_b_1()
@@ -2530,10 +2582,31 @@ impl SettingsView {
                             .track_scroll(&self.window_scroll_handle)
                             .size_full()
                             .overflow_y_scroll()
-                            .p(px(24.))
+                            .px(px(56.))
+                            .pt(px(28.))
+                            .pb(px(48.))
                             .flex()
                             .flex_col()
-                            .gap_6()
+                            .gap(px(24.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .text_size(px(32.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(theme.foreground)
+                                            .child(self.active_tab.label()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(14.))
+                                            .text_color(theme.muted)
+                                            .child(self.active_tab.subtitle()),
+                                    ),
+                            )
                             .child(match self.active_tab {
                                 SettingsTab::General => self.render_tab_general(theme, cx),
                                 SettingsTab::Appearance => self.render_tab_appearance(theme, window, cx),
@@ -2561,13 +2634,12 @@ impl SettingsView {
                     .flex_col()
                     .child(render_section_header("Tab Bar Layout", theme))
                     .child(
-                        render_group_card(theme)
-                            .p(px(14.))
+                        render_plain_group()
                             .child(
                                 div()
                                     .flex()
                                     .flex_row()
-                                    .gap_4()
+                                    .gap(px(24.))
                                     // Horizontal Card
                                     .child(
                                         div()
@@ -2576,13 +2648,12 @@ impl SettingsView {
                                             .flex()
                                             .flex_col()
                                             .items_center()
-                                            .gap_2p5()
-                                            .p(px(10.))
-                                            .rounded(px(8.))
+                                            .p(px(14.))
+                                            .rounded(px(12.))
                                             .bg(if is_horiz { theme.surface_raised } else { theme.surface })
                                             .border_1()
                                             .border_color(if is_horiz { theme.accent } else { theme.border })
-                                            .hover(move |s| s.bg(theme.surface_raised))
+                                            .hover(move |style| style.bg(theme.surface_raised))
                                             .cursor(CursorStyle::PointingHand)
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                                                 this.set_tab_layout(crate::config::TabLayout::Horizontal, cx);
@@ -2591,7 +2662,7 @@ impl SettingsView {
                                             .child(
                                                 div()
                                                     .w_full()
-                                                    .h(px(72.))
+                                                    .h(px(110.))
                                                     .rounded(px(6.))
                                                     .bg(theme.main_bg)
                                                     .border_1()
@@ -2625,30 +2696,16 @@ impl SettingsView {
                                                             .child(div().w(px(64.)).h(px(3.)).rounded_full().bg(theme.muted.opacity(0.5))),
                                                     ),
                                             )
-                                            // Pill label
                                             .child(
                                                 div()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .items_center()
-                                                    .gap_1p5()
-                                                    .px(px(10.))
-                                                    .py(px(4.))
-                                                    .rounded_full()
-                                                    .bg(if is_horiz { theme.selected } else { theme.surface })
-                                                    .border_1()
-                                                    .border_color(if is_horiz { theme.accent } else { theme.border })
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(11.5))
-                                                            .font_weight(if is_horiz { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                                                            .text_color(if is_horiz { theme.foreground } else { theme.muted })
-                                                            .child("Horizontal (Top Bar)"),
-                                                    )
-                                                    .when(is_horiz, |this| {
-                                                        this.child(render_icon(IconType::Check, theme.accent, 11.0))
-                                                    }),
-                                            ),
+                                                    .w_full()
+                                                    .pt(px(12.))
+                                                    .text_center()
+                                                    .text_size(px(13.5))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(if is_horiz { theme.foreground } else { theme.muted })
+                                                    .child("Horizontal (Top Bar)"),
+                                            )
                                     )
                                     // Vertical Card
                                     .child(
@@ -2658,13 +2715,12 @@ impl SettingsView {
                                             .flex()
                                             .flex_col()
                                             .items_center()
-                                            .gap_2p5()
-                                            .p(px(10.))
-                                            .rounded(px(8.))
+                                            .p(px(14.))
+                                            .rounded(px(12.))
                                             .bg(if is_vert { theme.surface_raised } else { theme.surface })
                                             .border_1()
                                             .border_color(if is_vert { theme.accent } else { theme.border })
-                                            .hover(move |s| s.bg(theme.surface_raised))
+                                            .hover(move |style| style.bg(theme.surface_raised))
                                             .cursor(CursorStyle::PointingHand)
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
                                                 this.set_tab_layout(crate::config::TabLayout::Vertical, cx);
@@ -2673,7 +2729,7 @@ impl SettingsView {
                                             .child(
                                                 div()
                                                     .w_full()
-                                                    .h(px(72.))
+                                                    .h(px(110.))
                                                     .rounded(px(6.))
                                                     .bg(theme.main_bg)
                                                     .border_1()
@@ -2708,30 +2764,16 @@ impl SettingsView {
                                                             .child(div().w(px(64.)).h(px(3.)).rounded_full().bg(theme.muted.opacity(0.5))),
                                                     ),
                                             )
-                                            // Pill label
                                             .child(
                                                 div()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .items_center()
-                                                    .gap_1p5()
-                                                    .px(px(10.))
-                                                    .py(px(4.))
-                                                    .rounded_full()
-                                                    .bg(if is_vert { theme.selected } else { theme.surface })
-                                                    .border_1()
-                                                    .border_color(if is_vert { theme.accent } else { theme.border })
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(11.5))
-                                                            .font_weight(if is_vert { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                                                            .text_color(if is_vert { theme.foreground } else { theme.muted })
-                                                            .child("Vertical (Sidebar)"),
-                                                    )
-                                                    .when(is_vert, |this| {
-                                                        this.child(render_icon(IconType::Check, theme.accent, 11.0))
-                                                    }),
-                                            ),
+                                                    .w_full()
+                                                    .pt(px(12.))
+                                                    .text_center()
+                                                    .text_size(px(13.5))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(if is_vert { theme.foreground } else { theme.muted })
+                                                    .child("Vertical (Sidebar)"),
+                                            )
                                     ),
                             ),
                     ),
@@ -2743,8 +2785,8 @@ impl SettingsView {
                     .flex_col()
                     .child(render_section_header("Terminal Behavior", theme))
                     .child(
-                        render_group_card(theme)
-                            .child(render_card_row(
+                        render_plain_group()
+                            .child(render_plain_row(
                                 "Cursor Blinking",
                                 Some("Smooth animated cursor in terminal buffer"),
                                 div()
@@ -2755,7 +2797,7 @@ impl SettingsView {
                                 false,
                                 theme,
                             ))
-                            .child(render_card_row(
+                            .child(render_plain_row(
                                 "Copy on Select",
                                 Some("Automatically copy highlighted text to system clipboard"),
                                 div()
@@ -2766,7 +2808,7 @@ impl SettingsView {
                                 false,
                                 theme,
                             ))
-                            .child(render_card_row(
+                            .child(render_plain_row(
                                 "Automatic Contrast Correction",
                                 Some("Fix program-requested colors that clash with the theme (Oklab lightness, hue preserved)"),
                                 div()
@@ -2785,36 +2827,35 @@ impl SettingsView {
                                     (50000, "50,000"),
                                     (100000, "100,000"),
                                 ];
-                                render_card_row(
+                                render_plain_row(
                                     "Scrollback History",
                                     Some("Maximum lines preserved in terminal buffer"),
                                     div()
                                         .flex()
                                         .flex_row()
-                                        .gap_1p5()
+                                        .gap(px(2.))
+                                        .p(px(3.))
+                                        .rounded(px(8.))
+                                        .bg(theme.surface_raised)
                                         .children(scrollback_pills.into_iter().map(|(lines, label)| {
                                             let is_active = self.scrollback == lines;
                                             div()
                                                 .flex()
                                                 .flex_row()
                                                 .items_center()
-                                                .gap_1()
-                                                .px(px(8.))
-                                                .py(px(4.))
-                                                .rounded(px(5.))
-                                                .border_1()
-                                                .border_color(if is_active { theme.accent } else { theme.border })
-                                                .bg(if is_active { theme.accent } else { theme.surface_raised })
+                                                .px(px(10.))
+                                                .py(px(5.))
+                                                .rounded(px(6.))
+                                                .when(is_active, |el| el.bg(theme.accent))
                                                 .hover(move |s| if !is_active { s.bg(theme.hover) } else { s })
-                                                .text_color(if is_active { theme.background } else { theme.foreground })
-                                                .text_size(px(11.))
-                                                .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                                .text_color(if is_active { theme.background } else { theme.muted })
+                                                .text_size(px(12.))
+                                                .font_weight(if is_active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
                                                 .cursor(CursorStyle::PointingHand)
                                                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
                                                     this.set_scrollback(lines, cx);
                                                 }))
                                                 .child(label)
-                                                .when(is_active, |el| el.child(render_icon(IconType::Check, theme.background, 10.0)))
                                         })),
                                     true,
                                     theme,
@@ -2828,8 +2869,8 @@ impl SettingsView {
                     .flex_col()
                     .child(render_section_header("Notifications", theme))
                     .child(
-                        render_group_card(theme)
-                            .child(render_card_row(
+                        render_plain_group()
+                            .child(render_plain_row(
                                 "AI Status",
                                 None::<&str>,
                                 div()
@@ -2840,7 +2881,7 @@ impl SettingsView {
                                 false,
                                 theme,
                             ))
-                            .child(render_card_row(
+                            .child(render_plain_row(
                                 "Program Status",
                                 None::<&str>,
                                 div()
@@ -2859,57 +2900,56 @@ impl SettingsView {
                     .flex_col()
                     .child(render_section_header("Updates", theme))
                     .child(
-                        render_group_card(theme)
+                        render_plain_group()
                             .child({
                                 let channels = [
                                     ("stable", "Stable"),
                                     ("beta", "Beta"),
                                 ];
-                                render_card_row(
+                                render_plain_row(
                                     "Update Channel",
                                     Some("Beta includes prereleases"),
                                     div()
                                         .flex()
                                         .flex_row()
-                                        .gap_1p5()
+                                        .gap(px(2.))
+                                        .p(px(3.))
+                                        .rounded(px(8.))
+                                        .bg(theme.surface_raised)
                                         .children(channels.into_iter().map(|(id, label)| {
                                             let is_active = self.update_channel == id;
                                             div()
                                                 .flex()
                                                 .flex_row()
                                                 .items_center()
-                                                .gap_1()
-                                                .px(px(8.))
-                                                .py(px(4.))
-                                                .rounded(px(5.))
-                                                .border_1()
-                                                .border_color(if is_active { theme.accent } else { theme.border })
-                                                .bg(if is_active { theme.accent } else { theme.surface_raised })
+                                                .px(px(10.))
+                                                .py(px(5.))
+                                                .rounded(px(6.))
+                                                .when(is_active, |el| el.bg(theme.accent))
                                                 .hover(move |s| if !is_active { s.bg(theme.hover) } else { s })
-                                                .text_color(if is_active { theme.background } else { theme.foreground })
-                                                .text_size(px(11.))
-                                                .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                                .text_color(if is_active { theme.background } else { theme.muted })
+                                                .text_size(px(12.))
+                                                .font_weight(if is_active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
                                                 .cursor(CursorStyle::PointingHand)
                                                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
                                                     this.set_update_channel(id, cx);
                                                 }))
                                                 .child(label)
-                                                .when(is_active, |el| el.child(render_icon(IconType::Check, theme.background, 10.0)))
                                         })),
                                     false,
                                     theme,
                                 )
                             })
-                            .child(render_card_row(
+                            .child(render_plain_row(
                                 "Version",
                                 Some("Current installed version"),
                                 div()
-                                    .px(px(7.))
-                                    .py(px(2.))
-                                    .rounded(px(4.))
+                                    .px(px(9.))
+                                    .py(px(4.))
+                                    .rounded(px(6.))
                                     .bg(theme.surface_raised)
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::BOLD)
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme.muted_strong)
                                     .child(concat!("v", env!("CARGO_PKG_VERSION"))),
                                 false,
@@ -2933,7 +2973,7 @@ impl SettingsView {
                                 let show_skip = self.update_found.is_some()
                                     && !self.update_ready
                                     && !self.update_checking;
-                                render_card_row(
+                                render_plain_row(
                                     "Check for updates",
                                     status.as_deref(),
                                     div()
@@ -2962,13 +3002,13 @@ impl SettingsView {
                                         })
                                         .child(
                                             div()
-                                                .px(px(10.))
-                                                .py(px(5.))
-                                                .rounded(px(6.))
+                                                .px(px(14.))
+                                                .py(px(7.))
+                                                .rounded(px(7.))
                                                 .bg(theme.accent)
                                                 .cursor(CursorStyle::PointingHand)
-                                                .text_size(px(11.5))
-                                                .font_weight(FontWeight::BOLD)
+                                                .text_size(px(12.))
+                                                .font_weight(FontWeight::SEMIBOLD)
                                                 .text_color(theme.background)
                                                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, window, cx| {
                                                     this.update_primary_action(window, cx);
