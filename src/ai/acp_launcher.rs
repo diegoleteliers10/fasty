@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context};
@@ -11,8 +11,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 static INSTALL_LOCK: Mutex<()> = Mutex::new(());
+static LOGIN_SHELL_PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 const REGISTRY: &str = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
 const MAX_ARCHIVE: u64 = 512 * 1024 * 1024;
+const PATH_MARKER_START: &str = "__FASTTY_PATH_START__";
+const PATH_MARKER_END: &str = "__FASTTY_PATH_END__";
+const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Serialize, Deserialize)]
 struct Launch {
@@ -72,28 +76,132 @@ pub(crate) fn prepare(command: &OsStr, args: &[String], cwd: &Path) -> anyhow::R
 }
 
 fn search_paths() -> Vec<PathBuf> {
-    let mut paths: Vec<_> = std::env::var_os("PATH")
-        .map(|value| std::env::split_paths(&value).collect())
-        .unwrap_or_default();
+    let mut paths = Vec::new();
+    push_unique(
+        &mut paths,
+        std::env::var_os("PATH")
+            .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    // A Finder launch starts with a bare PATH, so ask the login shell where
+    // the user actually installs tools. This finds OpenCode in ~/.opencode/bin
+    // and version-manager shims (nvm, asdf, mise, fnm) without extra config.
+    push_unique(&mut paths, login_shell_paths().iter().cloned());
     if let Some(home) = dirs::home_dir() {
-        for dir in [
-            ".local/bin",
-            ".bun/bin",
-            ".npm-global/bin",
-            ".cargo/bin",
-            ".volta/bin",
-        ] {
-            paths.push(home.join(dir));
-        }
+        push_unique(
+            &mut paths,
+            [
+                ".local/bin",
+                ".opencode/bin",
+                ".bun/bin",
+                ".npm-global/bin",
+                ".cargo/bin",
+                ".volta/bin",
+            ]
+            .into_iter()
+            .map(|dir| home.join(dir)),
+        );
         #[cfg(windows)]
-        paths.push(home.join("AppData/Roaming/npm"));
+        push_unique(&mut paths, [home.join("AppData/Roaming/npm")]);
     }
-    paths.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].map(PathBuf::from));
+    push_unique(
+        &mut paths,
+        ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].map(PathBuf::from),
+    );
     #[cfg(windows)]
     if let Some(program_files) = std::env::var_os("ProgramFiles") {
-        paths.push(PathBuf::from(program_files).join("nodejs"));
+        push_unique(&mut paths, [PathBuf::from(program_files).join("nodejs")]);
     }
     paths
+}
+
+fn push_unique(paths: &mut Vec<PathBuf>, candidates: impl IntoIterator<Item = PathBuf>) {
+    for candidate in candidates {
+        if !candidate.as_os_str().is_empty() && !paths.contains(&candidate) {
+            paths.push(candidate);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn login_shell_paths() -> &'static [PathBuf] {
+    LOGIN_SHELL_PATHS.get_or_init(|| login_shell_path().unwrap_or_default())
+}
+
+#[cfg(not(unix))]
+fn login_shell_paths() -> &'static [PathBuf] {
+    &[]
+}
+
+/// Reads PATH from the user's interactive login shell once per process. The
+/// probe writes markers around the value, so prompt or rc noise cannot leak
+/// into the result. It runs on a worker thread with a hard deadline and a
+/// discarded stderr.
+#[cfg(unix)]
+fn login_shell_path() -> Option<Vec<PathBuf>> {
+    let shell = std::env::var_os("SHELL")
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or_else(|| OsString::from("/bin/zsh"));
+    let script = login_shell_script(&shell);
+    let mut child = Command::new(&shell)
+        .args(["-ilc", script.as_str()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("acp-login-path".into())
+        .spawn(move || {
+            let mut output = String::new();
+            let _ = std::io::BufReader::new(stdout)
+                .take(64 * 1024)
+                .read_to_string(&mut output);
+            let _ = sender.send(output);
+        })
+        .ok()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < LOGIN_SHELL_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let output = receiver.recv_timeout(Duration::from_secs(1)).ok()?;
+    parse_login_shell_path(&output)
+}
+
+/// Fish keeps PATH as a list, so a plain `"$PATH"` expands with spaces. Join
+/// it with colons the way the exported variable looks.
+#[cfg(unix)]
+fn login_shell_script(shell: &OsStr) -> String {
+    let name = Path::new(shell)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let value = if name.contains("fish") {
+        "(string join : $PATH)"
+    } else {
+        "\"$PATH\""
+    };
+    format!("printf '\\n{PATH_MARKER_START}%s{PATH_MARKER_END}\\n' {value}")
+}
+
+fn parse_login_shell_path(output: &str) -> Option<Vec<PathBuf>> {
+    let start = output.find(PATH_MARKER_START)? + PATH_MARKER_START.len();
+    let rest = &output[start..];
+    let end = rest.find(PATH_MARKER_END)?;
+    let paths: Vec<PathBuf> = std::env::split_paths(&rest[..end]).collect();
+    (!paths.is_empty()).then_some(paths)
 }
 
 fn executable(path: &Path) -> bool {
@@ -518,5 +626,60 @@ fn run(mut command: Command, root: &Path, timeout: Duration) -> anyhow::Result<S
             );
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_marked_path_and_ignores_shell_noise() {
+        let output = format!(
+            "welcome to zsh\n{PATH_MARKER_START}/usr/bin:/opt/homebrew/bin{PATH_MARKER_END}\nbye\n"
+        );
+        assert_eq!(
+            parse_login_shell_path(&output),
+            Some(vec![
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/opt/homebrew/bin")
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_unmarked_shell_output() {
+        assert_eq!(
+            parse_login_shell_path("zsh: command not found: brew\n"),
+            None
+        );
+        assert_eq!(parse_login_shell_path(""), None);
+    }
+
+    #[test]
+    fn fish_joins_the_path_list_with_colons() {
+        assert!(login_shell_script(OsStr::new("/opt/homebrew/bin/fish"))
+            .contains("string join : $PATH"));
+        assert!(login_shell_script(OsStr::new("/bin/zsh")).contains("\"$PATH\""));
+    }
+
+    #[test]
+    fn push_unique_keeps_order_and_drops_duplicates() {
+        let mut paths = vec![PathBuf::from("/usr/bin")];
+        push_unique(
+            &mut paths,
+            [
+                PathBuf::from("/usr/bin"),
+                PathBuf::from(""),
+                PathBuf::from("/opt/homebrew/bin"),
+            ],
+        );
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/opt/homebrew/bin")
+            ]
+        );
     }
 }
