@@ -20599,8 +20599,9 @@ impl Render for RootView {
                                                         .items_center()
                                                         .justify_between()
                                                         .w_full()
-                                                        .h(px(26.))
-                                                        .px(px(7.))
+                                                        .h(px(36.))
+                                                        .flex_shrink_0()
+                                                        .px(px(9.))
                                                         .rounded(px(6.))
                                                         .cursor(CursorStyle::PointingHand)
                                                         .hover(move |style| style.bg(hover_bg))
@@ -20640,14 +20641,14 @@ impl Render for RootView {
                                                                     } else {
                                                                         theme.muted
                                                                     },
-                                                                    12.0,
+                                                                    13.0,
                                                                 ))
                                                                 .child(
                                                                     div()
                                                                         .flex_1()
                                                                         .overflow_hidden()
                                                                         .text_ellipsis()
-                                                                        .text_size(px(11.5))
+                                                                        .text_size(px(12.5))
                                                                         .font_weight(if is_current {
                                                                             FontWeight::BOLD
                                                                         } else {
