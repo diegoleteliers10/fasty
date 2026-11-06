@@ -19933,9 +19933,19 @@ impl Render for RootView {
                 let vp = _window.viewport_size();
                 let vp_w = vp.width.to_f64() as f32;
                 let vp_h = vp.height.to_f64() as f32;
-                let menu_w: f32 = 560.0_f32.min((vp_w - 16.0).max(160.0));
-                let list_max_h: f32 = (vp_h - 150.0).clamp(120.0, 320.0);
-                let menu_h: f32 = list_max_h + 91.0;
+                let menu_w: f32 = 420.0_f32.min((vp_w - 16.0).max(160.0));
+                let list_max_h: f32 = (vp_h - 220.0).clamp(96.0, 220.0);
+                // Height of the rendered list, not the cap, so the popup stays
+                // attached to the prompt when the filter leaves few rows.
+                let row_count = matches.len();
+                let list_content_h = if row_count == 0 {
+                    59.0
+                } else {
+                    row_count as f32 * 32.0 + (row_count as f32 - 1.0) * 2.0 + 6.0
+                };
+                let list_h = list_max_h.min(list_content_h);
+                const FILE_PICKER_CHROME_H: f32 = 91.0;
+                let menu_h: f32 = list_h + FILE_PICKER_CHROME_H;
                 let (anchor_x, anchor_y) = self.file_picker_anchor.unwrap_or_else(|| {
                     ((vp_w - menu_w) / 2.0, (vp_h - 160.0).max(0.0))
                 });
@@ -19944,11 +19954,13 @@ impl Render for RootView {
                 } else {
                     anchor_x.max(8.0)
                 };
-                // Open below the input line; flip above it near the screen bottom.
-                let popup_y = if anchor_y + 24.0 + menu_h > vp_h - 28.0 {
-                    (anchor_y - 8.0 - menu_h).max(36.0)
+                // Open above the input line so the prompt stays visible; fall
+                // back below only when there is no room above.
+                let above = anchor_y - 12.0 - menu_h;
+                let popup_y = if above >= 36.0 {
+                    above
                 } else {
-                    anchor_y + 24.0
+                    (anchor_y + 24.0).min(vp_h - menu_h - 8.0).max(36.0)
                 };
 
                 let mut rows: Vec<gpui::AnyElement> = Vec::new();
@@ -20002,9 +20014,9 @@ impl Render for RootView {
                                 .flex_row()
                                 .items_center()
                                 .justify_between()
-                                .h(px(40.))
+                                .h(px(32.))
                                 .px(px(10.))
-                                .rounded(px(8.))
+                                .rounded(px(7.))
                                 .when(is_selected, |row| row.bg(theme.surface_raised))
                                 .when(!is_selected, |row| {
                                     row.hover(move |style| style.bg(theme.hover))
@@ -20031,7 +20043,7 @@ impl Render for RootView {
                                         .child(render_icon(
                                             icon,
                                             if is_selected { theme.accent } else { theme.muted_strong },
-                                            15.0,
+                                            13.0,
                                         ))
                                         .child(
                                             div()
@@ -20050,7 +20062,7 @@ impl Render for RootView {
                                                 div()
                                                     .min_w(px(0.))
                                                     .truncate()
-                                                    .text_size(px(11.5))
+                                                    .text_size(px(10.5))
                                                     .text_color(theme.muted)
                                                     .child(SharedString::from(detail)),
                                             )
@@ -20060,7 +20072,7 @@ impl Render for RootView {
                                     row.child(
                                         div()
                                             .flex_shrink_0()
-                                            .text_size(px(11.))
+                                            .text_size(px(10.))
                                             .text_color(theme.muted)
                                             .child(kind_label),
                                     )
@@ -20070,7 +20082,7 @@ impl Render for RootView {
                                         div()
                                             .flex_shrink_0()
                                             .font_family(self.font_family.clone())
-                                            .text_size(px(12.5))
+                                            .text_size(px(11.))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(letter_color)
                                             .child(letter),
@@ -20124,17 +20136,17 @@ impl Render for RootView {
                                 .flex()
                                 .flex_row()
                                 .items_center()
-                                .gap(px(12.))
-                                .px(px(16.))
-                                .pt(px(12.))
-                                .pb(px(8.))
-                                .child(render_icon(IconType::Search, theme.accent, 16.0))
+                                .gap(px(10.))
+                                .px(px(12.))
+                                .pt(px(10.))
+                                .pb(px(6.))
+                                .child(render_icon(IconType::Search, theme.accent, 14.0))
                                 .child(
                                     div()
                                         .flex_1()
                                         .min_w(px(0.))
                                         .truncate()
-                                        .text_size(px(15.))
+                                        .text_size(px(13.5))
                                         .text_color(if self.file_picker_query.is_empty() {
                                             theme.muted
                                         } else {
@@ -20150,10 +20162,10 @@ impl Render for RootView {
                         // Search root breadcrumb
                         .child(
                             div()
-                                .px(px(16.))
-                                .pb(px(6.))
+                                .px(px(12.))
+                                .pb(px(4.))
                                 .truncate()
-                                .text_size(px(11.5))
+                                .text_size(px(10.5))
                                 .text_color(theme.muted)
                                 .child(SharedString::from(root_label)),
                         )
@@ -20180,9 +20192,9 @@ impl Render for RootView {
                                 .flex_row()
                                 .items_center()
                                 .justify_between()
-                                .px(px(16.))
-                                .py(px(9.))
-                                .text_size(px(11.5))
+                                .px(px(12.))
+                                .py(px(7.))
+                                .text_size(px(10.5))
                                 .text_color(theme.muted)
                                 .child(
                                     div()
@@ -20213,11 +20225,11 @@ impl Render for RootView {
                                         .flex_shrink_0()
                                         .child(
                                             div()
-                                                .px(px(6.))
-                                                .py(px(2.))
+                                                .px(px(5.))
+                                                .py(px(1.))
                                                 .rounded(px(4.))
                                                 .bg(theme.surface_raised)
-                                                .text_size(px(10.5))
+                                                .text_size(px(10.))
                                                 .text_color(theme.muted_strong)
                                                 .child("↵"),
                                         )
