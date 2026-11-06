@@ -200,8 +200,6 @@ impl RenderOnce for ProjectSidebar {
             .w(px(self.width))
             .h_full()
             .bg(theme.sidebar_bg)
-            .border_l_1()
-            .border_color(theme.border)
             .child(
                 div()
                     .flex()

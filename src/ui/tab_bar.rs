@@ -653,8 +653,6 @@ impl RenderOnce for TabSidebar {
             .flex()
             .flex_col()
             .bg(theme.tab_bar_bg)
-            .border_r_1()
-            .border_color(theme.border)
             .overflow_hidden()
             .flex_shrink_0()
             .child(
