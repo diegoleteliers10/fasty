@@ -18248,7 +18248,7 @@ impl Render for RootView {
                             .flex_row()
                             .items_center()
                             .justify_between()
-                            .h(px(50.))
+                            .h(px(40.))
                             .flex_shrink_0()
                             .px(px(12.))
                             .rounded(px(8.))
