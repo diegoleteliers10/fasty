@@ -233,6 +233,8 @@ pub struct SettingsView {
     pub font_search_query: String,
     pub font_search_state: crate::ui::TextInputState,
     pub font_highlighted_index: usize,
+    pub ai_model_dropdown_open: bool,
+    pub ai_model_scroll_handle: ScrollHandle,
     binding_render_cache: Option<std::rc::Rc<BindingRenderData>>,
     pub font_scroll_handle: UniformListScrollHandle,
     pub font_trigger_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
@@ -421,6 +423,8 @@ impl SettingsView {
             font_search_query: String::new(),
             font_search_state: crate::ui::TextInputState::default(),
             font_highlighted_index: 0,
+            ai_model_dropdown_open: false,
+            ai_model_scroll_handle: ScrollHandle::new(),
             binding_render_cache: None,
             font_scroll_handle: UniformListScrollHandle::new(),
             font_trigger_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -1013,6 +1017,11 @@ impl SettingsView {
         if ev.keystroke.key.eq_ignore_ascii_case("escape")
             || ev.keystroke.key.eq_ignore_ascii_case("esc")
         {
+            if self.ai_model_dropdown_open {
+                self.ai_model_dropdown_open = false;
+                cx.notify();
+                return;
+            }
             if self.font_combobox_open {
                 self.font_combobox_open = false;
                 if self.active_input_field == Some(ActiveInputField::FontSearch) {
@@ -4166,10 +4175,19 @@ impl SettingsView {
                         })),
                     ),
             )
-            // Section 2: Model Configuration (BYOK)
+            // Section 2: Model selector
             .child({
                 let is_model_focused = self.active_input_field == Some(ActiveInputField::AiModel);
                 let model_val = self.ai_model_input.clone();
+                let is_open = self.ai_model_dropdown_open;
+                let model_count = chips_to_render.len();
+                let subtitle = if is_acp {
+                    format!("{model_count} available from the agent, or type any model ID")
+                } else if is_ollama {
+                    format!("{model_count} installed models, or type any model ID")
+                } else {
+                    format!("{model_count} presets, or type any model ID")
+                };
 
                 div()
                     .flex()
@@ -4178,194 +4196,221 @@ impl SettingsView {
                     .child(
                         div().flex().flex_col()
                             .child(render_plain_row_inset(
-                                "Model Identifier",
-                                Some("Model name or alias (e.g. GLM-5.7, Opus 5)"),
+                                if is_acp { "Model" } else { "Model Identifier" },
+                                Some(subtitle),
                                 div()
                                     .w(px(300.))
-                                    .h(px(40.))
                                     .relative()
-                                    .child({
-                                        let bounds_cell = self.ai_model_bounds.clone();
-                                        canvas(
-                                            |_, _, _| {},
-                                            move |bounds, _, _, _| {
-                                                bounds_cell.set(Some(bounds));
-                                            },
-                                        )
-                                        .absolute()
-                                        .size_full()
-                                    })
-                                    .px(px(10.))
-                                    .rounded(px(8.))
-                                    .bg(theme.surface_raised)
-                                    .border_1()
-                                    .border_color(if is_model_focused { theme.accent } else { theme.border })
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .cursor(CursorStyle::IBeam)
-                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                                        this.active_input_field = Some(ActiveInputField::AiModel);
-                                        this.ai_model_state.last_bounds = this.ai_model_bounds.get();
-                                        let col = this.ai_model_state.index_for_position(ev.position, 13.0, 10.0, window);
-                                        this.ai_model_state.start_drag(col);
-                                        this.is_dragging_input = true;
-                                        cx.notify();
-                                    }))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.))
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .overflow_hidden()
-                                            .child(if model_val.is_empty() {
-                                                div()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .items_center()
-                                                    .when(is_model_focused, |this| {
-                                                        this.child(
-                                                            div()
-                                                                .w(px(2.))
-                                                                .h(px(13.))
-                                                                .rounded(px(1.))
-                                                                .bg(theme.accent)
-                                                                .mr(px(2.)),
-                                                        )
-                                                    })
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(13.))
-                                                            .text_color(theme.muted)
-                                                            .child(match self.ai_provider.as_str() {
-                                                                "ollama" => "e.g. gemma4:12b",
-                                                                "anthropic" => "e.g. claude-3-7-sonnet",
-                                                                "openai" => "e.g. gpt-4o",
-                                                                _ => "Custom model identifier...",
-                                                            }),
-                                                    )
-                                            } else {
-                                                crate::ui::text_input::render_line_spans(
-                                                    &model_val,
-                                                    0,
-                                                    if is_model_focused { Some(self.ai_model_state.cursor) } else { None },
-                                                    self.ai_model_state.selection,
-                                                    13.0,
-                                                    theme,
-                                                    Some(window),
-                                                )
-                                            }),
-                                    )
-                                    .when(!model_val.is_empty(), |this| {
-                                        this.child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .ml(px(4.))
-                                                .px(px(4.))
-                                                .py(px(1.))
-                                                .rounded(px(3.))
-                                                .hover(move |s| s.bg(theme.hover))
-                                                .cursor(CursorStyle::PointingHand)
-                                                .text_size(px(10.))
-                                                .text_color(theme.muted)
-                                                .child("✕")
-                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                    this.clear_ai_model(cx);
-                                                })),
-                                        )
-                                    }),
-                                false,
-                                theme,
-                            ))
-                            .child(
-                                div()
-                                    .px(px(14.))
-                                    .py(px(8.))
                                     .flex()
                                     .flex_col()
-                                    .gap(px(10.))
                                     .child(
                                         div()
+                                            .w_full()
+                                            .h(px(40.))
+                                            .relative()
+                                            .child({
+                                                let bounds_cell = self.ai_model_bounds.clone();
+                                                canvas(
+                                                    |_, _, _| {},
+                                                    move |bounds, _, _, _| {
+                                                        bounds_cell.set(Some(bounds));
+                                                    },
+                                                )
+                                                .absolute()
+                                                .size_full()
+                                            })
+                                            .px(px(10.))
+                                            .rounded(px(8.))
+                                            .bg(theme.surface_raised)
+                                            .border_1()
+                                            .border_color(if is_model_focused || is_open { theme.accent } else { theme.border })
                                             .flex()
                                             .flex_row()
                                             .items_center()
                                             .justify_between()
+                                            .cursor(CursorStyle::IBeam)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                                                this.active_input_field = Some(ActiveInputField::AiModel);
+                                                this.ai_model_state.last_bounds = this.ai_model_bounds.get();
+                                                let col = this.ai_model_state.index_for_position(ev.position, 13.0, 10.0, window);
+                                                this.ai_model_state.start_drag(col);
+                                                this.is_dragging_input = true;
+                                                cx.notify();
+                                            }))
                                             .child(
                                                 div()
-                                                    .text_size(px(12.))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(theme.foreground)
-                                                    .child(if is_ollama {
-                                                        "Installed Local Models"
-                                                    } else if is_acp {
-                                                        "Available ACP Models"
-                                                    } else {
-                                                        "Preset & Recent Models"
-                                                    }),
-                                            )
-                                            .when(is_ollama, |this| {
-                                                this.child(
-                                                    div()
-                                                        .px(px(7.))
-                                                        .py(px(3.))
-                                                        .rounded(px(5.))
-                                                        .bg(theme.surface_raised)
-                                                        .border_1()
-                                                        .border_color(theme.border)
-                                                        .cursor(CursorStyle::PointingHand)
-                                                        .hover(move |s| s.bg(theme.hover))
-                                                        .text_size(px(11.5))
-                                                        .text_color(theme.accent)
-                                                        .child("Refresh ↺")
-                                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                            this.refresh_ollama_models(cx);
-                                                        })),
-                                                )
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .flex_wrap()
-                                            .gap_1p5()
-                                            .children(chips_to_render.into_iter().map(|model_name| {
-                                                let is_active = self.ai_model_input.trim() == model_name;
-                                                let m_name = model_name.clone();
-                                                div()
-                                                    .id(SharedString::from(format!("ai-model-pill-{}", model_name)))
+                                                    .flex_1()
+                                                    .min_w(px(0.))
                                                     .flex()
                                                     .flex_row()
                                                     .items_center()
-                                                    .gap_1p5()
-                                                    .px(px(10.))
-                                                    .py(px(6.))
-                                                    .rounded(px(6.))
-                                                    .bg(if is_active { theme.accent } else { theme.surface_raised })
-                                                    .hover(move |s| if is_active { s } else { s.bg(theme.hover) })
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                                        this.set_ai_model(&m_name, cx);
-                                                    }))
-                                                    .when(is_ollama && !self.detected_ollama_models.is_empty(), |el| {
-                                                        el.child(div().w(px(6.)).h(px(6.)).rounded_full().bg(theme.green))
-                                                    })
-                                                    .child(
+                                                    .overflow_hidden()
+                                                    .child(if model_val.is_empty() {
                                                         div()
-                                                            .text_size(px(12.5))
-                                                            .font_weight(if is_active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
-                                                            .text_color(if is_active { theme.background } else { theme.muted })
-                                                            .child(SharedString::from(model_name)),
-                                                    )
-                                                    .when(is_active, |this| {
-                                                        this.child(render_icon(IconType::Check, theme.background, 11.0))
-                                                    })
-                                            }))
+                                                            .flex()
+                                                            .flex_row()
+                                                            .items_center()
+                                                            .when(is_model_focused, |this| {
+                                                                this.child(
+                                                                    div()
+                                                                        .w(px(2.))
+                                                                        .h(px(13.))
+                                                                        .rounded(px(1.))
+                                                                        .bg(theme.accent)
+                                                                        .mr(px(2.)),
+                                                                )
+                                                            })
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(13.))
+                                                                    .text_color(theme.muted)
+                                                                    .child("Type any model ID"),
+                                                            )
+                                                    } else {
+                                                        crate::ui::text_input::render_line_spans(
+                                                            &model_val,
+                                                            0,
+                                                            if is_model_focused { Some(self.ai_model_state.cursor) } else { None },
+                                                            self.ai_model_state.selection,
+                                                            13.0,
+                                                            theme,
+                                                            Some(window),
+                                                        )
+                                                    }),
+                                            )
+                                            .when(!model_val.is_empty(), |this| {
+                                                this.child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .ml(px(4.))
+                                                        .px(px(4.))
+                                                        .py(px(1.))
+                                                        .rounded(px(3.))
+                                                        .hover(move |s| s.bg(theme.hover))
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .text_size(px(11.))
+                                                        .text_color(theme.muted)
+                                                        .child("✕")
+                                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                            cx.stop_propagation();
+                                                            this.clear_ai_model(cx);
+                                                        })),
+                                                )
+                                            })
+                                            .child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .pl(px(4.))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.ai_model_dropdown_open = !this.ai_model_dropdown_open;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(render_icon(
+                                                        if is_open { IconType::ChevronUp } else { IconType::ChevronDown },
+                                                        theme.muted,
+                                                        14.0,
+                                                    )),
+                                            ),
                                     )
-                            ),
+                                    .when(is_open, |container| {
+                                        let open_upward = self.ai_model_bounds.get().is_some_and(|bounds| {
+                                            let window_h = window.viewport_size().height;
+                                            let space_below = window_h - bounds.bottom();
+                                            space_below < px(260.) && bounds.top() > space_below
+                                        });
+                                        container.child(gpui::deferred(
+                                            div()
+                                                .id("ai-model-dropdown")
+                                                .absolute()
+                                                .when(open_upward, |el| el.bottom(px(44.)))
+                                                .when(!open_upward, |el| el.top(px(44.)))
+                                                .left_0()
+                                                .right_0()
+                                                .occlude()
+                                                .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                                                    cx.stop_propagation();
+                                                })
+                                                .on_scroll_wheel(|_ev, _window, cx| cx.stop_propagation())
+                                                .rounded(px(8.))
+                                                .bg(theme.surface_raised)
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .shadow_lg()
+                                                .p(px(6.))
+                                                .flex()
+                                                .flex_col()
+                                                .gap(px(2.))
+                                                .when(is_ollama, |list| {
+                                                    list.child(
+                                                        div()
+                                                            .h(px(30.))
+                                                            .px(px(8.))
+                                                            .flex()
+                                                            .flex_row()
+                                                            .items_center()
+                                                            .justify_between()
+                                                            .rounded(px(6.))
+                                                            .hover(move |style| style.bg(theme.hover))
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .text_size(px(12.))
+                                                            .text_color(theme.accent)
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                                cx.stop_propagation();
+                                                                this.refresh_ollama_models(cx);
+                                                            }))
+                                                            .child("Refresh installed models")
+                                                            .child("↺"),
+                                                    )
+                                                })
+                                                .child(
+                                                    div()
+                                                        .id("ai-model-list")
+                                                        .max_h(px(220.))
+                                                        .overflow_y_scroll()
+                                                        .track_scroll(&self.ai_model_scroll_handle)
+                                                        .flex()
+                                                        .flex_col()
+                                                        .gap(px(2.))
+                                                        .children(chips_to_render.into_iter().map(|model_name| {
+                                                            let is_active = self.ai_model_input.trim() == model_name;
+                                                            let selected = model_name.clone();
+                                                            div()
+                                                                .id(SharedString::from(format!("ai-model-pill-{}", model_name)))
+                                                                .w_full()
+                                                                .h(px(32.))
+                                                                .flex()
+                                                                .flex_row()
+                                                                .items_center()
+                                                                .justify_between()
+                                                                .px(px(10.))
+                                                                .rounded(px(6.))
+                                                                .bg(if is_active { theme.accent } else { theme.surface_raised })
+                                                                .hover(move |style| if is_active { style } else { style.bg(theme.hover) })
+                                                                .cursor(CursorStyle::PointingHand)
+                                                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.set_ai_model(&selected, cx);
+                                                                    this.ai_model_dropdown_open = false;
+                                                                    cx.notify();
+                                                                }))
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(12.5))
+                                                                        .text_color(if is_active { theme.background } else { theme.foreground })
+                                                                        .child(SharedString::from(model_name)),
+                                                                )
+                                                                .when(is_active, |row| {
+                                                                    row.child(render_icon(IconType::Check, theme.background, 12.0))
+                                                                })
+                                                        })),
+                                                ),
+                                        ))
+                                    }),
+                                false,
+                                theme,
+                            )),
                     )
             })
             // Section 3: Endpoint & Auth Status
@@ -5071,6 +5116,10 @@ impl SettingsView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.ai_model_dropdown_open {
+            self.ai_model_dropdown_open = false;
+            cx.notify();
+        }
         if !self.font_combobox_open {
             return;
         }
