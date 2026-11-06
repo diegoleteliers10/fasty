@@ -3,6 +3,21 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.27.0 - 2026-11-06
+
+### Notifications
+
+- macOS Notification Center now reports pane activity: a finished or failed command, a terminal bell, and every agent status change from the Claude, Codex, Gemini, Antigravity, and OpenCode hooks.
+- Banners stay silent while the pane or the AI panel is in front of you. A bell repeats at most once every five seconds per pane.
+- Titles name the event: Command finished, Command failed, Attention needed, Agent finished, Agent needs you, Agent failed.
+- Settings > Notifications adds a Command Finish switch, which covers finished commands and terminal bells.
+- Delivery results and the authorization answer are appended to `notifications.log` in the cache directory, so a rejected banner is visible instead of silent.
+
+### AI
+
+- The ACP launcher reads PATH from the interactive login shell once per process. OpenCode installed in `~/.opencode/bin`, or a tool behind nvm, asdf, mise, or fnm, is found after a Finder launch.
+- The ACP PATH fallback also includes `~/.opencode/bin`, and a failed probe never blocks the launch.
+
 ## 0.26.0 - 2026-11-06
 
 ### Settings
