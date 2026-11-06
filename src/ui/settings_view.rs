@@ -271,6 +271,8 @@ pub struct SettingsView {
     pub ai_model_scroll_handle: ScrollHandle,
     keyboard_list_state: ListState,
     keyboard_row_count: usize,
+    settings_scroll_target: f32,
+    settings_scroll_animating: bool,
     binding_render_cache: Option<std::rc::Rc<BindingRenderData>>,
     pub font_scroll_handle: UniformListScrollHandle,
     pub font_trigger_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
@@ -466,6 +468,8 @@ impl SettingsView {
             ai_model_scroll_handle: ScrollHandle::new(),
             keyboard_list_state: ListState::new(0, ListAlignment::Top, px(240.)),
             keyboard_row_count: 0,
+            settings_scroll_target: 0.0,
+            settings_scroll_animating: false,
             binding_render_cache: None,
             font_scroll_handle: UniformListScrollHandle::new(),
             font_trigger_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -800,6 +804,7 @@ impl SettingsView {
             || q.contains("endpoint")
         {
             self.active_tab = SettingsTab::Ai;
+            self.sync_settings_scroll_target();
         } else if q.contains("theme")
             || q.contains("color")
             || q.contains("font")
@@ -808,6 +813,7 @@ impl SettingsView {
             || q.contains("appear")
         {
             self.active_tab = SettingsTab::Appearance;
+            self.sync_settings_scroll_target();
         } else if q.contains("key")
             || q.contains("short")
             || q.contains("bind")
@@ -815,6 +821,7 @@ impl SettingsView {
             || q.contains("ghost")
         {
             self.active_tab = SettingsTab::Keyboard;
+            self.sync_settings_scroll_target();
         } else if q.contains("tab")
             || q.contains("cursor")
             || q.contains("blink")
@@ -825,18 +832,21 @@ impl SettingsView {
             || q.contains("status")
         {
             self.active_tab = SettingsTab::General;
+            self.sync_settings_scroll_target();
         } else if q.contains("migr")
             || q.contains("warp")
             || q.contains("iterm")
             || q.contains("alacr")
         {
             self.active_tab = SettingsTab::Migration;
+            self.sync_settings_scroll_target();
         } else if q.contains("file")
             || q.contains("toml")
             || q.contains("fold")
             || q.contains("adv")
         {
             self.active_tab = SettingsTab::Advanced;
+            self.sync_settings_scroll_target();
         }
         cx.notify();
     }
@@ -1276,31 +1286,37 @@ impl SettingsView {
             match ev.keystroke.key.as_str() {
                 "1" => {
                     self.active_tab = SettingsTab::General;
+            self.sync_settings_scroll_target();
                     self.active_input_field = None;
                     cx.notify();
                 }
                 "2" => {
                     self.active_tab = SettingsTab::Appearance;
+            self.sync_settings_scroll_target();
                     self.active_input_field = None;
                     cx.notify();
                 }
                 "3" => {
                     self.active_tab = SettingsTab::Keyboard;
+            self.sync_settings_scroll_target();
                     self.active_input_field = None;
                     cx.notify();
                 }
                 "4" => {
                     self.active_tab = SettingsTab::Ai;
+            self.sync_settings_scroll_target();
                     self.active_input_field = None;
                     cx.notify();
                 }
                 "5" => {
                     self.active_tab = SettingsTab::Migration;
+            self.sync_settings_scroll_target();
                     self.active_input_field = None;
                     cx.notify();
                 }
                 "6" => {
                     self.active_tab = SettingsTab::Advanced;
+            self.sync_settings_scroll_target();
                     self.active_input_field = None;
                     cx.notify();
                 }
@@ -2322,6 +2338,7 @@ impl SettingsView {
                             .cursor(CursorStyle::PointingHand)
                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
                                 this.active_tab = tab;
+                                this.sync_settings_scroll_target();
                                 cx.notify();
                             }))
                             .child(
@@ -2538,6 +2555,7 @@ impl SettingsView {
                         div()
                             .id("settings-scroll-content")
                             .track_scroll(&self.window_scroll_handle)
+                            .on_scroll_wheel(cx.listener(Self::handle_settings_scroll))
                             .size_full()
                             .overflow_y_scroll()
                             .px(px(56.))
@@ -5221,6 +5239,61 @@ impl SettingsView {
         }
     }
 
+    fn sync_settings_scroll_target(&mut self) {
+        self.settings_scroll_target = self.window_scroll_handle.offset().y.as_f32();
+    }
+
+    fn handle_settings_scroll(
+        &mut self,
+        event: &gpui::ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = match event.delta {
+            gpui::ScrollDelta::Pixels(delta) => delta.y.as_f32(),
+            gpui::ScrollDelta::Lines(delta) => delta.y * 48.0,
+        };
+        if !delta.is_finite() || delta == 0.0 {
+            return;
+        }
+        let max = self.window_scroll_handle.max_offset().y.as_f32();
+        // The target is authoritative: the built-in scroll may apply the same
+        // delta before this handler, but the animation sets an absolute offset.
+        self.settings_scroll_target = (self.settings_scroll_target + delta).clamp(max, 0.0);
+        if !self.settings_scroll_animating {
+            self.settings_scroll_animating = true;
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(8))
+                        .await;
+                    let mut done = false;
+                    let result = this.update(cx, |this, cx| {
+                        let current = this.window_scroll_handle.offset().y.as_f32();
+                        let target = this.settings_scroll_target;
+                        let next = current + (target - current) * 0.5;
+                        if (target - next).abs() <= 0.5 {
+                            this.window_scroll_handle
+                                .set_offset(gpui::point(px(0.), px(target)));
+                            this.settings_scroll_animating = false;
+                            done = true;
+                        } else {
+                            this.window_scroll_handle
+                                .set_offset(gpui::point(px(0.), px(next)));
+                        }
+                        cx.notify();
+                    });
+                    if result.is_err() || done {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     fn handle_menu_outside_click(
         &mut self,
         ev: &MouseDownEvent,
@@ -5286,6 +5359,7 @@ impl Render for SettingsView {
             }))
             .on_action(cx.listener(|this, _: &crate::ui::native_menu::CheckForUpdates, window, cx| {
                 this.active_tab = SettingsTab::General;
+                    this.sync_settings_scroll_target();
                 this.check_updates_now(window, cx);
                 cx.notify();
             }))
