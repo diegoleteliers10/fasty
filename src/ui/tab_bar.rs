@@ -670,8 +670,6 @@ impl RenderOnce for TabSidebar {
                             .justify_between()
                             .h(px(34.))
                             .px(px(10.))
-                            .border_b_1()
-                            .border_color(theme.border)
                             .child(
                                 div()
                                     .flex()
