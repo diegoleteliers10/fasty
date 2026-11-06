@@ -5247,6 +5247,9 @@ impl RootView {
                     AppEvent::Notification { title, body } => {
                         send_system_notification(&title, &body);
                     }
+                    AppEvent::Bell => {
+                        this.notify_bell(pane_id, _window);
+                    }
                     AppEvent::Exit { .. } => {
                         this.handle_terminal_exit(pane_id, terminal_source_id, _window, cx);
                     }
@@ -6402,6 +6405,17 @@ impl RootView {
                     }
                     AppEvent::Notification { title, body } => {
                         send_system_notification(&title, &body);
+                    }
+                    AppEvent::Bell => {
+                        let bell_pane = this.tabs.iter().find(|tab| tab.id == tab_id)
+                            .and_then(|tab| tab.pane_tree.all_panes().into_iter().find_map(|pane| {
+                                pane.terminal.as_ref()
+                                    .filter(|terminal| terminal.source_id() == source_id)
+                                    .map(|_| pane.id)
+                            }));
+                        if let Some(pane_id) = bell_pane {
+                            this.notify_bell(pane_id, _window);
+                        }
                     }
                     AppEvent::Exit { .. } => {
                         let pane_id = this.tabs.iter().find(|tab| tab.id == tab_id)
@@ -9012,6 +9026,54 @@ impl RootView {
                 .is_some_and(|tab| tab.pane_tree.active_pane_id == pane_id)
     }
 
+    /// Label for a pane in a native notification: the pane title, or the tab
+    /// title when the pane has none.
+    fn pane_notification_label(&self, pane_id: PaneId) -> Option<String> {
+        let tab = self
+            .tabs
+            .iter()
+            .find(|tab| tab.pane_tree.find_pane(pane_id).is_some())?;
+        let tab_title = tab
+            .custom_title
+            .clone()
+            .unwrap_or_else(|| tab.title.clone());
+        Some(
+            tab.pane_tree
+                .find_pane(pane_id)
+                .map(|pane| pane.title.clone())
+                .filter(|title| !title.is_empty())
+                .unwrap_or(tab_title),
+        )
+    }
+
+    /// A terminal bell is the only attention signal an agent without Fastty
+    /// hooks sends. Report it natively when the pane is not in front of the
+    /// user, at most once every five seconds per pane.
+    fn notify_bell(&mut self, pane_id: PaneId, window: &Window) {
+        if !self.config.notify_on_command_finish || self.pane_is_foreground(pane_id, window) {
+            return;
+        }
+        static LAST: std::sync::Mutex<
+            Option<std::collections::HashMap<PaneId, std::time::Instant>>,
+        > = std::sync::Mutex::new(None);
+        let now = std::time::Instant::now();
+        let previous = LAST
+            .lock()
+            .map(|mut map| {
+                map.get_or_insert_with(std::collections::HashMap::new)
+                    .insert(pane_id, now)
+            })
+            .ok()
+            .flatten();
+        if previous.is_some_and(|last| now.duration_since(last).as_secs() < 5) {
+            return;
+        }
+        let Some(label) = self.pane_notification_label(pane_id) else {
+            return;
+        };
+        send_system_notification("Attention needed", &label);
+    }
+
     /// A finished command gets a card only when it lasted long enough to be
     /// worth reporting, or when it failed. A quick `ls` stays silent.
     fn notify_command_finished(
@@ -9039,18 +9101,7 @@ impl RootView {
         else {
             return;
         };
-        let source = {
-            let tab = &self.tabs[tab_idx];
-            let tab_title = tab
-                .custom_title
-                .clone()
-                .unwrap_or_else(|| tab.title.clone());
-            tab.pane_tree
-                .find_pane(pane_id)
-                .map(|pane| pane.title.clone())
-                .filter(|title| !title.is_empty())
-                .unwrap_or(tab_title)
-        };
+        let source = self.pane_notification_label(pane_id).unwrap_or_default();
         let duration = format_command_duration(duration_ms);
         let detail = match exit_code {
             Some(code) => format!("exit {code} · {duration}"),
@@ -9067,6 +9118,12 @@ impl RootView {
         } else {
             Vec::new()
         };
+        let title = if failed {
+            "Command failed"
+        } else {
+            "Command finished"
+        };
+        send_system_notification(title, &format!("{source} · {detail}"));
         self.push_notification(
             InternalNotification {
                 key: format!("command:{pane_id}"),
@@ -9226,11 +9283,6 @@ impl RootView {
         else {
             return;
         };
-        let source = format!(
-            "{} / pane {}",
-            tab.custom_title.as_deref().unwrap_or(&tab.title),
-            pane_id
-        );
         let tab_idx = self
             .tabs
             .iter()
@@ -9246,6 +9298,11 @@ impl RootView {
             .find_pane(pane_id)
             .map(|pane| pane.title.clone())
             .unwrap_or_default();
+        let source = if pane_title.is_empty() {
+            format!("{tab_title} / pane {pane_id}")
+        } else {
+            format!("{tab_title} / {pane_title}")
+        };
         let foreground = window.is_window_active()
             && !self.any_input_overlay_open()
             && self
@@ -9278,12 +9335,11 @@ impl RootView {
                     .last_notification
                     .is_none_or(|last| now.duration_since(last).as_secs() >= 5);
                 if requires_action || cooldown_elapsed {
-                    let text = if record.state == ProgramState::Idle {
-                        "Finished"
-                    } else {
-                        super::tab_bar::program_status_text(record)
+                    let title = match record.state {
+                        ProgramState::Blocked => "Agent needs you",
+                        ProgramState::Error => "Agent failed",
+                        _ => "Agent finished",
                     };
-                    let title = format!("Fastty: {text}");
                     let message = record
                         .msg
                         .as_deref()
@@ -10277,7 +10333,7 @@ impl RootView {
                     this.ai_confirm_reply_tx = Some(reply_tx);
                     this.notify_ai_status(
                         _window,
-                        "Fastty AI: Permission required",
+                        "Permission required",
                         AiNotificationUrgency::RequiresAction,
                     );
                     if this.config.notify_on_ai_status {
@@ -10364,7 +10420,7 @@ impl RootView {
                     this.ai_opencode_confirm_reply_tx = Some(reply_tx);
                     this.notify_ai_status(
                         _window,
-                        "Fastty AI: Permission required",
+                        "Permission required",
                         AiNotificationUrgency::RequiresAction,
                     );
                     if this.config.notify_on_ai_status {
@@ -10426,7 +10482,7 @@ impl RootView {
                             this.ai_question_selection.clear();
                             this.notify_ai_status(
                                 _window,
-                                "Fastty AI: Question",
+                                "Question",
                                 AiNotificationUrgency::RequiresAction,
                             );
                             if this.config.notify_on_ai_status {
@@ -10736,7 +10792,7 @@ impl RootView {
                             );
                             this.notify_ai_status(
                                 _window,
-                                "Fastty AI: Turn complete",
+                                "Turn complete",
                                 AiNotificationUrgency::Routine,
                             );
                             if this.config.notify_on_ai_status
@@ -10831,7 +10887,7 @@ impl RootView {
                             this.ai_messages.push(ai_error_message(&err));
                             this.notify_ai_status(
                                 _window,
-                                "Fastty AI: Turn failed",
+                                "Turn failed",
                                 AiNotificationUrgency::Routine,
                             );
                             if this.config.notify_on_ai_status

@@ -1436,6 +1436,11 @@ impl SettingsView {
         cx.notify();
     }
 
+    pub fn toggle_notify_on_command_finish(&mut self, cx: &mut Context<Self>) {
+        self.save_config(|latest| latest.notify_on_command_finish = !latest.notify_on_command_finish);
+        cx.notify();
+    }
+
     pub fn toggle_notify_on_program_status(&mut self, cx: &mut Context<Self>) {
         self.save_config(|latest| latest.notify_on_program_status = !latest.notify_on_program_status);
         cx.notify();
@@ -2858,6 +2863,17 @@ impl SettingsView {
                     .child(render_section_header("Notifications", theme))
                     .child(
                         render_plain_group()
+                            .child(render_plain_row(
+                                "Command Finish",
+                                None::<&str>,
+                                div()
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                        this.toggle_notify_on_command_finish(cx);
+                                    }))
+                                    .child(render_toggle_switch(self.config.notify_on_command_finish, theme)),
+                                false,
+                                theme,
+                            ))
                             .child(render_plain_row(
                                 "AI Status",
                                 None::<&str>,

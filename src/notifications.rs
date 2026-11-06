@@ -5,10 +5,38 @@
 //! silently drops reports on current macOS releases. Linux and Windows keep
 //! `notify-rust`.
 
+use std::io::Write;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::OnceLock;
 
 const QUEUE_DEPTH: usize = 16;
+const LOG_LIMIT: u64 = 64 * 1024;
+
+/// Appends one line to `notifications.log` in the cache directory. Delivery
+/// failures are otherwise invisible: a Finder launch sends stderr nowhere, so
+/// a rejected notification looks like a missing one.
+fn log(message: &str) {
+    let path = crate::paths::get().cache_dir.join("notifications.log");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    if file
+        .metadata()
+        .map(|meta| meta.len() > LOG_LIMIT)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(file, "{seconds} {message}");
+}
 
 /// Queue a native notification for delivery on the worker thread.
 pub fn send_system_notification(title: &str, body: &str) {
@@ -28,10 +56,10 @@ pub fn send_system_notification(title: &str, body: &str) {
     match worker {
         Ok(sender) => {
             if let Err(error) = sender.try_send((title.to_owned(), body.to_owned())) {
-                eprintln!("Fastty notification queue rejected a report: {error}");
+                log(&format!("queue rejected a report: {error}"));
             }
         }
-        Err(error) => eprintln!("Fastty notification worker failed: {error}"),
+        Err(error) => log(&format!("notification worker failed: {error}")),
     }
 }
 
@@ -85,6 +113,8 @@ mod macos {
         UNNotificationSound, UNUserNotificationCenter,
     };
 
+    use super::log;
+
     /// True only when the process carries a bundle identifier. An ObjC
     /// exception here aborts the whole process, so this must run before any
     /// `UNUserNotificationCenter` call.
@@ -110,16 +140,12 @@ mod macos {
             // Skip instead of aborting; without a bundle there is no
             // notification identity to authorize anyway.
             if !unuser_notifications_available() {
-                eprintln!(
-                    "Fastty notifications skipped: no bundle identity (bare binary launch)"
-                );
+                log("skipped: no bundle identity (bare binary launch)");
                 return;
             }
             let center = UNUserNotificationCenter::currentNotificationCenter();
             let granted_block = RcBlock::new(|granted: Bool, _error: *mut NSError| {
-                if !granted.as_bool() {
-                    eprintln!("Fastty notifications are disabled in System Settings");
-                }
+                log(&format!("authorization granted={}", granted.as_bool()));
             });
             center.requestAuthorizationWithOptions_completionHandler(
                 UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
@@ -131,9 +157,7 @@ mod macos {
     pub fn deliver(title: &str, body: &str) {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         if !unuser_notifications_available() {
-            eprintln!(
-                "Fastty notification dropped (no bundle identity): {title}"
-            );
+            log(&format!("dropped (no bundle identity): {title}"));
             return;
         }
         request_permission();
@@ -151,10 +175,10 @@ mod macos {
             &content,
             None,
         );
-        let add_block = RcBlock::new(|error: *mut NSError| {
-            if let Some(error) = unsafe { error.as_ref() } {
-                eprintln!("Fastty notification add failed: {error:?}");
-            }
+        let report = title.to_owned();
+        let add_block = RcBlock::new(move |error: *mut NSError| match unsafe { error.as_ref() } {
+            Some(error) => log(&format!("add failed for '{report}': {error:?}")),
+            None => log(&format!("posted '{report}'")),
         });
         center.addNotificationRequest_withCompletionHandler(&request, Some(&add_block));
     }
