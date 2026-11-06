@@ -2575,8 +2575,6 @@ impl RenderOnce for AiSidebar {
             .w(px(self.width))
             .h_full()
             .bg(sidebar_bg)
-            .border_l_1()
-            .border_color(theme.border)
             .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                 if history_open {
                     if let Some(callback) = dismiss_history.as_ref() {
