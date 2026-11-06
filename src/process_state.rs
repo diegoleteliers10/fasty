@@ -61,15 +61,19 @@ struct ProcessRecord {
 }
 
 impl ProcessTable {
-    pub(crate) fn new() -> Self {
-        Self {
-            system: System::new(),
+    pub(crate) fn new() -> Option<Self> {
+        let system = System::new().ok()?;
+        Some(Self {
+            system,
             records: BTreeMap::new(),
-        }
+        })
     }
     pub(crate) fn refresh(&mut self) {
-        self.system
-            .refresh_processes_specifics(ProcessesToUpdate::All, ProcessRefreshKind::new());
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
         self.records = self
             .system
             .processes()
@@ -206,7 +210,7 @@ mod tests {
     fn native_process_refresh_observes_the_current_process() {
         let pid = std::process::id();
         let group = process_group(pid).expect("The current process has a process group");
-        let mut table = ProcessTable::new();
+        let mut table = ProcessTable::new().expect("The process table is available");
         table.refresh();
         let ProcessObservation::Available { shell, foreground } =
             table.observe(Some(pid), Some(group))
@@ -222,7 +226,7 @@ mod tests {
 
     #[test]
     fn group_members_and_ancestors_are_sorted_and_cycles_stop() {
-        let mut table = ProcessTable::new();
+        let mut table = ProcessTable::new().expect("The process table is available");
         table.records.insert(1, record(1, 20, Some(2), 1));
         table.records.insert(2, record(2, 20, Some(1), 2));
         table.records.insert(3, record(3, 30, Some(2), 3));
@@ -247,7 +251,7 @@ mod tests {
 
     #[test]
     fn missing_foreground_and_coordinates_are_unavailable() {
-        let mut table = ProcessTable::new();
+        let mut table = ProcessTable::new().expect("The process table is available");
         table.records.insert(2, record(2, 20, None, 2));
         assert_eq!(
             table.observe(None, None),
@@ -261,7 +265,7 @@ mod tests {
 
     #[test]
     fn failed_shell_group_observation_is_unavailable() {
-        let mut table = ProcessTable::new();
+        let mut table = ProcessTable::new().expect("The process table is available");
         let mut shell = record(2, 20, None, 2);
         shell.group = None;
         table.records.insert(2, shell);
@@ -273,7 +277,7 @@ mod tests {
 
     #[test]
     fn a_reused_parent_pid_is_unavailable() {
-        let mut table = ProcessTable::new();
+        let mut table = ProcessTable::new().expect("The process table is available");
         table.records.insert(2, record(2, 30, None, 2));
         table.records.insert(3, record(3, 20, Some(2), 3));
         assert_eq!(
@@ -284,7 +288,7 @@ mod tests {
 
     #[test]
     fn process_start_time_detects_pid_reuse_and_wire_has_no_arguments() {
-        let mut table = ProcessTable::new();
+        let mut table = ProcessTable::new().expect("The process table is available");
         table.records.insert(2, record(2, 20, None, 2));
         let first = table.observe(Some(2), Some(2));
         table.records.insert(2, record(2, 21, None, 2));
@@ -314,7 +318,10 @@ pub fn foreground_child_name(shell_pid: u32) -> Option<String> {
         std::thread::Builder::new()
             .name("fastty-process-names".into())
             .spawn(move || {
-                let mut system = System::new();
+                let Ok(mut system) = System::new() else {
+                    eprintln!("Fastty process-name sampler could not read the process table");
+                    return;
+                };
                 let mut last_refresh: Option<std::time::Instant> = None;
                 loop {
                     let demanded = REFRESH_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed);
@@ -394,7 +401,11 @@ fn publish_foreground_child_names(
     system: &mut System,
     snapshot: &std::sync::Mutex<std::collections::HashMap<u32, String>>,
 ) {
-    system.refresh_processes_specifics(ProcessesToUpdate::All, ProcessRefreshKind::new());
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing(),
+    );
     let children: Vec<ChildProcess> = system
         .processes()
         .iter()

@@ -46,7 +46,7 @@ pub struct ApiMethodDescription {
 
 fn server() -> ApiServer {
     ApiServer {
-        schema_version: 1,
+        schema_version: 2,
         server_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_version: crate::daemon::PROTOCOL_VERSION,
         capabilities: crate::daemon::session_host_capabilities(),
@@ -64,8 +64,10 @@ fn tagged_variants(document: &Value, tag: &str) -> Result<BTreeMap<String, Value
     variants
         .iter()
         .map(|variant| {
-            let name = variant["properties"][tag]["enum"][0]
+            let property = &variant["properties"][tag];
+            let name = property["const"]
                 .as_str()
+                .or_else(|| property["enum"][0].as_str())
                 .ok_or_else(|| format!("a schema variant has no {tag} name"))?;
             Ok((name.to_string(), variant.clone()))
         })
@@ -166,7 +168,7 @@ fn standalone_schema(document: &Value, variants: Vec<Value>) -> Value {
     json!({
         "$schema": document["$schema"],
         "oneOf": variants,
-        "definitions": document["definitions"],
+        "$defs": document["$defs"],
     })
 }
 
@@ -237,7 +239,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(description.request_schema["definitions"]
+        assert!(description.request_schema["$defs"]
             .get("AttachMode")
             .is_some());
         let required = request["required"].as_array().unwrap();

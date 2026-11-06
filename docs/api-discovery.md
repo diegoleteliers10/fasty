@@ -10,7 +10,7 @@ fastty api describe spawn --json
 
 `list` returns the server version, protocol version, capabilities, and every request name. `describe` also returns the request and response schemas for one method. Without `--json`, the commands print text.
 
-The server generates the schemas from its Rust protocol types with Schemars. Each schema uses JSON Schema Draft 7. The request schema includes the `cmd` field. The response schema includes the `event` field and all possible response events for that method, including `error`. Each document includes its referenced type definitions.
+The server generates the schemas from its Rust protocol types with Schemars. Each schema uses JSON Schema Draft 2020-12. The type definitions are in `$defs`. The request schema includes the `cmd` field. The response schema includes the `event` field and all possible response events for that method, including `error`.
 
 The `response_mode` field is `single`, `stream`, or `ack_optional`. For `write` and `resize`, `ack_optional` means the server sends `done` only when the request sets `ack` to `true`. A stream can send more than one response. Its schema does not specify event order.
 
