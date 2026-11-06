@@ -5256,10 +5256,14 @@ impl SettingsView {
         if !delta.is_finite() || delta == 0.0 {
             return;
         }
-        let max = self.window_scroll_handle.max_offset().y.as_f32();
+        // `max_offset` is positive; offsets are negative (0 at the top).
+        let limit = self.window_scroll_handle.max_offset().y.as_f32().abs();
+        if !limit.is_finite() {
+            return;
+        }
         // The target is authoritative: the built-in scroll may apply the same
         // delta before this handler, but the animation sets an absolute offset.
-        self.settings_scroll_target = (self.settings_scroll_target + delta).clamp(max, 0.0);
+        self.settings_scroll_target = (self.settings_scroll_target + delta).clamp(-limit, 0.0);
         if !self.settings_scroll_animating {
             self.settings_scroll_animating = true;
             cx.spawn(async move |this, cx| {
