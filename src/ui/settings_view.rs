@@ -140,7 +140,7 @@ impl SettingsTab {
         match self {
             Self::General => "Layout, terminal behavior, notifications and updates.",
             Self::Appearance => "Theme, transparency and the type your shell is set in.",
-            Self::Keyboard => "Keybindings and modes.",
+            Self::Keyboard => "Pick a preset, then make any shortcut your own.",
             Self::Ai => "Providers, models, and assistant behavior.",
             Self::Migration => "Import settings from other terminals.",
             Self::Advanced => "Deeper configuration and diagnostics.",
@@ -3672,60 +3672,59 @@ impl SettingsView {
                     .flex()
                     .flex_col()
                     .child(render_section_header("Keybinding Presets", theme))
-                    .child(
-                        render_group_card(theme).children(presets.into_iter().enumerate().map(|(idx, (preset, name, desc))| {
-                            let is_active = self.keybinding_preset == preset;
-                            let is_last = idx == presets.len() - 1;
-                            div()
-                                .id(SharedString::from(format!("preset-row-{}", preset)))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .justify_between()
-                                .px(px(16.))
-                                .py(px(12.))
-                                .when(!is_last, |this| this.border_b_1().border_color(theme.border))
-                                .hover(move |s| s.bg(theme.surface_raised))
-                                .cursor(CursorStyle::PointingHand)
-                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                    this.set_keybinding_preset(preset, cx);
-                                }))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_0p5()
-                                        .child(
-                                            div()
-                                                .text_size(px(12.5))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(if is_active { theme.foreground } else { theme.muted_strong })
-                                                .child(name),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(11.))
-                                                .text_color(theme.muted)
-                                                .child(desc),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(20.))
-                                        .h(px(20.))
-                                        .rounded_full()
-                                        .border_1()
-                                        .border_color(if is_active { theme.accent } else { theme.border })
-                                        .bg(if is_active { theme.accent } else { theme.surface })
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .when(is_active, |this| {
-                                            this.child(render_icon(IconType::Check, theme.background, 12.0))
-                                        }),
-                                )
-                        })),
-                    ),
+                    .children(presets.into_iter().map(|(preset, name, desc)| {
+                        let is_active = self.keybinding_preset == preset;
+                        div()
+                            .id(SharedString::from(format!("preset-row-{}", preset)))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .px(px(0.))
+                            .py(px(14.))
+                            .rounded(px(8.))
+                            .when(is_active, |row| row.bg(theme.surface_raised))
+                            .hover(move |style| style.bg(theme.hover))
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                this.set_keybinding_preset(preset, cx);
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(3.))
+                                    .child(
+                                        div()
+                                            .text_size(px(15.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.foreground)
+                                            .child(name),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .text_color(theme.muted)
+                                            .child(desc),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w(px(22.))
+                                    .h(px(22.))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(if is_active { theme.accent } else { theme.muted })
+                                    .bg(if is_active { theme.accent } else { theme.surface })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .when(is_active, |dot| {
+                                        dot.child(render_icon(IconType::Check, theme.background, 13.0))
+                                    }),
+                            )
+                    })),
             );
 
         // Section 2: editable per-action bindings, grouped by category.
@@ -3743,16 +3742,17 @@ impl SettingsView {
                         this.child(
                             div()
                                 .id("kb-reset-all")
-                                .px(px(10.))
-                                .py(px(4.))
-                                .rounded(px(6.))
+                                .px(px(12.))
+                                .py(px(6.))
+                                .rounded(px(7.))
+                                .bg(theme.surface_raised)
                                 .border_1()
                                 .border_color(theme.border)
-                                .text_size(px(11.))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.muted_strong)
                                 .cursor(CursorStyle::PointingHand)
-                                .hover(|s| s.bg(theme.surface_raised))
+                                .hover(|s| s.bg(theme.hover))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _ev, _window, cx| {
@@ -3765,9 +3765,9 @@ impl SettingsView {
             )
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(13.))
                     .text_color(theme.muted)
-                    .mb(px(4.))
+                    .mb(px(8.))
                     .child("Click a shortcut, then press the keys. Esc cancels."),
             );
 
@@ -3779,7 +3779,7 @@ impl SettingsView {
             if actions.is_empty() {
                 continue;
             }
-            let mut card = render_group_card(theme);
+            let mut card = div().flex().flex_col();
             for (row_idx, action) in actions.iter().enumerate() {
                 let combos = effective.combos_for(*action);
                 let is_capturing = capturing == Some(*action);
@@ -3799,13 +3799,13 @@ impl SettingsView {
                     badges = badges.child(
                         div()
                             .id(SharedString::from(format!("kb-badge-{}", action.binding_id())))
-                            .px(px(7.))
-                            .py(px(3.))
-                            .rounded(px(5.))
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(6.))
                             .border_1()
                             .border_color(theme.border)
                             .border_dashed()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.muted)
                             .cursor(CursorStyle::PointingHand)
                             .hover(|s| s.bg(theme.surface_raised))
@@ -3828,10 +3828,10 @@ impl SettingsView {
                                     "kb-badge-{}-{i}",
                                     action.binding_id()
                                 )))
-                                .px(px(5.))
-                                .py(px(4.))
+                                .px(px(6.))
+                                .py(px(5.))
                                 .rounded(px(6.))
-                                .bg(theme.surface)
+                                .bg(theme.surface_raised)
                                 .border_1()
                                 .border_color(if is_recording { theme.accent } else { theme.border })
                                 .flex()
@@ -3839,7 +3839,7 @@ impl SettingsView {
                                 .items_center()
                                 .gap_1()
                                 .cursor(CursorStyle::PointingHand)
-                                .hover(|s| s.bg(theme.surface_raised))
+                                .hover(|s| s.bg(theme.hover))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _ev, _window, cx| {
@@ -3869,17 +3869,17 @@ impl SettingsView {
                                     // shortcut reads the way it is typed.
                                     el.children(keycaps.into_iter().map(|cap| {
                                         div()
-                                            .h(px(18.))
-                                            .min_w(px(18.))
+                                            .h(px(20.))
+                                            .min_w(px(20.))
                                             .px(px(5.))
                                             .rounded(px(4.))
-                                            .bg(theme.surface_raised)
+                                            .bg(theme.surface)
                                             .flex()
                                             .items_center()
                                             .justify_center()
                                             .child(
                                                 div()
-                                                    .text_size(px(11.))
+                                                    .text_size(px(11.5))
                                                     .font_weight(FontWeight::MEDIUM)
                                                     .text_color(theme.foreground)
                                                     .child(cap),
@@ -3939,7 +3939,7 @@ impl SettingsView {
                     );
                 }
 
-                card = card.child(render_card_row(
+                card = card.child(render_plain_row(
                     format!(
                         "{}{}",
                         action.display_name(),
@@ -3962,11 +3962,8 @@ impl SettingsView {
                                 .flex_row()
                                 .items_center()
                                 .justify_between()
-                                .px(px(16.))
+                                .px(px(0.))
                                 .py(px(10.))
-                                .bg(theme.surface_raised)
-                                .border_b_1()
-                                .border_color(theme.border)
                                 .child(
                                     div()
                                         .text_size(px(11.5))
@@ -4030,10 +4027,9 @@ impl SettingsView {
                     .mt(px(8.))
                     .child(
                         div()
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme.muted_strong)
-                            .mb(px(6.))
+                            .text_size(px(13.))
+                            .text_color(theme.muted)
+                            .mb(px(2.))
                             .child(category),
                     )
                     .child(card),
