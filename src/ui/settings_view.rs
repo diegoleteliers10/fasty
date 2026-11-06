@@ -268,7 +268,7 @@ impl SettingsView {
         let auto_discover_opencode = loaded_config.ai.providers.get(&loaded_config.ai.default)
             .is_some_and(crate::ai::ProviderConfig::is_acp);
         let theme_name = loaded_config.theme.as_deref().unwrap_or("default").to_string();
-        let theme = Theme::from_name(&theme_name).with_opacity(loaded_config.opacity);
+        let theme = Theme::from_name(&theme_name);
         let tab_layout = loaded_config.tab_layout;
         let scrollback = loaded_config.scrollback;
         let keybinding_preset = loaded_config.keybinding_preset.unwrap_or_default();
@@ -615,7 +615,7 @@ impl SettingsView {
         if let Some(ref t) = cfg.theme {
             self.current_theme_name = t.clone();
         }
-        self.theme = Theme::from_name(&self.current_theme_name).with_opacity(self.opacity);
+        self.theme = Theme::from_name(&self.current_theme_name);
 
         if let Some(prov) = cfg.ai.providers.get(&self.ai_provider) {
             self.ai_base_url_input = prov.command().unwrap_or_else(|| prov.base_url()).to_string();
@@ -680,7 +680,7 @@ impl SettingsView {
                 if let Some(name) = &self.config.theme {
                     self.current_theme_name = name.clone();
                 }
-                self.theme = Theme::from_name(&self.current_theme_name).with_opacity(self.opacity);
+                self.theme = Theme::from_name(&self.current_theme_name);
                 self.config_error = None;
                 self.refresh_baseline();
                 true
@@ -1255,7 +1255,7 @@ impl SettingsView {
         let name = theme_name.to_string();
         if self.save_config(move |latest| latest.theme = Some(name)) {
             self.current_theme_name = self.config.theme.clone().unwrap_or_default();
-            self.theme = Theme::from_name(&self.current_theme_name).with_opacity(self.config.opacity);
+            self.theme = Theme::from_name(&self.current_theme_name);
         }
         cx.notify();
     }
@@ -1278,7 +1278,7 @@ impl SettingsView {
     pub fn adjust_opacity(&mut self, opacity: f32, cx: &mut Context<Self>) {
         if self.save_config(|latest| latest.opacity = opacity.clamp(0.2, 1.0)) {
             self.opacity = self.config.opacity;
-            self.theme = Theme::from_name(&self.current_theme_name).with_opacity(self.opacity);
+            self.theme = Theme::from_name(&self.current_theme_name);
         }
         cx.notify();
     }

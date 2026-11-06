@@ -444,12 +444,12 @@ fn open_settings(cx: &mut App) {
             return;
         }
     }
-    let bounds = Bounds::centered(None, size(px(880.), px(640.)), cx);
+    let bounds = Bounds::centered(None, size(px(900.), px(720.)), cx);
     if let Ok(handle) = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(740.), px(520.))),
-            window_background: WindowBackgroundAppearance::Blurred,
+            window_min_size: Some(size(px(780.), px(560.))),
+            window_background: WindowBackgroundAppearance::Opaque,
             app_id: Some("com.fastty.app.settings".into()),
             titlebar: Some(TitlebarOptions {
                 title: Some("Fastty Settings".into()),
@@ -458,10 +458,7 @@ fn open_settings(cx: &mut App) {
             }),
             ..Default::default()
         },
-        |window, cx| {
-            window.set_background_appearance(WindowBackgroundAppearance::Blurred);
-            cx.new(|cx| SettingsView::new(window, cx))
-        },
+        |window, cx| cx.new(|cx| SettingsView::new(window, cx)),
     ) {
         *crate::ui::settings_view::SETTINGS_WINDOW_HANDLE.lock() = Some(handle);
     }
