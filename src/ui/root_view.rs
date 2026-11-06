@@ -7348,12 +7348,12 @@ impl RootView {
             }
         }
 
-        let bounds = Bounds::centered(None, size(px(880.), px(640.)), &*cx);
+        let bounds = Bounds::centered(None, size(px(900.), px(720.)), &*cx);
         let current_config = self.config.clone();
         if let Ok(handle) = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(740.), px(520.))),
+                window_min_size: Some(size(px(780.), px(560.))),
                 window_background: WindowBackgroundAppearance::Blurred,
                 app_id: Some("com.fastty.app.settings".into()),
                 titlebar: Some(TitlebarOptions {
