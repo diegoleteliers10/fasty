@@ -1374,12 +1374,12 @@ pub enum FileDropTarget {
 /// Rows PageUp and PageDown move in the `@` mention menu.
 const AI_AT_MENU_PAGE_ROWS: isize = 5;
 
-/// Cells per row. Four columns fills the window edge to edge up to the cell
-/// width cap; see `cell_width_cap_threshold`. Past that the grid centres itself,
-/// because a fifth column would push every cell past the readable width.
-const MC_MAX_COLS: usize = 4;
+/// Cells per row. Three columns fills the window edge to edge up to the cell
+/// width cap. Past that the grid centres itself, because a fourth column would
+/// push every cell past the readable width.
+const MC_MAX_COLS: usize = 3;
 /// Gap between cells.
-const MC_GAP: f32 = 16.0;
+const MC_GAP: f32 = 20.0;
 /// Padding inside the grid box. Flex wrapping measures the content box, so this
 /// padding comes out of the width the cells get.
 const MC_GRID_PAD: f32 = 4.0;
@@ -1387,36 +1387,31 @@ const MC_GRID_PAD: f32 = 4.0;
 /// the preview shows the last screenful of a tall terminal, which reads fine
 /// in a landscape box and wastes height in a portrait one. A window too short
 /// for the height shrinks the cell, and the grid then scrolls.
-const MC_CELL_ASPECT: f32 = 0.75;
+const MC_CELL_ASPECT: f32 = 0.66;
 /// Narrowest cell that still fits a usable preview. A window too narrow for
 /// this drops a column instead of shrinking cells further.
 const MC_MIN_CELL_W: f32 = 260.0;
 /// Widest cell. Past this a preview stretches without gaining readable detail.
-/// The value is high enough that four columns still fill the window on a
-/// 3440 px display, which is where a lower cap left a dead band at the edge.
 const MC_MAX_CELL_W: f32 = 900.0;
 /// Distance kept between the grid and the window edge.
-const MC_EDGE_MARGIN: f32 = 24.0;
-/// Space above the header bar.
-const MC_TOP_PAD: f32 = 56.0;
-/// Height of the header bar.
-const MC_HEADER_H: f32 = 38.0;
-/// Gap between the header bar and the grid.
-const MC_HEADER_GAP: f32 = 16.0;
-/// Space the header block takes: top padding, the bar, and the gap.
+const MC_EDGE_MARGIN: f32 = 32.0;
+/// Space above the title block.
+const MC_TOP_PAD: f32 = 40.0;
+/// Height of the title block.
+const MC_HEADER_H: f32 = 56.0;
+/// Gap between the title block and the grid.
+const MC_HEADER_GAP: f32 = 20.0;
+/// Space the title block takes: top padding, the block, and the gap.
 const MC_HEADER_SPACE: f32 = MC_TOP_PAD + MC_HEADER_H + MC_HEADER_GAP;
 
-/// Height of the card's top bar plus its bottom status bar. The bars carry
-/// their own borders, which sit inside their fixed heights, so no extra is
-/// added for them. The card's 2 px border is not counted here; that makes the
-/// estimate conservative, and the sweep found no overflow from the difference.
-const MC_CARD_CHROME_H: f32 = 32.0 + 26.0;
+/// Height of the card header, footer and 2 px border.
+const MC_CARD_CHROME_H: f32 = 40.0 + 30.0 + 4.0;
 /// Height of one preview line, including the gap between lines. The renderer
-/// sets `.h(px(13.))` per line with `.gap(px(1.5))`.
-const MC_PREVIEW_LINE_H: f32 = 14.5;
+/// sets `.h(px(14.))` per line with `.gap(px(1.5))`.
+const MC_PREVIEW_LINE_H: f32 = 15.5;
 /// Padding inside the preview area, top and bottom. The renderer sets
-/// `.py(px(6.))`.
-const MC_PREVIEW_PAD_H: f32 = 12.0;
+/// `.py(px(8.))`.
+const MC_PREVIEW_PAD_H: f32 = 16.0;
 
 /// Number of preview lines that fit the preview area of a `cell_h` tall card.
 ///
@@ -13000,6 +12995,20 @@ impl RootView {
             let selected = self.tab_overview_selected.min(selectable - 1);
             self.tab_overview_selected = selected;
 
+            if !modifiers.platform && !is_ctrl {
+                if let Some(digit) = key_lower.chars().next().and_then(|c| c.to_digit(10)) {
+                    if (1..=9).contains(&digit) {
+                        let target = (digit as usize - 1).min(selectable - 1);
+                        if target != selected {
+                            self.tab_overview_selected = target;
+                            self.tab_overview_scroll_handle.scroll_to_item(target);
+                            cx.notify();
+                        }
+                        return;
+                    }
+                }
+            }
+
             if key_lower == "enter" || key_lower == "return" {
                 if let Some(tab) = self.tabs.get(selected) {
                     let id = tab.id;
@@ -20724,6 +20733,35 @@ impl Render for RootView {
                 let cell_w = layout.cell_w;
                 let cell_h = layout.cell_h;
                 let container_w = layout.grid_w;
+                let tab_state = |tab: &TabData| {
+                    tab.pane_tree
+                        .all_panes()
+                        .into_iter()
+                        .filter_map(|pane| {
+                            self.visible_program_record(pane.id)
+                                .map(|record| record.state)
+                        })
+                        .max_by_key(|state| state.priority())
+                };
+                let running_tabs = self
+                    .tabs
+                    .iter()
+                    .filter(|tab| {
+                        tab_state(tab)
+                            == Some(crate::program_status::ProgramState::Working)
+                    })
+                    .count();
+                let attention_tabs = self
+                    .tabs
+                    .iter()
+                    .filter(|tab| {
+                        matches!(
+                            tab_state(tab),
+                            Some(crate::program_status::ProgramState::Blocked)
+                                | Some(crate::program_status::ProgramState::Error)
+                        )
+                    })
+                    .count();
 
                 this.child(
                     div()
@@ -20741,82 +20779,69 @@ impl Render for RootView {
                             this.is_tab_overview_open = false;
                             cx.notify();
                         }))
-                        // Top Header Bar
+                        // Title and keyboard hints
                         .child(
                             div()
                                 .flex()
                                 .flex_row()
-                                .items_center()
+                                .items_start()
                                 .justify_between()
                                 .w(px(container_w))
                                 .max_w(px(container_w))
                                 .h(px(MC_HEADER_H))
-                                .px(px(16.))
-                                .rounded(px(10.))
-                                .overflow_hidden()
-                                .bg(theme.surface)
-                                .border_1()
-                                .border_color(theme.border)
-                                .shadow_lg()
                                 .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
                                     cx.stop_propagation();
                                 })
                                 .child(
                                     div()
                                         .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap_2()
-                                        .min_w_0()
-                                        .flex_shrink_0()
-                                        .child(render_icon(IconType::Layers, theme.accent, 16.0))
+                                        .flex_col()
+                                        .gap(px(6.))
                                         .child(
                                             div()
-                                                .text_size(px(14.))
+                                                .text_size(px(22.))
                                                 .font_weight(FontWeight::BOLD)
                                                 .text_color(theme.foreground)
                                                 .child("Mission Control"),
                                         )
                                         .child(
                                             div()
-                                                .px(px(6.))
-                                                .py(px(2.))
-                                                .rounded(px(4.))
-                                                .bg(theme.surface_raised)
-                                                .text_size(px(11.))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(theme.accent)
-                                                .child(format!("{} Tabs", self.tabs.len())),
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(6.))
+                                                .text_size(px(12.))
+                                                .child(
+                                                    div()
+                                                        .text_color(theme.muted)
+                                                        .child(format!("{} tabs", self.tabs.len())),
+                                                )
+                                                .child(div().text_color(theme.muted).child("·"))
+                                                .child(
+                                                    div()
+                                                        .text_color(theme.green)
+                                                        .child(format!("{running_tabs} running")),
+                                                )
+                                                .child(div().text_color(theme.muted).child("·"))
+                                                .child(
+                                                    div()
+                                                        .text_color(theme.red)
+                                                        .child(format!(
+                                                            "{attention_tabs} needs attention"
+                                                        )),
+                                                ),
                                         ),
                                 )
                                 .child(
                                     div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap_3()
-                                        .min_w_0()
-                                        .child(
-                                            div()
-                                                .text_size(px(11.))
-                                                .text_color(theme.muted)
-                                                .whitespace_nowrap()
-                                                .text_ellipsis()
-                                                .overflow_hidden()
-                                                .child("← → ↑ ↓ Navigate • Enter Select • D Close • T New • ESC Exit"),
-                                        )
-                                        .child(
-                                            div()
-                                                .cursor(CursorStyle::PointingHand)
-                                                .p(px(4.))
-                                                .rounded(px(4.))
-                                                .hover(|s| s.bg(theme.hover))
-                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                    this.is_tab_overview_open = false;
-                                                    cx.notify();
-                                                }))
-                                                .child(render_icon(IconType::X, theme.muted, 14.0)),
-                                        ),
+                                        .pt(px(4.))
+                                        .flex_shrink(1.)
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.muted)
+                                        .whitespace_nowrap()
+                                        .child("←↑↓→ move   1-9 jump   ↵ open   d close   t new   esc exit"),
                                 ),
                         )
                         // Grid of Tab Thumbnails
@@ -20843,7 +20868,6 @@ impl Render for RootView {
                                         let tab_id = tab.id;
                                         let title = tab.custom_title.clone().unwrap_or_else(|| tab.title.clone());
                                         let proc_name = tab.terminal.as_ref().and_then(|t| t.get_foreground_process_name()).unwrap_or_else(|| "terminal".to_string());
-                                        let (icon_type, _) = super::icons::get_deck_process_icon(&proc_name);
                                         let active_term = tab.terminal.clone().or_else(|| tab.pane_tree.all_panes().first().and_then(|p| p.terminal.clone()));
                                         // The preview fills the card, so the line
                                         // count follows the cell height instead
@@ -20865,7 +20889,6 @@ impl Render for RootView {
                                                 ))
                                             })
                                             .unwrap_or_default();
-                                        let split_count = tab.pane_tree.all_panes().len();
                                         let branch_opt = tab.git_status.as_ref().map(|g| g.branch.clone());
 
                                         div()
@@ -20891,99 +20914,113 @@ impl Render for RootView {
                                                 this.is_tab_overview_open = false;
                                                 this.select_tab(tab_id, cx);
                                             }))
-                                            // Card Top Bar
-                                            .child(
+                                            // Card header
+                                            .child({
+                                                let dot_color = match tab_state(tab) {
+                                                    Some(crate::program_status::ProgramState::Blocked)
+                                                    | Some(crate::program_status::ProgramState::Error) => theme.red,
+                                                    Some(crate::program_status::ProgramState::Working)
+                                                    | Some(crate::program_status::ProgramState::Done) => theme.green,
+                                                    _ => theme.muted.opacity(0.5),
+                                                };
                                                 div()
-                                                    .h(px(32.))
+                                                    .h(px(40.))
                                                     .flex()
                                                     .flex_row()
                                                     .items_center()
                                                     .justify_between()
-                                                    .px(px(10.))
-                                                    .bg(if is_selected { theme.accent.opacity(0.12) } else { theme.surface_raised })
-                                                    .border_b_1()
-                                                    .border_color(theme.border)
+                                                    .px(px(12.))
                                                     .child(
                                                         div()
-                                                            .flex_1()
-                                                            .min_w_0()
                                                             .flex()
                                                             .flex_row()
                                                             .items_center()
-                                                            .gap_2()
-                                                            .child(render_icon(icon_type, theme.accent, 13.0))
+                                                            .gap(px(8.))
+                                                            .min_w(px(0.))
                                                             .child(
                                                                 div()
-                                                                    .flex_1()
-                                                                    .min_w_0()
-                                                                    .text_size(px(11.5))
+                                                                    .w(px(18.))
+                                                                    .h(px(18.))
+                                                                    .flex_shrink_0()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_center()
+                                                                    .rounded(px(5.))
+                                                                    .bg(if is_selected {
+                                                                        theme.accent
+                                                                    } else {
+                                                                        theme.surface_raised
+                                                                    })
+                                                                    .text_size(px(10.))
+                                                                    .text_color(if is_selected {
+                                                                        theme.black
+                                                                    } else {
+                                                                        theme.muted
+                                                                    })
+                                                                    .child(format!("{}", idx + 1)),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .min_w(px(0.))
+                                                                    .truncate()
+                                                                    .text_size(px(13.))
                                                                     .font_weight(FontWeight::BOLD)
                                                                     .text_color(theme.foreground)
-                                                                    .whitespace_nowrap()
-                                                                    .text_ellipsis()
-                                                                    .overflow_hidden()
                                                                     .child(title),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .min_w(px(0.))
+                                                                    .truncate()
+                                                                    .text_size(px(11.))
+                                                                    .text_color(theme.muted)
+                                                                    .child(proc_name.clone()),
                                                             ),
                                                     )
                                                     .child(
                                                         div()
-                                                            .flex_shrink_0()
                                                             .flex()
                                                             .flex_row()
                                                             .items_center()
-                                                            .gap_1_5()
-                                                            .when(split_count > 1, |el| {
-                                                                el.child(
-                                                                    div()
-                                                                        .px(px(4.))
-                                                                        .py(px(1.))
-                                                                        .rounded(px(3.))
-                                                                        .bg(theme.black)
-                                                                        .text_size(px(9.5))
-                                                                        .text_color(theme.yellow)
-                                                                        .child(format!("{split_count} splits")),
-                                                                )
-                                                            })
+                                                            .gap(px(8.))
+                                                            .flex_shrink_0()
                                                             .child(
                                                                 div()
-                                                                    .px(px(5.))
-                                                                    .py(px(1.))
+                                                                    .w(px(6.))
+                                                                    .h(px(6.))
                                                                     .rounded(px(3.))
-                                                                    .bg(if is_selected { theme.accent } else { theme.black })
-                                                                    .text_size(px(10.))
-                                                                    .font_weight(FontWeight::BOLD)
-                                                                    .text_color(if is_selected { theme.black } else { theme.muted })
-                                                                    .child(format!("#{}", idx + 1)),
+                                                                    .bg(dot_color),
                                                             )
-                                                            .child(
-                                                                div()
-                                                                    .cursor(CursorStyle::PointingHand)
-                                                                    .p(px(2.))
-                                                                    .rounded(px(3.))
-                                                                    .hover(|s| s.bg(theme.hover))
-                                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
-                                                                        cx.stop_propagation();
-                                                                        this.close_tab(tab_id, window, cx);
-                                                                        if this.tabs.is_empty() {
-                                                                            this.is_tab_overview_open = false;
-                                                                        } else {
-                                                                            this.tab_overview_selected = this.tab_overview_selected.min(this.tabs.len() - 1);
-                                                                        }
-                                                                        cx.notify();
-                                                                    }))
-                                                                    .child(render_icon(IconType::X, theme.muted, 11.0)),
-                                                            ),
-                                                    ),
-                                            )
+                                                            .when(is_selected, |row| {
+                                                                row.child(
+                                                                    div()
+                                                                        .cursor(CursorStyle::PointingHand)
+                                                                        .p(px(2.))
+                                                                        .rounded(px(4.))
+                                                                        .hover(|style| style.bg(theme.hover))
+                                                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
+                                                                            cx.stop_propagation();
+                                                                            this.close_tab(tab_id, window, cx);
+                                                                            if this.tabs.is_empty() {
+                                                                                this.is_tab_overview_open = false;
+                                                                            } else {
+                                                                                this.tab_overview_selected = this.tab_overview_selected.min(this.tabs.len() - 1);
+                                                                            }
+                                                                            cx.notify();
+                                                                        }))
+                                                                        .child(render_icon(IconType::X, theme.muted, 12.0)),
+                                                                )
+                                                            }),
+                                                    )
+                                            })
                                             // Mini Terminal Preview
                                             .child(
                                                 div()
                                                     .flex_1()
-                                                    .bg(theme.black.opacity(0.92))
-                                                    .px(px(8.))
-                                                    .py(px(6.))
+                                                    .px(px(12.))
+                                                    .py(px(8.))
                                                     .font_family(font_fam.clone())
-                                                    .text_size(px(8.0))
+                                                    .text_size(px(9.5))
                                                     .overflow_hidden()
                                                     .flex()
                                                     .flex_col()
@@ -21007,7 +21044,7 @@ impl Render for RootView {
                                                                 .map(|line| {
                                                                     let is_cursor_row = line.is_cursor_row;
                                                                     div()
-                                                                        .h(px(13.))
+                                                                        .h(px(14.))
                                                                         .w_full()
                                                                         .flex()
                                                                         .flex_row()
@@ -21019,12 +21056,12 @@ impl Render for RootView {
                                                                                 el.child(
                                                                                     div()
                                                                                         .w(px(5.))
-                                                                                        .h(px(9.))
+                                                                                        .h(px(10.))
                                                                                         .rounded(px(1.))
                                                                                         .bg(theme.accent)
                                                                                 )
                                                                             } else {
-                                                                                el.child(div().h(px(13.)).child(" "))
+                                                                                el.child(div().h(px(14.)).child(" "))
                                                                             }
                                                                         })
                                                                         .when(!line.spans.is_empty(), |el| {
@@ -21048,7 +21085,7 @@ impl Render for RootView {
                                                                                 row_el = row_el.child(
                                                                                     div()
                                                                                         .w(px(5.))
-                                                                                        .h(px(9.))
+                                                                                        .h(px(10.))
                                                                                         .rounded(px(1.))
                                                                                         .bg(theme.accent)
                                                                                         .ml(px(1.)),
@@ -21061,90 +21098,99 @@ impl Render for RootView {
                                                         }
                                                     ),
                                             )
-                                            // Card Bottom Status Bar
+                                            // Card footer
                                             .child({
-                                                let folder_name = tab.cwd.as_ref().and_then(|p| p.file_name()).map(|f| f.to_string_lossy().into_owned());
+                                                let cwd_label = tab
+                                                    .cwd
+                                                    .as_deref()
+                                                    .map(Self::short_home_path)
+                                                    .unwrap_or_else(|| "~".to_string());
                                                 div()
-                                                    .h(px(26.))
+                                                    .h(px(30.))
                                                     .flex()
                                                     .flex_row()
                                                     .items_center()
                                                     .justify_between()
-                                                    .px(px(8.))
-                                                    .bg(theme.surface)
+                                                    .px(px(12.))
                                                     .border_t_1()
-                                                    .border_color(theme.border)
+                                                    .border_color(theme.border.opacity(0.6))
                                                     .child(
                                                         div()
                                                             .flex_1()
-                                                            .min_w_0()
+                                                            .min_w(px(0.))
                                                             .flex()
                                                             .flex_row()
                                                             .items_center()
-                                                            .gap(px(5.))
-                                                            .text_size(px(9.5))
+                                                            .gap(px(6.))
+                                                            .text_size(px(10.5))
                                                             .text_color(theme.muted)
-                                                            .whitespace_nowrap()
-                                                            .text_ellipsis()
-                                                            .overflow_hidden()
-                                                            .child(div().child(format!("cmd: {}", proc_name)))
-                                                            .when_some(folder_name, |el, folder| {
-                                                                el.child(div().text_color(theme.muted.opacity(0.5)).child("•"))
-                                                                    .child(render_icon(IconType::Folder, theme.muted, 11.0))
-                                                                    .child(div().text_ellipsis().overflow_hidden().child(folder))
-                                                            }),
+                                                            .truncate()
+                                                            .child(render_icon(IconType::Folder, theme.muted, 12.0))
+                                                            .child(SharedString::from(cwd_label)),
                                                     )
                                                     .child(
                                                         div()
                                                             .flex_shrink_0()
-                                                            .pl(px(6.))
+                                                            .pl(px(8.))
                                                             .flex()
                                                             .flex_row()
                                                             .items_center()
                                                             .gap(px(4.))
-                                                            .text_size(px(9.5))
-                                                            .font_weight(FontWeight::MEDIUM)
-                                                            .text_color(theme.accent)
+                                                            .text_size(px(10.5))
+                                                            .text_color(theme.green)
                                                             .whitespace_nowrap()
                                                             .map(|el| {
-                                                                if let Some(b) = branch_opt {
-                                                                    el.child(render_icon(IconType::GitBranch, theme.accent, 11.0))
-                                                                        .child(b)
+                                                                if let Some(branch) = branch_opt {
+                                                                    el.child(render_icon(IconType::GitBranch, theme.green, 11.0))
+                                                                        .child(branch)
                                                                 } else {
-                                                                    el.child("local")
+                                                                    el
                                                                 }
                                                             }),
                                                     )
                                             })
                                     })
                                 )
-                                // Plus Card to Add Tab
+                                // Plus card
                                 .child(
                                     div()
                                         .flex()
                                         .flex_col()
                                         .items_center()
                                         .justify_center()
+                                        .gap(px(10.))
                                         .w(px(cell_w))
                                         .h(px(cell_h))
                                         .rounded(px(10.))
-                                        .bg(theme.surface.opacity(0.5))
-                                        .border_2()
+                                        .bg(theme.surface.opacity(0.4))
+                                        .border_1()
                                         .border_color(theme.border)
                                         .cursor(CursorStyle::PointingHand)
-                                        .hover(|s| s.bg(theme.hover).border_color(theme.accent))
+                                        .hover(|style| {
+                                            style
+                                                .bg(theme.surface_raised)
+                                                .border_color(theme.accent)
+                                        })
                                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, window, cx| {
                                             this.is_tab_overview_open = false;
                                             this.create_tab(window, cx);
                                         }))
-                                        .child(render_icon(IconType::Plus, theme.accent, 28.0))
+                                        .child(render_icon(IconType::Plus, theme.muted_strong, 20.0))
                                         .child(
                                             div()
-                                                .pt(px(6.))
-                                                .text_size(px(12.))
-                                                .font_weight(FontWeight::BOLD)
-                                                .text_color(theme.foreground)
-                                                .child("New Tab"),
+                                                .text_size(px(12.5))
+                                                .text_color(theme.muted_strong)
+                                                .child("New tab"),
+                                        )
+                                        .child(
+                                            div()
+                                                .px(px(6.))
+                                                .py(px(2.))
+                                                .rounded(px(4.))
+                                                .bg(theme.surface_raised)
+                                                .text_size(px(10.5))
+                                                .text_color(theme.muted)
+                                                .child("t"),
                                         ),
                                 ),
                         ),
@@ -23995,7 +24041,6 @@ mod mission_control_tests {
             1600.0,
             1920.0,
             2560.0,
-            3440.0,
             threshold - 1.0,
         ] {
             let layout = MissionControlLayout::new(width, 900.0, 8);
@@ -24073,9 +24118,9 @@ mod mission_control_tests {
     #[test]
     fn mission_control_geometry_is_identical_on_every_platform() {
         for (width, height, expected_cols, expected_cell_w, expected_cell_h) in [
-            (1512.0_f32, 982.0_f32, 4_usize, 352.0_f32, 264.0_f32),
-            (1920.0, 1080.0, 4, 454.0, 340.5),
-            (1280.0, 800.0, 4, 294.0, 220.5),
+            (1512.0_f32, 982.0_f32, 3_usize, 466.67_f32, 308.0_f32),
+            (1920.0, 1080.0, 3, 602.67, 397.76),
+            (1280.0, 800.0, 3, 389.33, 256.96),
         ] {
             let layout = MissionControlLayout::new(width, height, 8);
             assert_eq!(layout.cols, expected_cols, "cols at {width}x{height}");
@@ -24092,8 +24137,8 @@ mod mission_control_tests {
         }
     }
 
-    /// The card must stay big enough to hold the top bar, the status bar, and a
-    /// few preview lines. A short card would show a status bar and no terminal.
+    /// The card must stay big enough to hold the header, the footer, and a few
+    /// preview lines. A short card would show a footer and no terminal.
     #[test]
     fn mission_control_cell_holds_a_usable_preview() {
         for (width, height) in [
@@ -24105,7 +24150,7 @@ mod mission_control_tests {
             let layout = MissionControlLayout::new(width, height, 8);
             let lines = preview_line_count(layout.cell_h, 200);
             assert!(
-                lines >= 6,
+                lines >= 5,
                 "a {}x{} card at {width}x{height} holds only {lines} preview lines",
                 layout.cell_w,
                 layout.cell_h
@@ -24236,33 +24281,6 @@ mod mission_control_tests {
                 );
             }
         }
-    }
-
-    /// The widths where the cells fit with no slack, so the grid box has to grow
-    /// past the exact sum. Without the extra width the layout engine sums the
-    /// cells in `f32` and lands an ulp over the budget, which wraps the last
-    /// cell and makes the grid paint fewer columns than the keys navigate.
-    #[test]
-    fn mission_control_gives_the_last_cell_slack() {
-        // Width 1577 with three items is one such case: the exact sum leaves no
-        // room for the floating point error in the layout engine.
-        let exact = {
-            let layout = MissionControlLayout::new(1577.0, 900.0, 3);
-            layout.cell_w * 3.0 + 2.0 * MC_GAP + 2.0 * MC_GRID_PAD
-        };
-        assert_eq!(
-            fits_cols_in_row(exact, exact / 3.0),
-            2,
-            "the exact three column sum must be the failing case this guards"
-        );
-
-        let layout = MissionControlLayout::new(1577.0, 900.0, 3);
-        assert_eq!(layout.cols, 3);
-        assert!(
-            layout.grid_w > exact,
-            "grid_w {} must exceed the exact sum {exact} to leave slack",
-            layout.grid_w
-        );
     }
 
     /// A wider window must give the cells more room, which is what makes the
