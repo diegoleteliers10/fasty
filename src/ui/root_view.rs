@@ -3546,6 +3546,8 @@ pub struct RootView {
     /// Window-space pixel position of the terminal cursor line when the
     /// picker opened; the dropdown anchors above or below it.
     pub file_picker_anchor: Option<(f32, f32)>,
+    /// Git status per path relative to the picker root, captured when it opens.
+    pub file_picker_status: std::collections::HashMap<String, crate::git::GitFileStatus>,
     pub is_tab_overview_open: bool,
     pub tab_overview_selected: usize,
     pub tab_overview_scroll_handle: ScrollHandle,
@@ -4397,6 +4399,7 @@ impl RootView {
             file_picker_root: None,
             file_picker_index: Vec::new(),
             file_picker_anchor: None,
+            file_picker_status: std::collections::HashMap::new(),
             is_tab_overview_open: false,
             tab_overview_selected: 0,
             tab_overview_scroll_handle: ScrollHandle::new(),
@@ -7882,10 +7885,50 @@ impl RootView {
         self.is_global_search_open = false;
         self.file_picker_anchor = self.terminal_cursor_anchor(window);
         let active_tab = self.tabs.get(self.active_tab_idx);
-        self.file_picker_root = active_tab.and_then(|t| t.cwd.clone());
+        let root = active_tab.and_then(|tab| tab.cwd.clone());
+        self.file_picker_root = root.clone();
+        self.file_picker_status.clear();
+        if let Some(root) = root.as_deref() {
+            if let Some(workdir) = crate::git::repo_workdir(root) {
+                let root_prefix = root
+                    .strip_prefix(&workdir)
+                    .ok()
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .filter(|path| !path.is_empty());
+                for change in crate::git::cached_project_panel_snapshot(Some(root)).changes {
+                    let status = change
+                        .index
+                        .as_ref()
+                        .map(|side| side.status)
+                        .filter(|status| {
+                            matches!(
+                                status,
+                                crate::git::GitFileStatus::Added
+                                    | crate::git::GitFileStatus::Renamed
+                            )
+                        })
+                        .or_else(|| change.worktree.as_ref().map(|side| side.status))
+                        .or_else(|| change.index.as_ref().map(|side| side.status));
+                    let Some(status) = status else {
+                        continue;
+                    };
+                    let key = match root_prefix.as_deref() {
+                        Some(prefix) => {
+                            let Some(rest) = change.path.strip_prefix(&format!("{prefix}/"))
+                            else {
+                                continue;
+                            };
+                            rest.to_string()
+                        }
+                        None => change.path,
+                    };
+                    self.file_picker_status.insert(key, status);
+                }
+            }
+        }
         let current_branch = active_tab
-            .and_then(|t| t.git_status.as_ref())
-            .map(|g| g.branch.clone());
+            .and_then(|tab| tab.git_status.as_ref())
+            .map(|git| git.branch.clone());
         self.file_picker_index = crate::universal_picker::build_sources(
             self.file_picker_root.as_deref(),
             current_branch.as_deref(),
@@ -19865,14 +19908,25 @@ impl Render for RootView {
                 let root_label = self
                     .file_picker_root
                     .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
+                    .map(|path| Self::short_home_path(path))
                     .unwrap_or_else(|| "No working directory".to_string());
+                let selected_title = matches
+                    .get(selected_idx)
+                    .map(|item| {
+                        if item.kind == ItemKind::Dir {
+                            format!("{}/", item.title)
+                        } else {
+                            item.title.clone()
+                        }
+                    })
+                    .unwrap_or_default();
 
-                let menu_w: f32 = 220.0;
-                let menu_h: f32 = 340.0;
                 let vp = _window.viewport_size();
                 let vp_w = vp.width.to_f64() as f32;
                 let vp_h = vp.height.to_f64() as f32;
+                let menu_w: f32 = 560.0_f32.min((vp_w - 16.0).max(160.0));
+                let list_max_h: f32 = (vp_h - 150.0).clamp(120.0, 320.0);
+                let menu_h: f32 = list_max_h + 91.0;
                 let (anchor_x, anchor_y) = self.file_picker_anchor.unwrap_or_else(|| {
                     ((vp_w - menu_w) / 2.0, (vp_h - 160.0).max(0.0))
                 });
@@ -19887,6 +19941,136 @@ impl Render for RootView {
                 } else {
                     anchor_y + 24.0
                 };
+
+                let mut rows: Vec<gpui::AnyElement> = Vec::new();
+                if matches.is_empty() {
+                    rows.push(
+                        div()
+                            .px(px(12.))
+                            .py(px(16.))
+                            .text_size(px(13.))
+                            .text_color(theme.muted)
+                            .child(if self.file_picker_index.is_empty() {
+                                "No sources available yet".to_string()
+                            } else {
+                                "Nothing matching".to_string()
+                            })
+                            .into_any_element(),
+                    );
+                } else {
+                    for (idx, item) in matches.into_iter().enumerate() {
+                        let is_selected = idx == selected_idx;
+                        let is_dir = item.kind == ItemKind::Dir;
+                        let icon = match item.kind {
+                            ItemKind::Dir => IconType::Folder,
+                            ItemKind::File => IconType::FileCode,
+                            ItemKind::SshHost => IconType::Server,
+                            ItemKind::GitBranch => IconType::GitBranch,
+                            ItemKind::Snippet => IconType::Terminal,
+                            ItemKind::DockerContainer => IconType::Container,
+                        };
+                        let full_path = format!("{}{}", item.detail, item.title);
+                        let git_status = (item.kind == ItemKind::File)
+                            .then(|| self.file_picker_status.get(&full_path))
+                            .flatten()
+                            .copied();
+                        let (letter, letter_color) = match git_status {
+                            Some(crate::git::GitFileStatus::Added) => ("A", theme.green),
+                            Some(crate::git::GitFileStatus::Modified) => ("M", theme.yellow),
+                            Some(crate::git::GitFileStatus::Untracked) => ("?", theme.red),
+                            Some(crate::git::GitFileStatus::Deleted) => ("D", theme.red),
+                            Some(crate::git::GitFileStatus::Renamed) => ("R", theme.accent),
+                            Some(crate::git::GitFileStatus::Conflicted) => ("!", theme.red),
+                            None => ("", theme.muted),
+                        };
+                        let kind_label = item.kind.label();
+                        let show_kind_label = !matches!(item.kind, ItemKind::File | ItemKind::Dir);
+                        let detail = item.detail.clone();
+                        let title = item.title.clone();
+                        rows.push(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .h(px(40.))
+                                .px(px(10.))
+                                .rounded(px(8.))
+                                .when(is_selected, |row| row.bg(theme.surface_raised))
+                                .when(!is_selected, |row| {
+                                    row.hover(move |style| style.bg(theme.hover))
+                                })
+                                .cursor(CursorStyle::PointingHand)
+                                .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
+                                    if this.file_picker_selected != idx {
+                                        this.file_picker_selected = idx;
+                                        cx.notify();
+                                    }
+                                }))
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                    this.file_picker_selected = idx;
+                                    this.insert_selected_file_path(cx);
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(12.))
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .child(render_icon(
+                                            icon,
+                                            if is_selected { theme.accent } else { theme.muted_strong },
+                                            15.0,
+                                        ))
+                                        .child(
+                                            div()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_size(px(13.5))
+                                                .text_color(theme.foreground)
+                                                .child(if is_dir {
+                                                    SharedString::from(format!("{title}/"))
+                                                } else {
+                                                    SharedString::from(title)
+                                                }),
+                                        )
+                                        .when(!detail.is_empty(), |row| {
+                                            row.child(
+                                                div()
+                                                    .min_w(px(0.))
+                                                    .truncate()
+                                                    .text_size(px(11.5))
+                                                    .text_color(theme.muted)
+                                                    .child(SharedString::from(detail)),
+                                            )
+                                        }),
+                                )
+                                .when(show_kind_label, |row| {
+                                    row.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(px(11.))
+                                            .text_color(theme.muted)
+                                            .child(kind_label),
+                                    )
+                                })
+                                .when(!letter.is_empty(), |row| {
+                                    row.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .font_family(self.font_family.clone())
+                                            .text_size(px(12.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(letter_color)
+                                            .child(letter),
+                                    )
+                                })
+                                .into_any_element(),
+                        );
+                    }
+                }
 
                 this.child(
                     div()
@@ -19911,183 +20095,126 @@ impl Render for RootView {
                         .top(px(popup_y))
                         .left(px(popup_x))
                         .w(px(menu_w))
-                        .rounded(px(10.))
-                                .bg(theme.surface)
-                                .border_1()
-                                .border_color(theme.border)
-                                .shadow_xl()
-                                .p(px(8.))
+                        .rounded(px(12.))
+                        .bg(theme.surface)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_xl()
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        // Search input
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(12.))
+                                .px(px(16.))
+                                .pt(px(12.))
+                                .pb(px(8.))
+                                .child(render_icon(IconType::Search, theme.accent, 16.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_size(px(15.))
+                                        .text_color(if self.file_picker_query.is_empty() {
+                                            theme.muted
+                                        } else {
+                                            theme.foreground
+                                        })
+                                        .child(if self.file_picker_query.is_empty() {
+                                            "Insert a file, host, branch...".to_string()
+                                        } else {
+                                            format!("{}|", self.file_picker_query)
+                                        }),
+                                ),
+                        )
+                        // Search root breadcrumb
+                        .child(
+                            div()
+                                .px(px(16.))
+                                .pb(px(6.))
+                                .truncate()
+                                .text_size(px(11.5))
+                                .text_color(theme.muted)
+                                .child(SharedString::from(root_label)),
+                        )
+                        // Results list
+                        .child(
+                            div()
+                                .id("file-picker-list")
+                                .track_scroll(&self.file_picker_scroll_handle)
                                 .flex()
                                 .flex_col()
-                                .gap_2()
-                                .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
-                                    cx.stop_propagation();
-                                })
-                                .on_mouse_down(MouseButton::Right, |_ev, _window, cx| {
-                                    cx.stop_propagation();
-                                })
-                                // Search input
+                                .max_h(px(list_max_h))
+                                .min_h(px(0.))
+                                .flex_shrink(1.)
+                                .overflow_y_scroll()
+                                .px(px(8.))
+                                .pb(px(6.))
+                                .gap(px(2.))
+                                .children(rows),
+                        )
+                        // Footer
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .px(px(16.))
+                                .py(px(9.))
+                                .text_size(px(11.5))
+                                .text_color(theme.muted)
                                 .child(
                                     div()
                                         .flex()
                                         .flex_row()
                                         .items_center()
-                                        .gap_2()
-                                        .px(px(8.))
-                                        .py(px(6.))
-                                        .rounded(px(6.))
-                                        .bg(theme.surface_raised)
-                                        .child(render_icon(IconType::Search, theme.muted, 13.0))
+                                        .gap(px(8.))
+                                        .min_w(px(0.))
                                         .child(
                                             div()
-                                                .flex_1()
-                                                .overflow_hidden()
-                                                .whitespace_nowrap()
-                                                .text_size(px(13.))
-                                                .text_color(if self.file_picker_query.is_empty() { theme.muted } else { theme.foreground })
-                                                .child(if self.file_picker_query.is_empty() {
-                                                    "Insert anything: files, ssh, git…"
-                                                        .to_string()
-                                                } else {
-                                                    format!("{}|", self.file_picker_query)
-                                                }),
+                                                .flex_shrink_0()
+                                                .text_color(theme.accent)
+                                                .child("›"),
                                         )
+                                        .child(
+                                            div()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .child(SharedString::from(selected_title)),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .flex_shrink_0()
                                         .child(
                                             div()
                                                 .px(px(6.))
                                                 .py(px(2.))
                                                 .rounded(px(4.))
-                                                .bg(theme.surface)
-                                                .text_size(px(10.))
-                                                .text_color(theme.muted)
-                                                .child("ESC to close"),
-                                        ),
-                                )
-                                // Search root breadcrumb
-                                .child(
-                                    div()
-                                        .px(px(8.))
-                                        .text_size(px(10.))
-                                        .whitespace_nowrap()
-                                        .overflow_hidden()
-                                        .text_color(theme.muted)
-                                        .child(format!("In {}", root_label)),
-                                )
-                                // Results list
-                                .child(
-                                    div()
-                                        .id("file-picker-list")
-                                        .track_scroll(&self.file_picker_scroll_handle)
-                                        .flex()
-                                        .flex_col()
-                                        .max_h(px(260.))
-                                        .overflow_y_scroll()
-                                        .p(px(4.))
-                                        .gap_1()
-                                        .children(
-                                            if matches.is_empty() {
-                                                vec![
-                                                    div()
-                                                        .p(px(16.))
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(12.))
-                                                                .text_color(theme.muted)
-                                                                .child(if self.file_picker_index.is_empty() {
-                                                                    "No sources available yet".to_string()
-                                                                } else {
-                                                                    "Nothing matching".to_string()
-                                                                }),
-                                                        ),
-                                                ]
-                                            } else {
-                                                matches
-                                                    .into_iter()
-                                                    .enumerate()
-                                                    .map(|(idx, item)| {
-                                                        let is_selected = idx == selected_idx;
-                                                        let (icon, icon_color) = match item.kind {
-                                                            ItemKind::Dir => (IconType::Folder, theme.accent),
-                                                            ItemKind::File => (IconType::FileCode, theme.muted),
-                                                            ItemKind::SshHost => (IconType::Server, theme.accent),
-                                                            ItemKind::GitBranch => (IconType::GitBranch, theme.accent),
-                                                            ItemKind::Snippet => (IconType::Terminal, theme.muted),
-                                                            ItemKind::DockerContainer => (IconType::Container, theme.accent),
-                                                        };
-                                                        let file_name = item.title.clone();
-                                                        let dir_prefix = item.detail.clone();
-                                                        let kind_label = item.kind.label();
-                                                        let show_kind_label = !matches!(
-                                                            item.kind,
-                                                            ItemKind::File | ItemKind::Dir
-                                                        );
-                                                        div()
-                                                            .flex()
-                                                            .flex_row()
-                                                            .items_center()
-                                                            .gap_2()
-                                                            .px(px(10.))
-                                                            .py(px(6.))
-                                                            .rounded(px(6.))
-                                                            .bg(if is_selected { theme.accent } else { theme.surface })
-                                                            .hover(|s| if !is_selected { s.bg(theme.hover) } else { s })
-                                                            .cursor(CursorStyle::PointingHand)
-                                                            .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
-                                                                if this.file_picker_selected != idx {
-                                                                    this.file_picker_selected = idx;
-                                                                    cx.notify();
-                                                                }
-                                                            }))
-                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                                                this.file_picker_selected = idx;
-                                                                this.insert_selected_file_path(cx);
-                                                            }))
-                                                            .child(render_icon(
-                                                                icon,
-                                                                if is_selected { theme.black } else { icon_color },
-                                                                13.0,
-                                                            ))
-                                                            .child(
-                                                                div()
-                                                                    .flex_1()
-                                                                    .flex()
-                                                                    .flex_row()
-                                                                    .items_center()
-                                                                    .whitespace_nowrap()
-                                                                    .overflow_hidden()
-                                                                    .child(
-                                                                        div()
-                                                                            .text_size(px(11.5))
-                                                                            .text_color(if is_selected { theme.black.opacity(0.8) } else { theme.muted })
-                                                                            .child(dir_prefix),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .text_size(px(12.))
-                                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                                            .text_color(if is_selected { theme.black } else { theme.foreground })
-                                                                            .child(file_name),
-                                                                    ),
-                                                            )
-                                                            .when(show_kind_label, |row| {
-                                                                row.child(
-                                                                    div()
-                                                                        .ml_auto()
-                                                                        .pl(px(6.))
-                                                                        .text_size(px(9.5))
-                                                                        .text_color(if is_selected {
-                                                                            theme.black.opacity(0.6)
-                                                                        } else {
-                                                                            theme.muted
-                                                                        })
-                                                                        .child(kind_label),
-                                                                )
-                                                            })
-                                                    })
-                                                    .collect::<Vec<_>>()
-                                            }
-                                        ),
+                                                .bg(theme.surface_raised)
+                                                .text_size(px(10.5))
+                                                .text_color(theme.muted_strong)
+                                                .child("↵"),
+                                        )
+                                        .child("insert"),
                                 ),
+                        ),
                 )
             })
             // Git Context Menu Overlay

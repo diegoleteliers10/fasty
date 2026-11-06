@@ -353,6 +353,14 @@ pub fn list_worktrees(cwd: &Path) -> Vec<Worktree> {
     }
 }
 
+/// Repository workdir that contains `path`, if any.
+pub fn repo_workdir(path: &Path) -> Option<PathBuf> {
+    git2::Repository::discover(path)
+        .ok()?
+        .workdir()
+        .map(|workdir| workdir.to_path_buf())
+}
+
 /// Number of changed entries in a worktree, used by the worktree picker.
 /// `None` means the directory is missing or is not a repository.
 pub fn worktree_change_count(path: &Path) -> Option<usize> {
