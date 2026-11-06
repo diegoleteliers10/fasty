@@ -3516,7 +3516,6 @@ pub struct RootView {
         Arc<std::sync::Mutex<Option<crate::widgets::builtin::git_prs::PrsSummary>>>,
     pub is_search_open: bool,
     pub search_query: String,
-    pub search_case_sensitive: bool,
     pub search_regex: bool,
     pub search_invalid_pattern: bool,
     pub search_match_idx: usize,
@@ -4375,7 +4374,6 @@ impl RootView {
             pr_snapshot: Arc::new(std::sync::Mutex::new(None)),
             is_search_open: false,
             search_query: String::new(),
-            search_case_sensitive: false,
             search_regex: false,
             search_invalid_pattern: false,
             search_match_idx: 0,
@@ -7756,7 +7754,7 @@ impl RootView {
         }
         if self.search_regex
             && regex::RegexBuilder::new(&query)
-                .case_insensitive(!self.search_case_sensitive)
+                .case_insensitive(true)
                 .build()
                 .is_err()
         {
@@ -7772,11 +7770,7 @@ impl RootView {
             cx.notify();
             return;
         };
-        self.search_matches = terminal.search_matches_with(
-            &query,
-            self.search_case_sensitive,
-            self.search_regex,
-        );
+        self.search_matches = terminal.search_matches_with(&query, false, self.search_regex);
         if let Some(first) = self.search_matches.first().copied() {
             self.scroll_buffer_search_to_line(first.line, window);
         }
@@ -13548,11 +13542,6 @@ impl RootView {
                 cx.notify();
                 return;
             }
-            if modifiers.alt && key_lower == "c" {
-                self.search_case_sensitive = !self.search_case_sensitive;
-                self.refresh_buffer_search(_window, cx);
-                return;
-            }
             if modifiers.alt && key_lower == "r" {
                 self.search_regex = !self.search_regex;
                 self.refresh_buffer_search(_window, cx);
@@ -13581,12 +13570,13 @@ impl RootView {
                 self.refresh_buffer_search(_window, cx);
                 return;
             }
+            let alt_chord = modifiers.alt && !is_alt_gr;
             let mut char_to_add = None;
             if let Some(ref ch) = event.keystroke.key_char {
-                if !modifiers.platform && !is_ctrl {
+                if !modifiers.platform && !is_ctrl && !alt_chord {
                     char_to_add = Some(ch.clone());
                 }
-            } else if key.len() == 1 && !modifiers.platform && !is_ctrl {
+            } else if key.len() == 1 && !modifiers.platform && !is_ctrl && !alt_chord {
                 char_to_add = Some(key.clone());
             }
             if let Some(ch) = char_to_add {
@@ -15977,12 +15967,11 @@ impl RootView {
                         let search_regex = (search_open && self.search_regex)
                             .then(|| {
                                 regex::RegexBuilder::new(&search_query_str)
-                                    .case_insensitive(!self.search_case_sensitive)
+                                    .case_insensitive(true)
                                     .build()
                                     .ok()
                             })
                             .flatten();
-                        let search_case_sensitive = self.search_case_sensitive;
                         let active_search_match =
                             self.search_matches.get(self.search_match_idx).copied();
                         let num_lines = lines.len();
@@ -16027,7 +16016,7 @@ impl RootView {
                                         crate::terminal_state::find_literal_ranges(
                                             &full_line,
                                             &search_query_str,
-                                            search_case_sensitive,
+                                            false,
                                         )
                                     };
 
@@ -19167,7 +19156,7 @@ impl Render for RootView {
             .when(self.is_search_open, |this| {
                 let match_count = self.search_matches.len();
                 let counter = if self.search_invalid_pattern {
-                    "invalid pattern".to_string()
+                    "bad regex".to_string()
                 } else if match_count == 0 {
                     "0/0".to_string()
                 } else {
@@ -19254,32 +19243,6 @@ impl Render for RootView {
                                 .when(!compact_bar, |row| {
                                     row.child(
                                         div()
-                                            .id("buffer-search-case")
-                                            .flex_shrink_0()
-                                            .px(px(6.))
-                                        .py(px(2.))
-                                        .rounded(px(6.))
-                                        .when(self.search_case_sensitive, |toggle| {
-                                            toggle.bg(theme.surface_raised)
-                                        })
-                                        .text_size(px(11.5))
-                                        .text_color(if self.search_case_sensitive {
-                                            theme.accent
-                                        } else {
-                                            theme.muted
-                                        })
-                                        .cursor(CursorStyle::PointingHand)
-                                        .hover(move |style| style.text_color(theme.foreground))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                            this.search_case_sensitive = !this.search_case_sensitive;
-                                            this.refresh_buffer_search(_window, cx);
-                                        }))
-                                            .child("Aa"),
-                                    )
-                                })
-                                .when(!compact_bar, |row| {
-                                    row.child(
-                                        div()
                                             .id("buffer-search-regex")
                                             .flex_shrink_0()
                                             .px(px(6.))
@@ -19308,8 +19271,7 @@ impl Render for RootView {
                                         .flex_shrink_0()
                                         .w(px(1.))
                                         .h(px(14.))
-                                        .bg(theme.border)
-                                        .flex_shrink_0(),
+                                        .bg(theme.border),
                                 )
                                 .child(
                                     div()
