@@ -18209,8 +18209,8 @@ impl Render for RootView {
                 backdrop_bg.a = 0.65;
                 let groups = self.grouped_palette_commands();
                 let selected_idx = self.command_palette_selected;
-                let list_height = (_window.viewport_size().height.to_f64() as f32 - 220.0)
-                    .clamp(120.0, 360.0);
+                let list_height = (_window.viewport_size().height.to_f64() as f32 - 260.0)
+                    .clamp(96.0, 300.0);
                 let mut rows: Vec<gpui::AnyElement> = Vec::new();
                 let mut row_index = 0usize;
                 for (label, commands) in groups {
@@ -18248,7 +18248,7 @@ impl Render for RootView {
                             .flex_row()
                             .items_center()
                             .justify_between()
-                            .h(px(56.))
+                            .h(px(50.))
                             .flex_shrink_0()
                             .px(px(12.))
                             .rounded(px(8.))
@@ -18278,7 +18278,7 @@ impl Render for RootView {
                                     .child(render_icon(
                                         cmd.icon,
                                         if is_selected { theme.accent } else { theme.muted_strong },
-                                        16.0,
+                                        15.0,
                                     ))
                                     .child(
                                         div()
@@ -18299,8 +18299,8 @@ impl Render for RootView {
                             for key in palette_shortcut_keys(shortcut) {
                                 keys = keys.child(
                                     div()
-                                        .min_w(px(24.))
-                                        .h(px(24.))
+                                        .min_w(px(22.))
+                                        .h(px(22.))
                                         .px(px(5.))
                                         .flex()
                                         .items_center()
