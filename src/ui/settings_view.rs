@@ -141,7 +141,7 @@ impl SettingsTab {
             Self::General => "Layout, terminal behavior, notifications and updates.",
             Self::Appearance => "Theme, transparency and the type your shell is set in.",
             Self::Keyboard => "Pick a preset, then make any shortcut your own.",
-            Self::Ai => "Providers, models, and assistant behavior.",
+            Self::Ai => "Choose who powers Fastty AI and what it is allowed to do.",
             Self::Migration => "Import settings from other terminals.",
             Self::Advanced => "Deeper configuration and diagnostics.",
         }
@@ -2115,6 +2115,16 @@ fn render_plain_row(
                 .min_w_0()
                 .child(control),
         )
+}
+
+fn render_plain_row_inset(
+    title: impl Into<SharedString>,
+    subtitle: Option<impl Into<SharedString>>,
+    control: impl IntoElement,
+    _is_last: bool,
+    theme: &Theme,
+) -> gpui::Div {
+    render_plain_row(title, subtitle, control, false, theme).px(px(14.))
 }
 
 impl SettingsView {
@@ -4114,19 +4124,20 @@ impl SettingsView {
                     .flex_col()
                     .child(render_section_header("AI Provider", theme))
                     .child(
-                        render_group_card(theme).children(providers.into_iter().enumerate().map(|(idx, (id, name, badge, desc))| {
+                        div().flex().flex_col().children(providers.into_iter().enumerate().map(|(idx, (id, name, badge, desc))| {
                             let is_active = self.ai_provider == id;
-                            let is_last = idx == providers.len() - 1;
+                            let _is_last = idx == providers.len() - 1;
                             div()
                                 .id(SharedString::from(format!("ai-prov-row-{}", id)))
                                 .flex()
                                 .flex_row()
                                 .items_center()
                                 .justify_between()
-                                .px(px(16.))
-                                .py(px(12.))
-                                .when(!is_last, |this| this.border_b_1().border_color(theme.border))
-                                .hover(move |s| s.bg(theme.surface_raised))
+                                .px(px(14.))
+                                .py(px(14.))
+                                .rounded(px(8.))
+                                .when(is_active, |row| row.bg(theme.surface_raised))
+                                .hover(move |s| if is_active { s } else { s.bg(theme.hover) })
                                 .cursor(CursorStyle::PointingHand)
                                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, window, cx| {
                                     this.set_ai_provider(id, window, cx);
@@ -4144,42 +4155,43 @@ impl SettingsView {
                                                 .gap_2()
                                                 .child(
                                                     div()
-                                                        .text_size(px(12.5))
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(if is_active { theme.foreground } else { theme.muted_strong })
+                                                        .text_size(px(15.5))
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(theme.foreground)
                                                         .child(name),
                                                 )
                                                 .child(
                                                     div()
-                                                        .text_size(px(9.5))
-                                                        .px(px(5.))
-                                                        .py(px(1.))
-                                                        .rounded(px(3.))
-                                                        .bg(if is_active { theme.selected } else { theme.surface_raised })
-                                                        .text_color(if is_active { theme.accent } else { theme.muted })
-                                                        .child(badge),
+                                                        .text_size(px(10.))
+                                                        .px(px(6.))
+                                                        .py(px(2.))
+                                                        .rounded(px(4.))
+                                                        .bg(theme.surface_raised)
+                                                        .text_color(theme.muted)
+                                                        .child(badge.to_uppercase()),
                                                 ),
                                         )
                                         .child(
                                             div()
-                                                .text_size(px(11.))
+                                                .text_size(px(13.))
                                                 .text_color(theme.muted)
                                                 .child(desc),
                                         ),
                                 )
                                 .child(
                                     div()
-                                        .w(px(20.))
-                                        .h(px(20.))
+                                        .w(px(22.))
+                                        .h(px(22.))
+                                        .flex_shrink_0()
                                         .rounded_full()
                                         .border_1()
-                                        .border_color(if is_active { theme.accent } else { theme.border })
+                                        .border_color(if is_active { theme.accent } else { theme.muted })
                                         .bg(if is_active { theme.accent } else { theme.surface })
                                         .flex()
                                         .items_center()
                                         .justify_center()
                                         .when(is_active, |this| {
-                                            this.child(render_icon(IconType::Check, theme.background, 12.0))
+                                            this.child(render_icon(IconType::Check, theme.background, 13.0))
                                         }),
                                 )
                         })),
@@ -4195,13 +4207,13 @@ impl SettingsView {
                     .flex_col()
                     .child(render_section_header(if is_acp { "ACP Models" } else { "Model Configuration (BYOK)" }, theme))
                     .child(
-                        render_group_card(theme)
-                            .child(render_card_row(
+                        div().flex().flex_col()
+                            .child(render_plain_row_inset(
                                 "Model Identifier",
                                 Some("Model name or alias (e.g. GLM-5.7, Opus 5)"),
                                 div()
-                                    .w(px(210.))
-                                    .h(px(30.))
+                                    .w(px(300.))
+                                    .h(px(40.))
                                     .relative()
                                     .child({
                                         let bounds_cell = self.ai_model_bounds.clone();
@@ -4214,8 +4226,8 @@ impl SettingsView {
                                         .absolute()
                                         .size_full()
                                     })
-                                    .px(px(8.))
-                                    .rounded(px(6.))
+                                    .px(px(10.))
+                                    .rounded(px(8.))
                                     .bg(theme.surface_raised)
                                     .border_1()
                                     .border_color(if is_model_focused { theme.accent } else { theme.border })
@@ -4227,7 +4239,7 @@ impl SettingsView {
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                                         this.active_input_field = Some(ActiveInputField::AiModel);
                                         this.ai_model_state.last_bounds = this.ai_model_bounds.get();
-                                        let col = this.ai_model_state.index_for_position(ev.position, 11.0, 8.0, window);
+                                        let col = this.ai_model_state.index_for_position(ev.position, 13.0, 10.0, window);
                                         this.ai_model_state.start_drag(col);
                                         this.is_dragging_input = true;
                                         cx.notify();
@@ -4257,7 +4269,7 @@ impl SettingsView {
                                                     })
                                                     .child(
                                                         div()
-                                                            .text_size(px(11.))
+                                                            .text_size(px(13.))
                                                             .text_color(theme.muted)
                                                             .child(match self.ai_provider.as_str() {
                                                                 "ollama" => "e.g. gemma4:12b",
@@ -4272,7 +4284,7 @@ impl SettingsView {
                                                     0,
                                                     if is_model_focused { Some(self.ai_model_state.cursor) } else { None },
                                                     self.ai_model_state.selection,
-                                                    11.0,
+                                                    13.0,
                                                     theme,
                                                     Some(window),
                                                 )
@@ -4301,11 +4313,11 @@ impl SettingsView {
                             ))
                             .child(
                                 div()
-                                    .px(px(16.))
-                                    .py(px(12.))
+                                    .px(px(14.))
+                                    .py(px(8.))
                                     .flex()
                                     .flex_col()
-                                    .gap_2()
+                                    .gap(px(10.))
                                     .child(
                                         div()
                                             .flex()
@@ -4336,7 +4348,7 @@ impl SettingsView {
                                                         .border_color(theme.border)
                                                         .cursor(CursorStyle::PointingHand)
                                                         .hover(move |s| s.bg(theme.hover))
-                                                        .text_size(px(10.5))
+                                                        .text_size(px(11.5))
                                                         .text_color(theme.accent)
                                                         .child("Refresh ↺")
                                                         .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
@@ -4360,13 +4372,11 @@ impl SettingsView {
                                                     .flex_row()
                                                     .items_center()
                                                     .gap_1p5()
-                                                    .px(px(8.))
-                                                    .py(px(5.))
+                                                    .px(px(10.))
+                                                    .py(px(6.))
                                                     .rounded(px(6.))
-                                                    .bg(if is_active { theme.surface_raised } else { theme.surface })
-                                                    .border_1()
-                                                    .border_color(if is_active { theme.accent } else { theme.border })
-                                                    .hover(move |s| s.bg(theme.surface_raised))
+                                                    .bg(if is_active { theme.accent } else { theme.surface_raised })
+                                                    .hover(move |s| if is_active { s } else { s.bg(theme.hover) })
                                                     .cursor(CursorStyle::PointingHand)
                                                     .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
                                                         this.set_ai_model(&m_name, cx);
@@ -4376,13 +4386,13 @@ impl SettingsView {
                                                     })
                                                     .child(
                                                         div()
-                                                            .text_size(px(11.))
-                                                            .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::NORMAL })
-                                                            .text_color(if is_active { theme.foreground } else { theme.muted })
+                                                            .text_size(px(12.5))
+                                                            .font_weight(if is_active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                                                            .text_color(if is_active { theme.background } else { theme.muted })
                                                             .child(SharedString::from(model_name)),
                                                     )
                                                     .when(is_active, |this| {
-                                                        this.child(render_icon(IconType::Check, theme.accent, 11.0))
+                                                        this.child(render_icon(IconType::Check, theme.background, 11.0))
                                                     })
                                             }))
                                     )
@@ -4401,8 +4411,8 @@ impl SettingsView {
                     .flex_col()
                     .child(render_section_header(if is_acp { "ACP Agent" } else { "Endpoint & Authentication" }, theme))
                     .child(
-                        render_group_card(theme)
-                            .child(render_card_row(
+                        div().flex().flex_col()
+                            .child(render_plain_row_inset(
                                 if is_acp { "Executable Command" } else { "Endpoint URL" },
                                 Some(if is_acp { "Command used to start the ACP agent" } else { "HTTP API base address for model requests" }),
                                 div()
@@ -4412,8 +4422,8 @@ impl SettingsView {
                                     .gap_2()
                                     .child(
                                         div()
-                                            .w(px(210.))
-                                            .h(px(30.))
+                                            .w(px(300.))
+                                            .h(px(40.))
                                             .relative()
                                             .child({
                                                 let bounds_cell = self.ai_base_url_bounds.clone();
@@ -4426,8 +4436,8 @@ impl SettingsView {
                                                 .absolute()
                                                 .size_full()
                                             })
-                                            .px(px(8.))
-                                            .rounded(px(6.))
+                                            .px(px(10.))
+                                            .rounded(px(8.))
                                             .bg(theme.surface_raised)
                                             .border_1()
                                             .border_color(if is_url_focused { theme.accent } else { theme.border })
@@ -4437,7 +4447,7 @@ impl SettingsView {
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                                                 this.active_input_field = Some(ActiveInputField::AiBaseUrl);
                                                 this.ai_base_url_state.last_bounds = this.ai_base_url_bounds.get();
-                                                let col = this.ai_base_url_state.index_for_position(ev.position, 11.0, 8.0, window);
+                                                let col = this.ai_base_url_state.index_for_position(ev.position, 13.0, 10.0, window);
                                                 this.ai_base_url_state.start_drag(col);
                                                 this.is_dragging_input = true;
                                                 cx.notify();
@@ -4459,7 +4469,7 @@ impl SettingsView {
                                                     })
                                                     .child(
                                                         div()
-                                                            .text_size(px(11.))
+                                                            .text_size(px(13.))
                                                             .text_color(theme.muted)
                                                     .child(if is_acp { "e.g. claude-agent-acp" } else { "e.g. http://localhost:11434/v1" }),
                                                     )
@@ -4469,7 +4479,7 @@ impl SettingsView {
                                                     0,
                                                     if is_url_focused { Some(self.ai_base_url_state.cursor) } else { None },
                                                     self.ai_base_url_state.selection,
-                                                    11.0,
+                                                    13.0,
                                                     theme,
                                                     Some(window),
                                                 )
@@ -4477,15 +4487,15 @@ impl SettingsView {
                                     )
                                     .child(
                                         div()
-                                            .px(px(7.))
-                                            .py(px(4.))
-                                            .rounded(px(5.))
-                                            .bg(theme.surface)
+                                            .px(px(12.))
+                                            .py(px(6.))
+                                            .rounded(px(7.))
+                                            .bg(theme.surface_raised)
                                             .border_1()
                                             .border_color(theme.border)
-                                            .hover(move |s| s.bg(theme.surface_raised))
+                                            .hover(move |s| s.bg(theme.hover))
                                             .cursor(CursorStyle::PointingHand)
-                                            .text_size(px(10.5))
+                                            .text_size(px(12.5))
                                             .text_color(theme.muted_strong)
                                             .child(if is_acp { "Default" } else { "Reset" })
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
@@ -4495,7 +4505,7 @@ impl SettingsView {
                                 false,
                                 theme,
                             ))
-                            .when(!is_acp, |card| card.child(render_card_row(
+                            .when(!is_acp, |card| card.child(render_plain_row_inset(
                                 "API Secret Key",
                                 Some("Custom key stored in fastty.toml (overrides env)"),
                                 div()
@@ -4505,8 +4515,8 @@ impl SettingsView {
                                     .gap_2()
                                     .child(
                                         div()
-                                            .w(px(210.))
-                                            .h(px(30.))
+                                            .w(px(300.))
+                                            .h(px(40.))
                                             .relative()
                                             .child({
                                                 let bounds_cell = self.ai_api_key_bounds.clone();
@@ -4519,8 +4529,8 @@ impl SettingsView {
                                                 .absolute()
                                                 .size_full()
                                             })
-                                            .px(px(8.))
-                                            .rounded(px(6.))
+                                            .px(px(10.))
+                                            .rounded(px(8.))
                                             .bg(theme.surface_raised)
                                             .border_1()
                                             .border_color(if is_key_focused { theme.accent } else { theme.border })
@@ -4530,7 +4540,7 @@ impl SettingsView {
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                                                 this.active_input_field = Some(ActiveInputField::AiApiKey);
                                                 this.ai_api_key_state.last_bounds = this.ai_api_key_bounds.get();
-                                                let col = this.ai_api_key_state.index_for_position(ev.position, 11.0, 8.0, window);
+                                                let col = this.ai_api_key_state.index_for_position(ev.position, 13.0, 10.0, window);
                                                 this.ai_api_key_state.start_drag(col);
                                                 this.is_dragging_input = true;
                                                 cx.notify();
@@ -4552,7 +4562,7 @@ impl SettingsView {
                                                     })
                                                     .child(
                                                         div()
-                                                            .text_size(px(11.))
+                                                            .text_size(px(13.))
                                                             .text_color(theme.muted)
                                                             .child("Paste key (⌘V)..."),
                                                     )
@@ -4562,7 +4572,7 @@ impl SettingsView {
                                                     0,
                                                     Some(self.ai_api_key_state.cursor),
                                                     self.ai_api_key_state.selection,
-                                                    11.0,
+                                                    13.0,
                                                     theme,
                                                     Some(window),
                                                 )
@@ -4601,7 +4611,7 @@ impl SettingsView {
                                 false,
                                 theme,
                             )))
-                            .when(!is_acp, |card| card.child(render_card_row(
+                            .when(!is_acp, |card| card.child(render_plain_row_inset(
                                 "Authentication Status",
                                 Some(SharedString::from(auth_desc)),
                                 div()
@@ -4620,7 +4630,7 @@ impl SettingsView {
                                 false,
                                 theme,
                             )))
-                            .child(render_card_row(
+                            .child(render_plain_row_inset(
                                 "Test Connection",
                                 Some(if is_acp { "Refresh the model catalog from the ACP agent" } else { "Test endpoint reachability and model response" }),
                                 div()
@@ -4637,15 +4647,15 @@ impl SettingsView {
                                                     .flex_row()
                                                     .items_center()
                                                     .gap_1p5()
-                                                    .px(px(7.))
-                                                    .py(px(3.))
-                                                    .rounded(px(5.))
+                                                    .px(px(10.))
+                                                    .py(px(5.))
+                                                    .rounded(px(6.))
                                                     .bg(theme.surface_raised)
                                                     .border_1()
                                                     .border_color(theme.border)
                                                     .child(
                                                         div()
-                                                            .text_size(px(10.5))
+                                                            .text_size(px(12.))
                                                             .text_color(theme.yellow)
                                                             .child("Testing..."),
                                                     )
@@ -4657,16 +4667,16 @@ impl SettingsView {
                                                     .flex_row()
                                                     .items_center()
                                                     .gap_1p5()
-                                                    .px(px(7.))
-                                                    .py(px(3.))
-                                                    .rounded(px(5.))
+                                                    .px(px(10.))
+                                                    .py(px(5.))
+                                                    .rounded(px(6.))
                                                     .bg(theme.surface_raised)
                                                     .border_1()
                                                     .border_color(theme.green)
                                                     .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(theme.green))
                                                     .child(
                                                         div()
-                                                            .text_size(px(10.5))
+                                                            .text_size(px(12.))
                                                             .font_weight(FontWeight::MEDIUM)
                                                             .text_color(theme.green)
                                                             .child(SharedString::from(format!("OK ({}ms)", ms))),
@@ -4683,16 +4693,16 @@ impl SettingsView {
                                                     .flex_row()
                                                     .items_center()
                                                     .gap_1p5()
-                                                    .px(px(7.))
-                                                    .py(px(3.))
-                                                    .rounded(px(5.))
+                                                    .px(px(10.))
+                                                    .py(px(5.))
+                                                    .rounded(px(6.))
                                                     .bg(theme.surface_raised)
                                                     .border_1()
                                                     .border_color(theme.red)
                                                     .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(theme.red))
                                                     .child(
                                                         div()
-                                                            .text_size(px(10.5))
+                                                            .text_size(px(12.))
                                                             .text_color(theme.red)
                                                             .child(SharedString::from(format!("Failed: {}", short_err))),
                                                     )
@@ -4703,9 +4713,9 @@ impl SettingsView {
                                         let is_testing = self.ai_test_status == AiTestStatus::Testing;
                                         div()
                                             .id("ai-test-connection-btn")
-                                            .px(px(10.))
-                                            .py(px(4.))
-                                            .rounded(px(5.))
+                                            .px(px(14.))
+                                            .py(px(7.))
+                                            .rounded(px(7.))
                                             .bg(if is_testing { theme.surface_raised } else { theme.accent })
                                             .border_1()
                                             .border_color(if is_testing { theme.border } else { theme.accent })
@@ -4713,7 +4723,7 @@ impl SettingsView {
                                                 if is_testing { s } else { s.opacity(0.88) }
                                             })
                                             .cursor(if is_testing { CursorStyle::Arrow } else { CursorStyle::PointingHand })
-                                            .text_size(px(11.))
+                                            .text_size(px(12.5))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(if is_testing { theme.muted } else { theme.background })
                                             .child(if is_testing { "Testing..." } else if is_acp { "Refresh Models" } else { "Test Connection" })
@@ -4733,19 +4743,20 @@ impl SettingsView {
                     .flex_col()
                     .child(render_section_header("Tool Execution Permissions", theme))
                     .child(
-                        render_group_card(theme).children(permissions.into_iter().enumerate().map(|(idx, (mode, name, desc))| {
+                        div().flex().flex_col().children(permissions.into_iter().enumerate().map(|(idx, (mode, name, desc))| {
                             let is_active = self.ai_permission_mode == mode;
-                            let is_last = idx == permissions.len() - 1;
+                            let _is_last = idx == permissions.len() - 1;
                             div()
                                 .id(SharedString::from(format!("ai-mode-row-{:?}", mode)))
                                 .flex()
                                 .flex_row()
                                 .items_center()
                                 .justify_between()
-                                .px(px(16.))
-                                .py(px(12.))
-                                .when(!is_last, |this| this.border_b_1().border_color(theme.border))
-                                .hover(move |s| s.bg(theme.surface_raised))
+                                .px(px(14.))
+                                .py(px(14.))
+                                .rounded(px(8.))
+                                .when(is_active, |row| row.bg(theme.surface_raised))
+                                .hover(move |s| if is_active { s } else { s.bg(theme.hover) })
                                 .cursor(CursorStyle::PointingHand)
                                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
                                     this.set_ai_permission_mode(mode, cx);
@@ -4757,31 +4768,32 @@ impl SettingsView {
                                         .gap_0p5()
                                         .child(
                                             div()
-                                                .text_size(px(12.5))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(if is_active { theme.foreground } else { theme.muted_strong })
+                                                .text_size(px(15.5))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(theme.foreground)
                                                 .child(name),
                                         )
                                         .child(
                                             div()
-                                                .text_size(px(11.))
+                                                .text_size(px(13.))
                                                 .text_color(theme.muted)
                                                 .child(desc),
                                         ),
                                 )
                                 .child(
                                     div()
-                                        .w(px(20.))
-                                        .h(px(20.))
+                                        .w(px(22.))
+                                        .h(px(22.))
+                                        .flex_shrink_0()
                                         .rounded_full()
                                         .border_1()
-                                        .border_color(if is_active { theme.accent } else { theme.border })
+                                        .border_color(if is_active { theme.accent } else { theme.muted })
                                         .bg(if is_active { theme.accent } else { theme.surface })
                                         .flex()
                                         .items_center()
                                         .justify_center()
                                         .when(is_active, |this| {
-                                            this.child(render_icon(IconType::Check, theme.background, 12.0))
+                                            this.child(render_icon(IconType::Check, theme.background, 13.0))
                                         }),
                                 )
                         })),
@@ -4794,8 +4806,8 @@ impl SettingsView {
                     .flex_col()
                     .child(render_section_header("Context Window", theme))
                     .child(
-                        render_group_card(theme).child(
-                            render_card_row(
+                        div().flex().flex_col().child(
+                            render_plain_row_inset(
                                 "Token Budget",
                                 Some("Max tokens the model context holds before compaction triggers."),
                                 {
