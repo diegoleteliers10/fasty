@@ -989,6 +989,37 @@ pub fn reset_action_bindings(
 /// True when the user map changes anything for `action` vs the preset:
 /// an override pointing at it (aliases included), a marker on its preset
 /// combos, or a stolen preset combo.
+/// Actions with at least one user override. Built once per settings render so
+/// the page does not re-parse every binding for every row.
+pub fn customized_actions(
+    user: &HashMap<String, String>,
+    preset: KeybindingPreset,
+) -> std::collections::HashSet<Action> {
+    let mut customized = std::collections::HashSet::new();
+    if user.is_empty() {
+        return customized;
+    }
+    let actions = Action::all();
+    // One pass over the preset: combo -> actions it binds by default.
+    let mut owners: HashMap<KeyCombo, Vec<Action>> = HashMap::new();
+    for action in &actions {
+        for combo in KeyBindingResolver::preset_combos(preset, *action) {
+            owners.entry(combo).or_default().push(*action);
+        }
+    }
+    for (combo_str, action_str) in user {
+        if let Some(action) = parse_action(action_str) {
+            customized.insert(action);
+        }
+        if let Some(combo) = parse_combo(combo_str) {
+            if let Some(bound) = owners.get(&combo) {
+                customized.extend(bound.iter().copied());
+            }
+        }
+    }
+    customized
+}
+
 pub fn is_action_customized(
     user: &HashMap<String, String>,
     preset: KeybindingPreset,
