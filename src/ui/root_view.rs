@@ -21218,6 +21218,8 @@ impl Render for RootView {
             .when(self.is_global_search_open, |this| {
                 let backdrop = gpui::hsla(0.0, 0.0, 0.0, 0.65);
                 let selected_idx = self.global_search_selected;
+                let list_height = (_window.viewport_size().height.to_f64() as f32 - 260.0)
+                    .clamp(96.0, 300.0);
                 let query = self.global_search_query.clone();
                 let has_query = !query.trim().is_empty();
                 let total_matches = self.global_search_results.len();
@@ -21243,6 +21245,7 @@ impl Render for RootView {
                             .flex()
                             .flex_row()
                             .items_center()
+                            .flex_shrink_0()
                             .gap(px(6.))
                             .px(px(14.))
                             .pt(px(14.))
@@ -21293,9 +21296,10 @@ impl Render for RootView {
                                 .flex_row()
                                 .items_center()
                                 .justify_between()
-                                .h(px(44.))
+                                .h(px(34.))
+                                .flex_shrink_0()
                                 .px(px(10.))
-                                .rounded(px(8.))
+                                .rounded(px(7.))
                                 .hover(move |style| style.bg(theme.hover))
                                 .cursor(CursorStyle::PointingHand)
                                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
@@ -21307,19 +21311,19 @@ impl Render for RootView {
                                         .flex()
                                         .flex_row()
                                         .items_center()
-                                        .gap(px(10.))
+                                        .gap(px(8.))
                                         .min_w(px(0.))
-                                        .child(render_icon(icon, theme.muted_strong, 15.0))
+                                        .child(render_icon(icon, theme.muted_strong, 14.0))
                                         .child(
                                             div()
-                                                .text_size(px(13.))
+                                                .text_size(px(12.))
                                                 .text_color(theme.foreground)
                                                 .child(SharedString::from(title)),
                                         )
                                         .when_some(cwd, |row, cwd| {
                                             row.child(
                                                 div()
-                                                    .text_size(px(11.5))
+                                                    .text_size(px(10.5))
                                                     .text_color(theme.muted)
                                                     .child(SharedString::from(cwd)),
                                             )
@@ -21327,7 +21331,7 @@ impl Render for RootView {
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(11.5))
+                                        .text_size(px(10.5))
                                         .text_color(theme.muted)
                                         .child(SharedString::from(if lines == 1 {
                                             "1 line".to_string()
@@ -21340,10 +21344,11 @@ impl Render for RootView {
                     }
                     rows.push(
                         div()
+                            .flex_shrink_0()
                             .px(px(10.))
                             .pt(px(10.))
-                            .pb(px(4.))
-                            .text_size(px(12.))
+                            .pb(px(2.))
+                            .text_size(px(11.5))
                             .text_color(theme.muted)
                             .child(format!(
                                 "Searches the scrollback of every open tab and split. Use {alt_case} for match case and {alt_regex} for regex."
@@ -21404,20 +21409,21 @@ impl Render for RootView {
                                     .flex_row()
                                     .items_center()
                                     .justify_between()
+                                    .flex_shrink_0()
                                     .px(px(10.))
-                                    .pt(px(12.))
+                                    .pt(px(10.))
                                     .pb(px(2.))
                                     .child(
                                         div()
                                             .flex()
                                             .flex_row()
                                             .items_center()
-                                            .gap(px(10.))
+                                            .gap(px(8.))
                                             .min_w(px(0.))
-                                            .child(render_icon(icon, theme.muted_strong, 15.0))
+                                            .child(render_icon(icon, theme.muted_strong, 14.0))
                                             .child(
                                                 div()
-                                                    .text_size(px(13.))
+                                                    .text_size(px(12.))
                                                     .text_color(theme.foreground)
                                                     .child(SharedString::from(
                                                         result.tab_title.clone(),
@@ -21426,7 +21432,9 @@ impl Render for RootView {
                                             .when_some(cwd, |row, cwd| {
                                                 row.child(
                                                     div()
-                                                        .text_size(px(11.5))
+                                                        .min_w(px(0.))
+                                                        .truncate()
+                                                        .text_size(px(10.5))
                                                         .text_color(theme.muted)
                                                         .child(SharedString::from(cwd)),
                                                 )
@@ -21434,7 +21442,7 @@ impl Render for RootView {
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(11.5))
+                                            .text_size(px(10.5))
                                             .text_color(theme.muted)
                                             .child(SharedString::from(group_len.to_string())),
                                     )
@@ -21471,9 +21479,10 @@ impl Render for RootView {
                                 .flex_row()
                                 .items_center()
                                 .justify_between()
-                                .h(px(44.))
-                                .px(px(12.))
-                                .rounded(px(8.))
+                                .h(px(34.))
+                                .flex_shrink_0()
+                                .px(px(10.))
+                                .rounded(px(7.))
                                 .when(is_selected, |row| row.bg(theme.surface_raised))
                                 .when(!is_selected, |row| {
                                     row.hover(move |style| style.bg(theme.hover))
@@ -21499,13 +21508,13 @@ impl Render for RootView {
                                         .flex()
                                         .flex_row()
                                         .items_center()
-                                        .gap(px(12.))
+                                        .gap(px(10.))
                                         .min_w(px(0.))
                                         .child(
                                             div()
-                                                .w(px(36.))
+                                                .w(px(30.))
                                                 .flex_shrink_0()
-                                                .text_size(px(11.5))
+                                                .text_size(px(10.5))
                                                 .text_color(theme.muted)
                                                 .text_right()
                                                 .child(SharedString::from(line_number.to_string())),
@@ -21515,7 +21524,7 @@ impl Render for RootView {
                                                 .min_w(px(0.))
                                                 .truncate()
                                                 .font_family(font_family.clone())
-                                                .text_size(px(12.5))
+                                                .text_size(px(11.5))
                                                 .text_color(theme.foreground)
                                                 .child(
                                                     StyledText::new(SharedString::from(
@@ -21533,7 +21542,7 @@ impl Render for RootView {
                                             .items_center()
                                             .gap(px(5.))
                                             .flex_shrink_0()
-                                            .text_size(px(11.))
+                                            .text_size(px(10.))
                                             .text_color(theme.muted)
                                             .child("open tab")
                                             .child(
@@ -21591,17 +21600,17 @@ impl Render for RootView {
                                         .flex_row()
                                         .items_center()
                                         .gap(px(14.))
-                                        .px(px(16.))
-                                        .pt(px(12.))
-                                        .pb(px(8.))
-                                        .child(render_icon(IconType::Search, theme.accent, 16.0))
+                                        .px(px(14.))
+                                        .pt(px(10.))
+                                        .pb(px(6.))
+                                        .child(render_icon(IconType::Search, theme.accent, 15.0))
                                         .child(
                                             div()
                                                 .flex_1()
                                                 .min_w(px(0.))
                                                 .overflow_hidden()
                                                 .truncate()
-                                                .text_size(px(15.))
+                                                .text_size(px(14.))
                                                 .text_color(if has_query {
                                                     theme.foreground
                                                 } else {
@@ -21616,7 +21625,7 @@ impl Render for RootView {
                                         .when(has_query && total_matches > 0, |row| {
                                             row.child(
                                                 div()
-                                                    .text_size(px(11.5))
+                                                    .text_size(px(11.))
                                                     .text_color(theme.muted)
                                                     .child(SharedString::from(format!(
                                                         "{} matches · {} tabs",
@@ -21634,7 +21643,7 @@ impl Render for RootView {
                                                 .when(self.global_search_case_sensitive, |toggle| {
                                                     toggle.bg(theme.surface_raised)
                                                 })
-                                                .text_size(px(12.))
+                                                .text_size(px(11.5))
                                                 .text_color(if self.global_search_case_sensitive {
                                                     theme.accent
                                                 } else {
@@ -21658,7 +21667,7 @@ impl Render for RootView {
                                                 .when(self.global_search_regex, |toggle| {
                                                     toggle.bg(theme.surface_raised)
                                                 })
-                                                .text_size(px(12.))
+                                                .text_size(px(11.5))
                                                 .text_color(if self.global_search_regex {
                                                     theme.accent
                                                 } else {
@@ -21680,13 +21689,11 @@ impl Render for RootView {
                                         .track_scroll(&self.global_search_scroll_handle)
                                         .flex()
                                         .flex_col()
-                                        .max_h(px(340.))
-                                        .min_h(px(0.))
-                                        .flex_shrink(1.)
+                                        .h(px(list_height))
                                         .overflow_y_scroll()
                                         .px(px(8.))
                                         .pb(px(6.))
-                                        .gap(px(4.))
+                                        .gap(px(2.))
                                         .children(rows),
                                 )
                                 // Footer hints
@@ -21696,9 +21703,9 @@ impl Render for RootView {
                                         .flex_row()
                                         .items_center()
                                         .justify_between()
-                                        .px(px(16.))
-                                        .py(px(9.))
-                                        .text_size(px(11.))
+                                        .px(px(14.))
+                                        .py(px(7.))
+                                        .text_size(px(10.5))
                                         .text_color(theme.muted)
                                         .child(div().child(if has_query {
                                             "↑↓ navigate   ↵ jump   esc clear"
