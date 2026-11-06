@@ -3124,6 +3124,10 @@ impl SettingsView {
         }
 
         let theme_count = self.theme_cards.len();
+        let carousel_offset = self.theme_carousel_scroll.offset().x.as_f32();
+        let carousel_max = self.theme_carousel_scroll.max_offset().x.as_f32().abs();
+        let can_prev = carousel_offset < -0.5;
+        let can_next = carousel_offset > -carousel_max + 0.5;
         let current_theme_index = (((self
             .theme_carousel_scroll
             .offset()
@@ -3187,14 +3191,22 @@ impl SettingsView {
                                             .items_center()
                                             .justify_center()
                                             .rounded(px(8.))
-                                            .bg(theme.surface_raised)
-                                            .cursor(CursorStyle::PointingHand)
-                                            .hover(move |style| style.bg(theme.hover))
-                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                this.scroll_theme_carousel(1.0);
-                                                cx.notify();
-                                            }))
-                                            .child(render_icon(IconType::ChevronLeft, theme.muted_strong, 15.0)),
+                                            .bg(if can_prev { theme.surface_raised } else { theme.surface })
+                                            .cursor(if can_prev { CursorStyle::PointingHand } else { CursorStyle::Arrow })
+                                            .when(can_prev, |button| {
+                                                button.hover(move |style| style.bg(theme.hover))
+                                            })
+                                            .when(can_prev, |button| {
+                                                button.on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                    this.scroll_theme_carousel(1.0);
+                                                    cx.notify();
+                                                }))
+                                            })
+                                            .child(render_icon(
+                                                IconType::ChevronLeft,
+                                                if can_prev { theme.muted_strong } else { theme.muted.opacity(0.4) },
+                                                15.0,
+                                            )),
                                     )
                                     .child(
                                         div()
@@ -3205,14 +3217,22 @@ impl SettingsView {
                                             .items_center()
                                             .justify_center()
                                             .rounded(px(8.))
-                                            .bg(theme.surface_raised)
-                                            .cursor(CursorStyle::PointingHand)
-                                            .hover(move |style| style.bg(theme.hover))
-                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                this.scroll_theme_carousel(-1.0);
-                                                cx.notify();
-                                            }))
-                                            .child(render_icon(IconType::ChevronRight, theme.muted_strong, 15.0)),
+                                            .bg(if can_next { theme.surface_raised } else { theme.surface })
+                                            .cursor(if can_next { CursorStyle::PointingHand } else { CursorStyle::Arrow })
+                                            .when(can_next, |button| {
+                                                button.hover(move |style| style.bg(theme.hover))
+                                            })
+                                            .when(can_next, |button| {
+                                                button.on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                                    this.scroll_theme_carousel(-1.0);
+                                                    cx.notify();
+                                                }))
+                                            })
+                                            .child(render_icon(
+                                                IconType::ChevronRight,
+                                                if can_next { theme.muted_strong } else { theme.muted.opacity(0.4) },
+                                                15.0,
+                                            )),
                                     ),
                             ),
                     ),
