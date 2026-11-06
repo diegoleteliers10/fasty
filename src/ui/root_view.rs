@@ -12196,7 +12196,6 @@ impl RootView {
             || self.is_whats_new_open
     }
 
-    #[cfg(target_os = "macos")]
     fn select_all_terminal(&mut self, cx: &mut Context<Self>) {
         use alacritty_terminal::index::{Column, Line, Point};
         let Some(tab) = self.tabs.get(self.active_tab_idx) else {
