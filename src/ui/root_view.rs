@@ -18209,6 +18209,8 @@ impl Render for RootView {
                 backdrop_bg.a = 0.65;
                 let groups = self.grouped_palette_commands();
                 let selected_idx = self.command_palette_selected;
+                let list_height = (_window.viewport_size().height.to_f64() as f32 - 220.0)
+                    .clamp(120.0, 360.0);
                 let mut rows: Vec<gpui::AnyElement> = Vec::new();
                 let mut row_index = 0usize;
                 for (label, commands) in groups {
@@ -18217,6 +18219,7 @@ impl Render for RootView {
                             .flex()
                             .flex_row()
                             .items_center()
+                            .flex_shrink_0()
                             .gap(px(5.))
                             .px(px(10.))
                             .pt(px(14.))
@@ -18245,7 +18248,8 @@ impl Render for RootView {
                             .flex_row()
                             .items_center()
                             .justify_between()
-                            .h(px(46.))
+                            .h(px(56.))
+                            .flex_shrink_0()
                             .px(px(12.))
                             .rounded(px(8.))
                             .when(is_selected, |row| row.bg(theme.selected))
@@ -18274,13 +18278,13 @@ impl Render for RootView {
                                     .child(render_icon(
                                         cmd.icon,
                                         if is_selected { theme.accent } else { theme.muted_strong },
-                                        15.0,
+                                        16.0,
                                     ))
                                     .child(
                                         div()
                                             .min_w(px(0.))
                                             .truncate()
-                                            .text_size(px(13.5))
+                                            .text_size(px(14.))
                                             .text_color(theme.foreground)
                                             .child(cmd.title),
                                     ),
@@ -18295,15 +18299,15 @@ impl Render for RootView {
                             for key in palette_shortcut_keys(shortcut) {
                                 keys = keys.child(
                                     div()
-                                        .min_w(px(22.))
-                                        .h(px(22.))
+                                        .min_w(px(24.))
+                                        .h(px(24.))
                                         .px(px(5.))
                                         .flex()
                                         .items_center()
                                         .justify_center()
                                         .rounded(px(5.))
                                         .bg(theme.surface_raised)
-                                        .text_size(px(11.))
+                                        .text_size(px(11.5))
                                         .text_color(theme.muted_strong)
                                         .child(SharedString::from(key)),
                                 );
@@ -18382,7 +18386,7 @@ impl Render for RootView {
                                         .track_scroll(&self.command_palette_scroll_handle)
                                         .flex()
                                         .flex_col()
-                                        .max_h(px(320.))
+                                        .h(px(list_height))
                                         .overflow_y_scroll()
                                         .px(px(10.))
                                         .pb(px(8.))
