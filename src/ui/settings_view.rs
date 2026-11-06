@@ -1,8 +1,8 @@
 use gpui::{
     canvas, Context, CursorStyle, FontWeight, Hsla, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Render, ScrollHandle, ScrollStrategy, SharedString,
-    UniformListScrollHandle, Window, WindowControlArea, WindowHandle, div,
-    prelude::*, px, uniform_list, Animation, AnimationExt, DefiniteLength,
+    UniformListScrollHandle, Window, WindowControlArea, WindowHandle, div, list, ListAlignment,
+    ListState, prelude::*, px, uniform_list, Animation, AnimationExt, DefiniteLength,
 };
 use std::time::Duration;
 use icons::common::IconType;
@@ -184,6 +184,39 @@ pub struct BindingConflict {
     pub owner: crate::keybindings::Action,
 }
 
+const KEYBOARD_PRESETS: [(crate::keybindings::KeybindingPreset, &str, &str); 4] = [
+    (
+        crate::keybindings::KeybindingPreset::Default,
+        "Default (Fastty)",
+        "Standard modern shortcuts (⌘T, ⌘W, ⌘D, ⌘⌥Arrows)",
+    ),
+    (
+        crate::keybindings::KeybindingPreset::Ghostty,
+        "Ghostty",
+        "Ghostty-compatible splits, tabs & nav",
+    ),
+    (
+        crate::keybindings::KeybindingPreset::Tmux,
+        "tmux",
+        "tmux-compatible Ctrl+B leader & Alt arrows",
+    ),
+    (
+        crate::keybindings::KeybindingPreset::ITerm2,
+        "iTerm2",
+        "macOS iTerm2 muscle memory shortcuts",
+    ),
+];
+
+#[derive(Clone, Copy)]
+enum KeyboardRow {
+    PresetsHeader,
+    Preset(usize),
+    CustomHeader,
+    Category(&'static str),
+    Action(crate::keybindings::Action),
+    Conflict(crate::keybindings::Action),
+}
+
 struct BindingRenderData {
     combos: std::collections::HashMap<crate::keybindings::Action, Vec<Vec<String>>>,
     customized: std::collections::HashSet<crate::keybindings::Action>,
@@ -235,6 +268,8 @@ pub struct SettingsView {
     pub font_highlighted_index: usize,
     pub ai_model_dropdown_open: bool,
     pub ai_model_scroll_handle: ScrollHandle,
+    keyboard_list_state: ListState,
+    keyboard_row_count: usize,
     binding_render_cache: Option<std::rc::Rc<BindingRenderData>>,
     pub font_scroll_handle: UniformListScrollHandle,
     pub font_trigger_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
@@ -425,6 +460,8 @@ impl SettingsView {
             font_highlighted_index: 0,
             ai_model_dropdown_open: false,
             ai_model_scroll_handle: ScrollHandle::new(),
+            keyboard_list_state: ListState::new(0, ListAlignment::Top, px(240.)),
+            keyboard_row_count: 0,
             binding_render_cache: None,
             font_scroll_handle: UniformListScrollHandle::new(),
             font_trigger_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
@@ -2491,7 +2528,9 @@ impl SettingsView {
                     .relative()
                     .flex_1()
                     .overflow_hidden()
-                    .child(
+                    .child(if self.active_tab == SettingsTab::Keyboard {
+                        self.render_keyboard_page(theme, window, cx).into_any_element()
+                    } else {
                         div()
                             .id("settings-scroll-content")
                             .track_scroll(&self.window_scroll_handle)
@@ -2503,34 +2542,17 @@ impl SettingsView {
                             .flex()
                             .flex_col()
                             .gap(px(24.))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(6.))
-                                    .child(
-                                        div()
-                                            .text_size(px(32.))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(theme.foreground)
-                                            .child(self.active_tab.label()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(14.))
-                                            .text_color(theme.muted)
-                                            .child(self.active_tab.subtitle()),
-                                    ),
-                            )
+                            .child(self.render_page_title(theme))
                             .child(match self.active_tab {
                                 SettingsTab::General => self.render_tab_general(theme, cx),
                                 SettingsTab::Appearance => self.render_tab_appearance(theme, window, cx),
-                                SettingsTab::Keyboard => self.render_tab_keyboard(theme, cx),
+                                SettingsTab::Keyboard => div(),
                                 SettingsTab::Ai => self.render_tab_ai(theme, window, cx),
                                 SettingsTab::Migration => self.render_tab_migration(theme, cx),
                                 SettingsTab::Advanced => self.render_tab_advanced(theme, cx),
-                            }),
-                    ),
+                            })
+                            .into_any_element()
+                    }),
             )
     }
 
@@ -3644,397 +3666,450 @@ impl SettingsView {
             )
     }
 
-    fn render_tab_keyboard(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
-        let presets = [
-            (crate::keybindings::KeybindingPreset::Default, "Default (Fastty)", "Standard modern shortcuts (⌘T, ⌘W, ⌘D, ⌘⌥Arrows)"),
-            (crate::keybindings::KeybindingPreset::Ghostty, "Ghostty", "Ghostty-compatible splits, tabs & nav"),
-            (crate::keybindings::KeybindingPreset::Tmux, "tmux", "tmux-compatible Ctrl+B leader & Alt arrows"),
-            (crate::keybindings::KeybindingPreset::ITerm2, "iTerm2", "macOS iTerm2 muscle memory shortcuts"),
-        ];
-
-        let binding_data = self.binding_render_data();
-        let all_actions = crate::keybindings::Action::all();
-        let has_custom = !self.config.keybindings.is_empty();
-        let capturing = self.capturing_action;
-        let conflict = self.binding_conflict;
-
-        let mut root = div()
+    fn render_keyboard_page(&mut self, theme: &Theme, _window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = *theme;
+        let rows = std::rc::Rc::new(self.keyboard_rows());
+        if self.keyboard_row_count != rows.len() {
+            let previous = self.keyboard_list_state.logical_scroll_top();
+            self.keyboard_list_state.reset(rows.len());
+            self.keyboard_list_state.scroll_to(previous);
+            self.keyboard_row_count = rows.len();
+        }
+        let render = cx.processor(move |this: &mut SettingsView, ix: usize, _window, cx| {
+            let Some(row) = rows.get(ix).copied() else {
+                return div().into_any_element();
+            };
+            this.render_keyboard_row(row, &theme, cx)
+        });
+        let title = self.render_page_title(&theme);
+        div()
             .flex()
             .flex_col()
-            .gap_6()
-            // Section 1: Presets
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(render_section_header("Keybinding Presets", theme))
-                    .children(presets.into_iter().map(|(preset, name, desc)| {
-                        let is_active = self.keybinding_preset == preset;
-                        div()
-                            .id(SharedString::from(format!("preset-row-{}", preset)))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .px(px(14.))
-                            .py(px(14.))
-                            .rounded(px(8.))
-                            .when(is_active, |row| row.bg(theme.surface_raised))
-                            .hover(move |style| style.bg(theme.hover))
-                            .cursor(CursorStyle::PointingHand)
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                this.set_keybinding_preset(preset, cx);
-                            }))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(3.))
-                                    .child(
-                                        div()
-                                            .text_size(px(15.5))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(theme.foreground)
-                                            .child(name),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(13.))
-                                            .text_color(theme.muted)
-                                            .child(desc),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .w(px(22.))
-                                    .h(px(22.))
-                                    .flex_shrink_0()
-                                    .rounded_full()
-                                    .border_1()
-                                    .border_color(if is_active { theme.accent } else { theme.muted })
-                                    .bg(if is_active { theme.accent } else { theme.surface })
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .when(is_active, |dot| {
-                                        dot.child(render_icon(IconType::Check, theme.background, 13.0))
-                                    }),
-                            )
-                    })),
-            );
+            .size_full()
+            .overflow_hidden()
+            .px(px(56.))
+            .pt(px(28.))
+            .pb(px(24.))
+            .gap(px(24.))
+            .child(title)
+            .child(list(self.keyboard_list_state.clone(), render).flex_1())
+    }
 
-        // Section 2: editable per-action bindings, grouped by category.
-        let mut section = div()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(render_section_header("Custom Shortcuts", theme))
-                    .when(has_custom, |this| {
-                        this.child(
-                            div()
-                                .id("kb-reset-all")
-                                .px(px(12.))
-                                .py(px(6.))
-                                .rounded(px(7.))
-                                .bg(theme.surface_raised)
-                                .border_1()
-                                .border_color(theme.border)
-                                .text_size(px(12.5))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.muted_strong)
-                                .cursor(CursorStyle::PointingHand)
-                                .hover(|s| s.bg(theme.hover))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _ev, _window, cx| {
-                                        this.reset_all_bindings(cx);
-                                    }),
-                                )
-                                .child("Reset all"),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .text_size(px(13.))
-                    .text_color(theme.muted)
-                    .mb(px(8.))
-                    .child("Click a shortcut, then press the keys. Esc cancels."),
-            );
-
+    fn keyboard_rows(&self) -> Vec<KeyboardRow> {
+        let mut rows = vec![KeyboardRow::PresetsHeader];
+        rows.extend((0..KEYBOARD_PRESETS.len()).map(KeyboardRow::Preset));
+        rows.push(KeyboardRow::CustomHeader);
+        let all = crate::keybindings::Action::all();
         for category in crate::keybindings::Action::categories() {
-            let actions: Vec<crate::keybindings::Action> = all_actions
+            let actions: Vec<_> = all
                 .iter()
                 .copied()
-                .filter(|a| a.category() == category)
+                .filter(|action| action.category() == category)
                 .collect();
             if actions.is_empty() {
                 continue;
             }
-            let mut card = div().flex().flex_col();
-            for (row_idx, action) in actions.iter().enumerate() {
-                let combos = binding_data
-                    .combos
-                    .get(action)
-                    .cloned()
-                    .unwrap_or_default();
-                let is_capturing = capturing == Some(*action);
-                let customized = binding_data.customized.contains(action);
-                let is_last = row_idx == actions.len() - 1
-                    && conflict.is_none_or(|c| c.target != *action);
-
-                // Wrap, so a second combo and the reset and unbind buttons move
-                // to a second line instead of running off the card.
-                let mut badges = div().flex().flex_row().flex_wrap().items_center().gap_2();
-                if combos.is_empty() {
-                    let act = *action;
-                    badges = badges.child(
-                        div()
-                            .id(SharedString::from(format!("kb-badge-{}", action.binding_id())))
-                            .px(px(8.))
-                            .py(px(4.))
-                            .rounded(px(6.))
-                            .border_1()
-                            .border_color(theme.border)
-                            .border_dashed()
-                            .text_size(px(12.))
-                            .text_color(theme.muted)
-                            .cursor(CursorStyle::PointingHand)
-                            .hover(|s| s.bg(theme.surface_raised))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _ev, _window, cx| {
-                                    this.start_binding_capture(act, cx);
-                                }),
-                            )
-                            .child(if is_capturing { "Press keys…" } else { "Unbound" }),
-                    );
-                } else {
-                    for (i, combo) in combos.iter().enumerate() {
-                        let act = *action;
-                        let is_recording = is_capturing && i == 0;
-                        let keycaps = combo.clone();
-                        badges = badges.child(
-                            div()
-                                .id(SharedString::from(format!(
-                                    "kb-badge-{}-{i}",
-                                    action.binding_id()
-                                )))
-                                .px(px(6.))
-                                .py(px(5.))
-                                .rounded(px(6.))
-                                .bg(theme.surface_raised)
-                                .border_1()
-                                .border_color(if is_recording { theme.accent } else { theme.border })
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_1()
-                                .cursor(CursorStyle::PointingHand)
-                                .hover(|s| s.bg(theme.hover))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _ev, _window, cx| {
-                                        this.start_binding_capture(act, cx);
-                                    }),
-                                )
-                                .when(is_recording, |el| {
-                                    el.child(
-                                        div()
-                                            .h(px(18.))
-                                            .px(px(5.))
-                                            .rounded(px(4.))
-                                            .bg(theme.accent)
-                                            .flex()
-                                            .items_center()
-                                            .child(
-                                                div()
-                                                    .text_size(px(11.))
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(theme.background)
-                                                    .child("Press keys…"),
-                                            ),
-                                    )
-                                })
-                                .when(!is_recording, |el| {
-                                    // One keycap per key, in press order, so the
-                                    // shortcut reads the way it is typed.
-                                    el.children(keycaps.into_iter().map(|cap| {
-                                        div()
-                                            .h(px(20.))
-                                            .min_w(px(20.))
-                                            .px(px(5.))
-                                            .rounded(px(4.))
-                                            .bg(theme.surface)
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(
-                                                div()
-                                                    .text_size(px(11.5))
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(theme.foreground)
-                                                    .child(cap),
-                                            )
-                                    }))
-                                }),
-                        );
-                    }
-                }
-                // Per-action reset + unbind buttons.
-                if customized {
-                    let act = *action;
-                    badges = badges.child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "kb-reset-{}",
-                                action.binding_id()
-                            )))
-                            .px(px(6.))
-                            .py(px(3.))
-                            .rounded(px(5.))
-                            .text_size(px(11.))
-                            .text_color(theme.muted)
-                            .cursor(CursorStyle::PointingHand)
-                            .hover(|s| s.bg(theme.surface_raised))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _ev, _window, cx| {
-                                    this.reset_action_bindings_ui(act, cx);
-                                }),
-                            )
-                            .child("↺"),
-                    );
-                }
-                if !combos.is_empty() {
-                    let act = *action;
-                    badges = badges.child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "kb-unbind-{}",
-                                action.binding_id()
-                            )))
-                            .px(px(6.))
-                            .py(px(3.))
-                            .rounded(px(5.))
-                            .text_size(px(11.))
-                            .text_color(theme.muted)
-                            .cursor(CursorStyle::PointingHand)
-                            .hover(|s| s.bg(theme.surface_raised))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _ev, _window, cx| {
-                                    this.unbind_action(act, cx);
-                                }),
-                            )
-                            .child("✕"),
-                    );
-                }
-
-                card = card.child(render_plain_row(
-                    format!(
-                        "{}{}",
-                        action.display_name(),
-                        if customized { " •" } else { "" }
-                    ),
-                    None::<&str>,
-                    badges,
-                    is_last,
-                    theme,
-                ));
-
-                // Inline conflict confirmation under the target row.
-                if let Some(c) = conflict {
-                    if c.target == *action {
-                        let owner_name = c.owner.display_name();
-                        let combo_label = crate::keybindings::format_combo(&c.combo);
-                        card = card.child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .justify_between()
-                                .px(px(0.))
-                                .py(px(10.))
-                                .child(
-                                    div()
-                                        .text_size(px(11.5))
-                                        .text_color(theme.foreground)
-                                        .child(format!("{combo_label} is already assigned to {owner_name}.")),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .id("kb-conflict-reassign")
-                                                .px(px(10.))
-                                                .py(px(4.))
-                                                .rounded(px(6.))
-                                                .bg(theme.accent)
-                                                .text_size(px(11.))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(theme.background)
-                                                .cursor(CursorStyle::PointingHand)
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _ev, _window, cx| {
-                                                        this.confirm_binding_conflict(cx);
-                                                    }),
-                                                )
-                                                .child("Reassign"),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("kb-conflict-cancel")
-                                                .px(px(10.))
-                                                .py(px(4.))
-                                                .rounded(px(6.))
-                                                .border_1()
-                                                .border_color(theme.border)
-                                                .text_size(px(11.))
-                                                .text_color(theme.muted_strong)
-                                                .cursor(CursorStyle::PointingHand)
-                                                .hover(|s| s.bg(theme.surface))
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _ev, _window, cx| {
-                                                        this.cancel_binding_capture(cx);
-                                                    }),
-                                                )
-                                                .child("Cancel"),
-                                        ),
-                                ),
-                        );
-                    }
+            rows.push(KeyboardRow::Category(category));
+            for action in actions {
+                rows.push(KeyboardRow::Action(action));
+                if self
+                    .binding_conflict
+                    .is_some_and(|conflict| conflict.target == action)
+                {
+                    rows.push(KeyboardRow::Conflict(action));
                 }
             }
-            section = section.child(
+        }
+        rows
+    }
+
+    fn render_keyboard_row(
+        &mut self,
+        row: KeyboardRow,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match row {
+            KeyboardRow::PresetsHeader => render_section_header("Keybinding Presets", theme)
+                .into_any_element(),
+            KeyboardRow::Preset(idx) => self.render_keyboard_preset(idx, theme, cx),
+            KeyboardRow::CustomHeader => {
+                let has_custom = !self.config.keybindings.is_empty();
                 div()
                     .flex()
                     .flex_col()
-                    .mb(px(2.))
-                    .mt(px(8.))
+                    .gap(px(6.))
+                    .pt(px(28.))
+                    .pb(px(6.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(render_section_header("Custom Shortcuts", theme))
+                            .when(has_custom, |this| {
+                                this.child(
+                                    div()
+                                        .id("kb-reset-all")
+                                        .px(px(12.))
+                                        .py(px(6.))
+                                        .rounded(px(7.))
+                                        .bg(theme.surface_raised)
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .text_size(px(12.5))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme.muted_strong)
+                                        .cursor(CursorStyle::PointingHand)
+                                        .hover(|s| s.bg(theme.hover))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _ev, _window, cx| {
+                                                this.reset_all_bindings(cx);
+                                            }),
+                                        )
+                                        .child("Reset all"),
+                                )
+                            }),
+                    )
                     .child(
                         div()
                             .text_size(px(13.))
                             .text_color(theme.muted)
-                            .mb(px(2.))
-                            .child(category),
+                            .child("Click a shortcut, then press the keys. Esc cancels."),
                     )
-                    .child(card),
+                    .into_any_element()
+            }
+            KeyboardRow::Category(category) => div()
+                .pt(px(18.))
+                .pb(px(4.))
+                .text_size(px(13.))
+                .text_color(theme.muted)
+                .child(category)
+                .into_any_element(),
+            KeyboardRow::Action(action) => self.render_keyboard_action(action, theme, cx),
+            KeyboardRow::Conflict(action) => self.render_keyboard_conflict(action, theme, cx),
+        }
+    }
+
+    fn render_keyboard_preset(
+        &self,
+        idx: usize,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some((preset, name, desc)) = KEYBOARD_PRESETS.get(idx).copied() else {
+            return div().into_any_element();
+        };
+        let is_active = self.keybinding_preset == preset;
+        div()
+            .id(SharedString::from(format!("preset-row-{}", preset)))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px(px(14.))
+            .py(px(14.))
+            .rounded(px(8.))
+            .when(is_active, |row| row.bg(theme.surface_raised))
+            .hover(move |style| if is_active { style } else { style.bg(theme.hover) })
+            .cursor(CursorStyle::PointingHand)
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                this.set_keybinding_preset(preset, cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .child(
+                        div()
+                            .text_size(px(15.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme.foreground)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(theme.muted)
+                            .child(desc),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(22.))
+                    .h(px(22.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(if is_active { theme.accent } else { theme.muted })
+                    .bg(if is_active { theme.accent } else { theme.surface })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(is_active, |dot| {
+                        dot.child(render_icon(IconType::Check, theme.background, 13.0))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_keyboard_action(
+        &mut self,
+        action: crate::keybindings::Action,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let binding_data = self.binding_render_data();
+        let combos: &[Vec<String>] = binding_data
+            .combos
+            .get(&action)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let is_capturing = self.capturing_action == Some(action);
+        let customized = binding_data.customized.contains(&action);
+
+        let mut badges = div().flex().flex_row().flex_wrap().items_center().gap_2();
+        if combos.is_empty() {
+            badges = badges.child(
+                div()
+                    .id(SharedString::from(format!("kb-badge-{}", action.binding_id())))
+                    .px(px(8.))
+                    .py(px(4.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(theme.border)
+                    .border_dashed()
+                    .text_size(px(12.))
+                    .text_color(theme.muted)
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(|s| s.bg(theme.surface_raised))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            this.start_binding_capture(action, cx);
+                        }),
+                    )
+                    .child(if is_capturing { "Press keys…" } else { "Unbound" }),
+            );
+        } else {
+            for (i, keycaps) in combos.iter().enumerate() {
+                let is_recording = is_capturing && i == 0;
+                badges = badges.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "kb-badge-{}-{i}",
+                            action.binding_id()
+                        )))
+                        .px(px(6.))
+                        .py(px(5.))
+                        .rounded(px(6.))
+                        .bg(theme.surface_raised)
+                        .border_1()
+                        .border_color(if is_recording { theme.accent } else { theme.border })
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(|s| s.bg(theme.hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev, _window, cx| {
+                                this.start_binding_capture(action, cx);
+                            }),
+                        )
+                        .when(is_recording, |el| {
+                            el.child(
+                                div()
+                                    .h(px(18.))
+                                    .px(px(5.))
+                                    .rounded(px(4.))
+                                    .bg(theme.accent)
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.background)
+                                            .child("Press keys…"),
+                                    ),
+                            )
+                        })
+                        .when(!is_recording, |el| {
+                            el.children(keycaps.iter().map(|cap| {
+                                div()
+                                    .h(px(20.))
+                                    .min_w(px(20.))
+                                    .px(px(5.))
+                                    .rounded(px(4.))
+                                    .bg(theme.surface)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme.foreground)
+                                            .child(SharedString::from(cap.clone())),
+                                    )
+                            }))
+                        }),
+                );
+            }
+        }
+        if customized {
+            badges = badges.child(
+                div()
+                    .id(SharedString::from(format!("kb-reset-{}", action.binding_id())))
+                    .px(px(6.))
+                    .py(px(3.))
+                    .rounded(px(5.))
+                    .text_size(px(11.))
+                    .text_color(theme.muted)
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(|s| s.bg(theme.surface_raised))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            this.reset_action_bindings_ui(action, cx);
+                        }),
+                    )
+                    .child("↺"),
+            );
+        }
+        if !combos.is_empty() {
+            badges = badges.child(
+                div()
+                    .id(SharedString::from(format!("kb-unbind-{}", action.binding_id())))
+                    .px(px(6.))
+                    .py(px(3.))
+                    .rounded(px(5.))
+                    .text_size(px(11.))
+                    .text_color(theme.muted)
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(|s| s.bg(theme.surface_raised))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev, _window, cx| {
+                            this.unbind_action(action, cx);
+                        }),
+                    )
+                    .child("✕"),
             );
         }
 
-        root = root.child(section);
-        root
+        render_plain_row_inset(
+            format!(
+                "{}{}",
+                action.display_name(),
+                if customized { " •" } else { "" }
+            ),
+            None::<&str>,
+            badges,
+            false,
+            theme,
+        )
+        .into_any_element()
+    }
+
+    fn render_keyboard_conflict(
+        &self,
+        action: crate::keybindings::Action,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(conflict) = self.binding_conflict else {
+            return div().into_any_element();
+        };
+        if conflict.target != action {
+            return div().into_any_element();
+        }
+        let owner_name = conflict.owner.display_name();
+        let combo_label = crate::keybindings::format_combo(&conflict.combo);
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .px(px(14.))
+            .py(px(10.))
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(theme.foreground)
+                    .child(format!("{combo_label} is already assigned to {owner_name}.")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("kb-conflict-reassign")
+                            .px(px(12.))
+                            .py(px(5.))
+                            .rounded(px(6.))
+                            .bg(theme.accent)
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.background)
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _ev, _window, cx| {
+                                    this.confirm_binding_conflict(cx);
+                                }),
+                            )
+                            .child("Reassign"),
+                    )
+                    .child(
+                        div()
+                            .id("kb-conflict-cancel")
+                            .px(px(12.))
+                            .py(px(5.))
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme.border)
+                            .text_size(px(12.))
+                            .text_color(theme.muted_strong)
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|s| s.bg(theme.surface))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _ev, _window, cx| {
+                                    this.cancel_binding_capture(cx);
+                                }),
+                            )
+                            .child("Cancel"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_page_title(&self, theme: &Theme) -> gpui::Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(
+                div()
+                    .text_size(px(32.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme.foreground)
+                    .child(self.active_tab.label()),
+            )
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .text_color(theme.muted)
+                    .child(self.active_tab.subtitle()),
+            )
     }
 
     fn render_tab_ai(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
