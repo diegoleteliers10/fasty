@@ -3,6 +3,40 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.26.0 - 2026-11-06
+
+### Settings
+
+- General, Appearance, Keyboard, AI Assistant, Migration, and Advanced pages redesigned with one layout: page title, section headers, and inset rows.
+- Appearance shows themes in a horizontal carousel with a live terminal preview and the ANSI palette. A vertical wheel scrolls the page and a horizontal gesture moves the carousel.
+- Keyboard lists every action in a virtualized list, so only the visible rows render. Presets and custom bindings share the page, and conflicts appear inline.
+- AI Assistant uses provider rows and a model selector instead of a text field.
+- Every page scrolls through the gpui-kit `Scrollable`: system bounce on macOS, a scrollbar in the app palette, and each page opens at the top.
+- The settings window is opaque. Terminal opacity no longer affects it, which keeps scrolling at the display refresh rate.
+
+### Chrome
+
+- Removed the dividers between the tab sidebar, the AI panel, and the git panel, and the line under the TABS title.
+
+### Search and pickers
+
+- Command palette, global search, buffer search, Mission Control, update dialog, worktree picker, snippet picker, SSH picker, and file picker share one layout: fixed-height rows, one selection tone, and a footer with key hints.
+- Buffer search counts every occurrence, marks the active hit, and keeps the regex toggle with a "bad regex" state.
+- File picker shows git status letters and opens above the prompt.
+- Project and tab jumper uses the SSH dialog layout, with the folder, branch, and tab count.
+
+### Dependencies
+
+- `gpui` and `gpui_platform` move to the `gpui-pre` 0.3.11 snapshots, the same gpui that gpui-kit pins. Dynamic menu bindings use `KeyBinding::load`.
+- New gpui-kit 0.9.
+- schemars 1, sysinfo 0.40, icons 0.19, dirs 7, portable-pty 0.9, toml_edit 0.25, trash 5.3, miniz_oxide 0.9, getrandom 0.4, parking_lot 0.13, core-foundation 0.10, core-text 22.
+- The API discovery schema moves to JSON Schema 2020-12 with `$defs`, so `schema_version` is 2.
+- sysinfo 0.40 changes process sampling: `System::new` returns a `Result` and the refresh takes `remove_dead_processes`.
+
+### Cleanup
+
+- Removed runtime debug and timing logs from notifications, the session host, and the pane render path. Errors keep their messages.
+
 ## 0.25.2 - 2026-10-26
 
 ### Session host death forensics
