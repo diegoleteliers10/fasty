@@ -300,7 +300,10 @@ fn start_process_sampler() {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
         std::thread::spawn(|| {
-            let mut table = ProcessTable::new();
+            let Some(mut table) = ProcessTable::new() else {
+                eprintln!("Fastty process sampler could not read the process table");
+                return;
+            };
             loop {
                 if host_lifecycle().lock().stopping { return; }
                 let terminals: Vec<_> = registry().lock().iter()

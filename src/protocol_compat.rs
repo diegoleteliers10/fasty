@@ -462,6 +462,22 @@ mod tests {
         assert!(parse_request(r#"{"cmd":"future_command"}"#, None).is_err());
     }
 
+    fn schema_defs(document: &Value) -> Value {
+        document
+            .get("$defs")
+            .or_else(|| document.get("definitions"))
+            .cloned()
+            .unwrap_or_else(|| json!({}))
+    }
+
+    fn variant_tag(variant: &Value, tag: &str) -> Option<String> {
+        let property = &variant["properties"][tag];
+        property["const"]
+            .as_str()
+            .or_else(|| property["enum"][0].as_str())
+            .map(str::to_string)
+    }
+
     fn minimal(schema: &Value, defs: &Value) -> Option<Value> {
         if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
             let name = reference.rsplit('/').next()?;
@@ -517,19 +533,14 @@ mod tests {
 
     fn variants<T: schemars::JsonSchema>(tag: &str) -> Vec<(String, Value)> {
         let document = serde_json::to_value(schemars::schema_for!(T)).unwrap();
-        let definitions = document
-            .get("definitions")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let definitions = schema_defs(&document);
         let list = document["oneOf"]
             .as_array()
             .unwrap_or_else(|| panic!("the schema has no variants"));
         list.iter()
             .map(|variant| {
-                let name = variant["properties"][tag]["enum"][0]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("a variant has no {tag} name"))
-                    .to_string();
+                let name = variant_tag(variant, tag)
+                    .unwrap_or_else(|| panic!("a variant has no {tag} name"));
                 let instance = minimal(variant, &definitions)
                     .unwrap_or_else(|| panic!("cannot build a minimal {name} value"));
                 (name, instance)
@@ -595,16 +606,13 @@ mod tests {
     }
 
     fn schema_has_leaf(document: &Value, tag_key: &str, tag: &str, tokens: &[String]) -> bool {
-        let defs = document
-            .get("definitions")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let defs = schema_defs(document);
         let Some(variants) = document["oneOf"].as_array() else {
             return false;
         };
         let Some(variant) = variants
             .iter()
-            .find(|variant| variant["properties"][tag_key]["enum"][0].as_str() == Some(tag))
+            .find(|variant| variant_tag(variant, tag_key).as_deref() == Some(tag))
         else {
             return false;
         };
@@ -659,19 +667,14 @@ mod tests {
         T: schemars::JsonSchema + serde::Serialize + serde::de::DeserializeOwned,
     {
         let document = serde_json::to_value(schemars::schema_for!(T)).unwrap();
-        let definitions = document
-            .get("definitions")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let definitions = schema_defs(&document);
         let list = document["oneOf"]
             .as_array()
             .unwrap_or_else(|| panic!("the schema has no variants"));
         list.iter()
             .map(|variant| {
-                let name = variant["properties"][tag]["enum"][0]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("a variant has no {tag} name"))
-                    .to_string();
+                let name = variant_tag(variant, tag)
+                    .unwrap_or_else(|| panic!("a variant has no {tag} name"));
                 let instance = maximal(variant, &definitions, 0)
                     .unwrap_or_else(|| panic!("cannot build a {name} value"));
                 let typed: T = serde_json::from_value(instance)
