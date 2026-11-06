@@ -109,6 +109,8 @@ pub struct ThemeCardInfo {
     pub bg_color: gpui::Hsla,
     pub surf_color: gpui::Hsla,
     pub acc_color: gpui::Hsla,
+    pub fg_color: gpui::Hsla,
+    pub muted_color: gpui::Hsla,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -137,7 +139,7 @@ impl SettingsTab {
     pub fn subtitle(&self) -> &'static str {
         match self {
             Self::General => "Layout, terminal behavior, notifications and updates.",
-            Self::Appearance => "Theme, fonts, and colors.",
+            Self::Appearance => "Theme, transparency and the type your shell is set in.",
             Self::Keyboard => "Keybindings and modes.",
             Self::Ai => "Providers, models, and assistant behavior.",
             Self::Migration => "Import settings from other terminals.",
@@ -227,18 +229,7 @@ pub struct SettingsView {
     pub font_search_state: crate::ui::TextInputState,
     pub font_highlighted_index: usize,
     pub font_scroll_handle: UniformListScrollHandle,
-    /// Theme picker dropdown (Appearance): open flag, highlighted row, and
-    /// its scroll container. Each row is the theme's badge (color dots +
-    /// label), replacing the old wrapping grid of cards.
-    pub theme_dropdown_open: bool,
-    pub theme_dropdown_selected: usize,
-    pub theme_scroll_handle: ScrollHandle,
     pub font_trigger_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
-    /// Window-space bounds of the theme dropdown trigger, measured every
-    /// paint; the dropdown itself renders as a window-level overlay (last
-    /// child of `render`), so group cards with `overflow_hidden` and later
-    /// sections can never clip or cover it.
-    pub theme_trigger_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     pub font_search_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<gpui::Pixels>>>>,
     pub ai_base_url_input: String,
     pub ai_base_url_state: crate::ui::TextInputState,
@@ -345,6 +336,8 @@ impl SettingsView {
                     bg_color: t.background,
                     surf_color: t.surface_raised,
                     acc_color: t.accent,
+                    fg_color: t.foreground,
+                    muted_color: t.muted_strong,
                 }
             })
             .collect();
@@ -421,13 +414,9 @@ impl SettingsView {
             font_combobox_open: false,
             font_search_query: String::new(),
             font_search_state: crate::ui::TextInputState::default(),
-            theme_dropdown_open: false,
-            theme_dropdown_selected: 0,
-            theme_scroll_handle: ScrollHandle::new(),
             font_highlighted_index: 0,
             font_scroll_handle: UniformListScrollHandle::new(),
             font_trigger_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
-            theme_trigger_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             font_search_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             ai_base_url_state: crate::ui::TextInputState::new(ai_base_url_input.clone()),
             ai_base_url_input,
@@ -1013,41 +1002,6 @@ impl SettingsView {
             // Modifier-only or non-f-key bare keys: keep waiting.
             return;
         }
-        // Theme dropdown: navigate with arrows, commit with Enter, Esc to
-        // close. Runs before the generic escape handling below.
-        if self.theme_dropdown_open {
-            let key_lower = ev.keystroke.key.to_lowercase();
-            let count = self.theme_cards.len();
-            match key_lower.as_str() {
-                "escape" | "esc" => {
-                    self.theme_dropdown_open = false;
-                    cx.notify();
-                    return;
-                }
-                "down" | "arrowdown" if count > 0 => {
-                    self.theme_dropdown_selected = (self.theme_dropdown_selected + 1) % count;
-                    self.theme_scroll_handle.scroll_to_item(self.theme_dropdown_selected);
-                    cx.notify();
-                    return;
-                }
-                "up" | "arrowup" if count > 0 => {
-                    self.theme_dropdown_selected = if self.theme_dropdown_selected == 0 {
-                        count - 1
-                    } else {
-                        self.theme_dropdown_selected - 1
-                    };
-                    self.theme_scroll_handle.scroll_to_item(self.theme_dropdown_selected);
-                    cx.notify();
-                    return;
-                }
-                "enter" | "return" => {
-                    let idx = self.theme_dropdown_selected;
-                    self.select_theme_at(idx, cx);
-                    return;
-                }
-                _ => {}
-            }
-        }
         if ev.keystroke.key.eq_ignore_ascii_case("escape")
             || ev.keystroke.key.eq_ignore_ascii_case("esc")
         {
@@ -1303,31 +1257,6 @@ impl SettingsView {
             self.current_theme_name = self.config.theme.clone().unwrap_or_default();
             self.theme = Theme::from_name(&self.current_theme_name).with_opacity(self.config.opacity);
         }
-        cx.notify();
-    }
-
-    /// Opens/closes the theme dropdown; on open, the highlighted row starts
-    /// on the active theme and scrolls it into view.
-    pub fn toggle_theme_dropdown(&mut self, cx: &mut Context<Self>) {
-        self.theme_dropdown_open = !self.theme_dropdown_open;
-        if self.theme_dropdown_open {
-            self.theme_dropdown_selected = self
-                .theme_cards
-                .iter()
-                .position(|c| c.name == self.current_theme_name)
-                .unwrap_or(0);
-            self.theme_scroll_handle.scroll_to_item(self.theme_dropdown_selected);
-        }
-        cx.notify();
-    }
-
-    /// Applies the highlighted theme from the dropdown and closes it.
-    pub fn select_theme_at(&mut self, idx: usize, cx: &mut Context<Self>) {
-        let name = self.theme_cards.get(idx).map(|c| c.name.clone());
-        if let Some(name) = name {
-            self.set_theme(&name, cx);
-        }
-        self.theme_dropdown_open = false;
         cx.notify();
     }
 
@@ -3024,328 +2953,315 @@ impl SettingsView {
     }
 
     fn render_tab_appearance(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        let font_family = SharedString::from(self.font_family.clone());
+
+        // Theme grid: two cards per row, each with a live preview and a footer.
+        let mut theme_rows: Vec<gpui::AnyElement> = Vec::new();
+        for chunk in self.theme_cards.chunks(2) {
+            let mut row = div().flex().flex_row().items_stretch().gap(px(20.)).w_full();
+            for card in chunk {
+                let is_active = self.current_theme_name == card.name;
+                let name = card.name.clone();
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!("theme-card-{}", card.name)))
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(if is_active { theme.accent } else { theme.border })
+                        .bg(theme.surface)
+                        .overflow_hidden()
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(move |style| style.border_color(theme.muted_strong))
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                            this.set_theme(&name, cx);
+                        }))
+                        .child(
+                            div()
+                                .h(px(118.))
+                                .p(px(14.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(7.))
+                                .bg(card.bg_color)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .gap(px(4.))
+                                        .pb(px(4.))
+                                        .children((0..3).map(|_| {
+                                            div()
+                                                .w(px(6.))
+                                                .h(px(6.))
+                                                .rounded_full()
+                                                .bg(card.surf_color)
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(font_family.clone())
+                                        .text_size(px(12.5))
+                                        .text_color(card.fg_color)
+                                        .child("~ > fastty --version"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(font_family.clone())
+                                        .text_size(px(12.5))
+                                        .text_color(card.muted_color)
+                                        .child(format!("fastty {}", env!("CARGO_PKG_VERSION"))),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(font_family.clone())
+                                        .text_size(px(12.5))
+                                        .text_color(card.acc_color)
+                                        .child("~ > "),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .h(px(42.))
+                                .px(px(14.))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .bg(theme.surface_raised)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(9.))
+                                        .child(
+                                            div()
+                                                .w(px(10.))
+                                                .h(px(10.))
+                                                .rounded_full()
+                                                .bg(card.acc_color),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(13.5))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(theme.foreground)
+                                                .child(SharedString::from(card.label.clone())),
+                                        ),
+                                )
+                                .when(is_active, |row| {
+                                    row.child(render_icon(IconType::Check, theme.accent, 14.0))
+                                }),
+                        ),
+                );
+            }
+            if chunk.len() == 1 {
+                row = row.child(div().flex_1());
+            }
+            theme_rows.push(row.into_any_element());
+        }
+
+        let opacity_pills = [1.0, 0.95, 0.90, 0.85, 0.80, 0.75];
+
         div()
             .flex()
             .flex_col()
-            .gap_6()
-            // Section 1: Color Theme
+            .gap(px(24.))
+            // Color Theme
             .child(
                 div()
                     .flex()
                     .flex_col()
+                    .gap(px(10.))
                     .child(render_section_header("Color Theme", theme))
                     .child(
-                        render_group_card(theme)
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .px(px(16.))
-                                    .py(px(12.))
-                                    .border_b_1()
-                                    .border_color(theme.border)
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .gap_0p5()
-                                            .child(
-                                                div()
-                                                    .text_size(px(12.5))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(theme.foreground)
-                                                    .child("Active Theme"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(11.))
-                                                    .text_color(theme.muted)
-                                                    .child(SharedString::from(format!("Currently applied: {}", self.current_theme_name))),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap_1p5()
-                                            .px(px(8.))
-                                            .py(px(4.))
-                                            .rounded(px(5.))
-                                            .bg(theme.surface_raised)
-                                            .border_1()
-                                            .border_color(theme.border)
-                                            .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(theme.background))
-                                            .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(theme.surface))
-                                            .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(theme.accent))
-                                            .child(
-                                                div()
-                                                    .ml(px(2.))
-                                                    .text_size(px(11.))
-                                                    .font_weight(FontWeight::BOLD)
-                                                    .text_color(theme.foreground)
-                                                    .child(SharedString::from(self.current_theme_name.clone())),
-                                            ),
-                                    ),
-                            )
-                            .child({
-                                let is_open = self.theme_dropdown_open;
-                                // The trigger is the active theme's badge.
-                                let active_card = self
-                                    .theme_cards
-                                    .iter()
-                                    .find(|c| c.name == self.current_theme_name);
-                                let (trig_bg, trig_surf, trig_acc, trig_label) = match active_card
-                                {
-                                    Some(c) => {
-                                        (c.bg_color, c.surf_color, c.acc_color, c.label.clone())
-                                    }
-                                    None => (
-                                        theme.background,
-                                        theme.surface,
-                                        theme.accent,
-                                        self.current_theme_name.clone(),
-                                    ),
-                                };
-                                div()
-                                    .p(px(14.))
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div()
-                                            .relative()
-                                            .w_full()
-                                            .flex()
-                                            .flex_col()
-                                            // Trigger: current theme badge + chevron
-                                            .child(
-                                                div()
-                                                    .id("theme-dropdown-trigger")
-                                                    .relative()
-                                                    .w_full()
-                                                    .h(px(34.))
-                                                    .px(px(10.))
-                                                    .rounded(px(6.))
-                                                    .bg(if is_open { theme.surface_raised } else { theme.surface })
-                                                    .border_1()
-                                                    .border_color(if is_open { theme.accent } else { theme.border })
-                                                    .hover(move |s| {
-                                                        s.bg(theme.surface_raised)
-                                                            .border_color(theme.accent)
-                                                    })
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .flex()
-                                                    .flex_row()
-                                                    .items_center()
-                                                    .justify_between()
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(|this, _ev, _window, cx| {
-                                                            this.toggle_theme_dropdown(cx);
-                                                        }),
-                                                    )
-                                                    .child({
-                                                        let bounds_cell = self.theme_trigger_bounds.clone();
-                                                        canvas(
-                                                            |_, _, _| {},
-                                                            move |bounds, _, _, _| {
-                                                                bounds_cell.set(Some(bounds));
-                                                            },
-                                                        )
-                                                        .absolute()
-                                                        .size_full()
-                                                    })
-                                                    .child(
-                                                        div()
-                                                            .flex()
-                                                            .flex_row()
-                                                            .items_center()
-                                                            .gap_2()
-                                                            .child(
-                                                                div()
-                                                                    .flex()
-                                                                    .flex_row()
-                                                                    .items_center()
-                                                                    .gap_1()
-                                                                    .p(px(2.))
-                                                                    .rounded(px(4.))
-                                                                    .bg(trig_bg)
-                                                                    .border_1()
-                                                                    .border_color(trig_surf)
-                                                                    .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(trig_bg))
-                                                                    .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(trig_surf))
-                                                                    .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(trig_acc)),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(12.))
-                                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                                    .text_color(theme.foreground)
-                                                                    .child(trig_label),
-                                                            ),
-                                                    )
-                                                    .child(render_icon(
-                                                        if is_open { IconType::ChevronUp } else { IconType::ChevronDown },
-                                                        if is_open { theme.accent } else { theme.muted_strong },
-                                                        12.0,
-                                                    )),
-                                            )
-                                    )
-                            }),
-                    ),
+                        div()
+                            .text_size(px(13.))
+                            .text_color(theme.muted)
+                            .child(SharedString::from(format!(
+                                "Currently applied: {}",
+                                self.current_theme_name
+                            ))),
+                    )
+                    .children(theme_rows),
             )
-            // Section 2: Window Transparency
+            // Window
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .child(render_section_header("Window Transparency", theme))
-                    .child(
-                        render_group_card(theme).child({
-                            let opacity_pills = [1.0, 0.95, 0.90, 0.85, 0.80, 0.75];
-                            render_card_row(
-                                "Window Opacity",
-                                Some("Background transparency and macOS vibrancy blur"),
+                    .child(render_section_header("Window", theme))
+                    .child(render_plain_row(
+                        "Window Opacity",
+                        Some("Background transparency and macOS vibrancy blur"),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(2.))
+                            .p(px(3.))
+                            .rounded(px(8.))
+                            .bg(theme.surface_raised)
+                            .children(opacity_pills.into_iter().map(|value| {
+                                let is_active = (self.opacity - value).abs() < 0.025;
+                                let label = format!("{:.0}%", value * 100.0);
                                 div()
                                     .flex()
-                                    .flex_row()
-                                    .gap_1p5()
-                                    .children(opacity_pills.into_iter().map(|val| {
-                                        let is_active = (self.opacity - val).abs() < 0.025;
-                                        let label = format!("{:.0}%", val * 100.0);
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap_1()
-                                            .px(px(8.))
-                                            .py(px(4.))
-                                            .rounded(px(5.))
-                                            .border_1()
-                                            .border_color(if is_active { theme.accent } else { theme.border })
-                                            .bg(if is_active { theme.accent } else { theme.surface_raised })
-                                            .hover(move |s| if !is_active { s.bg(theme.hover) } else { s })
-                                            .text_color(if is_active { theme.background } else { theme.foreground })
-                                            .text_size(px(11.))
-                                            .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                                            .cursor(CursorStyle::PointingHand)
-                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                                this.adjust_opacity(val, cx);
-                                            }))
-                                            .child(label)
-                                            .when(is_active, |el| el.child(render_icon(IconType::Check, theme.background, 10.0)))
-                                    })),
-                                true,
-                                theme,
-                            )
-                        }),
-                    ),
+                                    .items_center()
+                                    .px(px(10.))
+                                    .py(px(5.))
+                                    .rounded(px(6.))
+                                    .when(is_active, |el| el.bg(theme.accent))
+                                    .hover(move |style| {
+                                        if !is_active {
+                                            style.bg(theme.hover)
+                                        } else {
+                                            style
+                                        }
+                                    })
+                                    .text_color(if is_active {
+                                        theme.background
+                                    } else {
+                                        theme.muted
+                                    })
+                                    .text_size(px(12.))
+                                    .font_weight(if is_active {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
+                                        this.adjust_opacity(value, cx);
+                                    }))
+                                    .child(label)
+                            })),
+                        true,
+                        theme,
+                    )),
             )
-            // Section 3: Typography
+            // Typography
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .child(render_section_header("Typography", theme))
-                    .child(
+                    .child(render_plain_row(
+                        "Font Size",
+                        Some("Terminal text grid cell point size"),
                         div()
-                            .bg(theme.surface)
-                            .border_1()
-                            .border_color(theme.border)
-                            .rounded(px(10.))
                             .flex()
-                            .flex_col()
-                            .child(render_card_row(
-                                "Font Size",
-                                Some("Terminal text grid cell point size"),
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .w(px(28.))
-                                            .h(px(28.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded(px(6.))
-                                            .bg(theme.surface_raised)
-                                            .hover(|s| s.bg(theme.hover))
-                                            .border_1()
-                                            .border_color(theme.border)
-                                            .text_color(theme.foreground)
-                                            .font_weight(FontWeight::BOLD)
-                                            .cursor(CursorStyle::PointingHand)
-                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                this.adjust_font_size(-1.0, cx);
-                                            }))
-                                            .child("−"),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w(px(46.))
-                                            .flex()
-                                            .justify_center()
-                                            .text_size(px(13.))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(theme.accent)
-                                            .child(format!("{:.0}px", self.font_size)),
-                                    )
-                                    .child(
-                                        div()
-                                            .w(px(28.))
-                                            .h(px(28.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded(px(6.))
-                                            .bg(theme.surface_raised)
-                                            .hover(|s| s.bg(theme.hover))
-                                            .border_1()
-                                            .border_color(theme.border)
-                                            .text_color(theme.foreground)
-                                            .font_weight(FontWeight::BOLD)
-                                            .cursor(CursorStyle::PointingHand)
-                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                                this.adjust_font_size(1.0, cx);
-                                            }))
-                                            .child("+"),
-                                    ),
-                                false,
-                                theme,
-                            ))
-                            .child(render_card_row(
-                                "Ligatures",
-                                Some("Combine character pairs like -> into a single glyph"),
-                                div()
-                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                        this.toggle_font_ligatures(cx);
-                                    }))
-                                    .child(render_toggle_switch(self.font_ligatures, theme)),
-                                false,
-                                theme,
-                            ))
-                            .when(cfg!(target_os = "macos"), |this| {
-                                this.child(render_card_row(
-                                    "Monospace Fonts Only",
-                                    Some("Show only fonts whose characters share one cell width"),
-                                    div()
-                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                                            this.toggle_monospace_fonts_only(cx);
-                                        }))
-                                        .child(render_toggle_switch(self.monospace_fonts_only, theme)),
-                                    false,
-                                    theme,
-                                ))
-                            })
+                            .flex_row()
+                            .items_center()
+                            .gap(px(2.))
+                            .p(px(3.))
+                            .rounded(px(8.))
+                            .bg(theme.surface_raised)
                             .child(
                                 div()
-                                    .p(px(16.))
-                                    .child(self.render_font_combobox(theme, window, cx)),
+                                    .w(px(28.))
+                                    .h(px(28.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(6.))
+                                    .hover(|style| style.bg(theme.hover))
+                                    .text_color(theme.foreground)
+                                    .font_weight(FontWeight::BOLD)
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                        this.adjust_font_size(-1.0, cx);
+                                    }))
+                                    .child("−"),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(46.))
+                                    .flex()
+                                    .justify_center()
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .child(format!("{:.0}px", self.font_size)),
+                            )
+                            .child(
+                                div()
+                                    .w(px(28.))
+                                    .h(px(28.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(6.))
+                                    .hover(|style| style.bg(theme.hover))
+                                    .text_color(theme.foreground)
+                                    .font_weight(FontWeight::BOLD)
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                        this.adjust_font_size(1.0, cx);
+                                    }))
+                                    .child("+"),
+                            ),
+                        false,
+                        theme,
+                    ))
+                    .child(render_plain_row(
+                        "Ligatures",
+                        Some("Combine character pairs like -> into a single glyph"),
+                        div()
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                this.toggle_font_ligatures(cx);
+                            }))
+                            .child(render_toggle_switch(self.font_ligatures, theme)),
+                        false,
+                        theme,
+                    ))
+                    .when(cfg!(target_os = "macos"), |this| {
+                        this.child(render_plain_row(
+                            "Monospace Fonts Only",
+                            Some("Show only fonts whose characters share one cell width"),
+                            div()
+                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
+                                    this.toggle_monospace_fonts_only(cx);
+                                }))
+                                .child(render_toggle_switch(self.monospace_fonts_only, theme)),
+                            false,
+                            theme,
+                        ))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.))
+                            .py(px(16.))
+                            .child(
+                                div()
+                                    .text_size(px(14.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .child("Font Family"),
+                            )
+                            .child(self.render_font_combobox(theme, window, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .px(px(14.))
+                            .py(px(10.))
+                            .rounded(px(8.))
+                            .bg(theme.surface_raised)
+                            .font_family(font_family)
+                            .text_size(px(12.5))
+                            .child(div().text_color(theme.accent).child("~ >"))
+                            .child(
+                                div()
+                                    .text_color(theme.muted_strong)
+                                    .child("echo \"fast ⇒ fastty\" ≠ slow"),
                             ),
                     ),
             )
@@ -3373,31 +3289,6 @@ impl SettingsView {
             .gap_2()
             .child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(12.5))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.foreground)
-                            .child("Font Family"),
-                    )
-                    .child(
-                        div()
-                            .px(px(6.))
-                            .py(px(2.))
-                            .rounded(px(4.))
-                            .bg(theme.surface_raised)
-                            .text_size(px(11.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme.accent)
-                            .child(self.font_family.clone()),
-                    ),
-            )
-            .child(
-                div()
                     .relative()
                     .w_full()
                     .flex()
@@ -3406,10 +3297,10 @@ impl SettingsView {
                         div()
                             .relative()
                             .w_full()
-                            .h(px(36.))
+                            .h(px(40.))
                             .px(px(12.))
-                            .rounded(px(6.))
-                            .bg(if is_open { theme.surface_raised } else { theme.surface })
+                            .rounded(px(8.))
+                            .bg(if is_open { theme.selected } else { theme.surface_raised })
                             .border_1()
                             .border_color(if is_open { theme.accent } else { theme.border })
                             .hover(move |s| s.bg(theme.surface_raised).border_color(theme.accent))
@@ -3457,7 +3348,7 @@ impl SettingsView {
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(12.5))
+                                            .text_size(px(13.5))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(theme.foreground)
                                             .child(self.font_family.clone()),
@@ -5246,7 +5137,6 @@ impl Render for SettingsView {
             .on_action(cx.listener(|this, _: &crate::ui::native_menu::Find, window, cx| {
                 this.active_input_field = Some(ActiveInputField::Search);
                 this.font_combobox_open = false;
-                this.theme_dropdown_open = false;
                 window.focus(&this.focus_handle, cx);
                 cx.notify();
             }))
@@ -5289,163 +5179,10 @@ impl Render for SettingsView {
             .when(self.celebration_generation > 0, |this| {
                 this.child(self.render_celebration())
             })
-            // Mounted last: the theme dropdown paints above every section
-            // and ignores the group cards' `overflow_hidden`, positioned
-            // from the trigger's measured window-space bounds.
-            .when(self.theme_dropdown_open, |this| {
-                this.child(self.render_theme_dropdown_overlay(&theme, window, cx))
-            })
     }
 }
 
 impl SettingsView {
-    /// Full-window overlay hosting the theme dropdown list. A transparent
-    /// backdrop closes it on any click; the list anchors to the trigger
-    /// bounds and flips above them when there is more room up there.
-    fn render_theme_dropdown_overlay(
-        &self,
-        theme: &Theme,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let vp = window.viewport_size();
-        let vp_h = vp.height.to_f64() as f32;
-        let vp_w = vp.width.to_f64() as f32;
-
-        let (left, top, width, open_upward) = match self.theme_trigger_bounds.get() {
-            Some(b) => {
-                let space_below = vp_h - b.bottom().to_f64() as f32;
-                let space_above = b.top().to_f64() as f32;
-                let open_up = space_below < 280.0 && space_above > space_below;
-                (
-                    b.left().to_f64() as f32,
-                    b.top().to_f64() as f32,
-                    b.size.width.to_f64() as f32,
-                    open_up,
-                )
-            }
-            None => (((vp_w - 320.0) / 2.0).max(16.0), vp_h - 300.0, 320.0, false),
-        };
-        let max_list_h = if open_upward {
-            (top - 12.0).clamp(120.0, 280.0)
-        } else {
-            (vp_h - top - 16.0).clamp(120.0, 280.0)
-        };
-
-        div()
-            .id("theme-dropdown-backdrop")
-            .absolute()
-            .inset_0()
-            .occlude()
-            .on_scroll_wheel(|_ev, _window, cx| {
-                cx.stop_propagation();
-            })
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _ev, _window, cx| {
-                this.theme_dropdown_open = false;
-                cx.notify();
-            }))
-            .on_mouse_down(MouseButton::Right, cx.listener(|this, _ev, _window, cx| {
-                this.theme_dropdown_open = false;
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .id("theme-dropdown-popover")
-                    .absolute()
-                    .when(open_upward, |el| el.bottom(px(vp_h - top + 4.0)))
-                    .when(!open_upward, |el| el.top(px(top + 4.0)))
-                    .left(px(left))
-                    .w(px(width.max(300.0)))
-                    .occlude()
-                    .on_mouse_down(MouseButton::Left, |_ev, _window, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_scroll_wheel(|_ev, _window, cx| {
-                        cx.stop_propagation();
-                    })
-                    .rounded(px(8.))
-                    .bg({
-                        let mut bg = theme.surface_raised;
-                        bg.a = 1.0;
-                        bg
-                    })
-                    .border_1()
-                    .border_color(theme.border)
-                    .shadow_lg()
-                    .p(px(6.))
-                    .child(
-                        div()
-                            .id("theme-dropdown-scroll")
-                            .track_scroll(&self.theme_scroll_handle)
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .max_h(px(max_list_h))
-                            .overflow_y_scroll()
-                            .children(self.theme_cards.iter().enumerate().map(|(idx, card)| {
-                                let is_active = self.current_theme_name == card.name;
-                                let is_hovered = idx == self.theme_dropdown_selected;
-                                let bg_color = card.bg_color;
-                                let surf_color = card.surf_color;
-                                let acc_color = card.acc_color;
-                                let label = card.label.clone();
-                                div()
-                                    .id(SharedString::from(format!("theme-option-{}", card.name)))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .px(px(8.))
-                                    .py(px(6.))
-                                    .rounded(px(6.))
-                                    .bg(if is_active { theme.accent.opacity(0.12) } else { theme.surface })
-                                    .when(is_hovered && !is_active, |row| row.bg(theme.hover))
-                                    .cursor(CursorStyle::PointingHand)
-                                    .on_mouse_move(cx.listener(move |this, _ev, _window, cx| {
-                                        if this.theme_dropdown_selected != idx {
-                                            this.theme_dropdown_selected = idx;
-                                            cx.notify();
-                                        }
-                                    }))
-                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
-                                        this.select_theme_at(idx, cx);
-                                    }))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .items_center()
-                                                    .gap_1()
-                                                    .p(px(2.))
-                                                    .rounded(px(4.))
-                                                    .bg(bg_color)
-                                                    .border_1()
-                                                    .border_color(surf_color)
-                                                    .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(bg_color))
-                                                    .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(surf_color))
-                                                    .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(acc_color)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(11.5))
-                                                    .font_weight(if is_active { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                                                    .text_color(if is_active { theme.foreground } else { theme.muted_strong })
-                                                    .child(label),
-                                            ),
-                                    )
-                                    .when(is_active, |row| {
-                                        row.child(render_icon(IconType::Check, theme.accent, 12.0))
-                                    })
-                            })),
-                    ),
-            )
-    }
 }
 
 #[cfg(test)]
