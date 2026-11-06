@@ -1,10 +1,15 @@
 use gpui::{
-    App, WeakEntity, canvas, Context, CursorStyle, FontWeight, Hsla, KeyDownEvent, MouseButton,
+    App, canvas, Context, CursorStyle, ElementId, FontWeight, Hsla, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle, ScrollStrategy,
     SharedString, UniformListScrollHandle, Window, WindowControlArea, WindowHandle, div, list,
     ListAlignment, ListState, prelude::*, px, uniform_list, Animation, AnimationExt,
     DefiniteLength,
 };
+use gpui_kit::base::{
+    ScrollbarMode, ScrollbarStyles, ScrollbarTheme, Theme as KitTheme, ThemeAppearance,
+};
+use gpui_kit::component::scroll::ScrollableElement as _;
+
 use std::time::Duration;
 use icons::common::IconType;
 use parking_lot::Mutex;
@@ -12,6 +17,41 @@ use crate::config::{self, Config};
 use crate::ui::icons::{render_app_logo, render_icon};
 use crate::ui::root_view::{available_system_fonts, open_path_or_url};
 use crate::ui::theme::Theme;
+
+/// gpui-kit paints its scrollbars from its own base theme, so project the
+/// fastty palette onto it whenever the settings theme changes.
+fn sync_kit_scrollbar_theme(theme: &Theme, cx: &mut App) {
+    let kit = KitTheme::global_mut(cx);
+    if kit.tokens.colors.foreground == theme.foreground
+        && kit.tokens.colors.background == theme.background
+        && kit.tokens.colors.border == theme.border
+        && kit.tokens.colors.muted == theme.muted_strong
+    {
+        return;
+    }
+    kit.appearance = if theme.background.l < 0.5 {
+        ThemeAppearance::Dark
+    } else {
+        ThemeAppearance::Light
+    };
+    kit.tokens.colors.foreground = theme.foreground;
+    kit.tokens.colors.background = theme.background;
+    kit.tokens.colors.border = theme.border;
+    kit.tokens.colors.muted = theme.muted_strong;
+    kit.scrollbar = ScrollbarTheme::new()
+        .with_mode(ScrollbarMode::Scrolling)
+        .with_styles(
+            ScrollbarStyles::default()
+                .thumb(|style| {
+                    style
+                        .bg(theme.muted_strong.opacity(0.35))
+                        .width(px(7.))
+                        .radius(px(4.))
+                })
+                .thumb_hover(|style| style.bg(theme.muted_strong.opacity(0.55)))
+                .thumb_active(|style| style.bg(theme.muted_strong.opacity(0.75))),
+        );
+}
 
 pub static SETTINGS_WINDOW_HANDLE: Mutex<Option<WindowHandle<SettingsView>>> = Mutex::new(None);
 
@@ -255,7 +295,6 @@ pub struct SettingsView {
     pub import_status_message: Option<String>,
     config_error: Option<String>,
     pub focus_handle: gpui::FocusHandle,
-    pub window_scroll_handle: ScrollHandle,
     pub system_fonts: Vec<String>,
     pub monospace_fonts_only: bool,
     pub font_ligatures: bool,
@@ -272,10 +311,6 @@ pub struct SettingsView {
     pub ai_model_scroll_handle: ScrollHandle,
     keyboard_list_state: ListState,
     keyboard_row_count: usize,
-    settings_scroll_target: f32,
-    settings_scroll_offset: f32,
-    settings_scroll_animating: bool,
-    settings_scroll_last_frame: Option<std::time::Instant>,
     theme_carousel_scroll: ScrollHandle,
     binding_render_cache: Option<std::rc::Rc<BindingRenderData>>,
     pub font_scroll_handle: UniformListScrollHandle,
@@ -455,7 +490,6 @@ impl SettingsView {
             font_size,
             font_family,
             focus_handle,
-            window_scroll_handle: ScrollHandle::new(),
             system_fonts,
             monospace_fonts_only,
             font_ligatures,
@@ -472,10 +506,6 @@ impl SettingsView {
             ai_model_scroll_handle: ScrollHandle::new(),
             keyboard_list_state: ListState::new(0, ListAlignment::Top, px(240.)),
             keyboard_row_count: 0,
-            settings_scroll_target: 0.0,
-            settings_scroll_offset: 0.0,
-            settings_scroll_animating: false,
-            settings_scroll_last_frame: None,
             theme_carousel_scroll: ScrollHandle::new(),
             binding_render_cache: None,
             font_scroll_handle: UniformListScrollHandle::new(),
@@ -811,7 +841,6 @@ impl SettingsView {
             || q.contains("endpoint")
         {
             self.active_tab = SettingsTab::Ai;
-            self.sync_settings_scroll_target();
         } else if q.contains("theme")
             || q.contains("color")
             || q.contains("font")
@@ -820,7 +849,6 @@ impl SettingsView {
             || q.contains("appear")
         {
             self.active_tab = SettingsTab::Appearance;
-            self.sync_settings_scroll_target();
         } else if q.contains("key")
             || q.contains("short")
             || q.contains("bind")
@@ -828,7 +856,6 @@ impl SettingsView {
             || q.contains("ghost")
         {
             self.active_tab = SettingsTab::Keyboard;
-            self.sync_settings_scroll_target();
         } else if q.contains("tab")
             || q.contains("cursor")
             || q.contains("blink")
@@ -839,21 +866,18 @@ impl SettingsView {
             || q.contains("status")
         {
             self.active_tab = SettingsTab::General;
-            self.sync_settings_scroll_target();
         } else if q.contains("migr")
             || q.contains("warp")
             || q.contains("iterm")
             || q.contains("alacr")
         {
             self.active_tab = SettingsTab::Migration;
-            self.sync_settings_scroll_target();
         } else if q.contains("file")
             || q.contains("toml")
             || q.contains("fold")
             || q.contains("adv")
         {
             self.active_tab = SettingsTab::Advanced;
-            self.sync_settings_scroll_target();
         }
         cx.notify();
     }
@@ -1293,37 +1317,31 @@ impl SettingsView {
             match ev.keystroke.key.as_str() {
                 "1" => {
                     self.active_tab = SettingsTab::General;
-            self.sync_settings_scroll_target();
                     self.active_input_field = None;
                     cx.notify();
                 }
                 "2" => {
                     self.active_tab = SettingsTab::Appearance;
-            self.sync_settings_scroll_target();
                     self.active_input_field = None;
                     cx.notify();
                 }
                 "3" => {
                     self.active_tab = SettingsTab::Keyboard;
-            self.sync_settings_scroll_target();
                     self.active_input_field = None;
                     cx.notify();
                 }
                 "4" => {
                     self.active_tab = SettingsTab::Ai;
-            self.sync_settings_scroll_target();
                     self.active_input_field = None;
                     cx.notify();
                 }
                 "5" => {
                     self.active_tab = SettingsTab::Migration;
-            self.sync_settings_scroll_target();
                     self.active_input_field = None;
                     cx.notify();
                 }
                 "6" => {
                     self.active_tab = SettingsTab::Advanced;
-            self.sync_settings_scroll_target();
                     self.active_input_field = None;
                     cx.notify();
                 }
@@ -2345,7 +2363,6 @@ impl SettingsView {
                             .cursor(CursorStyle::PointingHand)
                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _ev, _window, cx| {
                                 this.active_tab = tab;
-                                this.sync_settings_scroll_target();
                                 cx.notify();
                             }))
                             .child(
@@ -2561,10 +2578,7 @@ impl SettingsView {
                     } else {
                         div()
                             .id("settings-scroll-content")
-                            .track_scroll(&self.window_scroll_handle)
-                            .on_scroll_wheel(cx.listener(Self::handle_settings_scroll))
                             .size_full()
-                            .overflow_y_scroll()
                             .px(px(56.))
                             .pt(px(28.))
                             .pb(px(48.))
@@ -2580,6 +2594,14 @@ impl SettingsView {
                                 SettingsTab::Migration => self.render_tab_migration(theme, cx),
                                 SettingsTab::Advanced => self.render_tab_advanced(theme, cx),
                             })
+                            // The Scrollable owns the wheel, the bounce, and the
+                            // scrollbar. A per-tab id means every entry to a
+                            // page starts at the top.
+                            .overflow_y_scrollbar()
+                            .id(ElementId::named_usize(
+                                "settings-scroll",
+                                self.active_tab as usize,
+                            ))
                             .into_any_element()
                     }),
             )
@@ -5346,89 +5368,6 @@ impl SettingsView {
             .set_offset(gpui::point(px((current + direction * STEP).clamp(-max, 0.0)), px(0.)));
     }
 
-    fn sync_settings_scroll_target(&mut self) {
-        let offset = self.window_scroll_handle.offset().y.as_f32();
-        self.settings_scroll_target = offset;
-        self.settings_scroll_offset = offset;
-    }
-
-    fn handle_settings_scroll(
-        &mut self,
-        event: &gpui::ScrollWheelEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // Precise deltas (trackpad and its momentum) already carry the
-        // system's easing, so they follow the finger 1:1. A notched wheel
-        // reports lines and gets the frame-locked glide below.
-        let (delta, precise) = match event.delta {
-            gpui::ScrollDelta::Pixels(delta) => (delta.y.as_f32(), true),
-            gpui::ScrollDelta::Lines(delta) => (delta.y * 48.0, false),
-        };
-        if !delta.is_finite() || delta == 0.0 {
-            self.sync_settings_scroll_target();
-            return;
-        }
-        // `max_offset` is positive; offsets are negative (0 at the top).
-        let limit = self.window_scroll_handle.max_offset().y.as_f32().abs();
-        if !limit.is_finite() {
-            return;
-        }
-        // Undo any delta the built-in scroll already applied, then move the
-        // authoritative offset by exactly this event's delta.
-        self.window_scroll_handle
-            .set_offset(gpui::point(px(0.), px(self.settings_scroll_offset)));
-        self.settings_scroll_target = (self.settings_scroll_target + delta).clamp(-limit, 0.0);
-        if precise {
-            self.settings_scroll_offset = self.settings_scroll_target;
-            self.window_scroll_handle
-                .set_offset(gpui::point(px(0.), px(self.settings_scroll_target)));
-        } else if !self.settings_scroll_animating {
-            self.settings_scroll_animating = true;
-            self.settings_scroll_last_frame = None;
-            let entity = cx.weak_entity();
-            window.on_next_frame(move |window, app| {
-                Self::step_settings_scroll(entity, window, app)
-            });
-        }
-        cx.stop_propagation();
-        cx.notify();
-    }
-
-    /// Advance one vsync frame of the notched-wheel glide and reschedule while
-    /// the offset has not reached its target.
-    fn step_settings_scroll(entity: WeakEntity<Self>, window: &mut Window, app: &mut App) {
-        let continuing = entity
-            .update(app, |this, cx| {
-                let now = std::time::Instant::now();
-                let dt = this
-                    .settings_scroll_last_frame
-                    .replace(now)
-                    .map(|last| now.duration_since(last).as_secs_f32())
-                    .unwrap_or(0.016)
-                    .min(0.05);
-                // Exponential approach: 50 ms covers ~63% of the distance.
-                const TIME_CONSTANT: f32 = 0.05;
-                let blend = 1.0 - (-dt / TIME_CONSTANT).exp();
-                let target = this.settings_scroll_target;
-                let next =
-                    this.settings_scroll_offset + (target - this.settings_scroll_offset) * blend;
-                let settled = (target - next).abs() <= 0.25;
-                this.settings_scroll_offset = if settled { target } else { next };
-                this.window_scroll_handle
-                    .set_offset(gpui::point(px(0.), px(this.settings_scroll_offset)));
-                this.settings_scroll_animating = !settled;
-                cx.notify();
-                !settled
-            })
-            .unwrap_or(false);
-        if continuing {
-            window.on_next_frame(move |window, app| {
-                Self::step_settings_scroll(entity, window, app)
-            });
-        }
-    }
-
     fn handle_menu_outside_click(
         &mut self,
         ev: &MouseDownEvent,
@@ -5475,6 +5414,7 @@ impl SettingsView {
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
+        sync_kit_scrollbar_theme(&theme, cx);
         let win_ref = &*window;
         // UX3: detect on-disk edits made outside this window (throttled).
         self.refresh_stale_state();
@@ -5494,7 +5434,6 @@ impl Render for SettingsView {
             }))
             .on_action(cx.listener(|this, _: &crate::ui::native_menu::CheckForUpdates, window, cx| {
                 this.active_tab = SettingsTab::General;
-                    this.sync_settings_scroll_target();
                 this.check_updates_now(window, cx);
                 cx.notify();
             }))
