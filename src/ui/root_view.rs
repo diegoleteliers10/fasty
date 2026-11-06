@@ -21172,7 +21172,7 @@ impl Render for RootView {
             })
             // Global Multi-Tab Search Overlay
             .when(self.is_global_search_open, |this| {
-                let backdrop = gpui::hsla(0.0, 0.0, 0.0, 0.65);
+                let backdrop = gpui::hsla(0.0, 0.0, 0.0, 0.5);
                 let selected_idx = self.global_search_selected;
                 let list_height = (_window.viewport_size().height.to_f64() as f32 - 260.0)
                     .clamp(96.0, 300.0);
