@@ -126,6 +126,13 @@ pub fn get() -> &'static FasttyDirs {
     FASTTY_DIRS.get_or_init(|| FasttyDirs::new().expect("failed to initialize fastty paths"))
 }
 
+/// Directories only when something already initialized them. Background
+/// writers use this so a unit test or an early call cannot force a disk probe
+/// or panic on a host without a home directory.
+pub fn get_opt() -> Option<&'static FasttyDirs> {
+    FASTTY_DIRS.get()
+}
+
 pub fn default_system_shell() -> String {
     #[cfg(target_os = "windows")]
     {
