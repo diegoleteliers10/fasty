@@ -195,19 +195,22 @@ fn main() {
                 .next()
                 .and_then(|value| value.parse::<usize>().ok())
             else {
-                eprintln!("Usage: fastty capture <session-id> [--wait[=SECONDS]]");
+                eprintln!("Usage: fastty capture <session-id> [--json] [--wait[=SECONDS]]");
                 std::process::exit(1);
             };
             let mut wait = None;
+            let mut json = false;
             for arg in subcommand_args {
                 if let Some(seconds) = parse_wait_flag(&arg) {
                     wait = Some(seconds);
+                } else if arg == "--json" {
+                    json = true;
                 } else {
                     eprintln!("fastty capture: unknown flag {arg}");
                     std::process::exit(1);
                 }
             }
-            fastty::daemon_client::run_capture_command(id, wait);
+            fastty::daemon_client::run_capture_command(id, wait, json);
         }
         Some("focus") => {
             let Some(id) = subcommand_args
@@ -231,6 +234,7 @@ fn main() {
         Some("send") => {
             let mut enter = false;
             let mut wait = None;
+            let mut json = false;
             let mut rest = Vec::new();
             let mut after_separator = false;
             for arg in subcommand_args {
@@ -238,6 +242,8 @@ fn main() {
                     after_separator = true;
                 } else if !after_separator && arg == "--enter" {
                     enter = true;
+                } else if !after_separator && arg == "--json" {
+                    json = true;
                 } else if !after_separator && parse_wait_flag(&arg).is_some() {
                     wait = parse_wait_flag(&arg);
                 } else {
@@ -245,14 +251,14 @@ fn main() {
                 }
             }
             let Some(id) = rest.first().and_then(|value| value.parse::<usize>().ok()) else {
-                eprintln!("Usage: fastty send <session-id> [--enter] [--wait[=SECONDS]] -- <TEXT>");
+                eprintln!("Usage: fastty send <session-id> [--json] [--enter] [--wait[=SECONDS]] -- <TEXT>");
                 std::process::exit(1);
             };
             if rest.len() < 2 {
-                eprintln!("Usage: fastty send <session-id> [--enter] [--wait[=SECONDS]] -- <TEXT>");
+                eprintln!("Usage: fastty send <session-id> [--json] [--enter] [--wait[=SECONDS]] -- <TEXT>");
                 std::process::exit(1);
             }
-            fastty::daemon_client::run_send_command(id, rest[1..].join(" "), enter, wait);
+            fastty::daemon_client::run_send_command(id, rest[1..].join(" "), enter, wait, json);
         }
         Some("events") => {
             let mut wait = None;

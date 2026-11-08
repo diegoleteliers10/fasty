@@ -1,5 +1,8 @@
 # Actions and workflows
 
+For the automation subcommands (`send`, `capture`), the stable JSON output and
+exit codes are in [cli-automation.md](cli-automation.md).
+
 List the built-in action catalog as JSON. The output includes `schema_version`.
 
 ```sh
