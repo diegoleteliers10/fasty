@@ -16,9 +16,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-/// Upper bound on stored snapshots. Each entry is bounded by the snapshot
-/// generator (1 MiB), so this caps the file at roughly 48 MiB.
+/// Upper bound on stored snapshots.
 const MAX_ENTRIES: usize = 48;
+/// Largest snapshot this store accepts. The snapshot generator itself allows a
+/// much larger payload, so the cap has to be enforced here: one oversized pane
+/// would otherwise write tens of MiB and slow every later write.
+const MAX_RECORD_BYTES: usize = 1_048_576;
 /// Snapshots older than this are dropped on the next write.
 const MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 const FILE_NAME: &str = "session-snapshots.json";
@@ -42,6 +45,13 @@ impl SnapshotRecord {
     }
 }
 
+/// Tests must not read or write the real user state file.
+static DISK_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Reported once per process so a runaway pane does not flood stderr.
+static OVERSIZE_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn store() -> &'static parking_lot::Mutex<HashMap<String, SnapshotRecord>> {
     static STORE: OnceLock<parking_lot::Mutex<HashMap<String, SnapshotRecord>>> = OnceLock::new();
     STORE.get_or_init(|| parking_lot::Mutex::new(load()))
@@ -52,6 +62,9 @@ fn key(host_instance: Option<&str>, session_id: usize) -> String {
 }
 
 pub fn path() -> Option<PathBuf> {
+    if DISK_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     crate::paths::get_opt().map(|dirs| dirs.state_dir.join(FILE_NAME))
 }
 
@@ -97,21 +110,52 @@ pub fn record(
     foreground_running: bool,
     bytes: Vec<u8>,
 ) -> Option<()> {
-    if bytes.is_empty() {
-        return None;
-    }
-    let record = SnapshotRecord {
-        session_id,
-        host_instance: host_instance.map(str::to_string),
-        foreground_running,
-        updated_at: now_secs(),
-        encoded: BASE64_STANDARD.encode(&bytes),
-    };
+    record_many(&[(session_id, host_instance, foreground_running, bytes)]).then_some(())
+}
+
+/// Store several snapshots with one pass over the map and one file write.
+///
+/// The flush loop covers every live pane, so writing the whole JSON once per
+/// pane made a cycle cost N serializations of N records. Entries above
+/// [`MAX_RECORD_BYTES`] are dropped: a snapshot that large is not worth the
+/// disk and IO, and the pane keeps working without it.
+pub fn record_many(
+    entries: &[(usize, Option<&str>, bool, Vec<u8>)],
+) -> bool {
+    let now = now_secs();
+    let mut stored_any = false;
     let mut map = store().lock();
-    map.insert(key(host_instance, session_id), record);
+    for (session_id, host_instance, foreground_running, bytes) in entries {
+        if bytes.is_empty() {
+            continue;
+        }
+        if bytes.len() > MAX_RECORD_BYTES {
+            if !OVERSIZE_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "fastty: session snapshot for {session_id} is {} bytes, above the {MAX_RECORD_BYTES} byte cap; keeping the previous record",
+                    bytes.len()
+                );
+            }
+            continue;
+        }
+        map.insert(
+            key(*host_instance, *session_id),
+            SnapshotRecord {
+                session_id: *session_id,
+                host_instance: host_instance.map(str::to_string),
+                foreground_running: *foreground_running,
+                updated_at: now,
+                encoded: BASE64_STANDARD.encode(bytes),
+            },
+        );
+        stored_any = true;
+    }
+    if !stored_any {
+        return false;
+    }
     prune(&mut map);
     write(&map);
-    Some(())
+    true
 }
 
 /// Snapshot for a session that belonged to `host_instance`. When the recorded
@@ -154,6 +198,13 @@ fn write(map: &HashMap<String, SnapshotRecord>) {
     }
 }
 
+/// Test-only switch: keep every test off the real state file, even when another
+/// test already initialized the app paths.
+#[cfg(test)]
+pub(crate) fn disable_disk_for_tests() {
+    DISK_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Test-only reset so cases do not see each other's records.
 #[cfg(test)]
 pub(crate) fn clear_for_tests() {
@@ -165,16 +216,20 @@ pub(crate) fn clear_for_tests() {
 mod tests {
     use super::*;
 
-    /// The store keeps its map in memory and only writes when the app already
-    /// resolved its directories, so a unit test never touches a real file.
-    fn isolate() {
+    /// Serializes the cases and keeps every one off the real state file: the
+    /// store is process-wide, so parallel cases would otherwise interleave and
+    /// a test that runs after `paths::init` would write the user's directory.
+    fn isolate() -> parking_lot::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+        let guard = LOCK.get_or_init(|| parking_lot::Mutex::new(())).lock();
+        disable_disk_for_tests();
         clear_for_tests();
+        guard
     }
 
     #[test]
     fn record_and_lookup_round_trip() {
-        isolate();
-        clear_for_tests();
+        let _guard = isolate();
         let bytes = b"scrollback-bytes".to_vec();
         record(7, Some("host-a"), false, bytes.clone()).expect("record");
         let found = lookup(7, Some("host-a")).expect("lookup same host");
@@ -184,8 +239,7 @@ mod tests {
 
     #[test]
     fn a_foreign_host_instance_never_matches() {
-        isolate();
-        clear_for_tests();
+        let _guard = isolate();
         record(9, Some("host-a"), false, b"old".to_vec()).expect("record");
         assert!(
             lookup(9, Some("host-b")).is_none(),
@@ -195,8 +249,7 @@ mod tests {
 
     #[test]
     fn legacy_lookup_without_identity_is_unambiguous_only() {
-        isolate();
-        clear_for_tests();
+        let _guard = isolate();
         record(11, Some("host-a"), false, b"a".to_vec()).expect("record");
         assert!(lookup(11, None).is_some(), "single instance resolves");
         record(11, Some("host-b"), false, b"b".to_vec()).expect("record");
@@ -208,26 +261,58 @@ mod tests {
 
     #[test]
     fn foreground_state_is_preserved_for_restore_decisions() {
-        isolate();
-        clear_for_tests();
+        let _guard = isolate();
         record(13, Some("host-a"), true, b"tui".to_vec()).expect("record");
         assert!(lookup(13, Some("host-a")).expect("lookup").foreground_running);
     }
 
     #[test]
     fn empty_snapshot_is_not_recorded() {
-        isolate();
-        clear_for_tests();
+        let _guard = isolate();
         assert!(record(15, Some("host-a"), false, Vec::new()).is_none());
         assert!(lookup(15, Some("host-a")).is_none());
     }
 
     #[test]
     fn forget_removes_the_record() {
-        isolate();
-        clear_for_tests();
+        let _guard = isolate();
         record(17, Some("host-a"), false, b"x".to_vec()).expect("record");
         forget(17, Some("host-a"));
         assert!(lookup(17, Some("host-a")).is_none());
+    }
+
+    #[test]
+    fn a_snapshot_above_the_cap_keeps_the_previous_record() {
+        let _guard = isolate();
+        record(19, Some("host-a"), false, b"small".to_vec()).expect("record");
+        let oversized = vec![0u8; MAX_RECORD_BYTES + 1];
+        assert!(
+            record(19, Some("host-a"), false, oversized).is_none(),
+            "an oversized snapshot is not stored"
+        );
+        let kept = lookup(19, Some("host-a")).expect("previous record survives");
+        assert_eq!(kept.bytes().as_deref(), Some(b"small".as_slice()));
+    }
+
+    #[test]
+    fn record_many_stores_every_entry_in_one_pass() {
+        let _guard = isolate();
+        let entries = vec![
+            (21usize, Some("host-a"), false, b"one".to_vec()),
+            (22usize, Some("host-a"), false, b"two".to_vec()),
+            (23usize, Some("host-a"), false, Vec::new()),
+        ];
+        assert!(record_many(&entries));
+        assert!(lookup(21, Some("host-a")).is_some());
+        assert!(lookup(22, Some("host-a")).is_some());
+        assert!(lookup(23, Some("host-a")).is_none());
+    }
+
+    #[test]
+    fn record_many_without_storable_entries_reports_nothing_stored() {
+        let _guard = isolate();
+        let entries = vec![(25usize, Some("host-a"), false, Vec::new())];
+        assert!(!record_many(&entries));
+        assert!(lookup(25, Some("host-a")).is_none());
     }
 }

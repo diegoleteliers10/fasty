@@ -19,14 +19,22 @@ the snapshot is replayed into it.
 | `updated_at` | Seconds since the epoch, used to expire records |
 | `encoded` | Base64 of the snapshot bytes (`snapshot_state_for_save`) |
 
+A record above 1 MiB is rejected and the previous one is kept. The cap is
+enforced on write because the snapshot generator accepts a much larger payload.
+
 ## Rules
 
 1. A record is matched by `(host_instance, session_id)`. A bare session id only
    matches when exactly one instance recorded it, which covers legacy session
    files without an identity.
 2. A snapshot taken while a foreground program was running is not replayed. The
-   pane comes back as a shell instead, because a dead TUI screen answers no keys.
-3. A successful attach deletes the record; the live host is the source of truth.
-4. Records expire after seven days, and the store keeps at most 48 entries.
-5. The store lives in the state directory as `session-snapshots.json`. A write is
+   pane still comes back, as a shell in its own directory, because a dead TUI
+   screen answers no keys and losing the pane loses more than the screen.
+3. A successful attach deletes the record, including a retry that succeeds after
+   an earlier failure; the live host is the source of truth.
+4. Records expire after seven days, and the store keeps at most 48 entries, so
+   the file stays at or below about 48 MiB.
+5. The flush loop covers every live pane in one pass and one file write, and only
+   one flush runs at a time.
+6. The store lives in the state directory as `session-snapshots.json`. A write is
    atomic, and a missing or corrupt file is treated as empty.
