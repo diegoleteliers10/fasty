@@ -31,6 +31,7 @@ pub mod selection_classifier;
 pub mod session;
 pub mod session_manager;
 pub mod session_host;
+pub mod session_snapshots;
 pub mod snippets;
 pub mod ssh;
 pub mod terminal_state;
