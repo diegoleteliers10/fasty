@@ -3,6 +3,23 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.28.0 - 2026-11-09
+
+### Sessions
+
+- Pane scrollback and layout survive a host restart. Each pane keeps a snapshot per host session, an in-place revival rebuilds the pane when the host dies, and the next launch restores it when the saved session is gone.
+- The retained snapshot window stays bounded, and a pane whose foreground program owned the screen comes back as a shell in its own directory instead of replaying a dead TUI.
+
+### CLI automation
+
+- `send` and `capture` accept `--json` and document a stable exit-code contract: 0 success, 1 usage, 2 failure, 3 unknown session, 4 truncated capture.
+- New `fastty wait <id> --until TEXT` blocks until the pane prints a literal string. It reads a read-only attachment, matches only output produced after the call, never consumes the buffer, defaults to a 60 second timeout, keeps at most 8 KiB of text, and exits 5 on timeout or 2 with `session_closed`.
+- A match that lands in one output frame larger than the retained window is no longer lost.
+
+### Docs
+
+- `docs/cli-automation.md` documents the JSON shape, exit codes and wait semantics, and `docs/session-snapshots.md` documents the snapshot store.
+
 ## 0.27.0 - 2026-11-06
 
 ### Notifications
