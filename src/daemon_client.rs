@@ -1423,6 +1423,152 @@ pub fn run_send_command(
     }
 }
 
+/// Block until the pane prints `pattern`, or the timeout expires.
+///
+/// Streams the session over a read-only attach and scans only bytes produced
+/// after the call starts, so a match cannot come from text that was already on
+/// screen. Memory stays flat: the scanner keeps a bounded tail window.
+pub fn run_wait_command(
+    id: usize,
+    pattern: String,
+    timeout_secs: u64,
+    json: bool,
+) -> ! {
+    use crate::cli_contract::{self, CliExit};
+
+    #[cfg(not(unix))]
+    {
+        let _ = (id, pattern, timeout_secs, json);
+        fail_command(
+            "wait",
+            json,
+            CliExit::Failed,
+            "unsupported_platform",
+            "the daemon only listens on Unix domain sockets",
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(timeout_secs);
+        let mut scanner = crate::cli_wait::WaitScanner::new(&pattern);
+        let mut filter = crate::cli_wait::TextFilter::new();
+
+        let result: Result<crate::cli_wait::WaitMatch, (String, String, CliExit)> = (|| {
+            let mut stream = connect_with_retry(None)
+                .map_err(|error| ("daemon_unreachable".to_string(), error, CliExit::Failed))?;
+            send_request(
+                &mut stream,
+                &Request::Hello {
+                    read_only: true,
+                    protocol_version: Some(crate::daemon::PROTOCOL_VERSION),
+                },
+            )
+            .map_err(|error| ("protocol_error".to_string(), error, CliExit::Failed))?;
+            let mut reader = std::io::BufReader::new(stream);
+            if !matches!(read_response(&mut reader), Ok(Response::Hello { .. })) {
+                return Err((
+                    "access_denied".to_string(),
+                    "the daemon did not accept read-only mode".to_string(),
+                    CliExit::Failed,
+                ));
+            }
+            let mut stream = reader.into_inner();
+            send_request(
+                &mut stream,
+                &Request::Attach {
+                    id,
+                    expected_host_instance: None,
+                    mode: AttachMode::ReadOnly,
+                    binary_snapshot: false,
+                    snapshot_format: crate::daemon::SnapshotFormat::Legacy,
+                },
+            )
+            .map_err(|error| ("protocol_error".to_string(), error, CliExit::Failed))?;
+
+            let mut reader = std::io::BufReader::new(stream);
+            let mut buffered = String::new();
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err((
+                        "timeout".to_string(),
+                        format!("no output matched {pattern:?} within {timeout_secs}s"),
+                        CliExit::Timeout,
+                    ));
+                }
+                // The read timeout is what makes the deadline real: without it a
+                // silent pane would block forever.
+                let _ = reader.get_ref().set_read_timeout(Some(remaining));
+                match read_response(&mut reader) {
+                    Ok(Response::Attached { .. }) => continue,
+                    Ok(Response::Snapshot { data, .. }) => {
+                        // Already on screen when the wait started: never matched.
+                        let _ = data;
+                        continue;
+                    }
+                    Ok(Response::Output { data, .. }) => {
+                        let Some(bytes) = crate::daemon::base64_decode(&data) else {
+                            continue;
+                        };
+                        buffered.clear();
+                        filter.push(&bytes, &mut buffered);
+                        if let Some(found) = scanner.push(&buffered) {
+                            return Ok(found);
+                        }
+                    }
+                    Ok(Response::Closed { .. }) => {
+                        return Err((
+                            "session_closed".to_string(),
+                            format!("session {id} closed before the pattern appeared"),
+                            CliExit::Failed,
+                        ))
+                    }
+                    Ok(Response::Error { code, message }) => {
+                        let exit = cli_contract::classify(&code);
+                        return Err((code, message, exit));
+                    }
+                    Ok(_) => continue,
+                    Err(error) => {
+                        // The read timeout is set to the remaining budget, so a
+                        // failure at or past the deadline is the deadline.
+                        if Instant::now() >= deadline {
+                            return Err((
+                                "timeout".to_string(),
+                                format!("no output matched {pattern:?} within {timeout_secs}s"),
+                                CliExit::Timeout,
+                            ));
+                        }
+                        return Err(("protocol_error".to_string(), error, CliExit::Failed));
+                    }
+                }
+            }
+        })();
+
+        match result {
+            Ok(found) => {
+                if json {
+                    cli_contract::emit(&cli_contract::ok_envelope(
+                        "wait",
+                        serde_json::json!({
+                            "session": id,
+                            "pattern": pattern,
+                            "line": found.line,
+                            "waited_ms": started.elapsed().as_millis() as u64,
+                        }),
+                    ));
+                } else {
+                    println!("{}", found.line);
+                }
+                std::process::exit(CliExit::Ok.code());
+            }
+            Err((code, message, exit)) => fail_command("wait", json, exit, &code, &message),
+        }
+    }
+}
+
 /// Report a failed command the same way every time: one JSON document on stdout
 /// with `--json`, a plain line on stderr otherwise. Never both.
 fn fail_command(command: &str, json: bool, exit: crate::cli_contract::CliExit, code: &str, message: &str) -> ! {

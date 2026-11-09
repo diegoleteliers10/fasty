@@ -212,6 +212,62 @@ fn main() {
             }
             fastty::daemon_client::run_capture_command(id, wait, json);
         }
+        Some("wait") => {
+            let Some(id) = subcommand_args
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+            else {
+                eprintln!("Usage: fastty wait <session-id> --until <TEXT> [--timeout[=SECONDS]] [--json]");
+                std::process::exit(1);
+            };
+            let mut pattern: Option<String> = None;
+            let mut timeout: u64 = 60;
+            let mut json = false;
+            let mut args = subcommand_args.peekable();
+            while let Some(arg) = args.next() {
+                if arg == "--until" {
+                    match args.next() {
+                        Some(value) if !value.is_empty() => pattern = Some(value),
+                        _ => {
+                            eprintln!("fastty wait: --until needs a non-empty pattern");
+                            std::process::exit(1);
+                        }
+                    }
+                } else if let Some(value) = arg.strip_prefix("--until=") {
+                    if value.is_empty() {
+                        eprintln!("fastty wait: --until needs a non-empty pattern");
+                        std::process::exit(1);
+                    }
+                    pattern = Some(value.to_string());
+                } else if arg == "--timeout" {
+                    match args.next().and_then(|value| value.parse::<u64>().ok()) {
+                        Some(seconds) => timeout = seconds,
+                        None => {
+                            eprintln!("fastty wait: --timeout needs a number of seconds");
+                            std::process::exit(1);
+                        }
+                    }
+                } else if let Some(value) = arg.strip_prefix("--timeout=") {
+                    match value.parse::<u64>() {
+                        Ok(seconds) => timeout = seconds,
+                        Err(_) => {
+                            eprintln!("fastty wait: --timeout needs a number of seconds");
+                            std::process::exit(1);
+                        }
+                    }
+                } else if arg == "--json" {
+                    json = true;
+                } else {
+                    eprintln!("fastty wait: unknown flag {arg}");
+                    std::process::exit(1);
+                }
+            }
+            let Some(pattern) = pattern else {
+                eprintln!("Usage: fastty wait <session-id> --until <TEXT> [--timeout[=SECONDS]] [--json]");
+                std::process::exit(1);
+            };
+            fastty::daemon_client::run_wait_command(id, pattern, timeout, json);
+        }
         Some("focus") => {
             let Some(id) = subcommand_args
                 .next()
