@@ -234,6 +234,17 @@ pub fn self_update_blocked_reason() -> Option<String> {
                     .to_string(),
             );
         }
+        // Homebrew manda: si la app vino del cask, actualizarla por dentro deja
+        // el registro de brew desincronizado. El README ya prometia este
+        // comportamiento; el codigo no lo comprobaba.
+        if Path::new("/opt/homebrew/Caskroom/fastty").exists()
+            || Path::new("/usr/local/Caskroom/fastty").exists()
+        {
+            return Some(
+                "Fastty was installed with Homebrew. Update it with `brew upgrade --cask fastty`."
+                    .to_string(),
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

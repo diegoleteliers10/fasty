@@ -9,6 +9,9 @@ exclude = ["vendor/alacritty_terminal", "vendor/vte"]
 name = "fastty"
 version = "0.28.2"
 edition = "2021"
+description = "Fast, GPU-accelerated terminal emulator built with Rust and GPUI."
+homepage = "https://github.com/diegoleteliers10/fasty"
+repository = "https://github.com/diegoleteliers10/fasty"
 
 [lib]
 name = "fastty"
@@ -124,13 +127,18 @@ it offers GPU-accelerated rendering, a tabbed interface, built-in Git \
 integration, and a fully configurable TOML-based setup."""
 section = "utils"
 priority = "optional"
+# `$auto` agrega las libs que el binario enlaza (libc, libxcb, libxkbcommon,
+# zlib). El resto las carga GPUI con dlopen y no aparecen en DT_NEEDED; sin
+# declararlas, el .deb se instala pero la app falla al arrancar en un sistema
+# minimo con "failed to load libvulkan".
+depends = "$auto, libvulkan1, libx11-6, libwayland-client0, libfontconfig1, libfreetype6"
 # Keep the Debian package version identical to the crate version (no "-1"
 # revision suffix), so the artifact is named fastty_<version>_amd64.deb.
 revision = ""
 assets = [
     ["target/release/fastty", "usr/bin/", "755"],
     ["packaging/linux/fastty.desktop", "usr/share/applications/", "644"],
-    ["assets/fasttyIcon.png", "usr/share/icons/hicolor/512x512/apps/fastty.png", "644"],
-    ["assets/fasttyIcon.png", "usr/share/pixmaps/fastty.png", "644"],
+    ["assets/fasttyIcon-512.png", "usr/share/icons/hicolor/512x512/apps/fastty.png", "644"],
+    ["assets/fasttyIcon-512.png", "usr/share/pixmaps/fastty.png", "644"],
     ["README.md", "usr/share/doc/fastty/README.md", "644"],
 ]
