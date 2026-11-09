@@ -10,6 +10,7 @@ breaking change and bumps `schema_version`.
 |---|---|---|
 | `fastty capture <id> [--json] [--wait[=SECONDS]]` | yes | 1 |
 | `fastty send <id> [--json] [--enter] [--wait[=SECONDS]] -- <TEXT>` | yes | 1 |
+| `fastty wait <id> --until <TEXT> [--timeout[=SECONDS]] [--json]` | yes | 1 |
 
 `--wait` retries the connection until the daemon answers. It does not wait for
 output from the session.
@@ -23,6 +24,7 @@ output from the session.
 | 2 | The daemon was unreachable, the protocol failed, or it reported an error that is not a missing session |
 | 3 | The session id does not exist, or it disappeared before the request |
 | 4 | `capture` returned a partial screen because the output hit the 1 MiB cap |
+| 5 | `wait` reached its timeout without seeing the pattern |
 
 Code 4 replaces an older undocumented behaviour where a truncated capture
 exited with 2, the same code as a failure. Nothing documented that behaviour.

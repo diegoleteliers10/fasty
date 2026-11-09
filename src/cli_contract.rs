@@ -23,6 +23,8 @@ pub enum CliExit {
     NotFound,
     /// `capture` returned a partial screen because the output hit the cap.
     Truncated,
+    /// `wait` reached its timeout without seeing the pattern.
+    Timeout,
 }
 
 impl CliExit {
@@ -33,6 +35,7 @@ impl CliExit {
             CliExit::Failed => 2,
             CliExit::NotFound => 3,
             CliExit::Truncated => 4,
+            CliExit::Timeout => 5,
         }
     }
 }
@@ -89,6 +92,7 @@ mod tests {
         assert_eq!(CliExit::Failed.code(), 2);
         assert_eq!(CliExit::NotFound.code(), 3);
         assert_eq!(CliExit::Truncated.code(), 4);
+        assert_eq!(CliExit::Timeout.code(), 5);
     }
 
     #[test]

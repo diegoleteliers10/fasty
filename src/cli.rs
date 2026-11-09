@@ -61,6 +61,8 @@ impl CliOptions {
                                                            docs/cli-automation.md)\n    \
                         capture <id> [--json] [--wait]        Print a session's screen; --json\n    \
                                                            prints one stable document\n    \
+                        wait <id> --until <TEXT> [--timeout]  Block until a session prints TEXT;\n    \
+                                                           exit 5 on timeout\n    \
                         agent-hook install|uninstall <provider> --project|--user\n    \
                                                            Install or remove agent status hooks\n    \
                         agent-status <state> <provider> [kind]\n    \

@@ -7,6 +7,7 @@ pub mod ai;
 pub mod agent_hooks;
 pub mod cli;
 pub mod cli_contract;
+pub mod cli_wait;
 
 pub mod config;
 pub mod daemon;
