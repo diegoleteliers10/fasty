@@ -3,6 +3,14 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.28.1 - 2026-11-09
+
+### Build
+
+- The release build no longer downloads Binaryen. The v0.28.0 Linux and Windows jobs failed while `wasm-pack` fetched Binaryen version_117, and Create GitHub Release was skipped, so v0.28.0 has no release. `wasm-opt` is now off for the wasm client and the build no longer depends on that download.
+- The wasm client grows by 10,122 bytes (104,276 to 114,398, +9.7%). This is the accepted cost of removing the external download from the release path.
+- `fastty-wasm` now validates the v2 history row count the snapshot reader returns, so a truncated or unparsable count fails a test instead of passing unnoticed.
+
 ## 0.28.0 - 2026-11-09
 
 ### Sessions

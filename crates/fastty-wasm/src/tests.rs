@@ -237,4 +237,21 @@ mod tests {
         assert_eq!(term.main_grid.scrollback[2][0].c, '4');
         assert_eq!(term.grid().cells[0][0].c, 'S');
     }
+
+    #[test]
+    fn test_restore_binary_snapshot_v2_rejects_history_row_mismatch() {
+        let mut term = Terminal::new(80, 24, 100);
+        // Header claims 1 history row, but 6 cells over 2 cols and 1 screen
+        // row mean 2 history rows. The two counts must agree.
+        let mut raw = Vec::new();
+        for ch in ['a', '0', 'b', '1', 'A', 'B'] {
+            raw.extend(cell_bytes(ch));
+        }
+
+        let mut data = v2_header(1, 6, 6);
+        data.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(&raw, 6));
+
+        assert!(!term.restore_binary_snapshot(&data));
+        assert!(term.main_grid.scrollback.is_empty());
+    }
 }

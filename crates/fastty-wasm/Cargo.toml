@@ -24,5 +24,10 @@ web-sys = { version = "0.3", features = [
 ] }
 miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
 
+# wasm-opt stays off. wasm-pack resolves it by downloading one hardcoded
+# binaryen tarball (version_117) at build time, and that asset being
+# unreachable fails the whole build, wasm and all. With the download gone the
+# build needs no network and no host tooling. Cost: web/pkg grows about 10 KB
+# (104 KB to 114 KB). Re-enable only with binaryen provided by the runner.
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
+wasm-opt = false
