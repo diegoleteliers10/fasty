@@ -5614,6 +5614,20 @@ impl RootView {
     #[cfg(not(unix))]
     fn retry_host_session(&mut self, _pane_id: PaneId, _window: &mut Window, _cx: &mut Context<Self>) {}
 
+    /// Host sessions only exist where Unix sockets do, so a pane whose host is
+    /// gone has nothing to replay on other platforms and is removed instead.
+    #[cfg(not(unix))]
+    fn revive_pane_from_snapshot(
+        &mut self,
+        _tab_id: usize,
+        _pane_id: PaneId,
+        _session_id: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> bool {
+        false
+    }
+
     #[cfg(unix)]
     fn start_host_attach_retry(
         &mut self,

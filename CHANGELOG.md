@@ -3,6 +3,12 @@
 Notable changes per Fastty release. The newest section ships inside the app and
 appears in the "What's new" dialog after an update.
 
+## 0.28.2 - 2026-11-09
+
+### Build
+
+- The Windows release build compiles again. Pane revival after a dead host session needs Unix sockets, so the restore hook now has a non-Unix stub instead of being called without a definition.
+
 ## 0.28.1 - 2026-11-09
 
 ### Build
