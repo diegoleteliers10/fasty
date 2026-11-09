@@ -251,7 +251,7 @@ impl Terminal {
         if version != 1 && version != 2 {
             return false;
         }
-        let history_rows = u32::from_le_bytes([data[22], data[23], data[24], data[25]]) as usize;
+        let header_history_rows = u32::from_le_bytes([data[22], data[23], data[24], data[25]]) as usize;
         let cols = u16::from_le_bytes([data[8], data[9]]) as usize;
         let rows = u16::from_le_bytes([data[10], data[11]]) as usize;
         let cursor_col = u16::from_le_bytes([data[12], data[13]]) as usize;
@@ -267,6 +267,12 @@ impl Terminal {
         }
         let history_cells = cell_count - cols * rows;
         if history_cells % cols != 0 {
+            return false;
+        }
+        // v2 also counts the history rows in the header, so the two counts
+        // must agree. A header that says otherwise is corrupt, and trusting
+        // either side would render the wrong scrollback.
+        if version == 2 && header_history_rows != history_cells / cols {
             return false;
         }
 
