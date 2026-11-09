@@ -476,61 +476,84 @@ pub fn run_sessions_command(watch: bool, wait_secs: Option<u64>, json: bool) -> 
     }
 }
 
-pub fn run_capture_command(id: usize, wait_secs: Option<u64>) -> ! {
+pub fn run_capture_command(id: usize, wait_secs: Option<u64>, json: bool) -> ! {
+    use crate::cli_contract::{self, CliExit};
+
     #[cfg(not(unix))]
     {
-        let _ = (id, wait_secs);
-        eprintln!("fastty capture: not supported on this platform yet.");
-        std::process::exit(1);
+        let _ = (id, wait_secs, json);
+        fail_command(
+            "capture",
+            json,
+            CliExit::Failed,
+            "unsupported_platform",
+            "the daemon only listens on Unix domain sockets",
+        );
     }
     #[cfg(unix)]
     {
         use std::io::Write;
-        let mut stream = match connect_with_retry(wait_secs) {
-            Ok(stream) => stream,
-            Err(error) => {
-                eprintln!("fastty capture: {error}");
-                std::process::exit(1);
+
+        let outcome: Result<(String, bool), (String, String)> = (|| {
+            let mut stream = connect_with_retry(wait_secs)
+                .map_err(|error| ("daemon_unreachable".to_string(), error))?;
+            send_request(
+                &mut stream,
+                &Request::Hello {
+                    read_only: true,
+                    protocol_version: Some(crate::daemon::PROTOCOL_VERSION),
+                },
+            )
+            .map_err(|error| ("protocol_error".to_string(), error))?;
+            let mut reader = std::io::BufReader::new(stream);
+            if !matches!(read_response(&mut reader), Ok(Response::Hello { .. })) {
+                return Err((
+                    "access_denied".to_string(),
+                    "the daemon did not accept read-only mode".to_string(),
+                ));
             }
-        };
-        if let Err(error) = send_request(&mut stream, &Request::Hello { read_only: true, protocol_version: Some(crate::daemon::PROTOCOL_VERSION) }) {
-            eprintln!("fastty capture: {error}");
-            std::process::exit(1);
-        }
-        let mut reader = std::io::BufReader::new(stream);
-        if !matches!(read_response(&mut reader), Ok(Response::Hello { .. })) {
-            eprintln!("fastty capture: daemon did not accept read-only mode");
-            std::process::exit(1);
-        }
-        let mut stream = reader.into_inner();
-        if let Err(error) = send_request(&mut stream, &Request::Capture { id }) {
-            eprintln!("fastty capture: {error}");
-            std::process::exit(1);
-        }
-        match read_response(&mut std::io::BufReader::new(stream)) {
-            Ok(Response::Captured {
-                data, truncated, ..
-            }) => {
-                if std::io::stdout().write_all(data.as_bytes()).is_err() {
-                    std::process::exit(1);
+            let mut stream = reader.into_inner();
+            send_request(&mut stream, &Request::Capture { id })
+                .map_err(|error| ("protocol_error".to_string(), error))?;
+            match read_response(&mut std::io::BufReader::new(stream)) {
+                Ok(Response::Captured { data, truncated, .. }) => Ok((data, truncated)),
+                Ok(Response::Error { code, message }) => Err((code, message)),
+                Ok(other) => Err((
+                    "protocol_error".to_string(),
+                    format!("unexpected response from fastty: {other:?}"),
+                )),
+                Err(error) => Err(("protocol_error".to_string(), error)),
+            }
+        })();
+
+        match outcome {
+            Ok((data, truncated)) => {
+                if json {
+                    cli_contract::emit(&cli_contract::ok_envelope(
+                        "capture",
+                        serde_json::json!({
+                            "session": id,
+                            "data": data,
+                            "bytes": data.len(),
+                            "truncated": truncated,
+                        }),
+                    ));
+                } else if std::io::stdout().write_all(data.as_bytes()).is_err() {
+                    std::process::exit(CliExit::Failed.code());
                 }
-                if truncated {
-                    eprintln!("fastty capture: output was truncated at 1 MiB");
-                    std::process::exit(2);
-                }
-                std::process::exit(0);
+                let exit = if truncated {
+                    if !json {
+                        eprintln!("fastty capture: output was truncated at 1 MiB");
+                    }
+                    CliExit::Truncated
+                } else {
+                    CliExit::Ok
+                };
+                std::process::exit(exit.code());
             }
-            Ok(Response::Error { code, message }) => {
-                eprintln!("fastty capture: {code}: {message}");
-                std::process::exit(1);
-            }
-            Ok(_) => {
-                eprintln!("fastty capture: unexpected response from fastty");
-                std::process::exit(1);
-            }
-            Err(error) => {
-                eprintln!("fastty capture: {error}");
-                std::process::exit(1);
+            Err((code, message)) => {
+                let exit = cli_contract::classify(&code);
+                fail_command("capture", json, exit, &code, &message);
             }
         }
     }
@@ -1296,21 +1319,46 @@ pub fn run_write_command(id: usize, text: String, enter: bool, wait_secs: Option
 
 /// `fastty send` asks the visible Fastty window to approve input before it
 /// reaches the session.
-pub fn run_send_command(id: usize, text: String, enter: bool, wait_secs: Option<u64>) -> ! {
+pub fn run_send_command(
+    id: usize,
+    text: String,
+    enter: bool,
+    wait_secs: Option<u64>,
+    json: bool,
+) -> ! {
+    use crate::cli_contract::{self, CliExit};
+
     #[cfg(not(unix))]
     {
-        let _ = (id, text, enter, wait_secs);
-        eprintln!("fastty send: not supported on this platform yet.");
-        std::process::exit(1);
+        let _ = (id, text, enter, wait_secs, json);
+        fail_command(
+            "send",
+            json,
+            CliExit::Failed,
+            "unsupported_platform",
+            "the daemon only listens on Unix domain sockets",
+        );
     }
     #[cfg(unix)]
     {
-        let result = (|| {
-            let mut stream = connect_with_retry(wait_secs)?;
-            send_request(&mut stream, &Request::Hello { read_only: false, protocol_version: Some(crate::daemon::PROTOCOL_VERSION) })?;
+        let byte_count = text.len() + usize::from(enter);
+        let outcome: Result<(), (String, String)> = (|| {
+            let mut stream = connect_with_retry(wait_secs)
+                .map_err(|error| ("daemon_unreachable".to_string(), error))?;
+            send_request(
+                &mut stream,
+                &Request::Hello {
+                    read_only: false,
+                    protocol_version: Some(crate::daemon::PROTOCOL_VERSION),
+                },
+            )
+            .map_err(|error| ("protocol_error".to_string(), error))?;
             let mut reader = std::io::BufReader::new(stream);
-            if !matches!(read_response(&mut reader)?, Response::Hello { .. }) {
-                return Err("daemon did not accept the hello request".to_string());
+            if !matches!(read_response(&mut reader), Ok(Response::Hello { .. })) {
+                return Err((
+                    "protocol_error".to_string(),
+                    "the daemon did not accept the hello request".to_string(),
+                ));
             }
             let mut stream = reader.into_inner();
             send_request(
@@ -1318,12 +1366,19 @@ pub fn run_send_command(id: usize, text: String, enter: bool, wait_secs: Option<
                 &Request::SetAccessScope {
                     scope: crate::daemon::AccessScope::Interact,
                 },
-            )?;
+            )
+            .map_err(|error| ("protocol_error".to_string(), error))?;
             let mut reader = std::io::BufReader::new(stream);
-            match read_response(&mut reader)? {
-                Response::Done { .. } => {}
-                Response::Error { code, message } => return Err(format!("{code}: {message}")),
-                _ => return Err("unexpected access-scope response".to_string()),
+            match read_response(&mut reader) {
+                Ok(Response::Done { .. }) => {}
+                Ok(Response::Error { code, message }) => return Err((code, message)),
+                Ok(_) => {
+                    return Err((
+                        "protocol_error".to_string(),
+                        "unexpected access-scope response".to_string(),
+                    ))
+                }
+                Err(error) => return Err(("protocol_error".to_string(), error)),
             }
             let payload = if enter { format!("{text}\r") } else { text };
             let mut stream = reader.into_inner();
@@ -1333,21 +1388,196 @@ pub fn run_send_command(id: usize, text: String, enter: bool, wait_secs: Option<
                     id,
                     action: crate::daemon::ExternalAction::Send { text: payload },
                 },
-            )?;
-            match read_response(&mut std::io::BufReader::new(stream))? {
-                Response::Done { .. } => Ok(()),
-                Response::Error { code, message } => Err(format!("{code}: {message}")),
-                _ => Err("unexpected response from fastty".to_string()),
+            )
+            .map_err(|error| ("protocol_error".to_string(), error))?;
+            match read_response(&mut std::io::BufReader::new(stream)) {
+                Ok(Response::Done { .. }) => Ok(()),
+                Ok(Response::Error { code, message }) => Err((code, message)),
+                Ok(_) => Err((
+                    "protocol_error".to_string(),
+                    "unexpected response from fastty".to_string(),
+                )),
+                Err(error) => Err(("protocol_error".to_string(), error)),
             }
         })();
-        match result {
-            Ok(()) => std::process::exit(0),
-            Err(error) => {
-                eprintln!("fastty send: {error}");
-                std::process::exit(1);
+
+        match outcome {
+            Ok(()) => {
+                if json {
+                    cli_contract::emit(&cli_contract::ok_envelope(
+                        "send",
+                        serde_json::json!({
+                            "session": id,
+                            "bytes": byte_count,
+                            "enter": enter,
+                        }),
+                    ));
+                }
+                std::process::exit(CliExit::Ok.code());
+            }
+            Err((code, message)) => {
+                let exit = cli_contract::classify(&code);
+                fail_command("send", json, exit, &code, &message);
             }
         }
     }
+}
+
+/// Block until the pane prints `pattern`, or the timeout expires.
+///
+/// Streams the session over a read-only attach and scans only bytes produced
+/// after the call starts, so a match cannot come from text that was already on
+/// screen. Memory stays flat: the scanner keeps a bounded tail window.
+pub fn run_wait_command(
+    id: usize,
+    pattern: String,
+    timeout_secs: u64,
+    json: bool,
+) -> ! {
+    use crate::cli_contract::{self, CliExit};
+
+    #[cfg(not(unix))]
+    {
+        let _ = (id, pattern, timeout_secs, json);
+        fail_command(
+            "wait",
+            json,
+            CliExit::Failed,
+            "unsupported_platform",
+            "the daemon only listens on Unix domain sockets",
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(timeout_secs);
+        let mut scanner = crate::cli_wait::WaitScanner::new(&pattern);
+        let mut filter = crate::cli_wait::TextFilter::new();
+
+        let result: Result<crate::cli_wait::WaitMatch, (String, String, CliExit)> = (|| {
+            let mut stream = connect_with_retry(None)
+                .map_err(|error| ("daemon_unreachable".to_string(), error, CliExit::Failed))?;
+            send_request(
+                &mut stream,
+                &Request::Hello {
+                    read_only: true,
+                    protocol_version: Some(crate::daemon::PROTOCOL_VERSION),
+                },
+            )
+            .map_err(|error| ("protocol_error".to_string(), error, CliExit::Failed))?;
+            let mut reader = std::io::BufReader::new(stream);
+            if !matches!(read_response(&mut reader), Ok(Response::Hello { .. })) {
+                return Err((
+                    "access_denied".to_string(),
+                    "the daemon did not accept read-only mode".to_string(),
+                    CliExit::Failed,
+                ));
+            }
+            let mut stream = reader.into_inner();
+            send_request(
+                &mut stream,
+                &Request::Attach {
+                    id,
+                    expected_host_instance: None,
+                    mode: AttachMode::ReadOnly,
+                    binary_snapshot: false,
+                    snapshot_format: crate::daemon::SnapshotFormat::Legacy,
+                },
+            )
+            .map_err(|error| ("protocol_error".to_string(), error, CliExit::Failed))?;
+
+            let mut reader = std::io::BufReader::new(stream);
+            let mut buffered = String::new();
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err((
+                        "timeout".to_string(),
+                        format!("no output matched {pattern:?} within {timeout_secs}s"),
+                        CliExit::Timeout,
+                    ));
+                }
+                // The read timeout is what makes the deadline real: without it a
+                // silent pane would block forever.
+                let _ = reader.get_ref().set_read_timeout(Some(remaining));
+                match read_response(&mut reader) {
+                    Ok(Response::Attached { .. }) => continue,
+                    Ok(Response::Snapshot { data, .. }) => {
+                        // Already on screen when the wait started: never matched.
+                        let _ = data;
+                        continue;
+                    }
+                    Ok(Response::Output { data, .. }) => {
+                        let Some(bytes) = crate::daemon::base64_decode(&data) else {
+                            continue;
+                        };
+                        buffered.clear();
+                        filter.push(&bytes, &mut buffered);
+                        if let Some(found) = scanner.push(&buffered) {
+                            return Ok(found);
+                        }
+                    }
+                    Ok(Response::Closed { .. }) => {
+                        return Err((
+                            "session_closed".to_string(),
+                            format!("session {id} closed before the pattern appeared"),
+                            CliExit::Failed,
+                        ))
+                    }
+                    Ok(Response::Error { code, message }) => {
+                        let exit = cli_contract::classify(&code);
+                        return Err((code, message, exit));
+                    }
+                    Ok(_) => continue,
+                    Err(error) => {
+                        // The read timeout is set to the remaining budget, so a
+                        // failure at or past the deadline is the deadline.
+                        if Instant::now() >= deadline {
+                            return Err((
+                                "timeout".to_string(),
+                                format!("no output matched {pattern:?} within {timeout_secs}s"),
+                                CliExit::Timeout,
+                            ));
+                        }
+                        return Err(("protocol_error".to_string(), error, CliExit::Failed));
+                    }
+                }
+            }
+        })();
+
+        match result {
+            Ok(found) => {
+                if json {
+                    cli_contract::emit(&cli_contract::ok_envelope(
+                        "wait",
+                        serde_json::json!({
+                            "session": id,
+                            "pattern": pattern,
+                            "line": found.line,
+                            "waited_ms": started.elapsed().as_millis() as u64,
+                        }),
+                    ));
+                } else {
+                    println!("{}", found.line);
+                }
+                std::process::exit(CliExit::Ok.code());
+            }
+            Err((code, message, exit)) => fail_command("wait", json, exit, &code, &message),
+        }
+    }
+}
+
+/// Report a failed command the same way every time: one JSON document on stdout
+/// with `--json`, a plain line on stderr otherwise. Never both.
+fn fail_command(command: &str, json: bool, exit: crate::cli_contract::CliExit, code: &str, message: &str) -> ! {
+    if json {
+        crate::cli_contract::emit(&crate::cli_contract::err_envelope(command, exit, code, message));
+    } else {
+        eprintln!("fastty {command}: {code}: {message}");
+    }
+    std::process::exit(exit.code());
 }
 
 pub fn run_agent_status_command(state: String, app: String, kind: Option<String>) -> ! {

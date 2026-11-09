@@ -4782,7 +4782,96 @@ impl RootView {
             }
         }
         view.persist_session_for_quit(_window);
+        view.start_session_snapshot_flush(cx);
         view
+    }
+
+    /// How often live panes write a scrollback snapshot. A host restart loses
+    /// every host session, so this bounds how much output a restart can lose.
+    const SESSION_SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Mirror live panes into the snapshot store, off the UI thread, so the
+    /// next launch can rebuild a pane whose host session disappeared.
+    fn start_session_snapshot_flush(&mut self, cx: &mut Context<Self>) {
+        // One worker at a time. A slow snapshot (large scrollback, slow disk)
+        // must not queue a second thread that serializes the same map again.
+        static FLUSH_RUNNING: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Self::SESSION_SNAPSHOT_INTERVAL)
+                    .await;
+                let Ok(targets) = this.update(cx, |this, _cx| this.session_snapshot_targets()) else {
+                    return;
+                };
+                if targets.is_empty() {
+                    continue;
+                }
+                if FLUSH_RUNNING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    continue;
+                }
+                let spawned = std::thread::Builder::new()
+                    .name("fastty-session-snapshots".into())
+                    .spawn(move || {
+                        let mut entries = Vec::with_capacity(targets.len());
+                        for (session_id, host_instance, terminal) in targets {
+                            let Ok(bytes) = terminal.snapshot_state_for_save() else {
+                                continue;
+                            };
+                            let foreground_running =
+                                crate::session_host::session_process_status(session_id)
+                                    .map(|(running, _)| running)
+                                    .unwrap_or(false);
+                            entries.push((session_id, host_instance, foreground_running, bytes));
+                        }
+                        if !entries.is_empty() {
+                            let borrowed: Vec<(usize, Option<&str>, bool, Vec<u8>)> = entries
+                                .iter()
+                                .map(|(id, host, running, bytes)| {
+                                    (*id, host.as_deref(), *running, bytes.clone())
+                                })
+                                .collect();
+                            crate::session_snapshots::record_many(&borrowed);
+                        }
+                        FLUSH_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+                    });
+                if spawned.is_err() {
+                    FLUSH_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn session_snapshot_targets(
+        &self,
+    ) -> Vec<(usize, Option<String>, Arc<crate::terminal_state::TerminalState>)> {
+        let mut targets = Vec::new();
+        for tab in &self.tabs {
+            for pane in tab.pane_tree.root.all_panes() {
+                let Some(terminal) = pane.terminal.as_ref() else {
+                    continue;
+                };
+                let Some(session_id) = pane
+                    .host_session_id
+                    .or_else(|| terminal.remote_session_id())
+                else {
+                    continue;
+                };
+                let host_instance = pane
+                    .host_session_identity
+                    .as_ref()
+                    .map(|identity| identity.host_instance.0.clone())
+                    .or_else(|| {
+                        terminal
+                            .remote_session_identity()
+                            .map(|identity| identity.host_instance.0)
+                    });
+                targets.push((session_id, host_instance, terminal.clone()));
+            }
+        }
+        targets
     }
 
     pub fn persist_session(&self) {
@@ -5325,16 +5414,39 @@ impl RootView {
                 if this.close_owns_pane(tab_id, pane_id) {
                     return;
                 }
-                let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else { return; };
-                let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) else { return; };
-                if !pane.terminal.as_ref().is_some_and(|terminal| terminal.source_id() == source_id) {
+                let current = this
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .and_then(|tab| tab.pane_tree.find_pane(pane_id))
+                    .filter(|pane| {
+                        pane.terminal
+                            .as_ref()
+                            .is_some_and(|terminal| terminal.source_id() == source_id)
+                    });
+                if current.is_none() {
                     return;
                 }
                 match status {
                     crate::session_host::SessionReferenceStatus::Absent => {
-                        this.remove_exited_pane(tab_id, pane_id, window, cx);
+                        // The host that owned this pane died. Drop the dead
+                        // projection first: it can no longer render or answer
+                        // keys, and revival rebuilds the pane from a snapshot.
+                        if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                            if let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) {
+                                pane.terminal = None;
+                            }
+                            if tab.pane_tree.active_pane_id == pane_id {
+                                tab.terminal = None;
+                            }
+                        }
+                        if !this.revive_pane_from_snapshot(tab_id, pane_id, session_id, window, cx) {
+                            this.remove_exited_pane(tab_id, pane_id, window, cx);
+                        }
                     }
                     status => {
+                        let Some(tab) = this.tabs.iter_mut().find(|tab| tab.id == tab_id) else { return; };
+                        let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) else { return; };
                         let mut replacement = unavailable_terminal_pane(pane_id, Some(session_id), pane.host_session_identity.clone(), pane.title.clone(), pane.cwd.clone());
                         replacement.custom_title = pane.custom_title.clone();
                         if let crate::session_host::SessionReferenceStatus::Unknown(error) = status {
@@ -5538,6 +5650,83 @@ impl RootView {
         .detach();
     }
 
+    /// Rebuild a pane in place after its host session disappeared, replaying the
+    /// last recorded scrollback when one is usable.
+    ///
+    /// Returns `false` only when the pane is no longer in `tab_id`: the caller
+    /// then removes it. A pane without a replayable snapshot still comes back as
+    /// a shell in its own cwd, because losing the pane loses more than the
+    /// screen.
+    #[cfg(unix)]
+    fn revive_pane_from_snapshot(
+        &mut self,
+        tab_id: usize,
+        pane_id: PaneId,
+        session_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((title, custom_title, cwd, identity)) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.pane_tree.find_pane(pane_id))
+            .and_then(|pane| {
+                (pane.host_session_id == Some(session_id)).then(|| {
+                    (
+                        pane.title.clone(),
+                        pane.custom_title.clone(),
+                        pane.cwd.clone(),
+                        pane.host_session_identity.clone(),
+                    )
+                })
+            })
+        else {
+            return false;
+        };
+        let shell = self
+            .config
+            .shell
+            .clone()
+            .or_else(|| std::env::var("SHELL").ok())
+            .unwrap_or_else(crate::paths::default_system_shell);
+        let mut replacement = self.spawn_terminal_pane_with_session(
+            &shell,
+            &[],
+            cwd.as_deref(),
+            Some(title),
+            None,
+            None,
+            Some(pane_id),
+            MissingSessionPolicy::StartFresh,
+            None,
+            window,
+            cx,
+        );
+        // Best effort: a foreground TUI, a missing record, or a snapshot the
+        // terminal rejects all leave the fresh shell in place.
+        self.replay_session_snapshot(&mut replacement, Some(session_id), identity.as_ref());
+        replacement.custom_title = custom_title.or(replacement.custom_title);
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return false;
+        };
+        let Some(pane) = tab.pane_tree.find_pane_mut(pane_id) else {
+            return false;
+        };
+        *pane = replacement;
+        if tab.pane_tree.active_pane_id == pane_id {
+            if let Some(active) = tab.pane_tree.active_pane() {
+                tab.terminal = active.terminal.clone();
+                tab.cwd = active.cwd.clone();
+                tab.git_status = active.git_status.clone();
+            }
+        }
+        self.host_missing_sessions.remove(&pane_id);
+        self.persist_session();
+        cx.notify();
+        true
+    }
+
     #[cfg(unix)]
     fn finish_host_attach_retry(
         &mut self,
@@ -5567,7 +5756,11 @@ impl RootView {
             Ok(remote) => remote,
             Err(error) if is_missing_host_session(&error) => {
                 self.host_attach_retry_state.remove(&pane_id);
-                self.remove_exited_pane(tab_id, pane_id, window, cx);
+                // The host that owned this pane is gone. Keep the pane, its cwd
+                // and its scrollback instead of dropping it.
+                if !self.revive_pane_from_snapshot(tab_id, pane_id, session_id, window, cx) {
+                    self.remove_exited_pane(tab_id, pane_id, window, cx);
+                }
                 return;
             }
             Err(error) => {
@@ -5582,6 +5775,10 @@ impl RootView {
             .clone()
             .or_else(|| std::env::var("SHELL").ok())
             .unwrap_or_else(crate::paths::default_system_shell);
+        let attached_host = remote
+            .identity
+            .as_ref()
+            .map(|identity| identity.host_instance.0.clone());
         let mut replacement = self.spawn_terminal_pane_with_session(
             &shell,
             &[],
@@ -5619,6 +5816,9 @@ impl RootView {
         if restored {
             self.host_attach_retry_state.remove(&pane_id);
             self.host_missing_sessions.remove(&pane_id);
+            // The live host is authoritative again, so the stored scrollback is
+            // stale and must not be replayed after a later host restart.
+            crate::session_snapshots::forget(session_id, attached_host.as_deref());
         }
         self.persist_session();
         cx.notify();
@@ -5703,6 +5903,44 @@ impl RootView {
         Some(self.spawn_terminal_pane_with_session(shell, &[], cwd, Some(title), session_id, identity, Some(pane_id), if session_id.is_some() { MissingSessionPolicy::KeepUnavailable } else { MissingSessionPolicy::StartFresh }, remote, window, cx))
     }
 
+    /// Replay a stored scrollback snapshot into a freshly spawned pane.
+    ///
+    /// Returns `false` when there is nothing to replay or the pane was running a
+    /// foreground program: replaying a dead TUI screen would show stale chrome
+    /// that no longer answers to keys.
+    fn replay_session_snapshot(
+        &self,
+        pane: &mut TerminalPane,
+        session_id: Option<usize>,
+        identity: Option<&crate::daemon::SessionIdentity>,
+    ) -> bool {
+        let Some(session_id) = session_id else {
+            return false;
+        };
+        let Some(record) = crate::session_snapshots::lookup(
+            session_id,
+            identity.map(|identity| identity.host_instance.0.as_str()),
+        ) else {
+            return false;
+        };
+        if record.foreground_running {
+            return false;
+        }
+        let Some(bytes) = record.bytes() else {
+            return false;
+        };
+        let Some(terminal) = pane.terminal.as_ref() else {
+            return false;
+        };
+        if !terminal.restore_saved_snapshot(&bytes) {
+            return false;
+        }
+        if pane.custom_title.is_none() {
+            pane.custom_title = Some(format!("{} (previous output)", pane.title));
+        }
+        true
+    }
+
     fn restore_persisted_pane_node(
         &mut self,
         node: crate::session::PersistedPaneNode,
@@ -5714,8 +5952,63 @@ impl RootView {
         use crate::session::{PersistedPaneNode, PersistedSplitDirection};
         match node {
             PersistedPaneNode::Leaf(persisted) => {
-                let mut pane = self.restore_terminal_pane(shell, persisted.cwd.as_deref(), persisted.title, persisted.host_session_id, persisted.host_session_identity, persisted.pane_id, window, cx)?;
-                pane.custom_title = persisted.custom_title;
+                let restored = self.restore_terminal_pane(
+                    shell,
+                    persisted.cwd.as_deref(),
+                    persisted.title.clone(),
+                    persisted.host_session_id,
+                    persisted.host_session_identity.clone(),
+                    persisted.pane_id,
+                    window,
+                    cx,
+                );
+                let mut pane = match restored {
+                    Some(pane) => {
+                        // Only a live attach makes the stored scrollback obsolete.
+                        // An unavailable pane has a retry in flight, and dropping
+                        // its record here would lose the very history the retry
+                        // may need.
+                        if pane.terminal.is_some() {
+                            if let Some(session_id) = persisted.host_session_id {
+                                crate::session_snapshots::forget(
+                                    session_id,
+                                    persisted
+                                        .host_session_identity
+                                        .as_ref()
+                                        .map(|identity| identity.host_instance.0.as_str()),
+                                );
+                            }
+                        }
+                        pane
+                    }
+                    None => {
+                        // The host that owned this pane is gone, so the session id
+                        // no longer resolves. Rebuild the pane and replay the last
+                        // snapshot instead of dropping the tab.
+                        let mut pane = self.spawn_terminal_pane_with_session(
+                            shell,
+                            &[],
+                            persisted.cwd.as_deref(),
+                            Some(persisted.title.clone()),
+                            None,
+                            None,
+                            Some(persisted.pane_id),
+                            MissingSessionPolicy::StartFresh,
+                            None,
+                            window,
+                            cx,
+                        );
+                        self.replay_session_snapshot(
+                            &mut pane,
+                            persisted.host_session_id,
+                            persisted.host_session_identity.as_ref(),
+                        );
+                        pane
+                    }
+                };
+                if persisted.custom_title.is_some() {
+                    pane.custom_title = persisted.custom_title;
+                }
                 Some(PaneNode::Leaf(pane))
             }
             PersistedPaneNode::Split { direction, ratio, first, second } => {

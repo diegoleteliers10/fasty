@@ -55,6 +55,14 @@ impl CliOptions {
                         close <id>                            Terminate a headless session\n    \
                         resize <id> <cols> <rows>             Resize a session's PTY\n    \
                         write <id> [--enter] <TEXT...>        Type text into a session\n    \
+                        send <id> [--json] [--enter] [--wait] -- <TEXT>\n    \
+                                                           Type into a session; --json prints\n    \
+                                                           one stable document (see\n    \
+                                                           docs/cli-automation.md)\n    \
+                        capture <id> [--json] [--wait]        Print a session's screen; --json\n    \
+                                                           prints one stable document\n    \
+                        wait <id> --until <TEXT> [--timeout]  Block until a session prints TEXT;\n    \
+                                                           exit 5 on timeout\n    \
                         agent-hook install|uninstall <provider> --project|--user\n    \
                                                            Install or remove agent status hooks\n    \
                         agent-status <state> <provider> [kind]\n    \

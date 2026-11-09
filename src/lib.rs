@@ -6,6 +6,8 @@
 pub mod ai;
 pub mod agent_hooks;
 pub mod cli;
+pub mod cli_contract;
+pub mod cli_wait;
 
 pub mod config;
 pub mod daemon;
@@ -31,6 +33,7 @@ pub mod selection_classifier;
 pub mod session;
 pub mod session_manager;
 pub mod session_host;
+pub mod session_snapshots;
 pub mod snippets;
 pub mod ssh;
 pub mod terminal_state;
