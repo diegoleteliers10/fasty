@@ -170,20 +170,22 @@ impl WaitScanner {
     }
 
     /// Add text and return the match the first time the needle appears.
+    ///
+    /// The search runs before the trim. The daemon delivers one frame per read,
+    /// and a frame can be larger than the window: trimming first would discard
+    /// the part holding the match and the caller would time out even though the
+    /// text appeared.
     pub fn push(&mut self, text: &str) -> Option<WaitMatch> {
         if text.is_empty() {
             return None;
         }
         self.window.push_str(text);
-        let trimmed = self.window.len().saturating_sub(WINDOW_BYTES);
-        if trimmed > 0 {
-            // Cut on a character boundary so the window stays valid UTF-8.
-            let mut cut = trimmed;
-            while cut < self.window.len() && !self.window.is_char_boundary(cut) {
-                cut += 1;
-            }
-            self.window.drain(..cut);
-        }
+        let found = self.match_in_window();
+        self.trim_to_window();
+        found
+    }
+
+    fn match_in_window(&self) -> Option<WaitMatch> {
         let index = self.window.find(&self.needle)?;
         let line_start = self.window[..index].rfind('\n').map_or(0, |at| at + 1);
         let line_end = self.window[index..]
@@ -192,6 +194,19 @@ impl WaitScanner {
         Some(WaitMatch {
             line: self.window[line_start..line_end].trim().to_string(),
         })
+    }
+
+    fn trim_to_window(&mut self) {
+        let excess = self.window.len().saturating_sub(WINDOW_BYTES);
+        if excess == 0 {
+            return;
+        }
+        // Cut on a character boundary so the window stays valid UTF-8.
+        let mut cut = excess;
+        while cut < self.window.len() && !self.window.is_char_boundary(cut) {
+            cut += 1;
+        }
+        self.window.drain(..cut);
     }
 
     pub fn window(&self) -> &str {
@@ -268,6 +283,27 @@ mod tests {
         scanner.push(&"a".repeat(WINDOW_BYTES - 8));
         let found = scanner.push("\nall done\n").expect("match near the edge");
         assert_eq!(found.line, "all done");
+    }
+
+    #[test]
+    fn a_match_inside_one_oversized_frame_is_not_lost() {
+        // The daemon can deliver a frame larger than the window. The match sits
+        // in the part the trim would discard, so searching after the trim loses
+        // it and the caller times out even though the text appeared.
+        let mut scanner = WaitScanner::new("NEEDLE");
+        let mut frame = String::from("BUILD NEEDLE ok\n");
+        frame.push_str(&"x".repeat(WINDOW_BYTES * 2));
+        let found = scanner
+            .push(&frame)
+            .expect("a match in the leading part of a large frame must be found");
+        assert!(found.line.contains("NEEDLE"), "line was {:?}", found.line);
+    }
+
+    #[test]
+    fn the_window_stays_bounded_after_an_oversized_frame() {
+        let mut scanner = WaitScanner::new("never");
+        scanner.push(&"y".repeat(WINDOW_BYTES * 2));
+        assert!(scanner.window().len() <= WINDOW_BYTES);
     }
 
     #[test]

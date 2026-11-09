@@ -80,9 +80,34 @@ Only `no_such_session` maps to exit 3. Every other daemon code maps to 2.
 `capture` writes the screen text to stdout and keeps its message on stderr.
 `send` prints nothing on success. Exit codes are the same as with `--json`.
 
+## `wait`: block until a pane prints a string
+
+`fastty wait <id> --until <TEXT> [--timeout[=SECONDS]] [--json]`
+
+| Behaviour | Contract |
+|---|---|
+| Output scanned | Only output produced after the command starts. The initial screen is read and discarded, so text that was already on screen cannot answer the wait |
+| Match | Literal substring. No regular expression |
+| Consumption | None. The command reads a read-only attachment and never writes to the pane |
+| Timeout | 60 seconds by default; `--timeout <SECONDS>` overrides it |
+| Memory | At most 8 KiB of filtered text is kept, so an hours-long wait uses the same memory as a short one |
+| Success | Exit 0, with the matched line |
+| Timeout | Exit 5, `error.code: timeout` |
+| Pane closed first | Exit 2, `error.code: session_closed` |
+| No session | Exit 3, `error.code: no_such_session` |
+
+ANSI escape sequences are removed before matching, including a sequence split
+across two reads, so a colour code cannot sit inside the pattern.
+
+The two `--wait` flags above are unrelated: on `send` and `capture` they retry the
+connection until the daemon answers. `fastty wait` is the command that waits for
+output.
+
 ## Not covered by this version
 
 - `sessions --json` still prints a bare array without an envelope. Changing it
   would break existing callers, so it keeps its current shape.
-- A command that waits until the output matches a pattern does not exist.
-- There is no embedded scripting layer.
+- A regular-expression pattern. `--until` is literal only.
+- There is no embedded scripting layer, and adding one would mean a C runtime in
+  every release target plus an API surface, a permission model and resource
+  limits. A shell plus this JSON contract covers the same automation today.
