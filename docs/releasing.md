@@ -1,8 +1,8 @@
 # Releasing Fastty
 
-A release starts when a pull request merges into `main`. The automation reads
-the version from `Cargo.toml`, creates the matching tag, and starts the build.
-You do not push tags by hand.
+A release starts when a pull request merges into `main`. If the version tag
+already has a published release, the workflow creates a release commit that
+bumps the patch, tags it, and starts the build. You do not push tags by hand.
 
 ## Publish a version
 
@@ -11,6 +11,10 @@ You do not push tags by hand.
    ```bash
    cargo set-version 0.25.5
    ```
+
+   If you do not bump, the merge still produces a release: the workflow creates
+   a release commit with the next patch. Bump manually to choose minor/major or
+   to keep the version explicit on `main`.
 
 2. Add the release notes to `CHANGELOG.md`. Use the heading
    `## 0.25.5 - YYYY-MM-DD`. The release body comes from this section. Without
@@ -28,10 +32,12 @@ You do not push tags by hand.
 
 1. `.github/workflows/release-on-merge.yml` runs when a pull request into `main`
    closes with a merge.
-2. It reads `version` from `Cargo.toml` at the merge commit and builds the tag
-   `vX.Y.Z`.
-3. If the tag does not exist, it creates the tag on the merge commit and pushes
-   it.
+2. It reads `version` from `Cargo.toml` at the merge commit. If `vX.Y.Z` does
+   not exist, it tags the merge commit. If it exists and its release is already
+   published, it creates a release commit that bumps the patch (`v0.28.2` ->
+   `v0.28.3`), tags that commit, and continues. The release commit lives only on
+   the tag; `main` is not modified.
+3. It pushes the tag and starts the build.
 4. It starts `.github/workflows/release.yml` on the tag with `gh workflow run`.
 5. `release.yml` builds Linux, macOS Intel, macOS ARM, and Windows. Then it
    publishes the GitHub Release with every asset, including `SHA256SUMS`.
@@ -48,20 +54,23 @@ created by the token to stop recursive runs.
 
 ## Rules
 
-- The tag comes from `Cargo.toml`. A merge without a version bump creates no tag
-  and no release. The job finishes green in about 10 seconds.
-- Do not push the tag by hand. The workflow skips the tag when it already
-  exists.
-- If the tag exists but the release does not, the next merge with the same
-  version publishes it.
+- The tag comes from `Cargo.toml`. If the tag already exists and its release is
+  published, the workflow bumps the patch on a release commit and uses that tag.
+  A merge without a manual bump still produces a release.
+- Do not push the tag by hand. If the tag exists but the release does not, the
+  workflow dispatches the existing tag (recovery). Re-running the same merge
+  does not create another release.
 - One build runs per tag. The `concurrency` group stops duplicate builds.
 
 ## CI
 
 `.github/workflows/ci.yml` compiles `-p fastty` on macOS, Linux, and Windows on
-every pull request, and runs the test suite on Linux. Before it existed, the
-first place Linux and Windows were compiled was the release: v0.28.0 and v0.28.1
-both failed on a single target and the whole release was skipped.
+every pull request, and runs the test suite on macOS (one environment-dependent
+test is skipped). Linux and Windows are compile checks, which is what catches
+`cfg` errors; the Linux suite has pre-existing cases that assume macOS. Before
+the workflow existed, the first place Linux and Windows were compiled was the
+release: v0.28.0 and v0.28.1 both failed on a single target and the whole
+release was skipped.
 
 ## Signing and notarization
 

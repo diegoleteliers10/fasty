@@ -487,6 +487,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
+          fetch-depth: 0
 
       - name: Download All Build Artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -515,6 +516,13 @@ jobs:
             flag && /^## / { exit }
             flag { print }
           ' CHANGELOG.md > release_notes.md
+          if [[ ! -s release_notes.md ]]; then
+            {
+              echo "Release ${VERSION}."
+              echo
+              git log --oneline -15
+            } > release_notes.md
+          fi
           cat release_notes.md
 
       - name: Create GitHub Release and Upload Assets
